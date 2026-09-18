@@ -44,11 +44,11 @@ export function SidebarPullRequestsButton({
       <TooltipTrigger asChild>
         <Button
           variant="ghost"
-          size="icon-xs"
+          size={labeled ? "sm" : "icon-sm"}
           aria-label="Pull requests"
           data-testid="sidebar-pull-requests"
           onClick={() => setShowPullRequests(true)}
-          className={cn("relative h-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground", labeled ? "w-full justify-start gap-2 px-2 text-xs" : "w-7")}
+          className={cn("relative text-muted-foreground hover:bg-surface-2 hover:text-foreground", labeled ? "w-full justify-start gap-2 text-label" : "")}
         >
           <Icon className="size-[15px]" />
           {labeled && "Pull requests"}
@@ -62,7 +62,7 @@ export function SidebarPullRequestsButton({
           )}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+      <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
         {count > 0
           ? `Pull requests — ${count} waiting on you`
           : "Pull requests"}

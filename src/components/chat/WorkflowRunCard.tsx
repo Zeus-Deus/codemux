@@ -120,10 +120,10 @@ function WorkflowApprovalCard({
   return (
     <div
       data-testid="workflow-approval-card"
-      className="overflow-hidden rounded-[13px] border border-accent-ember/30 bg-accent-ember/5"
+      className="overflow-hidden rounded-lg border border-accent-ember/30 bg-accent-ember/5"
     >
       <div className="flex items-center gap-2.5 border-b border-border/60 px-3.5 py-3">
-        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[7px] bg-accent-ember/20 text-accent-ember">
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent-ember/20 text-accent-ember">
           <WorkflowIcon className="h-3.5 w-3.5" strokeWidth={1.6} aria-hidden />
         </span>
         <div className="min-w-0 flex-1">
@@ -144,7 +144,7 @@ function WorkflowApprovalCard({
               key={`${phase.title}-${i}`}
               className="flex items-center gap-2.5 text-body-sm"
             >
-              <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[5px] bg-foreground/[0.08] font-mono text-caption font-semibold text-muted-foreground">
+              <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-sm bg-surface-3 font-mono text-caption font-semibold text-muted-foreground">
                 {i + 1}
               </span>
               <span className="flex-1 font-medium text-foreground/90">
@@ -176,7 +176,7 @@ function WorkflowApprovalCard({
         <Button
           type="button"
           size="sm"
-          className="h-[33px] px-3.5 text-xs bg-foreground text-background hover:bg-foreground/90"
+          className="bg-foreground text-background hover:bg-foreground/90"
           onClick={runOnce}
           disabled={isResponding}
         >
@@ -186,7 +186,6 @@ function WorkflowApprovalCard({
           type="button"
           variant="outline"
           size="sm"
-          className="h-[33px] px-3.5 text-xs"
           onClick={runAlways}
           disabled={isResponding}
         >
@@ -196,7 +195,7 @@ function WorkflowApprovalCard({
           type="button"
           variant="outline"
           size="sm"
-          className="h-[33px] px-3 text-xs bg-transparent"
+          className="bg-transparent"
           onClick={() => setScriptOpen(true)}
         >
           View script
@@ -205,7 +204,7 @@ function WorkflowApprovalCard({
           type="button"
           variant="ghost"
           size="sm"
-          className="ml-auto h-[33px] px-3 text-xs text-muted-foreground hover:text-foreground"
+          className="ml-auto text-muted-foreground hover:text-foreground"
           onClick={deny}
           disabled={isResponding}
         >
@@ -294,7 +293,7 @@ function WorkflowRunningRow({
           onOpenPanel();
         }
       }}
-      className="cursor-pointer overflow-hidden rounded-[12px] border border-border bg-foreground/[0.025] hover:border-muted-foreground/60"
+      className="cursor-pointer overflow-hidden rounded-lg border border-border bg-surface-1 hover:border-muted-foreground/60"
     >
       <div className="flex items-center gap-2.5 px-3.5 py-2.5">
         {/* Stands for the whole run, like the Subagents card header, so it
@@ -312,7 +311,7 @@ function WorkflowRunningRow({
         </span>
         <span
           data-testid="workflow-open-panel"
-          className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-[7px] border border-border bg-background px-2.5 text-label font-semibold text-muted-foreground"
+          className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-muted-foreground"
         >
           Open panel
           <ChevronRight className="h-3 w-3" strokeWidth={1.7} aria-hidden />
@@ -378,7 +377,7 @@ function WorkflowSummaryRow({
         }
       }}
       title={`${agents} agents · ${phases} phases · ${tokens} tokens · ${elapsed}`}
-      className="flex cursor-pointer items-center gap-2.5 rounded-[12px] border border-border/60 bg-muted/30 px-3.5 py-2.5 hover:border-muted-foreground/60"
+      className="flex cursor-pointer items-center gap-2.5 rounded-lg border border-border/60 bg-muted/30 px-3.5 py-2.5 hover:border-muted-foreground/60"
     >
       <Icon className={cn("h-4 w-4 shrink-0", iconClass)} strokeWidth={1.8} aria-hidden />
       <span className="flex-1 text-body font-semibold text-muted-foreground">

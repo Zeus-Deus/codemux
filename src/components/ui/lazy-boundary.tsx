@@ -45,7 +45,7 @@ class ChunkErrorBoundary extends Component<
       <div
         role="alert"
         className={cn(
-          "flex min-h-20 w-full items-center justify-center px-4 text-center text-sm text-muted-foreground",
+          "flex min-h-20 w-full items-center justify-center px-4 text-center text-body text-muted-foreground",
           overlay ? "bg-background/20 backdrop-blur-[1px]" : "bg-background",
           this.props.className,
         )}
@@ -80,7 +80,7 @@ export function LazyBoundary({
       role="status"
       aria-label={`Loading ${label}`}
       className={cn(
-        "flex min-h-20 w-full items-center justify-center px-4 text-sm text-muted-foreground",
+        "flex min-h-20 w-full items-center justify-center px-4 text-body text-muted-foreground",
         overlay ? "bg-background/20 backdrop-blur-[1px]" : "bg-background",
         className,
       )}

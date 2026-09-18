@@ -74,7 +74,7 @@ const TreeNode = memo(function TreeNode({
   const children = dirContents.get(entry.path);
 
   const row =
-    "flex h-[22px] w-full items-center gap-1.5 rounded-[5px] pr-1.5 text-left text-xs transition-colors duration-[120ms]";
+    "flex h-[22px] w-full items-center gap-1.5 rounded-sm pr-1.5 text-left text-label transition-colors duration-[120ms]";
 
   if (entry.is_dir) {
     return (
@@ -83,7 +83,7 @@ const TreeNode = memo(function TreeNode({
           type="button"
           className={cn(
             row,
-            "text-foreground/62 hover:bg-foreground/5 hover:text-foreground/80",
+            "text-foreground/62 hover:bg-surface-2 hover:text-foreground/80",
             entry.is_gitignored && "opacity-50",
           )}
           style={{ paddingLeft: indentOf(depth) }}
@@ -139,8 +139,8 @@ const TreeNode = memo(function TreeNode({
       className={cn(
         row,
         selected
-          ? "bg-foreground/8 text-foreground"
-          : "text-foreground/44 hover:bg-foreground/5 hover:text-foreground/70",
+          ? "bg-surface-3 text-foreground"
+          : "text-foreground/44 hover:bg-surface-2 hover:text-foreground/70",
         entry.is_gitignored && "opacity-50",
       )}
       style={{ paddingLeft: indentOf(depth) }}
@@ -242,7 +242,7 @@ export function FileTreePanel({
             />
           ))}
           {rootEntries.length === 0 && (
-            <p className="py-8 text-center text-xs text-foreground/40">No files</p>
+            <p className="py-8 text-center text-label text-foreground/40">No files</p>
           )}
         </div>
       </ScrollArea>

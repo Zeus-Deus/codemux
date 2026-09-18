@@ -55,7 +55,7 @@ export function ImageLightbox({
               type="button"
               aria-label="Close expanded image"
               title="Click the image to close"
-              className="block w-fit max-w-full cursor-zoom-out overflow-hidden rounded-xl bg-[#090909] shadow-2xl ring-1 ring-white/15 outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+              className="block w-fit max-w-full cursor-zoom-out overflow-hidden rounded-lg bg-[#090909] shadow-2xl ring-1 ring-white/15 outline-none focus-visible:ring-2 focus-visible:ring-white/70"
             >
               {children}
             </button>

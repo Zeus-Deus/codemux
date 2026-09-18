@@ -41,9 +41,9 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
       disabled={!interactive}
       data-testid="task-receipt"
       className={cn(
-        "flex w-full items-center gap-2.5 rounded-[11px] border border-border/60 bg-foreground/[0.025] px-3 py-2 text-left transition-colors",
+        "flex w-full items-center gap-2.5 rounded-lg border border-border/60 bg-surface-1 px-3 py-2 text-left transition-colors",
         interactive
-          ? "cursor-pointer hover:border-border hover:bg-foreground/[0.05]"
+          ? "cursor-pointer hover:border-border hover:bg-surface-2"
           : "cursor-default",
       )}
     >
@@ -52,7 +52,7 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
         strokeWidth={1.6}
         aria-hidden
       />
-      <span className="min-w-0 flex-1 truncate text-xs text-foreground/80">
+      <span className="min-w-0 flex-1 truncate text-label text-foreground/80">
         {done > 0 ? "Task list updated" : "Task list created"} ·{" "}
         <span className="font-semibold text-foreground">
           {done > 0

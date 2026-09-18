@@ -66,7 +66,7 @@ export function ProjectImageDialog({
         className="sm:max-w-[420px] bg-popover p-0 gap-0 overflow-hidden"
       >
         <DialogHeader className="px-5 pt-4 pb-2">
-          <DialogTitle className="text-sm">Project image</DialogTitle>
+          <DialogTitle className="text-body">Project image</DialogTitle>
           <DialogDescription className="sr-only">
             Set a custom image for {projectName}
           </DialogDescription>
@@ -83,7 +83,7 @@ export function ProjectImageDialog({
               shape="circle"
             />
             <div className="min-w-0 flex-1">
-              <div className="text-sm text-foreground truncate">
+              <div className="text-body text-foreground truncate">
                 {projectName}
               </div>
               <div className="flex items-center gap-1 text-label text-muted-foreground/70 mt-0.5">
@@ -110,14 +110,14 @@ export function ProjectImageDialog({
 
           {/* Input */}
           <div className="space-y-1.5">
-            <label className="text-xs text-muted-foreground">
+            <label className="text-label text-muted-foreground">
               Image URL or website
             </label>
             <Input
               value={value}
               onChange={(e) => setValue(e.target.value)}
               placeholder="codemux.com  or  https://…/logo.png"
-              className="h-8 text-sm"
+              className="h-8 text-body"
               autoFocus
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleSave();
@@ -133,7 +133,7 @@ export function ProjectImageDialog({
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 px-2 text-xs text-muted-foreground hover:text-destructive"
+              className="text-muted-foreground hover:text-destructive"
               onClick={handleClear}
               disabled={!initialValue}
             >

@@ -220,7 +220,7 @@ export function ComposerFooter({
                   : undefined
               }
               className={cn(
-                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-sm font-medium leading-none transition-colors",
+                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors",
                 modelLeafLabel && "w-[34px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"

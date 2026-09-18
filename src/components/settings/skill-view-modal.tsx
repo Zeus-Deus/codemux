@@ -61,7 +61,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
             </span>
             {skill.filePath && (
               <span
-                className="block break-all font-mono text-xs"
+                className="block break-all font-mono text-label"
                 data-testid="skill-modal-filepath"
               >
                 {skill.filePath}
@@ -69,7 +69,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
             )}
             {skill.symlinked && (
               <span
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground/80"
+                className="inline-flex items-center gap-1 text-label text-muted-foreground/80"
                 data-testid="skill-modal-symlink"
               >
                 <Link2 className="h-3 w-3" aria-hidden />
@@ -84,7 +84,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
           <div
             data-testid="skill-modal-compat-warning"
             className={cn(
-              "rounded-md border p-3 text-xs",
+              "rounded-md border p-3 text-label",
               skill.compatibility === "soft-warn" &&
                 "border-status-working/30 bg-status-working/5",
               skill.compatibility === "hard-warn" &&
@@ -114,12 +114,12 @@ export function SkillViewModal({ skill, onClose }: Props) {
           className="flex-1 overflow-y-auto rounded-md border border-border/50 bg-muted/30 p-4"
         >
           {skill.readable === false ? (
-            <p className="text-sm italic text-muted-foreground">
+            <p className="text-body italic text-muted-foreground">
               This provider reports the skill as native-only and does not expose
               readable content for Codemux to show or use with another provider.
             </p>
           ) : skill.body.trim().length === 0 ? (
-            <p className="text-sm italic text-muted-foreground">
+            <p className="text-body italic text-muted-foreground">
               This skill has no body content.
             </p>
           ) : (
@@ -128,7 +128,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
         </div>
 
         {hasFrontmatter && (
-          <details className="text-xs">
+          <details className="text-label">
             <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
               Advanced metadata
             </summary>

@@ -79,8 +79,8 @@ export function SessionSelector({
       <DropdownMenuTrigger asChild>
         <Button
           variant="ghost"
-          size="sm"
-          className="h-6 gap-1 px-1.5 text-xs font-normal text-muted-foreground hover:text-foreground"
+          size="xs"
+          className="gap-1 font-normal text-muted-foreground hover:text-foreground"
           aria-label="Chat history"
           data-testid="session-selector-trigger"
         >

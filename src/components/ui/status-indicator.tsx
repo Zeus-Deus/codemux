@@ -83,7 +83,7 @@ export function StatusIndicator({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{dot}</TooltipTrigger>
-      <TooltipContent side="right" className="text-xs">
+      <TooltipContent side="right" className="text-label">
         {config.tooltip}
       </TooltipContent>
     </Tooltip>

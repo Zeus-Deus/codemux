@@ -161,7 +161,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
               // treatment, same as the panel toggle. Non-compact (legacy
               // bar) keeps its bordered chip and stays byte-identical.
               !compact && "border border-r-0 bg-secondary/50",
-              "text-xs font-medium",
+              "text-label font-medium",
               compact
                 ? cn("h-7 w-7 justify-center px-0", BAND_CONTROL_RADIUS)
                 : "h-6 rounded-l-md border-border/60 px-2",
@@ -502,7 +502,7 @@ function TitleBarDraftSlots() {
         // The draft's stand-in for the active tab, so it wears exactly the
         // active pill: same radius token, same 6% selected fill.
         className={cn(
-          "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-xs font-semibold text-foreground",
+          "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-label font-semibold text-foreground",
           BAND_CONTROL_RADIUS,
           BAND_ACTIVE_FILL,
         )}

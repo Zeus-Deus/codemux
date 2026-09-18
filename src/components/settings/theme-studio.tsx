@@ -76,7 +76,7 @@ export function ThemeStudio() {
     <Dialog open={request !== null} onOpenChange={(open) => { if (!open) close(); }}>
       <DialogContent
         showCloseButton={false}
-        className="flex h-[min(720px,calc(100vh-4rem))] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-2xl border border-border bg-card p-0 sm:max-w-[1000px]"
+        className="flex h-[min(720px,calc(100vh-4rem))] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-lg border border-border bg-card p-0 sm:max-w-[1000px]"
       >
         {request && (
           <StudioBody
@@ -284,7 +284,7 @@ function StudioBody({
           <div
             role="radiogroup"
             aria-label="Theme source"
-            className="flex flex-none rounded-[9px] border border-border/60 bg-muted/40 p-0.5"
+            className="flex flex-none rounded-md border border-border/60 bg-muted/40 p-0.5"
           >
             {(["generate", "import"] as const).map((value) => (
               <button
@@ -294,7 +294,7 @@ function StudioBody({
                 aria-checked={tab === value}
                 onClick={() => setTab(value)}
                 className={cn(
-                  "inline-flex h-[26px] items-center rounded-[7px] px-3.5 text-body-sm font-semibold transition-colors",
+                  "inline-flex h-[26px] items-center rounded-md px-3.5 text-body-sm font-semibold transition-colors",
                   tab === value
                     ? "bg-foreground text-background"
                     : "text-muted-foreground hover:text-foreground",
@@ -393,7 +393,6 @@ function StudioBody({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-[31px] gap-1.5 text-body-sm"
               onClick={() => downloadTheme(savedTheme)}
             >
               <Download className="size-3" /> Export
@@ -410,13 +409,13 @@ function StudioBody({
             </Button>
           </>
         )}
-        <Button type="button" variant="outline" size="sm" className="h-[31px] text-body-sm" onClick={onClose}>
+        <Button type="button" variant="outline" size="sm" onClick={onClose}>
           Cancel
         </Button>
         <Button
           type="button"
           size="sm"
-          className="h-[31px] gap-1.5 text-body-sm font-bold"
+          className="font-bold"
           onClick={saveTheme}
           disabled={!candidate}
         >
@@ -461,7 +460,7 @@ function GenerateColumn({
       {theme ? (
         <SolvedRoles theme={theme} />
       ) : (
-        <p className="rounded-[9px] border border-warning/25 bg-warning/10 px-3 py-2 text-label leading-relaxed text-warning">
+        <p className="rounded-md border border-warning/25 bg-warning/10 px-3 py-2 text-label leading-relaxed text-warning">
           Use a valid hex or OKLCH background and accent. Either polarity works
           — the background's brightness is what makes the theme light or dark.
         </p>
@@ -502,7 +501,7 @@ function SolvedRoles({ theme }: { theme: ThemeDefinition }) {
         {swatches.map((color, index) => (
           <span
             key={`${color}-${index}`}
-            className="h-[22px] rounded-[5px] border border-foreground/10"
+            className="h-[22px] rounded-sm border border-hairline-strong"
             style={{ background: normalizeColor(color, normalizeColor(theme.roles.background) ?? "#000") ?? color }}
           />
         ))}
@@ -523,7 +522,7 @@ function ContrastReadout({ theme }: { theme: ThemeDefinition }) {
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-[9px] border px-2.5 py-2",
+        "flex items-center gap-2 rounded-md border px-2.5 py-2",
         ok
           ? "border-status-open/25 bg-status-open/10"
           : "border-warning/25 bg-warning/10",
@@ -571,7 +570,7 @@ function ImportColumn({
       ) : (
       <div className="flex flex-col gap-1.5">
         <ColumnLabel>{sourceKind === "file" ? "File" : "Paste it here"}</ColumnLabel>
-        <div className="overflow-hidden rounded-[10px] border border-border bg-muted/30">
+        <div className="overflow-hidden rounded-lg border border-border bg-muted/30">
           <Textarea
             value={text}
             onChange={(event) => onText(event.target.value)}
@@ -594,7 +593,6 @@ function ImportColumn({
               type="button"
               variant="outline"
               size="sm"
-              className="h-[25px] gap-1.5 px-2.5 text-label"
               onClick={onChooseFile}
             >
               <FileUp className="size-[11px]" /> Choose file
@@ -606,14 +604,14 @@ function ImportColumn({
       )}
 
       {error && (
-        <p className="rounded-[10px] border border-destructive/25 bg-destructive/10 px-2.5 py-2 text-label leading-relaxed text-destructive">
+        <p className="rounded-lg border border-destructive/25 bg-destructive/10 px-2.5 py-2 text-label leading-relaxed text-destructive">
           {error}
         </p>
       )}
 
       {result && (
         <>
-          <div className="flex items-center gap-2.5 rounded-[10px] border border-status-open/25 bg-status-open/10 px-2.5 py-2.5">
+          <div className="flex items-center gap-2.5 rounded-lg border border-status-open/25 bg-status-open/10 px-2.5 py-2.5">
             <Check className="size-3 flex-none text-status-open" />
             <span className="flex-1 text-label leading-relaxed text-muted-foreground">
               Recognised a{" "}
@@ -656,7 +654,7 @@ function DerivedRoles({ result }: { result: ThemeImportResult }) {
           className="flex h-[30px] items-center gap-2.5 rounded-lg border border-border/60 bg-muted/30 px-2.5"
         >
           <span
-            className="size-3.5 flex-none rounded"
+            className="size-3.5 flex-none rounded-sm"
             style={{ background: normalizeColor(result.theme.roles[role], backdrop) ?? backdrop }}
           />
           <span className="flex-1 truncate text-label text-muted-foreground">
@@ -744,7 +742,7 @@ function NameField({ value, onChange }: { value: string; onChange: (value: strin
         onChange={(event) => onChange(event.target.value)}
         maxLength={48}
         aria-label="Theme name"
-        className="h-[34px] rounded-[9px] text-body"
+        className="h-[34px] rounded-md text-body"
       />
     </label>
   );
@@ -760,7 +758,7 @@ function SeedRow({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="flex h-[38px] items-center gap-2.5 rounded-[9px] border border-border bg-muted/30 px-2.5">
+    <label className="flex h-[38px] items-center gap-2.5 rounded-md border border-border bg-muted/30 px-2.5">
       <input
         type="color"
         value={normalizeColor(value) ?? "#000000"}

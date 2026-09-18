@@ -1122,17 +1122,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             value={workspaceName}
             onChange={(e) => setWorkspaceName(e.target.value)}
             placeholder="Workspace name (optional)"
-            className="h-6 text-xs flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
+            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
           />
           {branchMode === "create_new" ? (
             <Input
               value={branchName}
               onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
               placeholder="branch name"
-              className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
+              className="h-6 text-label w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
             />
           ) : (
-            <span className="h-6 text-xs text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
+            <span className="h-6 text-label text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
               on {openExistingBranch}
             </span>
           )}
@@ -1140,14 +1140,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
         {/* Center: prompt textarea with embedded controls */}
         <div className="relative px-3 pt-2 pb-3">
-          <div className="rounded-2xl border border-border bg-muted overflow-hidden">
+          <div className="rounded-lg border border-border bg-muted overflow-hidden">
             <Textarea
               ref={textareaRef}
               value={prompt}
               onChange={handleTextareaChange}
               onPaste={handlePasteImage}
               placeholder="What do you want to do?"
-              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
+              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-body px-4 pt-3 pb-1"
               rows={1}
             />
 
@@ -1162,10 +1162,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   >
                     <span
                       className={cn(
-                        "flex size-5 shrink-0 items-center justify-center rounded",
+                        "flex size-5 shrink-0 items-center justify-center rounded-sm",
                         linkedIssue.state === "Open"
                           ? "bg-success/15 text-success"
-                          : "bg-foreground/10 text-muted-foreground",
+                          : "bg-surface-3 text-muted-foreground",
                       )}
                     >
                       <CircleDot className="h-3 w-3" />
@@ -1177,7 +1177,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label={`Remove issue #${linkedIssue.number}`}
-                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-foreground/10 hover:text-foreground"
+                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-foreground"
                       onClick={() => {
                         setLinkedIssue(null);
                         if (branchAutoFilled) {
@@ -1260,7 +1260,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         setSelectedAgentId(p.id);
                         setLastSelectedAgentId(p.id);
                       }}
-                      className="text-xs gap-2"
+                      className="text-label gap-2"
                     >
                       <PresetIcon icon={p.icon} className="h-3.5 w-3.5" />
                       <span className="flex-1">{p.name}</span>
@@ -1324,7 +1324,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label="Attach files"
-                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground outline-none"
                       onClick={async () => {
                         const files = await pickFiles("Attach files");
                         if (files.length > 0) {
@@ -1348,7 +1348,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       <button
                         type="button"
                         aria-label="Link pull request"
-                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground outline-none"
                         onClick={() => {
                           setIssuePickerOpen(false);
                           setPrPickerOpen(true);
@@ -1368,7 +1368,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       <button
                         type="button"
                         aria-label="Link issue"
-                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground outline-none"
                         onClick={() => {
                           setPrPickerOpen(false);
                           setIssuePickerOpen(true);

@@ -925,12 +925,12 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             {status === "error" ? (
               <>
                 <Globe className="h-8 w-8 text-muted-foreground/30 mb-2" />
-                <p className="text-xs text-destructive">{errorMsg || "Connection failed"}</p>
+                <p className="text-label text-destructive">{errorMsg || "Connection failed"}</p>
               </>
             ) : (
               <>
                 <Loader2 className="h-6 w-6 animate-spin text-muted-foreground mb-2" />
-                <p className="text-xs text-muted-foreground">
+                <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
                   {status === "waiting" && "Waiting for first frame..."}

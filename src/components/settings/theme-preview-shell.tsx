@@ -30,7 +30,7 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
 
   return (
     <div
-      className="flex h-full min-h-0 overflow-hidden rounded-[11px] border"
+      className="flex h-full min-h-0 overflow-hidden rounded-lg border"
       style={{ background: c.bg, borderColor: c.border, colorScheme: theme.scheme }}
       data-theme-scheme={theme.scheme}
       aria-hidden="true"
@@ -81,7 +81,7 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
         {/* Chat */}
         <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-hidden p-4">
           <span
-            className="max-w-[56%] self-end rounded-[10px] px-[11px] py-2 text-label leading-[1.55]"
+            className="max-w-[56%] self-end rounded-lg px-[11px] py-2 text-label leading-[1.55]"
             style={{ background: c.card, color: c.fg }}
           >
             Rename the callback and fix the imports
@@ -100,7 +100,7 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
 
           {/* Diff card — the tints are the reason a palette gets judged */}
           <span
-            className="max-w-[76%] overflow-hidden rounded-[9px] border"
+            className="max-w-[76%] overflow-hidden rounded-md border"
             style={{ borderColor: c.border }}
           >
             <span

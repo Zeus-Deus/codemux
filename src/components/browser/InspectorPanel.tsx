@@ -21,7 +21,7 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
   return (
     <div className="flex shrink-0 items-center gap-2 border-b border-border/50 bg-card px-2 py-1">
       <div className="flex min-w-0 flex-1 items-center gap-2">
-        <span className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 font-mono text-label font-semibold text-primary">
+        <span className="shrink-0 rounded-sm bg-primary/10 px-1.5 py-0.5 font-mono text-label font-semibold text-primary">
           {element.tag}
           {element.id && <span className="text-muted-foreground">#{element.id}</span>}
         </span>

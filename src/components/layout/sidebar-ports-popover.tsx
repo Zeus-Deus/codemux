@@ -151,12 +151,12 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
           <PopoverTrigger asChild>
             <Button
               variant="ghost"
-              size="icon-xs"
+              size={labeled ? "sm" : "icon-sm"}
               aria-label="Ports"
               className={cn(
-                "relative h-7 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
+                "relative text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
                 portCount > 0 && "text-foreground",
-                labeled ? "w-full justify-start gap-2 px-2 text-xs" : "w-7",
+                labeled ? "w-full justify-start gap-2 text-label" : "",
               )}
             >
               <Icon className="size-[18px]" />
@@ -169,7 +169,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
-        <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+        <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
           {portCount > 0
             ? `${portCount} active port${portCount === 1 ? "" : "s"}`
             : "No active ports"}
@@ -188,7 +188,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
               <CommandEmpty>
                 <div className="flex flex-col items-center justify-center py-6 text-muted-foreground">
                   <Plug className="h-5 w-5 mb-2 opacity-50" />
-                  <span className="text-xs">No active ports detected</span>
+                  <span className="text-label">No active ports detected</span>
                 </div>
               </CommandEmpty>
             ) : (
@@ -208,7 +208,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                       onSelect={() => openInBrowser(port)}
                       className="group/port flex items-center gap-2 py-1.5"
                     >
-                      <span className="font-mono text-xs font-semibold text-foreground tabular-nums shrink-0">
+                      <span className="font-mono text-label font-semibold text-foreground tabular-nums shrink-0">
                         {port.port}
                       </span>
                       <span
@@ -237,7 +237,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                               <Globe className="h-3 w-3" />
                             </button>
                           </TooltipTrigger>
-                          <TooltipContent side="top" sideOffset={4} className="text-xs">
+                          <TooltipContent side="top" sideOffset={4} className="text-label">
                             Open in browser pane
                           </TooltipContent>
                         </Tooltip>
@@ -255,7 +255,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                               <Copy className="h-3 w-3" />
                             </button>
                           </TooltipTrigger>
-                          <TooltipContent side="top" sideOffset={4} className="text-xs">
+                          <TooltipContent side="top" sideOffset={4} className="text-label">
                             Copy URL
                           </TooltipContent>
                         </Tooltip>
@@ -274,7 +274,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                                 <X className="h-3 w-3" />
                               </button>
                             </TooltipTrigger>
-                            <TooltipContent side="top" sideOffset={4} className="text-xs">
+                            <TooltipContent side="top" sideOffset={4} className="text-label">
                               Kill process
                             </TooltipContent>
                           </Tooltip>

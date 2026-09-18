@@ -34,7 +34,7 @@ export function DiffView({
   let lineNo = 0;
 
   return (
-    <div className="overflow-hidden rounded-[11px] border border-border/60 bg-muted/40">
+    <div className="overflow-hidden rounded-lg border border-border/60 bg-muted/40">
       <div className="flex items-center justify-between gap-3 border-b border-border/60 px-[13px] py-[9px]">
         <span className="flex min-w-0 items-center gap-2 font-mono text-body-sm text-muted-foreground">
           {fileMeta ? (

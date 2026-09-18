@@ -736,18 +736,28 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
 
     // The slow git op (recursive checkout, may fetch). Off-load to the
     // blocking pool so it doesn't stall a Tokio worker.
-    let worktree_path = {
+    //
+    // Also resolves the branch the new worktree forks from, for display.
+    // Only a freshly created branch has one: without an explicit `base`,
+    // `git worktree add -b` forks the repo's checked-out branch, so that is
+    // read BEFORE the add. A reused on-disk worktree keeps whatever it was
+    // forked from originally, which we can't know, so it records nothing.
+    let (worktree_path, base_branch) = {
         let repo_path = repo_path.clone();
         let branch = branch.clone();
         let base = base.clone();
         tokio::task::spawn_blocking(move || {
-            crate::git::git_create_worktree(
-                Path::new(&repo_path),
-                &branch,
-                new_branch,
-                base.as_deref(),
-                pr_number,
-            )
+            let repo = Path::new(&repo_path);
+            let base_branch = if new_branch
+                && !crate::git::conventional_worktree_path(repo, &branch)
+                    .is_some_and(|p| p.exists())
+            {
+                base.clone().or_else(|| crate::git::current_branch(repo))
+            } else {
+                None
+            };
+            crate::git::git_create_worktree(repo, &branch, new_branch, base.as_deref(), pr_number)
+                .map(|path| (path, base_branch))
         })
         .await
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
@@ -826,6 +836,7 @@ pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runt
     };
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
+    state.set_workspace_base_branch(&workspace_id.0, base_branch);
 
     populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
 

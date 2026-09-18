@@ -57,12 +57,12 @@ import {
 const EMPTY_WORKSPACES: WorkspaceSnapshot[] = [];
 
 const GHOST_BTN =
-  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground outline-none transition-colors hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
 
 /** Location-picker row geometry, shared by the Home row and the project
  *  rows so both sections line up on the same baseline. */
 const PICKER_ITEM =
-  "flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground";
+  "flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-label font-medium text-foreground";
 /** Tints `CommandItem`'s built-in trailing check (its last child) to the
  *  accent the location picker has always used for "this is the current
  *  target". Falls back to the neutral check if the selector ever stops
@@ -505,7 +505,7 @@ function LocationControl({
             placeholder="Search projects…"
             value={query}
             onValueChange={setQuery}
-            className="text-xs"
+            className="text-label"
           />
           <CommandList
             className="max-h-[280px] min-h-0 flex-1 overflow-y-auto p-1.5 pb-0 [scrollbar-width:thin]"
@@ -577,7 +577,7 @@ function LocationControl({
                   handleSelectProject(result.path);
                 }
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
             >
               <FolderPlus className="size-3.5" />
               Open another project…
@@ -633,12 +633,12 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("current")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.08]"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
         >
           <Folder className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
-              <span className="text-xs font-semibold text-foreground">
+              <span className="text-label font-semibold text-foreground">
                 Current checkout
               </span>
               {isCurrent && (
@@ -654,12 +654,12 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("worktree")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.08]"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
         >
           <GitFork className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
-              <span className="text-xs font-semibold text-foreground">
+              <span className="text-label font-semibold text-foreground">
                 New worktree
               </span>
               {isWorktree && (
@@ -859,7 +859,7 @@ function BranchControl({
             <button
               type="button"
               className={cn(
-                "flex-1 rounded-md px-2 py-1 text-xs transition-colors",
+                "flex-1 rounded-md px-2 py-1 text-label transition-colors",
                 filterMode === "all"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -871,7 +871,7 @@ function BranchControl({
             <button
               type="button"
               className={cn(
-                "flex-1 rounded-md px-2 py-1 text-xs transition-colors",
+                "flex-1 rounded-md px-2 py-1 text-label transition-colors",
                 filterMode === "worktrees"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -903,7 +903,7 @@ function BranchControl({
                       key={branch.name}
                       value={branch.name}
                       onSelect={() => handleSelect(branch.name)}
-                      className="h-8 gap-2 px-2 text-xs"
+                      className="h-8 gap-2 px-2 text-label"
                       data-checked={active ? "true" : undefined}
                     >
                       <BranchRowIcon
@@ -915,7 +915,7 @@ function BranchControl({
                         {branch.name}
                       </span>
                       {hasWorktree && (
-                        <span className="shrink-0 rounded bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
+                        <span className="shrink-0 rounded-sm bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
                           WORKTREE
                         </span>
                       )}

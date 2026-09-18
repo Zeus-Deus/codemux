@@ -77,6 +77,7 @@ import { TabDropIndicator } from "../tab-drop-indicator";
 import { PaneActionButton } from "./pane-actions";
 import { PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 export interface DeckTab {
   id: RightPanelTab;
@@ -159,11 +160,11 @@ function DeckTabChip({
       }}
       className={cn(
         // No border, no shadow, no ring — the fill is the whole signal.
-        "group/tab relative flex h-[26px] shrink-0 items-center rounded-[7px]",
+        "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",
         "transition-colors duration-[120ms]",
         active
-          ? "bg-foreground/7 font-semibold text-foreground"
-          : "font-medium text-foreground/42 hover:bg-foreground/5 hover:text-foreground/70",
+          ? "bg-surface-3 font-semibold text-foreground"
+          : "font-medium text-foreground/42 hover:bg-surface-2 hover:text-foreground/70",
         dragging && "opacity-40",
       )}
     >
@@ -195,8 +196,8 @@ function DeckTabChip({
           className={cn(
             // Overlays the tab's right edge rather than taking a layout
             // slot, so revealing it on hover doesn't shove the row around.
-            "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-[4px] transition-opacity",
-            "hover:bg-foreground/15 focus-visible:opacity-100",
+            "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-sm transition-opacity",
+            "hover:bg-surface-3 focus-visible:opacity-100",
             active
               ? "opacity-50 hover:opacity-100"
               : // Opaque on purpose: it masks the label it sits on top of,
@@ -466,14 +467,14 @@ export const PaneTabStrip = memo(function PaneTabStrip({
             type="button"
             aria-label="Open pane"
             data-testid="right-panel-add-pane"
-            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-[7px] text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground data-[state=open]:bg-foreground/12 data-[state=open]:text-foreground"
+            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground"
           >
             <Plus className="size-[13px]" strokeWidth={1.7} />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align="start"
-          className="w-[206px] rounded-[11px] p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
+          className="w-[206px] rounded-lg p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
         >
           <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
             OPEN PANE
@@ -484,7 +485,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           {surfaces.map((surface) => (
             <DropdownMenuItem
               key={surface.id}
-              className="h-[30px] rounded-[7px] px-[9px] text-body font-medium"
+              className="h-[30px] rounded-md px-[9px] text-body font-medium"
               onClick={surface.onOpen}
             >
               <surface.icon className="size-[14px]" strokeWidth={1.5} />
@@ -493,7 +494,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           ))}
           <DropdownMenuSeparator className="mx-1 my-[5px]" />
           <DropdownMenuItem
-            className="h-[30px] rounded-[7px] px-[9px] text-body font-medium"
+            className="h-[30px] rounded-md px-[9px] text-body font-medium"
             onClick={onOpenFile}
           >
             <Search className="size-[14px]" strokeWidth={1.5} />
@@ -546,30 +547,34 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         data-stacked="true"
         className={cn("flex shrink-0 flex-col", className)}
       >
-        <div
-          className="flex h-10 items-center gap-[2px] px-[7px]"
+        <PanelHeader
+          variant="floating"
+          className="gap-[2px] px-[7px]"
           style={bandStyle}
         >
           {dragGap(true)}
           {paneActions}
-        </div>
-        <div className="flex h-9 items-center gap-[2px] border-b border-border/60 px-[7px]">
+        </PanelHeader>
+        <PanelHeader variant="inline" className="gap-[2px] px-[7px]">
           {tabRun}
           {dragGap(false)}
-        </div>
+        </PanelHeader>
       </div>
     );
   }
 
   return (
-    <div
+    <PanelHeader
       ref={headerRef}
+      variant={inTitlebar ? "floating" : "inline"}
       data-testid="right-panel-tabs-header"
       data-in-titlebar={inTitlebar ? "true" : undefined}
       className={cn(
         // One hairline under this row and nothing else between it and the
-        // pane body. The body starts flush.
-        "flex shrink-0 items-center gap-[2px] border-b border-border/60 px-[7px]",
+        // pane body. The body starts flush. The floating variant carries no
+        // rule of its own, so the band row asks for one explicitly: its seam
+        // is the bottom edge of the window band.
+        "gap-[2px] border-b border-hairline px-[7px]",
         // 40px when this row *is* the window band, so its seam lands exactly
         // on the band's bottom edge and its controls sit on the same
         // baseline as the sidebar toggle and the window buttons.
@@ -578,7 +583,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         // row here would draw a lighter slab across the panel's half of the
         // band. Under the legacy in-flow bar the row is ordinary panel
         // chrome below a real titlebar surface, so it keeps its card fill.
-        inTitlebar ? "h-10 bg-transparent" : "h-9 bg-card",
+        inTitlebar ? "bg-transparent" : "bg-card",
         className,
       )}
       style={bandStyle}
@@ -606,7 +611,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           />
         </>
       )}
-    </div>
+    </PanelHeader>
   );
 });
 

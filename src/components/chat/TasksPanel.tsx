@@ -106,7 +106,7 @@ export function TasksPanel({
           <span
             data-testid="tasks-status-badge"
             className={cn(
-              "inline-flex items-center rounded-[5px] px-1.5 py-px font-mono text-caption font-semibold uppercase tracking-[0.09em]",
+              "inline-flex items-center rounded-sm px-1.5 py-px font-mono text-caption font-semibold uppercase tracking-[0.09em]",
               BADGE_TONE[runState],
             )}
           >
@@ -126,7 +126,7 @@ export function TasksPanel({
           )}
         </div>
         <div
-          className="h-[3px] overflow-hidden rounded-full bg-foreground/12"
+          className="h-[3px] overflow-hidden rounded-full bg-surface-3"
           role="progressbar"
           aria-label="Task progress"
           aria-valuemin={0}
@@ -148,7 +148,7 @@ export function TasksPanel({
           {/* One-line intent in the agent's words — what makes an old
               list legible when scrolling back. */}
           {snapshot.explanation && (
-            <p className="mx-1.5 mb-3 text-xs leading-relaxed text-muted-foreground">
+            <p className="mx-1.5 mb-3 text-label leading-relaxed text-muted-foreground">
               {snapshot.explanation}
             </p>
           )}
@@ -164,7 +164,7 @@ export function TasksPanel({
                     "flex items-start gap-2 rounded-lg px-2 py-1.5 transition-colors",
                     task.status === "in_progress" && "bg-status-working/8",
                     task.status === "completed" && "bg-status-open/8",
-                    task.status === "pending" && "hover:bg-foreground/4",
+                    task.status === "pending" && "hover:bg-surface-2",
                   )}
                 >
                   <span className="mt-[3px] flex size-4 shrink-0 items-center justify-center">
@@ -186,7 +186,7 @@ export function TasksPanel({
                       {task.title}
                     </p>
                     {task.detail && task.detail !== task.title && (
-                      <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                      <p className="mt-0.5 text-label leading-relaxed text-muted-foreground">
                         {task.detail}
                       </p>
                     )}
@@ -244,7 +244,7 @@ export function TasksPaneActions({ snapshot }: { snapshot: TasksSnapshot }) {
         type="button"
         onClick={handleCopy}
         data-testid="tasks-copy"
-        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground"
+        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground"
       >
         {copied ? (
           <Check className="size-3" aria-hidden />

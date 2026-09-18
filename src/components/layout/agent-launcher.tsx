@@ -89,7 +89,7 @@ function TitlebarPinToggle({
           useTitlebarPinsStore.getState().toggleTitlebarPin(presetId);
         }}
         className={cn(
-          "flex h-5 w-5 shrink-0 items-center justify-center rounded transition-[color,opacity] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          "flex h-5 w-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
           pinned
             ? "text-accent-ember hover:text-accent-ember/80"
             : "absolute right-0 top-1/2 -translate-y-1/2 text-muted-foreground opacity-0 group-hover/command-item:opacity-100 group-data-selected/command-item:opacity-100 hover:text-foreground",
@@ -132,7 +132,7 @@ function PresetPinnedBadge({ presetId }: { presetId: string }) {
 }
 
 const LAUNCHER_ITEM_CLASS =
-  "h-[30px] rounded-[7px] px-2 py-0 text-body";
+  "h-[30px] rounded-md px-2 py-0 text-body";
 
 const LAUNCHER_GROUP_CLASS =
   "**:[[cmdk-group-heading]]:font-mono **:[[cmdk-group-heading]]:text-caption **:[[cmdk-group-heading]]:font-semibold **:[[cmdk-group-heading]]:tracking-[0.09em] **:[[cmdk-group-heading]]:uppercase";
@@ -262,7 +262,7 @@ function LauncherFooter({ onSelect }: { onSelect: () => void }) {
         value="manage presets"
         onSelect={onSelect}
         showCheckmark={false}
-        className="h-[34px] rounded-[7px] px-2 py-0 text-body"
+        className="h-[34px] rounded-md px-2 py-0 text-body"
       >
         <Settings className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="flex-1 text-muted-foreground">Manage presets…</span>
