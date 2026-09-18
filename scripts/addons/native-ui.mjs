@@ -143,6 +143,7 @@ let session;
 let driver;
 let desktop;
 let windowsDebugPolicy = false;
+let capabilities;
 const endpoint = "http://127.0.0.1:4444";
 async function request(method, path, body) {
   const response = await fetch(endpoint + path, {
@@ -359,9 +360,62 @@ async function openCommand(title) {
     ),
   ).then((el) => wd("POST", `/element/${elementId(el)}/click`, {}));
 }
+async function createNativeSession() {
+  const created = await request("POST", "/session", {
+    capabilities: { alwaysMatch: capabilities },
+  });
+  session = created.sessionId;
+  await wd("POST", "/timeouts", {
+    implicit: 0,
+    script: 30000,
+    pageLoad: 60000,
+  });
+  await until("native app ready", () =>
+    script(
+      "return !!window.__TAURI_INTERNALS__ && document.body.innerText.length > 50",
+    ),
+  );
+  await element('button[aria-label="Menu"]');
+}
+async function restartNativeSession() {
+  // The driver owns the Linux app child. On Windows attach mode we retain the
+  // exact process handle ourselves. Never stop a process by name or pattern.
+  await wd("DELETE", "");
+  session = undefined;
+  if (process.platform === "win32") {
+    desktop.kill();
+    await Promise.race([
+      desktop.done,
+      delay(5000).then(() => {
+        throw Error("Owned desktop did not exit");
+      }),
+    ]);
+    await until("old WebView2 debugger closed", async () => {
+      try {
+        await fetch("http://127.0.0.1:9231/json/version", {
+          signal: AbortSignal.timeout(500),
+        });
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    desktop = start(application, [], { env });
+    await until(
+      "restarted WebView2 ready",
+      async () =>
+        (
+          await fetch("http://127.0.0.1:9231/json/version", {
+            signal: AbortSignal.timeout(1000),
+          })
+        ).ok,
+    );
+  }
+  await createNativeSession();
+}
+
 try {
   await run(application, ["login", "--token", token], { env });
-  let capabilities;
   if (process.platform === "win32") {
     // The standard driver-launch path times out for this stock Windows app.
     // Microsoft's documented attach mode keeps the same binary and gives us
@@ -410,21 +464,7 @@ try {
     "driver startup",
     async () => (await request("GET", "/status"))?.ready === true,
   );
-  const created = await request("POST", "/session", {
-    capabilities: { alwaysMatch: capabilities },
-  });
-  session = created.sessionId;
-  await wd("POST", "/timeouts", {
-    implicit: 0,
-    script: 30000,
-    pageLoad: 60000,
-  });
-  await until("native app ready", () =>
-    script(
-      "return !!window.__TAURI_INTERNALS__ && document.body.innerText.length > 50",
-    ),
-  );
-  await element('button[aria-label="Menu"]');
+  await createNativeSession();
   await step("01-settings", openSettings);
   assert.deepEqual((await native("addon_inventory")).installed, []);
   assert.equal(
@@ -738,6 +778,83 @@ try {
       await assertNoSubmission();
     });
   }
+  await step(
+    "09-paused-restart-preserves-installations-and-settings",
+    async () => {
+      const persisted = (inventory) =>
+        inventory.installed
+          .map((i) => ({
+            installationId: i.installationId,
+            id: i.manifest.id,
+            digest: i.digest,
+            dataGeneration: i.dataGeneration,
+            source: i.source,
+            grant: i.grant,
+            desiredEnabled: i.desiredEnabled,
+          }))
+          .sort((a, b) => a.id.localeCompare(b.id));
+      const before = persisted(await native("addon_inventory"));
+      const settings = await native("addon_settings_get", {
+        id: "codemux.issue-companion",
+      });
+      await clickText("Pause all add-ons");
+      await until(
+        "paused before restart",
+        async () => (await native("addon_inventory")).paused,
+      );
+      await until(
+        "hosts reaped before restart",
+        async () => (await pluginHostCount()) === 0,
+      );
+      await restartNativeSession();
+      await openSettings();
+      const after = await native("addon_inventory");
+      assert.equal(after.paused, true);
+      assert.deepEqual(persisted(after), before);
+      assert.deepEqual(
+        await native("addon_settings_get", { id: "codemux.issue-companion" }),
+        settings,
+      );
+      assert.equal(await pluginHostCount(), 0);
+      await click('[aria-label="Close settings"]');
+      await checkCoreTerminal();
+      await openSettings();
+      await clickText("Resume add-ons");
+      await until(
+        "resumed after restart",
+        async () => !(await native("addon_inventory")).paused,
+      );
+      await click('[aria-label="Close settings"]');
+      await openCommand("Open Project Brief");
+      await hasText("draft-context.txt");
+      await openSettings();
+    },
+  );
+  await step("10-remove-packages-keeps-core-usable", async () => {
+    for (const title of [
+      "Issue Companion",
+      "Project Brief",
+      "Fault Isolation Fixture",
+    ]) {
+      const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes(${JSON.stringify(title)})))`;
+      await clickText("Remove", article);
+      await hasText(`Remove ${title}?`);
+      await clickText(
+        "Remove add-on",
+        `document.querySelector('[role="dialog"]')`,
+      );
+      await until(
+        `removed ${title}`,
+        async () =>
+          !(await native("addon_inventory")).installed.some(
+            (i) => i.manifest.name === title,
+          ),
+      );
+    }
+    assert.equal(await pluginHostCount(), 0);
+    await click('[aria-label="Close settings"]');
+    await checkCoreTerminal();
+  });
   if (evidence.failedChecks.length)
     throw Error("One or more native acceptance gates failed; see failedChecks");
   evidence.status = "passed";
