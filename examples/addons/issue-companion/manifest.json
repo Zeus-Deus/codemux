@@ -1,0 +1,85 @@
+{
+  "format": "codemux.feature-plugin",
+  "manifestVersion": 1,
+  "api": "^1.0.0",
+  "version": "1.0.0",
+  "entry": "plugin.js",
+  "platforms": [
+    "linux-x64",
+    "windows-x64"
+  ],
+  "author": {
+    "name": "CodeMux",
+    "url": "https://codemux.org"
+  },
+  "repository": "https://github.com/Zeus-Deus/codemux",
+  "license": "MIT",
+  "http": [
+    {
+      "origin": "https://api.github.com",
+      "methods": [
+        "GET"
+      ],
+      "credential": "github-token"
+    }
+  ],
+  "credentials": [
+    {
+      "id": "github-token",
+      "label": "GitHub token (optional)",
+      "origin": "https://api.github.com",
+      "type": "bearer"
+    }
+  ],
+  "id": "codemux.issue-companion",
+  "name": "Issue Companion",
+  "description": "Browse GitHub issues and add a selected issue to a chat draft.",
+  "permissions": [
+    "composer.append",
+    "external.open"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "open",
+        "title": "Open Issue Companion",
+        "requiresWorkspace": true
+      }
+    ],
+    "panels": [
+      {
+        "id": "issues",
+        "title": "Issue Companion",
+        "icon": "github"
+      }
+    ],
+    "composerActions": [
+      {
+        "id": "browse",
+        "title": "Browse GitHub issues",
+        "icon": "github"
+      }
+    ],
+    "composerViews": [
+      {
+        "id": "issues",
+        "title": "Issue Companion",
+        "icon": "github"
+      }
+    ]
+  },
+  "settings": [
+    {
+      "id": "owner",
+      "type": "string",
+      "label": "Repository owner",
+      "default": ""
+    },
+    {
+      "id": "repository",
+      "type": "string",
+      "label": "Repository name",
+      "default": ""
+    }
+  ]
+}
