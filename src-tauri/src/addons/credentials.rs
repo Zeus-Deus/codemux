@@ -132,6 +132,13 @@ impl Credentials {
         .map_err(|_| unavailable())?
     }
 
+    pub(super) async fn clear_session(&self, installation: &str) {
+        let _lock = self.serial.lock().await;
+        self.session
+            .lock()
+            .await
+            .retain(|(owner, _), _| owner != installation);
+    }
     pub async fn delete(&self, installation: &str, id: &str) -> Result<()> {
         let lock = self.serial.clone().lock_owned().await;
         self.session
@@ -234,6 +241,69 @@ mod tests {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         credentials.delete("installation", &key).await.unwrap();
         assert!(backend.values.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn unused_and_session_only_credentials_remove_without_an_os_service() {
+        use super::super::{
+            lifecycle::Reviews, manager::Manager, package::fixture_archive, Manifest,
+        };
+        for session_only in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let backend = Arc::new(RecordedStore::default());
+            backend
+                .locked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Arc::get_mut(&mut manager).unwrap().credentials = Credentials {
+                backend,
+                ..Credentials::default()
+            };
+            let package = root.path().join("fixture.cmxaddon");
+            std::fs::write(&package, fixture_archive()).unwrap();
+            let reviews = Reviews::default();
+            let review = reviews.prepare_local(&manager, &package).unwrap();
+            let mut installed = reviews
+                .accept(&manager, &review.token, false, false)
+                .await
+                .unwrap();
+            // Declaring an optional credential does not mean it was ever saved.
+            let declarations = Manifest::parse(
+                include_bytes!("../../../examples/addons/issue-companion/manifest.json"),
+                None,
+            )
+            .unwrap();
+            installed.manifest.credentials = declarations.credentials;
+            installed.manifest.http = declarations.http;
+            manager.save(&installed).unwrap();
+            let field = &installed.manifest.credentials[0];
+            let key = Credentials::key(&field.id, &field.origin);
+            if session_only {
+                manager
+                    .credentials
+                    .set(
+                        &installed.installation_id,
+                        &key,
+                        "synthetic-session".into(),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(manager
+                .remove(&installed.manifest.id, false)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                manager
+                    .credentials
+                    .get(&installed.installation_id, &key)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(manager.cleanup_warnings().unwrap().is_empty());
+        }
     }
     #[tokio::test]
     async fn uninstall_retries_credentials_removed_from_later_manifests_even_when_data_is_kept() {

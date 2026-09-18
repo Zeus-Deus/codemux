@@ -24,24 +24,11 @@ pub(super) fn queue(
     installation: &Installation,
     keep_data: bool,
 ) -> Result<()> {
-    // Include credentials from every accepted release, even declarations that
-    // were removed in later versions. The index contains no secret values.
+    // Every attempted persistent write is indexed before touching the OS store,
+    // including credentials removed from later manifests. A declaration alone
+    // is not evidence of a saved credential: querying an unavailable OS service
+    // for unused optional fields creates spurious permanent cleanup warnings.
     tx.execute("INSERT OR IGNORE INTO cleanup(installation,credential) SELECT installation,id FROM credential_entries WHERE installation=?1",[&installation.installation_id]).map_err(|_|unavailable())?;
-    for credential in installation.manifest.credentials.iter().chain(
-        installation
-            .previous
-            .iter()
-            .flat_map(|p| p.manifest.credentials.iter()),
-    ) {
-        tx.execute(
-            "INSERT OR IGNORE INTO cleanup(installation,credential) VALUES(?1,?2)",
-            rusqlite::params![
-                installation.installation_id,
-                super::credentials::Credentials::key(&credential.id, &credential.origin)
-            ],
-        )
-        .map_err(|_| unavailable())?;
-    }
     let mut digests = vec![installation.digest.clone()];
     if let Some(previous) = &installation.previous {
         if previous.digest != installation.digest {
@@ -261,6 +248,14 @@ impl Manager {
             let operation = self.operation(&files.plugin).await;
             let _lock = operation.lock().await;
             let installed = self.list()?;
+            if !installed
+                .iter()
+                .any(|i| i.installation_id == files.installation)
+            {
+                // Session-only values never touched the OS credential store.
+                // Remove them even when the user retained private plugin data.
+                self.credentials.clear_session(&files.installation).await;
+            }
             let mut paths = Vec::new();
             for digest in files.digests {
                 if !installed.iter().any(|i| {
