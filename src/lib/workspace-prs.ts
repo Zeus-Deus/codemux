@@ -166,14 +166,58 @@ export function prSetLabel(
       ? `${provider.nounTitle} ${providerRef(provider, primary.number)} — ${state}`
       : `${provider.nounTitle} — ${state}`;
   }
+  const primary = prs[0];
+  const opens = primary
+    ? `. Opens ${providerRef(provider, primary.number)}`
+    : "";
+  return `${summary.total} ${provider.nounPlural} — ${prSetComposition(summary)}${opens}`;
+}
+
+/** The set in the order a reviewer reads a stack: each PR after the one it is
+ *  based on, bottom first.
+ *
+ *  The backend sends the primary first, which is the right order for a badge
+ *  and the wrong one for a list — it would put an open PR from the middle of
+ *  the stack above the merged ones it sits on. Rebuilt from base/head links
+ *  rather than PR numbers, because numbers only follow stack order when the
+ *  stack was opened in one pass. PRs not linked to anything keep their
+ *  incoming order after the chains, so an unstacked set is left as it came. */
+export function stackOrder(prs: readonly WorkspacePrRef[]): WorkspacePrRef[] {
+  const children = new Map<number, WorkspacePrRef[]>();
+  const roots: WorkspacePrRef[] = [];
+  for (const pr of prs) {
+    const parent = stackedOn(pr, prs);
+    if (parent) {
+      const siblings = children.get(parent.number) ?? [];
+      siblings.push(pr);
+      children.set(parent.number, siblings);
+    } else {
+      roots.push(pr);
+    }
+  }
+  const ordered: WorkspacePrRef[] = [];
+  const seen = new Set<number>();
+  const visit = (pr: WorkspacePrRef) => {
+    if (seen.has(pr.number)) return;
+    seen.add(pr.number);
+    ordered.push(pr);
+    for (const child of children.get(pr.number) ?? []) visit(child);
+  };
+  // Roots that head a chain first, then standalone PRs, each in incoming order.
+  for (const root of roots) if (children.has(root.number)) visit(root);
+  for (const root of roots) visit(root);
+  // A cycle (two PRs based on each other) has no root; keep it rather than drop it.
+  for (const pr of prs) visit(pr);
+  return ordered;
+}
+
+/** "5 open, 4 merged" — the set's composition, open work first. */
+export function prSetComposition(summary: PrSetSummary): string {
   const parts: string[] = [];
   if (summary.open > 0) parts.push(`${summary.open} open`);
   if (summary.draft > 0) parts.push(`${summary.draft} draft`);
   if (summary.merged > 0) parts.push(`${summary.merged} merged`);
   if (summary.closed > 0) parts.push(`${summary.closed} closed`);
-  const primary = prs[0];
-  const opens = primary
-    ? `. Opens ${providerRef(provider, primary.number)}`
-    : "";
-  return `${summary.total} ${provider.nounPlural} — ${parts.join(", ")}${opens}`;
+  return parts.join(", ");
 }
+

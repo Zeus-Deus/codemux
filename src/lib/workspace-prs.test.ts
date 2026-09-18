@@ -3,6 +3,7 @@ import {
   prSetLabel,
   prSetSummary,
   prsDescribeThisCheckout,
+  stackOrder,
   stackedOn,
   workspacePrs,
   type WorkspacePrRef,
@@ -226,3 +227,24 @@ describe("prSetLabel", () => {
     );
   });
 });
+
+describe("stackOrder", () => {
+  it("rebuilds bottom-up order from base/head links, not incoming order", () => {
+    const stack = stackOfNine(Array(9).fill("OPEN"));
+    const shuffled = [stack[4], stack[8], stack[0], stack[2], stack[1], stack[7], stack[3], stack[6], stack[5]];
+    expect(stackOrder(shuffled).map((p) => p.number)).toEqual([
+      372, 373, 374, 375, 376, 377, 378, 379, 380,
+    ]);
+  });
+
+  it("leaves an unstacked set in the order it came", () => {
+    const prs = [pr(9, "OPEN", "a"), pr(3, "OPEN", "b"), pr(5, "OPEN", "c")];
+    expect(stackOrder(prs).map((p) => p.number)).toEqual([9, 3, 5]);
+  });
+
+  it("keeps PRs caught in a base cycle instead of dropping them", () => {
+    const prs = [pr(1, "OPEN", "x", "y"), pr(2, "OPEN", "y", "x")];
+    expect(stackOrder(prs).map((p) => p.number).sort()).toEqual([1, 2]);
+  });
+});
+

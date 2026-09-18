@@ -10,8 +10,17 @@ import { ProviderLogo } from "@/components/chat/provider-logo";
 import {
   isPrOnCurrentBranch,
   normalizePrState,
+  PrStatusIcon,
   prStatusTextClass,
 } from "@/components/github/pr-status-icon";
+import { openExternalUrl } from "@/lib/open-url";
+import {
+  prSetComposition,
+  prSetSummary,
+  stackOrder,
+  workspacePrs,
+  type WorkspacePrRef,
+} from "@/lib/workspace-prs";
 import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import {
@@ -214,6 +223,10 @@ export function WorkspaceHoverCardBody({
   const scProvider = providerForWorkspace(workspace);
   const prHost = hostOf(workspace.pr_url);
   const prHeadBranch = workspace.pr_head_branch ?? null;
+  // More than one PR gets its own section listing each one; the single-row
+  // treatment below is for the ordinary one-PR workspace.
+  const prs = workspacePrs(workspace);
+  const hasPrSet = prs.length > 1;
   const issue = workspace.linked_issue;
 
   // Elapsed since the current state began. Stamped client-side (the backend
@@ -333,12 +346,16 @@ export function WorkspaceHoverCardBody({
           workspace.git_branch && (
             <DetailRow label="Working tree" value="clean" muted />
           )}
-        {prState && (
-          <DetailRow
-            label={scProvider.nounTitle}
-            value={`${providerRef(scProvider, workspace.pr_number)} · ${prState}`}
-            valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
-          />
+        {hasPrSet ? (
+          <PrSetRows prs={prs} provider={scProvider} />
+        ) : (
+          prState && (
+            <DetailRow
+              label={scProvider.nounTitle}
+              value={`${providerRef(scProvider, workspace.pr_number)} · ${prState}`}
+              valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
+            />
+          )
         )}
         {/* Only when the change request is NOT the checked-out branch's. This is the
             details surface, so it can afford to answer the question the badge
@@ -346,7 +363,9 @@ export function WorkspaceHoverCardBody({
             something else. Naming the head branch says the PR came off a side
             branch — and explains why merging it will not settle this card. On
             the ordinary matching case the row would be pure repetition. */}
-        {prState && !isPrOnCurrentBranch(prHeadBranch, workspace.git_branch) && (
+        {prState &&
+          !hasPrSet &&
+          !isPrOnCurrentBranch(prHeadBranch, workspace.git_branch) && (
           <DetailRow
             label={`${scProvider.shortNoun} branch`}
             value={prHeadBranch!}
@@ -442,6 +461,80 @@ function hostOf(url: string | null | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+/** How many PRs the hover card lists before summarising the rest. Nine — the
+ *  stack that motivated this — fits; a set much deeper than that belongs on the
+ *  Pull Requests page rather than in a hover card. */
+const PR_SET_VISIBLE = 10;
+
+/** Every PR a workspace owns, one row each, bottom of the stack first.
+ *
+ *  This is what the chip's `+8` is standing in for: which of them have landed
+ *  and which are still open. Each row carries its own state icon and color,
+ *  so "four merged, five open" is read off the column of glyphs rather than
+ *  counted. The head branch rides alongside because in a stack it is the only
+ *  thing that says what each PR is *for*. */
+function PrSetRows({
+  prs,
+  provider,
+}: {
+  prs: readonly WorkspacePrRef[];
+  provider: ReturnType<typeof providerForWorkspace>;
+}) {
+  const summary = prSetSummary(prs);
+  const ordered = stackOrder(prs);
+  const visible = ordered.slice(0, PR_SET_VISIBLE);
+  const hidden = ordered.length - visible.length;
+  return (
+    <div data-pr-set>
+      <DetailRow
+        label={`${summary.total} ${provider.nounPlural}`}
+        value={prSetComposition(summary)}
+        muted
+      />
+      <ul className="flex flex-col pb-1">
+        {visible.map((pr) => (
+          <li key={pr.number}>
+            <button
+              type="button"
+              data-pr-set-row={pr.number}
+              disabled={!pr.url}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (pr.url) void openExternalUrl(pr.url, { event: e });
+              }}
+              aria-label={`${providerRef(provider, pr.number)} · ${normalizePrState(pr.state) ?? pr.state}${pr.head_branch ? ` · ${pr.head_branch}` : ""}`}
+              className={cn(
+                "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left font-mono text-label",
+                pr.url ? "hover:bg-foreground/[0.055]" : "cursor-default",
+              )}
+            >
+              <PrStatusIcon state={pr.state} size={3} className="shrink-0" />
+              <span
+                className={cn(
+                  "shrink-0 tabular-nums",
+                  prStatusTextClass(pr.state) ?? "text-foreground",
+                )}
+              >
+                {providerRef(provider, pr.number)}
+              </span>
+              {pr.head_branch && (
+                <span className="min-w-0 flex-1 truncate text-right text-muted-foreground">
+                  {pr.head_branch}
+                </span>
+              )}
+            </button>
+          </li>
+        ))}
+        {hidden > 0 && (
+          <li className="px-2 py-1 text-right font-mono text-label text-muted-foreground">
+            +{hidden} more
+          </li>
+        )}
+      </ul>
+    </div>
+  );
 }
 
 function DetailRow({
