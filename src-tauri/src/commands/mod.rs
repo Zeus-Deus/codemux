@@ -24,6 +24,7 @@ pub mod source_control;
 pub mod update;
 pub mod usage;
 pub mod usage_import;
+pub mod usage_resume;
 pub mod workspace;
 pub mod workspaces_sync;
 

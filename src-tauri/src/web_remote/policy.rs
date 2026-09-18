@@ -90,6 +90,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_search"
             | "agent_chat_send_queued_turn_now"
             | "agent_chat_send_turn"
+            | "agent_chat_resume_after_usage_limit"
+            | "agent_chat_cancel_usage_resume"
             | "agent_chat_set_fast_mode"
             | "agent_chat_set_model"
             | "agent_chat_set_permission_mode"
@@ -267,6 +269,8 @@ mod tests {
             "write_to_pty",
             "split_pane",
             "agent_chat_send_turn",
+            "agent_chat_resume_after_usage_limit",
+            "agent_chat_cancel_usage_resume",
             "materialize_chat_workspace",
             "submit_pr_review_with_comments",
             "automations_create",

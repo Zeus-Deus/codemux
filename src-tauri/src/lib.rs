@@ -1214,6 +1214,13 @@ fn build_core_app<R: tauri::Runtime>(
                             registry_handle.clone(),
                         )
                         .await;
+                        // Usage-limit auto-resume: the single owner of every
+                        // pending resume, so several windows or web-remote
+                        // clients can never double-fire one.
+                        commands::usage_resume::spawn_usage_resume_scheduler(
+                            registry_handle.clone(),
+                        )
+                        .await;
                     });
                 }
             }
@@ -2399,6 +2406,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_interrupt_turn,
             commands::agent_chat_stop_monitoring,
             commands::agent_chat_turn_active,
+            commands::usage_resume::agent_chat_resume_after_usage_limit,
+            commands::usage_resume::agent_chat_cancel_usage_resume,
             commands::agent_chat_respond_to_request,
             commands::async_questions::agent_chat_answer_question,
             commands::async_questions::agent_chat_question_attention,

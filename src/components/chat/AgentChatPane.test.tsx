@@ -30,6 +30,8 @@ type SliceOverrides = {
   /** Durable resume cursor. `undefined` (the default) means "never
    *  hydrated", which sends the mount effect down the cold path. */
   lastPersistedEventId?: number | null;
+  interrupted?: boolean;
+  usageLimit?: import("@/lib/agent-chat/types").UsageLimitState | null;
 };
 let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
@@ -215,6 +217,7 @@ vi.mock("./Composer", () => ({
     onSubmit,
     onStop,
     onContinueRun,
+    interrupted,
     onModeRemove,
     onModeActivate,
     onModelChange,
@@ -238,6 +241,7 @@ vi.mock("./Composer", () => ({
     onSubmit: () => void;
     onStop: () => void;
     onContinueRun?: () => void;
+    interrupted?: boolean;
     onModeRemove: () => void;
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
@@ -267,6 +271,7 @@ vi.mock("./Composer", () => ({
       data-configuration-ready={configurationReady ? "true" : "false"}
       data-session-ready={sessionReady ? "true" : "false"}
       data-session-awaiting-intent={sessionAwaitingIntent ? "true" : "false"}
+      data-interrupted={interrupted ? "true" : "false"}
     >
       <input
         data-testid="composer-draft"
@@ -465,6 +470,8 @@ vi.mock("@/tauri/commands", () => ({
   agentChatRevertTurnCheckpoint: vi.fn().mockResolvedValue([]),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatCancelQueuedTurn: vi.fn().mockResolvedValue(true),
+  agentChatResumeAfterUsageLimit: vi.fn().mockResolvedValue(undefined),
+  agentChatCancelUsageResume: vi.fn().mockResolvedValue(undefined),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSendQueuedTurnNow: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
@@ -613,6 +620,8 @@ vi.mock("@/stores/agent-chat-store", () => {
       debugActivityResolved: overrides.debugActivityResolved ?? false,
       pendingRequestIds: [],
       lastPersistedEventId: overrides.lastPersistedEventId ?? null,
+      interrupted: overrides.interrupted ?? false,
+      usageLimit: overrides.usageLimit ?? null,
     };
   }
   function buildThreads() {
@@ -982,6 +991,59 @@ describe("AgentChatPane Continue-run chip (issue #154)", () => {
     expect(sendInput.text).toBe("Continue");
     // No images travel with a Continue send even if attachments were staged.
     expect(sendInput.images).toEqual([]);
+  });
+});
+
+describe("AgentChatPane usage-limit row", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    currentSliceOverrides = {
+      "thread-x": {
+        interrupted: true,
+        usageLimit: {
+          provider: "claude",
+          resetsAtMs: Date.now() + 60 * 60_000,
+          autoResumeAtMs: Date.now() + 61 * 60_000,
+          window: "five_hour",
+          at: Date.now(),
+        },
+      },
+    };
+  });
+
+  it("is the only resume affordance and routes its buttons to the backend", async () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    // The Continue chip stands down while the usage row is up.
+    expect(
+      container.querySelector('[data-testid="composer"]')!.getAttribute("data-interrupted"),
+    ).toBe("false");
+    const commands = await import("@/tauri/commands");
+    fireEvent.click(
+      container.querySelector('[data-testid="composer-strip-usage-try-now"]')!,
+    );
+    await waitFor(() =>
+      expect(vi.mocked(commands.agentChatResumeAfterUsageLimit)).toHaveBeenCalledWith(
+        "claude",
+        "thread-x",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-testid="composer-strip-usage-cancel"]'),
+      ).not.toBeDisabled(),
+    );
+    fireEvent.click(
+      container.querySelector('[data-testid="composer-strip-usage-cancel"]')!,
+    );
+    await waitFor(() =>
+      expect(vi.mocked(commands.agentChatCancelUsageResume)).toHaveBeenCalledWith(
+        "claude",
+        "thread-x",
+      ),
+    );
   });
 });
 

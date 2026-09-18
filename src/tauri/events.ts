@@ -586,6 +586,28 @@ export type ProviderRuntimeEvent =
       thread_id: string;
       /** Seconds since the last observed runtime event for this thread. */
       silent_for_secs: number;
+    }
+  // Subscription usage limit (mirrors `ProviderRuntimeEvent::UsageLimitReached`
+  // in src-tauri/src/agent_provider/events.rs). The provider stopped the run
+  // because the user's plan limit is exhausted. Persisted, so hydrate replays
+  // it. Fields the backend omits are read as `null`.
+  | {
+      type: "usage_limit_reached";
+      thread_id: string;
+      provider: AgentChatProviderKind;
+      /** When the provider says the limit lifts (unix ms). */
+      resets_at_ms?: number | null;
+      /** When Codemux will resume the run on its own (unix ms); `null` when
+       *  no automatic resume is armed. */
+      auto_resume_at_ms?: number | null;
+      /** Exhausted window, e.g. `five_hour`, `seven_day`, `seven_day_opus`. */
+      window?: string | null;
+    }
+  // The automatic resume armed by `usage_limit_reached` was disarmed (the
+  // user cancelled it, or the resume could not be dispatched). Persisted.
+  | {
+      type: "usage_resume_cancelled";
+      thread_id: string;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

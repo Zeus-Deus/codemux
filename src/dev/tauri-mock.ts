@@ -44,6 +44,7 @@ import {
   MOCK_USER_IMAGE_DATA_URL,
   MOCK_WEB_REMOTE_PORT,
   MOCK_MONITORING_THREAD_ID,
+  MOCK_USAGE_LIMIT_THREAD_ID,
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
@@ -79,6 +80,7 @@ import {
   mockWebRemoteSessions,
   richChatTurnEnvelopes,
   monitoringEnvelopes,
+  usageLimitEnvelopes,
   subagentTurnEnvelopes,
   workflowApprovalEnvelopes,
   workflowCompleteEnvelopes,
@@ -1907,6 +1909,10 @@ const WORKFLOW_THREAD_BUILDERS: Record<string, () => unknown[]> = {
   // `monitoring` status and the composer strip's monitoring row is reachable.
   [MOCK_MONITORING_THREAD_ID]: () =>
     monitoringEnvelopes(MOCK_MONITORING_THREAD_ID),
+  // A run stopped on a usage limit with the automatic resume armed, so the
+  // composer strip's usage row and the transcript record are reachable.
+  [MOCK_USAGE_LIMIT_THREAD_ID]: () =>
+    usageLimitEnvelopes(MOCK_USAGE_LIMIT_THREAD_ID),
 };
 
 const workflowTranscriptCache = new Map<string, string[]>();
@@ -1929,7 +1935,7 @@ function mockWorkflowTranscript(threadId: string): string[] | null {
  *  the panes/worktree paths seeded in `mock-fixtures.ts`. */
 const WORKFLOW_THREAD_WORKSPACE: Record<
   string,
-  { workspaceId: string; cwd: string }
+  { workspaceId: string; cwd: string; title?: string }
 > = {
   [MOCK_WORKFLOW_APPROVAL_THREAD_ID]: {
     workspaceId: "ws-codemux-workflow-approval",
@@ -1947,6 +1953,11 @@ const WORKFLOW_THREAD_WORKSPACE: Record<
     workspaceId: "ws-codemux-monitoring",
     cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-monitoring`,
   },
+  [MOCK_USAGE_LIMIT_THREAD_ID]: {
+    workspaceId: "ws-codemux-usage-limit",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-usage-limit`,
+    title: "Port the importer",
+  },
 };
 
 function mockWorkflowSessionRecord(threadId: string): unknown | null {
@@ -1958,7 +1969,7 @@ function mockWorkflowSessionRecord(threadId: string): unknown | null {
     workspace_id: loc.workspaceId,
     cwd: loc.cwd,
     provider: "claude",
-    title: "Audit route auth",
+    title: loc.title ?? "Audit route auth",
     created_at: new Date().toISOString(),
     last_active_at: new Date().toISOString(),
     model: "claude-opus-4-8",
@@ -3585,6 +3596,12 @@ const handlers: Record<string, Handler> = {
     a.provider === "claude"
       ? [
           {
+            name: "goal",
+            description:
+              "Set a goal — keep working until the condition is met",
+            argumentHint: "<condition> | resume | clear | status | pause",
+          },
+          {
             name: "compact",
             description:
               "Clear conversation history but keep a summary in context",
@@ -4260,6 +4277,26 @@ const handlers: Record<string, Handler> = {
   // command: `true` emits the provider's own `ready` settlement (which
   // `interruptMockChatTurn` does), `false` tells the pane nothing was
   // running so it has to settle itself.
+  // Usage-limit resume: the real backend builds and sends the resume turn
+  // itself, so it reaches the pane only as a fanned-out user message.
+  agent_chat_resume_after_usage_limit: (a) => {
+    const { threadId } = a as { threadId: string };
+    emitChatEvent(threadId, {
+      type: "user_message",
+      thread_id: threadId,
+      text: "Continue from where you stopped; the usage limit has reset.",
+    });
+    streamMockChatReply(threadId);
+    return undefined;
+  },
+  agent_chat_cancel_usage_resume: (a) => {
+    const { threadId } = a as { threadId: string };
+    emitChatEvent(threadId, {
+      type: "usage_resume_cancelled",
+      thread_id: threadId,
+    });
+    return undefined;
+  },
   agent_chat_interrupt_turn: (a) => {
     const { threadId } = a as { threadId: string };
     return interruptMockChatTurn(threadId);

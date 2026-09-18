@@ -93,6 +93,44 @@ impl PlanQuotaStore {
             .ok()
             .and_then(|map| map.get(provider).and_then(|q| q.auth_mode))
     }
+
+    /// The exhausted window with the earliest future reset for `provider`,
+    /// as `(resets_at_ms, raw window label)`.
+    ///
+    /// Fallback for providers whose "usage limit hit" signal carries no
+    /// reset time of its own: the last quota reading is the only place the
+    /// provider reported one. See [`earliest_exhausted_reset`].
+    pub fn exhausted_reset_for(
+        &self,
+        provider: &str,
+        now_ms: i64,
+    ) -> Option<(i64, Option<String>)> {
+        let map = self.inner.lock().ok()?;
+        earliest_exhausted_reset(&map.get(provider)?.windows, now_ms)
+    }
+}
+
+/// A window counts as exhausted at or above this percentage. Slightly below
+/// 100 because providers round their reported utilization.
+pub const EXHAUSTED_WINDOW_PCT: f64 = 99.0;
+
+/// Pick the earliest *future* reset among the windows that are exhausted
+/// (`used_pct >= EXHAUSTED_WINDOW_PCT`). `None` when no exhausted window
+/// reported a reset that is still ahead — the caller must then treat the
+/// reset as unknown rather than invent one.
+pub fn earliest_exhausted_reset(
+    windows: &[PlanUsageWindow],
+    now_ms: i64,
+) -> Option<(i64, Option<String>)> {
+    windows
+        .iter()
+        .filter(|w| w.used_pct >= EXHAUSTED_WINDOW_PCT)
+        .filter_map(|w| {
+            w.resets_at_ms
+                .filter(|at| *at > now_ms)
+                .map(|at| (at, w.label.clone()))
+        })
+        .min_by_key(|(at, _)| *at)
 }
 
 /// One bar in the overview chart.
@@ -1135,6 +1173,39 @@ mod tests {
         let snap = store.snapshot();
         assert_eq!(snap["claude"].windows.len(), 1);
         assert_eq!(snap["claude"].windows[0].used_pct, 55.0);
+    }
+
+    #[test]
+    fn exhausted_reset_picks_earliest_future_reset_of_exhausted_windows() {
+        let at = |kind, pct, reset: Option<i64>, label: &str| PlanUsageWindow {
+            kind,
+            used_pct: pct,
+            resets_at_ms: reset,
+            label: Some(label.into()),
+        };
+        let now = 1_000;
+        let windows = vec![
+            // Not exhausted — ignored even though it resets soonest.
+            at(PlanWindowKind::Other, 50.0, Some(1_100), "a"),
+            // Exhausted but already reset — ignored.
+            at(PlanWindowKind::Other, 100.0, Some(900), "b"),
+            // Exhausted, no reset reported — ignored.
+            at(PlanWindowKind::Other, 100.0, None, "c"),
+            at(PlanWindowKind::SevenDay, 100.0, Some(9_000), "seven_day"),
+            at(PlanWindowKind::FiveHour, 99.2, Some(5_000), "five_hour"),
+        ];
+        assert_eq!(
+            earliest_exhausted_reset(&windows, now),
+            Some((5_000, Some("five_hour".into())))
+        );
+        assert_eq!(earliest_exhausted_reset(&windows[..3], now), None);
+        assert_eq!(earliest_exhausted_reset(&[], now), None);
+
+        let store = PlanQuotaStore::default();
+        assert_eq!(store.exhausted_reset_for("codex", now), None);
+        store.record("codex", windows, None, None, now);
+        assert_eq!(store.exhausted_reset_for("codex", now).map(|r| r.0), Some(5_000));
+        assert_eq!(store.exhausted_reset_for("claude", now), None);
     }
 
     #[test]

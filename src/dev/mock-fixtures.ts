@@ -580,6 +580,38 @@ const wsCodemuxMonitoring = (() => {
   };
 })();
 
+/** Thread id of the seeded usage-limit demo. */
+export const MOCK_USAGE_LIMIT_THREAD_ID = "thread-mock-usage-limit";
+
+/** Usage-limit demo: a run the provider stopped on a plan limit, with the
+ *  automatic resume armed about an hour out. Reaches the composer strip's
+ *  countdown row (Cancel / Try now), the transcript's usage-limit record and
+ *  an earlier automatically resumed turn under `npm run dev`. */
+const wsCodemuxUsageLimit = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-usage-limit`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-usage-limit",
+    title: "usage-limit-demo",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "demo/usage-limit",
+  });
+  const { surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_USAGE_LIMIT_THREAD_ID,
+  );
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
 /** A workspace that split one plan into a stack of pull requests — the shape
  *  an agent produces when it is asked for reviewable increments: a branch and
  *  a PR per concern, each based on the one below it. The early PRs have landed
@@ -911,6 +943,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMock,
   wsCodemuxChatLive,
   wsCodemuxMonitoring,
+  wsCodemuxUsageLimit,
   wsCodemuxPorts,
   wsCodemuxStack,
   wsCodemuxWorkflowApproval,
@@ -2172,6 +2205,85 @@ export function monitoringEnvelopes(threadId: string): unknown[] {
       thread_id: threadId,
       turn_id: turnId,
       status: { kind: "success" },
+      usage: null,
+    },
+  ];
+}
+
+// ── Usage-limit demo transcript ──────────────────────────────────────
+//
+// Two limit stops. The first was resumed automatically (its resume turn
+// renders as the quiet divider); the second is still standing, armed to
+// resume about an hour from now.
+
+/** Envelopes for {@link MOCK_USAGE_LIMIT_THREAD_ID}. */
+export function usageLimitEnvelopes(
+  threadId: string,
+  now: number = Date.now(),
+): unknown[] {
+  const minute = 60_000;
+  const firstReset = now - 3 * 60 * minute;
+  const resetsAt = now + 60 * minute + 12 * minute;
+  return [
+    {
+      type: "user_message",
+      thread_id: threadId,
+      text: "Port the importer to the streaming parser and keep the old path behind a flag.",
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: "turn-usage-1",
+      item: {
+        kind: "assistant_text",
+        text: "Starting with the parser adapter. The old path stays behind `IMPORTER_LEGACY`.",
+      },
+    },
+    {
+      type: "usage_limit_reached",
+      thread_id: threadId,
+      provider: "claude",
+      resets_at_ms: firstReset,
+      auto_resume_at_ms: firstReset + minute,
+      window: "five_hour",
+    },
+    {
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: "turn-usage-1",
+      status: { kind: "error", subtype: "rate_limit", message: "usage limit" },
+      usage: null,
+    },
+    {
+      type: "user_message",
+      thread_id: threadId,
+      text:
+        "[Resumed automatically after a provider usage limit reset. Continue the task from where you stopped; do not repeat work that already finished.]",
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: "turn-usage-2",
+      item: {
+        kind: "assistant_text",
+        text:
+          "Picking up where I stopped: the adapter compiles, and I'm moving the " +
+          "row decoder over next.",
+      },
+    },
+    {
+      type: "usage_limit_reached",
+      thread_id: threadId,
+      provider: "claude",
+      resets_at_ms: resetsAt,
+      auto_resume_at_ms: resetsAt + minute,
+      window: "five_hour",
+    },
+    {
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: "turn-usage-2",
+      status: { kind: "error", subtype: "rate_limit", message: "usage limit" },
       usage: null,
     },
   ];

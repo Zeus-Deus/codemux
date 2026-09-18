@@ -11,11 +11,21 @@ import {
 import type {
   ChatViewItem,
   SubagentView,
+  UsageLimitState,
   UserMessageItem,
 } from "@/lib/agent-chat/types";
+import {
+  countdownIntervalMs,
+  formatCountdown,
+  formatResetTime,
+  nextUsageLimitBoundary,
+  usageLimitPhase,
+  usageWindowLabel,
+} from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
+import { toast } from "@/lib/toast";
 
-import type { StripOccupant, StripRow } from "./ComposerStrip";
+import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
 
 /** How long the "just finished" row stays before it leaves the strip. */
 export const FINISHED_FLASH_MS = 2500;
@@ -225,6 +235,154 @@ export function useMonitoringOccupant({
     },
   };
   return { kind: "monitoring", summary: row, rows: [row] };
+}
+
+/** Longest single wait the usage row schedules; it re-arms after. */
+const MAX_TIMER_MS = 24 * 60 * 60_000;
+
+/**
+ * Usage-limit occupant: the provider stopped the run on a subscription
+ * limit and nothing has been sent since. The row counts down to the
+ * automatic resume (or to the reset when none is armed) and carries the
+ * one way to resume by hand; the transcript's `usage_limit` row is only
+ * the record.
+ *
+ * The countdown text repaints itself (`liveDetail`); React re-renders only
+ * at phase boundaries — the resume or reset instant, the start of the
+ * per-second window, and the end of the "Resuming…" grace.
+ */
+export function useUsageLimitOccupant({
+  usageLimit,
+  threadId,
+  streaming,
+  onResume,
+  onCancel,
+}: {
+  usageLimit: UsageLimitState | null;
+  threadId: string | null;
+  /** Live run or a send in flight: a turn is already answering the limit. */
+  streaming: boolean;
+  onResume: () => Promise<void>;
+  onCancel: () => Promise<void>;
+}): StripOccupant | null {
+  const [clock, setClock] = useState(() => Date.now());
+  const [pending, setPending] = useState<"resume" | "cancel" | null>(null);
+
+  useEffect(() => {
+    if (!usageLimit) return;
+    const now = Date.now();
+    // A limit that arrives after a long idle must not be judged against a
+    // stale clock.
+    if (Math.abs(now - clock) > 1_000) {
+      setClock(now);
+      return;
+    }
+    const next = nextUsageLimitBoundary(usageLimit, now);
+    if (next === null) return;
+    const id = window.setTimeout(
+      () => setClock(Date.now()),
+      Math.min(MAX_TIMER_MS, Math.max(0, next - now) + 25),
+    );
+    return () => window.clearTimeout(id);
+  }, [usageLimit, clock]);
+
+  // A new limit, a disarm, or a thread switch settles any in-flight click.
+  useEffect(() => {
+    setPending(null);
+  }, [usageLimit, threadId]);
+
+  if (!usageLimit || streaming) return null;
+
+  const run = (kind: "resume" | "cancel") => {
+    if (pending) return;
+    setPending(kind);
+    const action = kind === "resume" ? onResume : onCancel;
+    void Promise.resolve()
+      .then(action)
+      .catch((error: unknown) => {
+        console.error("[ComposerStrip] usage-limit action failed", error);
+        toast.error(
+          kind === "resume"
+            ? "Couldn't resume the run"
+            : "Couldn't cancel the automatic resume",
+          { description: error instanceof Error ? error.message : String(error) },
+        );
+      })
+      .finally(() => setPending(null));
+  };
+
+  const busy = pending !== null;
+  const tryNow: StripAction = {
+    label: "Try now",
+    title: "Resume now instead of waiting for the reset",
+    testId: "composer-strip-usage-try-now",
+    disabled: busy,
+    onClick: () => run("resume"),
+  };
+  const resume: StripAction = {
+    label: "Resume",
+    title: "Continue the run the usage limit stopped",
+    tone: "solid",
+    testId: "composer-strip-usage-resume",
+    disabled: busy,
+    onClick: () => run("resume"),
+  };
+  const windowLabel = usageWindowLabel(usageLimit.window);
+  const phase = usageLimitPhase(usageLimit, clock);
+
+  let row: StripRow;
+  switch (phase.kind) {
+    case "armed":
+    case "waiting": {
+      const at = phase.at;
+      const verb =
+        phase.kind === "armed" ? "resuming automatically in" : "resets in";
+      row = {
+        id: "usage-limit",
+        mark: { kind: "usage" },
+        label: "Usage limit",
+        liveDetail: {
+          compute: (now) => `${verb} ${formatCountdown(at - now)}`,
+          intervalMs: countdownIntervalMs(at, clock),
+          testId: "composer-strip-usage-countdown",
+        },
+        meta: `at ${formatResetTime(at, clock)}`,
+        secondaryAction:
+          phase.kind === "armed"
+            ? {
+                label: "Cancel",
+                title: "Don't resume automatically",
+                tone: "quiet",
+                testId: "composer-strip-usage-cancel",
+                disabled: busy,
+                onClick: () => run("cancel"),
+              }
+            : null,
+        action: tryNow,
+      };
+      break;
+    }
+    case "resuming":
+      row = {
+        id: "usage-limit",
+        mark: { kind: "usage" },
+        label: "Resuming…",
+        detail: "the usage limit has reset",
+      };
+      break;
+    case "reset":
+    case "reached":
+      row = {
+        id: "usage-limit",
+        mark: { kind: "usage" },
+        label:
+          phase.kind === "reset" ? "Usage limit has reset" : "Usage limit reached",
+        detail: windowLabel,
+        action: resume,
+      };
+      break;
+  }
+  return { kind: "usage", summary: row, rows: [row] };
 }
 
 /** Follow-ups parked behind the active turn, oldest first. */

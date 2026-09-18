@@ -2474,6 +2474,7 @@ fn turn_status_from_rpc_error(error: &RpcChildError, dialect: AcpDialect) -> Tur
     let message = detail.unwrap_or_else(|| error.to_string());
     let lower = message.to_ascii_lowercase();
     let rate_limited = lower.contains("rate limit")
+        || lower.contains("usage limit")
         || matches!(error, RpcChildError::RpcError(error) if error.data.as_ref().is_some_and(|data| {
             data.get("http_status").and_then(Value::as_u64) == Some(429)
                 || data.get("httpStatus").and_then(Value::as_u64) == Some(429)

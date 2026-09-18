@@ -71,6 +71,41 @@ describe("SlashCommandPopup", () => {
     expect(screen.getByText("Codemux UI")).toBeInTheDocument();
   });
 
+  it("shows a provider argument hint after the label without repeating it", () => {
+    render(
+      <SlashCommandPopup
+        items={[
+          {
+            id: "provider-command:review",
+            label: "review",
+            description: "Review a pull request",
+            command: "/review",
+            argumentHint: "<pr-url>",
+            group: "COMMANDS",
+            onSelect: vi.fn(),
+          },
+          {
+            id: "provider-command:fix",
+            label: "fix",
+            description: "/fix <issue>",
+            command: "/fix",
+            argumentHint: "<issue>",
+            group: "COMMANDS",
+            onSelect: vi.fn(),
+          },
+        ]}
+        highlightedId={null}
+        onHighlightChange={vi.fn()}
+        onSelect={vi.fn()}
+        open
+      />,
+    );
+    expect(screen.getByText("<pr-url>")).toBeInTheDocument();
+    // The description already carries the hint as its fallback.
+    expect(screen.queryByText("<issue>")).toBeNull();
+    expect(screen.getByText("/fix <issue>")).toBeInTheDocument();
+  });
+
   it("shows the command hint right-aligned (e.g. /plan)", () => {
     render(
       <SlashCommandPopup

@@ -15,6 +15,8 @@ import type { ChatMode } from "@/stores/agent-chat-store";
 import type { ProviderSlashCommand } from "@/tauri/commands";
 import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
 
+import { type GoalSubcommandWord } from "./goal";
+
 /**
  * Tone applied to a command-menu row's icon chip (redesigned `+`
  * command menu). Maps to the app's token utilities in
@@ -85,6 +87,10 @@ export interface SlashCommandItem {
    *  Optional; the menu falls back to `muted` when unset. Ignored by
    *  the legacy `SlashCommandPopup` (slash / mention surfaces). */
   tone?: CommandTone;
+  /** Provider-supplied argument hint (e.g. `<pr-url>`), kept verbatim so
+   *  the popup can show it after the label. Only set on commands without
+   *  registered subcommands — those list their arguments instead. */
+  argumentHint?: string;
 }
 
 export interface SlashAnchor {
@@ -93,6 +99,10 @@ export interface SlashAnchor {
   /** Substring between the trigger and the cursor. Empty when the
    *  user has just typed the trigger. */
   query: string;
+  /** Set when the cursor sits in the argument slot of `/<command> <query>`
+   *  rather than on the command name itself. `query` is then the partial
+   *  subcommand. See {@link findSlashArgAtCursor}. */
+  command?: string;
 }
 
 /** Mention anchors share the SlashAnchor shape — both record the
@@ -147,6 +157,189 @@ export function findSlashAtCursor(
   cursor: number,
 ): SlashAnchor | null {
   return findTriggerAtCursor(value, cursor, "/");
+}
+
+/** Thread state that decides which argument affordances apply. */
+export interface SlashCommandContext {
+  /** The thread has a standing goal (`threads[id].goal !== null`). */
+  hasActiveGoal: boolean;
+}
+
+/** One entry in a command's subcommand list. */
+export interface SlashSubcommand {
+  name: string;
+  description: string;
+  /** Only offered while the thread has a standing goal — managing a goal
+   *  that doesn't exist is meaningless. */
+  requiresActiveGoal?: boolean;
+}
+
+/** Argument affordances for one provider command. */
+interface SlashCommandSpec {
+  subcommands: readonly SlashSubcommand[];
+  /** Muted ghost text shown after `/<command> ` before any argument is
+   *  typed. Overrides the provider's own `argumentHint`. */
+  argumentPlaceholder?: (context: SlashCommandContext) => string;
+}
+
+const GOAL_SUBCOMMANDS: ReadonlyArray<
+  SlashSubcommand & { name: GoalSubcommandWord }
+> = [
+  {
+    name: "resume",
+    description: "Resume the goal after an interruption",
+    requiresActiveGoal: true,
+  },
+  {
+    name: "clear",
+    description: "Clear the current goal",
+    requiresActiveGoal: true,
+  },
+  {
+    name: "status",
+    description: "Show the goal's progress",
+    requiresActiveGoal: true,
+  },
+  {
+    name: "pause",
+    description: "Pause working on the goal",
+    requiresActiveGoal: true,
+  },
+];
+
+/**
+ * Argument affordances for provider commands, keyed by lowercase command
+ * name. Providers advertise a command's name but not its subcommands, so
+ * this is the one place to list them. The composer only uses an entry when
+ * the provider actually advertised that command.
+ */
+const SLASH_COMMAND_SPECS: ReadonlyMap<string, SlashCommandSpec> = new Map([
+  [
+    "goal",
+    {
+      subcommands: GOAL_SUBCOMMANDS,
+      argumentPlaceholder: ({ hasActiveGoal }) =>
+        hasActiveGoal
+          ? "describe a new goal, or pick an option above"
+          : "describe the goal to work toward",
+    },
+  ],
+]);
+
+/** Every registered subcommand for `name`, regardless of availability, or
+ *  an empty list. */
+export function subcommandsFor(name: string): readonly SlashSubcommand[] {
+  return SLASH_COMMAND_SPECS.get(name.toLowerCase())?.subcommands ?? [];
+}
+
+/** The subcommands of `name` that apply in `context`. */
+export function availableSubcommands(
+  name: string,
+  context: SlashCommandContext,
+): readonly SlashSubcommand[] {
+  return subcommandsFor(name).filter(
+    (sub) => !sub.requiresActiveGoal || context.hasActiveGoal,
+  );
+}
+
+/** A provider `argumentHint` made readable as ghost text: one surrounding
+ *  `<...>` or `[...]` pair is dropped (`<optional summary>` → `optional
+ *  summary`); anything more structured is kept verbatim. */
+export function cleanArgumentHint(hint: string | undefined): string | null {
+  const trimmed = hint?.trim() ?? "";
+  if (!trimmed) return null;
+  const wrapped = /^(?:<([^<>[\]]*)>|\[([^<>[\]]*)\])$/.exec(trimmed);
+  const inner = wrapped ? (wrapped[1] ?? wrapped[2] ?? "").trim() : trimmed;
+  return inner || null;
+}
+
+/**
+ * Ghost text for an empty argument slot: the draft is exactly
+ * `/<command> ` (leading spaces allowed, one trailing space, nothing else,
+ * caret at the end) and `<command>` is an advertised provider command. The
+ * slash must lead the draft, same as the provider-command popup rule.
+ * Returns null when no hint applies.
+ */
+export function slashArgumentPlaceholder({
+  value,
+  caretAtEnd,
+  commands,
+  context,
+}: {
+  value: string;
+  caretAtEnd: boolean;
+  /** Advertised provider commands (label = command name). */
+  commands: ReadonlyArray<Pick<SlashCommandItem, "label" | "argumentHint">>;
+  context: SlashCommandContext;
+}): string | null {
+  if (!caretAtEnd) return null;
+  const match = /^[ \t]*\/([^\s/]+) $/.exec(value);
+  if (!match) return null;
+  const name = match[1]!.toLowerCase();
+  const command = commands.find((c) => c.label.toLowerCase() === name);
+  if (!command) return null;
+  const spec = SLASH_COMMAND_SPECS.get(name);
+  if (spec?.argumentPlaceholder) return spec.argumentPlaceholder(context);
+  return cleanArgumentHint(command.argumentHint);
+}
+
+/**
+ * Detect the cursor in the argument slot of a leading `/<command> <partial>`
+ * whose command has registered subcommands. Like provider commands, the
+ * slash must lead the draft (leading whitespace allowed). `<partial>` is a
+ * single word, so a second space, or text that can't be a subcommand (a
+ * URL, an `@` mention), ends the match.
+ *
+ * Examples:
+ *   `"/goal "`            → { start: 0, command: "goal", query: "" }
+ *   `"/goal re"`          → { start: 0, command: "goal", query: "re" }
+ *   `"/goal resume "`     → null (past the argument)
+ *   `"/compact "`         → null (no registered subcommands)
+ *   `"hi /goal re"`       → null (slash doesn't lead the draft)
+ */
+export function findSlashArgAtCursor(
+  value: string,
+  cursor: number,
+): SlashAnchor | null {
+  if (cursor < 0 || cursor > value.length) return null;
+  const match = /^(\s*)\/([^\s/]+)[ \t]([\w-]*)$/.exec(value.slice(0, cursor));
+  if (!match) return null;
+  const command = match[2]!;
+  if (subcommandsFor(command).length === 0) return null;
+  return { start: match[1]!.length, query: match[3]!, command };
+}
+
+/** The slash context at the cursor: a command name being typed, or a
+ *  subcommand argument after one. */
+export function findSlashContextAtCursor(
+  value: string,
+  cursor: number,
+): SlashAnchor | null {
+  return findSlashAtCursor(value, cursor) ?? findSlashArgAtCursor(value, cursor);
+}
+
+/**
+ * Popup rows for `command`'s subcommands that apply in `context` and whose
+ * name starts with `query` (case-insensitive). Picking one inserts
+ * `/<command> <name> `.
+ */
+export function buildSubcommandItems(
+  command: string,
+  query: string,
+  context: SlashCommandContext,
+): SlashCommandItem[] {
+  const q = query.toLowerCase();
+  return availableSubcommands(command, context)
+    .filter((sub) => sub.name.startsWith(q))
+    .map((sub) => ({
+      id: `subcommand:${command}:${sub.name}`,
+      label: sub.name,
+      description: sub.description,
+      command: `/${command} ${sub.name}`,
+      icon: SquareSlash,
+      group: `/${command}`,
+      onSelect: () => {},
+    }));
 }
 
 /** Step 8 Stage 4 — category prefix parsed off a `@` mention query.
@@ -413,6 +606,10 @@ export function buildProviderCommands({
         c.description ||
         (c.argumentHint ? `/${c.name} ${c.argumentHint}` : "Provider command"),
       command: `/${c.name}`,
+      argumentHint:
+        c.argumentHint && subcommandsFor(c.name).length === 0
+          ? c.argumentHint
+          : undefined,
       icon: SquareSlash,
       group: "COMMANDS",
       onSelect: () => {},

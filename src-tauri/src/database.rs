@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 18;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -700,6 +700,26 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             ON agent_chat_turn_checkpoints(repo_path, ref_name);
         CREATE INDEX IF NOT EXISTS idx_agent_chat_turn_checkpoints_nonce
             ON agent_chat_turn_checkpoints(thread_id, client_nonce);
+
+        -- Pending automatic resumes after a provider usage limit (schema
+        -- v18). One row per thread. `resume_at_ms` (unix ms) is when the
+        -- backend scheduler re-sends the interrupted request; NULL means
+        -- 'not armed right now' while `attempts` still remembers how many
+        -- automatic resumes fired since the user's last own message. Kept
+        -- in SQLite so a multi-hour wait survives an app restart.
+        CREATE TABLE IF NOT EXISTS agent_chat_usage_resumes (
+            thread_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            resume_at_ms INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (thread_id)
+                REFERENCES agent_chat_sessions(thread_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_usage_resumes_due
+            ON agent_chat_usage_resumes(resume_at_ms);
 
         -- Hosts (Step 2 of cloud push — Settings → Hosts pane data model).
         --
@@ -4700,6 +4720,164 @@ impl DatabaseStore {
     }
 }
 
+// ── Agent Chat Usage-Limit Resumes ──
+//
+// Backing store for the usage-limit auto-resume scheduler in
+// `commands::agent_chat`. The command layer owns every policy decision
+// (when to arm, attempt caps); these methods are plain row operations.
+
+/// One thread's pending (or remembered) automatic resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChatUsageResume {
+    pub thread_id: String,
+    /// Lowercase provider id (`"claude"`, `"codex"`, ...).
+    pub provider: String,
+    /// When the scheduler fires, unix ms. `None` = not currently armed.
+    pub resume_at_ms: Option<i64>,
+    /// Automatic resumes already fired since the user's last own message.
+    pub attempts: i64,
+}
+
+impl DatabaseStore {
+    /// Arm (or re-arm / disarm with `None`) a thread's resume, keeping its
+    /// attempt count. Creates the row with `attempts = 0` when absent.
+    pub fn upsert_agent_chat_usage_resume(
+        &self,
+        thread_id: &str,
+        provider: &str,
+        resume_at_ms: Option<i64>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_usage_resumes (thread_id, provider, resume_at_ms, attempts, updated_at)
+             VALUES (?1, ?2, ?3, 0, datetime('now'))
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 provider = ?2, resume_at_ms = ?3, updated_at = datetime('now')",
+            params![thread_id, provider, resume_at_ms],
+        )
+        .map_err(|e| format!("Failed to arm usage resume: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_agent_chat_usage_resume(&self, thread_id: &str) -> Option<AgentChatUsageResume> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT thread_id, provider, resume_at_ms, attempts
+             FROM agent_chat_usage_resumes WHERE thread_id = ?1",
+            params![thread_id],
+            usage_resume_from_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Every armed row whose resume time is at or before `now_ms`, oldest
+    /// first.
+    pub fn list_due_agent_chat_usage_resumes(&self, now_ms: i64) -> Vec<AgentChatUsageResume> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT thread_id, provider, resume_at_ms, attempts
+             FROM agent_chat_usage_resumes
+             WHERE resume_at_ms IS NOT NULL AND resume_at_ms <= ?1
+             ORDER BY resume_at_ms ASC",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![now_ms], usage_resume_from_row)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Record that an automatic resume is being dispatched: disarm and bump
+    /// the attempt count in one statement. Returns `false` when the
+    /// observed schedule changed (including a later reset), so the caller
+    /// must not dispatch a stale snapshot.
+    pub fn mark_agent_chat_usage_resume_fired(
+        &self,
+        expected: &AgentChatUsageResume,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE agent_chat_usage_resumes
+                 SET resume_at_ms = NULL, attempts = attempts + 1, updated_at = datetime('now')
+                 WHERE thread_id = ?1 AND provider = ?2 AND resume_at_ms = ?3 AND attempts = ?4",
+                params![
+                    expected.thread_id,
+                    expected.provider,
+                    expected.resume_at_ms,
+                    expected.attempts
+                ],
+            )
+            .map_err(|e| format!("Failed to mark usage resume fired: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Disarm only the schedule observed by a scheduler pass. A newer
+    /// provider reset must not be cancelled by an older busy-thread check.
+    pub fn disarm_agent_chat_usage_resume(
+        &self,
+        expected: &AgentChatUsageResume,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE agent_chat_usage_resumes SET resume_at_ms = NULL, updated_at = datetime('now')
+             WHERE thread_id = ?1 AND provider = ?2 AND resume_at_ms = ?3 AND attempts = ?4",
+            params![expected.thread_id, expected.provider, expected.resume_at_ms, expected.attempts],
+        ).map_err(|e| format!("Failed to disarm usage resume: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Forget a thread's resume entirely (attempts reset). Returns whether a
+    /// row existed.
+    pub fn delete_agent_chat_usage_resume(&self, thread_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "DELETE FROM agent_chat_usage_resumes WHERE thread_id = ?1",
+                params![thread_id],
+            )
+            .map_err(|e| format!("Failed to delete usage resume: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Text of the thread's most recent persisted user turn whose text does
+    /// not start with `exclude_prefix`. Used to rebuild the interrupted
+    /// request for a usage-limit resume while skipping earlier resume notes.
+    pub fn latest_agent_chat_user_message_text(
+        &self,
+        thread_id: &str,
+        exclude_prefix: &str,
+    ) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT json_extract(payload, '$.text') FROM agent_chat_messages
+             WHERE thread_id = ?1
+               AND instr(payload, '\"user_message\"') > 0
+               AND json_valid(payload)
+               AND json_extract(payload, '$.type') = 'user_message'
+               AND substr(COALESCE(json_extract(payload, '$.text'), ''), 1, length(?2)) != ?2
+             ORDER BY id DESC LIMIT 1",
+            params![thread_id, exclude_prefix],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+}
+
+fn usage_resume_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentChatUsageResume> {
+    Ok(AgentChatUsageResume {
+        thread_id: row.get(0)?,
+        provider: row.get(1)?,
+        resume_at_ms: row.get(2)?,
+        attempts: row.get(3)?,
+    })
+}
+
 // ── Agent Chat Checkpoints (issue #80) ──
 //
 // One row per thread: the background run-start snapshot. Writes come
@@ -5334,6 +5512,102 @@ mod tests {
             branch: Some("main".to_string()),
             created_at: String::new(),
         }
+    }
+
+    #[test]
+    fn usage_resume_rows_arm_fire_once_and_cascade() {
+        let db = init_test_database();
+        let thread_id = "usage-resume";
+        db.upsert_agent_chat_session(thread_id, "ws", None, "claude")
+            .unwrap();
+        assert!(db.get_agent_chat_usage_resume(thread_id).is_none());
+
+        db.upsert_agent_chat_usage_resume(thread_id, "claude", Some(1_000))
+            .unwrap();
+        assert!(db.list_due_agent_chat_usage_resumes(999).is_empty());
+        let due = db.list_due_agent_chat_usage_resumes(1_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempts, 0);
+
+        // Firing disarms and counts; a second fire of the same row is refused.
+        assert!(db.mark_agent_chat_usage_resume_fired(&due[0]).unwrap());
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due[0]).unwrap());
+        let row = db.get_agent_chat_usage_resume(thread_id).unwrap();
+        assert_eq!(row.resume_at_ms, None);
+        assert_eq!(row.attempts, 1);
+        assert!(db.list_due_agent_chat_usage_resumes(i64::MAX).is_empty());
+
+        // Re-arming keeps the attempt count.
+        db.upsert_agent_chat_usage_resume(thread_id, "claude", Some(2_000))
+            .unwrap();
+        assert_eq!(db.get_agent_chat_usage_resume(thread_id).unwrap().attempts, 1);
+
+        assert!(db.delete_agent_chat_usage_resume(thread_id).unwrap());
+        assert!(!db.delete_agent_chat_usage_resume(thread_id).unwrap());
+
+        db.upsert_agent_chat_usage_resume(thread_id, "claude", Some(3_000))
+            .unwrap();
+        db.delete_agent_chat_session(thread_id).unwrap();
+        assert!(db.get_agent_chat_usage_resume(thread_id).is_none());
+    }
+
+    #[test]
+    fn usage_resume_claim_rejects_rearmed_or_replaced_snapshots() {
+        let db = init_test_database();
+        let id = "usage-resume-rearmed";
+        db.upsert_agent_chat_session(id, "ws", None, "claude")
+            .unwrap();
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(1_000))
+            .unwrap();
+        let due = db.list_due_agent_chat_usage_resumes(1_000).remove(0);
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(10_000))
+            .unwrap();
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        assert!(!db.disarm_agent_chat_usage_resume(&due).unwrap());
+        assert_eq!(
+            db.get_agent_chat_usage_resume(id).unwrap().resume_at_ms,
+            Some(10_000)
+        );
+        assert_eq!(db.get_agent_chat_usage_resume(id).unwrap().attempts, 0);
+
+        db.upsert_agent_chat_usage_resume(id, "codex", Some(1_000))
+            .unwrap();
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(1_000))
+            .unwrap();
+        assert!(db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(1_000))
+            .unwrap();
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        assert_eq!(db.get_agent_chat_usage_resume(id).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn latest_user_message_text_skips_excluded_prefix() {
+        let db = init_test_database();
+        let thread_id = "usage-resume-text";
+        db.upsert_agent_chat_session(thread_id, "ws", None, "claude")
+            .unwrap();
+        assert_eq!(db.latest_agent_chat_user_message_text(thread_id, "[Resumed"), None);
+        db.append_agent_chat_message(
+            thread_id,
+            r#"{"type":"user_message","thread_id":"usage-resume-text","text":"do the thing"}"#,
+        )
+        .unwrap();
+        db.append_agent_chat_message(
+            thread_id,
+            r#"{"type":"item_completed","thread_id":"usage-resume-text","text":"not a user row"}"#,
+        )
+        .unwrap();
+        db.append_agent_chat_message(
+            thread_id,
+            r#"{"type":"user_message","thread_id":"usage-resume-text","text":"[Resumed automatically ...]"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            db.latest_agent_chat_user_message_text(thread_id, "[Resumed"),
+            Some("do the thing".into())
+        );
     }
 
     #[test]

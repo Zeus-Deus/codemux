@@ -50,11 +50,14 @@ import {
   buildModeCommands,
   buildModelCommand,
   buildProviderCommands,
+  buildSubcommandItems,
   buildWorkflowCommand,
   filterCommandMenuItems,
   filterSlashItems,
   findMentionAtCursor,
-  findSlashAtCursor,
+  findSlashArgAtCursor,
+  findSlashContextAtCursor,
+  slashArgumentPlaceholder,
   nextModeInCycle,
   parseMentionQuery,
   type MentionAnchor,
@@ -207,6 +210,10 @@ interface Props {
    *  Used by the subagent drill-in to swap in "Steering goes to the
    *  orchestrator…" while the composer stays parent-bound. */
   placeholderOverride?: string;
+  /** The thread has a standing goal. Gates goal-management subcommands
+   *  (`/goal resume` …) and picks the `/goal ` ghost hint. Defaults to
+   *  false (no thread yet, or no goal set). */
+  hasActiveGoal?: boolean;
   /** Composer-level Cursor-style mode pill. Swaps the placeholder,
    *  hides the permission picker, and toggles the mode selector
    *  (dropdown → pill). */
@@ -421,6 +428,7 @@ export function Composer({
   isDraft = false,
   focusOnMount = false,
   placeholderOverride,
+  hasActiveGoal = false,
   mode,
   errorMessage = null,
   showStopButton = true,
@@ -535,6 +543,21 @@ export function Composer({
   // Esc closes leaving the typed `/` intact so the user can still type
   // a literal slash.
   const [slashAnchor, setSlashAnchor] = useState<SlashAnchor | null>(null);
+  // Last caret the textarea reported, tagged with the value it was read
+  // against so a stale report never applies to a newer draft.
+  const [caret, setCaret] = useState<{ value: string; atEnd: boolean } | null>(
+    null,
+  );
+  const recordCaret = useCallback((el: HTMLTextAreaElement) => {
+    const value = el.value;
+    const atEnd =
+      el.selectionStart === value.length && el.selectionEnd === value.length;
+    setCaret((prev) =>
+      prev && prev.value === value && prev.atEnd === atEnd
+        ? prev
+        : { value, atEnd },
+    );
+  }, []);
   const [slashHighlighted, setSlashHighlighted] = useState<string | null>(null);
   // IME composition guard — slash detection must not fire mid-composition,
   // otherwise dead-key sequences for non-Latin keyboards trigger the
@@ -831,6 +854,8 @@ export function Composer({
   // skills haven't loaded yet — refreshes after the first success
   // populate in the background without a UI hint.
   const slashPopupFooter = useMemo(() => {
+    // The subcommand list is static; load state belongs to the full list.
+    if (slashAnchor?.command) return null;
     if (skillsError) {
       return { tone: "error" as const, message: `Skills: ${skillsError}` };
     }
@@ -855,6 +880,7 @@ export function Composer({
     }
     return null;
   }, [
+    slashAnchor?.command,
     skillsError,
     skillsLoading,
     skillsLoaded,
@@ -864,9 +890,44 @@ export function Composer({
     providerCommandsEntry.loaded,
   ]);
 
-  const filteredItems = useMemo(
-    () => filterSlashItems(allSlashItems, slashAnchor?.query ?? ""),
-    [allSlashItems, slashAnchor?.query],
+  // In a command's argument slot (`/goal re|`) the popup lists that
+  // command's subcommands instead — but only when the provider actually
+  // advertised the command.
+  const slashArgCommand = slashAnchor?.command;
+  const filteredItems = useMemo(() => {
+    const query = slashAnchor?.query ?? "";
+    if (!slashArgCommand) return filterSlashItems(allSlashItems, query);
+    const name = slashArgCommand.toLowerCase();
+    const advertised = providerCommandItems.some(
+      (item) => item.label.toLowerCase() === name,
+    );
+    return advertised
+      ? buildSubcommandItems(slashArgCommand, query, { hasActiveGoal })
+      : [];
+  }, [
+    allSlashItems,
+    providerCommandItems,
+    slashArgCommand,
+    slashAnchor?.query,
+    hasActiveGoal,
+  ]);
+
+  // Muted ghost text after an empty `/<command> ` argument slot. Purely
+  // visual: painted in the mirror layer, never part of the value. The
+  // caret is only known once the textarea reports it for the current
+  // value; programmatic inserts (accepting a popup row) land the caret at
+  // the end, so an unreported caret counts as at-the-end.
+  const caretAtEnd =
+    caret !== null && caret.value === draft ? caret.atEnd : true;
+  const argumentGhost = useMemo(
+    () =>
+      slashArgumentPlaceholder({
+        value: draft,
+        caretAtEnd,
+        commands: providerCommandItems,
+        context: { hasActiveGoal },
+      }),
+    [draft, caretAtEnd, providerCommandItems, hasActiveGoal],
   );
 
   // Keep highlighted item valid: if the current highlight no longer
@@ -882,9 +943,13 @@ export function Composer({
   // Popup visibility is driven by *anchor presence only*, not by
   // filter results. An empty filter shows the "No commands match"
   // empty state rather than unmounting; auto-close happens via
-  // `findSlashAtCursor` returning null (cursor moved out of slash
-  // context) or explicit Esc.
-  const slashOpen = slashAnchor !== null;
+  // `findSlashContextAtCursor` returning null (cursor moved out of slash
+  // context) or explicit Esc. The exception is the argument slot: text
+  // that matches no subcommand is most likely the argument itself
+  // (`/goal ship the release`), so the popup stays out of the way.
+  const slashOpen =
+    slashAnchor !== null &&
+    (!slashAnchor.command || filteredItems.length > 0);
 
   // A draft can open with a command without the popup ever having been
   // opened — a paste, a restored draft, or a cursor moved past the
@@ -2268,20 +2333,24 @@ export function Composer({
     // are already double-guarded inside SlashCommandPopup itself.
     if (item.disabled) return;
     if (slashAnchor) {
-      const consumedLength = 1 + slashAnchor.query.length;
+      const consumedLength = slashAnchor.command
+        ? 1 + slashAnchor.command.length + 1 + slashAnchor.query.length
+        : 1 + slashAnchor.query.length;
       const before = draft.slice(0, slashAnchor.start);
       const after = draft.slice(slashAnchor.start + consumedLength);
 
       if (
         item.id.startsWith("skill:") ||
         item.id.startsWith("provider-command:") ||
+        item.id.startsWith("subcommand:") ||
         item.id.startsWith("delivery:") ||
         item.id === "workflow"
       ) {
         // Inline token expansion. Replace the typed `/<query>` with
-        // the full `/<skill-name> `, `/workflow `, or provider
-        // `/<command> ` (trailing space so the user can keep typing
-        // context after the token without an extra keystroke). The
+        // the full `/<skill-name> `, `/workflow `, provider
+        // `/<command> `, or `/<command> <subcommand> ` (trailing space
+        // so the user can keep typing context after the token without
+        // an extra keystroke). The
         // mirror overlay highlights skill tokens; `/workflow` and
         // provider commands are handled by the provider runtime —
         // this composer only ever inserts the text.
@@ -2298,6 +2367,17 @@ export function Composer({
           el.focus();
           el.setSelectionRange(newCursor, newCursor);
         });
+        // A command with subcommands (`/goal`) moves straight on to
+        // listing them instead of closing.
+        const argHit = item.id.startsWith("provider-command:")
+          ? findSlashArgAtCursor(next, newCursor)
+          : null;
+        if (argHit) {
+          setSlashAnchor(argHit);
+          setSlashHighlighted(null);
+          item.onSelect();
+          return;
+        }
       } else {
         // Mode picks (and any future non-text-token items) strip the
         // typed `/<query>` because the activation is state-only.
@@ -2677,9 +2757,10 @@ export function Composer({
   ) => {
     const value = e.target.value;
     const cursor = e.target.selectionStart ?? value.length;
+    recordCaret(e.target);
     onDraftChange(value);
     if (composingRef.current) return;
-    const slashHit = findSlashAtCursor(value, cursor);
+    const slashHit = findSlashContextAtCursor(value, cursor);
     const mentionHit = findMentionAtCursor(value, cursor);
     if (slashHit) {
       setSlashAnchor(slashHit);
@@ -2705,16 +2786,18 @@ export function Composer({
   // out of a trigger context without changing the text — close
   // whichever popup was open when that happens.
   const handleSelect = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
-    if (composingRef.current) return;
     const el = e.currentTarget;
+    recordCaret(el);
+    if (composingRef.current) return;
     const cursor = el.selectionStart ?? 0;
-    const slashHit = findSlashAtCursor(el.value, cursor);
+    const slashHit = findSlashContextAtCursor(el.value, cursor);
     const mentionHit = findMentionAtCursor(el.value, cursor);
     if (slashHit) {
       if (
         !slashAnchor ||
         slashHit.start !== slashAnchor.start ||
-        slashHit.query !== slashAnchor.query
+        slashHit.query !== slashAnchor.query ||
+        slashHit.command !== slashAnchor.command
       ) {
         setSlashAnchor(slashHit);
       }
@@ -3127,9 +3210,9 @@ export function Composer({
                 aria-hidden
                 data-testid="composer-highlight-mirror"
                 className={cn(
-                  "pointer-events-none absolute inset-0 px-3 py-2.5",
-                  "whitespace-pre-wrap break-words",
-                  "conversation-text leading-relaxed text-foreground",
+                  "pointer-events-none absolute inset-0",
+                  COMPOSER_TEXT_LAYOUT,
+                  "whitespace-pre-wrap break-words text-foreground",
                   // `overflow-y-auto` (rather than `overflow-hidden`) is
                   // required so we can imperatively assign `scrollTop` —
                   // setting `scrollTop` on a clipped element is a no-op in
@@ -3282,6 +3365,15 @@ export function Composer({
                     glyph — pad with a zero-width space so the mirror's
                     height matches the textarea's after a fresh Enter. */}
                 {draft.endsWith("\n") || draft === "" ? "​" : null}
+                {argumentGhost !== null && (
+                  <span
+                    aria-hidden
+                    data-testid="composer-argument-ghost"
+                    className={COMPOSER_PLACEHOLDER_COLOR}
+                  >
+                    {argumentGhost}
+                  </span>
+                )}
               </div>
               <textarea
                 ref={textareaRef}
@@ -3300,7 +3392,7 @@ export function Composer({
                   // value so popup state catches up with what was typed.
                   const el = e.currentTarget;
                   const cursor = el.selectionStart ?? el.value.length;
-                  const slashHit = findSlashAtCursor(el.value, cursor);
+                  const slashHit = findSlashContextAtCursor(el.value, cursor);
                   const mentionHit = findMentionAtCursor(el.value, cursor);
                   if (slashHit) {
                     setSlashAnchor(slashHit);
@@ -3328,10 +3420,11 @@ export function Composer({
                   // container top on every engine so the two layers stay
                   // glued, and drops the phantom line-box descent that
                   // otherwise made this box a few px too tall.
-                  "relative block w-full resize-none bg-transparent px-3 py-2.5",
+                  "relative block w-full resize-none bg-transparent",
+                  COMPOSER_TEXT_LAYOUT,
                   // Transparent text — the colored mirror behind shows
                   // through. Caret stays visible via `caret-foreground`.
-                  "conversation-text leading-relaxed text-transparent caret-foreground",
+                  "text-transparent caret-foreground",
                   "placeholder:text-muted-foreground/60",
                   "outline-none",
                 )}
@@ -3455,6 +3548,16 @@ function formatMcpRowStatus(
       return "discovered";
   }
 }
+
+/** Box and type metrics shared by the textarea and the mirror painted
+ *  behind it. One constant so the two layers can't drift apart and
+ *  desync the caret from the painted text (or the argument ghost). */
+const COMPOSER_TEXT_LAYOUT = "px-3 py-2.5 conversation-text leading-relaxed";
+
+/** Muted colour of the textarea's native placeholder, reused for the
+ *  argument ghost so both hints read the same. Keep in step with the
+ *  textarea's `placeholder:` utility. */
+const COMPOSER_PLACEHOLDER_COLOR = "text-muted-foreground/60";
 
 function placeholderForMode(mode: ChatMode, isDraft: boolean): string {
   switch (mode) {

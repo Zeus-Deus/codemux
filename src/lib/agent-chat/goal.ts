@@ -43,8 +43,17 @@ export type GoalCommand =
 
 type GoalFields = Pick<ChatThreadState, "goal" | "goalHistory">;
 
+/** `/goal` subcommands that act on the goal without replacing it. */
+export const GOAL_CONTROL_WORDS = ["status", "pause", "resume"] as const;
+/** The `/goal` subcommand that drops the standing goal. */
+export const GOAL_CLEAR_WORD = "clear";
+/** Every word `/goal` reads as a subcommand rather than as goal text. */
+export type GoalSubcommandWord =
+  | (typeof GOAL_CONTROL_WORDS)[number]
+  | typeof GOAL_CLEAR_WORD;
+
 const GOAL_COMMAND =/^\/goal(?:\s+([\s\S]*))?$/i;
-const CONTROL_ARGS = new Set(["", "status", "pause", "resume"]);
+const CONTROL_ARGS = new Set<string>(["", ...GOAL_CONTROL_WORDS]);
 
 /** Parse a user turn as a `/goal` command, or `null` when it isn't one. */
 export function parseGoalCommand(text: string): GoalCommand | null {
@@ -52,7 +61,7 @@ export function parseGoalCommand(text: string): GoalCommand | null {
   if (!match) return null;
   const arg = (match[1] ?? "").trim();
   const word = arg.toLowerCase();
-  if (word === "clear") return { kind: "clear" };
+  if (word === GOAL_CLEAR_WORD) return { kind: "clear" };
   if (CONTROL_ARGS.has(word)) return { kind: "control" };
   return { kind: "set", text: arg };
 }

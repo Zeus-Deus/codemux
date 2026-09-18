@@ -1787,6 +1787,23 @@ export const agentChatInterruptTurn = (
     turnId,
   });
 
+/** Send the resume turn for a usage-limited thread now, instead of waiting
+ *  for the automatic resume. The backend builds the text (`/goal resume` for
+ *  goal threads, a continuation note otherwise) and drops any armed
+ *  schedule. */
+export const agentChatResumeAfterUsageLimit = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+) =>
+  invoke<void>("agent_chat_resume_after_usage_limit", { provider, threadId });
+
+/** Disarm the thread's automatic usage-limit resume. The backend confirms
+ *  with a `usage_resume_cancelled` event. */
+export const agentChatCancelUsageResume = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+) => invoke<void>("agent_chat_cancel_usage_resume", { provider, threadId });
+
 /** Stop the background watch loops a pane is monitoring with.
  *
  *  Clears the thread's monitor tracking (and blocklists those ids for the rest
