@@ -266,6 +266,55 @@ async function pluginHostCount() {
 }
 let terminalProbe = 0;
 let credentialProbe;
+async function corePaneDeck() {
+  return script(
+    `return [...document.querySelectorAll('[data-testid="right-panel-tabs-content"] button[aria-pressed]')].map(e => ({ title: e.title, active: e.getAttribute('aria-pressed') === 'true' })).filter(e => !['Project Brief', 'Issue Companion'].includes(e.title))`,
+  );
+}
+async function checkEmptyAccessorySpace() {
+  const layout =
+    await script(`return [...document.querySelectorAll('[data-testid="composer-body"]')].map(body => {
+    const footer = body.nextElementSibling;
+    return { next: footer?.getAttribute('data-testid'), gap: footer?.getBoundingClientRect().top - body.getBoundingClientRect().bottom };
+  });`);
+  assert.ok(layout.length > 0);
+  for (const composer of layout) {
+    assert.equal(
+      composer.next,
+      "composer-controls-row",
+      "No empty accessory wrapper may separate the draft and footer",
+    );
+    assert.ok(
+      Math.abs(composer.gap) <= 1,
+      "No accessory spacing may remain without an accessory",
+    );
+  }
+  assert.equal(
+    await script(
+      `return document.querySelectorAll('[aria-label="Close add-on accessory"]').length`,
+    ),
+    0,
+  );
+}
+let corePanesBeforePlugin;
+async function checkCorePaneRestoration() {
+  const panes = await corePaneDeck();
+  assert.deepEqual(
+    panes.map((p) => p.title),
+    corePanesBeforePlugin,
+  );
+  assert.ok(
+    panes.some((p) => p.active),
+    "A core pane must become active when plugin panes are removed",
+  );
+  assert.equal(
+    await script(
+      `return document.querySelectorAll('[data-testid="addon-tab"]').length`,
+    ),
+    0,
+  );
+  await checkEmptyAccessorySpace();
+}
 async function checkCredentialSettings() {
   // Finish the real public-network test first, then close its view. This
   // synthetic credential must never be sent to GitHub or another service.
@@ -948,7 +997,9 @@ try {
     const content = await text();
     return (
       content.includes("Session error") ||
-      content.includes("Claude Code CLI (`claude`) is not installed or not on PATH.")
+      content.includes(
+        "Claude Code CLI (`claude`) is not installed or not on PATH.",
+      )
     );
   });
   const messagesBefore = await native("agent_chat_list_messages", { threadId });
@@ -978,6 +1029,9 @@ try {
     await hasText("Branch: main");
     await hasText("1 untracked");
     await hasText("draft-context.txt");
+    corePanesBeforePlugin = (await corePaneDeck()).map((p) => p.title);
+    assert.ok(corePanesBeforePlugin.length > 0);
+    await checkEmptyAccessorySpace();
   });
   await step("05-project-brief-real-draft", async () => {
     // WebDriver translates a newline to Enter; never send a submit key. The
@@ -1037,6 +1091,7 @@ try {
     await hasText("Theme");
     await capture("07-paused-core-appearance");
     await click('[aria-label="Close settings"]');
+    await checkCorePaneRestoration();
     await checkCoreTerminal();
     await capture("07-paused-core-terminal");
     await openSettings();
@@ -1296,6 +1351,13 @@ try {
     await click('[aria-label="Close settings"]');
     await checkCoreTerminal();
     await checkCredentialRemovalAndRedaction();
+    await checkCorePaneRestoration();
+    evidence.corePaneRestoration = {
+      preserved: corePanesBeforePlugin,
+      paused: true,
+      removed: true,
+      noEmptyAccessorySpace: true,
+    };
   });
   await step(
     "11-corrupt-plugin-registry-does-not-block-core-startup",
