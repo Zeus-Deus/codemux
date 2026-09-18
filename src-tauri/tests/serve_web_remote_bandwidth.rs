@@ -428,7 +428,13 @@ fn web_remote_compresses_ws_frames_binary_frames_pty_and_gzips_http() {
         // ── 3. PTY output arrives as [0x01] binary channel frames. ──
         // A `Channel<Vec<u8>>` used to reach the browser as a JSON number array
         // (~3.4x the bytes); it is now re-encoded onto the compact binary frame.
-        send_invoke(&mut plain, 2, "create_terminal_session", json!({})).await;
+        // Remote creation must name its target pane; the legacy command that
+        // implicitly targets the desktop's workspace is intentionally denied.
+        let pane_id = plain_state["workspaces"][0]["surfaces"][0]["active_pane_id"]
+            .as_str()
+            .expect("fixture has a terminal pane");
+        let split_args = json!({ "paneId": pane_id, "direction": "horizontal" });
+        send_invoke(&mut plain, 2, "split_pane", split_args.clone()).await;
         let session_id = loop {
             match next_frame(&mut plain, deadline).await {
                 Message::Text(text) => {
@@ -437,7 +443,7 @@ fn web_remote_compresses_ws_frames_binary_frames_pty_and_gzips_http() {
                         assert_eq!(
                             v["t"],
                             json!("ok"),
-                            "create_terminal_session should resolve headlessly: {v}"
+                            "split_pane should resolve headlessly: {v}"
                         );
                         break v["data"].as_str().expect("session id string").to_string();
                     }
@@ -509,14 +515,14 @@ fn web_remote_compresses_ws_frames_binary_frames_pty_and_gzips_http() {
         // `inflater` from step 2, deliberately reused — a fresh context here
         // would fail, which is the point). Small frames still ride as plain
         // `0x01`. This is the only place `0x03` is exercised on a real wire.
-        send_invoke(&mut zipped, 2, "create_terminal_session", json!({})).await;
+        send_invoke(&mut zipped, 2, "split_pane", split_args).await;
         let zipped_session = loop {
             match unwrap_compressed(&mut inflater, next_frame(&mut zipped, deadline).await) {
                 Frame::Json(v) if v["id"] == json!(2) => {
                     assert_eq!(
                         v["t"],
                         json!("ok"),
-                        "create_terminal_session should resolve headlessly: {v}"
+                        "split_pane should resolve headlessly: {v}"
                     );
                     break v["data"].as_str().expect("session id string").to_string();
                 }

@@ -241,6 +241,7 @@ mod tests {
             "touch_workspace",
             "get_app_state",
             "write_to_pty",
+            "split_pane",
             "agent_chat_send_turn",
             "materialize_chat_workspace",
         ] {
@@ -249,6 +250,7 @@ mod tests {
         for cmd in [
             "activate_workspace",
             "cycle_workspace",
+            "create_terminal_session",
             "dev_agent_chat_spawn_test_pane",
             "quit_app",
             "delete_archived_workspace",
