@@ -457,30 +457,38 @@ try {
       );
     });
   }
-  assert.equal(
-    await pluginHostCount(),
-    0,
-    "Enabling inert contributions must not eagerly start hosts",
-  );
-  evidence.checks.push("02-enabled-plugins-remain-lazy");
   await step("03-disable-enable", async () => {
-    const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Project Brief')))`;
-    await clickText("Disable", article);
-    await until(
-      "disabled",
-      async () =>
-        !(await native("addon_inventory")).installed.find(
-          (i) => i.manifest.id === "codemux.project-brief",
-        ).desiredEnabled,
+    // Install & enable includes the specification's candidate/normal activation
+    // transaction. Test lazy enablement separately after explicitly stopping it.
+    for (const [title, id] of [
+      ["Project Brief", "codemux.project-brief"],
+      ["Issue Companion", "codemux.issue-companion"],
+      ["Fault Isolation Fixture", "example.fault-isolation"],
+    ]) {
+      const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes(${JSON.stringify(title)})))`;
+      await clickText("Disable", article);
+      await until(
+        `disabled ${id}`,
+        async () =>
+          !(await native("addon_inventory")).installed.find(
+            (i) => i.manifest.id === id,
+          ).desiredEnabled,
+      );
+      await clickText("Enable", article);
+      await until(
+        `enabled ${id}`,
+        async () =>
+          (await native("addon_inventory")).installed.find(
+            (i) => i.manifest.id === id,
+          ).desiredEnabled,
+      );
+    }
+    assert.equal(
+      await pluginHostCount(),
+      0,
+      "Enabling inert contributions must not eagerly start hosts",
     );
-    await clickText("Enable", article);
-    await until(
-      "enabled",
-      async () =>
-        (await native("addon_inventory")).installed.find(
-          (i) => i.manifest.id === "codemux.project-brief",
-        ).desiredEnabled,
-    );
+    evidence.checks.push("03-enabled-plugins-remain-lazy");
   });
   await step("03-issue-configuration", async () => {
     await clickText(
