@@ -337,12 +337,38 @@ async fn handle_record(
         return;
     };
 
+    // v1 emits status(idle) followed by session.idle. Settle only on the
+    // latter, or the duplicate can complete the next queued turn.
+    if subagent_id.is_none()
+        && matches!(&event, OpenCodeEvent::Known(KnownEvent::SessionStatus(status)) if matches!(status.status, super::protocol::SessionStatusValue::Idle))
+    {
+        return;
+    }
     let ctx = peer.event_ctx.lock().await.clone();
     let mut usage = peer.usage.lock().await;
-    let events = opencode_event_to_runtime_with(event, &ctx, subagent_id.as_deref(), &mut usage);
+    let root_idle =
+        subagent_id.is_none() && matches!(&event, OpenCodeEvent::Known(KnownEvent::SessionIdle(_)));
+    let mut events =
+        opencode_event_to_runtime_with(event, &ctx, subagent_id.as_deref(), &mut usage);
+    if root_idle {
+        events.push(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ctx.thread_id.clone(),
+            status: crate::agent_provider::SessionStatus::Ready,
+        });
+    }
     drop(usage);
     let mut turn_settled = false;
-    for runtime in events {
+    let mut turn_running = false;
+    for runtime in &events {
+        if matches!(
+            runtime,
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: crate::agent_provider::SessionStatus::Running { .. },
+                ..
+            }
+        ) {
+            turn_running = true;
+        }
         // A parent-scoped turn completion or terminal session state means
         // the in-flight turn is over — disarm the give-up path so a later
         // server death while idle does NOT synthesize a spurious
@@ -350,20 +376,28 @@ async fn handle_record(
         // event here is the root session's.
         if matches!(
             runtime,
-            ProviderRuntimeEvent::TurnCompleted { .. }
-                | ProviderRuntimeEvent::SessionStateChanged {
-                    status: crate::agent_provider::SessionStatus::Ready
-                        | crate::agent_provider::SessionStatus::Closed
-                        | crate::agent_provider::SessionStatus::Error { .. },
-                    ..
-                }
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: crate::agent_provider::SessionStatus::Ready
+                    | crate::agent_provider::SessionStatus::Closed
+                    | crate::agent_provider::SessionStatus::Error { .. },
+                ..
+            }
         ) {
             turn_settled = true;
         }
-        let _ = event_tx.send(runtime);
     }
-    if turn_settled {
-        peer.event_ctx.lock().await.turn_active = false;
+    // Commit the state before the queue worker observes completion. Hold
+    // the lock across the batch so Ready cannot trail a new Running event.
+    let mut live = peer.event_ctx.lock().await;
+    if live.turn_id == ctx.turn_id {
+        if turn_settled {
+            live.turn_active = false;
+        } else if turn_running {
+            live.turn_active = true;
+        }
+    }
+    for runtime in events {
+        let _ = event_tx.send(runtime);
     }
 }
 
@@ -722,6 +756,34 @@ mod tests {
             router.lock().await.session_for_permission("per_1").as_deref(),
             Some("child")
         );
+    }
+
+    #[tokio::test]
+    async fn queue_boundary_waits_for_legacy_idle_and_commits_state_before_ready() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let peer = peer("s1");
+        peer.event_ctx.lock().await.turn_active = true;
+        handle_record("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"s1\",\"status\":{\"type\":\"idle\"}}}\n\n", &peer, &tx).await;
+        assert!(rx.try_recv().is_err());
+        assert!(peer.event_ctx.lock().await.turn_active);
+        handle_record(
+            "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"s1\"}}\n\n",
+            &peer,
+            &tx,
+        )
+        .await;
+        assert!(!peer.event_ctx.lock().await.turn_active);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProviderRuntimeEvent::TurnCompleted { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: crate::agent_provider::SessionStatus::Ready,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

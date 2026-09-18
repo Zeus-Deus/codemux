@@ -49,6 +49,29 @@ pub trait AgentProvider: Send + Sync {
     /// [`event_stream`](Self::event_stream).
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError>;
 
+    /// Non-interrupting guidance. Unsupported adapters may send normally
+    /// while idle, but must never silently queue or cancel a running turn.
+    async fn steer_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        if self.turn_active(&input.thread_id).await {
+            return Err(ProviderError::ValidationError {
+                message: "Safe steering is unavailable for this provider. Choose Queue or Interrupt and send.".into(),
+            });
+        }
+        self.send_turn(input).await
+    }
+
+    /// Deliver an existing queued message without dropping its attachments
+    /// or changing its position on failure.
+    async fn steer_queued_turn(
+        &self,
+        _thread_id: ThreadId,
+        _queued_id: String,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::ValidationError {
+            message: "Safe steering is unavailable for this provider.".into(),
+        })
+    }
+
     /// Interrupt the currently running turn. When `turn_id` is supplied the
     /// provider should only act if that specific turn is active, which lets
     /// the caller avoid racing against a turn that already finished.
@@ -61,7 +84,7 @@ pub trait AgentProvider: Send + Sync {
     /// Cancel a queued (not-yet-dispatched) follow-up turn by its queued
     /// id. Returns whether an item was actually removed. An unknown or
     /// already-dispatched id returns `false`; the default implementation is
-    /// a no-op for providers without a follow-up queue (e.g. OpenCode).
+    /// a no-op for providers without a follow-up queue.
     async fn cancel_queued_turn(
         &self,
         _thread_id: ThreadId,
@@ -70,7 +93,7 @@ pub trait AgentProvider: Send + Sync {
         Ok(false)
     }
 
-    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// **Interrupt and send:** promote a queued follow-up to the front of
     /// the queue and dispatch it immediately, soft-interrupting the active
     /// turn if one is running. The interrupt preserves the session,
     /// transcript, and on-disk work — nothing is discarded — and the

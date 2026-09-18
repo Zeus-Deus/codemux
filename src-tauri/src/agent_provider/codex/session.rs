@@ -664,6 +664,158 @@ impl CodexSession {
         }
     }
 
+    /// Serialize guidance with sends and queue drains. The provider owns the
+    /// safe delivery boundary; no interrupt RPC is involved.
+    pub async fn steer_turn(
+        self: &Arc<Self>,
+        input: SendTurnInput,
+    ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        let result = {
+            let _outbound = self.outbound.lock().await;
+            self.deliver_steer(input).await
+        };
+        self.drain_queue().await;
+        result
+    }
+
+    async fn deliver_steer(
+        &self,
+        input: SendTurnInput,
+    ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        let root = self.state.lock().await.codex_thread_id.clone();
+        for attempt in 0..2 {
+            // Native state, rather than a potentially delayed notification,
+            // determines whether this is guidance or a new follow-up.
+            let thread = self
+                .read_question_thread(&root)
+                .await
+                .map_err(|message| ProviderError::RpcError { message })?;
+            let active = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .and_then(|turns| turns.iter().rev().find(|t| t["status"] == "inProgress"))
+                .and_then(|turn| turn["id"].as_str());
+            if let Some(active) = active {
+                let params = super::protocol::TurnSteerParams {
+                    thread_id: root.clone(),
+                    expected_turn_id: active.to_owned(),
+                    client_user_message_id: input
+                        .client_nonce
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    input: turn_input_items(
+                        input.text.clone(),
+                        input.images.clone(),
+                        input.skill_invocations.clone(),
+                    ),
+                };
+                match self
+                    .child
+                    .request("turn/steer", serde_json::to_value(params).unwrap())
+                    .await
+                {
+                    Ok(value) => {
+                        let turn_id = value.get("turnId").and_then(Value::as_str).ok_or_else(|| ProviderError::RpcError { message: "Codex accepted guidance without a turn ID; delivery is uncertain.".into() })?;
+                        return Ok(crate::agent_provider::TurnStartResult {
+                            turn_id: TurnId(turn_id.into()),
+                            queued_id: None,
+                            steered: true,
+                        });
+                    }
+                    Err(crate::json_rpc_child::RpcChildError::RpcError(error))
+                        if attempt == 0 && steer_precondition_rejected(&error) =>
+                    {
+                        continue
+                    }
+                    Err(error) => {
+                        return Err(ProviderError::RpcError {
+                            message: format!("Guidance could not be confirmed: {error}"),
+                        })
+                    }
+                }
+            }
+            if !self.state.lock().await.pending_approvals.is_empty() {
+                return Err(ProviderError::ValidationError {
+                    message: "Resolve the pending approval before sending a follow-up.".into(),
+                });
+            }
+            let checkpoint = input.turn_checkpoint.as_ref();
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.prepare().await;
+            }
+            let sent = self
+                .do_send_with_id(
+                    input.text.clone(),
+                    input.images.clone(),
+                    input.skill_invocations.clone(),
+                    input.model_override.clone(),
+                    input.effort_override.clone(),
+                    input.client_nonce.clone(),
+                )
+                .await;
+            return match sent {
+                Ok(turn_id) => {
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.commit().await;
+                    }
+                    Ok(crate::agent_provider::TurnStartResult {
+                        turn_id,
+                        queued_id: None,
+                        steered: false,
+                    })
+                }
+                Err(error) => {
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.abort().await;
+                    }
+                    Err(plain_send_error(error))
+                }
+            };
+        }
+        Err(ProviderError::ValidationError {
+            message: "The active turn changed; your guidance was not sent. Try again.".into(),
+        })
+    }
+
+    pub async fn steer_queued(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
+        let outbound = self.outbound.lock().await;
+        let result = async {
+            let input = self
+                .state
+                .lock()
+                .await
+                .queued_turns
+                .iter()
+                .find(|q| q.queued_id == queued_id)
+                .map(|q| q.input.clone());
+            let Some(input) = input else { return Ok(()) };
+            let text = input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| input.text.clone());
+            let result = self.deliver_steer(input).await?;
+            self.state
+                .lock()
+                .await
+                .queued_turns
+                .retain(|q| q.queued_id != queued_id);
+            let _ = self
+                .event_tx()
+                .send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                    steered: result.steered,
+                    thread_id: self.thread_id.clone(),
+                    queued_id: queued_id.into(),
+                    turn_id: result.turn_id,
+                    text,
+                });
+            Ok(())
+        }
+        .await;
+        drop(outbound);
+        self.drain_queue().await;
+        result
+    }
+
     /// Pop the next queued turn (if idle) and dispatch it. No-op when the
     /// queue is empty or a turn is active. Emits
     /// [`ProviderRuntimeEvent::QueuedTurnDispatched`] on success; a failed
@@ -708,12 +860,15 @@ impl CodexSession {
                     if let Some(checkpoint) = checkpoint.as_ref() {
                         checkpoint.commit().await;
                     }
-                    let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnDispatched {
-                        thread_id: self.thread_id.clone(),
-                        queued_id: queued.queued_id,
-                        turn_id,
-                        text,
-                    });
+                    let _ = self
+                        .event_tx()
+                        .send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                            steered: false,
+                            thread_id: self.thread_id.clone(),
+                            queued_id: queued.queued_id,
+                            turn_id,
+                            text,
+                        });
                     return;
                 }
                 Err(err) => {
@@ -741,7 +896,8 @@ impl CodexSession {
     /// Cancel a single queued turn by id (user pressed X). Emits
     /// [`ProviderRuntimeEvent::QueuedTurnCancelled`] when found. Returns
     /// whether the queued item was actually removed.
-    pub async fn cancel_queued(&self, queued_id: &str) -> Result<bool, ProviderError> {
+    pub async fn cancel_queued(self: &Arc<Self>, queued_id: &str) -> Result<bool, ProviderError> {
+        let outbound = self.outbound.lock().await;
         let removed = {
             let mut state = self.state.lock().await;
             if let Some(pos) = state
@@ -761,10 +917,12 @@ impl CodexSession {
                 queued_id: queued_id.to_string(),
             });
         }
+        drop(outbound);
+        self.drain_queue().await;
         Ok(removed)
     }
 
-    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// **Interrupt and send:** promote a queued follow-up to the front of
     /// the queue and dispatch it immediately, interrupting the active
     /// turn if one is running. Soft stop — the Codex thread, transcript,
     /// and on-disk work are preserved; nothing is discarded.
@@ -785,6 +943,7 @@ impl CodexSession {
     /// approval keeps `drain_queue` from dispatching until it resolves, so
     /// the promoted message stays queued until then.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
+        let outbound = self.outbound.lock().await;
         let (has_active_turn, original_index) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
@@ -793,38 +952,21 @@ impl CodexSession {
                 None => return Ok(()),
             }
         };
-        if has_active_turn {
-            // Soft-stop the running turn. The event-loop drain (on the
-            // resulting turn/completed → Ready) dispatches the promoted
-            // item — `interrupt_turn` does not drain inline.
+        let result = if has_active_turn {
             match self.interrupt_turn(None).await {
-                Ok(()) => Ok(()),
-                // Race: the turn finished between our busy check and the
-                // interrupt RPC. The session is idle, so drain directly.
-                Err(ProviderError::ValidationError { .. }) => {
-                    self.drain_queue().await;
-                    Ok(())
-                }
+                Ok(()) | Err(ProviderError::ValidationError { .. }) => Ok(()),
                 Err(err) => {
-                    // A real interrupt failure: undo the reorder so a
-                    // failed steer doesn't leave the queue silently
-                    // rearranged.
-                    {
-                        let mut state = self.state.lock().await;
-                        restore_queued_position(
-                            &mut state.queued_turns,
-                            queued_id,
-                            original_index,
-                        );
-                    }
+                    let mut state = self.state.lock().await;
+                    restore_queued_position(&mut state.queued_turns, queued_id, original_index);
                     Err(err)
                 }
             }
         } else {
-            // Already idle — drain the promoted item out.
-            self.drain_queue().await;
             Ok(())
-        }
+        };
+        drop(outbound);
+        self.drain_queue().await;
+        result
     }
 
     /// Cancel every queued turn, emitting a cancellation for each. Used
@@ -898,36 +1040,7 @@ impl CodexSession {
         // The pre-Stage-9 adapter pushed an empty `TurnInputItem::Text`
         // alongside images, which Codex rejects with a 400 on the
         // image-only path.
-        use base64::Engine;
-        let mut input_items: Vec<TurnInputItem> =
-            Vec::with_capacity(images.len() + skill_invocations.len() + 1);
-        for img in images {
-            let encoded =
-                base64::engine::general_purpose::STANDARD.encode(&img.data);
-            input_items.push(TurnInputItem::Image {
-                url: format!("data:{};base64,{}", img.media_type, encoded),
-            });
-        }
-        for skill in skill_invocations {
-            if matches!(
-                skill.invocation,
-                crate::skills::SkillInvocationKind::CodexSkillItem
-            ) {
-                if let Some(path) = skill.path {
-                    input_items.push(TurnInputItem::Skill {
-                        name: skill.name,
-                        path,
-                    });
-                }
-            }
-        }
-        let trimmed_text = text.trim();
-        if !trimmed_text.is_empty() || input_items.is_empty() {
-            input_items.push(TurnInputItem::Text {
-                text,
-                text_elements: vec![],
-            });
-        }
+        let input_items = turn_input_items(text, images, skill_invocations);
 
         let model = model_override.or(model_default);
         let effort = effort_override.or(effort_default);
@@ -2071,4 +2184,42 @@ fn find_answer_in_history(
         }
     }
     None
+}
+
+fn turn_input_items(
+    text: String,
+    images: Vec<crate::agent_provider::ImageInput>,
+    skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
+) -> Vec<TurnInputItem> {
+    use base64::Engine;
+    let mut input_items: Vec<TurnInputItem> =
+        Vec::with_capacity(images.len() + skill_invocations.len() + 1);
+    for img in images {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&img.data);
+        input_items.push(TurnInputItem::Image {
+            url: format!("data:{};base64,{}", img.media_type, encoded),
+        });
+    }
+    for skill in skill_invocations {
+        if matches!(
+            skill.invocation,
+            crate::skills::SkillInvocationKind::CodexSkillItem
+        ) {
+            if let Some(path) = skill.path {
+                input_items.push(TurnInputItem::Skill {
+                    name: skill.name,
+                    path,
+                });
+            }
+        }
+    }
+    let trimmed_text = text.trim();
+    if !trimmed_text.is_empty() || input_items.is_empty() {
+        input_items.push(TurnInputItem::Text {
+            text,
+            text_elements: vec![],
+        });
+    }
+
+    input_items
 }

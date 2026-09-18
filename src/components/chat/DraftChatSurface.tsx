@@ -1,3 +1,4 @@
+import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
   useCallback,
   useEffect,
@@ -342,7 +343,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     let currentDraft = state.draftsById[draft.draftId];
     if (!currentDraft) return;
     if (currentDraft.promoting) return;
-    const text = currentDraft.inputDraft.trim();
+    const text = parseMessageDelivery(currentDraft.inputDraft).text;
     if (!text) return;
 
     // Submit-time salvage: if we're about to send a "home" draft while

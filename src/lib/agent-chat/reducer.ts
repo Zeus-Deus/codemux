@@ -1487,6 +1487,37 @@ function applyEventInner(
     }
 
     case "user_message": {
+      if (event.steered_turn_id) {
+        const index = state.messages.findIndex((item) =>
+          item.kind === "user_message" && !!event.client_nonce &&
+          item.clientNonce === event.client_nonce,
+        );
+        const existing = state.messages[index];
+        const previous = existing?.kind === "user_message" ? existing : undefined;
+        const needsSequence = !previous || !!previous.queued;
+        const item: UserMessageItem = {
+          ...previous,
+          kind: "user_message",
+          id: previous?.id ?? nextId("user"),
+          seq: needsSequence ? state.nextSeq : previous.seq,
+          text: event.text,
+          clientNonce: event.client_nonce,
+          created_at: previous?.inflight ? previous.created_at : now(),
+          queued: undefined,
+          inflight: true,
+          turn_id: event.steered_turn_id,
+          images: event.images?.map((image) => ({
+            src: image.path, mediaType: image.media_type,
+          })) ?? previous?.images,
+        };
+        return {
+          ...state,
+          nextSeq: needsSequence ? state.nextSeq + 1 : state.nextSeq,
+          messages: index >= 0
+            ? replaceItem(state.messages, index, item)
+            : appendItem(state.messages, item),
+        };
+      }
       // The one place a user turn enters the transcript from outside the
       // composer. Two callers, deliberately sharing this case:
       //   - hydrate replay, folding a persisted `user_message` row;
@@ -2089,7 +2120,20 @@ function applyEventInner(
       // produced), not where it was typed.
       const idx = findQueuedUserMessage(state.messages, event.queued_id);
       if (idx < 0) return state;
-      return promoteQueuedUserMessage(state, idx, now);
+      if (!event.steered) return promoteQueuedUserMessage(state, idx, now);
+      const existing = state.messages[idx] as UserMessageItem;
+      const { queued: _queued, ...rest } = existing;
+      return {
+        ...state,
+        nextSeq: state.nextSeq + 1,
+        messages: replaceItem(state.messages, idx, {
+          ...rest,
+          seq: state.nextSeq,
+          created_at: now(),
+          inflight: true,
+          turn_id: event.turn_id,
+        }),
+      };
     }
 
     case "queued_turn_cancelled": {

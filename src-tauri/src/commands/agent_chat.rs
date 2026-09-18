@@ -2120,6 +2120,8 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
 /// provider trait's contract is unchanged (adapters still receive bytes).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SendTurnCommandInput {
+    #[serde(default)]
+    pub delivery: crate::agent_provider::types::MessageDelivery,
     /// Thread the turn belongs to.
     pub thread_id: ThreadId,
     /// Plain-text content of the user message.
@@ -2269,7 +2271,7 @@ fn render_skill_invocations(
 pub async fn agent_chat_send_turn<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
-    input: SendTurnCommandInput,
+    mut input: SendTurnCommandInput,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
@@ -2280,6 +2282,19 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     ensure_live_session(&app, provider, &input.thread_id).await?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    use crate::agent_provider::types::MessageDelivery;
+    if input.client_nonce.as_deref().is_none_or(str::is_empty) {
+        input.client_nonce = Some(uuid::Uuid::new_v4().to_string());
+    }
+    if input.delivery == MessageDelivery::Steer
+        && !provider.supports_steering()
+        && impl_.turn_active(&input.thread_id).await
+    {
+        return Err(
+            "Safe steering is unavailable for this provider. Choose Queue or Interrupt and send."
+                .into(),
+        );
+    }
     // Capture the inputs we need for persistence before dispatching.
     let thread_id_for_persist = input.thread_id.0.clone();
     let user_text_for_persist = input
@@ -2386,31 +2401,51 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         client_nonce: input.client_nonce.clone(),
         turn_checkpoint,
     };
-    // A genuine new user turn is the authoritative, provider-agnostic
-    // anchor for resetting turn-scoped subagent tracking. Start a new
-    // tracker turn here so a subagent left non-terminal by the previous turn
-    // (e.g. Claude's background `async_launched` task that never emits a
-    // terminal `task_notification`) cannot pin `review_pending`/`running`
-    // and suppress `Review` for this turn and every one after (Finding 1).
-    // Confirmed monitor-class tasks are deliberately carried forward: a
-    // follow-up turn temporarily owns the Working dot, but the still-live
-    // watch loop must reappear as Monitoring when that turn settles even if
-    // the provider emits no fresh progress tick. Unlike
-    // `SessionStateChanged::Running`, which Claude does not fire per user
-    // turn, this path runs on every turn for all three providers.
-    //
-    // Follow-up queueing note: for a send that gets QUEUED behind an
-    // active turn this reset runs at enqueue time (not at dispatch). Stale
-    // agent entries are gone by the time the queued turn dispatches, while a
-    // confirmed monitor remains truthful across the queue boundary.
-    {
+    // Register attachments before the provider can emit TurnQueued and
+    // immediately dispatch it. The event bridge and RPC return race to
+    // transfer this entry, so exactly one owns its deferred persistence.
+    let pending_key = (
+        thread_id_for_persist.clone(),
+        input.client_nonce.clone().unwrap(),
+    );
+    pending_send_images().lock().unwrap().insert(
+        pending_key.clone(),
+        PendingQueuedTurn {
+            images: saved_images.clone(),
+            client_nonce: input.client_nonce.clone(),
+        },
+    );
+    // Ordinary sends establish tracking before provider events can arrive.
+    // Guidance must preserve the active turn's subagent state.
+    if input.delivery != MessageDelivery::Steer {
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.begin_turn(&thread_id_for_persist);
     }
-    let result = impl_
-        .send_turn(provider_input)
-        .await
-        .map_err(provider_err)?;
+    let sent = match input.delivery {
+        MessageDelivery::Steer => impl_.steer_turn(provider_input).await,
+        MessageDelivery::Queue | MessageDelivery::Interrupt => {
+            impl_.send_turn(provider_input).await
+        }
+    };
+    // Hold the source registry through transfer so the event bridge cannot
+    // observe a gap between removing the nonce and registering the queue id.
+    {
+        let mut pending_sends = pending_send_images().lock().unwrap();
+        let pending = pending_sends.remove(&pending_key);
+        if let (Ok(result), Some(pending)) = (&sent, pending) {
+            if let Some(id) = &result.queued_id {
+                pending_queued_images()
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), pending);
+            }
+        }
+    }
+    let result = sent.map_err(provider_err)?;
+    if input.delivery == MessageDelivery::Steer && !result.steered {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        tracker.begin_turn(&thread_id_for_persist);
+    }
 
     // Best-effort: bump last_active_at so the session floats to the
     // top of the dropdown, and set an auto-title from the first user
@@ -2437,6 +2472,7 @@ pub async fn agent_chat_send_turn<R: Runtime>(
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
+                result.steered.then_some(&result.turn_id),
             );
             bind_turn_checkpoint_transcript(
                 &app,
@@ -2458,6 +2494,7 @@ pub async fn agent_chat_send_turn<R: Runtime>(
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
+                result.steered.then_some(&result.turn_id),
             );
         }
         // Queued: stash the (already-on-disk) image records and the
@@ -2466,16 +2503,32 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         // can attach them at real turn order. Skip the map entirely when
         // there is nothing to carry (the dispatch persist writes text
         // only).
-        Some(queued_id) if !saved_images.is_empty() || input.client_nonce.is_some() => {
-            pending_queued_images().lock().unwrap().insert(
-                queued_id.clone(),
-                PendingQueuedTurn {
-                    images: saved_images,
-                    client_nonce: input.client_nonce.clone(),
-                },
-            );
-        }
         Some(_) => {}
+    }
+
+    if input.delivery == MessageDelivery::Interrupt {
+        if let Some(queued_id) = &result.queued_id {
+            if let Err(error) = impl_
+                .send_queued_turn_now(input.thread_id.clone(), queued_id.clone())
+                .await
+            {
+                // The message is accepted and still queued. Reporting a send
+                // failure would restore the draft and invite a duplicate.
+                let payload = AgentChatEventPayload {
+                    thread_id: input.thread_id.clone(),
+                    event: ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(input.thread_id.clone()),
+                        message: format!(
+                            "Could not interrupt; your message remains queued: {error}"
+                        ),
+                        original_payload: None,
+                    },
+                    persisted_id: None,
+                };
+                fan_out_to_thread_channels(&app, &input.thread_id, &payload);
+                let _ = app.emit(AGENT_CHAT_EVENT, payload);
+            }
+        }
     }
     Ok(result)
 }
@@ -2517,15 +2570,19 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
     provider: ProviderKind,
     thread_id: ThreadId,
     queued_id: String,
+    delivery: Option<crate::agent_provider::types::MessageDelivery>,
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    impl_
-        .send_queued_turn_now(thread_id, queued_id)
-        .await
-        .map_err(provider_err)
+    use crate::agent_provider::types::MessageDelivery;
+    match delivery.unwrap_or(MessageDelivery::Interrupt) {
+        MessageDelivery::Steer => impl_.steer_queued_turn(thread_id, queued_id).await,
+        MessageDelivery::Interrupt => impl_.send_queued_turn_now(thread_id, queued_id).await,
+        MessageDelivery::Queue => return Err("Message is already queued.".into()),
+    }
+    .map_err(provider_err)
 }
 
 /// A chat image attachment that has been written to disk for the
@@ -3183,6 +3240,11 @@ struct PendingQueuedTurn {
 /// written inline in [`agent_chat_send_turn`]. Follows the same
 /// module-static idiom as [`resume_locks`] to avoid threading a new
 /// managed state through every `forward_event` test harness.
+fn pending_send_images() -> &'static Mutex<HashMap<(String, String), PendingQueuedTurn>> {
+    static PENDING: OnceLock<Mutex<HashMap<(String, String), PendingQueuedTurn>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn pending_queued_images() -> &'static Mutex<HashMap<String, PendingQueuedTurn>> {
     static PENDING: OnceLock<Mutex<HashMap<String, PendingQueuedTurn>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3211,12 +3273,16 @@ fn persist_user_message(
     text: &str,
     images: &[PersistedChatImage],
     client_nonce: Option<&str>,
+    steered_turn_id: Option<&TurnId>,
 ) -> Option<i64> {
     let mut user_msg = serde_json::json!({
         "type": "user_message",
         "thread_id": thread_id,
         "text": text,
     });
+    if let Some(turn_id) = steered_turn_id {
+        user_msg["steered_turn_id"] = serde_json::json!(turn_id);
+    }
     if let Some(nonce) = client_nonce.filter(|n| !n.is_empty()) {
         user_msg["client_nonce"] = serde_json::Value::String(nonce.to_string());
     }
@@ -3702,7 +3768,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
     // API break; downstream consumers may add it back if they grow a
     // need for app-handle-scoped state.
     let _ = app;
-    match provider {
+    let mut capabilities = match provider {
         ProviderKind::Claude => {
             // Cache + cascade: sidecar `list-models` (SDK
             // `supportedModels()` — works for any Claude Code user) →
@@ -3768,7 +3834,9 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
             )
             .await
         }
-    }
+    }?;
+    capabilities.supports_steering = provider.supports_steering();
+    Ok(capabilities)
 }
 
 /// Probe the health of a chat provider's local runtime (binary present,
@@ -5239,6 +5307,23 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             }
         }
     }
+    if let ProviderRuntimeEvent::TurnQueued {
+        thread_id,
+        client_nonce: Some(nonce),
+        queued_id,
+        ..
+    } = &event
+    {
+        let mut pending_sends = pending_send_images().lock().unwrap();
+        let pending = pending_sends.remove(&(thread_id.0.clone(), nonce.clone()));
+        if let Some(pending) = pending {
+            pending_queued_images()
+                .lock()
+                .unwrap()
+                .insert(queued_id.clone(), pending);
+        }
+    }
+
     // A queued follow-up turn just dispatched — NOW persist its
     // user-message envelope, at real turn order (it was intentionally
     // skipped at enqueue time in `agent_chat_send_turn`). The queue lives
@@ -5247,7 +5332,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     if let ProviderRuntimeEvent::QueuedTurnDispatched {
         thread_id,
         queued_id,
+        steered,
         text,
+        turn_id,
         ..
     } = &event
     {
@@ -5273,6 +5360,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                 text,
                 &pending.images,
                 pending.client_nonce.as_deref(),
+                (*steered).then_some(turn_id),
             );
             bind_turn_checkpoint_transcript(
                 app,
@@ -5302,6 +5390,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                     text,
                     &pending.images,
                     pending.client_nonce.as_deref(),
+                    (*steered).then_some(turn_id),
                 );
             }
         }
@@ -5441,6 +5530,7 @@ fn fan_out_user_message<R: Runtime>(
     text: &str,
     images: &[PersistedChatImage],
     client_nonce: Option<&str>,
+    steered_turn_id: Option<&TurnId>,
 ) {
     if thread_id.is_empty() {
         return;
@@ -5449,6 +5539,7 @@ fn fan_out_user_message<R: Runtime>(
     let payload = AgentChatEventPayload {
         thread_id: thread.clone(),
         event: ProviderRuntimeEvent::UserMessage {
+            steered_turn_id: steered_turn_id.cloned(),
             thread_id: thread.clone(),
             text: text.to_string(),
             images: images
@@ -7836,6 +7927,7 @@ mod tests {
             media_type: "image/png".into(),
         }];
         let event = ProviderRuntimeEvent::UserMessage {
+            steered_turn_id: None,
             thread_id: ThreadId("t1".into()),
             text: "look".into(),
             images: images
@@ -7858,6 +7950,7 @@ mod tests {
     #[test]
     fn user_message_event_omits_empty_images_and_nonce() {
         let event = ProviderRuntimeEvent::UserMessage {
+            steered_turn_id: None,
             thread_id: ThreadId("t1".into()),
             text: "hello".into(),
             images: Vec::new(),
@@ -7900,6 +7993,7 @@ mod tests {
             "hi there",
             &images,
             Some("nonce-1"),
+            Some(&TurnId("active-turn".into())),
         );
 
         for captured in [&desktop_rx, &web_rx] {
@@ -7916,9 +8010,11 @@ mod tests {
                     text,
                     client_nonce,
                     images,
+                    steered_turn_id,
                     ..
                 } => {
                     assert_eq!(text, "hi there");
+                    assert_eq!(steered_turn_id.as_ref().map(|id| id.0.as_str()), Some("active-turn"));
                     assert_eq!(client_nonce.as_deref(), Some("nonce-1"));
                     assert_eq!(images.len(), 1);
                     assert_eq!(images[0].path, "/tmp/a.png");
@@ -7943,7 +8039,7 @@ mod tests {
         let (channel, captured) = capture_channel();
         registry.attach("", channel);
 
-        fan_out_user_message(&handle, "", Some(1), "hi", &[], None);
+        fan_out_user_message(&handle, "", Some(1), "hi", &[], None, None);
 
         assert!(captured.lock().unwrap().is_empty());
     }
@@ -7954,6 +8050,7 @@ mod tests {
     #[test]
     fn user_message_is_not_persisted_by_forward_event() {
         assert!(!should_persist_event(&ProviderRuntimeEvent::UserMessage {
+            steered_turn_id: None,
             thread_id: ThreadId("t1".into()),
             text: "hi".into(),
             images: Vec::new(),

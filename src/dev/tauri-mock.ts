@@ -1973,7 +1973,7 @@ let mockQueuedSeq = 0;
 // Follow-up queueing: track which threads have a turn in flight and the
 // FIFO follow-up queue behind each, so `agent_chat_send_turn` can mirror
 // the real backend (queue-while-busy) and drain on completion.
-const chatActiveTurns = new Set<string>();
+const chatActiveTurns = new Map<string, string>();
 interface MockQueuedTurn {
   queuedId: string;
   text: string;
@@ -2046,7 +2046,7 @@ function streamMockChatReply(
   let emptyDeltaSent = false;
   const send = (event: unknown) => emitChatEvent(threadId, event);
 
-  chatActiveTurns.add(threadId);
+  chatActiveTurns.set(threadId, turnId);
   send({
     type: "session_state_changed",
     thread_id: threadId,
@@ -2560,7 +2560,7 @@ function streamMockWorkLog(
     drainChatQueue(threadId);
   };
 
-  chatActiveTurns.add(threadId);
+  chatActiveTurns.set(threadId, turnId);
   let i = 0;
   const timer = window.setInterval(() => {
     const frame = frames[i++];
@@ -2602,7 +2602,7 @@ function streamMockBackgroundWait(
   const toolResult = (id: string, content: string) =>
     item({ kind: "tool_result", tool_use_id: id, content, is_error: false });
 
-  chatActiveTurns.add(threadId);
+  chatActiveTurns.set(threadId, turnId);
   const frames: Array<() => void> = [
     () =>
       send({
@@ -3569,7 +3569,7 @@ const handlers: Record<string, Handler> = {
   // start_session echoes back the frontend-minted thread id;
   // send_turn answers with the channel-streamed mock reply.
   list_chat_provider_capabilities: (a) =>
-    a.provider === "claude"
+    ({ ... (a.provider === "claude"
       ? CLAUDE_CAPABILITIES
       : a.provider === "codex"
         ? CODEX_UTILITY_CAPABILITIES
@@ -3577,7 +3577,7 @@ const handlers: Record<string, Handler> = {
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
             ? GROK_CAPABILITIES
-            : EMPTY_CAPABILITIES,
+            : EMPTY_CAPABILITIES), supports_steering: a.provider === "codex" || a.provider === "opencode" }),
   // Provider slash commands — in production these are harvested live
   // from the deployed Claude Code CLI (SDK `supportedCommands()`),
   // including custom `.claude/commands` entries. The mock serves a
@@ -4130,9 +4130,17 @@ const handlers: Record<string, Handler> = {
     const input = a.input as {
       thread_id: string;
       text: string;
+      delivery?: "queue" | "steer" | "interrupt";
+      display_text?: string;
       client_nonce?: string | null;
     };
     const threadId = input.thread_id;
+    if (input.delivery === "steer" && chatActiveTurns.has(threadId)) {
+      if (a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
+      const turnId = chatActiveTurns.get(threadId)!;
+      emitChatEvent(threadId, { type: "user_message", thread_id: threadId, text: input.display_text ?? input.text, client_nonce: input.client_nonce ?? undefined, steered_turn_id: turnId });
+      return { turn_id: turnId, queued_id: null, steered: true };
+    }
     // Queue-while-busy, mirroring the real provider: a send during an
     // active turn parks in the FIFO queue and renders greyed-out.
     if (chatActiveTurns.has(threadId)) {
@@ -4151,6 +4159,12 @@ const handlers: Record<string, Handler> = {
         client_nonce: input.client_nonce ?? null,
         text: input.text,
       });
+      if (input.delivery === "interrupt") {
+        const item = q.pop()!;
+        q.unshift(item);
+        interruptMockChatTurn(threadId);
+        drainChatQueue(threadId);
+      }
       return { turn_id: "", queued_id: queuedId };
     }
     // A prompt mentioning background work replays the yield-and-resume
@@ -4184,15 +4198,22 @@ const handlers: Record<string, Handler> = {
     return removed;
   },
   agent_chat_send_queued_turn_now: (a) => {
-    const { threadId, queuedId } = a as {
+    const { threadId, queuedId, delivery } = a as {
       threadId: string;
       queuedId: string;
+      delivery?: string;
     };
     const q = chatQueues.get(threadId);
     const idx = q ? q.findIndex((e) => e.queuedId === queuedId) : -1;
     // Unknown / already-dispatched id — idempotent no-op, matching the
     // real backend.
     if (!q || idx < 0) return undefined;
+    if (delivery === "steer" && chatActiveTurns.has(threadId)) {
+      if (a.provider !== "codex" && a.provider !== "opencode") throw new Error("Safe steering is unavailable for this provider.");
+      const [item] = q.splice(idx, 1);
+      emitChatEvent(threadId, { type: "queued_turn_dispatched", thread_id: threadId, queued_id: queuedId, text: item.text, turn_id: chatActiveTurns.get(threadId)!, steered: true });
+      return undefined;
+    }
     // Promote the item to the front of the queue so the drain dispatches
     // it next (mirrors `promote_queued_to_front`).
     if (idx > 0) {

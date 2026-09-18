@@ -68,6 +68,7 @@ interface Props {
   /** Follow-up queueing: send a queued turn now (steer) — soft-interrupts
    *  the active turn and dispatches this message immediately. */
   onSendQueuedNow?: (queuedId: string) => void;
+  onSteerQueued?: (queuedId: string) => void;
   /** Committed checkpoint keyed by the user bubble's client nonce. */
   turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   onRevertTurn?: (turnIndex: number) => void;
@@ -111,6 +112,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  onSteerQueued,
   turnCheckpointByNonce,
   onRevertTurn,
   revertingTurnIndex,
@@ -156,6 +158,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         onRejectPlan={onRejectPlan}
         onCancelQueued={onCancelQueued}
         onSendQueuedNow={onSendQueuedNow}
+          onSteerQueued={onSteerQueued}
         turnCheckpointByNonce={turnCheckpointByNonce}
         onRevertTurn={onRevertTurn}
         revertingTurnIndex={revertingTurnIndex}

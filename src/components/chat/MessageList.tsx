@@ -152,6 +152,7 @@ interface Props {
   /** Follow-up queueing: send a queued user turn now (steer) —
    *  soft-interrupts the active turn and dispatches it immediately. */
   onSendQueuedNow?: (queuedId: string) => void;
+  onSteerQueued?: (queuedId: string) => void;
   turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   onRevertTurn?: (turnIndex: number) => void;
   revertingTurnIndex?: number | null;
@@ -204,6 +205,7 @@ export const MessageList = memo(function MessageList({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  onSteerQueued,
   turnCheckpointByNonce,
   onRevertTurn,
   revertingTurnIndex,
@@ -1177,6 +1179,7 @@ export const MessageList = memo(function MessageList({
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
+          onSteerQueued={onSteerQueued}
           turnCheckpointByNonce={turnCheckpointByNonce}
           onRevertTurn={onRevertTurn}
           revertingTurnIndex={revertingTurnIndex}
@@ -1190,6 +1193,7 @@ export const MessageList = memo(function MessageList({
       onRejectPlan,
       onRespondToRequest,
       onSendQueuedNow,
+  onSteerQueued,
       onRevertTurn,
       requestsById,
       referenceCwdByMessageId,
@@ -1539,6 +1543,7 @@ function ItemRow({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  onSteerQueued,
   turnCheckpointByNonce,
   onRevertTurn,
   revertingTurnIndex,
@@ -1555,6 +1560,7 @@ function ItemRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  onSteerQueued?: (queuedId: string) => void;
   turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   onRevertTurn?: (turnIndex: number) => void;
   revertingTurnIndex?: number | null;
@@ -1593,6 +1599,7 @@ function ItemRow({
         item={item}
         onCancelQueued={onCancelQueued}
         onSendQueuedNow={onSendQueuedNow}
+          onSteerQueued={onSteerQueued}
         onRevert={
           checkpoint && onRevertTurn
             ? () => onRevertTurn(checkpoint.turn_index)
@@ -1854,6 +1861,7 @@ function SlotRow({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  onSteerQueued,
   turnCheckpointByNonce,
   onRevertTurn,
   revertingTurnIndex,
@@ -1871,6 +1879,7 @@ function SlotRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  onSteerQueued?: (queuedId: string) => void;
   turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   onRevertTurn?: (turnIndex: number) => void;
   revertingTurnIndex?: number | null;
@@ -1915,6 +1924,7 @@ function SlotRow({
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
+          onSteerQueued={onSteerQueued}
           turnCheckpointByNonce={turnCheckpointByNonce}
           onRevertTurn={onRevertTurn}
           revertingTurnIndex={revertingTurnIndex}
