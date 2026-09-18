@@ -506,7 +506,7 @@ function PrSetRows({
               aria-label={`${providerRef(provider, pr.number)} · ${normalizePrState(pr.state) ?? pr.state}${pr.head_branch ? ` · ${pr.head_branch}` : ""}`}
               className={cn(
                 "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left font-mono text-label",
-                pr.url ? "hover:bg-foreground/[0.055]" : "cursor-default",
+                pr.url ? "hover:bg-surface-2" : "cursor-default",
               )}
             >
               <PrStatusIcon state={pr.state} size={3} className="shrink-0" />
