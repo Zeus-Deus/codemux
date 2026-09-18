@@ -83,7 +83,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-0 libayatana-appindicator3-1 webkit2gtk-driver xvfb dbus-x11
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-0 libayatana-appindicator3-1 webkit2gtk-driver xvfb dbus-x11 imagemagick
       - uses: dtolnay/rust-toolchain@stable
       - name: Install external WebDriver
         run: cargo install tauri-driver --version 2.0.6 --locked

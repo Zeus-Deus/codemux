@@ -132,6 +132,7 @@ const env = {
 };
 let session;
 let driver;
+let desktop;
 const endpoint = "http://127.0.0.1:4444";
 async function request(method, path, body) {
   const response = await fetch(endpoint + path, {
@@ -218,10 +219,16 @@ async function shortcut(key) {
 }
 async function capture(name) {
   await writeFile(join(evidenceDir, `${name}.txt`), await text());
-  await writeFile(
-    join(evidenceDir, `${name}.png`),
-    Buffer.from(await wd("GET", "/screenshot"), "base64"),
-  );
+  if (process.platform === "linux") {
+    // WebKitWebDriver's snapshot hangs after the terminal canvas appears on
+    // the Ubuntu runner. Capture the actual disposable X display instead.
+    await run("import", ["-window", "root", join(evidenceDir, `${name}.png`)]);
+  } else {
+    await writeFile(
+      join(evidenceDir, `${name}.png`),
+      Buffer.from(await wd("GET", "/screenshot"), "base64"),
+    );
+  }
 }
 async function step(name, fn) {
   console.log(`Native UI: ${name}`);
@@ -246,15 +253,49 @@ async function openCommand(title) {
 }
 try {
   await run(application, ["login", "--token", token], { env });
-  driver = start("tauri-driver", ["--port", "4444"], {
-    env,
-  });
+  let capabilities;
+  if (process.platform === "win32") {
+    // The standard driver-launch path times out for this stock Windows app.
+    // Microsoft's documented attach mode keeps the same binary and gives us
+    // the owned process's startup diagnostics. The debug port exists only in
+    // this disposable CI child environment, never in product configuration.
+    desktop = start(application, [], {
+      env: {
+        ...env,
+        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=9231",
+      },
+    });
+    await until("stock WebView2 startup", async () => {
+      const response = await fetch("http://127.0.0.1:9231/json/version", {
+        signal: AbortSignal.timeout(1000),
+      });
+      return response.ok;
+    });
+    driver = start(
+      "msedgedriver.exe",
+      [
+        "--port=4444",
+        "--verbose",
+        `--log-path=${join(evidenceDir, "edge-driver.log")}`,
+      ],
+      { env },
+    );
+    capabilities = {
+      browserName: "webview2",
+      "ms:edgeOptions": { debuggerAddress: "127.0.0.1:9231" },
+    };
+    evidence.windowsDriverMode =
+      "Microsoft WebView2 attach (CI child environment only)";
+  } else {
+    driver = start("tauri-driver", ["--port", "4444"], { env });
+    capabilities = { "tauri:options": { application } };
+  }
   await until(
     "driver startup",
     async () => (await request("GET", "/status"))?.ready === true,
   );
   const created = await request("POST", "/session", {
-    capabilities: { alwaysMatch: { "tauri:options": { application } } },
+    capabilities: { alwaysMatch: capabilities },
   });
   session = created.sessionId;
   await wd("POST", "/timeouts", {
@@ -456,40 +497,68 @@ try {
       async () => !(await native("addon_inventory")).paused,
     );
   });
-  await step("08-hostile-plugin-core-interactivity", async () => {
-    await click('[aria-label="Close settings"]');
-    await openCommand("Run isolated blocking fixture");
-    const started = performance.now();
-    await type("textarea", " Core remains interactive.");
-    await until(
-      "hostile runtime quarantined",
-      async () =>
-        (await native("addon_inventory")).installed.find(
-          (i) => i.manifest.id === "example.fault-isolation",
-        ).status === "failed-disabled",
-      5000,
-    );
-    evidence.hostileUiObservationMs = performance.now() - started;
-    await until("core input accepted", () =>
-      script(
-        `return [...document.querySelectorAll('textarea')].some(e => e.value.includes('Core remains interactive.'))`,
-      ),
-    );
-    await openCommand("Open Project Brief");
-    await hasText("Branch: main");
-    await clickText(
-      "Refresh",
-      `document.querySelector('section[aria-label="Add-on view"]')`,
-    );
-    await hasText("draft-context.txt");
-    await openSettings();
-    await hasText("Fault Isolation Fixture");
-    await hasText("failed disabled");
-    assert.deepEqual(
-      await native("agent_chat_list_sessions", { workspaceId }),
-      sessionsBefore,
-    );
-  });
+  const faultInstallation = (await native("addon_inventory")).installed.find(
+    (i) => i.manifest.id === "example.fault-isolation",
+  );
+  evidence.hostileWorkloads = [];
+  // Saved installers include their exact fixture packages. Record every
+  // available workload: retrying an older one-command fixture never establishes
+  // the additional workloads in a newer package.
+  for (const command of faultInstallation.manifest.contributes.commands) {
+    await step(`08-hostile-${command.id}-core-interactivity`, async () => {
+      const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Fault Isolation Fixture')))`;
+      const current = (await native("addon_inventory")).installed.find(
+        (i) => i.manifest.id === "example.fault-isolation",
+      );
+      if (current.status === "failed-disabled") {
+        await clickText("Retry", article);
+        await until(
+          "explicit retry enabled",
+          async () =>
+            (await native("addon_inventory")).installed.find(
+              (i) => i.manifest.id === "example.fault-isolation",
+            ).desiredEnabled,
+        );
+      }
+      await click('[aria-label="Close settings"]');
+      await openCommand(command.title);
+      const started = performance.now();
+      const marker = ` Core input after ${command.id}.`;
+      await type("textarea", marker);
+      await until(
+        "hostile runtime quarantined",
+        async () =>
+          (await native("addon_inventory")).installed.find(
+            (i) => i.manifest.id === "example.fault-isolation",
+          ).status === "failed-disabled",
+        5000,
+      );
+      evidence.hostileWorkloads.push({
+        command: command.id,
+        uiObservationMs: performance.now() - started,
+      });
+      await until("core input accepted", () =>
+        script(
+          `return [...document.querySelectorAll('textarea')].some(e => e.value.includes(arguments[0]))`,
+          marker,
+        ),
+      );
+      await openCommand("Open Project Brief");
+      await hasText("Branch: main");
+      await clickText(
+        "Refresh",
+        `document.querySelector('section[aria-label="Add-on view"]')`,
+      );
+      await hasText("draft-context.txt");
+      await openSettings();
+      await hasText("Fault Isolation Fixture");
+      await hasText("failed disabled");
+      assert.deepEqual(
+        await native("agent_chat_list_sessions", { workspaceId }),
+        sessionsBefore,
+      );
+    });
+  }
   evidence.status = "passed";
 } catch (error) {
   evidence.status = "failed";
@@ -508,6 +577,14 @@ try {
       delay(3000).then(() => null),
     ]);
     if (result) await writeFile(join(evidenceDir, "driver.log"), result.output);
+  }
+  if (desktop) {
+    const result = await Promise.race([
+      desktop.done.catch((error) => ({ output: String(error) })),
+      delay(3000).then(() => null),
+    ]);
+    if (result)
+      await writeFile(join(evidenceDir, "desktop.log"), result.output);
   }
   account.closeAllConnections();
   account.close();

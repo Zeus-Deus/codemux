@@ -12,7 +12,7 @@ results cannot establish the corresponding desktop behavior.
 | Core independence | Existing full desktop CI; Settings browser evidence; native UI harness pause/resume | Clean/paused startup, zero host processes before use, terminal/projects/themes/update controls and pane restoration in installed apps |
 | Functional SDK | Real-host package integrations in `manager.rs`; `sdk-native.mjs`; installed-app `native-ui.mjs` | Both packages' actual UI/draft/HTTPS operations must pass on Linux and Windows |
 | Author independence | Both examples consume packed public SDK/CLI; Issue Companion built outside the checkout | Reviewed SDK distribution and final documentation against the published version |
-| Runtime failure | `addon-host/tests`, native `protocol.rs`, manager fault isolation; packaged five-workload evidence | Installed-app responsiveness for all hostile workloads, including exit and ignored shutdown; the UI harness currently covers a blocking command |
+| Runtime failure | `addon-host/tests`, native `protocol.rs`, manager fault isolation; packaged five-workload evidence | Installed-app responsiveness for all hostile workloads, including exit and ignored shutdown; the UI harness targets all five SDK callback workloads |
 | UI hostility | Protocol `tests/ui.rs` and `src/ui.rs`; renderer/view tests; native validation benchmark | Installed-app adversarial rendering and measured frame timing under load |
 | Authority | `permissions.rs`, manager broker tests, generation/context checks | Installed-app forged/stale interaction scenarios in combination with real UI transitions |
 | Context races | `platform.test.ts`, composer adapter/registry tests; real native broker cancellation, Git child reaping and update/uninstall serialization | Delayed request during project/thread/surface changes, uninstall during activation and HTTP/Git disable through the installed desktop |
@@ -29,8 +29,8 @@ results cannot establish the corresponding desktop behavior.
 ## Running the installed-app harness
 
 `addon-packaged.yml` builds the normal release installers and independent
-packages, verifies their payloads, then runs external `tauri-driver` against the
-installed desktop. It does not enable a production test server or change the
+packages, verifies their payloads, then runs external WebDriver against the
+installed desktop (`tauri-driver` on Linux; Microsoft WebView2 attach on Windows). It does not enable a production test server or change the
 application binary. The harness refuses local and self-hosted runners.
 
 The account API is a synthetic loopback fixture. The single-use native file

@@ -118,6 +118,19 @@ publication and Settings remain separate deliverables.
   focus when Escape closes its install dialog. These remain browser-preview
   checks, not native screen-reader/desktop E2E. Fixtures are removed from the seed.
 
+- Settings configuration controls wait for the stored values before accepting
+  edits or submission. A disposed release's late response/error is ignored.
+  TypeScript and three focused Settings tests pass for this guard.
+
+- Native Git exclude regression failed before the fix and passes afterward for
+  both ordinary and linked worktrees. All seven focused native Git tests and
+  `cargo check -j 2` pass. The snapshot copies only bounded regular-file exclude
+  data; repository programs remain disabled.
+- The expanded public-SDK hostile fixture builds and packs independently. Its
+  five commands terminate real local hosts in 1.7–253.0 ms (blocking loop, throw,
+  endless promises, recursion, allocation). These standalone timings do not
+  establish installed-app interactivity.
+
 ## Evidence-backed implementation clarifications
 
 - The sample uses `includeFiles`, but chapter 5 requires
@@ -195,12 +208,29 @@ and controlled draft insertion use the production app. Windows downloads the
 driver matching WebView2 and verifies Microsoft's executable signature.
 Installer and harness revisions are recorded separately so a harness-only retry
 cannot imply a newer app build was tested. This harness has passed syntax,
-workflow-parse and local-refusal checks; **native execution is still pending**.
+workflow-parse and local-refusal checks. A [stock Linux run](https://github.com/Zeus-Deus/codemux/actions/runs/35382610101)
+passed Settings startup, actual review/import of both independent examples and
+the hostile fixture, disable/enable and native configuration persistence.
+[Partial evidence](evidence/native-ui-linux-partial.json) records exact installer
+and harness revisions. Project Brief rendered real Git data, but the count
+assertion exposed missing repository-local exclude rules in the private Git
+snapshot. The run failed there; draft, HTTPS and hostile-GUI steps remain
+unverified. [Native review](evidence/native-package-review.png) and
+[configuration](evidence/native-settings-configuration.png) screenshots use only
+synthetic runner data. A later [Linux retry](https://github.com/Zeus-Deus/codemux/actions/runs/35383319034)
+passes the Git assertion with a versioned ignore fixture, then stops because
+WebKit screenshot capture times out after the terminal canvas appears; text
+queries still work. [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35383388810)
+stops at driver session creation. The harness now captures Linux's actual X
+display and uses Microsoft's [documented WebView2 attach mode](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/webdriver#step-4b-attaching-microsoft-edge-webdriver-to-a-running-webview2-app)
+with a debug port enabled only in the disposable CI child environment. No
+production test hook or app configuration change is introduced. Both platforms
+require a passing retry.
 It currently targets import/review, enable/disable, both example views and draft
 insertion, read-only public GitHub HTTPS, no auto-submit, pause/resume, and an
-independently packaged blocking-command fixture while typing in the core draft
-and reopening Project Brief. These targets are not evidence until execution
-passes, and do not cover the full race matrix. The OS file chooser and account
+independently packaged five-workload fixture while typing in the core draft
+and reopening Project Brief. Only the completed steps above are evidence; the remaining targets have not
+passed and the harness does not cover the full race matrix. The OS file chooser and account
 service are explicit fixture seams.
 
 - Stock built-app E2E for both examples, including real frontend/native IPC,
