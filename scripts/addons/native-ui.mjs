@@ -381,6 +381,136 @@ async function checkOfficialUpdater(phase) {
     version: update?.version ?? null,
   });
 }
+async function checkRemoteBoundary() {
+  assert.equal((await native("web_remote_status")).enabled, false);
+  const reservation = createServer();
+  await new Promise((done) => reservation.listen(0, "127.0.0.1", done));
+  const port = reservation.address().port;
+  await new Promise((done) => reservation.close(done));
+  let socket, paired;
+  try {
+    await native("web_remote_set_config", {
+      port,
+      bindScope: "loopback",
+      requireApproval: true,
+      accountModeEnabled: false,
+      trustAccountBrowsers: false,
+      relayModeEnabled: false,
+    });
+    const status = await native("web_remote_enable");
+    assert.equal(status.bind_scope, "loopback");
+    const base = `http://127.0.0.1:${port}`;
+    const pairing = await native("web_remote_create_pairing");
+    const pairResponse = await fetch(`${base}/api/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: base },
+      body: JSON.stringify({
+        token: pairing.token,
+        device_name: "Disposable add-on boundary test",
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    assert.equal(pairResponse.status, 200);
+    paired = await pairResponse.json();
+    assert.equal(paired.approved, false);
+    await native("web_remote_approve_session", {
+      sessionId: paired.session_id,
+    });
+    const ticketResponse = await fetch(`${base}/api/ws-ticket`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${paired.session_token}`,
+        Origin: base,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    assert.equal(ticketResponse.status, 200);
+    const { ticket } = await ticketResponse.json();
+    socket = new WebSocket(`ws://127.0.0.1:${port}/ws?ticket=${ticket}`);
+    const frames = [];
+    socket.addEventListener("message", (event) =>
+      frames.push(JSON.parse(event.data)),
+    );
+    await until(
+      "paired remote WebSocket ready",
+      () => socket.readyState === WebSocket.OPEN,
+    );
+    let sequence = 0;
+    async function invoke(cmd, args = {}) {
+      const id = ++sequence;
+      socket.send(JSON.stringify({ t: "invoke", id, cmd, args }));
+      return until(`remote ${cmd}`, () =>
+        frames.find((frame) => frame.id === id),
+      );
+    }
+    assert.equal(
+      (await invoke("get_app_state")).t,
+      "ok",
+      "Core RPC must still work",
+    );
+    assert.ok(
+      (await pluginHostCount()) > 0,
+      "Test the boundary with actual active plugins",
+    );
+    for (const cmd of [
+      "addon_inventory",
+      "addon_subscribe",
+      "addon_execute",
+      "addon_future_command",
+    ]) {
+      const response = await invoke(cmd, {
+        id: "codemux.project-brief",
+        onEvent: "__CHANNEL__:999",
+      });
+      assert.equal(response.t, "err");
+      assert.match(String(response.error), /REMOTE_UNSUPPORTED/);
+    }
+    for (const event of [
+      "addon:ci-boundary",
+      "addon_ci_boundary",
+      "ci-core-boundary",
+    ])
+      socket.send(JSON.stringify({ t: "listen", event }));
+    // A core RPC response is a barrier after the synchronous subscriptions.
+    assert.equal((await invoke("get_app_state")).t, "ok");
+    for (const event of [
+      "addon:ci-boundary",
+      "addon_ci_boundary",
+      "ci-core-boundary",
+    ])
+      await native("plugin:event|emit", {
+        event,
+        payload: { synthetic: true },
+      });
+    await until("core event forwarded", () =>
+      frames.some(
+        (frame) => frame.t === "event" && frame.event === "ci-core-boundary",
+      ),
+    );
+    assert.ok(
+      !frames.some(
+        (frame) => frame.t === "event" && frame.event.startsWith("addon"),
+      ),
+      "Plugin events must not cross the remote boundary",
+    );
+    evidence.remoteBoundary = {
+      transport: "paired loopback HTTP/WebSocket against stock desktop",
+      approval: "explicit desktop command",
+      coreRpc: true,
+      addonRpcDenied: true,
+      coreEvents: true,
+      addonEventsDenied: true,
+    };
+  } finally {
+    socket?.close();
+    if (paired)
+      await native("web_remote_revoke_session", {
+        sessionId: paired.session_id,
+      });
+    await native("web_remote_disable");
+  }
+  assert.equal((await native("web_remote_status")).enabled, false);
+}
 async function createNativeSession() {
   const created = await request("POST", "/session", {
     capabilities: { alwaysMatch: capabilities },
@@ -769,6 +899,10 @@ try {
       );
     },
     true,
+  );
+  await step(
+    "07-paired-remote-cannot-invoke-or-subscribe-to-plugins",
+    checkRemoteBoundary,
   );
   await step("07-no-auto-submit", async () => {
     await assertNoSubmission();
