@@ -1,0 +1,63 @@
+name: Reviewed add-on catalog
+on:
+  pull_request:
+    paths: ['catalog/addons/**', 'src-tauri/addon-catalog/**', 'src-tauri/addon-protocol/**', 'src-tauri/src/addons/package.rs', 'src-tauri/src/addons/download.rs', 'src-tauri/src/addons/http.rs', '.github/workflows/addon-catalog.yml']
+  push:
+    branches: [main]
+    paths: ['catalog/addons/**']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify schema and deterministic catalog generation
+        run: |
+          cargo run -j 2 --locked --manifest-path src-tauri/addon-protocol/Cargo.toml --example catalog-schema > /tmp/catalog-schema.json
+          diff -u catalog/addons/schema/catalog-v1.json /tmp/catalog-schema.json
+          cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- generate catalog/addons/catalog-v1.json catalog/addons/entries
+          git diff --exit-code -- catalog/addons/catalog-v1.json
+      - name: Check accepted history and inert release provenance
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git show "$BASE_SHA:catalog/addons/catalog-v1.json" > /tmp/previous-catalog.json 2>/dev/null; then
+            cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json /tmp/previous-catalog.json
+          else
+            cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-addon-catalog
+          path: catalog/addons/catalog-v1.json
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: reviewed-addon-catalog
+      - name: Publish immutable reviewed artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          revision=$(jq -er '.revision' catalog-v1.json)
+          tag="addons-catalog-r$revision"
+          sha256sum catalog-v1.json > catalog-v1.json.sha256
+          # Existing tags are never overwritten, even on workflow reruns.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            mkdir accepted
+            gh release download "$tag" --pattern catalog-v1.json --dir accepted
+            cmp catalog-v1.json accepted/catalog-v1.json
+          else
+            gh release create "$tag" catalog-v1.json catalog-v1.json.sha256 --target "$GITHUB_SHA" --title "Add-on catalog revision $revision" --notes "Reviewed feature add-on catalog. Package releases remain independent of the desktop app."
+          fi

@@ -1,0 +1,284 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Catalog",
+  "type": "object",
+  "required": [
+    "blocked",
+    "generatedAt",
+    "plugins",
+    "revision",
+    "schemaVersion"
+  ],
+  "properties": {
+    "blocked": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Blocked"
+      }
+    },
+    "generatedAt": {
+      "type": "string"
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Plugin"
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Blocked": {
+      "type": "object",
+      "required": [
+        "date",
+        "reason"
+      ],
+      "properties": {
+        "date": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Capabilities": {
+      "type": "object",
+      "required": [
+        "credentials",
+        "http",
+        "permissions"
+      ],
+      "properties": {
+        "credentials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Credential"
+          }
+        },
+        "http": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HttpGrant"
+          }
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Permission"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Credential": {
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "origin",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/CredentialType"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CredentialType": {
+      "type": "string",
+      "enum": [
+        "bearer"
+      ]
+    },
+    "HttpGrant": {
+      "type": "object",
+      "required": [
+        "credential",
+        "methods",
+        "origin"
+      ],
+      "properties": {
+        "credential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HttpMethod"
+          }
+        },
+        "origin": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ]
+    },
+    "Permission": {
+      "type": "string",
+      "enum": [
+        "workspace.read",
+        "git.read",
+        "composer.append",
+        "external.open"
+      ]
+    },
+    "Platform": {
+      "type": "string",
+      "enum": [
+        "linux-x64",
+        "windows-x64"
+      ]
+    },
+    "Plugin": {
+      "type": "object",
+      "required": [
+        "description",
+        "id",
+        "name",
+        "publisher",
+        "readme",
+        "releases",
+        "repository",
+        "tier"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "publisher": {
+          "type": "string"
+        },
+        "readme": {
+          "type": "string"
+        },
+        "releases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Release"
+          }
+        },
+        "repository": {
+          "type": "string"
+        },
+        "tier": {
+          "$ref": "#/definitions/Tier"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Release": {
+      "type": "object",
+      "required": [
+        "api",
+        "capabilities",
+        "compressedBytes",
+        "downloadUrl",
+        "license",
+        "platforms",
+        "publishedAt",
+        "sha256",
+        "sourceCommit",
+        "version"
+      ],
+      "properties": {
+        "api": {
+          "type": "string"
+        },
+        "capabilities": {
+          "$ref": "#/definitions/Capabilities"
+        },
+        "compressedBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "downloadUrl": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Platform"
+          }
+        },
+        "publishedAt": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "sourceCommit": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Tier": {
+      "type": "string",
+      "enum": [
+        "official",
+        "community"
+      ]
+    }
+  }
+}
