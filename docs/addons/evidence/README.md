@@ -1,7 +1,7 @@
 # Verification artifacts
 
-All PNG images use the repository's synthetic Tauri mock. They establish visual
-layout only, not native plugin operation.
+The `core-*` and `settings-*` PNGs below use the repository's synthetic Tauri
+mock. They establish visual layout only, not native plugin operation.
 
 - `core-before.png`: baseline workspace without the plugin platform.
 - `core-after.png`: implementation workspace with zero installed add-ons.
@@ -20,3 +20,12 @@ Native and packaged verification is tracked separately in ../IMPLEMENTATION.md.
 content validation. Reproduce the workload with
 `cargo run --release -j 2 --manifest-path src-tauri/addon-protocol/Cargo.toml --example ui-validation-benchmark`.
 It excludes IPC and desktop rendering.
+
+Files named `native-*.png` capture the actual stock installed app in disposable
+GitHub runners using synthetic account/project data. `native-ui-*.json` records
+installer SHA-256/build revision, harness revision, hardware, completed checks
+and failures separately. A `status: failed` run is never an overall passing gate;
+its individual completed checks can supplement another run on the same exact
+installer. Provider CLIs are intentionally absent from these runners, so core
+chat checks cover controlled typing and no submission, not provider inference.
+The implementation ledger links each run and explains fixture seams.

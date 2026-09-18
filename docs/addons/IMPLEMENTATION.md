@@ -33,6 +33,48 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- The full expanded saved-installer GUI harness passes on
+  [Linux](https://github.com/Zeus-Deus/codemux/actions/runs/35393863385) and
+  [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35393865596), including
+  successful HTTPS, all five hostile callbacks, keyboard/themes/updater checks,
+  restart, GUI-off, removal and corrupt-registry startup. The 500-path rendering
+  workload mounts 14 actual rows, refreshes real Git five times while typing,
+  and records frame gaps on the specified runner hardware. Linux p95/max are
+  16/28 ms (681 samples); Windows 15.7/15.8 ms (344 samples). Both meet the
+  recorded shared-runner 100 ms p95 frame-gap ceiling; this is not a universal
+  frame-rate guarantee or a substitute for the native validation budget.
+  [Linux evidence](evidence/native-ui-linux-render-91bd6a2b.json) and
+  [Windows evidence](evidence/native-ui-windows-render-da835efb.json) identify
+  their exact source/digest and separate harness revision.
+
+- Accessibility regressions failed before and pass after virtualized list items
+  expose total size/absolute position and table row counts/indices include the
+  header. TypeScript and all seven renderer tests pass. A temporary localhost
+  fixture using the actual trusted renderer and bundled fonts was visually
+  inspected; keyboard scrolling reached file 500, with correct absolute ARIA
+  positions and bounded DOM rows. The preview and server were removed afterward.
+
+- [Windows native keyboard/theme/updater acceptance](https://github.com/Zeus-Deus/codemux/actions/runs/35392870675)
+  passes the full expanded harness on the saved `da835efb` installer: real dialog
+  autofocus/Escape/focus restoration, light/dark theme changes, official updater
+  checks with no plugins and while paused, plus the previously recorded example,
+  fault, restart, GUI-off, removal and corruption cases.
+  [Exact evidence](evidence/native-ui-windows-access-da835efb.json) is retained.
+  The [Linux retry](https://github.com/Zeus-Deus/codemux/actions/runs/35392866707)
+  passes those added checks, restart/removal/corruption and all five faults on
+  `91bd6a2b`, but its public GitHub request hit a rate limit. That run is explicitly
+  [failed](evidence/native-ui-linux-access-91bd6a2b.json); the earlier same-installer
+  run provides the successful real HTTPS/draft evidence.
+- Native Linux removal exposed a spurious credential-cleanup warning when an
+  optional credential had never been saved. A regression fails before and passes
+  after using the existing pre-write credential index for OS cleanup and clearing
+  session-only values separately. Actual saved/retired credentials still retain
+  retryable deletion tombstones. Five focused credential tests, 41 native add-on
+  tests and all six real-host integrations pass; nine environment-dependent tests
+  are reported separately from the focused run. The new real-child activation
+  race proves removal waits for activation, reaps its child, deletes private state,
+  and cannot resurrect the package after restart.
+
 - The [Linux installer run](https://github.com/Zeus-Deus/codemux/actions/runs/35389012944)
   at merge `91bd6a2b` passes both example flows and all five hostile SDK callbacks
   after the acknowledgement/backpressure correction. The healthy Project Brief,
