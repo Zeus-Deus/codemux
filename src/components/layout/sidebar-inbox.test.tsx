@@ -1877,6 +1877,27 @@ describe("SidebarInbox — wrapping-up tier", () => {
     expect(cardOrder(container)).toEqual(["ws-2", "ws-1"]);
   });
 
+  it("collapses and expands the tier from its header", async () => {
+    const base = Date.now();
+    workspaces = [
+      makeWorkspace({ title: "Handed off", worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN", ...readStamps(base) }),
+      makeWorkspace({ title: "Live work" }),
+    ];
+    const { container } = await flushRender();
+
+    const header = screen.getByRole("button", { name: "Wrapping up (1)" });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(cardOrder(container)).toEqual(["ws-2"]);
+    // Hidden cards leave the jump targets so Alt+N matches what is on screen.
+    expect(getJumpTarget(2)).toBeNull();
+
+    fireEvent.click(header);
+    expect(cardOrder(container)).toEqual(["ws-2", "ws-1"]);
+  });
+
   it("keeps an unread open-PR card on top — unseen news outranks the PR", async () => {
     const base = Date.now();
     workspaces = [
