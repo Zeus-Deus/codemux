@@ -703,7 +703,9 @@ try {
       "msedgedriver.exe",
       [
         "--port=4444",
-        "--verbose",
+        // Verbose WebDriver logs record password SendKeys payloads. Preserve
+        // warnings without recording the synthetic secret in command traces.
+        "--log-level=WARNING",
         `--log-path=${join(evidenceDir, "edge-driver.log")}`,
       ],
       { env },
