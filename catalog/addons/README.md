@@ -1,0 +1,48 @@
+# CodeMux feature add-on catalog
+
+Submit entries in `entries/<publisher.plugin>.json` through a pull request to this
+public repository. The catalog is curated metadata; validation never loads a
+plugin's JavaScript or runs package scripts. Themes and footer presets are separate.
+
+Each entry follows `schema/catalog-v1.json`'s `Plugin` definition. Releases must use
+a public GitHub Release asset in the declared repository, an immutable stable
+semver, a full source commit, the exact SHA-256 and compressed byte count, API and
+platform support, license, and normalized manifest capabilities. Sort permissions,
+HTTP origins/methods, and credential IDs. The release tag must resolve to its
+declared source commit. Publisher/source ownership and the official/community tier
+are assigned by maintainers, not by a package manifest.
+
+Before approving an entry or update, maintainers review the source commit and diff,
+dependency changes, permission changes, publisher's control of the source repo,
+release build provenance, and license. Automated checks verify the public source
+commit and tag, download and hash the exact asset, and run the same inert archive
+validator as the desktop. No raw branch installs or build-on-install are supported.
+Record that review in the PR; an automated green check is not publisher approval.
+
+Run:
+
+```sh
+cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- generate catalog/addons/catalog-v1.json catalog/addons/entries
+cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json
+```
+
+Increment the envelope revision for every change, including revocations. Never
+reuse a catalog revision or release version with changed bytes. Keep historical
+release records so ownership and digest continuity can be checked. To revoke a
+package, add a `blocked` entry with either `pluginId` or `sha256`, a bounded reason,
+and an RFC3339 date. Desktop refresh disables matching installations; offline
+devices cannot learn new revocations until they reconnect. Local imports are also
+checked against the last accepted blocklist.
+
+After a reviewed merge, CI publishes `catalog-v1.json` and its SHA-256 as assets on
+the immutable `addons-catalog-r<revision>` release. The website pins that artifact
+and digest in a separate reviewed change; it never reads a mutable branch during
+page requests. New desktop installs and updates require a successful online refresh.
+
+The initial catalog is intentionally empty. Project Brief and Issue Companion are
+independent example packages in `examples/addons/`; add entries only after their
+source commits and real release assets exist and the acceptance gates pass. Do not
+invent release URLs or label locally built packages as reviewed catalog releases.
+
+Report a listing or security concern through the repository's issue/security links.
+Catalog review is a contribution review signal, not a guarantee against defects.
