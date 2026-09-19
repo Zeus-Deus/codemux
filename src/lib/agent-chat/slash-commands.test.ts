@@ -230,6 +230,37 @@ describe("filterSlashItems", () => {
   it("returns empty when nothing matches", () => {
     expect(filterSlashItems(items, "xyz")).toEqual([]);
   });
+
+  it("matches descriptions after names for queries of 3+ chars", () => {
+    const withSkills: SlashCommandItem[] = [
+      {
+        id: "skill:update-personal-desktop",
+        label: "update-personal-desktop",
+        description: "Update the personal Hermes Agent fork · codex · project",
+        searchDescription: "Update the personal Hermes Agent fork",
+        command: "/update-personal-desktop",
+        group: "SKILLS",
+        onSelect: () => {},
+      },
+      {
+        id: "skill:hermes-notes",
+        label: "hermes-notes",
+        command: "/hermes-notes",
+        group: "SKILLS",
+        onSelect: () => {},
+      },
+    ];
+    expect(filterSlashItems(withSkills, "herme").map((i) => i.id)).toEqual([
+      "skill:hermes-notes",
+      "skill:update-personal-desktop",
+    ]);
+    // Short queries stay name-only so `/he` doesn't match prose.
+    expect(filterSlashItems(withSkills, "he").map((i) => i.id)).toEqual([
+      "skill:hermes-notes",
+    ]);
+    // The display-only scope suffix is not searchable.
+    expect(filterSlashItems(withSkills, "codex")).toEqual([]);
+  });
 });
 
 describe("buildModeCommands", () => {
