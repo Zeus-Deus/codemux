@@ -2663,6 +2663,10 @@ fn build_core_app<R: tauri::Runtime>(
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            // Native reload of the main webview only — the recovery path for
+            // a UI that stopped responding. Never restarts the backend.
+            webview_recovery::reload_main_window,
+            webview_recovery::ack_reload_request,
             // Native window background, so a light palette doesn't launch
             // behind `tauri.conf.json`'s near-black default.
             set_window_background,

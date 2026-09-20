@@ -67,17 +67,26 @@ describe("keybind-registry", () => {
     expect(entry!.when).toBe("non-terminal");
   });
 
-  it("registers reload-blocking shortcuts", () => {
+  it("swallows the reload keys a terminal needs", () => {
     const blockReload = getRegistryEntry("blockReload");
     expect(blockReload).toBeDefined();
     expect(blockReload!.defaultKeys).toBe("Ctrl+R");
 
-    const blockHardReload = getRegistryEntry("blockHardReload");
-    expect(blockHardReload).toBeDefined();
-    expect(blockHardReload!.defaultKeys).toBe("Ctrl+Shift+R");
-
     const blockF5 = getRegistryEntry("blockF5Reload");
     expect(blockF5).toBeDefined();
     expect(blockF5!.defaultKeys).toBe("F5");
+  });
+
+  it("documents the recovery reload on the chord the app process grabs", () => {
+    const entry = getRegistryEntry("reloadInterface");
+    expect(entry).toBeDefined();
+    // `webview_recovery.rs` hard-codes this combo on the GTK toplevel so it
+    // works with a dead renderer; the two must not drift apart.
+    expect(entry!.defaultKeys).toBe("Ctrl+Shift+R");
+    // Shown in Settings → Shortcuts, so it has to explain itself.
+    expect(entry!.description).toBeTruthy();
+    // Window-level: the terminal gives the combo up instead of sending it to
+    // the pty.
+    expect(entry!.when ?? "always").toBe("always");
   });
 });

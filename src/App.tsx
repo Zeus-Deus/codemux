@@ -19,6 +19,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Toaster } from "@/components/ui/sonner";
 import { PrEventWatcher } from "@/components/pull-requests/pr-event-watcher";
 import { UpdateToast } from "@/components/update/update-toast";
+import { ReloadInterfaceDialog } from "@/components/overlays/reload-interface-dialog";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
@@ -152,7 +153,14 @@ function App() {
   useWebNotifications();
 
   if (isLoading || !isAuthenticated) {
-    return <LoginScreen />;
+    return (
+      <>
+        <LoginScreen />
+        {/* Recovery reload stays reachable before sign-in too — a blank
+            renderer does not wait for a session. */}
+        <ReloadInterfaceDialog />
+      </>
+    );
   }
 
   return (
@@ -199,6 +207,9 @@ function App() {
           nothing, and sits above the full-screen destinations so it keeps
           watching from every screen. */}
       <PrEventWatcher />
+      {/* Confirmation for the recovery reload, and the listener the app
+          process talks to when the interface stops responding. */}
+      <ReloadInterfaceDialog />
       <Toaster />
     </>
   );

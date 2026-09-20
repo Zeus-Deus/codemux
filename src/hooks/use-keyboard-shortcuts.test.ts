@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
+vi.mock("@/lib/interface-reload", () => ({
+  requestInterfaceReload: vi.fn(),
+}));
+
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   splitPane: vi.fn().mockResolvedValue(undefined),
@@ -19,6 +23,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { activateWorkspace, undockBrowserFromRightPanel } from "@/tauri/commands";
+import { requestInterfaceReload } from "@/lib/interface-reload";
 import {
   setJumpTargets,
 } from "@/components/layout/sidebar-inbox-jump";
@@ -412,5 +417,37 @@ describe("use-keyboard-shortcuts dispatch — toggleRightPanel", () => {
 
     expect(undockBrowserFromRightPanel).not.toHaveBeenCalled();
     expect(useUIStore.getState().getRightPanelTab("ws-1")).toBeNull();
+  });
+});
+
+describe("reload keys", () => {
+  it("swallows Ctrl+R and F5 with no workspace open", () => {
+    // No appState: a blank app must still not hand these to the browser —
+    // Ctrl+R is reverse-i-search and F5 is a live key in curses apps, and
+    // reloading would drop the UI while agents keep running behind it.
+    expect(useAppStore.getState().appState).toBeNull();
+
+    expect(dispatch("blockReload", FAKE_EVENT)).toBe(true);
+    expect(dispatch("blockF5Reload", FAKE_EVENT)).toBe(true);
+    expect(requestInterfaceReload).not.toHaveBeenCalled();
+  });
+
+  it("routes the recovery chord to the confirm-then-reload flow", () => {
+    const handled = dispatch("reloadInterface", FAKE_EVENT);
+
+    expect(handled).toBe(true);
+    expect(requestInterfaceReload).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the recovery chord to the browser in the web remote client", () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    try {
+      // A remote tab has no desktop webview to recover; Ctrl+Shift+R stays
+      // the browser's own hard reload.
+      expect(dispatch("reloadInterface", FAKE_EVENT)).toBe(false);
+      expect(requestInterfaceReload).not.toHaveBeenCalled();
+    } finally {
+      delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+    }
   });
 });

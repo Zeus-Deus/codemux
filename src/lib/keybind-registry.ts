@@ -37,8 +37,12 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "zoomOut", label: "Decrease interface size", category: "general", defaultKeys: "Ctrl+-", description: "Make all interface text and chrome smaller" },
   { id: "zoomReset", label: "Reset interface size", category: "general", defaultKeys: "Ctrl+0" },
   { id: "closeOverlay", label: "Close overlay", category: "general", defaultKeys: "Escape", description: "Close settings, search, or command palette" },
+  // Ctrl+R is reverse-i-search in every terminal pane and F5 is a live key in
+  // curses apps, so both stay swallowed — they never reload. The one reload is
+  // Ctrl+Shift+R, handled by the app process itself so it still works when the
+  // interface has stopped responding.
+  { id: "reloadInterface", label: "Reload interface", category: "general", defaultKeys: "Ctrl+Shift+R", description: "Redraw the UI when it goes blank or stops responding — agents, terminals and running commands keep going" },
   { id: "blockReload", label: "Block reload", category: "general", defaultKeys: "Ctrl+R", description: "Prevents accidental app reload" },
-  { id: "blockHardReload", label: "Block hard reload", category: "general", defaultKeys: "Ctrl+Shift+R", description: "Prevents accidental app reload" },
   { id: "blockF5Reload", label: "Block F5 reload", category: "general", defaultKeys: "F5", description: "Prevents accidental app reload" },
 
   // ── Search ──

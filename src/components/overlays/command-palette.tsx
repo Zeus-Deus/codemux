@@ -70,6 +70,7 @@ import {
   type AgentChatSearchResult,
 } from "@/tauri/commands";
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
+import { requestInterfaceReload } from "@/lib/interface-reload";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
@@ -239,6 +240,17 @@ const COMMANDS: PaletteCommand[] = [
     run: () => useUIStore.getState().setShowDevices(true),
   },
   { id: "settings", label: "Settings", icon: Settings, actionId: "openSettings", keywords: "preferences config" },
+  {
+    id: "reload-interface",
+    label: "Reload interface",
+    icon: RefreshCw,
+    actionId: "reloadInterface",
+    keywords: "refresh recover blank frozen stuck unresponsive restart ui",
+    // `actionId` supplies the shortcut hint, but the row runs the request
+    // directly: the keybind deliberately yields to the browser's own reload
+    // in the web remote client, and a palette click should still work there.
+    run: () => requestInterfaceReload(),
+  },
   {
     id: "regen-mcp",
     label: "Regenerate MCP config",

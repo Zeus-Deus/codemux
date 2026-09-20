@@ -19,6 +19,8 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
 import { stepInterfaceSize } from "@/lib/typography";
 import { getRegistryEntry } from "@/lib/keybind-registry";
+import { requestInterfaceReload } from "@/lib/interface-reload";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
@@ -230,6 +232,23 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
 
+  // ── Reload ──
+  // Swallowed, never reloads: Ctrl+R is reverse-i-search in a terminal pane
+  // and F5 is a live key in curses apps, so both are consumed here rather than
+  // handed to the browser. Runs before the appState guard — an app with no
+  // workspace open still must not reload itself out from under a running agent.
+  if (actionId === "blockReload" || actionId === "blockF5Reload") {
+    return true;
+  }
+  // The one real reload, and a recovery action: it asks first, and the app
+  // process — not the page — performs it. See `src/lib/interface-reload.ts`.
+  // In the web remote client the chord stays the browser's own hard reload.
+  if (actionId === "reloadInterface") {
+    if (isRemoteClient()) return false;
+    requestInterfaceReload();
+    return true;
+  }
+
   if (!appState) return false;
   const ws = appState.workspaces.find(
     (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
@@ -327,11 +346,6 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
   if (actionId === "closePane") {
     if (activePaneId) closePane(activePaneId).catch(console.error);
-    return true;
-  }
-
-  // Block browser reload shortcuts — returning true triggers preventDefault
-  if (actionId === "blockReload" || actionId === "blockHardReload" || actionId === "blockF5Reload") {
     return true;
   }
 
