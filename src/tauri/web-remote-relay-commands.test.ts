@@ -30,6 +30,7 @@ describe("webRemoteSetConfig relay toggle", () => {
       accountModeEnabled: null,
       trustAccountBrowsers: null,
       relayModeEnabled: true,
+      lanEnabled: null,
     });
   });
 
