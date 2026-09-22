@@ -960,6 +960,7 @@ async fn configure_via_control_socket(
     let status = relay.data.unwrap_or(json!({}));
     Ok(WebRemoteConfig {
         enabled: status["enabled"].as_bool().unwrap_or(true),
+        lan_enabled: status["lan_enabled"].as_bool().unwrap_or(true),
         port: status["port"]
             .as_u64()
             .and_then(|p| u16::try_from(p).ok())

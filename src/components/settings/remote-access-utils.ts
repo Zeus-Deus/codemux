@@ -47,6 +47,66 @@ export const BIND_SCOPE_OPTIONS: BindScopeOption[] = [
   },
 ];
 
+/** Whether the LAN listener ("On my network") is switched on. Absent means on:
+ *  before the transports were split, `enabled` *was* the listener. */
+export function lanEnabledOf(status: WebRemoteStatus | null): boolean {
+  return status?.lan_enabled ?? true;
+}
+
+// ── Exposure (what the current configuration actually opens) ─────────
+
+/** Where the LAN listener is reachable for a scope, phrased to follow
+ *  "listens on …". */
+export function lanExposurePhrase(scope: WebRemoteBindScope): string {
+  switch (scope) {
+    case "tailscale":
+      return "your Tailscale address and this device only";
+    case "loopback":
+      return "this device only (127.0.0.1)";
+    default:
+      return "every network interface of this machine";
+  }
+}
+
+/**
+ * One sentence describing what this configuration exposes — derived from the
+ * actual switches and scope, never a blanket claim. While remote access is off
+ * it previews what turning it on would open.
+ */
+export function describeExposure(status: WebRemoteStatus | null): string {
+  const enabled = status?.enabled ?? false;
+  const lan = lanEnabledOf(status);
+  const relay = status?.relay_mode_enabled ?? false;
+  const where = lanExposurePhrase(bindScopeOf(status));
+  const approval = !(status?.trust_account_browsers ?? false);
+  const relayClause = approval
+    ? "browsers signed into your Codemux account can reach it from anywhere, once you approve them"
+    : "browsers signed into your Codemux account can reach it from anywhere, without approval";
+
+  if (!enabled) {
+    if (lan && relay) {
+      return `Turning this on starts a server that listens on ${where}, and lets browsers signed into your Codemux account reach it from anywhere.`;
+    }
+    if (lan) return `Turning this on starts a server that listens on ${where}.`;
+    if (relay) {
+      return "Turning this on lets browsers signed into your Codemux account reach this machine from anywhere. Nothing listens on your network.";
+    }
+    return "Turning this on doesn't open anything by itself — you choose how devices connect next.";
+  }
+  // Once on, describe what is actually live: a listener that failed to bind
+  // exposes nothing, whatever its switch says.
+  const listening = lan && !status?.lan_error;
+  if (listening && relay) return `The server listens on ${where}, and ${relayClause}.`;
+  if (listening) {
+    return `The server listens on ${where}. Nothing is reachable from outside those networks.`;
+  }
+  if (relay) return `Nothing listens on your network — ${relayClause}.`;
+  if (lan) {
+    return "The server couldn't start listening, so nothing can reach this machine right now.";
+  }
+  return "Nothing can reach this machine yet — turn on a way to connect below.";
+}
+
 /** The effective bind scope for a status payload, defaulting to `all` when
  *  the field is absent (a config persisted before the field existed). */
 export function bindScopeOf(status: WebRemoteStatus | null): WebRemoteBindScope {

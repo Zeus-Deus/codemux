@@ -210,10 +210,18 @@ struct DeviceListResponse {
     devices: Vec<Value>,
 }
 
+/// One registration attempt, then a status broadcast — on every outcome,
+/// including the skip paths (no node id, signed out), so Settings always shows
+/// the current reason rather than a stale one.
+async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
+    register_attempt(app, shared).await;
+    super::emit_state_changed(app);
+}
+
 /// Run one registration attempt: gather the node id + bearer + device id, POST,
 /// and update the status. Signed out (no bearer) or no node id → skip quietly
 /// (record the reason, don't error). Never panics.
-async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
+async fn register_attempt<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
     // Snapshot every input synchronously so no DB/State guard is held across
     // the network await below (mirrors the account-mode admission discipline).
     let (bearer, reg) = {
@@ -262,7 +270,6 @@ async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
                 .record_error(Some(reg.device_id.clone()), e);
         }
     }
-    super::emit_state_changed(app);
 }
 
 /// Start device registration: register immediately, then refresh `lastSeenAt`

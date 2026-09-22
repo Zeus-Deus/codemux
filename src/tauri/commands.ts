@@ -3152,13 +3152,16 @@ export const workspaceOpenOnHost = (syncRowId: number) =>
 export const webRemoteStatus = () =>
   invoke<WebRemoteStatus>("web_remote_status");
 
-/** Turn the server on: binds the listener and persists `enabled=true`, so
- *  it is restored on the next app boot. */
+/** Turn the kill switch on: persists `enabled=true` and starts every way in
+ *  that is switched on underneath it (LAN listener, relay). A way in that
+ *  can't start reports why in `lan_error` / `relay_error` rather than failing
+ *  the call. Calling it again while on retries a failed way in. */
 export const webRemoteEnable = () =>
   invoke<WebRemoteStatus>("web_remote_enable");
 
-/** Turn the server off: tears the listener down and persists
- *  `enabled=false`. Paired devices are kept (revoke to remove them). */
+/** Turn the kill switch off: stops every way in, severs every connected
+ *  device, and persists `enabled=false`. Paired devices are kept (revoke to
+ *  remove them). */
 export const webRemoteDisable = () =>
   invoke<WebRemoteStatus>("web_remote_disable");
 
@@ -3169,9 +3172,9 @@ export const webRemoteDisable = () =>
  *  `accountModeEnabled` toggles the account sign-in admission path
  *  (`POST /api/pair-account`), and `trustAccountBrowsers` is the "trust
  *  browsers on my account without approval" opt-out — neither rebinds the
- *  listener. `relayModeEnabled` starts/stops the parallel from-anywhere iroh
- *  endpoint (never a rebind of the axum listener). Omitted fields are left
- *  unchanged. */
+ *  listener. `relayModeEnabled` starts/stops the from-anywhere iroh endpoint
+ *  and `lanEnabled` starts/stops the LAN listener — each independently of the
+ *  other. Omitted fields are left unchanged. */
 export const webRemoteSetConfig = (opts: {
   port?: number;
   requireApproval?: boolean;
@@ -3179,6 +3182,7 @@ export const webRemoteSetConfig = (opts: {
   accountModeEnabled?: boolean;
   trustAccountBrowsers?: boolean;
   relayModeEnabled?: boolean;
+  lanEnabled?: boolean;
 }) =>
   invoke<WebRemoteStatus>("web_remote_set_config", {
     port: opts.port ?? null,
@@ -3187,6 +3191,7 @@ export const webRemoteSetConfig = (opts: {
     accountModeEnabled: opts.accountModeEnabled ?? null,
     trustAccountBrowsers: opts.trustAccountBrowsers ?? null,
     relayModeEnabled: opts.relayModeEnabled ?? null,
+    lanEnabled: opts.lanEnabled ?? null,
   });
 
 /** The device's stable iroh `node_id` (its `EndpointId`) — the address a

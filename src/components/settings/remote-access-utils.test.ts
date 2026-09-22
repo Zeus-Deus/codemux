@@ -16,6 +16,7 @@ import {
   composePairUrl,
   connectedSessionCount,
   describeDevice,
+  describeExposure,
   endpointIsSecure,
   endpointSecurityHint,
   formatCountdown,
@@ -474,5 +475,88 @@ describe("isRebindDisconnectError — expected, not a failure", () => {
     expect(isRebindDisconnectError("Unknown access scope: bogus")).toBe(false);
     expect(isRebindDisconnectError(null)).toBe(false);
     expect(isRebindDisconnectError(undefined)).toBe(false);
+  });
+});
+
+describe("describeExposure", () => {
+  const base = (p: Partial<WebRemoteStatus>): WebRemoteStatus => ({
+    enabled: true,
+    running: true,
+    port: 4377,
+    require_approval: false,
+    active_connections: 0,
+    connected_sessions: 0,
+    sessions: [],
+    ...p,
+  });
+
+  it("only claims every interface when the scope is all networks", () => {
+    expect(describeExposure(base({ bind_scope: "all" }))).toMatch(
+      /every network interface/,
+    );
+    expect(describeExposure(base({ bind_scope: "tailscale" }))).toMatch(
+      /your Tailscale address and this device only/,
+    );
+    expect(describeExposure(base({ bind_scope: "loopback" }))).toMatch(
+      /this device only \(127\.0\.0\.1\)/,
+    );
+    for (const scope of ["tailscale", "loopback"] as const) {
+      expect(describeExposure(base({ bind_scope: scope }))).not.toMatch(
+        /every network interface/,
+      );
+    }
+  });
+
+  it("says nothing listens locally in a relay-only setup, and mentions approval", () => {
+    const relayOnly = describeExposure(
+      base({ lan_enabled: false, relay_mode_enabled: true }),
+    );
+    expect(relayOnly).toMatch(/Nothing listens on your network/);
+    expect(relayOnly).toMatch(/once you approve them/);
+    expect(
+      describeExposure(
+        base({
+          lan_enabled: false,
+          relay_mode_enabled: true,
+          trust_account_browsers: true,
+        }),
+      ),
+    ).toMatch(/without approval/);
+  });
+
+  it("covers both ways in, and neither", () => {
+    expect(
+      describeExposure(base({ lan_enabled: true, relay_mode_enabled: true })),
+    ).toMatch(/listens on every network interface.*from anywhere/);
+    expect(
+      describeExposure(base({ lan_enabled: false, relay_mode_enabled: false })),
+    ).toMatch(/Nothing can reach this machine yet/);
+  });
+
+  it("never claims a listener that failed to bind is exposed", () => {
+    const failed = { lan_enabled: true, lan_error: "port taken", running: false };
+    expect(describeExposure(base(failed))).toMatch(
+      /couldn't start listening, so nothing can reach this machine/,
+    );
+    const failedWithRelay = describeExposure(
+      base({ ...failed, relay_mode_enabled: true }),
+    );
+    expect(failedWithRelay).toMatch(/Nothing listens on your network/);
+    expect(failedWithRelay).not.toMatch(/every network interface/);
+  });
+
+  it("previews what turning remote access on would open", () => {
+    expect(
+      describeExposure(base({ enabled: false, lan_enabled: false })),
+    ).toMatch(/doesn't open anything by itself/);
+    expect(
+      describeExposure(
+        base({ enabled: false, lan_enabled: true, bind_scope: "tailscale" }),
+      ),
+    ).toMatch(/Turning this on starts a server that listens on your Tailscale address/);
+    // A legacy status without `lan_enabled` still had its listener.
+    expect(describeExposure(base({ enabled: false }))).toMatch(
+      /every network interface/,
+    );
   });
 });

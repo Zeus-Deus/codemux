@@ -3,8 +3,10 @@
 //! Turns the desktop app into a second frontend for its own backend: a
 //! browser on another device loads the same UI bundle and drives the same
 //! running instance over HTTP + WebSocket. Default-off — nothing binds
-//! until the user enables it, at which point an axum server comes up on
-//! `0.0.0.0:<port>` (default 4377).
+//! until the user enables it. Under that kill switch there are two independent
+//! ways in: the LAN listener (an axum server on `<scope>:<port>`, default 4377)
+//! and the from-anywhere iroh relay transport. Each has its own switch, and a
+//! failure to start one never keeps the other down.
 //!
 //! Module layout:
 //! - [`mod@self`] — managed state, config persistence, lifecycle, commands.
@@ -91,10 +93,30 @@ const STATE_CHANGED_EVENT: &str = "web-remote-state-changed";
 /// frontend's updater hook listens for it.
 const UPDATE_REQUESTED_EVENT: &str = "web-remote-update-requested";
 
+/// Serde default for `lan_enabled`: a config persisted before the transports
+/// were split keeps its listener, because back then `enabled` *was* the
+/// listener. (A fresh config starts with it off — see [`WebRemoteConfig::default`].)
+fn legacy_lan_enabled() -> bool {
+    true
+}
+
 /// Persisted, user-controlled configuration.
+///
+/// `enabled` is the **kill switch** for every way in. Underneath it, each
+/// transport has its own switch and runs independently of the other:
+/// `lan_enabled` owns the axum `/ws` listener (LAN / tailnet / loopback), and
+/// `relay_mode_enabled` owns the iroh relay transport (app.codemux.org). A
+/// failure to bind one never stops the other from coming up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRemoteConfig {
+    /// Master kill switch. Off → nothing listens and nothing registers.
     pub enabled: bool,
+    /// Whether the LAN listener (axum `/ws` on `port`, bound per `bind_scope`)
+    /// runs while remote access is on. Off for a fresh config, so turning remote
+    /// access on never opens a network port by itself; `codemux remote enable`,
+    /// `serve`, and `connect` turn it on explicitly. Legacy configs load `true`.
+    #[serde(default = "legacy_lan_enabled")]
+    pub lan_enabled: bool,
     pub port: u16,
     pub require_approval: bool,
     /// Which interfaces to bind: `all` (0.0.0.0) | `tailscale` | `loopback`.
@@ -133,6 +155,7 @@ impl Default for WebRemoteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            lan_enabled: false,
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: default_bind_scope(),
@@ -211,6 +234,17 @@ pub(crate) struct Shared {
     pub registration: registration::RegistrationManager,
     /// Last desktop-update availability the frontend updater hook published.
     update: Mutex<UpdateAvailability>,
+    /// Why a wanted transport is not running, per transport. Surfaced in the
+    /// status so Settings shows the real reason instead of optimistic copy.
+    transport_errors: Mutex<TransportErrors>,
+}
+
+/// The last start failure of each transport, cleared when it comes up or is
+/// turned off. `None` means "running, or not wanted".
+#[derive(Debug, Clone, Default)]
+struct TransportErrors {
+    lan: Option<String>,
+    relay: Option<String>,
 }
 
 impl Default for Shared {
@@ -228,6 +262,7 @@ impl Default for Shared {
             iroh: iroh::IrohManager::default(),
             registration: registration::RegistrationManager::default(),
             update: Mutex::new(UpdateAvailability::default()),
+            transport_errors: Mutex::new(TransportErrors::default()),
         }
     }
 }
@@ -268,8 +303,15 @@ impl WebRemoteState {
 /// emitted as the `web-remote-state-changed` payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct WebRemoteStatus {
+    /// Master kill switch for every way in.
     pub enabled: bool,
+    /// Whether the LAN listener is bound right now.
     pub running: bool,
+    /// Whether the LAN listener is wanted (its own switch under `enabled`).
+    pub lan_enabled: bool,
+    /// Why the LAN listener is wanted but not bound (port taken, no tailnet
+    /// address for the `tailscale` scope, …). `None` when bound or not wanted.
+    pub lan_error: Option<String>,
     pub port: u16,
     pub require_approval: bool,
     /// Which interfaces the server binds: `all` | `tailscale` | `loopback`.
@@ -320,6 +362,14 @@ pub struct WebRemoteStatus {
     /// The stable device id this desktop registers under, once a registration
     /// attempt has run. `None` before then.
     pub device_id: Option<String>,
+    /// Whether the iroh relay endpoint is bound right now.
+    pub relay_running: bool,
+    /// Why the relay transport is wanted but not bound. `None` when bound or
+    /// not wanted.
+    pub relay_error: Option<String>,
+    /// The last device-registration error (signed out, registry unreachable,
+    /// …). Carried on the broadcast so the readout refreshes when it changes.
+    pub registration_error: Option<String>,
 }
 
 /// A paired device as shown in the desktop management UI.
@@ -396,12 +446,20 @@ pub(crate) fn control_pair_from(
     shared: &Arc<Shared>,
     suggested_name: Option<String>,
 ) -> Result<ControlPairing, String> {
-    let (enabled, port) = {
+    let (enabled, lan_enabled, port) = {
         let cfg = shared.config.lock().unwrap();
-        (cfg.enabled, cfg.port)
+        (cfg.enabled, cfg.lan_enabled, cfg.port)
     };
     if !enabled {
         return Err("Remote access is not enabled — enable it in Settings first".to_string());
+    }
+    // A pairing link points at the LAN listener, so it is useless while that
+    // way in is switched off (e.g. a relay-only setup).
+    if !lan_enabled {
+        return Err(
+            "Access on your network is off — turn on \"On my network\" in Settings, or run `codemux remote enable`"
+                .to_string(),
+        );
     }
     let info = mint_pairing(shared, suggested_name);
     // Reuse the endpoint enumeration + its single `recommended` pick so the
@@ -468,7 +526,8 @@ pub struct ControlEnableResult {
 }
 
 /// Validate an enable request's scope and fold it (plus the port) into `cfg`,
-/// flipping `enabled` on. Pure so the config side of [`control_enable`] is
+/// flipping `enabled` and the LAN listener (`lan_enabled`) on — `codemux remote
+/// enable` / `serve` exist to open the network listener. Pure so the config side of [`control_enable`] is
 /// unit-testable without an `AppHandle`. On an unknown scope it returns a clear
 /// error and leaves `cfg` untouched (nothing is persisted).
 fn apply_enable_request(
@@ -482,6 +541,7 @@ fn apply_enable_request(
         }
     }
     cfg.enabled = true;
+    cfg.lan_enabled = true;
     if let Some(p) = port {
         cfg.port = p;
     }
@@ -507,12 +567,16 @@ fn recommended_endpoint(port: u16) -> Option<endpoints::Endpoint> {
 /// `codemux remote enable` CLI over SSH). Shares the exact bind/rollback and
 /// `web-remote-state-changed` emission paths the Tauri commands use:
 ///
-/// - Off → on: fold the requested `scope`/`port` into config, then run the same
-///   [`enable_core`] path (rolling `enabled` — and the scope/port — back on a
-///   bind failure such as `tailscale` with no tailnet address).
-/// - Already on with a `scope`/`port` flag: treat it as a config change and
-///   rebind through the same [`set_config_core`] path the Settings pane uses.
-/// - Already on with no flags: report it's already running with current status.
+/// - LAN listener already bound, no flags: report it's already running.
+/// - LAN listener already bound with a `scope`/`port` flag: rebind through the
+///   same [`set_config_core`] path the Settings pane uses (restoring the
+///   last-good scope/port if the new one can't bind).
+/// - Otherwise (off, relay-only, or persisted-on but not bound): fold the flags
+///   into config, turn the kill switch and the LAN listener on, and run the same
+///   [`enable_core`] path. If the listener still can't bind (e.g. `tailscale`
+///   with no tailnet address) the previous config is restored and the reason is
+///   returned — this command exists to open the network listener, so a run that
+///   leaves it closed is a failure.
 pub async fn control_enable<R: Runtime>(
     app: &AppHandle<R>,
     scope: Option<String>,
@@ -523,62 +587,42 @@ pub async fn control_enable<R: Runtime>(
     // an enable with no flags must keep the persisted port/scope/relay, and
     // must not persist a default over them.
     ensure_config_hydrated(app, &shared);
-    let already_enabled = shared.config.lock().unwrap().enabled;
     let already_bound = shared.runtime.lock().unwrap().is_some();
 
-    let (status, already_running) = if already_enabled {
-        if scope.is_some() || port.is_some() {
-            // A scope/port change while running rebinds via the same path a
-            // port change from the Settings pane uses (drops existing sockets).
-            let status =
-                set_config_core(app, &shared, port, None, scope, None, None, None).await?;
-            if already_bound {
-                (status, false)
-            } else {
-                // Persisted-enabled but nothing bound (headless serve leaves
-                // boot-time binding to its awaited startup path). `set_config_core`
-                // only *rebinds* an already-running listener, so an enable with
-                // flags would otherwise persist the new scope/port and leave the
-                // server off. Bind through the shared path instead.
-                (enable_core(app, &shared).await?, false)
-            }
-        } else if already_bound {
-            (build_status(app, &shared), true)
-        } else {
-            // The persisted switch can be on while no listener exists: most
-            // notably headless serve mode deliberately leaves boot-time bind
-            // restoration to its awaited startup path, and the GUI can also
-            // reach this state after a prior restore failure. Treat the live
-            // runtime as authoritative and actually bind instead of reporting
-            // a config bit as "already running".
-            (enable_core(app, &shared).await?, false)
-        }
-    } else {
-        // Was off. Capture the last-good scope/port so a failed bind (e.g.
-        // `--scope tailscale` with no tailnet) restores them rather than
-        // leaving a bad scope persisted with the server off.
-        let (old_port, old_scope) = {
-            let cfg = shared.config.lock().unwrap();
-            (cfg.port, cfg.bind_scope.clone())
+    let (status, already_running) = if already_bound && scope.is_none() && port.is_none() {
+        (build_status(app, &shared), true)
+    } else if already_bound {
+        // A scope/port change while running rebinds via the same path a port
+        // change from the Settings pane uses (drops existing LAN sockets).
+        let change = ConfigChange {
+            port,
+            bind_scope: scope,
+            ..ConfigChange::default()
         };
+        (set_config_core(app, &shared, change).await?, false)
+    } else {
+        // Capture the last-good config so a failed bind restores it rather
+        // than leaving a bad scope persisted with the listener down.
+        let previous = shared.config.lock().unwrap().clone();
         {
             let mut cfg = shared.config.lock().unwrap();
             apply_enable_request(&mut cfg, scope, port)?;
         }
-        match enable_core(app, &shared).await {
-            Ok(status) => (status, false),
-            Err(e) => {
-                // `enable_core` already rolled `enabled` back to false; restore
-                // the previous scope/port too and persist the last-good config.
-                {
-                    let mut cfg = shared.config.lock().unwrap();
-                    cfg.port = old_port;
-                    cfg.bind_scope = old_scope;
-                }
-                persist_config(app, &shared);
-                return Err(e);
+        let status = enable_core(app, &shared).await?;
+        if let Some(e) = status.lan_error.clone() {
+            {
+                let mut cfg = shared.config.lock().unwrap();
+                cfg.enabled = previous.enabled;
+                cfg.lan_enabled = previous.lan_enabled;
+                cfg.port = previous.port;
+                cfg.bind_scope = previous.bind_scope;
             }
+            persist_config(app, &shared);
+            reconcile_transports(app, &shared).await;
+            emit_state_changed(app);
+            return Err(e);
         }
+        (status, false)
     };
 
     let ep = recommended_endpoint(status.port);
@@ -597,8 +641,9 @@ pub async fn control_enable<R: Runtime>(
 /// off` when a GUI or `serve` already holds the control endpoint).
 ///
 /// Goes through the same [`set_config_core`] the Settings pane's relay switch
-/// uses, so the flag is persisted and — when the server is bound — the iroh
-/// endpoint plus device registration start/stop in lockstep. Deliberately the
+/// uses, so the flag is persisted and — whenever remote access is on, whether or
+/// not the LAN listener is bound — the iroh endpoint plus device registration
+/// start/stop in lockstep. Deliberately the
 /// only way the CLI flips relay mode on a live instance: writing the setting
 /// row directly would be silently overwritten the next time the instance
 /// persists its in-memory config.
@@ -607,7 +652,11 @@ pub async fn control_set_relay<R: Runtime>(
     enabled: bool,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
-    set_config_core(app, &shared, None, None, None, None, None, Some(enabled)).await
+    let change = ConfigChange {
+        relay_mode_enabled: Some(enabled),
+        ..ConfigChange::default()
+    };
+    set_config_core(app, &shared, change).await
 }
 
 /// Disable web remote access from the same-machine control socket (the
@@ -650,9 +699,12 @@ fn build_status<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> WebRemo
     let update = shared.update.lock().unwrap().clone();
     let iroh_node_id = shared.iroh.node_id();
     let registration = shared.registration.status();
+    let errors = shared.transport_errors.lock().unwrap().clone();
     WebRemoteStatus {
         enabled: cfg.enabled,
         running,
+        lan_enabled: cfg.lan_enabled,
+        lan_error: errors.lan,
         port: cfg.port,
         require_approval: cfg.require_approval,
         bind_scope: cfg.bind_scope.clone(),
@@ -668,6 +720,13 @@ fn build_status<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> WebRemo
         iroh_node_id,
         device_registered: registration.registered,
         device_id: registration.device_id,
+        relay_running: shared.iroh.is_running(),
+        relay_error: errors.relay,
+        registration_error: if cfg.enabled && cfg.relay_mode_enabled {
+            registration.last_error
+        } else {
+            None
+        },
     }
 }
 
@@ -840,7 +899,7 @@ async fn start_server<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> R
             let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
             let result = axum::serve(listener, service)
                 .with_graceful_shutdown(async move {
-                    // Resolves when `stop_server` flips the watch to `true`.
+                    // Resolves when `stop_lan` flips the watch to `true`.
                     let _ = shutdown_rx.changed().await;
                 })
                 .await;
@@ -858,22 +917,116 @@ async fn start_server<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> R
     Ok(())
 }
 
-fn stop_server(shared: &Arc<Shared>) {
-    // Sever every live socket up front. `with_graceful_shutdown` only stops the
-    // listener accepting *new* connections; an already-open WebSocket would
-    // otherwise keep working (and keep full desktop control) until it happened
-    // to reload. Disabling remote access is a security action, so kick every
-    // connected device immediately — the same mechanism revocation uses.
-    shared.connections.close_all();
+/// Stop the LAN listener and sever the sockets that arrived over it. Relay
+/// sessions don't ride this listener, so they are left alone — a phone on
+/// app.codemux.org keeps working while the LAN port rebinds or is turned off.
+///
+/// Severing matters: `with_graceful_shutdown` only stops the listener accepting
+/// *new* connections, and an already-open WebSocket would otherwise keep full
+/// desktop control until it happened to reload.
+fn stop_lan(shared: &Arc<Shared>) {
+    shared.connections.close_transport(server::Transport::Lan);
     if let Some(running) = shared.runtime.lock().unwrap().take() {
         let _ = running.shutdown.send(true);
     }
 }
 
-/// Load persisted config on boot and, if the feature was left enabled,
-/// re-bind the server. Called once from the Tauri `setup` hook — which the
-/// headless `codemux serve` app runs too (see `crate::build_headless_app`). A
-/// bind failure (port taken) is logged, not fatal — the desktop still runs.
+/// Stop the relay transport: sever its sessions, close the iroh endpoint, and
+/// stop refreshing this device's registration.
+fn stop_relay(shared: &Arc<Shared>) {
+    shared.connections.close_transport(server::Transport::Relay);
+    iroh::stop(shared);
+    registration::stop(shared);
+}
+
+/// Which transports should be running for `cfg`, as `(lan, relay)`. The kill
+/// switch gates both; under it each transport follows only its own switch —
+/// in particular the relay never depends on the LAN listener.
+fn desired_transports(cfg: &WebRemoteConfig) -> (bool, bool) {
+    (
+        cfg.enabled && cfg.lan_enabled,
+        cfg.enabled && cfg.relay_mode_enabled,
+    )
+}
+
+/// The start/stop seam [`reconcile_transports_with`] drives. Production is
+/// [`AppTransports`]; tests substitute a scripted driver so the "one transport
+/// failing never blocks the other" rule is checked without binding sockets.
+/// Starts must be idempotent (already running → `Ok`).
+trait TransportDriver {
+    async fn start_lan(&self) -> Result<(), String>;
+    fn stop_lan(&self);
+    async fn start_relay(&self) -> Result<(), String>;
+    fn stop_relay(&self);
+}
+
+struct AppTransports<'a, R: Runtime> {
+    app: &'a AppHandle<R>,
+    shared: &'a Arc<Shared>,
+}
+
+impl<R: Runtime> TransportDriver for AppTransports<'_, R> {
+    async fn start_lan(&self) -> Result<(), String> {
+        start_server(self.app, self.shared).await
+    }
+
+    fn stop_lan(&self) {
+        stop_lan(self.shared);
+    }
+
+    async fn start_relay(&self) -> Result<(), String> {
+        iroh::start(self.app, self.shared).await?;
+        // Register only once the endpoint is up, so the registry never
+        // advertises a node that isn't listening. No-op when signed out.
+        registration::start(self.app, self.shared);
+        Ok(())
+    }
+
+    fn stop_relay(&self) {
+        stop_relay(self.shared);
+    }
+}
+
+/// Bring each transport to the state the config asks for, independently, and
+/// record why a wanted transport failed to start. Never fails as a whole: a LAN
+/// bind failure (port taken, no tailnet address) must not keep the relay from
+/// registering, and vice versa.
+async fn reconcile_transports_with<D: TransportDriver>(shared: &Shared, driver: &D) {
+    let (want_lan, want_relay) = desired_transports(&shared.config.lock().unwrap());
+
+    let lan_error = if want_lan {
+        driver.start_lan().await.err()
+    } else {
+        driver.stop_lan();
+        None
+    };
+    if let Some(e) = &lan_error {
+        eprintln!("[codemux::web_remote] LAN listener could not start: {e}");
+    }
+    shared.transport_errors.lock().unwrap().lan = lan_error;
+
+    let relay_error = if want_relay {
+        driver.start_relay().await.err()
+    } else {
+        driver.stop_relay();
+        None
+    };
+    if let Some(e) = &relay_error {
+        eprintln!("[codemux::web_remote] relay transport could not start: {e}");
+    }
+    shared.transport_errors.lock().unwrap().relay = relay_error;
+}
+
+async fn reconcile_transports<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
+    reconcile_transports_with(shared, &AppTransports { app, shared }).await;
+}
+
+/// Load persisted config on boot and, if remote access was left on, bring each
+/// wanted transport back up. Called once from the Tauri `setup` hook — which
+/// the headless `codemux serve` app runs too (see `crate::build_headless_app`).
+/// A transport that fails to start is recorded in the status (and logged), not
+/// fatal, and never stops the other transport: the config keeps saying what the
+/// user asked for, and Settings shows why it isn't running.
 pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     let shared = app.state::<WebRemoteState>().shared();
     ensure_config_hydrated(app, &shared);
@@ -897,26 +1050,11 @@ pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     if !enabled {
         return;
     }
-    let relay_mode_enabled = shared.config.lock().unwrap().relay_mode_enabled;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let shared = app.state::<WebRemoteState>().shared();
-        match start_server(&app, &shared).await {
-            Ok(()) => {
-                // If the from-anywhere iroh transport was left enabled, bind it
-                // too (best-effort; never blocks or fails the boot restore).
-                if relay_mode_enabled {
-                    if let Err(e) = iroh::start(&app, &shared).await {
-                        eprintln!("[codemux::web_remote] restore-on-boot iroh bind failed: {e}");
-                    }
-                    // Re-register with the account device registry (best-effort;
-                    // no-op when signed out or the registry is unreachable).
-                    registration::start(&app, &shared);
-                }
-                emit_state_changed(&app);
-            }
-            Err(e) => eprintln!("[codemux::web_remote] restore-on-boot bind failed: {e}"),
-        }
+        reconcile_transports(&app, &shared).await;
+        emit_state_changed(&app);
     });
 }
 
@@ -959,6 +1097,7 @@ pub fn e2e_autostart<R: Runtime>(app: &AppHandle<R>) {
         {
             let mut cfg = shared.config.lock().unwrap();
             cfg.enabled = true;
+            cfg.lan_enabled = true;
             cfg.port = port;
             // Deterministic pairing for the harness: approval off.
             cfg.require_approval = false;
@@ -1002,12 +1141,17 @@ pub fn web_remote_status<R: Runtime>(app: AppHandle<R>) -> WebRemoteStatus {
     build_status(&app, &shared)
 }
 
-/// Flip `enabled` on and, if binding fails, roll it back off — the shared body
-/// of the `web_remote_enable` Tauri command and the `codemux remote enable`
-/// control command, so both persist config, bind (with rollback), start the
-/// parallel iroh transport when relay mode is on, and emit `web-remote-state-
-/// changed` through the exact same path. Callers that want to change the scope
-/// or port first mutate `shared.config`, then call this.
+/// Turn the kill switch on and bring up every transport that is switched on
+/// underneath it — the shared body of the `web_remote_enable` Tauri command and
+/// the `codemux remote enable` control command, so both persist config, start
+/// the transports, and emit `web-remote-state-changed` through the exact same
+/// path. Callers that want to change the scope or port first mutate
+/// `shared.config`, then call this.
+///
+/// Each transport starts independently: a LAN bind failure leaves `enabled` on
+/// (the relay may be up, and the user can fix the port and retry) and is
+/// reported as `lan_error` in the returned status rather than as an `Err`.
+/// Calling this again while enabled is the "retry" for a failed transport.
 async fn enable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<WebRemoteStatus, String> {
     // Enabling changes exactly one field. Hydrating first is what keeps the
     // `persist_config` below from writing the in-memory default over every
@@ -1015,27 +1159,7 @@ async fn enable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Re
     ensure_config_hydrated(app, shared);
     shared.config.lock().unwrap().enabled = true;
     persist_config(app, shared);
-    if let Err(e) = start_server(app, shared).await {
-        // Binding failed — e.g. the `tailscale` scope with no tailnet
-        // address, or the port is already taken. Roll the master switch back
-        // off so the UI never shows "enabled but not running", persist that,
-        // and surface the reason. The server stays off.
-        shared.config.lock().unwrap().enabled = false;
-        persist_config(app, shared);
-        emit_state_changed(app);
-        return Err(e);
-    }
-    // Bring the parallel iroh transport up too if relay mode was left enabled.
-    // A failure here is logged but never fails the enable — iroh is strictly
-    // additive over the primary `/ws` transport, which is already bound.
-    if shared.config.lock().unwrap().relay_mode_enabled {
-        if let Err(e) = iroh::start(app, shared).await {
-            eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
-        }
-        // Register this device with the account control plane so an account
-        // browser can discover it (best-effort; skips when signed out).
-        registration::start(app, shared);
-    }
+    reconcile_transports(app, shared).await;
     emit_state_changed(app);
     Ok(build_status(app, shared))
 }
@@ -1060,13 +1184,12 @@ fn disable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<
     ensure_config_hydrated(app, shared);
     mark_disabled(&mut shared.config.lock().unwrap());
     persist_config(app, shared);
-    // The master switch is the kill for *every* remote transport: `stop_server`
-    // severs all live sockets (iroh sessions included, via the shared registry's
-    // `close_all`), then tear the iroh endpoint down so it stops accepting and
-    // stop refreshing this device's registration.
-    stop_server(shared);
-    iroh::stop(shared);
-    registration::stop(shared);
+    // The master switch is the kill for *every* remote transport: stop both,
+    // then sever anything still connected regardless of how it came in.
+    stop_lan(shared);
+    stop_relay(shared);
+    shared.connections.close_all();
+    *shared.transport_errors.lock().unwrap() = TransportErrors::default();
     emit_state_changed(app);
     Ok(build_status(app, shared))
 }
@@ -1078,6 +1201,7 @@ pub fn web_remote_disable<R: Runtime>(app: AppHandle<R>) -> Result<WebRemoteStat
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn web_remote_set_config<R: Runtime>(
     app: AppHandle<R>,
     port: Option<u16>,
@@ -1086,19 +1210,64 @@ pub async fn web_remote_set_config<R: Runtime>(
     account_mode_enabled: Option<bool>,
     trust_account_browsers: Option<bool>,
     relay_mode_enabled: Option<bool>,
+    lan_enabled: Option<bool>,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
-    set_config_core(
-        &app,
-        &shared,
+    let change = ConfigChange {
         port,
         require_approval,
         bind_scope,
         account_mode_enabled,
         trust_account_browsers,
         relay_mode_enabled,
-    )
-    .await
+        lan_enabled,
+    };
+    set_config_core(&app, &shared, change).await
+}
+
+/// A partial config update. Every `Some(…)` is an intentional change; every
+/// `None` is left exactly as persisted.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfigChange {
+    pub port: Option<u16>,
+    pub require_approval: Option<bool>,
+    pub bind_scope: Option<String>,
+    pub account_mode_enabled: Option<bool>,
+    pub trust_account_browsers: Option<bool>,
+    pub relay_mode_enabled: Option<bool>,
+    pub lan_enabled: Option<bool>,
+}
+
+/// Fold `change` into `cfg`, returning whether the LAN listener's address
+/// (port or scope) changed. Pure so the config side is unit-testable.
+fn apply_config_change(cfg: &mut WebRemoteConfig, change: ConfigChange) -> bool {
+    let old_port = cfg.port;
+    let old_scope = cfg.bind_scope.clone();
+    if let Some(p) = change.port {
+        cfg.port = p;
+    }
+    if let Some(r) = change.require_approval {
+        cfg.require_approval = r;
+    }
+    if let Some(s) = change.bind_scope {
+        cfg.bind_scope = s;
+    }
+    // Account-mode toggles never rebind the listener (they only gate the
+    // `/api/pair-account` admission path).
+    if let Some(a) = change.account_mode_enabled {
+        cfg.account_mode_enabled = a;
+    }
+    if let Some(t) = change.trust_account_browsers {
+        cfg.trust_account_browsers = t;
+    }
+    // The two transport switches start/stop their own transport only.
+    if let Some(r) = change.relay_mode_enabled {
+        cfg.relay_mode_enabled = r;
+    }
+    if let Some(l) = change.lan_enabled {
+        cfg.lan_enabled = l;
+    }
+    cfg.port != old_port || cfg.bind_scope != old_scope
 }
 
 /// The shared body of [`web_remote_set_config`], taking the shared state
@@ -1107,75 +1276,39 @@ pub async fn web_remote_set_config<R: Runtime>(
 async fn set_config_core<R: Runtime>(
     app: &AppHandle<R>,
     shared: &Arc<Shared>,
-    port: Option<u16>,
-    require_approval: Option<bool>,
-    bind_scope: Option<String>,
-    account_mode_enabled: Option<bool>,
-    trust_account_browsers: Option<bool>,
-    relay_mode_enabled: Option<bool>,
+    change: ConfigChange,
 ) -> Result<WebRemoteStatus, String> {
-    // Every `Some(…)` below is an intentional change; every `None` must be left
+    // Every `Some(…)` is an intentional change; every `None` must be left
     // exactly as persisted, which requires the persisted values to be in memory
     // before the write-back.
     ensure_config_hydrated(app, shared);
 
     // Reject an unknown scope before mutating anything, so we never persist a
     // value the bind logic can't honour.
-    if let Some(ref s) = bind_scope {
+    if let Some(ref s) = change.bind_scope {
         if !is_valid_bind_scope(s) {
             return Err(format!("Unknown access scope: {s}"));
         }
     }
 
-    let (old_port, old_scope, port_changed, scope_changed, relay_target, relay_changed) = {
+    let (old_port, old_scope, address_changed) = {
         let mut cfg = shared.config.lock().unwrap();
-        let old_port = cfg.port;
-        let old_scope = cfg.bind_scope.clone();
-        let old_relay = cfg.relay_mode_enabled;
-        if let Some(p) = port {
-            cfg.port = p;
-        }
-        if let Some(r) = require_approval {
-            cfg.require_approval = r;
-        }
-        if let Some(s) = bind_scope {
-            cfg.bind_scope = s;
-        }
-        // Account-mode toggles never rebind the listener (they only gate the
-        // `/api/pair-account` admission path), so they're applied here and
-        // persisted without touching the running server.
-        if let Some(a) = account_mode_enabled {
-            cfg.account_mode_enabled = a;
-        }
-        if let Some(t) = trust_account_browsers {
-            cfg.trust_account_browsers = t;
-        }
-        // The iroh transport toggle is a start/stop of a *parallel* endpoint,
-        // never a rebind of the axum listener — applied below, after persist.
-        if let Some(r) = relay_mode_enabled {
-            cfg.relay_mode_enabled = r;
-        }
-        (
-            old_port,
-            old_scope.clone(),
-            cfg.port != old_port,
-            cfg.bind_scope != old_scope,
-            cfg.relay_mode_enabled,
-            cfg.relay_mode_enabled != old_relay,
-        )
+        let (old_port, old_scope) = (cfg.port, cfg.bind_scope.clone());
+        let changed = apply_config_change(&mut cfg, change);
+        (old_port, old_scope, changed)
     };
     persist_config(app, shared);
 
-    // A port or scope change while running requires a rebind (the same
-    // stop→start path a port change already used, which also drops existing
-    // connections — they can't follow to a new port/interface).
-    let running = shared.runtime.lock().unwrap().is_some();
-    if running && (port_changed || scope_changed) {
-        stop_server(shared);
+    // A port or scope change while the LAN listener is bound requires a rebind
+    // (which drops its sockets — they can't follow to a new port/interface).
+    // Relay sessions are unaffected.
+    let lan_bound = shared.runtime.lock().unwrap().is_some();
+    if lan_bound && address_changed {
+        stop_lan(shared);
         if let Err(e) = start_server(app, shared).await {
             // The new binding failed (e.g. switching to `tailscale` with no
-            // tailnet address). Restore the previous config and rebind to it
-            // so the server keeps running on its last-good address instead of
+            // tailnet address). Restore the previous address and rebind to it
+            // so the listener keeps running on its last-good address instead of
             // being left off, then report why the change was rejected.
             {
                 let mut cfg = shared.config.lock().unwrap();
@@ -1183,30 +1316,16 @@ async fn set_config_core<R: Runtime>(
                 cfg.bind_scope = old_scope;
             }
             persist_config(app, shared);
-            let _ = start_server(app, shared).await;
+            reconcile_transports(app, shared).await;
             emit_state_changed(app);
             return Err(e);
         }
     }
 
-    // Apply an iroh relay-mode toggle. It only *runs* while the feature itself
-    // is bound (`running`); turning it on while the server is off just persists
-    // the flag, and `web_remote_enable` starts the endpoint then. An iroh start
-    // failure is logged, never fatal — the primary `/ws` transport is unaffected.
-    if relay_changed {
-        if relay_target {
-            if running {
-                if let Err(e) = iroh::start(app, shared).await {
-                    eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
-                }
-                // Start device registration in lockstep with the endpoint.
-                registration::start(app, shared);
-            }
-        } else {
-            iroh::stop(shared);
-            registration::stop(shared);
-        }
-    }
+    // Start or stop each transport to match its switch. Turning the relay on
+    // no longer waits for the LAN listener: it comes up whenever remote access
+    // is on. A transport that can't start is reported in the status.
+    reconcile_transports(app, shared).await;
 
     emit_state_changed(app);
     Ok(build_status(app, shared))
@@ -1361,6 +1480,7 @@ mod tests {
     fn config_roundtrips_through_json() {
         let cfg = WebRemoteConfig {
             enabled: true,
+            lan_enabled: true,
             port: 5000,
             require_approval: true,
             bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
@@ -1415,6 +1535,7 @@ mod tests {
     fn account_config_roundtrips_through_json() {
         let cfg = WebRemoteConfig {
             enabled: true,
+            lan_enabled: true,
             port: 4377,
             require_approval: false,
             bind_scope: BIND_SCOPE_ALL.to_string(),
@@ -1451,6 +1572,8 @@ mod tests {
         let status = WebRemoteStatus {
             enabled: true,
             running: true,
+            lan_enabled: true,
+            lan_error: None,
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: BIND_SCOPE_ALL.to_string(),
@@ -1466,6 +1589,9 @@ mod tests {
             iroh_node_id: None,
             device_registered: false,
             device_id: None,
+            relay_running: false,
+            relay_error: None,
+            registration_error: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["account_mode_enabled"], true);
@@ -1479,6 +1605,8 @@ mod tests {
         let status = WebRemoteStatus {
             enabled: true,
             running: true,
+            lan_enabled: true,
+            lan_error: None,
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
@@ -1494,6 +1622,9 @@ mod tests {
             iroh_node_id: None,
             device_registered: false,
             device_id: None,
+            relay_running: false,
+            relay_error: None,
+            registration_error: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["bind_scope"], "tailscale");
@@ -1559,7 +1690,11 @@ mod tests {
     #[test]
     fn control_pair_when_enabled_mints_a_usable_single_use_token() {
         let shared = Arc::new(Shared::default());
-        shared.config.lock().unwrap().enabled = true;
+        {
+            let mut cfg = shared.config.lock().unwrap();
+            cfg.enabled = true;
+            cfg.lan_enabled = true;
+        }
 
         let res = control_pair_from(&shared, Some("Phone".to_string())).unwrap();
         // The URL is the recommended endpoint's origin + the pairing fragment;
@@ -1676,6 +1811,8 @@ mod tests {
         let status = WebRemoteStatus {
             enabled: true,
             running: true,
+            lan_enabled: true,
+            lan_error: None,
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: BIND_SCOPE_ALL.to_string(),
@@ -1691,6 +1828,9 @@ mod tests {
             iroh_node_id: None,
             device_registered: false,
             device_id: None,
+            relay_running: false,
+            relay_error: None,
+            registration_error: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["active_connections"], 3);
@@ -1706,6 +1846,8 @@ mod tests {
         let status = WebRemoteStatus {
             enabled: true,
             running: true,
+            lan_enabled: true,
+            lan_error: None,
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: BIND_SCOPE_ALL.to_string(),
@@ -1721,6 +1863,9 @@ mod tests {
             iroh_node_id: None,
             device_registered: false,
             device_id: None,
+            relay_running: false,
+            relay_error: None,
+            registration_error: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["update_available"], true);
@@ -1844,6 +1989,335 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
         assert!(!cfg.relay_mode_enabled);
+    }
+
+    // ── Transport independence (the kill switch + per-way-in switches) ──
+
+    /// A [`TransportDriver`] that records calls and fails on request, so the
+    /// reconcile rules are checked without binding sockets or an iroh endpoint.
+    #[derive(Default)]
+    struct ScriptedDriver {
+        lan_fails_with: Option<String>,
+        relay_fails_with: Option<String>,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl ScriptedDriver {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TransportDriver for ScriptedDriver {
+        async fn start_lan(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("start_lan");
+            self.lan_fails_with.clone().map_or(Ok(()), Err)
+        }
+        fn stop_lan(&self) {
+            self.calls.lock().unwrap().push("stop_lan");
+        }
+        async fn start_relay(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("start_relay");
+            self.relay_fails_with.clone().map_or(Ok(()), Err)
+        }
+        fn stop_relay(&self) {
+            self.calls.lock().unwrap().push("stop_relay");
+        }
+    }
+
+    fn shared_with(cfg: WebRemoteConfig) -> Shared {
+        let shared = Shared::default();
+        *shared.config.lock().unwrap() = cfg;
+        shared
+    }
+
+    #[tokio::test]
+    async fn relay_starts_even_when_the_lan_listener_fails_to_bind() {
+        // The bug this split exists for: with the LAN listener unable to bind,
+        // turning relay on used to persist the flag and do nothing else, so the
+        // device never registered and app.codemux.org stayed empty.
+        let shared = shared_with(WebRemoteConfig {
+            enabled: true,
+            lan_enabled: true,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        });
+        let driver = ScriptedDriver {
+            lan_fails_with: Some("bind 0.0.0.0:4377: Address already in use".into()),
+            ..ScriptedDriver::default()
+        };
+
+        reconcile_transports_with(&shared, &driver).await;
+
+        assert_eq!(driver.calls(), vec!["start_lan", "start_relay"]);
+        let errors = shared.transport_errors.lock().unwrap().clone();
+        assert_eq!(
+            errors.lan.as_deref(),
+            Some("bind 0.0.0.0:4377: Address already in use"),
+            "the bind failure is kept for Settings to show"
+        );
+        assert_eq!(errors.relay, None, "the relay came up regardless");
+        assert!(
+            shared.config.lock().unwrap().enabled,
+            "a failed LAN bind never flips the kill switch off behind the user's back"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_only_setup_never_opens_the_lan_listener() {
+        let shared = shared_with(WebRemoteConfig {
+            enabled: true,
+            lan_enabled: false,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        });
+        let driver = ScriptedDriver::default();
+
+        reconcile_transports_with(&shared, &driver).await;
+
+        assert_eq!(driver.calls(), vec!["stop_lan", "start_relay"]);
+    }
+
+    #[tokio::test]
+    async fn a_relay_failure_is_recorded_without_touching_the_lan_listener() {
+        let shared = shared_with(WebRemoteConfig {
+            enabled: true,
+            lan_enabled: true,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        });
+        let driver = ScriptedDriver {
+            relay_fails_with: Some("iroh endpoint bind failed".into()),
+            ..ScriptedDriver::default()
+        };
+
+        reconcile_transports_with(&shared, &driver).await;
+
+        let errors = shared.transport_errors.lock().unwrap().clone();
+        assert_eq!(errors.lan, None);
+        assert_eq!(errors.relay.as_deref(), Some("iroh endpoint bind failed"));
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_stops_both_transports_and_clears_their_errors() {
+        let shared = shared_with(WebRemoteConfig {
+            enabled: false,
+            lan_enabled: true,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        });
+        *shared.transport_errors.lock().unwrap() = TransportErrors {
+            lan: Some("stale".into()),
+            relay: Some("stale".into()),
+        };
+        let driver = ScriptedDriver::default();
+
+        reconcile_transports_with(&shared, &driver).await;
+
+        assert_eq!(driver.calls(), vec!["stop_lan", "stop_relay"]);
+        let errors = shared.transport_errors.lock().unwrap().clone();
+        assert_eq!(errors.lan, None, "an unwanted transport has no error to show");
+        assert_eq!(errors.relay, None);
+    }
+
+    #[tokio::test]
+    async fn a_successful_retry_clears_the_previous_error() {
+        let shared = shared_with(WebRemoteConfig {
+            enabled: true,
+            lan_enabled: true,
+            ..WebRemoteConfig::default()
+        });
+        shared.transport_errors.lock().unwrap().lan = Some("port taken".into());
+
+        reconcile_transports_with(&shared, &ScriptedDriver::default()).await;
+
+        assert_eq!(shared.transport_errors.lock().unwrap().lan, None);
+    }
+
+    /// The boot path from issue #404, end to end with the real transports: the
+    /// LAN port is taken and relay mode is on. The listener must report the
+    /// bind error, the kill switch must stay on, and the iroh relay endpoint
+    /// must still come up (creating the device identity key it registers with).
+    ///
+    /// Ignored because it binds real sockets and an iroh endpoint and writes
+    /// that key under the data dir. Run it against throwaway dirs:
+    ///
+    /// ```sh
+    /// HOME=$(mktemp -d) XDG_DATA_HOME=$(mktemp -d) cargo test -j 2 \
+    ///   --manifest-path src-tauri/Cargo.toml relay_boots_with_the_lan_port_taken \
+    ///   -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "binds real sockets + an iroh endpoint and writes the identity key under the data dir"]
+    fn relay_boots_with_the_lan_port_taken() {
+        use tauri::Manager as _;
+
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().unwrap().port();
+
+        let app = tauri::test::mock_app();
+        app.manage(crate::database::DatabaseStore::new_in_memory());
+        app.manage(WebRemoteState::default());
+        let handle = app.handle().clone();
+        save_config_to_db(
+            &handle.state::<crate::database::DatabaseStore>(),
+            &WebRemoteConfig {
+                enabled: true,
+                lan_enabled: true,
+                relay_mode_enabled: true,
+                port,
+                bind_scope: BIND_SCOPE_LOOPBACK.to_string(),
+                ..WebRemoteConfig::default()
+            },
+        )
+        .unwrap();
+
+        restore_on_boot(&handle);
+
+        let shared = handle.state::<WebRemoteState>().shared();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            let status = build_status(&handle, &shared);
+            if status.relay_running && status.lan_error.is_some() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transports never settled: {status:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+
+        assert!(status.enabled, "the kill switch stays on");
+        assert!(!status.running, "the LAN listener could not bind");
+        assert!(
+            status.lan_error.as_deref().unwrap().contains("in use"),
+            "the real bind error is reported: {:?}",
+            status.lan_error
+        );
+        assert!(status.relay_running, "the relay came up regardless");
+        assert!(status.relay_error.is_none());
+        assert!(
+            status.iroh_node_id.is_some(),
+            "the identity key registration needs now exists"
+        );
+
+        stop_relay(&shared);
+        drop(blocker);
+    }
+
+    #[test]
+    fn desired_transports_follow_their_own_switch_under_the_kill_switch() {
+        let cfg = |enabled, lan_enabled, relay_mode_enabled| WebRemoteConfig {
+            enabled,
+            lan_enabled,
+            relay_mode_enabled,
+            ..WebRemoteConfig::default()
+        };
+        assert_eq!(desired_transports(&cfg(false, true, true)), (false, false));
+        assert_eq!(desired_transports(&cfg(true, true, false)), (true, false));
+        assert_eq!(desired_transports(&cfg(true, false, true)), (false, true));
+        assert_eq!(desired_transports(&cfg(true, true, true)), (true, true));
+    }
+
+    #[test]
+    fn config_without_lan_enabled_keeps_its_listener() {
+        // Before the split, `enabled` *was* the LAN listener. A config persisted
+        // then must come back with the listener still on.
+        let legacy = r#"{"enabled":true,"port":4377,"require_approval":false,"bind_scope":"all","relay_mode_enabled":true}"#;
+        let cfg: WebRemoteConfig = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.lan_enabled);
+        // A fresh config opens nothing on the network until asked to.
+        assert!(!WebRemoteConfig::default().lan_enabled);
+    }
+
+    #[test]
+    fn apply_enable_request_turns_the_lan_listener_on() {
+        // `codemux remote enable` exists to open the network listener, so it
+        // turns that way in back on after a relay-only setup.
+        let mut cfg = WebRemoteConfig {
+            lan_enabled: false,
+            ..WebRemoteConfig::default()
+        };
+        apply_enable_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.enabled && cfg.lan_enabled);
+    }
+
+    #[test]
+    fn control_pair_errors_when_the_lan_listener_is_off() {
+        // Pairing links point at the LAN listener; in a relay-only setup there
+        // is nothing for the link to reach.
+        let shared = Arc::new(Shared::default());
+        {
+            let mut cfg = shared.config.lock().unwrap();
+            cfg.enabled = true;
+            cfg.lan_enabled = false;
+        }
+        let err = control_pair_from(&shared, None).unwrap_err();
+        assert!(err.contains("On my network"), "clear error: {err}");
+        assert_eq!(shared.pairing.live_count(), 0);
+    }
+
+    #[test]
+    fn config_change_reports_address_changes_only() {
+        let mut cfg = WebRemoteConfig::default();
+        let toggles = ConfigChange {
+            lan_enabled: Some(false),
+            relay_mode_enabled: Some(true),
+            require_approval: Some(true),
+            ..ConfigChange::default()
+        };
+        assert!(!apply_config_change(&mut cfg, toggles), "switches never rebind");
+        assert!(!cfg.lan_enabled && cfg.relay_mode_enabled && cfg.require_approval);
+
+        let same_port = ConfigChange {
+            port: Some(cfg.port),
+            ..ConfigChange::default()
+        };
+        assert!(!apply_config_change(&mut cfg, same_port));
+
+        let scope = ConfigChange {
+            bind_scope: Some(BIND_SCOPE_LOOPBACK.into()),
+            ..ConfigChange::default()
+        };
+        assert!(apply_config_change(&mut cfg, scope));
+    }
+
+    #[test]
+    fn status_carries_transport_fields_in_snake_case() {
+        // Settings renders each way in from these fields, so the wire names are
+        // a contract with the frontend.
+        let status = WebRemoteStatus {
+            enabled: true,
+            running: false,
+            lan_enabled: true,
+            lan_error: Some("bind 0.0.0.0:4377: Address already in use".into()),
+            port: DEFAULT_PORT,
+            require_approval: false,
+            bind_scope: BIND_SCOPE_ALL.to_string(),
+            active_connections: 0,
+            connected_sessions: 0,
+            sessions: vec![],
+            update_available: false,
+            update_version: None,
+            account_mode_enabled: false,
+            trust_account_browsers: false,
+            account_signed_in: true,
+            relay_mode_enabled: true,
+            iroh_node_id: Some("node".into()),
+            device_registered: true,
+            device_id: None,
+            relay_running: true,
+            relay_error: None,
+            registration_error: None,
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v["lan_enabled"], true);
+        assert_eq!(v["lan_error"], "bind 0.0.0.0:4377: Address already in use");
+        assert_eq!(v["relay_running"], true);
+        assert!(v["relay_error"].is_null());
+        assert!(v["registration_error"].is_null());
+        assert!(v.get("lanError").is_none(), "no camelCase leakage");
     }
 
     #[test]

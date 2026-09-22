@@ -26,7 +26,8 @@
 //! [`axum::extract::ws::Message`]s the [`super::dispatch::ChannelRouter`] and
 //! [`super::events::EventHub`] already produce, re-encoded onto the wire. The
 //! connection registers in the **shared** [`super::server::ConnectionRegistry`],
-//! so revocation and `close_all` sever iroh sessions exactly as they do WS ones.
+//! so revocation and `close_all` sever iroh sessions exactly as they do WS ones
+//! (tagged as the relay transport, so turning relay off severs only these).
 //!
 //! ## Wire codec (kind-tagged, length-delimited)
 //!
@@ -748,8 +749,9 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
 
 /// Stop the iroh endpoint (abort its accept loop and close it gracefully). Live
 /// iroh sessions are severed separately via the shared [`ConnectionRegistry`]
-/// (`close_all`), exactly like the WS transport — this just stops accepting new
-/// connections and releases the endpoint. Safe to call when not running.
+/// (`close_transport(Relay)` / `close_all`), exactly like the WS transport — this
+/// just stops accepting new connections and releases the endpoint. Safe to call
+/// when not running.
 ///
 /// [`ConnectionRegistry`]: super::server::ConnectionRegistry
 pub(crate) fn stop(shared: &Arc<Shared>) {
@@ -868,7 +870,7 @@ async fn handle_bi_stream<R: Runtime>(
     let (close_tx, mut close_rx) = watch::channel(false);
     let conn_id = shared
         .connections
-        .register(&session_id, out_tx.clone(), close_tx.clone());
+        .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
     super::emit_state_changed(&app);
 
     // 3. Acknowledge, then hand the send half to the writer task.
@@ -1575,7 +1577,7 @@ mod tests {
         let (close_tx, mut close_rx) = watch::channel(false);
         let conn_id = shared
             .connections
-            .register(&session_id, out_tx.clone(), close_tx.clone());
+            .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
 
         let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
         let writer = tokio::spawn(writer_loop(send, out_rx));

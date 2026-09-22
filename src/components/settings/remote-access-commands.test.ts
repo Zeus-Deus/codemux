@@ -53,6 +53,7 @@ describe("web_remote_* command wrappers", () => {
       accountModeEnabled: null,
       trustAccountBrowsers: null,
       relayModeEnabled: null,
+      lanEnabled: null,
     });
 
     webRemoteSetConfig({ requireApproval: true });
@@ -63,6 +64,7 @@ describe("web_remote_* command wrappers", () => {
       accountModeEnabled: null,
       trustAccountBrowsers: null,
       relayModeEnabled: null,
+      lanEnabled: null,
     });
 
     webRemoteSetConfig({ bindScope: "tailscale" });
@@ -73,6 +75,7 @@ describe("web_remote_* command wrappers", () => {
       accountModeEnabled: null,
       trustAccountBrowsers: null,
       relayModeEnabled: null,
+      lanEnabled: null,
     });
 
     // Account-mode toggles ride the same command; neither rebinds the listener.
@@ -84,6 +87,7 @@ describe("web_remote_* command wrappers", () => {
       accountModeEnabled: true,
       trustAccountBrowsers: null,
       relayModeEnabled: null,
+      lanEnabled: null,
     });
 
     webRemoteSetConfig({ trustAccountBrowsers: true });
@@ -94,6 +98,7 @@ describe("web_remote_* command wrappers", () => {
       accountModeEnabled: null,
       trustAccountBrowsers: true,
       relayModeEnabled: null,
+      lanEnabled: null,
     });
 
     // The from-anywhere iroh transport toggle rides the same command.
@@ -105,6 +110,19 @@ describe("web_remote_* command wrappers", () => {
       accountModeEnabled: null,
       trustAccountBrowsers: null,
       relayModeEnabled: true,
+      lanEnabled: null,
+    });
+
+    // So does the LAN listener's own switch.
+    webRemoteSetConfig({ lanEnabled: false });
+    expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
+      port: null,
+      requireApproval: null,
+      bindScope: null,
+      accountModeEnabled: null,
+      trustAccountBrowsers: null,
+      relayModeEnabled: null,
+      lanEnabled: false,
     });
   });
 

@@ -3071,13 +3071,64 @@ let webRemoteBindScope: WebRemoteBindScope = "all";
 let webRemoteAccountMode = true;
 let webRemoteTrustAccount = false;
 const webRemoteAccountSignedIn = true;
+// The two ways in, each with its own switch under the kill switch. The relay
+// registers a moment after it comes up so the "Registering…" state is visible.
+let webRemoteLanEnabled = false;
+let webRemoteRelayEnabled = false;
+let webRemoteRegisteredAt: string | null = null;
+let webRemoteRegisterTimer: ReturnType<typeof setTimeout> | null = null;
+// Set via `__codemuxRemoteMock.failLanBind(...)` to show the LAN listener's
+// failure state (port taken, no tailnet address).
+let webRemoteLanBindError: string | null = null;
+const MOCK_RELAY_NODE_ID =
+  "4f1c9a7e2b6d8053a1e4c7f0b9d2e6a3c5f8b1d4e7a0c3f6b9d2e5a8c1f4b7e0";
+
+function webRemoteLanRunning(): boolean {
+  return webRemoteEnabled && webRemoteLanEnabled && !webRemoteLanBindError;
+}
+
+function webRemoteRelayRunning(): boolean {
+  return webRemoteEnabled && webRemoteRelayEnabled;
+}
+
+/** Mirror the backend's reconcile: the relay registers on its own schedule,
+ *  independent of the LAN listener. */
+function reconcileMockRelay(): void {
+  if (!webRemoteRelayRunning()) {
+    if (webRemoteRegisterTimer) clearTimeout(webRemoteRegisterTimer);
+    webRemoteRegisterTimer = null;
+    webRemoteRegisteredAt = null;
+    return;
+  }
+  if (webRemoteRegisteredAt || webRemoteRegisterTimer) return;
+  webRemoteRegisterTimer = setTimeout(() => {
+    webRemoteRegisterTimer = null;
+    if (!webRemoteRelayRunning()) return;
+    webRemoteRegisteredAt = new Date().toISOString();
+    emitWebRemoteState();
+  }, 1200);
+}
+
+function buildWebRemoteRegistration() {
+  return {
+    registered: webRemoteRegisteredAt !== null,
+    device_id: "b7d0c1e2-mock-device",
+    name: "mac-studio",
+    node_id: MOCK_RELAY_NODE_ID,
+    last_registered_at: webRemoteRegisteredAt,
+    last_error: null,
+  };
+}
 let webRemoteSessions: WebRemoteSessionView[] = mockWebRemoteSessions();
 let webRemoteLiveSeq = 0;
 
 function buildWebRemoteStatus(): WebRemoteStatus {
   return {
     enabled: webRemoteEnabled,
-    running: webRemoteEnabled,
+    running: webRemoteLanRunning(),
+    lan_enabled: webRemoteLanEnabled,
+    lan_error:
+      webRemoteEnabled && webRemoteLanEnabled ? webRemoteLanBindError : null,
     port: webRemotePort,
     require_approval: webRemoteRequireApproval,
     bind_scope: webRemoteBindScope,
@@ -3093,6 +3144,13 @@ function buildWebRemoteStatus(): WebRemoteStatus {
     account_mode_enabled: webRemoteAccountMode,
     trust_account_browsers: webRemoteTrustAccount,
     account_signed_in: webRemoteAccountSignedIn,
+    relay_mode_enabled: webRemoteRelayEnabled,
+    relay_running: webRemoteRelayRunning(),
+    relay_error: null,
+    iroh_node_id: webRemoteRelayEnabled ? MOCK_RELAY_NODE_ID : null,
+    device_registered: webRemoteRegisteredAt !== null,
+    device_id: webRemoteRelayEnabled ? "b7d0c1e2-mock-device" : null,
+    registration_error: null,
   };
 }
 
@@ -3119,6 +3177,7 @@ function emitWebRemoteState(): void {
       addPendingDevice(name?: string): string;
       addAccountDevice(name?: string): string;
       setConnected(id: string, connected: boolean): void;
+      failLanBind(reason?: string | null): void;
     };
   }
 ).__codemuxRemoteMock = {
@@ -3165,6 +3224,14 @@ function emitWebRemoteState(): void {
     webRemoteSessions = webRemoteSessions.map((s) =>
       s.id === id ? { ...s, connected } : s,
     );
+    emitWebRemoteState();
+  },
+  /** Simulate the LAN listener failing to bind (pass `null` to clear). */
+  failLanBind(reason?: string | null): void {
+    webRemoteLanBindError =
+      reason === undefined
+        ? `bind 0.0.0.0:${webRemotePort}: Address already in use (os error 98)`
+        : reason;
     emitWebRemoteState();
   },
 };
@@ -5235,11 +5302,13 @@ const handlers: Record<string, Handler> = {
   web_remote_status: () => buildWebRemoteStatus(),
   web_remote_enable: () => {
     webRemoteEnabled = true;
+    reconcileMockRelay();
     emitWebRemoteState();
     return buildWebRemoteStatus();
   },
   web_remote_disable: () => {
     webRemoteEnabled = false;
+    reconcileMockRelay();
     emitWebRemoteState();
     return buildWebRemoteStatus();
   },
@@ -5261,9 +5330,19 @@ const handlers: Record<string, Handler> = {
     if (typeof a.trustAccountBrowsers === "boolean") {
       webRemoteTrustAccount = a.trustAccountBrowsers;
     }
+    if (typeof a.relayModeEnabled === "boolean") {
+      webRemoteRelayEnabled = a.relayModeEnabled;
+    }
+    if (typeof a.lanEnabled === "boolean") {
+      webRemoteLanEnabled = a.lanEnabled;
+    }
+    // A port change is how a user clears a "port taken" bind failure.
+    if (typeof a.port === "number") webRemoteLanBindError = null;
+    reconcileMockRelay();
     emitWebRemoteState();
     return buildWebRemoteStatus();
   },
+  web_remote_registration_status: () => buildWebRemoteRegistration(),
   web_remote_create_pairing: () => mockWebRemotePairing(),
   web_remote_list_endpoints: () => mockWebRemoteEndpoints(webRemotePort),
   web_remote_list_sessions: () => webRemoteSessions,

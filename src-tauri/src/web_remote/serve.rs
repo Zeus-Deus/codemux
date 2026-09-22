@@ -183,17 +183,7 @@ pub async fn serve_startup<R: tauri::Runtime>(
     // note it is NOT passed as `Some(false)` when the flag is absent, so an
     // omitted `--relay` can never turn a persisted relay off.)
     if opts.relay {
-        match web_remote::web_remote_set_config(
-            handle.clone(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(true),
-        )
-        .await
-        {
+        match web_remote::control_set_relay(handle, true).await {
             Ok(status) => result.status = status,
             Err(e) => eprintln!("[codemux serve] relay transport could not be enabled: {e}"),
         }
