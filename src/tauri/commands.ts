@@ -3189,6 +3189,12 @@ export const webRemoteSetConfig = (opts: {
     relayModeEnabled: opts.relayModeEnabled ?? null,
   });
 
+/** Retry bringing remote access up now: re-attempts the LAN listener bind
+ *  (rejecting with the reason if it still fails — the backend keeps retrying
+ *  in the background) and re-runs relay registration when relay mode is on. */
+export const webRemoteRetry = () =>
+  invoke<WebRemoteStatus>("web_remote_retry");
+
 /** The device's stable iroh `node_id` (its `EndpointId`) — the address a
  *  hosted-origin browser dials to reach this desktop over the relay transport.
  *  `null` until relay mode has been enabled at least once (the identity key is

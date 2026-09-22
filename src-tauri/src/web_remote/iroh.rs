@@ -627,7 +627,7 @@ fn load_or_create_secret_key() -> Result<SecretKey, String> {
                 return Ok(SecretKey::from_bytes(&arr));
             }
         }
-        eprintln!(
+        log::warn!(
             "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
             path.display()
         );
@@ -670,6 +670,10 @@ struct RunningIroh {
 #[derive(Default)]
 pub struct IrohManager {
     inner: Mutex<Option<RunningIroh>>,
+    /// Serialises [`start`]: the enable path, the Settings toggle, and the
+    /// registration supervisor can all try to bring the endpoint up at once,
+    /// and two concurrent binds would leak the loser's endpoint.
+    start_lock: tokio::sync::Mutex<()>,
     /// `node_id` of the running endpoint (cached so the command can answer
     /// without touching the endpoint).
     node_id: Mutex<Option<String>>,
@@ -702,6 +706,7 @@ impl IrohManager {
 /// Bind the desktop iroh endpoint and start accepting connections. Idempotent.
 /// Runs on the app's existing tokio runtime — no second runtime is spawned.
 pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<(), String> {
+    let _start = shared.iroh.start_lock.lock().await;
     if shared.iroh.is_running() {
         return Ok(());
     }
@@ -713,8 +718,16 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
         .await
         .map_err(|e| format!("iroh endpoint bind failed: {e}"))?;
 
+    // Relay mode may have been switched off while the bind was in flight (the
+    // stop path found nothing to tear down yet). Don't install an endpoint
+    // nobody wants.
+    if !super::relay_wanted(&shared.config.lock().unwrap()) {
+        endpoint.close().await;
+        return Ok(());
+    }
+
     let node_id = endpoint.id().to_string();
-    eprintln!("[codemux::web_remote] iroh relay transport enabled: node_id={node_id}");
+    log::info!("[codemux::web_remote] iroh relay transport enabled: node_id={node_id}");
 
     // Log the home relay once one is established (proof the relay accepted us).
     // Non-blocking: enabling must not wait on the relay handshake.
@@ -728,7 +741,7 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
                 .next()
                 .map(|u| u.to_string())
                 .unwrap_or_else(|| "<none>".to_string());
-            eprintln!(
+            log::info!(
                 "[codemux::web_remote] iroh home relay for node {}: {relay}",
                 ep.id()
             );

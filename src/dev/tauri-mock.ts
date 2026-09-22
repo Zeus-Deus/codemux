@@ -123,6 +123,7 @@ import type {
   ThemeColors,
   UserSettings,
   WebRemoteBindScope,
+  WebRemoteRegistrationStatus,
   WebRemoteSessionView,
   WebRemoteStatus,
   WorkspaceSnapshot,
@@ -3073,11 +3074,87 @@ let webRemoteTrustAccount = false;
 const webRemoteAccountSignedIn = true;
 let webRemoteSessions: WebRemoteSessionView[] = mockWebRemoteSessions();
 let webRemoteLiveSeq = 0;
+// From-anywhere (relay) transport + the failure states it can be in, so the
+// Settings pane's error surfaces are demoable (see `failBind` /
+// `failRegistration` on `window.__codemuxRemoteMock`).
+let webRemoteRelayMode = false;
+let webRemoteBindError: string | null = null;
+let webRemoteRegistrationError: string | null = null;
+// Registration attempted but not yet settled, with no reason recorded — the
+// state the pre-#404 backend left behind when relay mode never started.
+let webRemoteRegistrationPending = false;
+// The relay endpoint never came up (no identity key, so no node id either).
+let webRemoteRelayDown = false;
+const MOCK_IROH_NODE_ID =
+  "8f3c2a61d94e0b7f5a1c6e2d9b4f7a03c5e8d1b6f2a9c4e7d0b3a6f9c2e5d8b1";
+
+// Dev-only seeding for the Remote Access failure states (screenshots, manual
+// QA): `?webRemoteMock=bind-failed` (listener down, relay registered),
+// `registration-failed` (listener up, registration erroring), or `issue-404`
+// (listener down and registration silently pending — the pre-fix state).
+{
+  const scenario = new URLSearchParams(location.search).get("webRemoteMock");
+  if (scenario) {
+    webRemoteEnabled = true;
+    webRemoteRelayMode = true;
+  }
+  if (scenario === "bind-failed" || scenario === "issue-404") {
+    webRemoteBindError =
+      "No Tailscale address found — connect Tailscale or choose a different access scope";
+    webRemoteBindScope = "tailscale";
+  }
+  if (scenario === "issue-404") {
+    webRemoteRegistrationPending = true;
+    webRemoteRelayDown = true;
+  }
+  if (scenario === "registration-failed") {
+    webRemoteRegistrationError =
+      "device registration returned 503 Service Unavailable";
+  }
+}
+
+function webRemoteRunning(): boolean {
+  return webRemoteEnabled && webRemoteBindError == null;
+}
+
+function webRemoteRegistered(): boolean {
+  return (
+    webRemoteEnabled &&
+    webRemoteRelayMode &&
+    webRemoteRegistrationError == null &&
+    !webRemoteRegistrationPending
+  );
+}
+
+function buildWebRemoteRegistration(): WebRemoteRegistrationStatus {
+  const registered = webRemoteRegistered();
+  return {
+    registered,
+    device_id: "3d1f7b2e-5c9a-4e61-b8d0-2a7f6c4e9b13",
+    name: "dev-workstation",
+    node_id: webRemoteRelayMode && !webRemoteRelayDown ? MOCK_IROH_NODE_ID : null,
+    last_registered_at: registered
+      ? new Date(Date.now() - 45_000).toISOString()
+      : null,
+    last_error: registered ? null : webRemoteRegistrationError,
+  };
+}
 
 function buildWebRemoteStatus(): WebRemoteStatus {
+  const relayLive =
+    webRemoteEnabled && webRemoteRelayMode && !webRemoteRelayDown;
   return {
     enabled: webRemoteEnabled,
-    running: webRemoteEnabled,
+    running: webRemoteRunning(),
+    bind_error:
+      webRemoteEnabled && !webRemoteRunning() ? webRemoteBindError : null,
+    relay_mode_enabled: webRemoteRelayMode,
+    relay_running: relayLive,
+    iroh_node_id:
+      webRemoteRelayMode && !webRemoteRelayDown ? MOCK_IROH_NODE_ID : null,
+    device_registered: webRemoteRegistered(),
+    registration_error:
+      relayLive && !webRemoteRegistered() ? webRemoteRegistrationError : null,
     port: webRemotePort,
     require_approval: webRemoteRequireApproval,
     bind_scope: webRemoteBindScope,
@@ -3119,6 +3196,8 @@ function emitWebRemoteState(): void {
       addPendingDevice(name?: string): string;
       addAccountDevice(name?: string): string;
       setConnected(id: string, connected: boolean): void;
+      failBind(reason?: string | null): void;
+      failRegistration(reason?: string | null): void;
     };
   }
 ).__codemuxRemoteMock = {
@@ -3165,6 +3244,25 @@ function emitWebRemoteState(): void {
     webRemoteSessions = webRemoteSessions.map((s) =>
       s.id === id ? { ...s, connected } : s,
     );
+    emitWebRemoteState();
+  },
+  // Simulate the LAN listener failing to bind (pass `null` to heal it):
+  //   window.__codemuxRemoteMock.failBind()
+  failBind(reason?: string | null): void {
+    webRemoteBindError =
+      reason === null
+        ? null
+        : (reason ??
+          "No Tailscale address found — connect Tailscale or choose a different access scope");
+    emitWebRemoteState();
+  },
+  // Simulate device registration failing (pass `null` to heal it):
+  //   window.__codemuxRemoteMock.failRegistration()
+  failRegistration(reason?: string | null): void {
+    webRemoteRegistrationError =
+      reason === null
+        ? null
+        : (reason ?? "device registration returned 503 Service Unavailable");
     emitWebRemoteState();
   },
 };
@@ -5261,9 +5359,20 @@ const handlers: Record<string, Handler> = {
     if (typeof a.trustAccountBrowsers === "boolean") {
       webRemoteTrustAccount = a.trustAccountBrowsers;
     }
+    if (typeof a.relayModeEnabled === "boolean") {
+      webRemoteRelayMode = a.relayModeEnabled;
+    }
     emitWebRemoteState();
     return buildWebRemoteStatus();
   },
+  web_remote_retry: () => {
+    emitWebRemoteState();
+    if (webRemoteBindError != null) throw new Error(webRemoteBindError);
+    return buildWebRemoteStatus();
+  },
+  web_remote_registration_status: () => buildWebRemoteRegistration(),
+  web_remote_iroh_node_id: () =>
+    webRemoteRelayMode && !webRemoteRelayDown ? MOCK_IROH_NODE_ID : null,
   web_remote_create_pairing: () => mockWebRemotePairing(),
   web_remote_list_endpoints: () => mockWebRemoteEndpoints(webRemotePort),
   web_remote_list_sessions: () => webRemoteSessions,

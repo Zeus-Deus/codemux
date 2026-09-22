@@ -940,7 +940,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             port,
         }) => {
             match command {
-                Some(ConnectCommand::Status) => crate::web_remote::connect::run_connect_status()?,
+                Some(ConnectCommand::Status) => crate::web_remote::connect::run_connect_status().await?,
                 Some(ConnectCommand::Off) => crate::web_remote::connect::run_connect_off().await?,
                 None => {
                     crate::web_remote::connect::run_connect(
@@ -1187,6 +1187,13 @@ fn print_enable_result(data: &Value) {
         _ => "every interface",
     };
     println!("Access scope:  {scope} ({scope_note})");
+    if let Some(err) = status["bind_error"].as_str() {
+        // Relay mode kept remote access on without its LAN listener; don't
+        // print an address nothing is listening on.
+        println!("Listener:      not running — {err}");
+        println!("               (retrying in the background; relay access is unaffected)");
+        return;
+    }
     if !endpoint_host.is_empty() {
         let secure = if endpoint_secure {
             "secure context"

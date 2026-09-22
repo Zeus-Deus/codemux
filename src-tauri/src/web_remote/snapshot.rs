@@ -175,6 +175,9 @@ mod tests {
             iroh_node_id: None,
             device_registered: false,
             device_id: None,
+            bind_error: None,
+            relay_running: false,
+            registration_error: None,
         };
 
         let body = snapshot_json(&app_state, &status);

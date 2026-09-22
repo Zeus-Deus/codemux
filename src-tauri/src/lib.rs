@@ -506,6 +506,10 @@ fn build_core_app<R: tauri::Runtime>(
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Warn)
+                // Remote access's lifecycle (listener bound/retried, relay
+                // node id + home relay) is what a "why can't I connect"
+                // report needs, and it is a handful of lines per boot.
+                .level_for("codemux_lib::web_remote", log::LevelFilter::Info)
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
@@ -2658,6 +2662,7 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_request_update,
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
+            web_remote::web_remote_retry,
             // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
             webview_tuning::set_smooth_scrolling,
             // Which renderer this process ended up on, so the UI can drop
