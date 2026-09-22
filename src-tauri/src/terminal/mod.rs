@@ -2554,6 +2554,38 @@ pub fn detach_pty_output(
     Ok(())
 }
 
+/// Drop every output subscriber whose channel id `keep` rejects, across all
+/// sessions, and return how many went. Used when the desktop page is
+/// replaced: a reloaded page's channels never fail to send, so the failed-send
+/// pruning in `queue_or_send_output` cannot catch them, and a dead subscriber
+/// that never pauses would also switch off back-pressure for its session.
+pub fn retain_output_subscribers(state: &PtyState, keep: impl Fn(u32) -> bool) -> usize {
+    let mut removed = 0;
+    let touched: Vec<String> = {
+        let mut guard = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter_mut()
+            .filter_map(|(session_id, runtime)| {
+                let before = runtime.output_subscribers.len();
+                runtime
+                    .output_subscribers
+                    .retain(|subscriber| keep(subscriber.channel.id()));
+                let dropped = before - runtime.output_subscribers.len();
+                if dropped == 0 {
+                    return None;
+                }
+                removed += dropped;
+                recompute_flow_paused(runtime);
+                Some(session_id.clone())
+            })
+            .collect()
+    };
+    for session_id in &touched {
+        forward_flow_control_to_daemon(&state.sessions, session_id);
+    }
+    removed
+}
+
 /// Pause one subscriber's view of a session's PTY output (terminal flow
 /// control). The renderer calls this when a fast producer outruns its xterm
 /// write queue. Pausing does not stop the reader outright: the child only
@@ -4642,6 +4674,45 @@ mod tests {
             !flag.load(Ordering::Relaxed),
             "a fresh attach must clear a stale pause (new subscriber is unpaused)"
         );
+    }
+
+    /// Replacing the desktop page drops its subscribers (their sends never
+    /// fail, so nothing else would) while a kept one — a connected browser's —
+    /// keeps streaming. Dropping the dead, never-paused subscriber also puts
+    /// back-pressure back in the hands of the one that is still reading.
+    #[test]
+    fn test_retain_output_subscribers_drops_rejected_channels() {
+        let sessions = make_sessions();
+        let dead_page: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        let remote: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        let remote_id = remote.id();
+        attach_subscriber(&sessions, "a", dead_page);
+        let remote_gen = attach_subscriber(&sessions, "a", remote);
+        attach_subscriber(&sessions, "b", Channel::new(|_| Ok(())));
+        set_pty_flow_paused(&sessions, "a", Some(remote_gen), true);
+        let flag = with_existing_session_runtime(&sessions, "a", |runtime| {
+            runtime.flow_paused.clone()
+        })
+        .expect("runtime exists");
+        assert!(!flag.load(Ordering::Relaxed), "the dead subscriber blocks parking");
+
+        let state = PtyState { sessions: sessions.clone() };
+        assert_eq!(retain_output_subscribers(&state, |id| id == remote_id), 2);
+
+        let left = |session: &str| {
+            with_existing_session_runtime(&sessions, session, |runtime| {
+                runtime
+                    .output_subscribers
+                    .iter()
+                    .map(|subscriber| subscriber.channel.id())
+                    .collect::<Vec<_>>()
+            })
+            .expect("runtime exists")
+        };
+        assert_eq!(left("a"), vec![remote_id]);
+        assert!(left("b").is_empty());
+        assert!(flag.load(Ordering::Relaxed), "the remaining paused reader parks the PTY");
+        assert_eq!(retain_output_subscribers(&state, |id| id == remote_id), 0, "idempotent");
     }
 
     /// A subscriber pausing alone must NOT park the reader while another

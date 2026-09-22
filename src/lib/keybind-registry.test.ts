@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { KEYBIND_REGISTRY, getRegistryEntry, KEYBIND_CATEGORIES } from "./keybind-registry";
+import {
+  KEYBIND_REGISTRY,
+  getRegistryEntry,
+  getNativeEntryForCombo,
+  KEYBIND_CATEGORIES,
+} from "./keybind-registry";
 import { parseKeyCombo } from "./keybind-utils";
 
 describe("keybind-registry", () => {
@@ -79,5 +84,28 @@ describe("keybind-registry", () => {
     const blockF5 = getRegistryEntry("blockF5Reload");
     expect(blockF5).toBeDefined();
     expect(blockF5!.defaultKeys).toBe("F5");
+  });
+
+  it("documents the native reload-interface shortcut", () => {
+    const entry = getRegistryEntry("reloadInterface");
+    expect(entry).toBeDefined();
+    // Must match RECOVERY_SHORTCUT in src-tauri/src/webview_recovery.rs.
+    expect(entry!.defaultKeys).toBe("Ctrl+Alt+R");
+    expect(entry!.native).toBe(true);
+    expect(entry!.category).toBe("general");
+    expect(entry!.description).toMatch(/codemux reload-ui/);
+  });
+
+  it("only the reload-interface entry is native", () => {
+    expect(KEYBIND_REGISTRY.filter((e) => e.native).map((e) => e.id)).toEqual(["reloadInterface"]);
+  });
+
+  it("finds the native entry for its combo in any modifier order", () => {
+    expect(getNativeEntryForCombo("Alt+Ctrl+R")?.id).toBe("reloadInterface");
+    expect(getNativeEntryForCombo("Ctrl+Alt+R")?.id).toBe("reloadInterface");
+    expect(getNativeEntryForCombo("Alt+Ctrl+r")?.id).toBe("reloadInterface");
+    expect(getNativeEntryForCombo("Ctrl+R")).toBeUndefined();
+    expect(getNativeEntryForCombo("Alt+Ctrl+Shift+R")).toBeUndefined();
+    expect(getNativeEntryForCombo("")).toBeUndefined();
   });
 });

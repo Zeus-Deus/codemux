@@ -160,6 +160,11 @@ impl ChannelRouter {
         true
     }
 
+    /// Ids of every channel currently routed to a connected browser.
+    pub fn routed_ids(&self) -> std::collections::HashSet<u32> {
+        self.routes.lock().unwrap().keys().copied().collect()
+    }
+
     /// Drop every route owned by a connection. Called when its WS closes —
     /// "channels die with their WS connection".
     pub fn remove_conn(&self, conn_id: u64) {
@@ -542,5 +547,17 @@ mod tests {
         let routes = router.routes.lock().unwrap();
         assert_eq!(routes.len(), 1);
         assert!(routes.values().all(|r| r.conn_id == 200));
+    }
+
+    #[test]
+    fn routed_ids_lists_only_live_routes() {
+        let router = Arc::new(ChannelRouter::default());
+        let (tx_a, _ra) = mpsc::unbounded_channel();
+        let (tx_b, _rb) = mpsc::unbounded_channel();
+        let a = router.alloc(1, 100, tx_a, false);
+        let b = router.alloc(2, 200, tx_b, false);
+        assert_eq!(router.routed_ids(), [a, b].into_iter().collect());
+        router.remove_conn(100);
+        assert_eq!(router.routed_ids(), [b].into_iter().collect());
     }
 }

@@ -62,6 +62,14 @@ describe("resolveKeybinds", () => {
     expect(entry?.isCustom).toBe(false);
   });
 
+  it("ignores overrides for native shortcuts", () => {
+    const r = resolveKeybinds({ reloadInterface: "Ctrl+K" });
+    const entry = r.keybindMap.get("reloadInterface")!;
+    expect(entry.activeKeys).toBe("Ctrl+Alt+R");
+    expect(entry.isCustom).toBe(false);
+    expect(r.getActionForKeys("Ctrl+K")).toBe("commandPalette");
+  });
+
   it("isCustom flag is false with no overrides", () => {
     const result = resolveKeybinds({});
     const entry = result.keybindMap.get("commandPalette");
