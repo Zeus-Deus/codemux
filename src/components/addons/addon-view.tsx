@@ -35,12 +35,14 @@ interface AddonViewProps {
 }
 /** How long an explanation for a refused click stays in the view. */
 const NOTICE_MS = 8000;
+function errorCode(cause: unknown): unknown {
+  return typeof cause === "object" && cause !== null && "data" in cause
+    ? (cause as { data?: { code?: unknown } }).data?.code
+    : undefined;
+}
 /** A refused click or link is transient: the view stays usable and says why. */
 function refusal(cause: unknown, link: boolean): string {
-  const code =
-    typeof cause === "object" && cause !== null && "data" in cause
-      ? (cause as { data?: { code?: unknown } }).data?.code
-      : undefined;
+  const code = errorCode(cause);
   if (code === "CONTEXT_STALE")
     return "This view changed before your action reached the add-on. Try again.";
   if (link && code === "PERMISSION_DENIED")
@@ -55,13 +57,34 @@ function Diagnostic({ children }: { children: ReactNode }) {
     </div>
   );
 }
+/** The view's own surface: a labelled region, or a plain box inside a
+ *  surface that already has one. */
+function ViewFrame({
+  label,
+  region = true,
+  children,
+}: {
+  label?: string;
+  region?: boolean;
+  children: ReactNode;
+}) {
+  const Region = region ? "section" : "div";
+  return (
+    <Region
+      aria-label={region ? (label ?? "Add-on view") : undefined}
+      data-testid="addon-view"
+      className="h-full min-h-0 overflow-auto p-3"
+    >
+      {children}
+    </Region>
+  );
+}
 /**
  * Contains a render failure to the add-on's own surface. The rest of the
- * app keeps working, and a new `resetKey` (a new tree revision or view)
- * tries again.
+ * app keeps working, and a new `resetKey` tries again.
  */
 class AddonBoundary extends Component<
-  { resetKey: string; children: ReactNode },
+  { resetKey: string; fallback: ReactNode; children: ReactNode },
   { failed: boolean }
 > {
   state = { failed: false };
@@ -76,20 +99,25 @@ class AddonBoundary extends Component<
       this.setState({ failed: false });
   }
   render() {
-    return !this.state.failed ? (
-      this.props.children
-    ) : (
-      <Diagnostic>
-        CodeMux could not display this add-on view. It will try again when
-        the add-on updates it.
-      </Diagnostic>
-    );
+    return !this.state.failed ? this.props.children : this.props.fallback;
   }
 }
 export function AddonView(props: AddonViewProps) {
-  const { id, view, workspaceId, kind = "panels" } = props;
+  const { id, view, workspaceId, kind = "panels", label, region } = props;
+  // Only a failure outside the add-on's tree lands here, and it stays until
+  // this view is opened again.
   return (
-    <AddonBoundary resetKey={`${id}/${view}/${workspaceId}/${kind}`}>
+    <AddonBoundary
+      resetKey={`${id}/${view}/${workspaceId}/${kind}`}
+      fallback={
+        <ViewFrame label={label} region={region}>
+          <Diagnostic>
+            CodeMux could not display this add-on view. Close it and open it
+            again to retry.
+          </Diagnostic>
+        </ViewFrame>
+      }
+    >
       <AddonViewBody {...props} />
     </AddonBoundary>
   );
@@ -215,13 +243,8 @@ function AddonViewBody({
       if (live.current === current) setNotice(refusal(cause, false));
     });
   }
-  const Region = region ? "section" : "div";
   return (
-    <Region
-      aria-label={region ? (label ?? "Add-on view") : undefined}
-      data-testid="addon-view"
-      className="h-full min-h-0 overflow-auto p-3"
-    >
+    <ViewFrame label={label} region={region}>
       {error || failed || installation?.status === "failed-disabled" ? (
         <Diagnostic>
           {error ||
@@ -251,6 +274,12 @@ function AddonViewBody({
           )}
           <AddonBoundary
             resetKey={`${tree.generation}/${tree.viewId}/${tree.revision}`}
+            fallback={
+              <Diagnostic>
+                CodeMux could not display this add-on view. It will try again
+                when the add-on updates it.
+              </Diagnostic>
+            }
           >
             <AddonRenderer
               nodes={tree.tree.children}
@@ -276,6 +305,6 @@ function AddonViewBody({
           Loading add-on…
         </p>
       )}
-    </Region>
+    </ViewFrame>
   );
 }

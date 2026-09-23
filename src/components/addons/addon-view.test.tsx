@@ -323,6 +323,40 @@ describe("add-on view containment and labels", () => {
       quiet.mockRestore();
     }
   });
+  it("keeps its labelled surface and gives honest advice when the view itself fails", async () => {
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A failure outside the add-on's tree (here: a broken inventory row).
+      useAddonsStore.setState({
+        installed: [
+          {
+            ...installed,
+            get manifest(): never {
+              throw new Error("broken row");
+            },
+          } as AddonInstallation,
+        ],
+      });
+      render(
+        <AddonView
+          id="test.plugin"
+          view="panel"
+          workspaceId="workspace"
+          label="Brief — Fixture"
+        />,
+      );
+      const region = screen.getByRole("region", { name: "Brief — Fixture" });
+      expect(region).toBe(screen.getByTestId("addon-view"));
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "CodeMux could not display this add-on view. Close it and open it again to retry.",
+      );
+      expect(screen.getByRole("alert")).not.toHaveTextContent(
+        "try again when the add-on updates it",
+      );
+    } finally {
+      quiet.mockRestore();
+    }
+  });
   it("names its region after the panel and the add-on", async () => {
     render(
       <AddonView
