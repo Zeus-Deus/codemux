@@ -234,7 +234,17 @@ pub fn addon_registry_reset<R: Runtime>(
         *manager = None;
         backup
     };
-    state.get(&app)?;
+    // The move already happened; never lose where the previous files went.
+    state.get(&app).map_err(|error| {
+        ProtocolError::new(
+            error.data.code,
+            format!(
+                "{} The previous add-on files were moved to {}.",
+                error.message,
+                backup.display()
+            ),
+        )
+    })?;
     Ok(backup.display().to_string())
 }
 #[tauri::command]
