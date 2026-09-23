@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 
 assert.equal(
   process.env.GITHUB_ACTIONS,
@@ -142,8 +143,29 @@ const account = createServer((req, res) => {
   }
 });
 await new Promise((done) => account.listen(0, "127.0.0.1", done));
+// The Linux system opener resolves xdg-open from the app's PATH. Put a logger
+// first on the PATH of the launched app only, so an add-on link records the
+// exact URL CodeMux hands to the desktop instead of starting a browser.
+let openerLog;
+let openerPath;
+if (process.platform === "linux") {
+  const openerDir = join(root, "system-opener");
+  openerLog = join(root, "system-opener.log");
+  assert.ok(!openerLog.includes("'"));
+  await mkdir(openerDir);
+  await writeFile(
+    join(openerDir, "xdg-open"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> '${openerLog}'\n`,
+    { mode: 0o755 },
+  );
+  openerPath = `${openerDir}:${process.env.PATH}`;
+  evidence.seams.push(
+    "Linux xdg-open on the launched app's PATH is a logger; the native opener path runs, no browser starts",
+  );
+}
 const env = {
   ...process.env,
+  ...(openerPath && { PATH: openerPath }),
   CODEMUX_API_URL: `http://127.0.0.1:${account.address().port}`,
   WEBKIT_DISABLE_COMPOSITING_MODE: "1",
 };
@@ -200,6 +222,18 @@ async function element(css) {
   );
 }
 const composer = '[data-testid="composer-body"] textarea';
+// The visible chat composer cards: each holds its draft, its one add-on
+// accessory slot and its footer, in that order.
+const composerCards = `[...document.querySelectorAll('[data-testid="composer-body"]')].filter(e => e.getClientRects().length).map(e => e.parentElement)`;
+// An add-on panel is a region named for the panel and the add-on that owns it.
+const addonPanel = (title, addon = title) =>
+  `section[data-testid="addon-view"][aria-label=${JSON.stringify(`${title} — ${addon}`)}]`;
+const briefView = addonPanel("Project Brief");
+const issuesView = addonPanel("Issue Companion");
+const accessory = '[data-testid="composer-addon-accessory"]';
+const accessoryView = `${accessory} [data-testid="addon-view"]`;
+// A clickText() scope for the first element matching a selector.
+const within = (css) => `document.querySelector(${JSON.stringify(css)})`;
 const elementId = (el) => el["element-6066-11e4-a52e-4f735466cecf"];
 async function clickText(value, scope = "document") {
   const el = await until(`click ${value}`, () =>
@@ -235,18 +269,14 @@ async function type(css, value) {
   );
   await wd("POST", `/element/${elementId(el)}/value`, { text: value });
 }
-async function typeComposer(value) {
-  // Use explicit paired keys and release prior modifier state. Verify the
-  // controlled value before invoking a plugin, so driver input cannot be
-  // mistaken for a plugin draft-preservation or auto-submit failure.
-  await wd("DELETE", "/actions");
-  await click(composer);
+// Explicit paired key presses, paced so each one is handled before the next.
+async function pressKeys(values) {
   await wd("POST", "/actions", {
     actions: [
       {
         type: "key",
         id: "keyboard",
-        actions: [...value].flatMap((value) => [
+        actions: values.flatMap((value) => [
           { type: "keyDown", value },
           { type: "keyUp", value },
           { type: "pause", duration: 20 },
@@ -254,6 +284,14 @@ async function typeComposer(value) {
       },
     ],
   });
+}
+async function typeComposer(value) {
+  // Use explicit paired keys and release prior modifier state. Verify the
+  // controlled value before invoking a plugin, so driver input cannot be
+  // mistaken for a plugin draft-preservation or auto-submit failure.
+  await wd("DELETE", "/actions");
+  await click(composer);
+  await pressKeys([...value]);
   await until("controlled composer input", () =>
     script(
       `return [...document.querySelectorAll(arguments[0])].some(e => e.value.includes(arguments[1]))`,
@@ -261,6 +299,115 @@ async function typeComposer(value) {
       value,
     ),
   );
+}
+// The one visible chat composer's draft.
+async function draft() {
+  const values = await script(
+    `return ${composerCards}.map(card => card.querySelector('[data-testid="composer-body"] textarea')?.value ?? null)`,
+  );
+  assert.equal(values.length, 1, "Expected exactly one visible chat composer");
+  return values[0];
+}
+// Wait for an add-on to append to the draft. Returns the appended text after
+// checking that everything already in the draft was kept in place.
+async function appendedToDraft(before, label) {
+  const after = await until(label, async () => {
+    const value = await draft();
+    return value !== before ? value : null;
+  });
+  assert.ok(
+    after.startsWith(before),
+    "An add-on append must keep the existing draft text",
+  );
+  const separator = before && !before.endsWith("\n") ? "\n" : "";
+  assert.equal(
+    after.slice(before.length, before.length + separator.length),
+    separator,
+  );
+  return after.slice(before.length + separator.length);
+}
+// Run an add-on composer action from the composer's own attach menu, as a
+// person does. Its row sits under "Add-ons" and names the add-on it runs.
+async function chooseComposerAction(pluginId, actionId, title, addon) {
+  const attach = await until("enabled composer attach button", () =>
+    script(
+      `const cards = ${composerCards};
+      const button = cards.length === 1 ? cards[0].querySelector('[data-testid="composer-attach-button"]') : null;
+      return button && !button.disabled ? button : null;`,
+    ),
+  );
+  if (
+    (await script(
+      "return arguments[0].getAttribute('aria-expanded')",
+      attach,
+    )) !== "true"
+  )
+    await wd("POST", `/element/${elementId(attach)}/click`, {});
+  // A row stays disabled, with its reason, until the draft is registered.
+  const row = await until(`${title} in the composer Add-ons menu`, () =>
+    script(
+      `return [...document.querySelectorAll('[data-testid="composer-command-menu"] [role="option"]')].find(e => e.dataset.testid === arguments[0] && e.getAttribute('aria-disabled') === 'false') ?? null`,
+      `slash-item-addon:${pluginId}:${actionId}`,
+    ),
+  );
+  assert.deepEqual(
+    await script(
+      `return {
+        group: arguments[0].closest('[cmdk-group]')?.querySelector('[cmdk-group-heading]')?.textContent,
+        lines: arguments[0].innerText.split('\\n').map(s => s.trim()).filter(Boolean),
+      }`,
+      row,
+    ),
+    { group: "Add-ons", lines: [title, addon] },
+  );
+  await wd("POST", `/element/${elementId(row)}/click`, {});
+  await until("composer attach menu closed", () =>
+    script(
+      `return !document.querySelector('[data-testid="composer-command-menu"]')`,
+    ),
+  );
+}
+// A notification with this title and description, as the host attributes it.
+async function toastShown(title, description) {
+  await until(`toast ${title}: ${description}`, () =>
+    script(
+      `return [...document.querySelectorAll('[data-sonner-toast]')].some(t => t.querySelector('[data-title]')?.innerText.trim() === arguments[0] && t.querySelector('[data-description]')?.innerText.trim() === arguments[1])`,
+      title,
+      description,
+    ),
+  );
+}
+// Close the attach menu if a failed step left it open; its own trigger
+// toggles it, as for a person.
+async function closeComposerMenu() {
+  const menu = '[data-testid="composer-command-menu"]';
+  if (!(await script(`return !!document.querySelector(arguments[0])`, menu)))
+    return;
+  const attach = await script(
+    `return ${composerCards}.map(card => card.querySelector('[data-testid="composer-attach-button"]')).find(e => e?.getAttribute('aria-expanded') === 'true') ?? null`,
+  );
+  assert.ok(attach, "An open attach menu belongs to a visible composer");
+  await wd("POST", `/element/${elementId(attach)}/click`, {});
+  await until("composer attach menu closed", () =>
+    script(`return !document.querySelector(arguments[0])`, menu),
+  );
+}
+async function closeComposerAccessory() {
+  if (
+    !(await script(`return !!document.querySelector(arguments[0])`, accessory))
+  )
+    return;
+  await click('[aria-label="Close add-on accessory"]');
+  await until("composer accessory closed", () =>
+    script(`return !document.querySelector(arguments[0])`, accessory),
+  );
+  await until("draft focused after closing the accessory", () =>
+    script(
+      `return document.activeElement?.matches(arguments[0]) === true`,
+      composer,
+    ),
+  );
+  await checkEmptyAccessorySpace();
 }
 async function pluginHostCount() {
   // Read-only inventory on the disposable job VM, including orphaned hosts.
@@ -278,6 +425,23 @@ async function pluginHostCount() {
   return (await run("ps", ["-eo", "comm="]))
     .split("\n")
     .filter((name) => name.trim().startsWith("codemux-addon-h")).length;
+}
+// Read-only Windows evidence: the window in front and whether it is this
+// run's own app. A failure to read it is recorded, never a failed gate.
+async function windowsForeground() {
+  let output;
+  try {
+    output = await run("powershell.exe", [
+      "-NoProfile",
+      "-File",
+      "scripts/addons/windows-foreground.ps1",
+      "-DesktopPid",
+      String(desktop.pid),
+    ]);
+    return JSON.parse(output);
+  } catch (error) {
+    return { error: String(error), output };
+  }
 }
 let terminalProbe = 0;
 let credentialProbe;
@@ -312,11 +476,36 @@ async function checkNativeUpdateRollback() {
   await choosePackage(path);
   await clickText("Select development package");
   await hasText("Review Project Brief");
+  await hasText("replaces 1.0.0 from another source");
+  // A replacement gets a fresh identity and grant, so installing it waits
+  // for the explicit replace choice. The buttons are also held while the
+  // dialog finishes opening, so only a withdrawn choice proves the gate.
+  const installButtons = (disabled) =>
+    until(`install buttons ${disabled ? "held" : "offered"}`, () =>
+      script(
+        `const buttons = [...document.querySelectorAll('[role="dialog"] button')].filter(e => ['Install', 'Install & enable'].includes(e.innerText.trim()));
+        return buttons.length === 2 && buttons.every(e => e.disabled === arguments[0]) ? buttons.map(e => e.innerText.trim()) : null;`,
+        disabled,
+      ),
+    );
+  assert.deepEqual(await installButtons(true), ["Install", "Install & enable"]);
   const replace = await script(
     `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Replace the existing source')).querySelector('input')`,
   );
-  await wd("POST", `/element/${elementId(replace)}/click`, {});
-  await clickText("Accept and install");
+  const chooseReplace = async (checked) => {
+    await wd("POST", `/element/${elementId(replace)}/click`, {});
+    await until(`replace choice ${checked ? "made" : "withdrawn"}`, () =>
+      script("return arguments[0].checked === arguments[1]", replace, checked),
+    );
+    await installButtons(!checked);
+  };
+  await chooseReplace(true);
+  await chooseReplace(false);
+  await chooseReplace(true);
+  await clickText(
+    "Install & enable",
+    `document.querySelector('[role="dialog"]')`,
+  );
   await until(
     "selected development source",
     async () => (await native("addon_inventory")).developmentPackage === id,
@@ -332,7 +521,7 @@ async function checkNativeUpdateRollback() {
   await click('[aria-label="Close settings"]');
   await openCommand("Open Project Brief");
   await hasText("Branch: main");
-  const checkbox = 'section[aria-label="Add-on view"] input[type="checkbox"]';
+  const checkbox = `${briefView} input[type="checkbox"]`;
   await click(checkbox);
   await until("private preference off", () =>
     script(
@@ -373,7 +562,27 @@ async function checkNativeUpdateRollback() {
   );
   await rename(path + ".next", path);
   await hasText("Review Project Brief");
-  await hasText("Open HTTPS links after your interaction");
+  // A same-source update lists only the access it adds and offers only the
+  // update, which keeps the add-on's current enablement.
+  assert.deepEqual(
+    await until("expanded-access update review", () =>
+      script(
+        `const dialog = document.querySelector('[role="dialog"]');
+        const added = dialog?.querySelector('section[aria-label="New access"]');
+        return added ? {
+          added: [...added.querySelectorAll('li')].map(e => e.innerText.trim()),
+          requested: !!dialog.querySelector('section[aria-label="Requested access"]'),
+          buttons: [...dialog.querySelectorAll('button:not([data-slot="dialog-close"])')].map(e => e.innerText.trim()),
+        } : null;`,
+      ),
+    ),
+    {
+      added: ["Open HTTPS links after your interaction"],
+      requested: false,
+      buttons: ["Update to 1.0.2"],
+    },
+  );
+  await hasText("Update 1.0.1 → 1.0.2 · Local / unverified");
   await wd("POST", "/actions", {
     actions: [
       {
@@ -459,8 +668,9 @@ async function checkNativeUpdateRollback() {
   await openSettings();
 }
 async function corePaneDeck() {
+  // Add-on tabs are marked, and named "<panel> — <add-on>"; the rest are core.
   return script(
-    `return [...document.querySelectorAll('[data-testid="right-panel-tabs-content"] button[aria-pressed]')].map(e => ({ title: e.title, active: e.getAttribute('aria-pressed') === 'true' })).filter(e => !['Project Brief', 'Issue Companion'].includes(e.title))`,
+    `return [...document.querySelectorAll('[data-testid="right-panel-tabs-content"] button[aria-pressed]')].filter(e => !e.closest('[data-testid="addon-tab"]')).map(e => ({ title: e.title, active: e.getAttribute('aria-pressed') === 'true' }))`,
   );
 }
 async function checkEmptyAccessorySpace() {
@@ -518,6 +728,16 @@ async function checkCredentialSettings() {
     `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Issue Companion')))`,
   );
   const field = "#credential-github-token";
+  // The stored state is shown next to the field, never the value itself.
+  const credentialState = () =>
+    script(
+      `const badge = document.querySelector('[data-state][data-slot="badge"]');
+      return badge ? { state: badge.getAttribute('data-state'), label: badge.innerText.trim() } : null;`,
+    );
+  assert.deepEqual(await until("credential state shown", credentialState), {
+    state: "not-configured",
+    label: "Not configured",
+  });
   const secret = `ci-synthetic-only-${createHash("sha256").update(root).digest("hex")}`;
   await type(field, secret);
   assert.equal(
@@ -556,6 +776,14 @@ async function checkCredentialSettings() {
       field,
     ),
   );
+  const stored =
+    process.platform === "win32"
+      ? { state: "saved", label: "Stored in the system credential store" }
+      : { state: "session-only", label: "Stored for this session only" };
+  await until(`credential ${stored.state}`, async () =>
+    isDeepStrictEqual(await credentialState(), stored),
+  );
+  await element('[aria-label="Clear GitHub token (optional)"]');
   await step(
     "07-credential-success-clears-error",
     async () => {
@@ -615,8 +843,44 @@ async function checkCredentialRemovalAndRedaction() {
     );
   evidence.credentials.removalAndFileRedaction = true;
 }
+// Remove an add-on from its Settings row. Keeping its private data for a
+// reinstall is an explicit choice in the dialog, never the default.
+async function removeAddon(title, keepData = false) {
+  const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes(${JSON.stringify(title)})))`;
+  await clickText("Remove", article);
+  await hasText(`Remove ${title}?`);
+  const keep = await until("keep-data choice", () =>
+    script(
+      `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Keep data for reinstall from the same source'))?.querySelector('input') ?? null`,
+    ),
+  );
+  assert.equal(await script("return arguments[0].checked", keep), false);
+  if (keepData) {
+    await wd("POST", `/element/${elementId(keep)}/click`, {});
+    await until("keep data chosen", () =>
+      script("return arguments[0].checked", keep),
+    );
+  }
+  await clickText("Remove add-on", `document.querySelector('[role="dialog"]')`);
+  await until(
+    `removed ${title}`,
+    async () =>
+      !(await native("addon_inventory")).installed.some(
+        (i) => i.manifest.name === title,
+      ),
+  );
+  // The native transaction completes before the Settings refresh and dialog
+  // exit animation. Wait for the actual UI before the next click.
+  await until(`removal dialog and ${title} card closed`, () =>
+    script(
+      `return !document.querySelector('[role="dialog"]') && ![...document.querySelectorAll('article')].some(e => e.innerText.includes(arguments[0]))`,
+      title,
+    ),
+  );
+}
 async function checkCoreTerminal() {
   const marker = `CODEMUX_CORE_${++terminalProbe}`;
+  const command = `echo ${marker}`;
   await wd("DELETE", "/actions");
   const screen = await element(".xterm-screen");
   const rect = await wd("GET", `/element/${elementId(screen)}/rect`);
@@ -641,7 +905,74 @@ async function checkCoreTerminal() {
       },
     ],
   });
-  await type("textarea.xterm-helper-textarea", `echo ${marker}`);
+  const terminal = await until("native terminal input focused", () =>
+    script(
+      `const input = document.activeElement; return input?.matches('textarea.xterm-helper-textarea') ? input.closest('.xterm') : null`,
+    ),
+  );
+  // The terminal's visible rows, one per line, spaces kept.
+  const screenText = () =>
+    script("return arguments[0].innerText.replace(/\\u00a0/g, ' ')", terminal);
+  // Every keystroke reaches the shell as its own write, and on Windows two
+  // have arrived swapped. Type at a steady pace and submit only a command
+  // line the shell echoed exactly; a different line is erased and retyped.
+  // The command must end the screen right after the prompt, spaces and all;
+  // only a long line's row breaks may fall inside it. A word character just
+  // before it would be what remains of an erased attempt.
+  assert.match(command, /^[\w ]+$/);
+  const typedLine = new RegExp(
+    `(?:^|[^\\w\\s])\\s*${[...command]
+      .map((c) => (c === " " ? "[ \\n]+" : c))
+      .join("\\n?")}\\s*$`,
+  );
+  for (let attempt = 1; ; attempt++) {
+    const baseline = await screenText();
+    await pressKeys([...command]);
+    let last;
+    let changed = Date.now();
+    const echoed = await until(
+      "native terminal echoed the command",
+      async () => {
+        const current = await screenText();
+        if (typedLine.test(current)) return "exact";
+        if (current !== last) {
+          last = current;
+          changed = Date.now();
+        } else if (current !== baseline && Date.now() - changed >= 1500) {
+          return "different";
+        }
+        return null;
+      },
+    );
+    if (echoed === "exact") break;
+    (evidence.terminalRetypes ??= []).push({
+      command,
+      attempt,
+      echoed: last.replace(/\s+/g, " ").trim().slice(-120),
+    });
+    assert.ok(
+      attempt < 3,
+      `The terminal did not receive "${command}" as typed`,
+    );
+    await pressKeys(Array(command.length + 4).fill("\uE003"));
+    let settled;
+    let since = Date.now();
+    await until("mistyped command erased", async () => {
+      const current = await screenText();
+      if (current !== settled) {
+        settled = current;
+        since = Date.now();
+        return false;
+      }
+      return Date.now() - since >= 1000;
+    });
+  }
+  // Only the echo itself prints a row that is exactly the marker. A shell
+  // error that quotes a mistyped command never does.
+  const markerRows = async () =>
+    (await screenText()).split("\n").filter((row) => row.trim() === marker)
+      .length;
+  const rowsBefore = await markerRows();
   await wd("POST", "/actions", {
     actions: [
       {
@@ -654,11 +985,9 @@ async function checkCoreTerminal() {
       },
     ],
   });
-  await until("native terminal command returned", () =>
-    script(
-      `return [...document.querySelectorAll('.xterm')].some(e => e.innerText.replace(/\\s+/g, '').split(arguments[0]).length >= 3)`,
-      marker,
-    ),
+  await until(
+    "native terminal command returned",
+    async () => (await markerRows()) > rowsBefore,
   );
 }
 async function shortcut(key) {
@@ -702,10 +1031,12 @@ async function step(name, fn, continueAfterFailure = false) {
     await capture(`${name}-failed`);
   }
 }
-async function openSettings() {
+// A working registry shows the manager; an unreadable one shows only its repair.
+const REGISTRY_UNAVAILABLE = "The add-on registry could not be opened";
+async function openSettings(ready = "Import package") {
   await shortcut(",");
   await clickText("Add-ons");
-  await hasText("Import package");
+  await hasText(ready);
 }
 async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   // Built by build-examples.sh with the packed public SDK/CLI. Outcomes are read
@@ -728,7 +1059,10 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   await choosePackage(path);
   await clickText("Import package");
   await hasText("Review Context Race Fixture");
-  await clickText("Accept and install");
+  await clickText(
+    "Install & enable",
+    `document.querySelector('[role="dialog"]')`,
+  );
   await until("context fixture installed", async () =>
     (await native("addon_inventory")).installed.some(
       (i) => i.manifest.id === "example.context-races" && i.desiredEnabled,
@@ -924,7 +1258,10 @@ async function checkRemovalDuringActivation() {
   await choosePackage(path);
   await clickText("Import package");
   await hasText("Review Activation Race Fixture");
-  await clickText("Accept and install");
+  await clickText(
+    "Install & enable",
+    `document.querySelector('[role="dialog"]')`,
+  );
   await until("activation fixture installed", async () =>
     (await native("addon_inventory")).installed.some(
       (i) => i.manifest.id === id && i.desiredEnabled,
@@ -1223,7 +1560,9 @@ try {
     desktop = start(application, [], {
       env: {
         ...env,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=9231",
+        // Same value as the CI policy in windows-webview-debug.ps1.
+        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:
+          "--remote-debugging-port=9231 --disable-backgrounding-occluded-windows",
       },
     });
     await until("stock WebView2 startup", async () => {
@@ -1249,6 +1588,9 @@ try {
     };
     evidence.windowsDriverMode =
       "Microsoft WebView2 attach (app-specific disposable runner policy)";
+    evidence.seams.push(
+      "Windows WebView2 test switch --disable-backgrounding-occluded-windows: the runner browser an add-on link opens cannot pause the covered app's rendering",
+    );
   } else {
     driver = start("tauri-driver", ["--port", "4444"], { env });
     capabilities = { "tauri:options": { application } };
@@ -1349,8 +1691,23 @@ try {
       await hasText(`Review ${title}`);
       assert.equal(await script("return window.__addonChooserConsumed"), true);
       await hasText("SHA-256");
+      // A new installation lists everything it requests and offers to
+      // install it disabled or enabled; this run enables it.
+      assert.deepEqual(
+        await script(
+          `const dialog = document.querySelector('[role="dialog"]');
+          return {
+            requested: !!dialog.querySelector('section[aria-label="Requested access"]'),
+            buttons: [...dialog.querySelectorAll('button:not([data-slot="dialog-close"])')].map(e => e.innerText.trim()),
+          };`,
+        ),
+        { requested: true, buttons: ["Install", "Install & enable"] },
+      );
       await capture(`review-${slug}`);
-      await clickText("Accept and install");
+      await clickText(
+        "Install & enable",
+        `document.querySelector('[role="dialog"]')`,
+      );
       await until(`native installation ${slug}`, async () =>
         (await native("addon_inventory")).installed.some(
           (i) => i.manifest.id === id && i.desiredEnabled,
@@ -1515,6 +1872,18 @@ try {
     await hasText("Branch: main");
     await hasText("1 untracked");
     await hasText("draft-context.txt");
+    // The add-on's tab is marked as one and names the add-on that owns it.
+    assert.deepEqual(
+      await script(
+        `return [...document.querySelectorAll('[data-testid="right-panel-tabs-content"] [data-testid="addon-tab"] button[aria-pressed]')].map(e => ({ label: e.getAttribute('aria-label'), title: e.title }))`,
+      ),
+      [
+        {
+          label: "Project Brief — Project Brief",
+          title: "Project Brief — Project Brief",
+        },
+      ],
+    );
     corePanesBeforePlugin = (await corePaneDeck()).map((p) => p.title);
     assert.ok(corePanesBeforePlugin.length > 0);
     await checkEmptyAccessorySpace();
@@ -1523,12 +1892,45 @@ try {
     // WebDriver translates a newline to Enter; never send a submit key. The
     // plugin itself appends its multiline text through the real draft adapter.
     await typeComposer("Existing draft <literal> ");
-    await clickText("Add to draft");
+    await clickText("Add to draft", within(briefView));
     await until("literal draft appended", () =>
       script(
         `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('draft-context.txt'))`,
       ),
     );
+  });
+  // The brief as the add-on writes it; the changed-path line follows the
+  // "Include changed filenames" setting.
+  const briefLines =
+    "Project: [^\\n]+\\nBranch: main\\nChanges: \\d+ staged, \\d+ unstaged, \\d+ untracked, \\d+ conflicts";
+  await step("05-project-brief-composer-action", async () => {
+    // The composer's own Add-ons menu targets the draft it was opened from.
+    // It appends after the text already there and never submits the draft.
+    const before = await draft();
+    await chooseComposerAction(
+      "codemux.project-brief",
+      "insert",
+      "Add project brief",
+      "Project Brief",
+    );
+    const added = await appendedToDraft(
+      before,
+      "brief appended by the composer action",
+    );
+    assert.match(
+      added,
+      new RegExp(
+        `^${briefLines}\\nChanged paths: [^\\n]*draft-context\\.txt[^\\n]*$`,
+      ),
+    );
+    await assertNoSubmission();
+    evidence.composerActions = {
+      projectBrief: {
+        menuGroup: "Add-ons",
+        includeFiles: true,
+        appended: true,
+      },
+    };
   });
   await step(
     "06-issue-companion-native-https",
@@ -1537,16 +1939,176 @@ try {
       // Public, read-only HTTPS through the production DNS/TLS broker. No token,
       // intercepted fetch, or fixture-only origin exception. A rate limit fails
       // this gate visibly instead of treating an error state as a successful fetch.
-      await element('section[aria-label="Add-on view"] select');
-      await clickText(
-        "Add to draft",
-        `document.querySelector('section[aria-label="Add-on view"]')`,
-      );
+      await element(`${issuesView} select`);
+      await clickText("Add to draft", within(issuesView));
       await until("issue appended to actual draft", () =>
         script(
           `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('https://github.com/octocat/Hello-World/issues/'))`,
         ),
       );
+    },
+    true,
+  );
+  // Before the synthetic credential exists: this reaches public GitHub too.
+  await step(
+    "06-issue-companion-composer-accessory-and-link",
+    async () => {
+      const before = await draft();
+      let failure;
+      try {
+        await chooseComposerAction(
+          "codemux.issue-companion",
+          "browse",
+          "Browse GitHub issues",
+          "Issue Companion",
+        );
+        // The composer's one add-on area opens directly above its footer and
+        // names the view and the add-on. Its view is not a separate region.
+        assert.deepEqual(
+          await until("composer accessory opened", () =>
+            script(
+              `const cards = ${composerCards};
+              const section = cards.length === 1 ? cards[0].querySelector(arguments[0]) : null;
+              if (!section) return null;
+              const footer = section.nextElementSibling;
+              const view = section.querySelector('[data-testid="addon-view"]');
+              return {
+                label: section.getAttribute('aria-label'),
+                header: section.firstElementChild?.innerText.trim(),
+                afterDraft: section.previousElementSibling?.getAttribute('data-testid'),
+                beforeFooter: footer?.getAttribute('data-testid'),
+                above: !!footer && section.getBoundingClientRect().bottom <= footer.getBoundingClientRect().top + 1,
+                view: view && { tag: view.tagName, label: view.getAttribute('aria-label') },
+                accessories: document.querySelectorAll(arguments[0]).length,
+              };`,
+              accessory,
+            ),
+          ),
+          {
+            label: "Issue Companion — Issue Companion",
+            header: "Issue Companion · Issue Companion",
+            afterDraft: "composer-body",
+            beforeFooter: "composer-controls-row",
+            above: true,
+            view: { tag: "DIV", label: null },
+            accessories: 1,
+          },
+        );
+        // Unauthenticated public GitHub, as in the panel step: a rate limit or
+        // any other failed load is this gate's recorded failure.
+        const loaded = await until("accessory issues loaded", () =>
+          script(
+            `const view = document.querySelector(arguments[0]);
+            if (!view) return null;
+            const select = view.querySelector('select');
+            if (select?.value) return { number: select.value, label: select.selectedOptions[0]?.text ?? '' };
+            const text = view.innerText;
+            return text.includes('Browse issues from your configured GitHub repository.') && !text.includes('Loading issues…') ? { error: text } : null;`,
+            accessoryView,
+          ),
+        );
+        assert.ok(
+          loaded.number,
+          `Issue Companion listed no issues: ${loaded.error}`,
+        );
+        await capture("06-issue-companion-composer-accessory");
+        const url = `https://github.com/octocat/Hello-World/issues/${loaded.number}`;
+        await clickText("Add to draft", within(accessoryView));
+        const added = await appendedToDraft(
+          before,
+          "issue appended from the composer accessory",
+        );
+        assert.ok(
+          added.endsWith(`\n${url}`),
+          "The accessory appends to its own draft",
+        );
+        const words = (value) => value.replace(/\s+/g, " ").trim();
+        assert.equal(
+          words(added.slice(0, -url.length - 1)),
+          words(loaded.label.replace(/^#\d+ /, "")),
+        );
+        await assertNoSubmission();
+        evidence.composerActions.issueAccessory = {
+          menuGroup: "Add-ons",
+          aboveFooter: true,
+          appended: true,
+        };
+        // The attributed external link. Linux records the URL the app hands
+        // to xdg-open; on Windows the system handler opens it, so only the
+        // attribution is observable.
+        const launched = async () => {
+          if (!openerLog) return [];
+          try {
+            return (await readFile(openerLog, "utf8"))
+              .split("\n")
+              .filter(Boolean);
+          } catch (error) {
+            if (error.code === "ENOENT") return [];
+            throw error;
+          }
+        };
+        const earlier = await launched();
+        const frontBefore =
+          process.platform === "win32" ? await windowsForeground() : undefined;
+        await clickText("Open in browser", within(accessoryView));
+        await toastShown("Issue Companion is opening a link", url);
+        const failed = () =>
+          script(
+            `return [...document.querySelectorAll('[data-sonner-toast] [data-title]')].some(e => e.innerText.trim() === "Issue Companion couldn't open the link")`,
+          );
+        if (process.platform === "linux") {
+          const opened = await until(
+            "system opener received the link",
+            async () => {
+              const all = await launched();
+              return all.length > earlier.length
+                ? all.slice(earlier.length)
+                : null;
+            },
+          );
+          await delay(1000);
+          assert.deepEqual((await launched()).slice(earlier.length), opened);
+          assert.deepEqual(opened, [url]);
+          assert.equal(await failed(), false);
+        }
+        evidence.composerActions.externalLink = {
+          attributionToast: true,
+          launch:
+            process.platform === "linux"
+              ? "exact HTTPS URL logged by xdg-open on the app's PATH"
+              : "system handler; not observable on the runner",
+        };
+        if (process.platform === "win32") {
+          // The runner's own browser may now cover the app for the rest of
+          // the run. Record what came to the front, so a later frame or
+          // screenshot problem can be traced to it.
+          const openFailureToast = await failed();
+          await delay(3000);
+          Object.assign(evidence.composerActions.externalLink, {
+            openFailureToast: openFailureToast || (await failed()),
+            foreground: {
+              before: frontBefore,
+              after: await windowsForeground(),
+            },
+          });
+        }
+      } catch (error) {
+        failure = error;
+      }
+      // Later steps need the composer as it was. A cleanup failure after a
+      // failed check is recorded on its own, so neither error hides the other.
+      try {
+        await closeComposerMenu();
+        await closeComposerAccessory();
+      } catch (error) {
+        if (!failure) throw error;
+        evidence.failedChecks.push({
+          name: "06-issue-companion-composer-accessory-cleanup",
+          error: String(error),
+        });
+      }
+      if (failure) throw failure;
+      evidence.composerActions.issueAccessory.closed = true;
     },
     true,
   );
@@ -1636,14 +2198,19 @@ try {
       await checkCoreTerminal();
       await openCommand("Open Project Brief");
       await hasText("Branch: main");
-      await clickText(
-        "Refresh",
-        `document.querySelector('section[aria-label="Add-on view"]')`,
-      );
+      await clickText("Refresh", within(briefView));
       await hasText("draft-context.txt");
       await openSettings();
       await hasText("Fault Isolation Fixture");
       await hasText("failed disabled");
+      // A quarantined add-on can be retried or turned off from its row.
+      await until("quarantined row offers Retry and Disable", () =>
+        script(
+          `const row = ${article};
+          const labels = row ? [...row.querySelectorAll('button')].map(e => e.innerText.trim()) : [];
+          return labels.includes('Retry') && labels.includes('Disable') && !labels.includes('Enable');`,
+        ),
+      );
       await assertNoSubmission();
     });
   }
@@ -1659,7 +2226,7 @@ try {
     await openCommand("Open Project Brief");
     // The public Git API deliberately caches summaries for one second.
     await delay(1100);
-    const view = `document.querySelector('section[aria-label="Add-on view"]')`;
+    const view = within(briefView);
     await clickText("Refresh", view);
     await hasText("501 untracked");
     await hasText("Showing the first 500 changed paths.");
@@ -1670,6 +2237,18 @@ try {
       rows > 0 && rows <= 14,
       "The trusted list must virtualize 500 paths",
     );
+    // Whether the page counts as shown while it is measured, recorded with
+    // the result so a hidden or covered window is not read as slow rendering.
+    const pageState = () =>
+      script(
+        "return { visibility: document.visibilityState, focused: document.hasFocus() }",
+      );
+    const probeStart = {
+      ...(await pageState()),
+      ...(process.platform === "win32" && {
+        foreground: await windowsForeground(),
+      }),
+    };
     await script(`window.__addonFrameProbe = {gaps: [], active: true, last: performance.now()};
       const probe = window.__addonFrameProbe;
       const tick = now => {
@@ -1688,10 +2267,6 @@ try {
     const gaps = await script(
       `const p = window.__addonFrameProbe; p.active = false; delete window.__addonFrameProbe; return p.gaps;`,
     );
-    assert.ok(
-      gaps.length >= 30,
-      "A visible native WebView must supply frame samples",
-    );
     gaps.sort((a, b) => a - b);
     const p95FrameGapMs = gaps[Math.floor((gaps.length - 1) * 0.95)];
     evidence.uiRendering = {
@@ -1702,7 +2277,12 @@ try {
       maxFrameGapMs: gaps.at(-1),
       refreshMs,
       p95FrameGapBudgetMs: 100,
+      page: { start: probeStart, end: await pageState() },
     };
+    assert.ok(
+      gaps.length >= 30,
+      "A visible native WebView must supply frame samples",
+    );
     assert.ok(
       p95FrameGapMs <= 100,
       "Shared-runner UI frame p95 exceeds the recorded 100 ms budget",
@@ -1710,7 +2290,7 @@ try {
     await step(
       "08-virtual-list-native-accessibility",
       async () => {
-        const list = 'section[aria-label="Add-on view"] [role="list"]';
+        const list = `${briefView} [role="list"]`;
         const positions = () =>
           script(
             `return [...document.querySelector(arguments[0]).querySelectorAll('[role="listitem"]')].map(e => ({size:Number(e.getAttribute('aria-setsize')),position:Number(e.getAttribute('aria-posinset'))}))`,
@@ -1763,6 +2343,77 @@ try {
     "09-native-update-review-and-matching-data-rollback",
     checkNativeUpdateRollback,
   );
+  // After the source replacement above, which starts with fresh settings and
+  // private data: these choices must then survive the restart below.
+  const briefChecked = `${briefView} input[type="checkbox"]`;
+  const briefPaths = `${briefView} [role="list"]`;
+  const showPaths = (checked) =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === arguments[1] && !!document.querySelector(arguments[2]) === arguments[1]`,
+      briefChecked,
+      checked,
+      briefPaths,
+    );
+  await step("09-project-brief-setting-and-private-preference", async () => {
+    await clickText(
+      "Configure / Permissions",
+      `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Project Brief')))`,
+    );
+    const includeFiles = '[aria-label="Include changed filenames"]';
+    await until("include-files setting loaded on", () =>
+      script(
+        `const s = document.querySelector(arguments[0]); return !!s && !s.disabled && s.getAttribute('aria-checked') === 'true'`,
+        includeFiles,
+      ),
+    );
+    await click(includeFiles);
+    await until("include-files setting off", () =>
+      script(
+        `return document.querySelector(arguments[0])?.getAttribute('aria-checked') === 'false'`,
+        includeFiles,
+      ),
+    );
+    await clickText("Save settings");
+    await until(
+      "include-files setting saved",
+      async () =>
+        (await native("addon_settings_get", { id: "codemux.project-brief" }))[
+          "include-files"
+        ] === false,
+    );
+    await hasText("Saved");
+    await clickText("Installed");
+    await click('[aria-label="Close settings"]');
+    // The panel's own private preference hides its changed-path list.
+    await openCommand("Open Project Brief");
+    await until("changed paths shown before the change", () => showPaths(true));
+    await click(briefChecked);
+    await until("changed paths hidden", () => showPaths(false));
+    // Remount so what remains is the stored preference, not view state.
+    await click('[aria-label="Close Project Brief"]');
+    await openCommand("Open Project Brief");
+    await hasText("Branch: main");
+    await until("hidden paths persisted", () => showPaths(false));
+    // The brief the add-on writes follows its setting: no changed paths now.
+    const before = await draft();
+    await chooseComposerAction(
+      "codemux.project-brief",
+      "insert",
+      "Add project brief",
+      "Project Brief",
+    );
+    const added = await appendedToDraft(
+      before,
+      "brief without changed paths appended",
+    );
+    assert.match(added, new RegExp(`^${briefLines}$`));
+    await assertNoSubmission();
+    evidence.projectBriefPreferences = {
+      includeFilesOffOmitsChangedPaths: true,
+      privatePreferencePersisted: true,
+    };
+    await openSettings();
+  });
   await step(
     "09-paused-restart-preserves-installations-and-settings",
     async () => {
@@ -1782,6 +2433,10 @@ try {
       const settings = await native("addon_settings_get", {
         id: "codemux.issue-companion",
       });
+      const briefSettings = await native("addon_settings_get", {
+        id: "codemux.project-brief",
+      });
+      assert.equal(briefSettings["include-files"], false);
       await clickText("Pause all add-ons");
       await until(
         "paused before restart",
@@ -1800,6 +2455,10 @@ try {
         await native("addon_settings_get", { id: "codemux.issue-companion" }),
         settings,
       );
+      assert.deepEqual(
+        await native("addon_settings_get", { id: "codemux.project-brief" }),
+        briefSettings,
+      );
       assert.equal(await pluginHostCount(), 0);
       await click('[aria-label="Close settings"]');
       await checkCoreTerminal();
@@ -1811,7 +2470,14 @@ try {
       );
       await click('[aria-label="Close settings"]');
       await openCommand("Open Project Brief");
-      await hasText("draft-context.txt");
+      await hasText("Branch: main");
+      // The panel's private preference came back from its own storage. Both
+      // choices stay off: removal keeps them for the reinstall below.
+      await until("hidden paths survived the restart", () => showPaths(false));
+      evidence.projectBriefPreferences.survivedRestart = {
+        includeFiles: false,
+        showPaths: false,
+      };
       await openSettings();
     },
   );
@@ -1844,10 +2510,7 @@ try {
       );
       await openCommand("Open Project Brief");
       await hasText("Branch: main");
-      await clickText(
-        "Add to draft",
-        `document.querySelector('section[aria-label="Add-on view"]')`,
-      );
+      await clickText("Add to draft", within(briefView));
       await hasText("No chat composer is available");
       await capture("09-classic-interface-panel-without-composer");
       await native("set_agent_chat_enabled", { enabled: true });
@@ -1857,34 +2520,10 @@ try {
     },
   );
   await step("10-remove-packages-keeps-core-usable", async () => {
-    for (const title of [
-      "Issue Companion",
-      "Project Brief",
-      "Fault Isolation Fixture",
-    ]) {
-      const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes(${JSON.stringify(title)})))`;
-      await clickText("Remove", article);
-      await hasText(`Remove ${title}?`);
-      await clickText(
-        "Remove add-on",
-        `document.querySelector('[role="dialog"]')`,
-      );
-      await until(
-        `removed ${title}`,
-        async () =>
-          !(await native("addon_inventory")).installed.some(
-            (i) => i.manifest.name === title,
-          ),
-      );
-      // The native transaction completes before the Settings refresh and
-      // dialog exit animation. Wait for the actual UI before the next click.
-      await until(`removal dialog and ${title} card closed`, () =>
-        script(
-          `return !document.querySelector('[role="dialog"]') && ![...document.querySelectorAll('article')].some(e => e.innerText.includes(arguments[0]))`,
-          title,
-        ),
-      );
-    }
+    // Project Brief keeps its data for the reinstall step that follows.
+    await removeAddon("Issue Companion");
+    await removeAddon("Project Brief", true);
+    await removeAddon("Fault Isolation Fixture");
     assert.equal(await pluginHostCount(), 0);
     await click('[aria-label="Close settings"]');
     await checkCoreTerminal();
@@ -1896,6 +2535,89 @@ try {
       removed: true,
       noEmptyAccessorySpace: true,
     };
+  });
+  await step("10-project-brief-reinstall-follows-data-choice", async () => {
+    // A local package is matched to its kept data by its exact bytes: the
+    // same file the source replacement and rollback above ended on.
+    const id = "codemux.project-brief";
+    const reinstall = async (restore) => {
+      await openSettings();
+      await choosePackage(
+        resolve(
+          "examples/addons/project-brief/codemux.project-brief-1.0.0.cmxaddon",
+        ),
+      );
+      await clickText("Import package");
+      await hasText("Review Project Brief");
+      await hasText("Version 1.0.0 · Local / unverified");
+      const option = await script(
+        `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Restore private data retained from version'))?.querySelector('input') ?? null`,
+      );
+      assert.equal(
+        !!option,
+        restore,
+        restore
+          ? "Kept data must be offered back to its own package"
+          : "Data removed with the add-on must not be offered back",
+      );
+      if (restore) {
+        await hasText(
+          "Restore private data retained from version 1.0.0 of this same source. Credentials are not restored.",
+        );
+        // Restoring is the person's choice, never the default.
+        assert.equal(
+          await script("return arguments[0].checked", option),
+          false,
+        );
+        await wd("POST", `/element/${elementId(option)}/click`, {});
+        await until("restore chosen", () =>
+          script("return arguments[0].checked", option),
+        );
+      }
+      await clickText(
+        "Install & enable",
+        `document.querySelector('[role="dialog"]')`,
+      );
+      await until("Project Brief reinstalled", async () =>
+        (await native("addon_inventory")).installed.some(
+          (i) => i.manifest.id === id && i.desiredEnabled,
+        ),
+      );
+      await until("reinstall review closed", () =>
+        script(`return !document.querySelector('[role="dialog"]')`),
+      );
+      const settings = await native("addon_settings_get", { id });
+      await click('[aria-label="Close settings"]');
+      await openCommand("Open Project Brief");
+      await hasText("Branch: main");
+      return settings;
+    };
+    // Kept data comes back on request: the setting and the preference.
+    assert.equal((await reinstall(true))["include-files"], false);
+    await until("restored preference hides changed paths", () =>
+      showPaths(false),
+    );
+    // Removed without keeping data: nothing is offered and defaults apply.
+    await openSettings();
+    await removeAddon("Project Brief");
+    assert.equal((await reinstall(false))["include-files"], true);
+    await until("default preference shows changed paths", () =>
+      showPaths(true),
+    );
+    // The default is also what the panel shows before its storage answers,
+    // so give a stale stored value time to appear.
+    await delay(1000);
+    assert.ok(await showPaths(true), "No private preference may remain");
+    await hasText("draft-context.txt");
+    evidence.projectBriefPreferences.reinstall = {
+      keptDataRestored: { includeFiles: false, showPaths: false },
+      removedDataNotOffered: { includeFiles: true, showPaths: true },
+    };
+    await openSettings();
+    await removeAddon("Project Brief");
+    assert.equal(await pluginHostCount(), 0);
+    await click('[aria-label="Close settings"]');
+    await checkCorePaneRestoration();
   });
   await step("10-delayed-public-sdk-context-races", () =>
     checkContextRaces(workspaceId, assertNoSubmission),
@@ -1937,10 +2659,20 @@ try {
         flag: "wx",
       });
       await startNativeSession();
-      await openSettings();
+      // Add-ons stay off, and the manager offers only the registry's repair:
+      // there is nothing to pause, resume or install until it is reset.
+      await openSettings(REGISTRY_UNAVAILABLE);
       const unavailable = await native("addon_inventory");
       assert.equal(unavailable.paused, true);
       assert.ok(unavailable.error);
+      assert.ok(unavailable.registryError?.path);
+      assert.deepEqual(
+        await script(
+          `const labels = [...document.querySelectorAll('button')].map(e => e.innerText.trim());
+          return ['Reset add-on registry', 'Import package', 'Pause all add-ons', 'Resume add-ons'].map(label => labels.includes(label));`,
+        ),
+        [true, false, false, false],
+      );
       assert.equal(await pluginHostCount(), 0);
       await clickText("Appearance");
       await hasText("Theme");
@@ -1949,6 +2681,44 @@ try {
       await typeComposer(" Core input while plugin storage is unavailable.");
     },
   );
+  await step("11-registry-reset-restores-add-on-management", async () => {
+    await openSettings(REGISTRY_UNAVAILABLE);
+    await clickText("Reset add-on registry");
+    await hasText("Reset the add-on registry?");
+    await clickText(
+      "Reset registry",
+      `document.querySelector('[role="dialog"]')`,
+    );
+    const moved =
+      "The add-on registry was reset. The previous files were moved to ";
+    const notice = await until("registry reset notice", () =>
+      script(
+        `return [...document.querySelectorAll('[role="status"]')].map(e => e.innerText.trim()).find(t => t.startsWith(arguments[0])) ?? null`,
+        moved,
+      ),
+    );
+    const inventory = await until("fresh add-on registry opened", async () => {
+      const value = await native("addon_inventory");
+      return !value.error && !value.registryError && value;
+    });
+    assert.equal(inventory.paused, false);
+    assert.deepEqual(inventory.installed, []);
+    // The unreadable files were moved aside as a backup, never deleted.
+    const backup = notice.slice(moved.length, -1);
+    assert.equal(
+      await readFile(join(backup, "registry.sqlite"), "utf8"),
+      "Synthetic invalid plugin registry",
+    );
+    assert.ok(
+      (await readdir(backup)).includes("registry.sqlite.ci-backup"),
+      "The registry backup must keep every earlier file",
+    );
+    await hasText("Import package");
+    assert.equal(await pluginHostCount(), 0);
+    evidence.registryReset = { backupKept: true, freshRegistry: true };
+    await click('[aria-label="Close settings"]');
+    await checkCoreTerminal();
+  });
   if (evidence.failedChecks.length)
     throw Error("One or more native acceptance gates failed; see failedChecks");
   evidence.status = "passed";
