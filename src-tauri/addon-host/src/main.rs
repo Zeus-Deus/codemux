@@ -288,6 +288,9 @@ impl Traffic {
             {
                 self.violation(now)
             }
+            // The host answers the parent itself. A response written by plugin
+            // code would put author text into the parent's stop reason.
+            None => self.violation(now),
             _ => match encode(&msg) {
                 Ok(bytes) => self.write(&bytes),
                 Err(error) => self.fault = Some(error),
