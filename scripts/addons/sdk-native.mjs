@@ -7,6 +7,7 @@ import { readFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createContext, runInContext } from "node:vm";
 import assert from "node:assert/strict";
 const dir = await mkdtemp(join(tmpdir(), "codemux-sdk-native-"));
 const entry = resolve("packages/plugin-sdk");
@@ -224,6 +225,7 @@ try {
   policy.contributes.panels = [
     { id: "form", title: "Form", icon: "list" },
     { id: "swap", title: "Swap", icon: "refresh-cw" },
+    { id: "grid", title: "Grid", icon: "list" },
   ];
   const policySource = await bundle("./tests/policy.tsx");
   {
@@ -406,6 +408,113 @@ try {
     assert.ok(await host.stopped(), "a repeated view ID must stop the plugin");
     console.log(
       "PASS: a mount that arrives before the unmount freeing its slot is served",
+    );
+  }
+  {
+    // The desktop also bounds live callbacks over the views it holds. Four
+    // grids hold all 4,096; a view mounted before grid1's unmount arrives
+    // stays within the desktop's count, so the plugin must render it.
+    // Rendering 4,096 SDK buttons does not fit the host's CPU deadline, so
+    // this block runs the same bundle on the host's bootstrap in a Node realm.
+    const frames = [];
+    // What the host treats as fatal: an unhandled rejection or a throwing timer.
+    const faults = [];
+    const fault = (error) => faults.push(error);
+    process.on("unhandledRejection", fault);
+    const timers = new Map();
+    const epoch = performance.now();
+    const realm = createContext({
+      __nativeNow: () => Math.floor(performance.now() - epoch),
+      __nativeSend: (line) => frames.push(JSON.parse(line)),
+      __nativeTimer: (delay, repeat) => {
+        const id = timers.size + 1;
+        const tick = () => {
+          try {
+            realm.__tick(id);
+          } catch (error) {
+            fault(error);
+          }
+        };
+        timers.set(
+          id,
+          repeat ? setInterval(tick, delay) : setTimeout(tick, delay),
+        );
+        return id;
+      },
+      __nativeClearTimer: (id) => clearTimeout(timers.get(id)),
+    });
+    try {
+      runInContext(
+        await readFile("src-tauri/addon-host/src/bootstrap.js", "utf8"),
+        realm,
+      );
+      realm.__configure("sdk-native", JSON.stringify(policy));
+      runInContext(policySource, realm);
+      let seq = 0;
+      const send = (method, params) =>
+        realm.__dispatch(
+          JSON.stringify({ jsonrpc: "2.0", id: ++seq, method, params }),
+        );
+      const until = async (predicate) => {
+        const end = Date.now() + 5000;
+        while (Date.now() < end && !faults.length) {
+          const index = frames.findIndex(predicate);
+          if (index >= 0) return frames.splice(index, 1)[0];
+          await sleep(10);
+        }
+        throw Error("Realm deadline: " + faults.join("; "));
+      };
+      const patch = (viewId) =>
+        until((m) => m.method === "ui.patch" && m.params.viewId === viewId);
+      send("activate", {});
+      await until((m) => m.method === "ready");
+      const callbacks = new Set();
+      const collect = (value) => {
+        if (value?.callbackId) callbacks.add(value.callbackId);
+        if (value && typeof value === "object")
+          Object.values(value).forEach(collect);
+      };
+      for (let n = 1; n <= 4; n++) {
+        const viewId = "grid" + n;
+        send("view.mount", {
+          id: "grid",
+          kind: "panels",
+          viewId,
+          context: "c",
+        });
+        collect((await patch(viewId)).params.records);
+        send("ui.ack", { viewId, revision: 1 });
+      }
+      assert.equal(callbacks.size, 4096);
+      send("view.mount", {
+        id: "swap",
+        kind: "panels",
+        viewId: "swap5",
+        context: "c",
+      });
+      const fifth = pressCallback(await patch("swap5"));
+      send("ui.ack", { viewId: "swap5", revision: 1 });
+      send("view.unmount", { viewId: "grid1" });
+      send("ui.event", {
+        viewId: "swap5",
+        callbackId: fifth,
+        context: "trusted-interaction",
+      });
+      assert.match(
+        JSON.stringify((await patch("swap5")).params.records),
+        /Round 1/,
+      );
+      assert.deepEqual(
+        faults,
+        [],
+        "callbacks of a departing view must not fault",
+      );
+    } finally {
+      process.off("unhandledRejection", fault);
+      for (const timer of timers.values()) clearTimeout(timer);
+    }
+    console.log(
+      "PASS: callbacks of a view whose unmount is still on its way do not fault",
     );
   }
   for (const [change, reason] of [

@@ -467,10 +467,8 @@ function adapter({ manifest, send, now }: Transport) {
               return { callbackId: id };
             }),
           );
-          if (
-            [...views.values()].reduce((n, v) => n + v.callbacks.size, 0) > 4096
-          )
-            throw new PluginError("RESOURCE_LIMIT", "Callback limit");
+          // The desktop bounds live callbacks over the views it holds. A view
+          // it has dropped can still be here, so no local total is enforced.
           sentRevision++;
           send("ui.patch", { viewId: p.viewId, records: serialized });
         };
