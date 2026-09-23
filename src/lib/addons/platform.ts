@@ -17,6 +17,7 @@ import {
   addonError,
   addonMessage,
   type AddonEvent,
+  type AddonInventory,
 } from "./types";
 export function activeAddonWorkspace(): string | null {
   const state = useAppStore.getState();
@@ -31,6 +32,35 @@ export function activeAddonWorkspace(): string | null {
     ? id
     : null;
 }
+/**
+ * Saved add-on pane IDs are dropped only when the user disabled or removed
+ * the add-on, or its release no longer declares the panel. Pause-all, a
+ * diagnostic launch without add-ons, recovery and a registry failure keep
+ * them: the right panel hides unavailable panes while they last, and they
+ * come back on resume or repair.
+ */
+function forgetUnwantedAddonPanes(inventory: AddonInventory) {
+  if (inventory.paused || inventory.error || inventory.registryError) return;
+  const wanted = new Set(
+    inventory.installed
+      .filter(
+        (i) =>
+          i.desiredEnabled &&
+          i.status !== "removing" &&
+          i.status !== "blocked-disabled",
+      )
+      .flatMap(({ manifest }) =>
+        manifest.contributes.panels.map(
+          (panel) => `addon:${manifest.id}:${panel.id}`,
+        ),
+      ),
+  );
+  useUIStore
+    .getState()
+    .forgetRightPanelPanes(
+      (pane) => pane.startsWith("addon:") && !wanted.has(pane),
+    );
+}
 let inventoryRevision = 0;
 let latestInventory: Promise<void> = Promise.resolve();
 export function refreshAddons(): Promise<void> {
@@ -40,19 +70,7 @@ export function refreshAddons(): Promise<void> {
       const inventory = await addonInventory();
       if (revision !== inventoryRevision) return;
       useAddonsStore.setState({ ...inventory, loaded: true });
-      const enabled = new Set(
-        inventory.paused
-          ? []
-          : inventory.installed
-              .filter((i) => addonEnabled(i) || i.status === "failed-disabled")
-              .map((i) => i.manifest.id),
-      );
-      const ui = useUIStore.getState();
-      for (const [workspace, panes] of Object.entries(ui.rightPanelPanes))
-        for (const pane of panes) {
-          if (pane.startsWith("addon:") && !enabled.has(pane.split(":")[1]))
-            ui.closeRightPanelPane(workspace, pane);
-        }
+      forgetUnwantedAddonPanes(inventory);
     } catch (error) {
       if (revision !== inventoryRevision) return;
       useAddonsStore.setState({

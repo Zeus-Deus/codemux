@@ -16,11 +16,27 @@ import {
 } from "@/stores/addons-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { useUIStore } from "@/stores/ui-store";
 import type { AppStateSnapshot } from "@/tauri/types";
-import type { AddonEvent, AddonInstallation, AddonInventory } from "./types";
+import type {
+  AddonEvent,
+  AddonInstallation,
+  AddonInventory,
+  AddonManifest,
+} from "./types";
 const installation = {
   installationId: "installation",
-  manifest: { id: "test.plugin", name: "Fixture" },
+  manifest: {
+    id: "test.plugin",
+    name: "Fixture",
+    permissions: ["composer.append", "external.open"],
+    contributes: {
+      commands: [],
+      panels: [{ id: "brief", title: "Brief", icon: "file-text" }],
+      composerActions: [],
+      composerViews: [{ id: "issues", title: "Issues", icon: "github" }],
+    },
+  } as unknown as AddonManifest,
   desiredEnabled: true,
   status: "enabled-running",
 } as AddonInstallation;
@@ -117,5 +133,94 @@ describe("delayed native effect completion", () => {
     await first;
     expect(useAddonsStore.getState().paused).toBe(true);
     expect(useAddonsStore.getState().installed).toEqual([]);
+  });
+});
+describe("saved add-on pane preferences", () => {
+  const pane = "addon:test.plugin:brief" as const;
+  const inventory = (overrides: Partial<AddonInventory>): AddonInventory => ({
+    installed: [installation],
+    paused: false,
+    error: null,
+    ...overrides,
+  });
+  const refreshWith = async (value: AddonInventory) => {
+    vi.mocked(addonInventory).mockResolvedValueOnce(value);
+    await refreshAddons();
+  };
+  beforeEach(() => {
+    useUIStore.setState({
+      rightPanelPanes: { workspace: ["files", pane], other: [pane] },
+      rightPanelDismissedPanes: {},
+      rightPanelTabs: { workspace: pane },
+      rightPanelLastTabs: {},
+    });
+  });
+  const saved = () => useUIStore.getState().rightPanelPanes;
+  it("survive pause-all, a failed manager, a registry error and resume", async () => {
+    await refreshWith(inventory({ paused: true }));
+    await refreshWith(
+      inventory({ paused: true, installed: [], error: "Manager unavailable" }),
+    );
+    await refreshWith(
+      inventory({
+        paused: true,
+        installed: [],
+        registryError: { path: "/data/addons-v1", cause: "locked" },
+      }),
+    );
+    expect(saved()).toEqual({ workspace: ["files", pane], other: [pane] });
+    expect(useUIStore.getState().rightPanelDismissedPanes).toEqual({});
+    expect(useUIStore.getState().rightPanelTabs.workspace).toBe(pane);
+    await refreshWith(inventory({}));
+    expect(saved()).toEqual({ workspace: ["files", pane], other: [pane] });
+  });
+  it("survive an inventory request that fails outright", async () => {
+    vi.mocked(addonInventory).mockRejectedValueOnce({ message: "IPC failed" });
+    await refreshAddons();
+    expect(saved()).toEqual({ workspace: ["files", pane], other: [pane] });
+  });
+  it("keep a failed add-on's pane so its diagnostic stays until closed", async () => {
+    await refreshWith(
+      inventory({
+        installed: [
+          { ...installation, status: "failed-disabled", failure: "Crashed" },
+        ],
+      }),
+    );
+    expect(saved()).toEqual({ workspace: ["files", pane], other: [pane] });
+  });
+  it.each<[string, AddonInstallation[]]>([
+    [
+      "disabled",
+      [{ ...installation, desiredEnabled: false, status: "installed-disabled" }],
+    ],
+    [
+      "disabled after a failure",
+      [{ ...installation, desiredEnabled: false, status: "failed-disabled" }],
+    ],
+    ["removed", []],
+    ["being removed", [{ ...installation, status: "removing" }]],
+    ["blocked", [{ ...installation, status: "blocked-disabled" }]],
+  ])("are forgotten everywhere once the add-on is %s", async (_, installed) => {
+    await refreshWith(inventory({ installed }));
+    expect(saved()).toEqual({ workspace: ["files"], other: [] });
+    expect(useUIStore.getState().rightPanelDismissedPanes).toEqual({});
+    expect(useUIStore.getState().rightPanelTabs.workspace).toBe("files");
+  });
+  it("forget a panel the installed release no longer declares", async () => {
+    await refreshWith(
+      inventory({
+        installed: [
+          {
+            ...installation,
+            manifest: {
+              ...installation.manifest,
+              contributes: { ...installation.manifest.contributes, panels: [] },
+            },
+          },
+        ],
+      }),
+    );
+    expect(saved()).toEqual({ workspace: ["files"], other: [] });
   });
 });

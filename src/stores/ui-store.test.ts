@@ -535,3 +535,65 @@ it("distinguishes repeated requests for the same mounted Settings page", () => {
   const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
   expect(persisted.state).not.toHaveProperty("settingsNavigationVersion");
 });
+
+describe("ui-store — forgetting add-on panes", () => {
+  const brief = "addon:test.plugin:brief" as const;
+  const other = "addon:other.plugin:view" as const;
+  const isBrief = (pane: string) => pane === brief;
+
+  it("drops the pane everywhere without recording a dismissal", () => {
+    useUIStore.setState({
+      rightPanelPanes: {
+        "ws-1": ["files", brief, "changes"],
+        "ws-2": [brief, other],
+      },
+      rightPanelDismissedPanes: { "ws-1": ["tasks", brief] },
+      rightPanelTabs: { "ws-1": brief, "ws-2": other },
+      rightPanelLastTabs: { "ws-3": brief },
+    });
+
+    useUIStore.getState().forgetRightPanelPanes(isBrief);
+
+    const s = useUIStore.getState();
+    expect(s.rightPanelPanes).toEqual({
+      "ws-1": ["files", "changes"],
+      "ws-2": [other],
+    });
+    // Forgotten, not closed: nothing new is remembered about it.
+    expect(s.rightPanelDismissedPanes).toEqual({ "ws-1": ["tasks"] });
+    // The active pane hands focus to the pane that took its slot.
+    expect(s.rightPanelTabs).toEqual({ "ws-1": "changes", "ws-2": other });
+    expect(s.rightPanelLastTabs).toEqual({});
+  });
+
+  it("lands on the picker when the forgotten pane was the only one", () => {
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": [brief] },
+      rightPanelDismissedPanes: {},
+      rightPanelTabs: { "ws-1": brief },
+    });
+
+    useUIStore.getState().forgetRightPanelPanes(isBrief);
+
+    expect(useUIStore.getState().rightPanelPanes["ws-1"]).toEqual([]);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe(
+      RIGHT_PANEL_EMPTY,
+    );
+  });
+
+  it("keeps a collapsed panel collapsed and changes nothing when no pane matches", () => {
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files", brief] },
+      rightPanelDismissedPanes: {},
+      rightPanelTabs: { "ws-1": null },
+    });
+    const before = useUIStore.getState();
+
+    useUIStore.getState().forgetRightPanelPanes((pane) => pane === other);
+    expect(useUIStore.getState()).toBe(before);
+
+    useUIStore.getState().forgetRightPanelPanes(isBrief);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBeNull();
+    expect(useUIStore.getState().rightPanelPanes["ws-1"]).toEqual(["files"]);
+  });
+});
