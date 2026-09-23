@@ -101,7 +101,9 @@ jobs:
             gh release create "$tag" catalog-v1.json catalog-v1.json.sha256 --target "$GITHUB_SHA" --latest=false --title "Add-on catalog revision $revision" --notes "Reviewed feature add-on catalog. Package releases remain independent of the desktop app."
           fi
           after=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
-          if [ "$after" != "$latest" ]; then
+          # A desktop release published meanwhile rightly takes Latest; restore
+          # only when Latest moved to the catalog or another non-desktop release.
+          if [[ ! $after =~ ^v[0-9] ]]; then
             gh release edit "$latest" --latest
             echo "::error::Publishing $tag changed the Latest release to $after; restored $latest"
             exit 1
