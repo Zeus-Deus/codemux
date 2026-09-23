@@ -75,4 +75,11 @@ test('manifest bytes are read as strictly as the desktop reads them', () => {
  assert.throws(() => validate(manifest), /outside the signed 64-bit range/);
  manifest.settings = [{id: 'note', type: 'string', label: 'Note', default: '\ud800'}];
  assert.throws(() => validate(manifest), /not valid Unicode/);
+ manifest.settings = [];
+ // URL parsing percent-encodes a lone surrogate, so https() checks it first.
+ for (const field of ['repository', 'author.url']) {
+  const copy = structuredClone(manifest);
+  apply(copy, '/' + field.replace('.', '/'), 'https://github.com/example/\udc00');
+  assert.throws(() => validate(copy), /author\.url and repository must be HTTPS URLs/, field);
+ }
 });
