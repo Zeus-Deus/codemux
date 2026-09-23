@@ -1276,3 +1276,61 @@ body.pane-resizing iframe {
     transition-duration: 0ms;
   }
 }
+
+/* The sidebar empty state's engraved plate (sidebar-empty-state.tsx).
+ * It prints in once, then drifts and catches a slow pass of light. Hovering
+ * the call to action wakes it: brighter ink, quicker light. The two idle
+ * loops are transform-only, so they composite without layout or paint. */
+@keyframes cm-plate-in {
+  from {
+    clip-path: inset(100% 0 0 0);
+    opacity: 0;
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+.cm-plate {
+  animation: cm-plate-in 1.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  transition: opacity 0.6s ease;
+}
+@keyframes cm-plate-drift {
+  from {
+    transform: scale(1);
+  }
+  to {
+    transform: scale(1.035);
+  }
+}
+.cm-plate-drift {
+  animation: cm-plate-drift 14s ease-in-out infinite alternate;
+}
+@keyframes cm-plate-sheen {
+  0% {
+    transform: translateX(-110%) skewX(-18deg);
+  }
+  55%,
+  100% {
+    transform: translateX(260%) skewX(-18deg);
+  }
+}
+.cm-plate-sheen {
+  opacity: 0.85;
+  animation: cm-plate-sheen 9s ease-in-out infinite;
+}
+[data-sidebar-empty]:has([data-cta]:hover) .cm-plate {
+  opacity: 0.95;
+}
+[data-sidebar-empty]:has([data-cta]:hover) .cm-plate-sheen {
+  animation-duration: 2.4s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-plate,
+  .cm-plate-drift,
+  .cm-plate-sheen {
+    animation: none;
+  }
+  .cm-plate-sheen {
+    opacity: 0;
+  }
+}

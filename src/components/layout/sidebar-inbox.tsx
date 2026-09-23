@@ -94,6 +94,7 @@ import {
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { SidebarEmptyState } from "./sidebar-empty-state";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
@@ -1890,7 +1891,7 @@ export function SidebarInbox() {
   };
 
   return (
-    <div className="flex flex-col">
+    <div className="flex flex-1 flex-col">
       {/* Sticky header block: the project filter plus the "needs you" strip.
           Both stay put while the card list scrolls beneath them, so blocked
           work is reachable from anywhere in a long list — that reachability
@@ -2029,7 +2030,9 @@ export function SidebarInbox() {
         />
       </div>
 
-      <div className="px-2.5 pb-2.5" onContextMenuCapture={handleListContextMenuCapture}>
+      {/* A flex column that fills the sidebar, so the empty state can grow
+          into the free space and push the parked shelves to the bottom. */}
+      <div className="flex flex-1 flex-col px-2.5 pb-2.5" onContextMenuCapture={handleListContextMenuCapture}>
         <SidebarDraftBlock
           catalog={sidebarDraftCatalog}
           filterPath={filter}
@@ -2039,15 +2042,7 @@ export function SidebarInbox() {
         {visibleDraftCount === 0 &&
           orderedActiveCards.length === 0 &&
           filteredPending.length === 0 && (
-          <div className="px-2 py-6 text-center text-label text-muted-foreground">
-            Nothing active
-            {filterName && (
-              <>
-                {" in "}
-                <span className="font-mono">{filterName}</span>
-              </>
-            )}
-          </div>
+            <SidebarEmptyState filterName={filterName ?? null} />
           )}
 
         {pinnedCards.map((ws, index) => renderCard(ws, index))}
