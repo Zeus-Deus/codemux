@@ -349,6 +349,12 @@ publication and Settings remain separate deliverables.
 - Catalog history cannot delete accepted ownership/release records: otherwise a
   later revision could reassign them without detection. Withdrawals use blocked
   entries while retaining their history. No mutable release replacement is allowed.
+- Catalog and package releases share the app repository, whose Latest release
+  feeds the desktop updater, `install.sh` and hosted-client deploys. Merging the
+  committed revision 1 catalog would otherwise have published it as Latest. The
+  catalog workflow now publishes only on an approved dispatch from `main`, with
+  `--latest=false` and a check that Latest is unchanged; package releases use
+  non-`v*` tags and `--latest=false` ([release procedure](RELEASING.md)).
 - Rollback copies the recorded private data snapshot into a fresh writable
   generation, probes, switches the tuple, and normally activates through a
   durable journal. Failed activation preserves the original rollback snapshot.
