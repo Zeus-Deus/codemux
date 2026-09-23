@@ -35,60 +35,85 @@
       "type": "array",
       "items": {
         "$ref": "#/definitions/Credential"
-      }
+      },
+      "maxItems": 20
     },
     "description": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 240,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
     },
     "entry": {
-      "type": "string"
+      "type": "string",
+      "enum": [
+        "plugin.js"
+      ]
     },
     "format": {
-      "type": "string"
+      "type": "string",
+      "enum": [
+        "codemux.feature-plugin"
+      ]
     },
     "http": {
       "type": "array",
       "items": {
         "$ref": "#/definitions/HttpGrant"
-      }
+      },
+      "maxItems": 20
     },
     "id": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])\\.)[a-z][a-z0-9-]{1,39}\\.(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$)[a-z][a-z0-9-]{1,39}$"
     },
     "license": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 100,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
     },
     "manifestVersion": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "maximum": 1.0,
+      "minimum": 1.0
     },
     "name": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 80,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
     },
     "permissions": {
       "type": "array",
       "items": {
         "$ref": "#/definitions/Permission"
-      }
+      },
+      "uniqueItems": true
     },
     "platforms": {
       "type": "array",
       "items": {
         "$ref": "#/definitions/Platform"
-      }
+      },
+      "minItems": 1,
+      "uniqueItems": true
     },
     "repository": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^https://"
     },
     "settings": {
       "type": "array",
       "items": {
         "$ref": "#/definitions/Setting"
-      }
+      },
+      "maxItems": 50
     },
     "version": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\\+[0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*)?$"
     }
   },
   "additionalProperties": false,
@@ -101,10 +126,14 @@
       ],
       "properties": {
         "name": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
         },
         "url": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^https://"
         }
       },
       "additionalProperties": false
@@ -118,13 +147,17 @@
       ],
       "properties": {
         "id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$"
         },
         "requiresWorkspace": {
           "type": "boolean"
         },
         "title": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
         }
       },
       "additionalProperties": false
@@ -142,25 +175,29 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/Command"
-          }
+          },
+          "maxItems": 20
         },
         "composerActions": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/View"
-          }
+          },
+          "maxItems": 8
         },
         "composerViews": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/View"
-          }
+          },
+          "maxItems": 4
         },
         "panels": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/View"
-          }
+          },
+          "maxItems": 8
         }
       },
       "additionalProperties": false
@@ -175,13 +212,18 @@
       ],
       "properties": {
         "id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$"
         },
         "label": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
         },
         "origin": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^https://(?!.*\\.(?:[0-9]+|0x[0-9a-f]*)$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
         },
         "type": {
           "$ref": "#/definitions/CredentialType"
@@ -213,10 +255,13 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/HttpMethod"
-          }
+          },
+          "minItems": 1,
+          "uniqueItems": true
         },
         "origin": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^https://(?!.*\\.(?:[0-9]+|0x[0-9a-f]*)$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
         }
       },
       "additionalProperties": false
@@ -262,10 +307,14 @@
               "type": "boolean"
             },
             "id": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
             },
             "label": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
             },
             "type": {
               "type": "string",
@@ -286,13 +335,18 @@
           "properties": {
             "default": {
               "default": "",
-              "type": "string"
+              "type": "string",
+              "maxLength": 4096
             },
             "id": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
             },
             "label": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
             },
             "type": {
               "type": "string",
@@ -319,10 +373,14 @@
               "format": "int64"
             },
             "id": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
             },
             "label": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
             },
             "max": {
               "type": "integer",
@@ -355,10 +413,14 @@
               "type": "string"
             },
             "id": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
             },
             "label": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
             },
             "type": {
               "type": "string",
@@ -369,8 +431,14 @@
             "values": {
               "type": "array",
               "items": {
-                "type": "string"
-              }
+                "type": "string",
+                "maxLength": 4096,
+                "minLength": 1,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "uniqueItems": true
             }
           },
           "additionalProperties": false
@@ -386,13 +454,35 @@
       ],
       "properties": {
         "icon": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "file-text",
+            "git-branch",
+            "github",
+            "list",
+            "check",
+            "info",
+            "settings",
+            "book-open",
+            "link",
+            "refresh-cw",
+            "plus",
+            "circle-alert",
+            "folder",
+            "terminal",
+            "code",
+            "search"
+          ]
         },
         "id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$"
         },
         "title": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
         }
       },
       "additionalProperties": false
