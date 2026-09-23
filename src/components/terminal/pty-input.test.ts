@@ -7,6 +7,10 @@ vi.mock("@/tauri/commands", () => ({
       new Promise<void>((resolve) => writes.push({ session, data, resolve })),
   ),
 }));
+const remote = vi.hoisted(() => ({ client: false }));
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => remote.client,
+}));
 
 import { writePtyInput } from "./pty-input";
 
@@ -56,5 +60,21 @@ describe("writePtyInput", () => {
     for (const w of writes) w.resolve();
     await settle();
     error.mockRestore();
+  });
+
+  it("sends each remote write at once instead of waiting for the previous reply", async () => {
+    // The remote connection and the server's ordered lane keep writes in
+    // order; waiting would add a network round trip to every key.
+    remote.client = true;
+    try {
+      writePtyInput("r", "l");
+      writePtyInput("r", "s");
+      writePtyInput("r", "\r");
+      expect(writes.map((w) => w.data)).toEqual(["l", "s", "\r"]);
+      for (const w of writes) w.resolve();
+      await settle();
+    } finally {
+      remote.client = false;
+    }
   });
 });
