@@ -768,7 +768,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     });
     fixtureThreads.set(
       threadId,
-      await native("agent_chat_list_messages", { threadId }),
+      persistedTurns(await native("agent_chat_list_messages", { threadId })),
     );
   };
   const drafts = () =>
@@ -886,13 +886,19 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   });
   for (const [threadId, messages] of fixtureThreads)
     assert.deepEqual(
-      await native("agent_chat_list_messages", { threadId }),
+      persistedTurns(await native("agent_chat_list_messages", { threadId })),
       messages,
       "Race tests must never submit prompts",
     );
   await selectWorkspace(originalWorkspace, "synthetic-project");
   await assertNoSubmission();
   await checkCoreTerminal();
+}
+// The provider sidecar may record its own "not installed" status row after the
+// composer already shows that state. Status rows carry no prompt; every other
+// persisted row must stay unchanged.
+function persistedTurns(rows) {
+  return rows.filter((row) => JSON.parse(row).type !== "session_state_changed");
 }
 async function checkRemovalDuringActivation() {
   const id = "example.activation-race";
@@ -917,16 +923,25 @@ async function checkRemovalDuringActivation() {
   // Installation ran its probe; make the palette command start a fresh host.
   await native("addon_disable", { id });
   await native("addon_enable", { id });
-  await until("no host before the command", async () => (await pluginHostCount()) === 0);
+  await until(
+    "no host before the command",
+    async () => (await pluginHostCount()) === 0,
+  );
   await openCommand("CI slow activation append");
   const started = Date.now();
   // Removal is requested while the fixture's activation is still waiting.
   await native("addon_remove", { id, keepData: false });
   const removalMs = Date.now() - started;
   await until("activation fixture removed", async () =>
-    (await native("addon_inventory")).installed.every((i) => i.manifest.id !== id),
+    (await native("addon_inventory")).installed.every(
+      (i) => i.manifest.id !== id,
+    ),
   );
-  await until("activation host reaped", async () => (await pluginHostCount()) === 0, 2000);
+  await until(
+    "activation host reaped",
+    async () => (await pluginHostCount()) === 0,
+    2000,
+  );
   await delay(1500);
   assert.ok(
     (
@@ -1457,7 +1472,9 @@ try {
       )
     );
   });
-  const messagesBefore = await native("agent_chat_list_messages", { threadId });
+  const messagesBefore = persistedTurns(
+    await native("agent_chat_list_messages", { threadId }),
+  );
   assert.ok(
     !messagesBefore.some((row) => JSON.parse(row).type === "user_message"),
   );
@@ -1468,7 +1485,7 @@ try {
     // Session lists omit rows without an SDK cursor. Check the actual bound
     // thread's persisted messages too; an unchanged empty list alone is weak.
     assert.deepEqual(
-      await native("agent_chat_list_messages", { threadId }),
+      persistedTurns(await native("agent_chat_list_messages", { threadId })),
       messagesBefore,
       "Plugin operations must not persist or submit a prompt",
     );
