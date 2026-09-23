@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
@@ -18,11 +18,18 @@ impl Drop for Host {
 }
 impl Host {
     fn new(source: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codemux-addon-host"))
+        Self::with(
+            Command::new(env!("CARGO_BIN_EXE_codemux-addon-host")),
+            source,
+        )
+    }
+    fn with(mut command: Command, source: &str) -> Self {
+        // Only the one-line stop reason reaches stderr, so it never fills.
+        let mut child = command
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let input = child.stdin.take();
@@ -104,6 +111,18 @@ impl Host {
             assert!(Instant::now() < until, "host failed to stop");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    /// Waits for the exit and returns what the host printed on stderr.
+    fn reason(&mut self) -> String {
+        self.stopped();
+        let mut text = String::new();
+        self.child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
     }
 }
 fn spin(milliseconds: u64) -> String {
@@ -385,4 +404,31 @@ fn ui_batches_over_thirty_per_second_wait_instead_of_faulting() {
     host.call(3, "command.execute", json!({"id":"hello","count":39}));
     host.collect(Duration::from_secs(2));
     host.stopped();
+}
+#[test]
+fn oversized_requests_are_answered_and_oversized_batches_stop_the_host() {
+    let mut host = Host::new(
+        "__codemuxRegister({}, ({send}) => m => {\
+         if(!m.method){if(m.error)send('log',{message:m.id+':'+m.error.data.code+':'+m.error.message});return}\
+         if(m.method!=='command.execute')return;const text='x'.repeat(1100000);\
+         if(m.params.request)send('host.request',{operation:'settings.get',params:{text}},7);\
+         else send('ui.patch',{viewId:'view',records:[[2,'b',text]]});});",
+    );
+    host.receive();
+    host.call(1, "activate", json!({}));
+    assert!(host.yielded(1));
+    host.call(2, "command.execute", json!({"id":"hello","request":true}));
+    let frames = host.collect(Duration::from_millis(500));
+    assert!(!frames.iter().any(|f| f["method"] == "host.request"));
+    assert_eq!(
+        logs(&frames)[0]["message"],
+        "7:RESOURCE_LIMIT:Host request exceeds 1 MiB"
+    );
+    assert!(host.alive(), "an oversized request is answered, not fatal");
+    // A dropped batch would leave the renderer's tree silently stale.
+    host.call(3, "command.execute", json!({"id":"hello","request":false}));
+    assert_eq!(
+        host.reason().trim(),
+        "Plugin host stopped: Outgoing frame limit"
+    );
 }

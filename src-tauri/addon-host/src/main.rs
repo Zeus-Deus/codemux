@@ -151,11 +151,47 @@ impl Traffic {
     fn release_at(&mut self, now: Instant) -> Option<Instant> {
         (!self.held.is_empty()).then(|| self.paced(now))
     }
+    /// Answers a request with a bounded RESOURCE_LIMIT error and counts it.
+    fn reject(&mut self, id: u64, message: &'static str, now: Instant) {
+        let reply = Envelope::response(
+            &self.generation,
+            id,
+            Err(ProtocolError::new(ErrorCode::ResourceLimit, message)),
+        );
+        self.replies.push_back(serde_json::to_vec(&reply).unwrap());
+        self.violation(now);
+    }
+    /// Envelope::parse refuses a frame over 1 MiB unread, so classify it by
+    /// its method alone. A request is answered; a UI batch or activation
+    /// cannot be dropped, so it stops the generation.
+    fn oversized(&mut self, line: &str, now: Instant) {
+        #[derive(serde::Deserialize)]
+        struct Head {
+            method: Option<String>,
+            id: Option<u64>,
+        }
+        match serde_json::from_str::<Head>(line) {
+            Ok(Head {
+                method: Some(method),
+                id: Some(id),
+            }) if method == "host.request" => self.reject(id, "Host request exceeds 1 MiB", now),
+            Ok(Head {
+                method: Some(method),
+                ..
+            }) if method == "ui.patch" || method == "ready" => {
+                self.fault = Some("Outgoing frame limit")
+            }
+            _ => self.violation(now),
+        }
+    }
     fn send(&mut self, line: &str) {
         if self.fault.is_some() {
             return;
         }
         let now = Instant::now();
+        if line.len() > limits::FRAME {
+            return self.oversized(line, now);
+        }
         let Ok(mut msg) = Envelope::parse(line.as_bytes(), Some(&self.generation), true) else {
             return self.violation(now);
         };
@@ -164,21 +200,14 @@ impl Traffic {
                 let Some(id) = msg.id else {
                     return self.violation(now);
                 };
-                let rejected = if !self.requests.accept(now, 20, 100) {
-                    "Plugin request quota exceeded"
-                } else {
-                    match encode(&msg) {
-                        Ok(bytes) => return self.write(&bytes),
-                        Err(_) => "Host request exceeds 1 MiB",
-                    }
-                };
-                let reply = Envelope::response(
-                    &self.generation,
-                    id,
-                    Err(ProtocolError::new(ErrorCode::ResourceLimit, rejected)),
-                );
-                self.replies.push_back(serde_json::to_vec(&reply).unwrap());
-                self.violation(now);
+                if !self.requests.accept(now, 20, 100) {
+                    return self.reject(id, "Plugin request quota exceeded", now);
+                }
+                match encode(&msg) {
+                    Ok(bytes) => self.write(&bytes),
+                    // Re-encoding can expand some numbers past the limit.
+                    Err(_) => self.reject(id, "Host request exceeds 1 MiB", now),
+                }
             }
             Some("ui.patch") => {
                 // A patch cannot be dropped without corrupting the tree.
