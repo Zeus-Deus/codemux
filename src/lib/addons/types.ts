@@ -80,7 +80,11 @@ export interface AddonInstallation {
     | "blocked-disabled"
     | "removing";
   failure: string | null;
-  previous: { manifest: AddonManifest } | null;
+  previous: {
+    manifest: AddonManifest;
+    digest?: string;
+    dataGeneration?: string;
+  } | null;
   /** Newer compatible, unblocked catalog version from the cached snapshot. */
   updateAvailable?: string | null;
   /** Present for catalog-source installations only. */
@@ -187,6 +191,35 @@ export interface AddonReview {
   removed?: AddonAccess;
   catalog?: AddonListing | null;
 }
+/** One reviewed release in the cached catalog (`addon_catalog`). */
+export interface AddonCatalogRelease {
+  version: string;
+  api: string;
+  platforms: string[];
+  sha256: string;
+  publishedAt: string;
+  capabilities: Pick<AddonManifest, "permissions" | "http" | "credentials">;
+}
+export interface AddonCatalogPlugin {
+  id: string;
+  name: string;
+  publisher: string;
+  tier: "official" | "community";
+  description: string;
+  repository: string;
+  readme: string;
+  releases: AddonCatalogRelease[];
+}
+/** `addon_catalog` result: the cached snapshot, and why a refresh failed. */
+export interface AddonCatalogBrowse {
+  snapshot: {
+    /** Seconds since the Unix epoch. */
+    fetchedAt: number;
+    catalog: { revision: number; plugins: AddonCatalogPlugin[] };
+  } | null;
+  error: string | null;
+  stale: boolean;
+}
 export interface AddonUpdateCheck {
   upToDate: boolean;
   installedVersion: string;
@@ -217,6 +250,18 @@ export function addonMessage(error: unknown): string {
     : typeof error === "string"
       ? error
       : "The add-on operation failed";
+}
+/** The stable host error code of a rejection, when it carries one. */
+export function addonCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("data" in error))
+    return null;
+  const data = (error as { data: unknown }).data;
+  return typeof data === "object" &&
+    data !== null &&
+    "code" in data &&
+    typeof data.code === "string"
+    ? data.code
+    : null;
 }
 export function addonError(code: string, message: string): AddonError {
   return { message, data: { code } };
