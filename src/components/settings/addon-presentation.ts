@@ -91,38 +91,38 @@ export interface AddonProblem {
   message: string;
 }
 /**
- * Names the reason behind a catalog, link or update rejection. The host's
- * message stays the detail; the title tells unsupported platform, API,
- * blocked, unlisted and unreachable-catalog cases apart at a glance.
+ * Titles for catalog, link and update rejections, by host error code and
+ * message; the first match wins and `null` matches any message. The host's
+ * message stays the detail; the title tells an unsupported device or API,
+ * a blocked or unlisted release and an unreachable catalog apart at a glance.
  */
+const PROBLEM_TITLES: [code: string, message: RegExp | null, title: string][] = [
+  // The catalog says a release is "not available for <platform>"; the host
+  // words a device without add-on support three ways.
+  [
+    "INCOMPATIBLE_API",
+    /not available for|is available for|(not supported|unsupported) on this platform|platform is not supported/,
+    "Not available for this device",
+  ],
+  ["INCOMPATIBLE_API", /add-on API|plugin API/, "Incompatible add-on API"],
+  ["INCOMPATIBLE_API", null, "Incompatible release"],
+  ["PERMISSION_DENIED", /blocked/i, "Release blocked"],
+  ["INVALID_MESSAGE", /not listed|has no releases/, "Not in the catalog"],
+  ["INVALID_MESSAGE", /already installed/, "Already installed"],
+  ["INVALID_MESSAGE", /Downgrades/, "Older release"],
+  [
+    "INVALID_MESSAGE",
+    /install link|catalog ID|semantic version|stable release/,
+    "Not a valid install link or ID",
+  ],
+  ["NETWORK_DENIED", null, "Network unavailable"],
+  ["TIMEOUT", null, "Network unavailable"],
+];
 export function addonProblem(error: unknown): AddonProblem {
   const message = addonMessage(error);
   const code = addonCode(error);
-  const title =
-    code === "INCOMPATIBLE_API"
-      ? /not available for|is available for|unsupported on this platform/.test(
-          message,
-        )
-        ? "Not available for this device"
-        : /add-on API|plugin API/.test(message)
-          ? "Incompatible add-on API"
-          : "Incompatible release"
-      : code === "PERMISSION_DENIED" && /blocked/i.test(message)
-        ? "Release blocked"
-        : code === "INVALID_MESSAGE"
-          ? /not listed/.test(message)
-            ? "Not in the catalog"
-            : /already installed/.test(message)
-              ? "Already installed"
-              : /Downgrades/.test(message)
-                ? "Older release"
-                : /install link|catalog ID|semantic version|stable release/.test(
-                      message,
-                    )
-                  ? "Not a valid install link or ID"
-                  : null
-          : code === "NETWORK_DENIED" || code === "TIMEOUT"
-            ? "Network unavailable"
-            : null;
-  return { title, message };
+  const rule = PROBLEM_TITLES.find(
+    ([c, pattern]) => c === code && (!pattern || pattern.test(message)),
+  );
+  return { title: rule?.[2] ?? null, message };
 }
