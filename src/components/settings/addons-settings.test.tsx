@@ -691,6 +691,56 @@ it("shows each credential's state and clears a stored one", async () => {
   expect(screen.queryByRole("button", { name: /^Clear/ })).toBeNull();
 });
 
+it("keeps what was typed in another credential field while one is saved", async () => {
+  let finish!: () => void;
+  answer({
+    addon_settings_get: () => ({ owner: "", repository: "" }),
+    addon_credential_set: () =>
+      new Promise<null>((resolve) => {
+        finish = () => resolve(null);
+      }),
+  });
+  const base = manifest as AddonManifest;
+  useAddonsStore.setState({
+    installed: [
+      {
+        ...installation,
+        manifest: {
+          ...base,
+          credentials: [
+            ...base.credentials,
+            {
+              id: "uploads-token",
+              label: "Uploads token",
+              origin: "https://uploads.example.com",
+              type: "bearer",
+            },
+          ],
+        },
+      },
+    ],
+  });
+  render(<AddonsSettings />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Configure / Permissions" }),
+  );
+  const github = screen.getByLabelText("GitHub token (optional)");
+  const uploads = screen.getByLabelText("Uploads token");
+  fireEvent.change(github, { target: { value: "synthetic-github" } });
+  fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
+  await waitFor(() =>
+    expect(addonInvoke).toHaveBeenCalledWith(
+      "addon_credential_set",
+      expect.objectContaining({ credentialId: "github-token" }),
+    ),
+  );
+  // The other field stays editable while the first value is stored.
+  fireEvent.change(uploads, { target: { value: "synthetic-uploads" } });
+  await act(async () => finish());
+  await waitFor(() => expect(github).toHaveValue(""));
+  expect(uploads).toHaveValue("synthetic-uploads");
+});
+
 it("explains compatibility and shows bounded diagnostics without log text", async () => {
   answer({
     addon_settings_get: () => ({ owner: "", repository: "" }),

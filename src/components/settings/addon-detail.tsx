@@ -82,21 +82,27 @@ function Credentials({
                 value={values[field.id] ?? ""}
                 placeholder="Enter a new value"
                 aria-describedby={`credential-${field.id}-state`}
-                onChange={(e) =>
-                  setValues({ ...values, [field.id]: e.target.value })
-                }
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setValues((all) => ({ ...all, [field.id]: value }));
+                }}
               />
               <Button
                 disabled={busy || !values[field.id]}
                 onClick={() =>
                   void run(async () => {
+                    const sent = values[field.id];
                     await addonInvoke("addon_credential_set", {
                       id: installation.manifest.id,
                       credentialId: field.id,
-                      value: values[field.id],
+                      value: sent,
                       sessionOnly: session,
                     });
-                    setValues({ ...values, [field.id]: "" });
+                    // The fields stay editable during the save: clear only
+                    // the value that was stored and keep anything typed since.
+                    setValues((all) =>
+                      all[field.id] === sent ? { ...all, [field.id]: "" } : all,
+                    );
                   })
                 }
               >
