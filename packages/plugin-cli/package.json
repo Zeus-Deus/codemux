@@ -3,6 +3,19 @@
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
+  "description": "Build, check, pack and watch CodeMux feature plugins.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zeus-Deus/codemux.git",
+    "directory": "packages/plugin-cli"
+  },
+  "homepage": "https://github.com/Zeus-Deus/codemux/tree/main/packages/plugin-cli#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "bin": {
     "codemux-plugin": "./src/cli.mjs"
   },
@@ -14,8 +27,6 @@
   ],
   "dependencies": {
     "esbuild": "0.28.2",
-    "ajv": "8.17.1",
-    "ajv-formats": "3.0.1",
-    "semver": "7.7.2"
+    "ajv": "8.17.1"
   }
 }
