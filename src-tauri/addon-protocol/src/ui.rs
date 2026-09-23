@@ -138,9 +138,19 @@ fn property(key: &str, v: &Value) -> bool {
 }
 impl Tree {
     pub fn apply(&mut self, records: &[Value]) -> Result<()> {
-        self.apply_started(records, Instant::now())
+        self.apply_within(records, limits::CALLBACKS)
     }
-    fn apply_started(&mut self, records: &[Value], started: Instant) -> Result<()> {
+    /// Applies a batch only if the committed tree holds at most `callbacks`
+    /// live callbacks: the remainder of the plugin-wide budget for this view.
+    pub fn apply_within(&mut self, records: &[Value], callbacks: usize) -> Result<()> {
+        self.apply_started(records, Instant::now(), callbacks)
+    }
+    fn apply_started(
+        &mut self,
+        records: &[Value],
+        started: Instant,
+        allowed_callbacks: usize,
+    ) -> Result<()> {
         let budget = || {
             if started.elapsed() > Duration::from_millis(50) {
                 Err(ProtocolError::new(
@@ -156,7 +166,9 @@ impl Tree {
             return Err(invalid());
         }
         let mut candidate = self.clone();
-        candidate.validate()?;
+        // Content-only updates cannot change callbacks; every structural or
+        // listener change revalidates the candidate and recounts them.
+        let mut callbacks = candidate.validate_counted()?;
         let mut bytes = serde_json::to_vec(&candidate).map_err(|_| invalid())?.len();
         for record in records {
             budget()?;
@@ -238,16 +250,25 @@ impl Tree {
                     return Err(invalid());
                 }
             } else {
-                candidate.validate()?;
+                callbacks = candidate.validate_counted()?;
                 bytes = serde_json::to_vec(&candidate).map_err(|_| invalid())?.len();
             }
             budget()?;
         }
         budget()?;
+        if callbacks > allowed_callbacks {
+            return Err(ProtocolError::new(
+                ErrorCode::ResourceLimit,
+                "Plugin callback limit exceeded",
+            ));
+        }
         *self = candidate;
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_counted().map(|_| ())
+    }
+    fn validate_counted(&self) -> Result<usize> {
         let mut ids = HashSet::new();
         let mut callbacks = HashSet::new();
         for node in &self.children {
@@ -256,7 +277,17 @@ impl Tree {
         if serde_json::to_vec(self).map_err(|_| invalid())?.len() > limits::TREE {
             return Err(invalid());
         }
-        Ok(())
+        Ok(callbacks.len())
+    }
+    /// Live callback IDs in this validated tree.
+    pub fn callback_count(&self) -> usize {
+        fn count(nodes: &[Node]) -> usize {
+            nodes
+                .iter()
+                .map(|n| n.event_listeners.len() + count(&n.children))
+                .sum()
+        }
+        count(&self.children)
     }
     pub fn callback(&self, node_id: &str, event: &str, callback_id: &str) -> bool {
         find(&self.children, node_id)
@@ -325,7 +356,9 @@ mod budget_tests {
     fn exhausted_budget_cannot_commit_any_mutation() {
         let mut tree = Tree::default();
         let expired = Instant::now() - Duration::from_millis(51);
-        let error = tree.apply_started(&[], expired).unwrap_err();
+        let error = tree
+            .apply_started(&[], expired, limits::CALLBACKS)
+            .unwrap_err();
         assert_eq!(error.data.code, ErrorCode::ResourceLimit);
         assert!(tree.children.is_empty());
     }
