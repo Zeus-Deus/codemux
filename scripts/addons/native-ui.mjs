@@ -235,32 +235,41 @@ const accessoryView = `${accessory} [data-testid="addon-view"]`;
 // A clickText() scope for the first element matching a selector.
 const within = (css) => `document.querySelector(${JSON.stringify(css)})`;
 const elementId = (el) => el["element-6066-11e4-a52e-4f735466cecf"];
-async function clickText(value, scope = "document") {
-  const el = await until(`click ${value}`, () =>
-    script(
-      `return [...${scope}.querySelectorAll('button,[role="menuitem"],[role="option"]')].find(e => e.getClientRects().length && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && (e.innerText.trim() === arguments[0] || e.getAttribute('aria-label') === arguments[0])) ?? null`,
-      value,
-    ),
-  );
-  await wd("POST", `/element/${elementId(el)}/click`, {});
-}
-async function click(css) {
-  // The app may replace a node between locating and clicking it (for example
-  // a chat pane's first focus swaps its composer). The driver dispatches no
-  // click on a stale reference, so only that rejection is retried.
+// The driver dispatches no click for these rejections, so retrying cannot
+// repeat an action. A node can be replaced between locating and clicking it
+// (a chat pane's first focus swaps its composer); a transient toast can cover
+// a target near the window's lower edge; and a control can sit below the fold
+// of a nested scroll area, which WebDriver does not scroll by itself.
+const undispatched =
+  /"error":"(stale element reference|element click intercepted|element not interactable)"/;
+async function clickElement(locate) {
   for (let attempt = 0; ; attempt++) {
-    const el = await element(css);
+    const el = await locate();
+    await script(
+      "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'})",
+      el,
+    );
     try {
       await wd("POST", `/element/${elementId(el)}/click`, {});
       return;
     } catch (error) {
-      if (
-        attempt === 2 ||
-        !String(error).includes('"error":"stale element reference"')
-      )
-        throw error;
+      if (attempt === 9 || !undispatched.test(String(error))) throw error;
+      await delay(500);
     }
   }
+}
+async function clickText(value, scope = "document") {
+  await clickElement(() =>
+    until(`click ${value}`, () =>
+      script(
+        `return [...${scope}.querySelectorAll('button,[role="menuitem"],[role="option"]')].find(e => e.getClientRects().length && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && (e.innerText.trim() === arguments[0] || e.getAttribute('aria-label') === arguments[0])) ?? null`,
+        value,
+      ),
+    ),
+  );
+}
+async function click(css) {
+  await clickElement(() => element(css));
 }
 async function type(css, value) {
   const el = await element(css);
@@ -882,7 +891,12 @@ async function checkCoreTerminal() {
   const marker = `CODEMUX_CORE_${++terminalProbe}`;
   const command = `echo ${marker}`;
   await wd("DELETE", "/actions");
-  const screen = await element(".xterm-screen");
+  // Hidden or parked terminals keep their DOM; use the one on screen.
+  const screen = await until("visible native terminal", () =>
+    script(
+      `return [...document.querySelectorAll('.xterm-screen')].find(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && e.checkVisibility?.() !== false }) ?? null`,
+    ),
+  );
   const rect = await wd("GET", `/element/${elementId(screen)}/rect`);
   // The shell-starting badge covers the centre of a narrow terminal. Focus
   // its visible first row using a real pointer action, not a DOM focus bypass.
@@ -905,11 +919,27 @@ async function checkCoreTerminal() {
       },
     ],
   });
-  const terminal = await until("native terminal input focused", () =>
+  const focused = () =>
     script(
       `const input = document.activeElement; return input?.matches('textarea.xterm-helper-textarea') ? input.closest('.xterm') : null`,
-    ),
-  );
+    );
+  let terminal = await until(
+    "native terminal input focused",
+    focused,
+    3000,
+  ).catch(() => null);
+  if (!terminal) {
+    // A background runner window can drop the pointer's focus change. Focus
+    // this terminal's own input instead; typing and output below still go
+    // through the real terminal and shell.
+    await script(
+      "arguments[0].closest('.xterm').querySelector('textarea.xterm-helper-textarea').focus()",
+      screen,
+    );
+    terminal = await until("native terminal input focused", focused);
+    evidence.terminalFocusFallbacks =
+      (evidence.terminalFocusFallbacks ?? 0) + 1;
+  }
   // The terminal's visible rows, one per line, spaces kept.
   const screenText = () =>
     script("return arguments[0].innerText.replace(/\\u00a0/g, ' ')", terminal);
