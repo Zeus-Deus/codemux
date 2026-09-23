@@ -106,7 +106,7 @@ impl Development {
                     while changes.try_recv().is_ok(){}
                     if manager.paused(){continue}
                     let Ok(installation)=manager.installation(&plugin) else{break};
-                    if !installation.desired_enabled || !matches!(installation.status,Status::EnabledIdle|Status::EnabledRunning) || installation.source!=source {continue}
+                    if !installation.desired_enabled || !matches!(installation.status,Status::EnabledIdle|Status::Activating|Status::EnabledRunning) || installation.source!=source {continue}
                     if let Some(token)=pending.take(){reviews.cancel(&token);}
                     let read_manager=manager.clone(); let read_reviews=reviews.clone(); let read_path=path.clone();
                     let read_plugin=plugin.clone(); let read_source=source.clone(); let read_cancel=stopped.clone();
@@ -227,5 +227,55 @@ mod tests {
             .await
             .is_err());
         assert!(development.package().is_none());
+    }
+    #[tokio::test]
+    async fn a_rebuild_while_the_add_on_is_activating_is_still_reviewed() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let reviews = Arc::new(Reviews::default());
+        let path = root.path().join("selected.cmxaddon");
+        std::fs::write(&path, super::super::package::fixture_archive()).unwrap();
+        let review = reviews.prepare_local(&manager, &path).unwrap();
+        let mut installed = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        // A lazy activation is in flight when the rebuild lands.
+        installed.desired_enabled = true;
+        installed.status = Status::Activating;
+        manager.save(&installed).unwrap();
+        let development = Development::default();
+        development.set_enabled(true);
+        let mut events = manager.events.subscribe();
+        development
+            .watch(
+                manager.clone(),
+                reviews.clone(),
+                path.clone(),
+                installed.manifest.id.clone(),
+                installed.source.clone(),
+            )
+            .unwrap();
+        let rebuilt = super::super::lifecycle::tests::package_with(|manifest| {
+            manifest
+                .permissions
+                .push(codemux_addon_protocol::manifest::Permission::WorkspaceRead)
+        });
+        let replacement = root.path().join("replacement.cmxaddon");
+        std::fs::write(&replacement, &rebuilt.archive).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    UiEvent::DevelopmentReview { review } => break review,
+                    UiEvent::DevelopmentError { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("a rebuild during activation must not be dropped");
+        assert_eq!(pending.digest, rebuilt.digest);
+        development.set_enabled(false);
     }
 }
