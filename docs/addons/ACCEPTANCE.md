@@ -3,7 +3,7 @@
 This maps chapter 12 of [the requirements](BUILD-SPEC.md) to executable checks.
 Recorded revisions, results and the remaining publication steps are in
 [the ledger](IMPLEMENTATION.md). Installed-app evidence below comes from the
-stock installers built from the final source (FINAL_RUN_LINKS). Browser mocks
+stock installers built from the final source ([run 35916722628](https://github.com/Zeus-Deus/codemux/actions/runs/35916722628); [Linux](evidence/native-ui-linux-final-81b4e666.json) and [Windows](evidence/native-ui-windows-final-81b4e666.json) results). Browser mocks
 and a native broker test that supplies frontend effect results are unit
 coverage only; they are never counted as desktop evidence.
 

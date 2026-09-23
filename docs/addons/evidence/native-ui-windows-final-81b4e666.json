@@ -1,9 +1,9 @@
 {
-  "commit": "029c1414cbef053e4ab3bbad0b072c2f1a24bfef",
+  "commit": "9b807e9bc16f5d1078d6074526b47699517540e5",
   "platform": "win32",
   "hardware": {
     "osRelease": "10.0.26100",
-    "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cpu": "AMD EPYC 7763 64-Core Processor                ",
     "logicalCpus": 4,
     "memoryBytes": 17174360064
   },
@@ -59,11 +59,11 @@
     "CI-only delayed public-SDK package built with the packed author tools; normal native package import, SDK broker and plugin-rendered status panel"
   ],
   "installerBuild": {
-    "commit": "029c1414cbef053e4ab3bbad0b072c2f1a24bfef",
-    "run": "35910781948",
+    "commit": "9b807e9bc16f5d1078d6074526b47699517540e5",
+    "run": "35916722628",
     "platform": "win32"
   },
-  "installerSha256": "d68cb9886a7c30c48fd09f5abb10d7e5e70b342bbbd7c91345c2862ee8066d0a",
+  "installerSha256": "fb45fb4f814da89d483efea7062f1f2cfa1ee9e68326e04f269f8fd60d99bbcc",
   "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
   "officialUpdater": [
     {
@@ -126,37 +126,37 @@
   "hostileWorkloads": [
     {
       "command": "block",
-      "uiObservationMs": 732.4176999999981
+      "uiObservationMs": 752.6326999999947
     },
     {
       "command": "throw",
-      "uiObservationMs": 742.5650999999998
+      "uiObservationMs": 773.6938000000009
     },
     {
       "command": "promises",
-      "uiObservationMs": 811.0418999999965
+      "uiObservationMs": 1125.0247999999992
     },
     {
       "command": "recurse",
-      "uiObservationMs": 817.5629000000044
+      "uiObservationMs": 794.1506000000008
     },
     {
       "command": "allocate",
-      "uiObservationMs": 843.2424000000028
+      "uiObservationMs": 824.1682999999975
     }
   ],
   "uiRendering": {
     "workload": "500 visible-model paths, five real Git refreshes while typing",
     "renderedRows": 14,
-    "frameSamples": 382,
+    "frameSamples": 392,
     "p95FrameGapMs": 15.700000000004366,
-    "maxFrameGapMs": 15.80000000000291,
+    "maxFrameGapMs": 15.700000000004366,
     "refreshMs": [
-      331.10659999999916,
-      359.0908000000054,
-      433.6054000000004,
-      331.4066000000021,
-      331.5216000000073
+      330.1137000000017,
+      344.77489999998943,
+      347.4285999999993,
+      604.7620000000024,
+      340.02219999999215
     ],
     "p95FrameGapBudgetMs": 100,
     "page": {
@@ -238,7 +238,7 @@
   "removalDuringActivation": {
     "fixtureSha256": "134058dd99368fa93676488c4d6ed1a413164daab0897c75faf32d9324b49d5f",
     "activationDelayMs": 700,
-    "removalCompletedMs": 1034
+    "removalCompletedMs": 742
   },
   "registryReset": {
     "backupKept": true,
