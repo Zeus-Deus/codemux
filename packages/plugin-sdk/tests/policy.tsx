@@ -66,5 +66,18 @@ export default definePlugin({
         </Stack>
       );
     });
+    // Each press replaces the button, releasing the previous callback.
+    ctx.panels.register("swap", () => {
+      const [round, setRound] = useState(0);
+      return (
+        <Stack>
+          <Button
+            key={round}
+            label={"Round " + round}
+            onPress={() => setRound((n) => n + 1)}
+          />
+        </Stack>
+      );
+    });
   },
 });

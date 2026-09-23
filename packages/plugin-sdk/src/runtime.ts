@@ -516,10 +516,28 @@ function adapter({ manifest, send, now }: Transport) {
         views.get(p.viewId)?.acknowledge(p.revision);
         break;
       case "ui.event": {
-        const fn = views.get(p.viewId)?.callbacks.get(p.callbackId);
-        if (!fn) fail();
+        if (
+          typeof p?.viewId !== "string" ||
+          typeof p.callbackId !== "string" ||
+          typeof p.context !== "string" ||
+          (p.value != null &&
+            typeof p.value !== "string" &&
+            typeof p.value !== "boolean")
+        )
+          fail();
+        // The desktop checks each event against the tree it has applied, so an
+        // event can still cross the patch that released its callback, or an
+        // unmount. That is a stale click, not a fault: ignore it.
+        const view = views.get(p.viewId);
+        const fn = view?.callbacks.get(p.callbackId);
+        if (!fn) {
+          diagnose(
+            `A UI event for a ${view ? "released callback" : "closed view"} was ignored`,
+          );
+          break;
+        }
         // Remote DOM returns the author's promise through the event response.
-        settle(fn!({ context: p.context, value: p.value }), "UI callback");
+        settle(fn({ context: p.context, value: p.value }), "UI callback");
         break;
       }
       case "workspace.changed":

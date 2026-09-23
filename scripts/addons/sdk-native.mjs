@@ -122,6 +122,18 @@ function peak(host, predicate, ms = 1000) {
   }
   return most;
 }
+// The press callback of the one button a patch inserts.
+function pressCallback(patch) {
+  const found = [];
+  const visit = (value) => {
+    if (value?.element === "cmx-button")
+      found.push(value.eventListeners.press.callbackId);
+    if (value && typeof value === "object") Object.values(value).forEach(visit);
+  };
+  visit(patch.params.records);
+  assert.equal(found.length, 1, JSON.stringify(patch.params.records));
+  return found[0];
+}
 try {
   {
     const manifest = structuredClone(hello);
@@ -209,7 +221,10 @@ try {
     "exhaust",
     "flood",
   ].map((id) => ({ id, title: "Run " + id, requiresWorkspace: false }));
-  policy.contributes.panels = [{ id: "form", title: "Form", icon: "list" }];
+  policy.contributes.panels = [
+    { id: "form", title: "Form", icon: "list" },
+    { id: "swap", title: "Swap", icon: "refresh-cw" },
+  ];
   const policySource = await bundle("./tests/policy.tsx");
   {
     const host = await start(policySource, policy);
@@ -276,6 +291,103 @@ try {
       "PASS: stable host rejections, disposed registrations and subscriptions keep the plugin running",
     );
   }
+  {
+    // The desktop checks each event against the tree it has applied, so a
+    // click can cross the patch that released its callback, or an unmount.
+    // Such a stale event is ignored; the plugin keeps running.
+    const host = await start(policySource, policy);
+    await activated(host);
+    const press = (viewId, callbackId) =>
+      host.send("ui.event", {
+        viewId,
+        callbackId,
+        context: "trusted-interaction",
+      });
+    const log = (m) => m.method === "log";
+    host.send("view.mount", {
+      id: "swap",
+      kind: "panels",
+      viewId: "swap1",
+      context: "context1",
+    });
+    const first = pressCallback(
+      await host.until((m) => m.method === "ui.patch"),
+    );
+    host.send("ui.ack", { viewId: "swap1", revision: 1 });
+    press("swap1", first);
+    const replaced = await host.until((m) => m.method === "ui.patch");
+    assert.ok(
+      replaced.params.records.some((r) => r[0] === 1),
+      "the pressed button must be removed",
+    );
+    const second = pressCallback(replaced);
+    assert.notEqual(second, first);
+    host.send("ui.ack", { viewId: "swap1", revision: 2 });
+    // The first callback was released when that patch was sent.
+    press("swap1", first);
+    assert.match(
+      (await host.until(log)).params.message,
+      /released callback was ignored/,
+    );
+    press("never-mounted", second);
+    assert.match((await host.until(log)).params.message, /closed view/);
+    await sleep(100);
+    assert.ok(
+      !host.frames.some((m) => m.method === "ui.patch"),
+      "an ignored event must not run a callback",
+    );
+    // A current callback still runs and renders.
+    press("swap1", second);
+    const next = await host.until((m) => m.method === "ui.patch");
+    assert.match(JSON.stringify(next.params.records), /Round 2/);
+    host.send("ui.ack", { viewId: "swap1", revision: 3 });
+    host.send("view.unmount", { viewId: "swap1" });
+    press("swap1", pressCallback(next));
+    assert.match((await host.until(log)).params.message, /closed view/);
+    // The same host still mounts and serves a new view.
+    host.send("view.mount", {
+      id: "swap",
+      kind: "panels",
+      viewId: "swap2",
+      context: "context1",
+    });
+    const again = await host.until((m) => m.method === "ui.patch");
+    assert.equal(again.params.viewId, "swap2");
+    host.send("ui.ack", { viewId: "swap2", revision: 1 });
+    press("swap2", pressCallback(again));
+    assert.match(
+      JSON.stringify((await host.until((m) => m.method === "ui.patch")).params),
+      /Round 1/,
+    );
+    assert.ok(host.alive(), "stale UI events must not stop the plugin");
+    console.log(
+      "PASS: UI events for released callbacks and closed views are ignored",
+    );
+  }
+  for (const [change, reason] of [
+    [(e) => ({ ...e, callbackId: Number(e.callbackId) }), "a numeric callback"],
+    [(e) => ({ ...e, value: { text: "x" } }), "an object value"],
+    [({ context, ...e }) => e, "a missing context"],
+  ]) {
+    // Malformed events remain faults, even for a live view and callback.
+    const host = await start(policySource, policy);
+    await activated(host);
+    host.send("view.mount", {
+      id: "swap",
+      kind: "panels",
+      viewId: "swap1",
+      context: "context1",
+    });
+    const callbackId = pressCallback(
+      await host.until((m) => m.method === "ui.patch"),
+    );
+    host.send(
+      "ui.event",
+      change({ viewId: "swap1", callbackId, context: "trusted-interaction" }),
+    );
+    assert.ok(await host.stopped(), `${reason} must stop the plugin`);
+  }
+  console.log("PASS: malformed UI events remain faults");
   {
     // Controlled input at typing speed: 60 changes/s for 2 s with prompt
     // acknowledgements must stay under the 30 batches/s native limit.

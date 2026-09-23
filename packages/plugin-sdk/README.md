@@ -127,7 +127,9 @@ storage, but network, notifications, panels and composer calls are refused.
 A stable host rejection is an ordinary outcome. When a command handler, composer
 action, UI callback or subscription callback returns a promise that rejects with
 a `PluginError`, the SDK records a short diagnostic and the plugin keeps running.
-Still, catch errors where users need to see them, as the example above does.
+Still, catch errors where users need to see them, as the example above does. A
+click can also cross an update: an event for a callback that a newer render
+removed, or for a view that has closed, is ignored with a short diagnostic.
 
 Everything else is a runtime fault. A synchronous throw from any callback or
 render, a promise that rejects with anything other than a `PluginError`, an
