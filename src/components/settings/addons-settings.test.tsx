@@ -290,8 +290,16 @@ async function openReview(review: AddonReview) {
 }
 
 it("offers Retry and Disable for a failed add-on, and Disable revokes it", async () => {
-  answer({});
+  // Effects of the add-on are fenced for the whole disable call.
+  const fenced: (number | undefined)[] = [];
+  answer({
+    addon_disable: () => {
+      fenced.push(useAddonsStore.getState().revoking["codemux.issue-companion"]);
+      return null;
+    },
+  });
   useAddonsStore.setState({
+    revoking: {},
     installed: [
       {
         ...installation,
@@ -314,6 +322,8 @@ it("offers Retry and Disable for a failed add-on, and Disable revokes it", async
   await waitFor(() =>
     expect(failed.getByRole("button", { name: "Retry" })).toBeEnabled(),
   );
+  expect(fenced).toEqual([1]);
+  expect(useAddonsStore.getState().revoking).toEqual({});
   fireEvent.click(failed.getByRole("button", { name: "Retry" }));
   await waitFor(() =>
     expect(addonInvoke).toHaveBeenCalledWith("addon_enable", {
