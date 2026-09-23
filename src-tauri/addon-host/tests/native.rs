@@ -394,8 +394,9 @@ fn ui_batches_over_thirty_per_second_wait_instead_of_faulting() {
         }
     }
     assert!(arrivals[29] < Duration::from_millis(500));
+    // Released after the 1 s window plus a margin for arrival jitter.
     assert!(
-        arrivals[30] >= Duration::from_millis(900),
+        arrivals[30] >= Duration::from_millis(1040),
         "{:?}",
         arrivals[30]
     );

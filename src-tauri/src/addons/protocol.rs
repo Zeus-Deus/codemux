@@ -205,12 +205,15 @@ impl Host {
       // means the host itself is compromised or broken: stop at once.
       let message=Envelope::parse(&frame,Some(&generation),true)?;frame.clear();
       if message.method.is_none() { if let Some(error)=message.error { return Err(error) } continue; }
-      // The host answers excess requests itself; this backstop does the same
-      // and stops only on repeated violations, keeping rejections bounded.
-      if message.method.as_deref()==Some("host.request")&&!requests.accept(Instant::now(),20,100){
+      // The host enforces the exact quota at the source. This backstop bounds
+      // only a broken host: it allows twice that to absorb arrival bunching,
+      // answers excess requests, and stops only on repeated violations.
+      if message.method.as_deref()==Some("host.request")&&!requests.accept(Instant::now(),40,200){
        let quota=ProtocolError::new(ErrorCode::ResourceLimit,"Plugin request quota exceeded");
        if repeated(&mut violations,Instant::now()){return Err(quota)}
-       if let Some(id)=message.id{let mut bytes=serde_json::to_vec(&Envelope::response(&generation,id,Err(quota))).unwrap();bytes.push(b'\n');let _=replies.try_send(Outbound{bytes});}
+       // Violations bound these replies to four per 10 s, so each may wait for
+       // the input queue in its own task while the reader moves on.
+       if let Some(id)=message.id{let mut bytes=serde_json::to_vec(&Envelope::response(&generation,id,Err(quota))).unwrap();bytes.push(b'\n');let (replies,cancel)=(replies.clone(),cancel.clone());tokio::spawn(async move{tokio::select!{_=cancel.cancelled()=>{},_=tokio::time::timeout(Duration::from_millis(1500),replies.send(Outbound{bytes}))=>{}}});}
        continue;
       }
       if message.method.as_deref()==Some("ready")&&message.params.as_ref().is_some_and(|p|p["phase"]=="yielded"){
@@ -395,11 +398,14 @@ mod tests {
             }
         }
     }
-    // Reads the generation from the first initialize frame, floods requests,
-    // then records replies while keeping its output pipe open on fd 3.
+    // Reads the generation from the first initialize frame, floods requests
+    // between pauses in which it reads nothing else, then records replies
+    // while keeping its output pipe open on fd 3.
     const REQUESTS: &str = "IFS= read -r line\n\
         generation=$(printf '%s' \"$line\" | /bin/sed 's/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/')\n\
+        /bin/sleep PAUSE\n\
         i=1; while [ $i -le COUNT ]; do printf '{\"jsonrpc\":\"2.0\",\"generation\":\"%s\",\"id\":%d,\"method\":\"host.request\",\"params\":{\"operation\":\"settings.get\",\"params\":{}}}\\n' \"$generation\" $i; i=$((i+1)); done\n\
+        /bin/sleep PAUSE\n\
         exec 3>&1\nexec /bin/cat > OUT";
     #[tokio::test]
     async fn oversized_and_malformed_child_frames_stop_the_generation() {
@@ -427,11 +433,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let replies = root.path().join("replies");
         let body = REQUESTS
-            .replace("COUNT", "22")
+            .replace("COUNT", "42")
+            .replace("PAUSE", "0.5")
             .replace("OUT", replies.to_str().unwrap());
         let executable = script(root.path(), "flooding-host", &body);
         let (host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
-        for _ in 0..20 {
+        // While the host reads nothing, fill its pipe and the input queue so
+        // the quota replies below cannot be queued at once.
+        for id in 1000..1003 {
+            host.respond(id, Ok(json!("x".repeat(600_000))))
+                .await
+                .unwrap();
+        }
+        // The backstop allows twice the host's own quota before answering.
+        for _ in 0..40 {
             let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
             assert!(matches!(event, Ok(Some(Event::Message(_)))));
         }
@@ -441,22 +456,30 @@ mod tests {
                 .await
                 .is_err()
         );
-        let written = std::fs::read_to_string(&replies).unwrap();
-        let rejected: Vec<Value> = written
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .filter(|reply: &Value| reply["error"]["data"]["code"] == "RESOURCE_LIMIT")
-            .collect();
-        assert_eq!(
-            rejected.iter().map(|r| r["id"].clone()).collect::<Vec<_>>(),
-            [json!(21), json!(22)]
-        );
+        let until = Instant::now() + Duration::from_secs(3);
+        let rejected = loop {
+            let written = std::fs::read_to_string(&replies).unwrap_or_default();
+            let rejected: Vec<Value> = written
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .filter(|reply: &Value| reply["error"]["data"]["code"] == "RESOURCE_LIMIT")
+                .map(|reply| reply["id"].clone())
+                .collect();
+            if rejected.len() >= 2 || Instant::now() >= until {
+                break rejected;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(rejected, [json!(41), json!(42)]);
         assert!(host.stop().await);
-        let body = REQUESTS.replace("COUNT", "25").replace("OUT", "/dev/null");
+        let body = REQUESTS
+            .replace("COUNT", "45")
+            .replace("PAUSE", "0")
+            .replace("OUT", "/dev/null");
         let executable = script(root.path(), "flooding-host", &body);
         let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
         let (error, messages) = stopped(&mut events).await;
-        assert_eq!(messages, 20);
+        assert_eq!(messages, 40);
         assert!(error.is_none_or(|e| e.message == "Plugin request quota exceeded"));
     }
     #[tokio::test]

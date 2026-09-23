@@ -184,6 +184,18 @@ pub struct LogEntry {
 }
 /// Each serialized entry is at most 64 bytes, bounding the ring to 64 KiB.
 const LOG_ENTRIES: usize = 65536 / 64;
+/// The trusted host paces UI batches to 30/s and 1,800/min at the source. This
+/// backstop bounds only a broken host: it allows twice that to absorb arrival
+/// bunching, never drops a batch, and stops only on repeated excess.
+fn ui_traffic(rate: &mut (limits::RateLimit, VecDeque<Instant>), now: Instant) -> Result<()> {
+    if !rate.0.accept(now, 60, 3600) && super::protocol::repeated(&mut rate.1, now) {
+        return Err(ProtocolError::new(
+            ErrorCode::ResourceLimit,
+            "UI traffic limit",
+        ));
+    }
+    Ok(())
+}
 struct PendingEffect {
     generation: String,
     sender: oneshot::Sender<Result<Value>>,
@@ -658,17 +670,7 @@ impl Manager {
                 if running.disposed_views.lock().await.contains(view_id) {
                     return Ok(());
                 }
-                // The host already paces batches. Arrival jitter is tolerated
-                // here: only repeated excess stops, and no batch is dropped.
-                let now = Instant::now();
-                let mut rate = running.ui_rate.lock().await;
-                if !rate.0.accept(now, 30, 1800) && super::protocol::repeated(&mut rate.1, now) {
-                    return Err(ProtocolError::new(
-                        ErrorCode::ResourceLimit,
-                        "UI traffic limit",
-                    ));
-                }
-                drop(rate);
+                ui_traffic(&mut *running.ui_rate.lock().await, Instant::now())?;
                 let mut views = running.views.lock().await;
                 let view = views
                     .get_mut(view_id)
@@ -1631,7 +1633,8 @@ mod tests {
         let view = show(&manager, &running).await;
         let started = Instant::now();
         let mut applied = Vec::new();
-        while started.elapsed() < Duration::from_millis(2500) {
+        // Longer than the 10 s window in which repeated excess would stop it.
+        while started.elapsed() < Duration::from_secs(11) {
             match tokio::time::timeout(Duration::from_millis(100), events.recv()).await {
                 Ok(Ok(UiEvent::Tree { revision, .. })) => {
                     applied.push(Instant::now());
@@ -1645,16 +1648,40 @@ mod tests {
             }
         }
         assert!(!running.cancel.is_cancelled());
-        assert!(applied.len() >= 50, "only {} batches", applied.len());
-        // The host defers batches; arrival jitter may add at most one.
+        assert!(applied.len() >= 200, "only {} batches", applied.len());
+        // The host defers batches with a margin, so even arrival times stay
+        // within 30 per second.
         for (index, at) in applied.iter().enumerate() {
             let window = applied[index..]
                 .iter()
                 .take_while(|later| later.duration_since(*at) < Duration::from_secs(1))
                 .count();
-            assert!(window <= 31, "{window} batches within one second");
+            assert!(window <= 30, "{window} batches within one second");
         }
         manager.shutdown().await;
+    }
+    #[test]
+    fn ui_backstop_allows_arrival_bunching_and_stops_repeated_excess() {
+        let mut rate = Default::default();
+        let now = Instant::now();
+        // Twice the paced rate arrives at once, then four excess batches are
+        // still applied; the fifth excess within 10 s stops the plugin.
+        for _ in 0..64 {
+            ui_traffic(&mut rate, now).unwrap();
+        }
+        let error = ui_traffic(&mut rate, now).unwrap_err();
+        assert_eq!(error.message, "UI traffic limit");
+        // Occasional excess is tolerated: violations expire after 10 s.
+        let mut rate = Default::default();
+        for second in 0..16 {
+            let now = now + Duration::from_secs(second);
+            for _ in 0..60 {
+                ui_traffic(&mut rate, now).unwrap();
+            }
+            if second % 3 == 0 {
+                assert!(ui_traffic(&mut rate, now).is_ok());
+            }
+        }
     }
     #[test]
     fn supervision_uses_the_specified_delays() {

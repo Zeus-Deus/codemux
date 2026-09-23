@@ -150,18 +150,23 @@ impl Traffic {
         }
     }
     /// Earliest time the next UI batch may leave the 30/s and 1,800/min window.
+    /// The guard keeps paced batches inside the parent's arrival-time window
+    /// despite pipe and scheduling jitter.
     fn paced(&mut self, now: Instant) -> Instant {
+        const GUARD: Duration = Duration::from_millis(50);
         while self
             .patches
             .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60))
+            .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60) + GUARD)
         {
             self.patches.pop_front();
         }
         let mut at = now;
         for (count, window) in [(1800, 60), (30, 1)] {
             if self.patches.len() >= count {
-                at = at.max(self.patches[self.patches.len() - count] + Duration::from_secs(window));
+                at = at.max(
+                    self.patches[self.patches.len() - count] + Duration::from_secs(window) + GUARD,
+                );
             }
         }
         at
