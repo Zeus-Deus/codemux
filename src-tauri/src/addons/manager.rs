@@ -154,15 +154,17 @@ impl Running {
         *self.last_used.lock().unwrap() = Instant::now();
         self.activity.notify_one();
     }
-    /// Activated, no mounted UI, and no pending call in either direction.
-    /// Both the idle stop and eviction use this one predicate.
-    fn is_idle(&self) -> bool {
-        self.activated.load(Ordering::Acquire)
+    /// When the host became idle: activated, no mounted UI, and no pending call
+    /// in either direction. It counts from the later of the last recorded use
+    /// and the last yielded call. Both the idle stop and eviction use it.
+    fn idle_since(&self) -> Option<Instant> {
+        let idle = self.activated.load(Ordering::Acquire)
             && !self.probe
             && !self.cancel.is_cancelled()
             && self.requests.available_permits() == 16
-            && !self.host.pending_calls()
-            && self.views.try_lock().is_ok_and(|views| views.is_empty())
+            && self.views.try_lock().is_ok_and(|views| views.is_empty());
+        let settled = self.host.settled().filter(|_| idle)?;
+        Some(settled.max(*self.last_used.lock().unwrap()))
     }
 }
 /// Sanitized per-installation log activity. It outlives the generation that
@@ -491,9 +493,9 @@ impl Manager {
             // activating, rendering, or serving a call.
             let idle = hosts
                 .iter()
-                .filter(|(_, r)| r.is_idle())
-                .min_by_key(|(_, r)| *r.last_used.lock().unwrap())
-                .map(|(id, _)| id.clone());
+                .filter_map(|(id, r)| Some((r.idle_since()?, id)))
+                .min()
+                .map(|(_, id)| id.clone());
             if let Some(id) = idle {
                 drop(hosts);
                 self.stop(&id, None).await;
@@ -557,15 +559,12 @@ impl Manager {
                 // Stop 60 s after the last completed call with no mounted UI.
                 // A busy host re-checks after each activity and at least once
                 // per idle period.
-                let idle_at = if instance.is_idle() {
-                    *instance.last_used.lock().unwrap() + manager.timing.idle
-                } else {
-                    Instant::now() + manager.timing.idle
-                };
+                let idle_at =
+                    instance.idle_since().unwrap_or_else(Instant::now) + manager.timing.idle;
                 tokio::select! {
                  _=instance.cancel.cancelled()=>break,
                  _=instance.activity.notified()=>{},
-                 _=tokio::time::sleep_until(idle_at.into())=>{if instance.is_idle()&&instance.last_used.lock().unwrap().elapsed()>=manager.timing.idle{manager.stop(&instance.manifest.id,None).await;break}},
+                 _=tokio::time::sleep_until(idle_at.into())=>{if instance.idle_since().is_some_and(|since|since.elapsed()>=manager.timing.idle){manager.stop(&instance.manifest.id,None).await;break}},
                  event=events.recv()=>{let result=match event{
                   Some(Event::Message(message))=>{
                    if message.method.as_deref()==Some("ready")&&message.params.as_ref().is_some_and(|p|p["phase"]=="activated"){
@@ -716,6 +715,7 @@ impl Manager {
                 Ok(())
             }
             Some("ready") => {
+                // The transport forwards only yields that end a pending call.
                 if params["requestId"].is_u64() {
                     running.touch();
                 }
@@ -1612,6 +1612,60 @@ mod tests {
         let installed = manager.installation(&running.manifest.id).unwrap();
         assert!(matches!(installed.status, Status::EnabledIdle));
         assert!(installed.failure.is_none());
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_host_serving_a_parent_call_is_neither_idle_nor_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let timing = Timing {
+            idle: Duration::from_millis(300),
+            ..Timing::default()
+        };
+        let manager = Manager::open_with(root.path().into(), test_host_path(), timing).unwrap();
+        let installation = installed(
+            Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap(),
+        );
+        manager.save(&installation).unwrap();
+        // The command runs 200 ms of synchronous work inside its 250 ms budget.
+        let source = "__codemuxRegister({}, ({send}) => m => {\
+            if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});\
+            else if(m.method==='command.execute'){const end=Date.now()+200;while(Date.now()<end){}console.info('done');}});";
+        let running = manager
+            .activate(installation, source.into(), false)
+            .await
+            .unwrap();
+        let activated = Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Sent directly, so no recorded use: only the pending call keeps the
+        // host from idling when its 300 ms idle period ends mid-call.
+        running
+            .host
+            .send("command.execute", json!({"id":"hello"}))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            running.idle_since().is_none(),
+            "a host serving a call cannot be evicted"
+        );
+        tokio::time::timeout(Duration::from_secs(3), running.stopped.cancelled())
+            .await
+            .expect("an idle host stops");
+        let elapsed = activated.elapsed();
+        let installed = manager.installation(&running.manifest.id).unwrap();
+        assert_eq!(installed.failure, None);
+        assert!(matches!(installed.status, Status::EnabledIdle));
+        // The idle period restarts when the call yields, about 350 ms in.
+        assert!(elapsed >= Duration::from_millis(600), "{elapsed:?}");
+        let diagnostics = manager.diagnostics(&running.manifest.id).unwrap();
+        assert!(diagnostics
+            .logs
+            .iter()
+            .any(|entry| entry.level == "info" && entry.bytes == "done".len()));
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]

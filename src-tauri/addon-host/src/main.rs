@@ -279,6 +279,15 @@ impl Traffic {
                     Err(error) => self.fault = Some(error),
                 }
             }
+            // Only the host reports yields; plugin code may announce activation.
+            Some("ready")
+                if msg
+                    .params
+                    .as_ref()
+                    .is_none_or(|p| p["phase"] != "activated") =>
+            {
+                self.violation(now)
+            }
             _ => match encode(&msg) {
                 Ok(bytes) => self.write(&bytes),
                 Err(error) => self.fault = Some(error),
