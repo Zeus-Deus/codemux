@@ -60,7 +60,12 @@ export function matches(comparators,[major,minor,patch]) {
  return comparators.every(c=>test[c.op](c));
 }
 export function validate(manifest) {
- if (!checkSchema(manifest)) throw Error('Manifest schema: '+checkSchema.errors.map(e=>e.instancePath+' '+e.message).join('; '));
+ const schemaErrors=checkSchema(manifest) ? [] : checkSchema.errors;
+ const failSchema=errors=>{throw Error('Manifest schema: '+errors.map(e=>e.instancePath+' '+e.message).join('; '))};
+ // The rules below assume the schema's shape; value constraints the schema also
+ // encodes (enum, pattern, lengths, bounds) get their more specific message there.
+ const structural=schemaErrors.filter(e=>!['enum','const','pattern','format','minLength','maxLength','minimum','maximum','minItems','maxItems','uniqueItems'].includes(e.keyword));
+ if (structural.length) failSchema(structural);
  const m=manifest;
  const require=(ok,message)=>{if(!ok)throw Error(message)};
  require(m.format==='codemux.feature-plugin'&&m.manifestVersion===1&&m.entry==='plugin.js','Unsupported package format: use format "codemux.feature-plugin", manifestVersion 1 and entry "plugin.js"');
@@ -89,5 +94,6 @@ export function validate(manifest) {
  require(m.http.length<=20&&m.credentials.length<=20&&unique(m.http.map(h=>h.origin))&&unique(m.credentials.map(c=>c.id))&&unique(m.credentials.map(c=>c.origin)),'Duplicate or excessive HTTP grants');
  for(const h of m.http)require(origin(h.origin)&&h.methods.length>0&&unique(h.methods)&&(h.credential===null||m.credentials.some(c=>c.id===h.credential&&c.origin===h.origin)),`Invalid HTTP declaration "${h.origin}": use an exact lowercase HTTPS hostname origin on port 443, no wildcard, IP address, trailing dot or path`);
  for(const c of m.credentials)require(id.test(c.id)&&text(c.label,80)&&origin(c.origin)&&m.http.some(h=>h.origin===c.origin&&h.credential===c.id),`Invalid credential "${c.id}"`);
+ if (schemaErrors.length) failSchema(schemaErrors);
  return m;
 }
