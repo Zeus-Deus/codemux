@@ -946,6 +946,11 @@ impl Manager {
         self.save(&installation)?;
         self.stop(id, None).await;
         self.commit_removal(&installation, keep_data)?;
+        // Diagnostics belong to this installation identity; a reinstall starts fresh.
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .remove(&installation.installation_id);
         let _ = self.events.send(super::manager::UiEvent::Inventory);
         // The retry path takes the same operation lock; release this completed
         // removal before attempting any OS or filesystem cleanup.

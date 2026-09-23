@@ -229,6 +229,8 @@ jobs:
             examples/addons/project-brief/*.cmxaddon
             examples/addons/issue-companion/*.cmxaddon
             scripts/addons/fixtures/fault-isolation/*.cmxaddon
+            scripts/addons/fixtures/context-races/*.cmxaddon
+            scripts/addons/fixtures/activation-race/*.cmxaddon
       - name: Install external WebDriver
         run: cargo install tauri-driver --version 2.0.6 --locked
       - name: Install matching Microsoft WebView2 driver

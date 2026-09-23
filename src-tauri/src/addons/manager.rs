@@ -339,7 +339,7 @@ pub struct Manager {
     effects: Mutex<HashMap<String, PendingEffect>>,
     pub events: broadcast::Sender<UiEvent>,
     paused: AtomicBool,
-    diagnostics: StdMutex<HashMap<String, Diagnostics>>,
+    pub(super) diagnostics: StdMutex<HashMap<String, Diagnostics>>,
     timing: Timing,
 }
 /// Supervision delays. Tests shorten them; they grant no authority.
