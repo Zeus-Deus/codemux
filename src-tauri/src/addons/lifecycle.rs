@@ -173,6 +173,13 @@ fn unavailable() -> ProtocolError {
         "The add-on transaction could not be saved",
     )
 }
+/// The previous generation could not be stopped, so nothing may replace it.
+fn still_running() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::PluginStopped,
+        "The running version has not exited yet; retry once it stops",
+    )
+}
 fn journal_error() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
@@ -367,6 +374,10 @@ impl Reviews {
     }
     pub fn cancel(&self, token: &str) {
         self.pending.lock().unwrap().remove(token);
+    }
+    /// Whether the review `token` still awaits a decision.
+    pub fn is_pending(&self, token: &str) -> bool {
+        self.pending.lock().unwrap().contains_key(token)
     }
     pub async fn accept(
         &self,
@@ -574,7 +585,9 @@ impl Reviews {
         let mut queued = false;
         let result: Result<()> = async {
             active_review()?;
-            manager.stop(id, None).await;
+            if !manager.stop(id, None).await {
+                return Err(still_running());
+            }
             if let Some(old) = &old {
                 let mut updating = old.clone();
                 updating.status = Status::Updating;
@@ -661,8 +674,8 @@ impl Reviews {
         }
         .await;
         if let Err(error) = result {
-            manager.stop(id, None).await;
-            manager.restore(old.as_ref(), &candidate, journal.parent().unwrap());
+            let reaped = manager.stop(id, None).await;
+            manager.restore(old.as_ref(), &candidate, journal.parent().unwrap(), reaped);
             return Err(error);
         }
         #[cfg(test)]
@@ -746,16 +759,28 @@ impl Manager {
     /// Failure path of an update or rollback: put back the previous tuple and
     /// its enablement, or nothing for a new installation, and drop settings
     /// restored for a new installation ID. The journal is removed only once
-    /// that is durable; otherwise startup recovery retries.
-    fn restore(&self, old: Option<&Installation>, candidate: &Installation, journal: &Path) {
+    /// that is durable; otherwise startup recovery retries. A generation that
+    /// is still unreaped keeps the restored record quarantined.
+    fn restore(
+        &self,
+        old: Option<&Installation>,
+        candidate: &Installation,
+        journal: &Path,
+        reaped: bool,
+    ) {
         let restored = match old {
             Some(old) => {
                 let mut restored = old.clone();
-                restored.status = if restored.desired_enabled {
+                restored.status = if !reaped {
+                    Status::FailedDisabled
+                } else if restored.desired_enabled {
                     Status::EnabledIdle
                 } else {
                     Status::InstalledDisabled
                 };
+                if !reaped {
+                    restored.failure = Some(super::manager::QUARANTINED.into());
+                }
                 self.commit_replacement(&restored)
             }
             None => self
@@ -1007,7 +1032,9 @@ impl Manager {
         )?;
         let live = || candidate.desired_enabled && !self.paused();
         let result: Result<()> = async {
-            self.stop(id, None).await;
+            if !self.stop(id, None).await {
+                return Err(still_running());
+            }
             let mut updating = old.clone();
             updating.status = Status::Updating;
             self.save(&updating)?;
@@ -1048,8 +1075,8 @@ impl Manager {
         }
         .await;
         if let Err(error) = result {
-            self.stop(id, None).await;
-            self.restore(Some(&old), &candidate, journal.parent().unwrap());
+            let reaped = self.stop(id, None).await;
+            self.restore(Some(&old), &candidate, journal.parent().unwrap(), reaped);
             return Err(error);
         }
         if std::fs::remove_dir_all(journal.parent().unwrap()).is_ok() {

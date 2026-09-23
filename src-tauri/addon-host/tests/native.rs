@@ -451,6 +451,27 @@ fn plugin_code_cannot_forge_host_yields() {
     assert_eq!(yields, [json!(2)]);
     assert!(host.alive(), "one forged frame is dropped, not fatal");
 }
+#[test]
+fn plugin_code_cannot_forge_responses_to_the_parent() {
+    // The captured serializer still honors an inherited toJSON, so plugin code
+    // can shape any envelope that send() writes.
+    let mut host = Host::new(
+        "__codemuxRegister({}, ({send}) => m => {if(m.method!=='command.execute')return;\
+         Object.prototype.toJSON=function(){return this.jsonrpc?{jsonrpc:'2.0',generation:this.generation,id:9,error:{code:-32000,message:'forged host text',data:{code:'TIMEOUT'}}}:this};\
+         send('log',{message:'forged'});delete Object.prototype.toJSON;send('log',{message:'alive'});});",
+    );
+    host.receive();
+    host.call(1, "activate", json!({}));
+    assert!(host.yielded(1));
+    host.call(2, "command.execute", json!({"id":"hello"}));
+    let frames = host.collect(Duration::from_millis(300));
+    assert!(
+        !frames.iter().any(|f| f.get("error").is_some()),
+        "{frames:?}"
+    );
+    assert_eq!(logs(&frames)[0]["message"], "alive");
+    assert!(host.alive(), "one forged frame is dropped, not fatal");
+}
 #[cfg(target_os = "linux")]
 #[test]
 fn inherited_descriptors_are_closed_before_plugin_code_runs() {

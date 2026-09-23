@@ -112,6 +112,10 @@ pub struct Host {
     done: CancellationToken,
     sequence: Arc<AtomicU64>,
     progress: Arc<Mutex<Progress>>,
+    /// Holding this delays the reaped signal, as a kernel that is slow to
+    /// terminate the child would.
+    #[cfg(test)]
+    pub(super) reaping: Arc<tokio::sync::Mutex<()>>,
 }
 impl Host {
     pub async fn spawn(
@@ -177,7 +181,11 @@ impl Host {
             done: done.clone(),
             sequence: Arc::new(AtomicU64::new(1)),
             progress: progress.clone(),
+            #[cfg(test)]
+            reaping: Default::default(),
         };
+        #[cfg(test)]
+        let reaping = host.reaping.clone();
         let writing_cancel = cancel.clone();
         // A broken input pipe usually means the host is exiting. Stop writing
         // but let the reader observe the exit and its reason; later writes fail
@@ -213,7 +221,9 @@ impl Host {
       // The trusted host validates every plugin frame, so a malformed one here
       // means the host itself is compromised or broken: stop at once.
       let message=Envelope::parse(&frame,Some(&generation),true)?;frame.clear();
-      if message.method.is_none() { if let Some(error)=message.error { return Err(error) } continue; }
+      // The host accepts every parent call itself, so an error response means
+      // it is broken. Stop with a fixed reason; never surface the frame's text.
+      if message.method.is_none() { if message.error.is_some() { return Err(ProtocolError::invalid("Unexpected plugin host response")) } continue; }
       // The host enforces the exact quota at the source. This backstop bounds
       // only a broken host: it allows twice that to absorb arrival bunching,
       // answers excess requests, and stops only on repeated violations.
@@ -246,6 +256,8 @@ impl Host {
             }
             drop(events);
             reap(&mut child).await;
+            #[cfg(test)]
+            drop(reaping.lock().await);
             done.cancel();
         });
         if source.len() > limits::BUNDLE {
@@ -444,6 +456,21 @@ mod tests {
             let error = stopped(&mut events).await.0.expect("stop reason");
             assert_eq!((error.data.code, error.message.as_str()), (code, message));
         }
+    }
+    #[tokio::test]
+    async fn child_error_responses_stop_with_a_fixed_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let body = "IFS= read -r line\n\
+            generation=$(printf '%s' \"$line\" | /bin/sed 's/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/')\n\
+            printf '{\"jsonrpc\":\"2.0\",\"generation\":\"%s\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"forged host text\",\"data\":{\"code\":\"TIMEOUT\"}}}\\n' \"$generation\"\n\
+            exec /bin/sleep 60";
+        let executable = script(root.path(), "responding-host", body);
+        let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+        let error = stopped(&mut events).await.0.expect("stop reason");
+        assert_eq!(
+            (error.data.code, error.message.as_str()),
+            (ErrorCode::InvalidMessage, "Unexpected plugin host response")
+        );
     }
     #[tokio::test]
     async fn parent_request_quota_answers_excess_and_stops_repeated_violations() {

@@ -57,6 +57,8 @@ pub struct Installation {
 }
 /// The plugin API this app provides.
 pub const HOST_API: semver::Version = semver::Version::new(1, 0, 0);
+/// Recorded while a stopped generation's process has not been reaped.
+pub(super) const QUARANTINED: &str = "The plugin process has not exited; it remains quarantined";
 /// Compatibility explanation for the Settings detail view.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,6 +190,8 @@ pub enum UiEvent {
     Inventory,
     DevelopmentReview {
         review: super::lifecycle::Review,
+        #[serde(skip)]
+        sequence: u64,
     },
     DevelopmentError {
         message: String,
@@ -205,13 +209,39 @@ pub enum UiEvent {
         request_id: String,
         operation: String,
         params: Value,
+        #[serde(skip)]
+        sequence: u64,
     },
     Stopped {
         plugin_id: String,
         generation: String,
         message: String,
+        #[serde(skip)]
+        sequence: u64,
     },
 }
+impl UiEvent {
+    /// The position of an event that is sent only once. Current state replaces
+    /// every other event a lagged subscriber missed; see `Manager::resubscribe`.
+    pub fn sequence(&self) -> Option<u64> {
+        match self {
+            Self::DevelopmentReview { sequence, .. }
+            | Self::Effect { sequence, .. }
+            | Self::Stopped { sequence, .. } => Some(*sequence),
+            _ => None,
+        }
+    }
+}
+/// One-shot events are numbered and sent under one lock, so every subscriber
+/// receives them in sequence order. Stops and development reviews are kept
+/// for a subscriber that lagged; pending effects are replayed from `effects`.
+#[derive(Default)]
+struct Announced {
+    sequence: u64,
+    recent: VecDeque<UiEvent>,
+}
+/// Stops and reviews kept for resynchronization; more than any lag window holds.
+const ANNOUNCED: usize = 64;
 struct View {
     tree: Tree,
     context: String,
@@ -317,6 +347,21 @@ struct PendingEffect {
     cancel: CancellationToken,
     deadline: Instant,
     claimed: Option<Instant>,
+    /// The announcement, sent again to a subscriber that lagged past it.
+    event: UiEvent,
+}
+/// Removes a pending effect however its request ends, including when the
+/// request timeout or a stop drops the waiting future.
+struct EffectGuard<'a> {
+    effects: &'a StdMutex<HashMap<String, PendingEffect>>,
+    id: String,
+}
+impl Drop for EffectGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut effects) = self.effects.lock() {
+            effects.remove(&self.id);
+        }
+    }
 }
 /// Broker access withdrawn the moment a disable or removal begins, while that
 /// operation still waits for the plugin's lock (for example behind a lazy
@@ -339,6 +384,11 @@ impl Drop for Revocation<'_> {
 /// A claimed effect is being applied by the trusted UI. Its result may arrive
 /// shortly after the interaction deadline, which only bounds claiming.
 const CLAIMED_GRACE: Duration = Duration::from_secs(2);
+/// Claim window of an effect that no interaction bounds, such as a
+/// notification. Like an interaction's, it ends with its claimed grace well
+/// inside the 15 s request timeout of the broker and the SDK, so an effect the
+/// UI applied is never reported to the plugin as timed out.
+const UNPROMPTED_CLAIM: Duration = Duration::from_secs(10);
 impl PendingEffect {
     fn expires(&self) -> Instant {
         self.claimed
@@ -355,8 +405,9 @@ pub struct Manager {
     pub(super) catalog: super::catalog::CatalogState,
     running: Arc<Mutex<HashMap<String, Arc<Running>>>>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    effects: Mutex<HashMap<String, PendingEffect>>,
+    effects: StdMutex<HashMap<String, PendingEffect>>,
     pub events: broadcast::Sender<UiEvent>,
+    announced: StdMutex<Announced>,
     paused: AtomicBool,
     pub(super) diagnostics: StdMutex<HashMap<String, Diagnostics>>,
     /// Plugin IDs whose disable or removal has begun, counted per operation.
@@ -421,8 +472,11 @@ impl Manager {
         let registry = Connection::open(root.join("registry.sqlite")).map_err(storage_error)?;
         registry.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE IF NOT EXISTS installations(id TEXT PRIMARY KEY,plugin_id TEXT NOT NULL UNIQUE,record TEXT NOT NULL);CREATE TABLE IF NOT EXISTS settings(installation TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS credential_entries(installation TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(installation,id));CREATE TABLE IF NOT EXISTS file_cleanup(installation TEXT PRIMARY KEY,record TEXT NOT NULL);CREATE TABLE IF NOT EXISTS cleanup(installation TEXT NOT NULL,credential TEXT NOT NULL,PRIMARY KEY(installation,credential));").map_err(storage_error)?;
         let configured_credentials = {
+            // A key awaiting cleanup is never read, even if a failed save left
+            // an index entry beside its tombstone: the OS store may still hold
+            // the value the user cleared.
             let mut query = registry
-                .prepare("SELECT installation,id FROM credential_entries")
+                .prepare("SELECT installation,id FROM credential_entries WHERE NOT EXISTS(SELECT 1 FROM cleanup WHERE cleanup.installation=credential_entries.installation AND cleanup.credential=credential_entries.id)")
                 .map_err(storage_error)?;
             let entries = query
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -457,8 +511,9 @@ impl Manager {
             catalog: Default::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
             operations: Mutex::new(HashMap::new()),
-            effects: Mutex::new(HashMap::new()),
+            effects: StdMutex::new(HashMap::new()),
             events,
+            announced: Default::default(),
             paused: AtomicBool::new(
                 stored_paused
                     || std::env::var_os("CODEMUX_DISABLE_ADDONS").is_some_and(|v| v == "1"),
@@ -552,6 +607,36 @@ impl Manager {
         transaction.commit().map_err(storage_error)?;
         let _ = self.events.send(UiEvent::Inventory);
         Ok(())
+    }
+    /// Sends a one-shot event under the next sequence number. `event` runs
+    /// under the same lock, so it can record the event before anyone sees it.
+    fn announce(&self, event: impl FnOnce(u64) -> UiEvent) {
+        let mut announced = self.announced.lock().unwrap();
+        announced.sequence += 1;
+        let event = event(announced.sequence);
+        if !matches!(event, UiEvent::Effect { .. }) {
+            announced.recent.push_back(event.clone());
+            if announced.recent.len() > ANNOUNCED {
+                announced.recent.pop_front();
+            }
+        }
+        let _ = self.events.send(event);
+    }
+    pub(crate) fn announce_review(&self, review: super::lifecycle::Review) {
+        self.announce(|sequence| UiEvent::DevelopmentReview { review, sequence });
+    }
+    /// A receiver and the last one-shot event sent before it.
+    pub fn subscribe(&self) -> (broadcast::Receiver<UiEvent>, u64) {
+        let announced = self.announced.lock().unwrap();
+        (self.events.subscribe(), announced.sequence)
+    }
+    /// Keeps `id` disabled while a stopped generation's process is unreaped.
+    fn quarantine(&self, id: &str) {
+        if let Ok(mut installation) = self.installation(id) {
+            installation.status = Status::FailedDisabled;
+            installation.failure = Some(QUARANTINED.into());
+            let _ = self.save(&installation);
+        }
     }
     pub async fn operation(&self, id: &str) -> Arc<Mutex<()>> {
         self.operations
@@ -653,6 +738,15 @@ impl Manager {
             )?;
         let mut hosts = self.running.lock().await;
         if let Some(running) = hosts.get(&installation.manifest.id) {
+            // A generation that is stopping, possibly quarantined unreaped, or
+            // a probe is not this activation; an update must not pass its probe
+            // or commit with it.
+            if running.cancel.is_cancelled() || running.probe != probe {
+                return Err(ProtocolError::new(
+                    ErrorCode::PluginStopped,
+                    "Add-on is stopping; retry shortly",
+                ));
+            }
             return Ok(running.clone());
         }
         if hosts.len() >= 8 {
@@ -971,7 +1065,9 @@ impl Manager {
             _ => Err(ProtocolError::invalid("Unknown child method")),
         }
     }
-    pub async fn stop(&self, id: &str, failure: Option<String>) {
+    /// False while a generation of `id` stays registered because its process
+    /// has not been reaped; nothing may replace or restart it until then.
+    pub async fn stop(&self, id: &str, failure: Option<String>) -> bool {
         // Keep the generation registered until its child has been reaped. This
         // prevents a lazy activation from overlapping a generation being stopped.
         let running = {
@@ -984,11 +1080,20 @@ impl Manager {
                 Some(running) => {
                     let stopped = running.stopped.clone();
                     drop(hosts);
-                    let _ = tokio::time::timeout(Duration::from_secs(2), stopped.cancelled()).await;
-                    return;
+                    return tokio::time::timeout(Duration::from_secs(2), stopped.cancelled())
+                        .await
+                        .is_ok();
                 }
                 None => None,
             }
+        };
+        // The generation is revoked whether or not its process exits in time,
+        // so an activation it was running is over rather than interrupted.
+        let settle = || {
+            let _ = self.registry.lock().unwrap().execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [format!("activation:{id}")],
+            );
         };
         let probe = running.as_ref().is_some_and(|r| r.probe);
         if let Some(running) = &running {
@@ -1003,23 +1108,20 @@ impl Manager {
                 .revoke_generation(running.generation());
             self.effects
                 .lock()
-                .await
+                .unwrap()
                 .retain(|_, effect| effect.generation != running.generation());
-            let _ = self.events.send(UiEvent::Stopped {
+            self.announce(|sequence| UiEvent::Stopped {
                 plugin_id: id.into(),
                 generation: running.generation().into(),
                 message: failure.clone().unwrap_or_else(|| "Plugin stopped".into()),
+                sequence,
             });
             if !running.host.stop().await {
                 // A kernel-level termination delay must never make room for a
                 // second generation. Keep the cancelled instance registered
                 // until the supervisor confirms actual reaping.
-                if let Ok(mut installation) = self.installation(id) {
-                    installation.status = Status::FailedDisabled;
-                    installation.failure =
-                        Some("The plugin process has not exited; it remains quarantined".into());
-                    let _ = self.save(&installation);
-                }
+                self.quarantine(id);
+                settle();
                 let hosts = self.running.clone();
                 let instance = running.clone();
                 let id = id.to_owned();
@@ -1034,19 +1136,16 @@ impl Manager {
                     }
                     instance.stopped.cancel();
                 });
-                return;
+                return false;
             }
         }
-        let _ = self.registry.lock().unwrap().execute(
-            "DELETE FROM metadata WHERE key=?1",
-            [format!("activation:{id}")],
-        );
+        settle();
         if probe {
             self.running.lock().await.remove(id);
             if let Some(running) = running {
                 running.stopped.cancel();
             }
-            return;
+            return true;
         }
         if let Ok(mut installation) = self.installation(id) {
             installation.status = if failure.is_some() {
@@ -1078,6 +1177,7 @@ impl Manager {
             self.running.lock().await.remove(id);
             running.stopped.cancel();
         }
+        true
     }
     pub async fn ensure_active(self: &Arc<Self>, id: &str) -> Result<Arc<Running>> {
         let operation = self.operation(id).await;
@@ -1218,10 +1318,46 @@ impl Manager {
         }
         Ok(())
     }
-    /// Current state for a subscriber that missed broadcast events: inventory
-    /// plus the latest tree of every mounted view.
-    pub async fn resync_events(&self) -> Vec<UiEvent> {
+    /// For a subscriber that lagged after one-shot event `seen`: a new receiver,
+    /// the last one-shot event before it, and what the subscriber missed. That
+    /// is the inventory, the later stops, development reviews that still await
+    /// a decision and unclaimed effects, and the latest tree of every mounted view.
+    pub async fn resubscribe(
+        &self,
+        seen: u64,
+        pending_review: impl Fn(&str) -> bool,
+    ) -> (broadcast::Receiver<UiEvent>, u64, Vec<UiEvent>) {
         let mut events = vec![UiEvent::Inventory];
+        let (receiver, sequence, mut effects) = {
+            let announced = self.announced.lock().unwrap();
+            events.extend(
+                announced
+                    .recent
+                    .iter()
+                    .filter(|event| event.sequence() > Some(seen))
+                    .filter(|event| match event {
+                        UiEvent::DevelopmentReview { review, .. } => pending_review(&review.token),
+                        _ => true,
+                    })
+                    .cloned(),
+            );
+            let now = Instant::now();
+            let effects: Vec<_> = self
+                .effects
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|effect| {
+                    effect.event.sequence() > Some(seen)
+                        && effect.claimed.is_none()
+                        && !effect.cancel.is_cancelled()
+                        && now < effect.deadline
+                })
+                .map(|effect| effect.event.clone())
+                .collect();
+            (self.events.subscribe(), announced.sequence, effects)
+        };
+        effects.sort_by_key(UiEvent::sequence);
         let hosts: Vec<_> = self.running.lock().await.values().cloned().collect();
         for running in hosts {
             for (view_id, view) in running.views.lock().await.iter() {
@@ -1234,7 +1370,8 @@ impl Manager {
                 });
             }
         }
-        events
+        events.extend(effects);
+        (receiver, sequence, events)
     }
     /// Move an unreadable add-on directory aside, whole, so a fresh registry
     /// can open without pruning its packages or private data. Returns the backup.
@@ -1557,24 +1694,33 @@ impl Manager {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         let cancel = cancel.unwrap_or_else(|| running.cancel.clone());
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
-        self.effects.lock().await.insert(
-            id.clone(),
-            PendingEffect {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + UNPROMPTED_CLAIM);
+        let _pending = EffectGuard {
+            effects: &self.effects,
+            id: id.clone(),
+        };
+        self.announce(|sequence| {
+            let event = UiEvent::Effect {
                 plugin_id: running.manifest.id.clone(),
                 generation: running.generation().into(),
-                sender: tx,
-                cancel: cancel.clone(),
-                deadline,
-                claimed: None,
-            },
-        );
-        let _ = self.events.send(UiEvent::Effect {
-            plugin_id: running.manifest.id.clone(),
-            generation: running.generation().into(),
-            request_id: id.clone(),
-            operation: operation.into(),
-            params,
+                request_id: id.clone(),
+                operation: operation.into(),
+                params,
+                sequence,
+            };
+            self.effects.lock().unwrap().insert(
+                id.clone(),
+                PendingEffect {
+                    plugin_id: running.manifest.id.clone(),
+                    generation: running.generation().into(),
+                    sender: tx,
+                    cancel: cancel.clone(),
+                    deadline,
+                    claimed: None,
+                    event: event.clone(),
+                },
+            );
+            event
         });
         let mut rx = rx;
         let mut expires = deadline;
@@ -1586,18 +1732,18 @@ impl Manager {
                 _ = tokio::time::sleep_until(expires.into()) => {
                     // A claim just before the deadline extends only the wait
                     // for its result, never the window for claiming it.
-                    match self.effects.lock().await.get(&id).map(PendingEffect::expires) {
+                    let extended = self.effects.lock().unwrap().get(&id).map(PendingEffect::expires);
+                    match extended {
                         Some(extended) if extended > Instant::now() => expires = extended,
                         _ => break rx.try_recv().unwrap_or_else(|_| Err(ProtocolError::new(ErrorCode::Timeout, "Host UI did not respond"))),
                     }
                 }
             }
         };
-        self.effects.lock().await.remove(&id);
         result
     }
     pub async fn claim_effect(&self, id: &str, generation: &str) -> Result<()> {
-        let mut effects = self.effects.lock().await;
+        let mut effects = self.effects.lock().unwrap();
         if let Some(effect) = effects.get(id) {
             self.check_access(&effect.plugin_id)?;
         }
@@ -1621,7 +1767,7 @@ impl Manager {
         generation: &str,
         result: Result<Value>,
     ) -> Result<()> {
-        let mut effects = self.effects.lock().await;
+        let mut effects = self.effects.lock().unwrap();
         if effects.get(id).is_none_or(|effect| {
             effect.generation != generation
                 || effect.cancel.is_cancelled()
@@ -2152,6 +2298,23 @@ mod tests {
         assert_eq!(timing.idle, Duration::from_secs(60));
         assert_eq!(timing.request("storage.set"), Duration::from_secs(15));
         assert_eq!(timing.request("http.fetch"), Duration::from_secs(30));
+        // A notification the UI applied is answered before the request times out.
+        assert!(UNPROMPTED_CLAIM + CLAIMED_GRACE < timing.request("ui.notify"));
+    }
+    #[test]
+    fn event_sequence_numbers_stay_in_the_host() {
+        let event = UiEvent::Stopped {
+            plugin_id: "example.hello".into(),
+            generation: "generation".into(),
+            message: "Plugin stopped".into(),
+            sequence: 7,
+        };
+        assert_eq!(event.sequence(), Some(7));
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({"type":"stopped","pluginId":"example.hello","generation":"generation","message":"Plugin stopped"})
+        );
+        assert_eq!(UiEvent::Inventory.sequence(), None);
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
@@ -2199,6 +2362,10 @@ mod tests {
         .await
         .expect("the stalled request is answered with TIMEOUT");
         assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(
+            manager.effects.lock().unwrap().is_empty(),
+            "a timed-out request leaves no effect to claim or answer"
+        );
         assert!(!running.cancel.is_cancelled());
         assert_eq!(running.requests.available_permits(), 16);
         manager.shutdown().await;
@@ -2689,7 +2856,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(result.is_err(), "delayed request after {action}");
-            assert!(manager.effects.lock().await.is_empty());
+            assert!(manager.effects.lock().unwrap().is_empty());
             assert!(manager
                 .contexts
                 .lock()
@@ -2929,6 +3096,219 @@ mod tests {
             manager.ensure_active(&old.manifest.id).await.unwrap();
             manager.shutdown().await;
         }
+    }
+    /// Holds back the reaped signal of a generation, as a kernel that is slow
+    /// to terminate its process would, until the guard is dropped.
+    async fn delay_reaping(running: &Running) -> tokio::sync::OwnedMutexGuard<()> {
+        running.host.reaping.clone().lock_owned().await
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_an_unreaped_generation_blocks_updates_and_rollback_and_stays_quarantined() {
+        let healthy = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let release = |version: &str| {
+            let version = version.to_owned();
+            super::super::lifecycle::tests::package_with_source(healthy.as_bytes(), |manifest| {
+                manifest.version = version
+            })
+        };
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let source = Source::Local {
+            identity: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut installed = None;
+        for version in ["1.0.0", "2.0.0"] {
+            let review = reviews
+                .prepare(&manager, release(version), source.clone())
+                .unwrap();
+            installed = reviews
+                .accept(&manager, &review.token, true, false)
+                .await
+                .ok();
+        }
+        let installed = installed.expect("the update to 2.0.0 is running");
+        let id = installed.manifest.id.clone();
+        let running = manager.running.lock().await.get(&id).cloned().unwrap();
+        let reaping = delay_reaping(&running).await;
+        let review = reviews
+            .prepare(&manager, release("3.0.0"), source.clone())
+            .unwrap();
+        let error = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .err()
+            .expect("an update cannot replace an unreaped generation");
+        assert_eq!(error.data.code, ErrorCode::PluginStopped);
+        let error = manager
+            .rollback(&id)
+            .await
+            .err()
+            .expect("nor can a rollback");
+        assert_eq!(error.data.code, ErrorCode::PluginStopped);
+        let record = manager.installation(&id).unwrap();
+        assert_eq!(record.digest, installed.digest, "nothing was committed");
+        assert_eq!(record.data_generation, installed.data_generation);
+        assert!(record.previous.is_some(), "the rollback snapshot is kept");
+        assert!(matches!(record.status, Status::FailedDisabled));
+        assert_eq!(record.failure.as_deref(), Some(QUARANTINED));
+        // No candidate ever ran: the stopping generation is the only one, and
+        // an activation never takes it for its own.
+        let registered = manager.running.lock().await.get(&id).cloned().unwrap();
+        assert_eq!(registered.generation(), running.generation());
+        let error = manager
+            .activate(record, healthy.into(), true)
+            .await
+            .err()
+            .expect("a probe never passes with the stopping generation");
+        assert_eq!(error.message, "Add-on is stopping; retry shortly");
+        drop(reaping);
+        tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled())
+            .await
+            .expect("the generation is released once reaped");
+        assert!(manager.running.lock().await.is_empty());
+        assert!(matches!(
+            manager.installation(&id).unwrap().status,
+            Status::FailedDisabled
+        ));
+        assert_eq!(
+            std::fs::read_dir(root.path().join("private/recovery"))
+                .unwrap()
+                .count(),
+            0
+        );
+        manager.shutdown().await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_a_quarantined_activation_is_not_an_unclean_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let installation = installed(
+            Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap(),
+        );
+        let id = installation.manifest.id.clone();
+        manager.save(&installation).unwrap();
+        // It never reports activation, so the activation deadline stops it.
+        let activation = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .activate(
+                        installation,
+                        "__codemuxRegister({}, () => () => {});".into(),
+                        false,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        });
+        let running = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(running) = manager.running.lock().await.get(&id).cloned() {
+                    break running;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let reaping = delay_reaping(&running).await;
+        let error = activation.await.unwrap().unwrap_err();
+        assert_eq!(error.data.code, ErrorCode::Timeout);
+        assert_eq!(
+            manager.installation(&id).unwrap().failure.as_deref(),
+            Some(QUARANTINED)
+        );
+        let starting: bool = manager
+            .registry
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key LIKE 'activation:%')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!starting, "the revoked activation is over");
+        drop(reaping);
+        tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled())
+            .await
+            .expect("the generation is released once reaped");
+        manager.shutdown().await;
+        drop(manager);
+        // A clean exit after the quarantine pauses nothing on the next launch.
+        let reopened = Manager::open(root.path().into(), test_host_path()).unwrap();
+        assert!(!reopened.paused());
+        assert!(reopened.interrupted_activations().is_empty());
+        assert_eq!(
+            reopened.installation(&id).unwrap().failure.as_deref(),
+            Some(QUARANTINED)
+        );
+    }
+    async fn next_announced(events: &mut broadcast::Receiver<UiEvent>) -> UiEvent {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.sequence().is_some() {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("a one-shot event")
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_a_lagged_subscriber_gets_later_stops_and_unclaimed_effects_again() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let running = start(&manager, broker_manifest("example.resync", &[]), "").await;
+        let (mut events, _) = manager.subscribe();
+        let notify = |message: &'static str| {
+            let (manager, running) = (manager.clone(), running.clone());
+            tokio::spawn(async move {
+                manager
+                    .request(&running, "ui.notify", json!({ "message": message }))
+                    .await
+            })
+        };
+        let identity = |event: &UiEvent| match event {
+            UiEvent::Effect { request_id, .. } => Some(request_id.clone()),
+            UiEvent::Stopped { generation, .. } => Some(generation.clone()),
+            _ => None,
+        };
+        let replayed = |events: &[UiEvent]| events.iter().filter_map(identity).collect::<Vec<_>>();
+        let _seen = notify("received before the lag");
+        let seen = next_announced(&mut events).await;
+        let _missed = notify("missed");
+        let missed = next_announced(&mut events).await;
+        let _claimed = notify("claimed during the lag");
+        let claimed = next_announced(&mut events).await;
+        manager
+            .claim_effect(&identity(&claimed).unwrap(), running.generation())
+            .await
+            .unwrap();
+        let (_, _, resync) = manager
+            .resubscribe(seen.sequence().unwrap(), |_| true)
+            .await;
+        assert!(matches!(resync[0], UiEvent::Inventory));
+        assert_eq!(replayed(&resync), [identity(&missed).unwrap()]);
+        // A stop also retires the generation's pending effects.
+        manager.stop(&running.manifest.id, None).await;
+        let (_, last, resync) = manager
+            .resubscribe(seen.sequence().unwrap(), |_| true)
+            .await;
+        assert_eq!(replayed(&resync), [running.generation().to_owned()]);
+        let (_, _, resync) = manager.resubscribe(last, |_| true).await;
+        assert!(replayed(&resync).is_empty());
+        assert!(manager.effects.lock().unwrap().is_empty());
+        manager.shutdown().await;
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
@@ -4013,7 +4393,7 @@ mod tests {
             .effect_result(&request, &generation, Ok(json!(1)))
             .await
             .is_err());
-        assert!(manager.effects.lock().await.is_empty());
+        assert!(manager.effects.lock().unwrap().is_empty());
         manager.shutdown().await;
     }
     fn http_manifest(id: &str) -> Manifest {
