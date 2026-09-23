@@ -252,6 +252,63 @@ describe("rejected effects are explained to the user", () => {
     expect(lastResult().error).not.toBeNull();
   });
 });
+describe("refusals reach the plugin", () => {
+  // `addon_effect_result` deserializes the host's ProtocolError: a numeric
+  // code, the message and data.code, and no other field. Any other shape is
+  // refused, and the plugin would get a TIMEOUT at its deadline instead.
+  const protocolError = (code: string, message: string) => ({
+    code: -32000,
+    message,
+    data: { code },
+  });
+  it.each([
+    [
+      "an undeclared panel",
+      effect("panels.open", { id: "undeclared" }),
+      protocolError(
+        "PERMISSION_DENIED",
+        "Contribution does not belong to this plugin",
+      ),
+    ],
+    [
+      "a closed composer",
+      effect("composer.appendText", { composerId: "closed", text: "brief" }),
+      protocolError("NO_COMPOSER", "This chat composer is no longer available"),
+    ],
+    [
+      "a non-HTTPS link",
+      effect("links.open", { url: "http://example.com" }),
+      protocolError("NETWORK_DENIED", "Only HTTPS links can be opened"),
+    ],
+    [
+      "an unknown operation",
+      effect("ui.unknown", {}),
+      protocolError("INVALID_MESSAGE", "Unknown add-on UI operation"),
+    ],
+  ])("returns %s in the host's error shape", async (_, request, expected) => {
+    await applyAddonEffect(request);
+    expect(lastResult().error).toStrictEqual(expected);
+  });
+  it("returns a failed system open and an unexpected failure in the host's error shape", async () => {
+    vi.mocked(openUrl).mockRejectedValue("No handler");
+    await applyAddonEffect(
+      effect("links.open", { url: "https://example.com" }),
+    );
+    expect(lastResult().error).toStrictEqual(
+      protocolError(
+        "CONTEXT_STALE",
+        "The system could not open the link: No handler",
+      ),
+    );
+    append.mockImplementationOnce(() => {
+      throw Object.assign(new Error("Draft is read-only"), { data: {} });
+    });
+    await applyAddonEffect(event);
+    expect(lastResult().error).toStrictEqual(
+      protocolError("CONTEXT_STALE", "Draft is read-only"),
+    );
+  });
+});
 describe("composer accessory and link effects", () => {
   it("composerViews.open opens the declared accessory for the bound composer", async () => {
     await applyAddonEffect(effect("composerViews.open", { id: "issues" }));

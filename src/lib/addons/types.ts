@@ -116,10 +116,11 @@ export interface AddonInventory {
   /** Plugin IDs whose activation an unclean exit interrupted; cleared by Resume. */
   interruptedActivations?: string[];
 }
+/** The host's protocol error; `addon_effect_result` accepts only this shape. */
 export interface AddonError {
+  code: number;
   message: string;
   data: { code: string };
-  code?: number;
 }
 export interface AddonNode {
   id: string;
@@ -264,7 +265,7 @@ export function addonCode(error: unknown): string | null {
     : null;
 }
 export function addonError(code: string, message: string): AddonError {
-  return { message, data: { code } };
+  return { code: -32000, message, data: { code } };
 }
 export function addonEnabled(installation: AddonInstallation): boolean {
   return (
