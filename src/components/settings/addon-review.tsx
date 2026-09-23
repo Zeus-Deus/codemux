@@ -43,6 +43,7 @@ export function AddonReviewDialog({
   busy,
   paused,
   problem,
+  ended,
   onDismiss,
   onAccept,
 }: {
@@ -50,6 +51,8 @@ export function AddonReviewDialog({
   busy: boolean;
   paused: boolean;
   problem: AddonProblem | null;
+  /** The host uses up a review on accept, even when the install then fails. */
+  ended: boolean;
   onDismiss: () => void;
   onAccept: (choice: ReviewChoice) => void;
 }) {
@@ -72,6 +75,7 @@ export function AddonReviewDialog({
             busy={busy}
             paused={paused}
             problem={problem}
+            ended={ended}
             onAccept={onAccept}
           />
         )}
@@ -95,12 +99,14 @@ function ReviewBody({
   busy,
   paused,
   problem,
+  ended,
   onAccept,
 }: {
   review: AddonReview;
   busy: boolean;
   paused: boolean;
   problem: AddonProblem | null;
+  ended: boolean;
   onAccept: (choice: ReviewChoice) => void;
 }) {
   const [replace, setReplace] = useState(false);
@@ -108,7 +114,7 @@ function ReviewBody({
   const { manifest } = review;
   const update = isUpdateReview(review);
   const added = review.added ?? manifestAccess(manifest);
-  const blocked = busy || (review.replacesSource && !replace);
+  const blocked = busy || ended || (review.replacesSource && !replace);
   return (
     <>
       <p className="text-body">{manifest.description}</p>
@@ -235,10 +241,16 @@ function ReviewBody({
         </p>
       )}
       <ProblemAlert problem={problem} />
+      {ended && (
+        <p role="status" className="text-body">
+          This review has ended. To try again, close it and review the package
+          again.
+        </p>
+      )}
       <DialogFooter>
         {update ? (
           <Button
-            disabled={busy}
+            disabled={busy || ended}
             onClick={() =>
               onAccept({
                 // Same-source updates keep the add-on's current enablement.

@@ -189,6 +189,9 @@ export function AddonsSettings() {
   const state = useAddonsStore();
   const [selected, setSelected] = useState<string | null>(null);
   const [review, setReview] = useState<AddonReview | null>(null);
+  // The token of a review whose accept failed. The host removes a review as
+  // it accepts it, so the same review can never be accepted again.
+  const [endedReview, setEndedReview] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   // Failures of the open dialog's operation render inside that dialog; the
@@ -633,6 +636,7 @@ export function AddonsSettings() {
         busy={busy}
         paused={state.paused}
         problem={dialogProblem}
+        ended={review !== null && review.token === endedReview}
         onDismiss={() => {
           if (review)
             void addonInvoke("addon_cancel_review", {
@@ -645,10 +649,15 @@ export function AddonsSettings() {
           if (!review) return;
           void perform(
             async () => {
-              await addonInvoke("addon_accept_review", {
-                token: review.token,
-                ...choice,
-              });
+              try {
+                await addonInvoke("addon_accept_review", {
+                  token: review.token,
+                  ...choice,
+                });
+              } catch (cause) {
+                setEndedReview(review.token);
+                throw cause;
+              }
               setReview(null);
             },
             { dialog: true },

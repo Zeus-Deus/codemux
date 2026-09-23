@@ -658,6 +658,54 @@ it("shows a failed install inside the review dialog", async () => {
   ).toBeInTheDocument();
 });
 
+it("ends a review whose install failed instead of offering a retry that cannot work", async () => {
+  // The host removes a review as it accepts it; the same token can only
+  // fail again with "Package review expired".
+  const fresh = reviewOf({ manifest: manifest as AddonManifest });
+  answer({
+    addon_catalog_review: () => fresh,
+    addon_accept_review: () =>
+      reject("STORAGE_UNAVAILABLE", "Not enough disk space"),
+  });
+  const dialog = within(await openReview(fresh));
+  fireEvent.click(dialog.getByRole("button", { name: "Install & enable" }));
+  expect(await dialog.findByRole("alert")).toHaveTextContent(
+    "Not enough disk space",
+  );
+  await act(async () => {});
+  expect(dialog.getByRole("status")).toHaveTextContent(
+    "This review has ended. To try again, close it and review the package again.",
+  );
+  const install = dialog.getByRole("button", { name: "Install" });
+  expect(install).toBeDisabled();
+  expect(
+    dialog.getByRole("button", { name: "Install & enable" }),
+  ).toBeDisabled();
+  fireEvent.click(install);
+  expect(
+    vi
+      .mocked(addonInvoke)
+      .mock.calls.filter(([command]) => command === "addon_accept_review"),
+  ).toHaveLength(1);
+  fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  // Reviewing the package again gives a review that can be accepted.
+  answer({
+    addon_catalog_review: () => ({ ...fresh, token: "second-review" }),
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Install from link / ID" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Find release" }));
+  const again = within(
+    await screen.findByRole("dialog", { name: "Review Issue Companion" }),
+  );
+  await waitFor(() =>
+    expect(again.getByRole("button", { name: "Install" })).toBeEnabled(),
+  );
+  expect(again.queryByRole("status")).toBeNull();
+});
+
 it("shows each credential's state and clears a stored one", async () => {
   answer({
     addon_settings_get: () => ({ owner: "", repository: "" }),
