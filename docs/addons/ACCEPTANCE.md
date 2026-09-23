@@ -1,30 +1,30 @@
 # Acceptance evidence map
 
 This maps chapter 12 of [the requirements](BUILD-SPEC.md) to executable checks.
-It is a review aid, not a declaration that the release gates pass. Recorded
-revisions, results and remaining release gates are in [the ledger](IMPLEMENTATION.md).
-Native UI harness targets below remain unverified until their installed-app CI
-run passes. Browser mocks and a native broker test that supplies frontend effect
-results cannot establish the corresponding desktop behavior.
+Recorded revisions, results and the remaining publication steps are in
+[the ledger](IMPLEMENTATION.md). Installed-app evidence below comes from the
+stock installers built from the final source (FINAL_RUN_LINKS). Browser mocks
+and a native broker test that supplies frontend effect results are unit
+coverage only; they are never counted as desktop evidence.
 
-| Requirement | Checks and evidence | Remaining desktop/release evidence |
+| Requirement | Checks | Installed-app evidence on Linux and Windows |
 | --- | --- | --- |
-| Core independence | Existing full desktop CI; Settings browser evidence; native UI harness pause/resume | Saved installers pass clean/paused zero-host checks, terminal/input/projects, pane restoration, themes and read-only official updater checks; final-source repeat remains |
-| Functional SDK | Real-host package integrations in `manager.rs`; `sdk-native.mjs`; installed-app `native-ui.mjs` | Both pass on saved Linux/Windows installers; repeat on final-source installers |
-| Author independence | Both examples consume packed public SDK/CLI; Issue Companion built outside the checkout | Reviewed SDK distribution and final documentation against the published version |
-| Runtime failure | `addon-host/tests`, native `protocol.rs`, manager fault isolation; packaged five-workload evidence | Both saved installers pass all five SDK callback workloads; Linux includes the backpressure fix. Native real-child tests cover unexpected exit and hostile shutdown; final-source platform checks remain |
-| UI hostility | Protocol `tests/ui.rs` and `src/ui.rs`; renderer/view tests; native validation benchmark | Native pre-render rejection tests pass; both saved installers pass 500-path virtualization/frame budgets. Final-source repeat remains |
-| Authority | `permissions.rs`, manager broker tests, generation/context checks | Installed-app forged/stale interaction scenarios in combination with real UI transitions |
-| Context races | `platform.test.ts`, composer adapter/registry tests; real native broker cancellation, Git child reaping and update/uninstall serialization | Delayed request during project/thread/surface changes, uninstall during activation and HTTP/Git disable through the installed desktop |
-| Package validation | `package.rs`: raw traversal/link/reserved-path fixtures, expansion limits, digest/identity checks; protocol manifest contracts | Both saved installers pass native archive import/review; retain inert rejection tests on the final source |
-| Network | `http.rs`, `http_native_tests.rs`: real TLS, pinned DNS, limits, redirects, method/header/origin denial, timeout/cancellation and public HTTPS | Production HTTPS/render/draft passes on saved Linux/Windows installers; final-source repeat pending |
-| Secrets | `credentials.rs`: real Linux/Windows OS backends, locked-store fallback, source/origin isolation, historical-key cleanup and retry tombstones | Installed Settings fallback/removal/redaction passes on Linux and native OS save/delete/redaction passes on Windows; final-source repeat remains |
-| Persistence | Storage persistence, retained-source checks, corrupt registry and unclean-session tests | Both saved installers pass actual restart/grants/settings, removal and core startup with corrupt registry; final-source repeat pending |
-| Updates | Lifecycle tests: eight durable interruptions, actual SQLite full, candidate failure, matching-data rollback, cancelled review, uninstall serialization | Six actual ENOSPC checkpoints pass on Linux; both rebuilt saved installers pass active-host update, expanded-access cancellation and matching-data rollback; final-source repeat remains |
-| UI/accessibility | Renderer/view/Settings tests and light/dark/small-window/GUI-off browser screenshots | Both saved installers pass chat-GUI-off panel/terminal behavior, keyboard dialog focus, native themes, core pane restoration and absence of empty accessory/footer spacing; corrected virtual row ARIA needs final-source native inspection |
-| Remote boundary | Native RPC add-on rejection before rewriting and event forwarding; frontend remote/workspace checks | Paired installed-desktop HTTP/WebSocket with active plugins passes on Linux and Windows; final-source repeat remains |
-| Website/catalog | Protocol/catalog validator, website catalog tests/build and desktop/mobile screenshots | Reviewed package releases and immutable catalog artifact; website/native digest identity against that artifact |
-| Packaged platforms | deb/AppImage/NSIS payload provenance, clean-environment SDK callbacks and hostile-host deadlines | Stock desktop GUI acceptance is additional to payload checks |
+| Core independence | Full desktop CI; Settings tests; pause/resume and registry tests | Zero hosts at clean start and while paused; lazy start; terminal, draft typing and projects keep working; themes; read-only official updater check with and without add-ons; core panes restored after pause and removal; no empty accessory space |
+| Functional SDK | Real-host package tests in `manager.rs` (panels, commands, composer actions, composer view, links); `sdk-native.mjs` | Both examples install from their packages; Project Brief's command, panel and composer action; Issue Companion's public HTTPS, accessory, attributed link and draft insertion; setting and private preference survive restart |
+| Author independence | Both examples and all CI fixtures built only with the packed SDK/CLI; starter built outside the checkout (`author.test.mjs`) | The installed examples and fixtures are those packed builds |
+| Runtime failure | `addon-host/tests` (CPU, timers, stack, heap, quotas, forged frames); `protocol.rs`; manager fault isolation and unexpected exit | Throw, loop, endless promises, recursion and allocation each quarantine only the fixture while terminal, draft and Project Brief keep working; packaged deadlines for deb, rpm, AppImage and NSIS |
+| UI hostility | `addon-protocol/tests/ui.rs`, manager UI limits (batch rate, queue, views, callbacks per plugin, malformed IDs), renderer and view tests | 500-row virtualized list with frame budget and ARIA positions; stale events stay inline |
+| Authority | `permissions.rs`; broker tests for forged context, wrong generation, expired or reused interaction, undeclared method and denied capability | Paired remote client cannot invoke or subscribe to add-ons |
+| Context races | Real-host delayed-effect transitions, Git child reaping, HTTP cancellation, uninstall during activation; adapter and platform tests | Typing during a delayed append keeps user text; project switch, thread close and composer replacement reject with `CONTEXT_STALE`; disable cancels; removal during activation leaves no host and no insertion |
+| Package validation | `package.rs` raw archive fixtures, expansion limits, digest and identity; shared manifest case corpus for desktop and CLI | Native import, review and source-replacement confirmation |
+| Network | `http.rs`, `http_native_tests.rs`: real TLS, pinned DNS, private and mapped addresses, redirects, header and body limits, timeout, cancellation, public HTTPS | Production HTTPS request, rendering and draft insertion |
+| Secrets | `credentials.rs`: OS backends (Windows in CI, Linux Secret Service in CI), locked store, session-only fallback, isolation, cleanup tombstones, clearing | Credential states in Settings, explicit session-only fallback on Linux, OS save and delete on Windows, redaction of driver logs, removal |
+| Persistence | Storage, retained-source, registry corruption and reset, unclean-session tests | Restart keeps installations, grants, settings and data; corrupt registry keeps core startup and offers reset; reset restores management |
+| Updates | Lifecycle tests: eight interruption points, SQLite full, candidate failure, rollback with matching data, blocklist disable, catalog cache and fresh-fetch rules; six real ENOSPC checkpoints on Linux | Active-host update, expanded-access review and cancellation, rollback with matching private data |
+| UI and access | Renderer, view, composer and Settings tests (keyboard, focus, dialogs, errors inside dialogs, screen-reader labels) | Keyboard dialog focus, light and dark themes, chat GUI off, small window, core pane restoration |
+| Remote boundary | `addon_*` rejection before rewriting and event forwarding; remote client and remote workspace tests | Paired loopback HTTP/WebSocket client with active add-ons |
+| Website/catalog | Protocol and catalog-crate validation (duplicates, ownership, rollback, blocked, schema); website tests and build | Publication deferred: the first catalog artifact and website-to-desktop digest check follow a maintainer release |
+| Packaged platforms | Exact host provenance, clean-environment SDK callbacks and hostile deadlines for every built installer | The same installers run the full installed-app suite above |
 
 ## Running the installed-app harness
 
@@ -46,3 +46,13 @@ Every execution records the installer build revision, harness revision and
 installer SHA-256 separately, plus per-step screenshots and text. A harness-only
 retry never implies a newly compiled app was tested. Failure artifacts must be
 read before changing either the harness or the implementation.
+
+The race fixtures (`scripts/addons/fixtures/context-races` and
+`activation-race`) are ordinary packages built with the packed SDK and CLI by
+`build-examples.sh`, or by `build-ci-fixtures.sh` for harness-only retries.
+They report outcomes in their own panel, so the notification limit cannot hide
+a result. On Linux the harness puts a logging `xdg-open` first on the app's
+`PATH` to prove an attributed link reached the system opener; on Windows only
+the attribution toast is asserted. Clicks the driver did not dispatch (a stale,
+covered or scrolled-away element) are retried; every other failure is a failed
+gate.

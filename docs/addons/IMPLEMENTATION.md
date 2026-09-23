@@ -6,10 +6,14 @@ Desktop integration baseline: `09966161` after the isolated ordered rebase
 `feat/site-revamp` branch (includes the latest main). Both use isolated worktrees;
 pre-existing Hermes work and website changes are preserved.
 
-**Unreleased implementation. The acceptance matrix is not complete.** Passing
-standalone host tests, browser mocks, or the research probe is not release approval.
-The [acceptance evidence map](ACCEPTANCE.md) connects each matrix row to its
-checks and outstanding installed-app evidence.
+**Implemented and verified; unpublished by maintainer decision.** Every chapter
+12 row now has native evidence on Linux and Windows, including installed-app
+runs of the final source (see [Completion pass](#completion-pass-2026-09-23)).
+Nothing is published: SDK/CLI npm packages, example package releases, the first
+catalog artifact and the website pin wait for an explicit maintainer release,
+as described in [RELEASING.md](RELEASING.md). Passing standalone host tests,
+browser mocks, or the research probe is not release approval on its own. The
+[acceptance evidence map](ACCEPTANCE.md) connects each matrix row to its checks.
 
 ## Ordered delivery
 
@@ -19,10 +23,10 @@ checks and outstanding installed-app evidence.
 | 2 | Native manager, scoped broker, private persistence, installer foundations | Draft [#392](https://github.com/Zeus-Deus/codemux/pull/392) |
 | 3 | Trusted UI, palette, panel deck, controlled composer | Draft [#393](https://github.com/Zeus-Deus/codemux/pull/393) |
 | 4 | Settings, lifecycle/recovery, review, developer watch | Draft [#394](https://github.com/Zeus-Deus/codemux/pull/394) |
-| 5 | Independent examples and native resource packaging | Draft [#395](https://github.com/Zeus-Deus/codemux/pull/395); packaged gates pending |
-| 6 | Reviewed catalog schema, validator, immutable artifact publication | Draft [#396](https://github.com/Zeus-Deus/codemux/pull/396); empty seed, no published example releases |
-| 7 | Website pinned catalog, search/detail/handoff, author documentation | Draft [website #7](https://github.com/Zeus-Deus/codemux-sitev2/pull/7); build and affected tests pass |
-| 8 | Release hardening and complete acceptance evidence | Draft [#397](https://github.com/Zeus-Deus/codemux/pull/397); see unresolved gates below |
+| 5 | Independent examples and native resource packaging | Draft [#395](https://github.com/Zeus-Deus/codemux/pull/395); packaged gates pass on the final source in PR 8 |
+| 6 | Reviewed catalog schema, validator, immutable artifact publication | Draft [#396](https://github.com/Zeus-Deus/codemux/pull/396); empty seed, publication gated behind a maintainer dispatch |
+| 7 | Website pinned catalog, search/detail/handoff, author documentation | Draft [website #7](https://github.com/Zeus-Deus/codemux-sitev2/pull/7); 50 tests and production build pass |
+| 8 | Release hardening, completion fixes and complete acceptance evidence | Draft [#397](https://github.com/Zeus-Deus/codemux/pull/397); all gates pass, publication deferred |
 
 Later PRs stack on their specified prerequisites. Full desktop CI was enabled
 for the stack in PR 8; earlier draft heads do not each have full desktop CI
@@ -31,7 +35,92 @@ catalog reader and transactional installer are included in the manager foundatio
 activation, removal and recovery paths must share one authority boundary. Catalog
 publication and Settings remain separate deliverables.
 
+## Completion pass (2026-09-23)
+
+The stack stopped at `b5377a1d` with green CI but open gates. The completion
+pass audited all 14 chapters against that code, fixed what it found, and
+re-ran every acceptance gate on the final source.
+
+**Audit.** Eleven area audits (host/protocol, UI validation, SDK/CLI, broker,
+UI integration, packages, HTTP/credentials, lifecycle, Settings/remote,
+catalog/website, examples/packaging/CI) reported 113 gaps with file-level
+evidence. An independent skeptic per area refuted 6, leaving 107 (6 high, 52
+medium, 48 low, 1 uncertain). The fixes were made in ownership-scoped packages,
+each reviewed independently, then merged; a final whole-diff review with seven
+lenses and two skeptics per finding confirmed 17 further defects, all fixed.
+
+**High-severity gaps and their fixes**
+
+- The host's timer scheduler ran plugin-replaceable builtins outside the
+  accounted CPU window, and module evaluation got its own 1 s. Timers, the
+  128-timer cap, the 100 ms minimum and wake computation now live in Rust;
+  evaluation and activation share one 1 s budget; bootstrap intrinsics are
+  captured at load.
+- A failed source-replacement install left a journal that the next launch
+  replayed, resurrecting removed add-ons or reverting later updates. Failure
+  restores by plugin ID; recovery applies a journal only to its exact tuple.
+- Merging the catalog would have published `addons-catalog-r1` as the
+  repository's Latest release, breaking the desktop updater, `install.sh` and
+  the hosted-client deploy. Publication is a maintainer dispatch behind the
+  `addon-catalog` environment, always `--latest=false`, with Latest verified
+  before and after; package releases use non-`v*` tags.
+- The desktop never rechecked the catalog, so revocations reached only users
+  who opened Browse. A background task (after the startup checkpoint, only with
+  installed add-ons, at most once per 24 h) applies blocks without activating code.
+- Composer actions and the composer accessory had no test at any layer. They
+  now have real-host, Vitest and installed-app coverage.
+- The delayed-draft race harness exceeded the three-per-minute notification
+  limit, so the plugin was quarantined before any race was observed. Race
+  fixtures are now ordinary SDK packages reporting outcomes in their own panel.
+
+**Other behavior changes (selected).** Stable host errors from handlers and UI
+callbacks no longer quarantine a plugin; plain throws still do. First quota
+excesses get `RESOURCE_LIMIT` replies and the SDK paces itself; only repeated
+violations stop a generation. `panels.open` needs a live interaction. Workspace
+storage is keyed by a hash of the authorized root, not a reusable counter.
+Credential state is visible in Settings and can be cleared. Reviews show the
+installed release, added and removed access, and use **Install**, **Install &
+enable** or **Update to <version>**; updates keep current enablement. Rows show
+update availability, publisher/tier, compatibility and bounded diagnostics
+(counts only, never log text). A corrupt registry offers **Reset add-on
+registry**. Pause, registry errors and diagnostic launches no longer delete
+saved add-on panes. Disable and removal revoke broker access before waiting for
+the plugin's lock.
+
+**Defects found only by installed-app testing**
+
+- Removal requested during a lazy activation let the command queued behind the
+  activation append to the draft on Windows. Disable and removal now withdraw
+  access immediately; the real-host uninstall test checks that window.
+- Terminal input sent as independent IPC calls arrived reordered on a loaded
+  Windows runner (`echo CODEMUX_CORE_4` became `echo CODEMUXE__4COR`). Desktop
+  input now keeps one write in flight per session and coalesces the rest;
+  remote clients, whose transport is already ordered, send at once. This core
+  fix affects every terminal user, with or without add-ons.
+- Ubuntu 22.04's `rpm2cpio` exits 1 on Tauri's rpm after writing it completely
+  (reproduced in an `ubuntu:22.04` container against the published 0.22.8 rpm);
+  the rpm gate uses `bsdtar`.
+- Vitest discovered the author CLI's `node:test` suites; they are excluded.
+
+**Final evidence**
+
+- Local, Ryzen 5 7600 / Linux: 86 focused, 34 real-host and 2 remote-boundary
+  native add-on tests; 17 host, 16 catalog and 22 protocol crate tests; 88 CLI
+  tests; 11 SDK native callback checks; TypeScript and 50 affected frontend test
+  files (964 tests); website 50 tests and production build.
+- Hosted CI on the final source: FINAL_CI_SUMMARY
+- Installed desktops built from the final source: FINAL_NATIVE_SUMMARY
+- Before any fix, the `b5377a1d` installers already passed the ported race
+  suite on [Linux](evidence/native-ui-linux-races-b5377a1d.json) and
+  [Windows](evidence/native-ui-windows-races-b5377a1d.json). The intermediate
+  [Linux installer `8eb46caa`](evidence/native-ui-linux-8eb46caa.json) passed
+  37 checks, including removal during activation (696 ms against a 700 ms
+  activation) with no host or draft insertion left behind.
+
 ## Verified evidence (Linux x86_64 unless stated otherwise)
+
+The entries below record the original implementation's runs on earlier
+installers, newest first. They remain valid for those revisions.
 
 - Rebuilt Windows `312321e3` passes the [entire expanded native GUI flow](https://github.com/Zeus-Deus/codemux/actions/runs/35397531415),
   including active-host update, expanded-access review/cancellation and rollback
@@ -408,24 +497,88 @@ publication and Settings remain separate deliverables.
   test rejects a non-tmpfs or volume larger than 32 MiB. The actual hosted six-checkpoint run passed at `278df894`, as recorded above;
   the strengthened data-generation assertion is tracked separately.
 
+### Completion pass clarifications
+
+- **Handled errors.** A handler or UI callback that rejects with a stable host
+  error code (for example `CONTEXT_STALE` after a project switch) is logged
+  through the bounded log channel and the plugin keeps running. Plain throws and
+  other rejections remain runtime faults, so the hostile fixtures still
+  quarantine. A UI event for a released callback is ignored, not a fault.
+- **Quotas.** The host answers the first excess `host.request` with
+  `RESOURCE_LIMIT` and holds excess UI batches (at most eight) instead of
+  dropping them; five violations within 10 s stop the generation. The parent's
+  transport and manager backstops allow twice the host limits and exist only
+  to bound a broken host. The SDK paces requests (18 per 1.2 s, 95 per 62 s), UI
+  batches (about 16/s) and logs below those limits.
+- **Timers and CPU.** Plugin JavaScript runs only inside accounted windows;
+  evaluation plus activation share the 1 s activation budget. Timer ticks no
+  longer emit `ready`, and plugin code cannot forge `ready` or responses: the
+  host counts them as violations, and a child error response stops the plugin
+  with a fixed reason, never plugin text.
+- **Stop reasons.** The host prints one reason from a fixed allowlist on stderr
+  before exiting; nothing else from stderr reaches diagnostics. Diagnostics
+  keep counts, levels, sizes and times per installation for the session, never
+  log text.
+- **Inherited handles.** On Linux the host closes every descriptor above 2 at
+  startup, before any thread or plugin code runs. Stable Rust cannot restrict handle
+  inheritance on Windows without replacing process supervision; std creates its
+  own handles non-inheritable, so the residual risk is inheritable handles that
+  third-party native code in the app might create.
+- **Interactions.** `panels.open`, `composerViews.open`, `composer.appendText`
+  and `links.open` each consume a live single-use interaction (10 s). A claimed
+  effect may finish up to 2 s after its claim. Unprompted `ui.notify` effects are
+  bounded to 12 s so they always finish inside the 15 s request timeout.
+- **Revocation.** Disable and removal withdraw broker access (contexts,
+  commands, views, UI events, host requests and effect claims) before waiting
+  for the plugin's operation lock; the lock still serializes registry changes.
+- **Workspace storage.** Workspace-scoped keys use a hash of the authorized
+  canonical root instead of the reusable in-app workspace counter. Rows written
+  under the old key cannot be attributed to one project and are discarded once.
+- **HTTP.** Responses no longer expose `etag`, and conditional request headers
+  are refused, following the header rules of chapter 6. A result that cannot be
+  framed is answered with `RESOURCE_LIMIT` instead of never being answered.
+- **Credentials.** v1 manifests have no optional flag: an unconfigured
+  credential sends unauthenticated requests, and a configured but unreadable one
+  fails with `CREDENTIAL_REQUIRED`. Credential IDs use the same lowercase ID
+  grammar as settings, so a declaration like the specification's `apiToken`
+  example is written in lowercase, as Issue Companion's `github-token` is. A cleared credential stays cleared after a failed re-save and a
+  restart; retrying cleanup never deletes a session-only value saved later.
+- **Manifests and catalog.** Origins must be multi-label hostnames without
+  wildcards, underscores or trailing dots; IDs cannot contain a Windows device
+  name. The published JSON Schemas are generated from the Rust types and are
+  never stricter than the desktop validator; the CLI shares a case corpus with
+  it. Catalog selection reports incompatible API, unsupported platform, blocked
+  release and missing version separately.
+- **Updates and recovery.** Updates keep the installation's enablement; fresh
+  installs and source replacements enable only on **Install & enable**. While
+  paused, install, update and rollback commit without a probe; the first start
+  after Resume is the normal activation. `incompatible-disabled` is derived from
+  the running app on every listing. A reset registry is moved aside whole; OS
+  keyring entries of the old installations stay in their installation-specific
+  namespaces, unreachable by new installations. An unreaped (quarantined)
+  generation blocks update and rollback instead of being mistaken for a probe.
+- **Background catalog recheck.** It starts 30 s after the manager opens, runs
+  only while an add-on is installed, fetches only a missing, damaged or 24 h old
+  snapshot, retries hourly after a failure, and never runs under
+  `--disable-addons`. It only applies blocks; it never activates code.
+- **Release builds.** Desktop releases run tauri-action with
+  `scripts/addons/verified-tauri-build.mjs` as its build command, so the
+  packaged runtime gate checks the exact deb, rpm, AppImage or NSIS files that
+  are uploaded; the packaged workflow uses the same wrapper on every run.
+- **Context races through the GUI.** Disabling during an in-flight HTTP or Git
+  request is covered by real-host tests (Git child reaping, HTTP cancellation,
+  delayed-effect transitions) rather than WebDriver: shared runners cannot hold
+  a public request open deterministically. All other chapter 12 race cases run
+  in the installed desktop.
+
 ## Unresolved release gates
 
-- Repeat the expanded installed-app acceptance on both platforms after the final
-  storage cleanup, virtual-row accessibility and credential-error changes.
-  Saved-installer evidence above records its exact earlier source and cannot
-  establish the final binary. Full CI and the independent distribution workflow
-  must also pass for the final review head.
-- The context/authority matrix uses both real-child native broker cancellation
-  and focused controlled-composer tests with injected timing and transport seams
-  allowed by chapter 12. Integrated example flows use real stock desktop IPC.
-  Delayed effects across every project/thread/surface transition have not all
-  been driven through WebDriver; this distinction remains explicit in the
-  acceptance map rather than treating mocked effect completion as native UI.
-- Publish reviewed independent package assets and the first immutable catalog
-  artifact through normal authorized workflows, then pin that artifact in the
-  website and verify website-to-desktop digest identity. The prepared release
-  distributions and instructions are reviewable; nothing has been published,
-  merged or listed using fabricated assets.
+- **Publication, deferred by maintainer decision.** Publish the reviewed SDK/CLI
+  tarballs and example packages, dispatch the first catalog revision, pin it in
+  the website and verify website-to-desktop digest identity, following
+  [RELEASING.md](RELEASING.md). Nothing has been published, merged or listed.
+- **Repository setting.** Add required reviewers to the `addon-catalog`
+  environment before the first catalog dispatch; until then, write access to
+  run the workflow is the only gate.
 
 See [the acceptance evidence map](ACCEPTANCE.md) and [release procedure](RELEASING.md).
-No milestone with an unresolved exit gate is represented as complete.

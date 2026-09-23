@@ -104,8 +104,10 @@ review candidate, not an approved catalog release.
    `addon-catalog` environment with required reviewers so that a dispatch also
    needs approval. The job checks the catalog against the newest published
    revision, creates the immutable `addons-catalog-r<revision>` release with
-   `--latest=false`, and fails, restoring the previous Latest release, if Latest
-   changed. In `codemux-sitev2`, run
+   `--latest=false`. It refuses to start unless Latest is a desktop `v*`
+   release, and fails, restoring the previous Latest, if publishing moved Latest
+   to anything but a desktop release; a desktop release published at the same
+   time keeps it. In `codemux-sitev2`, run
    `node scripts/pin-addon-catalog.mjs <artifact-url> <reviewed-sha256>`, run affected
    catalog tests and the site build, and review the pin change.
 6. Verify that the website's download and copied install link resolve to the same

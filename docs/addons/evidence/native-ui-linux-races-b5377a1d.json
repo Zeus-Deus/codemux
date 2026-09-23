@@ -1,0 +1,170 @@
+{
+  "commit": "1c9e3bd1128d934bdcd22a75ce73886d4b05221b",
+  "platform": "linux",
+  "hardware": {
+    "osRelease": "6.8.0-1064-azure",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "logicalCpus": 4,
+    "memoryBytes": 16765411328
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "07-credential-success-clears-error",
+    "06-host-credential-settings-and-explicit-fallback",
+    "07-paired-remote-cannot-invoke-or-subscribe-to-plugins",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "08-virtual-list-native-accessibility",
+    "08-bounded-list-rendering-and-frame-budget",
+    "09-native-update-review-and-matching-data-rollback",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "10-context-typing-preserved",
+    "10-context-project-switch-cancels",
+    "10-context-thread-close-cancels",
+    "10-context-composer-replacement-cancels",
+    "10-context-disable-cancels",
+    "10-delayed-public-sdk-context-races",
+    "10-remove-during-activation-leaves-no-host-or-draft",
+    "11-corrupt-plugin-registry-does-not-block-core-startup"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native",
+    "CI-only delayed public-SDK package built with the packed author tools; normal native package import, SDK broker and plugin-rendered status panel"
+  ],
+  "installerBuild": {
+    "commit": "fe79468311d9482ecfd5d38b6573703af9a4abcb",
+    "run": "35398102950",
+    "platform": "linux"
+  },
+  "installerSha256": "6fc0e008fdb6b0edc93a9c2393d13c34ffc5a06b86f97d7885ef10f58e8ab631",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "credentials": {
+    "maskedInput": true,
+    "noSecretInInventoryOrSettings": true,
+    "mode": "missing Secret Service, explicit session-only fallback",
+    "removalAndFileRedaction": true
+  },
+  "remoteBoundary": {
+    "transport": "paired loopback HTTP/WebSocket against stock desktop",
+    "approval": "explicit desktop command",
+    "coreRpc": true,
+    "addonRpcDenied": true,
+    "coreEvents": true,
+    "addonEventsDenied": true
+  },
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 1087.647159
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 1108.9837659999976
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 1232.5089799999987
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 1124.1479699999982
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 1225.3498699999982
+    }
+  ],
+  "uiRendering": {
+    "workload": "500 visible-model paths, five real Git refreshes while typing",
+    "renderedRows": 14,
+    "frameSamples": 684,
+    "p95FrameGapMs": 17,
+    "maxFrameGapMs": 23,
+    "refreshMs": [
+      336.3466039999985,
+      308.68212300000596,
+      308.97810000000027,
+      310.7354419999974,
+      307.25568299999577
+    ],
+    "p95FrameGapBudgetMs": 100
+  },
+  "virtualListAccessibility": {
+    "label": "Add-on list",
+    "setSize": 500,
+    "keyboardEndPosition": 500,
+    "boundedRows": true
+  },
+  "nativeUpdates": {
+    "sameAccess": true,
+    "activeHost": true,
+    "expandedAccessReview": true,
+    "cancellation": true,
+    "rollbackMatchingPrivateData": true,
+    "developerModeOff": true
+  },
+  "corePaneRestoration": {
+    "preserved": [
+      "Files",
+      "Changes",
+      "Review"
+    ],
+    "paused": true,
+    "removed": true,
+    "noEmptyAccessorySpace": true
+  },
+  "contextRaces": {
+    "fixtureSha256": "872fb9f893cc0b8e77d94bdbb231be568993f2e510f519d398718c265936f7be",
+    "delayMs": 4000,
+    "completed": [
+      "typing",
+      "workspace",
+      "thread",
+      "replacement",
+      "disable"
+    ],
+    "rejections": {
+      "workspace": "CONTEXT_STALE",
+      "thread": "CONTEXT_STALE",
+      "replacement": "CONTEXT_STALE"
+    }
+  },
+  "removalDuringActivation": {
+    "fixtureSha256": "27ddb0c99ad0539d83c2bdac9c089b28da544e41525a3b1e48e0b8ae94775520",
+    "activationDelayMs": 700,
+    "removalCompletedMs": 694
+  },
+  "status": "passed"
+}
