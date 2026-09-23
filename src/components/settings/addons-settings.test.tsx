@@ -791,6 +791,71 @@ it("keeps a failed registry reset inside its dialog", async () => {
   expect(resubscribeAddons).not.toHaveBeenCalled();
 });
 
+it("offers Reset instead of Resume for a broken registry and leaves no alert once it recovers", async () => {
+  answer({
+    addon_registry_reset: () => {
+      // The host opens a fresh registry; its inventory no longer fails.
+      useAddonsStore.setState({
+        paused: false,
+        error: null,
+        registryError: null,
+      });
+      return "/data/addons-v1-backup-20260923T101500Z";
+    },
+  });
+  useAddonsStore.setState({
+    paused: true,
+    error:
+      "The add-on registry at /data/addons-v1 could not be opened: file is not a database. Reset it to start with no add-ons; the current files are kept as a backup.",
+    registryError: { path: "/data/addons-v1", cause: "file is not a database" },
+  });
+  render(<AddonsSettings />);
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: "Resume add-ons" })).toBeNull();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Reset add-on registry" }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Reset registry" }),
+  );
+  expect(
+    await screen.findByText(/The add-on registry was reset/),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "Pause all add-ons" }),
+  ).toBeInTheDocument();
+});
+
+it("replaces an earlier page error once a dialog operation succeeds", async () => {
+  answer({
+    addon_disable: () =>
+      reject("STORAGE_UNAVAILABLE", "Could not save the add-on state"),
+    addon_remove: () => [],
+  });
+  useAddonsStore.setState({ installed: [installation] });
+  render(<AddonsSettings />);
+  const item = within(row("Issue Companion"));
+  fireEvent.click(item.getByRole("button", { name: "Disable" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not save the add-on state",
+  );
+  await waitFor(() =>
+    expect(item.getByRole("button", { name: "Disable" })).toBeEnabled(),
+  );
+  fireEvent.click(item.getByRole("button", { name: "Remove" }));
+  const dialog = within(
+    await screen.findByRole("dialog", { name: "Remove Issue Companion?" }),
+  );
+  fireEvent.click(dialog.getByRole("button", { name: "Remove add-on" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(addonInvoke).toHaveBeenCalledWith("addon_remove", {
+    id: "codemux.issue-companion",
+    keepData: false,
+  });
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
 it("reopens the event stream after Resume retries a failed open", async () => {
   answer({});
   useAddonsStore.setState({

@@ -215,11 +215,11 @@ export function AddonsSettings() {
       ? beginAddonRevocation(options.revoke)
       : undefined;
     setBusy(true);
+    // Each operation replaces the previous outcome, including one a dialog
+    // operation leaves behind on the page (a registry reset or a removal).
+    setError("");
+    setNotice("");
     if (options.dialog) setDialogProblem(null);
-    else {
-      setError("");
-      setNotice("");
-    }
     try {
       await action();
     } catch (cause) {
@@ -281,34 +281,34 @@ export function AddonsSettings() {
             Optional tools for your projects and conversations.
           </p>
         </div>
-        <Button
-          variant="outline"
-          disabled={busy}
-          onClick={() => {
-            void perform(
-              async () => {
-                if (!state.paused) return addonInvoke("addon_pause_all");
-                // Resuming also retries a manager that failed to open, whose
-                // event stream then has to be opened again.
-                await addonInvoke("addon_resume");
-                await resubscribeAddons(activeAddonWorkspace);
-              },
-              { revoke: state.paused ? undefined : "*" },
-            );
-          }}
-        >
-          <Pause className="size-4" />
-          {state.paused ? "Resume add-ons" : "Pause all add-ons"}
-        </Button>
+        {/* An unreadable registry cannot be paused or resumed; the registry
+            panel offers the reset that recovers it instead. */}
+        {!state.registryError && (
+          <Button
+            variant="outline"
+            disabled={busy}
+            onClick={() => {
+              void perform(
+                async () => {
+                  if (!state.paused) return addonInvoke("addon_pause_all");
+                  // Resuming also retries a manager that failed to open, whose
+                  // event stream then has to be opened again.
+                  await addonInvoke("addon_resume");
+                  await resubscribeAddons(activeAddonWorkspace);
+                },
+                { revoke: state.paused ? undefined : "*" },
+              );
+            }}
+          >
+            <Pause className="size-4" />
+            {state.paused ? "Resume add-ons" : "Pause all add-ons"}
+          </Button>
+        )}
       </header>
       <ProblemAlert
         problem={
-          state.registryError
-            ? // The registry panel below already shows the open failure.
-              error && error !== state.error
-              ? error
-              : null
-            : error || state.error
+          // The registry panel below already shows the open failure.
+          state.registryError ? error || null : error || state.error
         }
       />
       {notice && (
@@ -325,7 +325,8 @@ export function AddonsSettings() {
           <p>{state.error}</p>
           <p className="text-muted-foreground">
             Add-ons stay off until it is repaired. The rest of CodeMux is not
-            affected.
+            affected. Restarting CodeMux tries to open it again; resetting
+            starts with no add-ons and keeps the current files as a backup.
           </p>
           <Button
             size="sm"
