@@ -174,11 +174,21 @@ impl Credentials {
             .retain(|(owner, _), _| owner != installation);
     }
     pub async fn delete(&self, installation: &str, id: &str) -> Result<()> {
+        self.remove(installation, id, true).await
+    }
+    /// Deletes only the stored value, which is what a cleanup tombstone refers
+    /// to. A value the user entered for this session afterwards stays in use.
+    pub(super) async fn delete_stored(&self, installation: &str, id: &str) -> Result<()> {
+        self.remove(installation, id, false).await
+    }
+    async fn remove(&self, installation: &str, id: &str, session: bool) -> Result<()> {
         let lock = self.serial.clone().lock_owned().await;
-        self.session
-            .lock()
-            .unwrap()
-            .remove(&(installation.into(), id.into()));
+        if session {
+            self.session
+                .lock()
+                .unwrap()
+                .remove(&(installation.into(), id.into()));
+        }
         self.configured
             .lock()
             .unwrap()
@@ -255,7 +265,21 @@ impl Manager {
         let key = declared_key(installation, credential)?;
         // Persist the host-owned index before the non-cancellable OS write. If
         // this IPC task is dropped, uninstall/restart can still find the credential.
-        if !session_only {
+        // A tombstone already lets cleanup find it, and the OS store may still
+        // hold the value the user cleared: index the key only once the new value
+        // replaced that one, so a failed save can never bring the old one back.
+        if !session_only
+            && !self
+                .registry
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cleanup WHERE installation=?1 AND credential=?2)",
+                    rusqlite::params![installation.installation_id, key],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(registry_unavailable)?
+        {
             self.record_credential(&installation.installation_id, &key)?;
         }
         self.credentials
@@ -264,14 +288,19 @@ impl Manager {
         if !session_only {
             // The new value replaced any earlier one awaiting removal. A kept
             // tombstone would delete the credential the user just saved.
-            self.registry
-                .lock()
-                .unwrap()
-                .execute(
-                    "DELETE FROM cleanup WHERE installation=?1 AND credential=?2",
-                    rusqlite::params![installation.installation_id, key],
-                )
-                .map_err(registry_unavailable)?;
+            let mut db = self.registry.lock().unwrap();
+            let tx = db.transaction().map_err(registry_unavailable)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO credential_entries(installation,id) VALUES(?1,?2)",
+                rusqlite::params![installation.installation_id, key],
+            )
+            .map_err(registry_unavailable)?;
+            tx.execute(
+                "DELETE FROM cleanup WHERE installation=?1 AND credential=?2",
+                rusqlite::params![installation.installation_id, key],
+            )
+            .map_err(registry_unavailable)?;
+            tx.commit().map_err(registry_unavailable)?;
         }
         let _ = self.events.send(UiEvent::Inventory);
         Ok(())
@@ -577,6 +606,134 @@ mod tests {
                 .data
                 .code,
             ErrorCode::PermissionDenied
+        );
+    }
+    /// An installed add-on declaring a credential, with a recorded OS store.
+    async fn declared(
+        root: &std::path::Path,
+        backend: &Arc<RecordedStore>,
+    ) -> (Arc<Manager>, Installation, String) {
+        use super::super::{lifecycle::Reviews, package::fixture_archive, Manifest};
+        let mut manager = Manager::open(root.join("private"), "unused".into()).unwrap();
+        Arc::get_mut(&mut manager).unwrap().credentials = Credentials::recorded(backend.clone());
+        let package = root.join("fixture.cmxaddon");
+        std::fs::write(&package, fixture_archive()).unwrap();
+        let reviews = Reviews::default();
+        let review = reviews.prepare_local(&manager, &package).unwrap();
+        let mut installed = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        let declarations = Manifest::parse(
+            include_bytes!("../../../examples/addons/issue-companion/manifest.json"),
+            None,
+        )
+        .unwrap();
+        installed.manifest.credentials = declarations.credentials;
+        installed.manifest.http = declarations.http;
+        manager.save(&installed).unwrap();
+        let field = installed.manifest.credentials[0].id.clone();
+        (manager, installed, field)
+    }
+    #[tokio::test]
+    async fn a_cleared_credential_stays_cleared_after_a_failed_save_and_a_restart() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RecordedStore::default());
+        let (manager, installed, field) = declared(root.path(), &backend).await;
+        let declaration = &installed.manifest.credentials[0];
+        let key = Credentials::key(&declaration.id, &declaration.origin);
+        let state = |manager: &Manager| manager.credential_states(&installed).unwrap()[&field];
+        manager
+            .save_credential(&installed, &field, "synthetic-cleared".into(), false)
+            .await
+            .unwrap();
+        // The OS store keeps the cleared value until cleanup succeeds.
+        backend.locked.store(true, SeqCst);
+        assert!(!manager
+            .clear_credential(&installed, &field)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .save_credential(&installed, &field, "synthetic-unsaved".into(), false)
+            .await
+            .is_err());
+        assert_eq!(state(&manager), CredentialState::CleanupPending);
+        let indexed: bool = manager
+            .registry
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM credential_entries WHERE installation=?1 AND id=?2)",
+                rusqlite::params![installed.installation_id, key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!indexed, "a failed save must not index the cleared value");
+        backend.locked.store(false, SeqCst);
+        drop(manager);
+        let mut manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let configured = manager.credentials.configured.clone();
+        Arc::get_mut(&mut manager).unwrap().credentials = Credentials {
+            backend: backend.clone(),
+            configured,
+            ..Credentials::default()
+        };
+        assert_eq!(state(&manager), CredentialState::CleanupPending);
+        assert_eq!(
+            manager
+                .credentials
+                .get(&installed.installation_id, &key)
+                .await
+                .unwrap(),
+            None,
+            "the cleared value is never sent again"
+        );
+        assert!(manager.retry_cleanup().await.unwrap().is_empty());
+        assert!(backend.values.lock().unwrap().is_empty());
+        assert_eq!(state(&manager), CredentialState::NotConfigured);
+    }
+    #[tokio::test]
+    async fn retrying_cleanup_keeps_a_session_value_saved_after_the_clear() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RecordedStore::default());
+        let (manager, installed, field) = declared(root.path(), &backend).await;
+        let declaration = &installed.manifest.credentials[0];
+        let key = Credentials::key(&declaration.id, &declaration.origin);
+        let session = || async {
+            manager
+                .credentials
+                .get(&installed.installation_id, &key)
+                .await
+                .unwrap()
+        };
+        manager
+            .save_credential(&installed, &field, "synthetic-cleared".into(), false)
+            .await
+            .unwrap();
+        backend.locked.store(true, SeqCst);
+        assert!(!manager
+            .clear_credential(&installed, &field)
+            .await
+            .unwrap()
+            .is_empty());
+        // The error for a locked store suggests exactly this.
+        manager
+            .save_credential(&installed, &field, "synthetic-session".into(), true)
+            .await
+            .unwrap();
+        // Cleanup removes only the stored value, whether or not it can yet.
+        assert!(!manager.retry_cleanup().await.unwrap().is_empty());
+        assert_eq!(session().await.as_deref(), Some("synthetic-session"));
+        backend.locked.store(false, SeqCst);
+        assert!(manager.retry_cleanup().await.unwrap().is_empty());
+        assert!(backend.values.lock().unwrap().is_empty());
+        assert_eq!(session().await.as_deref(), Some("synthetic-session"));
+        assert_eq!(
+            manager.credential_states(&installed).unwrap()[&field],
+            CredentialState::SessionOnly
         );
     }
     #[tokio::test]

@@ -421,8 +421,11 @@ impl Manager {
         let registry = Connection::open(root.join("registry.sqlite")).map_err(storage_error)?;
         registry.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE IF NOT EXISTS installations(id TEXT PRIMARY KEY,plugin_id TEXT NOT NULL UNIQUE,record TEXT NOT NULL);CREATE TABLE IF NOT EXISTS settings(installation TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS credential_entries(installation TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(installation,id));CREATE TABLE IF NOT EXISTS file_cleanup(installation TEXT PRIMARY KEY,record TEXT NOT NULL);CREATE TABLE IF NOT EXISTS cleanup(installation TEXT NOT NULL,credential TEXT NOT NULL,PRIMARY KEY(installation,credential));").map_err(storage_error)?;
         let configured_credentials = {
+            // A key awaiting cleanup is never read, even if a failed save left
+            // an index entry beside its tombstone: the OS store may still hold
+            // the value the user cleared.
             let mut query = registry
-                .prepare("SELECT installation,id FROM credential_entries")
+                .prepare("SELECT installation,id FROM credential_entries WHERE NOT EXISTS(SELECT 1 FROM cleanup WHERE cleanup.installation=credential_entries.installation AND cleanup.credential=credential_entries.id)")
                 .map_err(storage_error)?;
             let entries = query
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

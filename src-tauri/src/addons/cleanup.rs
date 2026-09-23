@@ -264,7 +264,7 @@ impl Manager {
             }
             if self
                 .credentials
-                .delete(&installation, &credential)
+                .delete_stored(&installation, &credential)
                 .await
                 .is_ok()
             {
