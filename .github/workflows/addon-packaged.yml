@@ -66,7 +66,7 @@ jobs:
             librsvg2-dev \
             patchelf \
             libfuse2 \
-            file rpm2cpio cpio webkit2gtk-driver xvfb dbus-x11 imagemagick
+            file libarchive-tools webkit2gtk-driver xvfb dbus-x11 imagemagick
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

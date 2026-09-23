@@ -41,12 +41,11 @@ jobs:
             patchelf \
             libfuse2 \
             file \
-            rpm2cpio \
-            cpio
+            libarchive-tools
         # libfuse2 is required by tauri build's AppImage packager; kept here
         # (unlike ci.yml which excludes it) because this workflow produces
-        # actual bundles, not just type-checks. rpm2cpio and cpio unpack the
-        # rpm for the add-on runtime gate.
+        # actual bundles, not just type-checks. libarchive-tools (bsdtar)
+        # unpacks the rpm for the add-on runtime gate.
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
