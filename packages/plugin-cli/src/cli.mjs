@@ -5,11 +5,11 @@ import {gzipSync} from 'node:zlib';
 import {createHash} from 'node:crypto';
 import {watch} from 'node:fs';
 import {build as bundle} from 'esbuild';
-import {pluginId,validate} from './validate.mjs';
+import {parse,pluginId,validate} from './validate.mjs';
 import {bundleOptions} from './bundle.mjs';
 const usage='codemux-plugin init <directory> [--id publisher.name] | build [directory] [--sourcemap] | check [directory] | pack [directory] [--out <file>] | dev [directory] [--sourcemap] [--out <file>]';
 const options={},positional=[];
-async function manifest(){const bytes=await readFile(join(root,'manifest.json'));if(bytes.length>65536)throw Error('Manifest too large');return validate(JSON.parse(bytes));}
+async function manifest(){const bytes=await readFile(join(root,'manifest.json'));if(bytes.length>65536)throw Error('Manifest too large');return validate(parse(bytes));}
 // Write through a temporary sibling so a watching desktop never reads a torn package.
 async function writeAtomic(path,bytes){await mkdir(dirname(path),{recursive:true});const temporary=join(dirname(path),'.'+basename(path)+'.'+process.pid+'.tmp');await writeFile(temporary,bytes);for(let attempt=0;;attempt++){try{return await rename(temporary,path)}catch(e){if(attempt>=5||!['EPERM','EBUSY','EACCES'].includes(e.code)){await rm(temporary,{force:true});throw e}await new Promise(r=>setTimeout(r,50))}}}
 // The entry point is always src/index.tsx; `--sourcemap` also writes source.map.

@@ -1,9 +1,49 @@
 import {readFile} from 'node:fs/promises';
+import {isUtf8} from 'node:buffer';
 import Ajv from 'ajv';
 // Mirrors the desktop's authoritative validator (addon-protocol manifest.rs),
 // so `check` and `pack` accept exactly the manifests the app imports.
 const schema=JSON.parse(await readFile(new URL('../schema/manifest.json',import.meta.url),'utf8'));
+// A JS number cannot hold every int64, so validate() checks integer ranges.
 const checkSchema=new Ajv({strict:false,allErrors:true,formats:{uint32:true,int64:true}}).compile(schema);
+const i64=[-(2n**63n),2n**63n-1n];
+// The exact source integers of objects from parse(); a JS number rounds past 2^53.
+const sourceIntegers=new WeakMap();
+const integer=(object,key)=>sourceIntegers.get(object)?.get(key)??(Number.isInteger(object[key])?BigInt(object[key]):NaN);
+// The desktop reads manifest bytes with serde_json, which rejects what JSON.parse
+// accepts: invalid UTF-8, duplicate keys and lone surrogates. Every manifest number
+// is an integer field, and serde_json reads a fraction, an exponent, -0 or a value
+// outside 64 bits as a float, which no such field accepts.
+export function parse(bytes) {
+ if(!isUtf8(bytes))throw Error('manifest.json is not valid UTF-8');
+ // Buffer decoding needs no ICU and keeps a byte order mark, which JSON.parse rejects.
+ const source=Buffer.from(bytes).toString('utf8');
+ JSON.parse(source);
+ // The grammar is valid, so each token is a string, a literal, a number or a bracket.
+ const tokens=source.match(/"(?:[^"\\]|\\.)*"|[{}[\]]|[^\s"{}[\],:]+/g);
+ let at=0;
+ const string=token=>{const value=JSON.parse(token);if(!value.isWellFormed())throw Error(`Invalid string ${token} in manifest.json: lone surrogate escapes are not valid Unicode`);return value};
+ const read=()=>{
+  const token=tokens[at++];
+  if(token==='['){const list=[];while(tokens[at]!==']')list.push(read());at++;return list}
+  if(token==='{'){
+   const object={},integers=new Map();
+   while(tokens[at]!=='}'){
+    const key=string(tokens[at++]);
+    if(Object.hasOwn(object,key))throw Error(`Duplicate key "${key}" in manifest.json`);
+    const value=read();
+    if(typeof value==='number')integers.set(key,BigInt(tokens[at-1]));
+    Object.defineProperty(object,key,{value,writable:true,enumerable:true,configurable:true});
+   }
+   at++;sourceIntegers.set(object,integers);return object;
+  }
+  if(token[0]==='"')return string(token);
+  if(['true','false','null'].includes(token))return JSON.parse(token);
+  if(!/^-?(0|[1-9]\d*)$/.test(token)||token==='-0'||BigInt(token)<i64[0]||BigInt(token)>i64[1])throw Error(`Invalid number ${token} in manifest.json: use a whole number within the signed 64-bit range, without a fraction or exponent`);
+  return Number(token);
+ };
+ return read();
+}
 const id=/^[a-z][a-z0-9-]{0,39}$/;
 // Windows reserves device names even when an extension follows.
 const reserved=/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
@@ -12,7 +52,7 @@ const unique=values=>new Set(values).size===values.length;
 // Rust rejects C0 and C1 controls, and JSON with lone surrogates never parses there.
 const text=(s,n)=>typeof s==='string'&&s.length>0&&s.isWellFormed()&&[...s].length<=n&&!/[\u0000-\u001f\u007f-\u009f]/.test(s);
 export const icons=['file-text','git-branch','github','list','check','info','settings','book-open','link','refresh-cw','plus','circle-alert','folder','terminal','code','search'];
-const https=value=>{try {const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password;}catch{return false}};
+const https=value=>{try {const u=new URL(value);return value.isWellFormed()&&u.protocol==='https:'&&!u.username&&!u.password;}catch{return false}};
 const origin=value=>{try {const u=new URL(value);return https(value)&&u.origin===value&&!u.port&&!/^\[|^[\d.]+$/.test(u.hostname)&&!u.hostname.includes('*')&&!u.hostname.endsWith('.')&&u.pathname==='/'&&!u.search&&!u.hash;}catch{return false}};
 // Rust semver 1.0 grammar: strict SemVer 2.0 versions with u64 numbers, and
 // comma-separated requirements where a bare version means a caret requirement.
@@ -87,8 +127,12 @@ export function validate(manifest) {
  require(m.settings.length<=50&&unique(m.settings.map(s=>s.id)),'Duplicate or more than 50 settings');
  for(const s of m.settings) {
   require(id.test(s.id)&&text(s.label,80),`Invalid setting "${s.id}"`);
-  if(s.type==='string')require(Buffer.byteLength(s.default??'')<=4096,`String default of "${s.id}" exceeds 4 KiB`);
-  if(s.type==='integer')require(s.min<=s.default&&s.default<=s.max,`Integer default of "${s.id}" is outside min/max`);
+  if(s.type==='string')require((s.default??'').isWellFormed()&&Buffer.byteLength(s.default??'')<=4096,`String default of "${s.id}" exceeds 4 KiB or is not valid Unicode`);
+  if(s.type==='integer'){
+   const [value,min,max]=['default','min','max'].map(key=>integer(s,key));
+   require(i64[0]<=min&&max<=i64[1],`Integer bounds of "${s.id}" are outside the signed 64-bit range`);
+   require(min<=value&&value<=max,`Integer default of "${s.id}" is outside min/max`);
+  }
   if(s.type==='enum')require(s.values.length>0&&s.values.length<=50&&unique(s.values)&&s.values.includes(s.default)&&s.values.every(v=>text(v,4096)),`Invalid enum setting "${s.id}"`);
  }
  require(m.http.length<=20&&m.credentials.length<=20&&unique(m.http.map(h=>h.origin))&&unique(m.credentials.map(c=>c.id))&&unique(m.credentials.map(c=>c.origin)),'Duplicate or excessive HTTP grants');

@@ -335,8 +335,10 @@ function adapter({ manifest, send, now }: Transport) {
         break;
       }
       case "view.mount": {
-        if (views.size >= 4 || views.has(p.viewId))
-          throw new PluginError("RESOURCE_LIMIT", "View limit");
+        // The desktop enforces the view limit and issues each view ID once. It
+        // can send a mount before the unmount that freed its slot, so views
+        // beyond the limit here are not a fault.
+        if (views.has(p.viewId)) fail();
         const kind = p.kind === "composerViews" ? "composerViews" : "panels";
         const key = kind + "/" + p.id;
         if (!handlers.has(key)) fail();
@@ -465,10 +467,8 @@ function adapter({ manifest, send, now }: Transport) {
               return { callbackId: id };
             }),
           );
-          if (
-            [...views.values()].reduce((n, v) => n + v.callbacks.size, 0) > 4096
-          )
-            throw new PluginError("RESOURCE_LIMIT", "Callback limit");
+          // The desktop bounds live callbacks over the views it holds. A view
+          // it has dropped can still be here, so no local total is enforced.
           sentRevision++;
           send("ui.patch", { viewId: p.viewId, records: serialized });
         };

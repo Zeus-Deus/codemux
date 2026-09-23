@@ -79,5 +79,13 @@ export default definePlugin({
         </Stack>
       );
     });
+    // A quarter of the plugin's 4,096 live callbacks.
+    ctx.panels.register("grid", () => (
+      <Stack>
+        {Array.from({ length: 1024 }, (_, n) => (
+          <Button key={n} label={String(n)} onPress={() => {}} />
+        ))}
+      </Stack>
+    ));
   },
 });
