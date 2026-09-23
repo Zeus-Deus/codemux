@@ -377,6 +377,21 @@ async function toastShown(title, description) {
     ),
   );
 }
+// Close the attach menu if a failed step left it open; its own trigger
+// toggles it, as for a person.
+async function closeComposerMenu() {
+  const menu = '[data-testid="composer-command-menu"]';
+  if (!(await script(`return !!document.querySelector(arguments[0])`, menu)))
+    return;
+  const attach = await script(
+    `return ${composerCards}.map(card => card.querySelector('[data-testid="composer-attach-button"]')).find(e => e?.getAttribute('aria-expanded') === 'true') ?? null`,
+  );
+  assert.ok(attach, "An open attach menu belongs to a visible composer");
+  await wd("POST", `/element/${elementId(attach)}/click`, {});
+  await until("composer attach menu closed", () =>
+    script(`return !document.querySelector(arguments[0])`, menu),
+  );
+}
 async function closeComposerAccessory() {
   if (
     !(await script(`return !!document.querySelector(arguments[0])`, accessory))
@@ -410,6 +425,23 @@ async function pluginHostCount() {
   return (await run("ps", ["-eo", "comm="]))
     .split("\n")
     .filter((name) => name.trim().startsWith("codemux-addon-h")).length;
+}
+// Read-only Windows evidence: the window in front and whether it is this
+// run's own app. A failure to read it is recorded, never a failed gate.
+async function windowsForeground() {
+  let output;
+  try {
+    output = await run("powershell.exe", [
+      "-NoProfile",
+      "-File",
+      "scripts/addons/windows-foreground.ps1",
+      "-DesktopPid",
+      String(desktop.pid),
+    ]);
+    return JSON.parse(output);
+  } catch (error) {
+    return { error: String(error), output };
+  }
 }
 let terminalProbe = 0;
 let credentialProbe;
@@ -446,19 +478,30 @@ async function checkNativeUpdateRollback() {
   await hasText("Review Project Brief");
   await hasText("replaces 1.0.0 from another source");
   // A replacement gets a fresh identity and grant, so installing it waits
-  // for the explicit replace choice.
-  const installButtons = () =>
-    script(
-      `return [...document.querySelectorAll('[role="dialog"] button')].filter(e => ['Install', 'Install & enable'].includes(e.innerText.trim())).map(e => ({ label: e.innerText.trim(), disabled: e.disabled }))`,
+  // for the explicit replace choice. The buttons are also held while the
+  // dialog finishes opening, so only a withdrawn choice proves the gate.
+  const installButtons = (disabled) =>
+    until(`install buttons ${disabled ? "held" : "offered"}`, () =>
+      script(
+        `const buttons = [...document.querySelectorAll('[role="dialog"] button')].filter(e => ['Install', 'Install & enable'].includes(e.innerText.trim()));
+        return buttons.length === 2 && buttons.every(e => e.disabled === arguments[0]) ? buttons.map(e => e.innerText.trim()) : null;`,
+        disabled,
+      ),
     );
-  assert.deepEqual(await installButtons(), [
-    { label: "Install", disabled: true },
-    { label: "Install & enable", disabled: true },
-  ]);
+  assert.deepEqual(await installButtons(true), ["Install", "Install & enable"]);
   const replace = await script(
     `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Replace the existing source')).querySelector('input')`,
   );
-  await wd("POST", `/element/${elementId(replace)}/click`, {});
+  const chooseReplace = async (checked) => {
+    await wd("POST", `/element/${elementId(replace)}/click`, {});
+    await until(`replace choice ${checked ? "made" : "withdrawn"}`, () =>
+      script("return arguments[0].checked === arguments[1]", replace, checked),
+    );
+    await installButtons(!checked);
+  };
+  await chooseReplace(true);
+  await chooseReplace(false);
+  await chooseReplace(true);
   await clickText(
     "Install & enable",
     `document.querySelector('[role="dialog"]')`,
@@ -800,6 +843,41 @@ async function checkCredentialRemovalAndRedaction() {
     );
   evidence.credentials.removalAndFileRedaction = true;
 }
+// Remove an add-on from its Settings row. Keeping its private data for a
+// reinstall is an explicit choice in the dialog, never the default.
+async function removeAddon(title, keepData = false) {
+  const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes(${JSON.stringify(title)})))`;
+  await clickText("Remove", article);
+  await hasText(`Remove ${title}?`);
+  const keep = await until("keep-data choice", () =>
+    script(
+      `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Keep data for reinstall from the same source'))?.querySelector('input') ?? null`,
+    ),
+  );
+  assert.equal(await script("return arguments[0].checked", keep), false);
+  if (keepData) {
+    await wd("POST", `/element/${elementId(keep)}/click`, {});
+    await until("keep data chosen", () =>
+      script("return arguments[0].checked", keep),
+    );
+  }
+  await clickText("Remove add-on", `document.querySelector('[role="dialog"]')`);
+  await until(
+    `removed ${title}`,
+    async () =>
+      !(await native("addon_inventory")).installed.some(
+        (i) => i.manifest.name === title,
+      ),
+  );
+  // The native transaction completes before the Settings refresh and dialog
+  // exit animation. Wait for the actual UI before the next click.
+  await until(`removal dialog and ${title} card closed`, () =>
+    script(
+      `return !document.querySelector('[role="dialog"]') && ![...document.querySelectorAll('article')].some(e => e.innerText.includes(arguments[0]))`,
+      title,
+    ),
+  );
+}
 async function checkCoreTerminal() {
   const marker = `CODEMUX_CORE_${++terminalProbe}`;
   const command = `echo ${marker}`;
@@ -832,12 +910,21 @@ async function checkCoreTerminal() {
       `const input = document.activeElement; return input?.matches('textarea.xterm-helper-textarea') ? input.closest('.xterm') : null`,
     ),
   );
+  // The terminal's visible rows, one per line, spaces kept.
   const screenText = () =>
-    script("return arguments[0].innerText.replace(/\\s+/g, '')", terminal);
+    script("return arguments[0].innerText.replace(/\\u00a0/g, ' ')", terminal);
   // Every keystroke reaches the shell as its own write, and on Windows two
   // have arrived swapped. Type at a steady pace and submit only a command
   // line the shell echoed exactly; a different line is erased and retyped.
-  const expected = command.replace(/\s+/g, "");
+  // The command must end the screen right after the prompt, spaces and all;
+  // only a long line's row breaks may fall inside it. A word character just
+  // before it would be what remains of an erased attempt.
+  assert.match(command, /^[\w ]+$/);
+  const typedLine = new RegExp(
+    `(?:^|[^\\w\\s])\\s*${[...command]
+      .map((c) => (c === " " ? "[ \\n]+" : c))
+      .join("\\n?")}\\s*$`,
+  );
   for (let attempt = 1; ; attempt++) {
     const baseline = await screenText();
     await pressKeys([...command]);
@@ -847,7 +934,7 @@ async function checkCoreTerminal() {
       "native terminal echoed the command",
       async () => {
         const current = await screenText();
-        if (current.includes(expected)) return "exact";
+        if (typedLine.test(current)) return "exact";
         if (current !== last) {
           last = current;
           changed = Date.now();
@@ -861,7 +948,7 @@ async function checkCoreTerminal() {
     (evidence.terminalRetypes ??= []).push({
       command,
       attempt,
-      echoed: last.slice(-120),
+      echoed: last.replace(/\s+/g, " ").trim().slice(-120),
     });
     assert.ok(
       attempt < 3,
@@ -880,6 +967,12 @@ async function checkCoreTerminal() {
       return Date.now() - since >= 1000;
     });
   }
+  // Only the echo itself prints a row that is exactly the marker. A shell
+  // error that quotes a mistyped command never does.
+  const markerRows = async () =>
+    (await screenText()).split("\n").filter((row) => row.trim() === marker)
+      .length;
+  const rowsBefore = await markerRows();
   await wd("POST", "/actions", {
     actions: [
       {
@@ -892,11 +985,9 @@ async function checkCoreTerminal() {
       },
     ],
   });
-  await until("native terminal command returned", () =>
-    script(
-      `return [...document.querySelectorAll('.xterm')].some(e => e.innerText.replace(/\\s+/g, '').split(arguments[0]).length >= 3)`,
-      marker,
-    ),
+  await until(
+    "native terminal command returned",
+    async () => (await markerRows()) > rowsBefore,
   );
 }
 async function shortcut(key) {
@@ -1469,7 +1560,9 @@ try {
     desktop = start(application, [], {
       env: {
         ...env,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=9231",
+        // Same value as the CI policy in windows-webview-debug.ps1.
+        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:
+          "--remote-debugging-port=9231 --disable-backgrounding-occluded-windows",
       },
     });
     await until("stock WebView2 startup", async () => {
@@ -1495,6 +1588,9 @@ try {
     };
     evidence.windowsDriverMode =
       "Microsoft WebView2 attach (app-specific disposable runner policy)";
+    evidence.seams.push(
+      "Windows WebView2 test switch --disable-backgrounding-occluded-windows: the runner browser an add-on link opens cannot pause the covered app's rendering",
+    );
   } else {
     driver = start("tauri-driver", ["--port", "4444"], { env });
     capabilities = { "tauri:options": { application } };
@@ -1858,13 +1954,14 @@ try {
     "06-issue-companion-composer-accessory-and-link",
     async () => {
       const before = await draft();
-      await chooseComposerAction(
-        "codemux.issue-companion",
-        "browse",
-        "Browse GitHub issues",
-        "Issue Companion",
-      );
+      let failure;
       try {
+        await chooseComposerAction(
+          "codemux.issue-companion",
+          "browse",
+          "Browse GitHub issues",
+          "Issue Companion",
+        );
         // The composer's one add-on area opens directly above its footer and
         // names the view and the add-on. Its view is not a separate region.
         assert.deepEqual(
@@ -1951,6 +2048,8 @@ try {
           }
         };
         const earlier = await launched();
+        const frontBefore =
+          process.platform === "win32" ? await windowsForeground() : undefined;
         await clickText("Open in browser", within(accessoryView));
         await toastShown("Issue Companion is opening a link", url);
         const failed = () =>
@@ -1978,13 +2077,37 @@ try {
             process.platform === "linux"
               ? "exact HTTPS URL logged by xdg-open on the app's PATH"
               : "system handler; not observable on the runner",
-          ...(process.platform === "win32" && {
-            openFailureToast: await failed(),
-          }),
         };
-      } finally {
-        await closeComposerAccessory();
+        if (process.platform === "win32") {
+          // The runner's own browser may now cover the app for the rest of
+          // the run. Record what came to the front, so a later frame or
+          // screenshot problem can be traced to it.
+          const openFailureToast = await failed();
+          await delay(3000);
+          Object.assign(evidence.composerActions.externalLink, {
+            openFailureToast: openFailureToast || (await failed()),
+            foreground: {
+              before: frontBefore,
+              after: await windowsForeground(),
+            },
+          });
+        }
+      } catch (error) {
+        failure = error;
       }
+      // Later steps need the composer as it was. A cleanup failure after a
+      // failed check is recorded on its own, so neither error hides the other.
+      try {
+        await closeComposerMenu();
+        await closeComposerAccessory();
+      } catch (error) {
+        if (!failure) throw error;
+        evidence.failedChecks.push({
+          name: "06-issue-companion-composer-accessory-cleanup",
+          error: String(error),
+        });
+      }
+      if (failure) throw failure;
       evidence.composerActions.issueAccessory.closed = true;
     },
     true,
@@ -2114,6 +2237,18 @@ try {
       rows > 0 && rows <= 14,
       "The trusted list must virtualize 500 paths",
     );
+    // Whether the page counts as shown while it is measured, recorded with
+    // the result so a hidden or covered window is not read as slow rendering.
+    const pageState = () =>
+      script(
+        "return { visibility: document.visibilityState, focused: document.hasFocus() }",
+      );
+    const probeStart = {
+      ...(await pageState()),
+      ...(process.platform === "win32" && {
+        foreground: await windowsForeground(),
+      }),
+    };
     await script(`window.__addonFrameProbe = {gaps: [], active: true, last: performance.now()};
       const probe = window.__addonFrameProbe;
       const tick = now => {
@@ -2132,10 +2267,6 @@ try {
     const gaps = await script(
       `const p = window.__addonFrameProbe; p.active = false; delete window.__addonFrameProbe; return p.gaps;`,
     );
-    assert.ok(
-      gaps.length >= 30,
-      "A visible native WebView must supply frame samples",
-    );
     gaps.sort((a, b) => a - b);
     const p95FrameGapMs = gaps[Math.floor((gaps.length - 1) * 0.95)];
     evidence.uiRendering = {
@@ -2146,7 +2277,12 @@ try {
       maxFrameGapMs: gaps.at(-1),
       refreshMs,
       p95FrameGapBudgetMs: 100,
+      page: { start: probeStart, end: await pageState() },
     };
+    assert.ok(
+      gaps.length >= 30,
+      "A visible native WebView must supply frame samples",
+    );
     assert.ok(
       p95FrameGapMs <= 100,
       "Shared-runner UI frame p95 exceeds the recorded 100 ms budget",
@@ -2335,11 +2471,9 @@ try {
       await click('[aria-label="Close settings"]');
       await openCommand("Open Project Brief");
       await hasText("Branch: main");
-      // The panel's private preference came back from its own storage.
+      // The panel's private preference came back from its own storage. Both
+      // choices stay off: removal keeps them for the reinstall below.
       await until("hidden paths survived the restart", () => showPaths(false));
-      await click(briefChecked);
-      await until("changed paths shown again", () => showPaths(true));
-      await hasText("draft-context.txt");
       evidence.projectBriefPreferences.survivedRestart = {
         includeFiles: false,
         showPaths: false,
@@ -2386,34 +2520,10 @@ try {
     },
   );
   await step("10-remove-packages-keeps-core-usable", async () => {
-    for (const title of [
-      "Issue Companion",
-      "Project Brief",
-      "Fault Isolation Fixture",
-    ]) {
-      const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes(${JSON.stringify(title)})))`;
-      await clickText("Remove", article);
-      await hasText(`Remove ${title}?`);
-      await clickText(
-        "Remove add-on",
-        `document.querySelector('[role="dialog"]')`,
-      );
-      await until(
-        `removed ${title}`,
-        async () =>
-          !(await native("addon_inventory")).installed.some(
-            (i) => i.manifest.name === title,
-          ),
-      );
-      // The native transaction completes before the Settings refresh and
-      // dialog exit animation. Wait for the actual UI before the next click.
-      await until(`removal dialog and ${title} card closed`, () =>
-        script(
-          `return !document.querySelector('[role="dialog"]') && ![...document.querySelectorAll('article')].some(e => e.innerText.includes(arguments[0]))`,
-          title,
-        ),
-      );
-    }
+    // Project Brief keeps its data for the reinstall step that follows.
+    await removeAddon("Issue Companion");
+    await removeAddon("Project Brief", true);
+    await removeAddon("Fault Isolation Fixture");
     assert.equal(await pluginHostCount(), 0);
     await click('[aria-label="Close settings"]');
     await checkCoreTerminal();
@@ -2425,6 +2535,89 @@ try {
       removed: true,
       noEmptyAccessorySpace: true,
     };
+  });
+  await step("10-project-brief-reinstall-follows-data-choice", async () => {
+    // A local package is matched to its kept data by its exact bytes: the
+    // same file the source replacement and rollback above ended on.
+    const id = "codemux.project-brief";
+    const reinstall = async (restore) => {
+      await openSettings();
+      await choosePackage(
+        resolve(
+          "examples/addons/project-brief/codemux.project-brief-1.0.0.cmxaddon",
+        ),
+      );
+      await clickText("Import package");
+      await hasText("Review Project Brief");
+      await hasText("Version 1.0.0 · Local / unverified");
+      const option = await script(
+        `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Restore private data retained from version'))?.querySelector('input') ?? null`,
+      );
+      assert.equal(
+        !!option,
+        restore,
+        restore
+          ? "Kept data must be offered back to its own package"
+          : "Data removed with the add-on must not be offered back",
+      );
+      if (restore) {
+        await hasText(
+          "Restore private data retained from version 1.0.0 of this same source. Credentials are not restored.",
+        );
+        // Restoring is the person's choice, never the default.
+        assert.equal(
+          await script("return arguments[0].checked", option),
+          false,
+        );
+        await wd("POST", `/element/${elementId(option)}/click`, {});
+        await until("restore chosen", () =>
+          script("return arguments[0].checked", option),
+        );
+      }
+      await clickText(
+        "Install & enable",
+        `document.querySelector('[role="dialog"]')`,
+      );
+      await until("Project Brief reinstalled", async () =>
+        (await native("addon_inventory")).installed.some(
+          (i) => i.manifest.id === id && i.desiredEnabled,
+        ),
+      );
+      await until("reinstall review closed", () =>
+        script(`return !document.querySelector('[role="dialog"]')`),
+      );
+      const settings = await native("addon_settings_get", { id });
+      await click('[aria-label="Close settings"]');
+      await openCommand("Open Project Brief");
+      await hasText("Branch: main");
+      return settings;
+    };
+    // Kept data comes back on request: the setting and the preference.
+    assert.equal((await reinstall(true))["include-files"], false);
+    await until("restored preference hides changed paths", () =>
+      showPaths(false),
+    );
+    // Removed without keeping data: nothing is offered and defaults apply.
+    await openSettings();
+    await removeAddon("Project Brief");
+    assert.equal((await reinstall(false))["include-files"], true);
+    await until("default preference shows changed paths", () =>
+      showPaths(true),
+    );
+    // The default is also what the panel shows before its storage answers,
+    // so give a stale stored value time to appear.
+    await delay(1000);
+    assert.ok(await showPaths(true), "No private preference may remain");
+    await hasText("draft-context.txt");
+    evidence.projectBriefPreferences.reinstall = {
+      keptDataRestored: { includeFiles: false, showPaths: false },
+      removedDataNotOffered: { includeFiles: true, showPaths: true },
+    };
+    await openSettings();
+    await removeAddon("Project Brief");
+    assert.equal(await pluginHostCount(), 0);
+    await click('[aria-label="Close settings"]');
+    await checkCorePaneRestoration();
   });
   await step("10-delayed-public-sdk-context-races", () =>
     checkContextRaces(workspaceId, assertNoSubmission),
