@@ -335,8 +335,10 @@ function adapter({ manifest, send, now }: Transport) {
         break;
       }
       case "view.mount": {
-        if (views.size >= 4 || views.has(p.viewId))
-          throw new PluginError("RESOURCE_LIMIT", "View limit");
+        // The desktop enforces the view limit and issues each view ID once. It
+        // can send a mount before the unmount that freed its slot, so views
+        // beyond the limit here are not a fault.
+        if (views.has(p.viewId)) fail();
         const kind = p.kind === "composerViews" ? "composerViews" : "panels";
         const key = kind + "/" + p.id;
         if (!handlers.has(key)) fail();

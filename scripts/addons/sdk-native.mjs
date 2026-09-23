@@ -364,6 +364,50 @@ try {
       "PASS: UI events for released callbacks and closed views are ignored",
     );
   }
+  {
+    // The desktop enforces the four-view limit, and a remount can deliver the
+    // new view's mount before the unmount that freed its slot. Four views are
+    // live when the fifth mount arrives; the plugin must serve it.
+    const host = await start(policySource, policy);
+    await activated(host);
+    const mount = async (viewId) => {
+      host.send("view.mount", {
+        id: "swap",
+        kind: "panels",
+        viewId,
+        context: "context1",
+      });
+      const patch = await host.until(
+        (m) => m.method === "ui.patch" && m.params.viewId === viewId,
+      );
+      host.send("ui.ack", { viewId, revision: 1 });
+      return pressCallback(patch);
+    };
+    for (let n = 1; n <= 4; n++) await mount("swap" + n);
+    const fifth = await mount("swap5");
+    host.send("view.unmount", { viewId: "swap1" });
+    host.send("ui.event", {
+      viewId: "swap5",
+      callbackId: fifth,
+      context: "trusted-interaction",
+    });
+    const update = await host.until(
+      (m) => m.method === "ui.patch" && m.params.viewId === "swap5",
+    );
+    assert.match(JSON.stringify(update.params.records), /Round 1/);
+    assert.ok(host.alive(), "a mount ahead of its unmount must not fault");
+    // The desktop issues each view ID once; a repeated mount stays a fault.
+    host.send("view.mount", {
+      id: "swap",
+      kind: "panels",
+      viewId: "swap5",
+      context: "context1",
+    });
+    assert.ok(await host.stopped(), "a repeated view ID must stop the plugin");
+    console.log(
+      "PASS: a mount that arrives before the unmount freeing its slot is served",
+    );
+  }
   for (const [change, reason] of [
     [(e) => ({ ...e, callbackId: Number(e.callbackId) }), "a numeric callback"],
     [(e) => ({ ...e, value: { text: "x" } }), "an object value"],
