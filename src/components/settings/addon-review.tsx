@@ -43,6 +43,8 @@ export function AddonReviewDialog({
   busy,
   paused,
   problem,
+  ended,
+  returnFocus,
   onDismiss,
   onAccept,
 }: {
@@ -50,6 +52,9 @@ export function AddonReviewDialog({
   busy: boolean;
   paused: boolean;
   problem: AddonProblem | null;
+  /** The host uses up a review on accept, even when the install then fails. */
+  ended: boolean;
+  returnFocus: HTMLElement | null;
   onDismiss: () => void;
   onAccept: (choice: ReviewChoice) => void;
 }) {
@@ -60,7 +65,10 @@ export function AddonReviewDialog({
         if (!open && !busy) onDismiss();
       }}
     >
-      <AddonDialogContent className="max-h-[85vh] overflow-auto sm:max-w-lg">
+      <AddonDialogContent
+        className="max-h-[85vh] overflow-auto sm:max-w-lg"
+        returnFocus={returnFocus}
+      >
         <DialogHeader>
           <DialogTitle>Review {review?.manifest.name}</DialogTitle>
           <DialogDescription>{review && summary(review)}</DialogDescription>
@@ -72,6 +80,7 @@ export function AddonReviewDialog({
             busy={busy}
             paused={paused}
             problem={problem}
+            ended={ended}
             onAccept={onAccept}
           />
         )}
@@ -95,12 +104,14 @@ function ReviewBody({
   busy,
   paused,
   problem,
+  ended,
   onAccept,
 }: {
   review: AddonReview;
   busy: boolean;
   paused: boolean;
   problem: AddonProblem | null;
+  ended: boolean;
   onAccept: (choice: ReviewChoice) => void;
 }) {
   const [replace, setReplace] = useState(false);
@@ -108,14 +119,29 @@ function ReviewBody({
   const { manifest } = review;
   const update = isUpdateReview(review);
   const added = review.added ?? manifestAccess(manifest);
-  const blocked = busy || (review.replacesSource && !replace);
+  const blocked = busy || ended || (review.replacesSource && !replace);
   return (
     <>
       <p className="text-body">{manifest.description}</p>
       {review.development && (
+        // The host starts watching only on an accept that enables the add-on
+        // and stops on disable; a later Enable does not watch the file again.
         <p className="rounded-sm border p-3 text-body">
-          Development package. Once enabled, CodeMux watches this selected file
-          for validated local rebuilds. Permission changes still need review.
+          Development package.{" "}
+          {update ? (
+            <>
+              CodeMux keeps watching this selected file for validated local
+              rebuilds until you disable the add-on or turn off Developer mode.
+            </>
+          ) : (
+            <>
+              Install &amp; enable also watches this selected file for
+              validated local rebuilds until you disable the add-on or turn off
+              Developer mode. Installing it disabled, or enabling it later,
+              does not watch the file.
+            </>
+          )}{" "}
+          Permission changes still need review.
         </p>
       )}
       <div className="grid gap-1 text-body">
@@ -235,10 +261,16 @@ function ReviewBody({
         </p>
       )}
       <ProblemAlert problem={problem} />
+      {ended && (
+        <p role="status" className="text-body">
+          This review has ended. To try again, close it and review the package
+          again.
+        </p>
+      )}
       <DialogFooter>
         {update ? (
           <Button
-            disabled={busy}
+            disabled={busy || ended}
             onClick={() =>
               onAccept({
                 // Same-source updates keep the add-on's current enablement.

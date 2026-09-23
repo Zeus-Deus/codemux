@@ -13,6 +13,7 @@ import {
 import { addonInventory, addonInvoke, subscribeAddons } from "./bridge";
 import { addonComposer, composerForWorkspace } from "./composer-registry";
 import {
+  addonCode,
   addonEnabled,
   addonError,
   addonMessage,
@@ -226,10 +227,12 @@ export async function applyAddonEffect(
         throw addonError("INVALID_MESSAGE", "Unknown add-on UI operation");
     }
   } catch (cause) {
-    error =
-      typeof cause === "object" && cause !== null && "data" in cause
-        ? (cause as AddonError)
-        : addonError("CONTEXT_STALE", addonMessage(cause));
+    // Rebuilt in the host's exact error shape: it refuses any other, and the
+    // plugin would then get a TIMEOUT at its deadline instead of this error.
+    error = addonError(
+      addonCode(cause) ?? "CONTEXT_STALE",
+      addonMessage(cause),
+    );
     // The plugin gets the error too, but whether it tells the user depends
     // on the plugin. The host always says what was refused and why. One
     // toast per add-on, replaced in place, so a noisy plugin cannot stack them.

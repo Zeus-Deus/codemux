@@ -658,6 +658,195 @@ it("shows a failed install inside the review dialog", async () => {
   ).toBeInTheDocument();
 });
 
+it("ends a review whose install failed instead of offering a retry that cannot work", async () => {
+  // The host removes a review as it accepts it; the same token can only
+  // fail again with "Package review expired".
+  const fresh = reviewOf({ manifest: manifest as AddonManifest });
+  answer({
+    addon_catalog_review: () => fresh,
+    addon_accept_review: () =>
+      reject("STORAGE_UNAVAILABLE", "Not enough disk space"),
+  });
+  const dialog = within(await openReview(fresh));
+  fireEvent.click(dialog.getByRole("button", { name: "Install & enable" }));
+  expect(await dialog.findByRole("alert")).toHaveTextContent(
+    "Not enough disk space",
+  );
+  await act(async () => {});
+  expect(dialog.getByRole("status")).toHaveTextContent(
+    "This review has ended. To try again, close it and review the package again.",
+  );
+  const install = dialog.getByRole("button", { name: "Install" });
+  expect(install).toBeDisabled();
+  expect(
+    dialog.getByRole("button", { name: "Install & enable" }),
+  ).toBeDisabled();
+  fireEvent.click(install);
+  expect(
+    vi
+      .mocked(addonInvoke)
+      .mock.calls.filter(([command]) => command === "addon_accept_review"),
+  ).toHaveLength(1);
+  fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  // Reviewing the package again gives a review that can be accepted.
+  answer({
+    addon_catalog_review: () => ({ ...fresh, token: "second-review" }),
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Install from link / ID" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Find release" }));
+  const again = within(
+    await screen.findByRole("dialog", { name: "Review Issue Companion" }),
+  );
+  await waitFor(() =>
+    expect(again.getByRole("button", { name: "Install" })).toBeEnabled(),
+  );
+  expect(again.queryByRole("status")).toBeNull();
+});
+
+it.each(["dismissing", "installing"])(
+  "returns focus to Install from link / ID after %s the review found from a link",
+  async (close) => {
+    const fresh = reviewOf({ manifest: manifest as AddonManifest });
+    answer({ addon_catalog_review: () => fresh });
+    render(<AddonsSettings />);
+    const opener = screen.getByRole("button", {
+      name: "Install from link / ID",
+    });
+    opener.focus();
+    fireEvent.click(opener);
+    const input = screen.getByRole("textbox", {
+      name: "Add-on install link or ID",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(input));
+    fireEvent.change(input, { target: { value: fresh.manifest.id } });
+    // Enter in the field: the link dialog, and the field with it, goes away
+    // as the review opens.
+    fireEvent.submit(input.closest("form")!);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review Issue Companion",
+    });
+    await waitFor(() =>
+      expect(dialog.contains(document.activeElement)).toBe(true),
+    );
+    await waitFor(() => expect(opener).toBeEnabled());
+    if (close === "dismissing")
+      fireEvent.keyDown(document.activeElement!, {
+        key: "Escape",
+        code: "Escape",
+      });
+    else
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Install & enable" }),
+      );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  },
+);
+
+const watchedReview = () =>
+  reviewOf({
+    token: "development-token",
+    development: true,
+    manifest: { ...(manifest as AddonManifest), name: "Watched Package" },
+  });
+
+it("says that only Install & enable watches a selected development package", async () => {
+  // The host watches the file only from an accept that enables it; a later
+  // Enable on the row does not start watching.
+  useAddonsStore.setState({ developmentReview: watchedReview() });
+  render(<AddonsSettings />);
+  const dialog = within(
+    await screen.findByRole("dialog", { name: "Review Watched Package" }),
+  );
+  expect(
+    dialog.getByText(/^Development package\. Install & enable also watches/),
+  ).toHaveTextContent(
+    "Installing it disabled, or enabling it later, does not watch the file.",
+  );
+  expect(dialog.queryByText(/Once enabled/)).toBeNull();
+  expect(dialog.getByRole("button", { name: "Install" })).toBeEnabled();
+  expect(
+    dialog.getByRole("button", { name: "Install & enable" }),
+  ).toBeEnabled();
+  // A watched rebuild's own review keeps the watch it already has.
+  fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await act(async () =>
+    useAddonsStore.setState({
+      developmentReview: {
+        ...watchedReview(),
+        token: "reload-token",
+        installed: installedRelease(true),
+      },
+    }),
+  );
+  expect(
+    await screen.findByText(
+      /^Development package\. CodeMux keeps watching this selected file/,
+    ),
+  ).toBeInTheDocument();
+});
+
+it("holds a watched rebuild's review until the open review closes", async () => {
+  const fresh = reviewOf({ manifest: manifest as AddonManifest });
+  answer({ addon_catalog_review: () => fresh });
+  const dialog = within(await openReview(fresh));
+  await act(async () =>
+    useAddonsStore.setState({ developmentReview: watchedReview() }),
+  );
+  // The review the user is reading does not change under the pointer.
+  expect(
+    screen.getByRole("dialog", { name: "Review Issue Companion" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("dialog", { name: "Review Watched Package" }),
+  ).toBeNull();
+  fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+  expect(
+    await screen.findByRole("dialog", { name: "Review Watched Package" }),
+  ).toBeInTheDocument();
+  expect(addonInvoke).toHaveBeenCalledWith("addon_cancel_review", {
+    token: "review-token",
+  });
+  expect(addonInvoke).not.toHaveBeenCalledWith("addon_cancel_review", {
+    token: "development-token",
+  });
+  expect(useAddonsStore.getState().developmentReview).toBeNull();
+});
+
+it("shows a watched rebuild's review that arrives during an install once it finishes", async () => {
+  const fresh = reviewOf({ manifest: manifest as AddonManifest });
+  let finish!: () => void;
+  answer({
+    addon_catalog_review: () => fresh,
+    addon_accept_review: () =>
+      new Promise((resolve) => {
+        finish = () => resolve(installation);
+      }),
+  });
+  const dialog = within(await openReview(fresh));
+  fireEvent.click(dialog.getByRole("button", { name: "Install & enable" }));
+  await waitFor(() =>
+    expect(addonInvoke).toHaveBeenCalledWith(
+      "addon_accept_review",
+      expect.objectContaining({ token: "review-token" }),
+    ),
+  );
+  await act(async () =>
+    useAddonsStore.setState({ developmentReview: watchedReview() }),
+  );
+  expect(
+    screen.getByRole("dialog", { name: "Review Issue Companion" }),
+  ).toBeInTheDocument();
+  await act(async () => finish());
+  expect(
+    await screen.findByRole("dialog", { name: "Review Watched Package" }),
+  ).toBeInTheDocument();
+});
+
 it("shows each credential's state and clears a stored one", async () => {
   answer({
     addon_settings_get: () => ({ owner: "", repository: "" }),

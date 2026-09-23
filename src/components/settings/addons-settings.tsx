@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { PackagePlus, Pause, Puzzle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -189,6 +189,9 @@ export function AddonsSettings() {
   const state = useAddonsStore();
   const [selected, setSelected] = useState<string | null>(null);
   const [review, setReview] = useState<AddonReview | null>(null);
+  // The token of a review whose accept failed. The host removes a review as
+  // it accepts it, so the same review can never be accepted again.
+  const [endedReview, setEndedReview] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   // Failures of the open dialog's operation render inside that dialog; the
@@ -205,19 +208,32 @@ export function AddonsSettings() {
   const [tab, setTab] = useState<"installed" | "browse">("installed");
   const [target, setTarget] = useState("");
   const [linkOpen, setLinkOpen] = useState(false);
-  const showReview = (value: AddonReview) => {
+  const linkOpener = useRef<HTMLButtonElement>(null);
+  // Where focus returns when the review closes, when not to the element
+  // focused as it opened: a review found from a link replaces the link
+  // dialog, and what was focused there is gone by then.
+  const [reviewReturn, setReviewReturn] = useState<HTMLElement | null>(null);
+  const showReview = (
+    value: AddonReview,
+    returnFocus: HTMLElement | null = null,
+  ) => {
     setDialogProblem(null);
+    setReviewReturn(returnFocus);
     setReview(value);
   };
   useEffect(() => {
     void refreshAddons();
   }, []);
+  // A watched rebuild's review arrives on its own. It waits in the store until
+  // the open review and any operation have finished, so it never replaces
+  // the review under the user's pointer; the store keeps only the newest
+  // one, and the host cancels the one it replaces.
   useEffect(() => {
-    if (state.developmentReview) {
+    if (state.developmentReview && !review && !busy) {
       showReview(state.developmentReview);
       useAddonsStore.setState({ developmentReview: null });
     }
-  }, [state.developmentReview]);
+  }, [state.developmentReview, review, busy]);
   const perform = async (
     action: () => Promise<unknown>,
     options: { revoke?: string; dialog?: boolean } = {},
@@ -416,6 +432,7 @@ export function AddonsSettings() {
             </div>
             <div className="flex flex-wrap gap-2">
               <Button
+                ref={linkOpener}
                 variant="outline"
                 disabled={busy}
                 onClick={() => openDialog(() => setLinkOpen(true))}
@@ -607,7 +624,7 @@ export function AddonsSettings() {
                     { target: target.trim() },
                   );
                   setLinkOpen(false);
-                  showReview(found);
+                  showReview(found, linkOpener.current);
                 },
                 { dialog: true },
               );
@@ -633,6 +650,8 @@ export function AddonsSettings() {
         busy={busy}
         paused={state.paused}
         problem={dialogProblem}
+        ended={review !== null && review.token === endedReview}
+        returnFocus={reviewReturn}
         onDismiss={() => {
           if (review)
             void addonInvoke("addon_cancel_review", {
@@ -645,10 +664,15 @@ export function AddonsSettings() {
           if (!review) return;
           void perform(
             async () => {
-              await addonInvoke("addon_accept_review", {
-                token: review.token,
-                ...choice,
-              });
+              try {
+                await addonInvoke("addon_accept_review", {
+                  token: review.token,
+                  ...choice,
+                });
+              } catch (cause) {
+                setEndedReview(review.token);
+                throw cause;
+              }
               setReview(null);
             },
             { dialog: true },
