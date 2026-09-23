@@ -13,10 +13,10 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant},
@@ -136,7 +136,9 @@ pub struct Running {
     storage: StdMutex<Option<Storage>>,
     settings: StdMutex<Value>,
     views: Mutex<HashMap<String, View>>,
-    disposed_views: Mutex<HashSet<String>>,
+    // Views are numbered per generation, so a late batch for any disposed
+    // view is recognized without retaining one tombstone per disposal.
+    issued_views: AtomicU64,
     ui_rate: Mutex<limits::RateLimit>,
     requests: Arc<Semaphore>,
     git: Git,
@@ -149,13 +151,30 @@ impl Running {
     pub fn generation(&self) -> &str {
         &self.host.generation
     }
+    fn issued_view(&self, view_id: &str) -> bool {
+        view_id
+            .strip_prefix("view-")
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| {
+                format!("view-{n}") == view_id && n <= self.issued_views.load(Ordering::Acquire)
+            })
+    }
 }
 struct PendingEffect {
     generation: String,
     sender: oneshot::Sender<Result<Value>>,
     cancel: CancellationToken,
     deadline: Instant,
-    claimed: bool,
+    claimed: Option<Instant>,
+}
+/// A claimed effect is being applied by the trusted UI. Its result may arrive
+/// shortly after the interaction deadline, which only bounds claiming.
+const CLAIMED_GRACE: Duration = Duration::from_secs(2);
+impl PendingEffect {
+    fn expires(&self) -> Instant {
+        self.claimed
+            .map_or(self.deadline, |at| self.deadline.max(at + CLAIMED_GRACE))
+    }
 }
 pub struct Manager {
     pub root: PathBuf,
@@ -447,7 +466,7 @@ impl Manager {
             storage: StdMutex::new(Some(storage)),
             settings: StdMutex::new(settings),
             views: Mutex::new(HashMap::new()),
-            disposed_views: Mutex::new(HashSet::new()),
+            issued_views: AtomicU64::new(0),
             ui_rate: Mutex::new(limits::RateLimit::default()),
             requests: Arc::new(Semaphore::new(16)),
             git: Git::default(),
@@ -558,7 +577,22 @@ impl Manager {
                     let operation = params["operation"].as_str().unwrap_or("");
                     let timeout = if operation == "http.fetch" { 30 } else { 15 };
                     let result = tokio::select! {_ = instance.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin stopped")),result=tokio::time::timeout(Duration::from_secs(timeout),manager.request(&instance,operation,params["params"].clone()))=>result.unwrap_or_else(|_|Err(ProtocolError::new(ErrorCode::Timeout,"Host request timed out")))};
-                    let _ = instance.host.respond(id, result).await;
+                    // Never leave a request unanswered because its result
+                    // does not fit a frame; the plugin would wait for TIMEOUT.
+                    if let Err(error) = instance.host.respond(id, result).await {
+                        if error.data.code == ErrorCode::ResourceLimit {
+                            let _ = instance
+                                .host
+                                .respond(
+                                    id,
+                                    Err(ProtocolError::new(
+                                        ErrorCode::ResourceLimit,
+                                        "Host response exceeds the 1 MiB message limit",
+                                    )),
+                                )
+                                .await;
+                        }
+                    }
                 });
                 Ok(())
             }
@@ -569,8 +603,14 @@ impl Manager {
                 let records = params["records"]
                     .as_array()
                     .ok_or_else(|| ProtocolError::invalid("Missing mutation batch"))?;
-                if running.disposed_views.lock().await.contains(view_id) {
-                    return Ok(());
+                // The child may flush a batch before it receives view.unmount.
+                // Ignore late batches for disposed views; reject unknown IDs.
+                if !running.views.lock().await.contains_key(view_id) {
+                    return if running.issued_view(view_id) {
+                        Ok(())
+                    } else {
+                        Err(ProtocolError::invalid("Unknown plugin view"))
+                    };
                 }
                 if !running
                     .ui_rate
@@ -584,16 +624,23 @@ impl Manager {
                     ));
                 }
                 let mut views = running.views.lock().await;
-                let view = views
-                    .get_mut(view_id)
-                    .ok_or_else(|| ProtocolError::invalid("View was unmounted"))?;
+                // Live callbacks are bounded per plugin, not only per view.
+                let others: usize = views
+                    .iter()
+                    .filter(|(id, _)| id.as_str() != view_id)
+                    .map(|(_, v)| v.tree.callback_count())
+                    .sum();
+                let Some(view) = views.get_mut(view_id) else {
+                    return Ok(());
+                };
                 if view.revision - view.acknowledged >= 2 {
                     return Err(ProtocolError::new(
                         ErrorCode::ResourceLimit,
                         "UI update queue overflow",
                     ));
                 }
-                view.tree.apply(records)?;
+                view.tree
+                    .apply_within(records, limits::CALLBACKS.saturating_sub(others))?;
                 view.revision += 1;
                 let _ = self.events.send(UiEvent::Tree {
                     plugin_id: running.manifest.id.clone(),
@@ -764,15 +811,6 @@ impl Manager {
             return Ok(());
         };
         self.contexts.lock().await.revoke(&view.context);
-        let mut disposed = running.disposed_views.lock().await;
-        if disposed.len() >= 4096 {
-            return Err(ProtocolError::new(
-                ErrorCode::ResourceLimit,
-                "View lifetime limit; reopen the add-on",
-            ));
-        }
-        disposed.insert(view_id.into());
-        drop(disposed);
         running
             .host
             .send("view.unmount", json!({"viewId":view_id}))
@@ -851,17 +889,27 @@ impl Manager {
         self.contexts.lock().await.change_workspace();
         let hosts: Vec<_> = self.running.lock().await.values().cloned().collect();
         for running in hosts {
-            let mut views = running.views.lock().await;
-            running
-                .disposed_views
-                .lock()
-                .await
-                .extend(views.keys().cloned());
-            views.clear();
-            drop(views);
+            running.views.lock().await.clear();
+            // Every plugin is told so it unmounts its views, but only a
+            // workspace.read grant receives a context for the new project.
+            let context = match &workspace {
+                Some(workspace)
+                    if running
+                        .manifest
+                        .permissions
+                        .contains(&Permission::WorkspaceRead) =>
+                {
+                    self.contexts
+                        .lock()
+                        .await
+                        .issue(running.generation(), Some(workspace.clone()), None)
+                        .ok()
+                }
+                _ => None,
+            };
             let _ = running
                 .host
-                .send("workspace.changed", json!({"context":if workspace.is_some(){self.contexts.lock().await.issue(running.generation(),workspace.clone(),None).ok()}else{None}}))
+                .send("workspace.changed", json!({ "context": context }))
                 .await;
         }
     }
@@ -914,11 +962,11 @@ impl Manager {
             "git.summary" => {
                 super::permissions::require(&running.manifest, Permission::GitRead)?;
                 let context = self.context(running, &params).await?;
-                let workspace = context.workspace.ok_or_else(|| {
+                let workspace = context.workspace.clone().ok_or_else(|| {
                     ProtocolError::new(ErrorCode::NoWorkspace, "No workspace is open")
                 })?;
                 let summary = running.git.summary(&workspace, &context.cancel).await?;
-                self.context(running, &params).await?;
+                self.contexts.lock().await.live(&context)?;
                 Ok(serde_json::to_value(summary).unwrap())
             }
             "settings.get" => Ok(running.settings.lock().unwrap().clone()),
@@ -927,16 +975,9 @@ impl Manager {
                     Some("global") => "global".into(),
                     Some("workspace") => {
                         let context = self.context(running, &params).await?;
-                        format!(
-                            "workspace:{}",
-                            context
-                                .workspace
-                                .ok_or_else(|| ProtocolError::new(
-                                    ErrorCode::NoWorkspace,
-                                    "No workspace is open"
-                                ))?
-                                .id
-                        )
+                        super::workspace::storage_scope(&context.workspace.ok_or_else(|| {
+                            ProtocolError::new(ErrorCode::NoWorkspace, "No workspace is open")
+                        })?)
                     }
                     _ => return Err(ProtocolError::invalid("Invalid storage scope")),
                 };
@@ -1006,7 +1047,7 @@ impl Manager {
                         &context.cancel,
                     )
                     .await?;
-                self.context(running, &params).await?;
+                self.contexts.lock().await.live(&context)?;
                 Ok(serde_json::to_value(response).unwrap())
             }
             "ui.notify" => {
@@ -1076,17 +1117,26 @@ impl Manager {
                         ));
                     }
                 }
-                if operation != "panels.open" {
-                    self.contexts.lock().await.consume(
-                        params["context"].as_str().unwrap(),
-                        running.generation(),
-                        Instant::now(),
-                    )?;
-                }
+                // Every app effect, including opening a panel, needs a fresh
+                // user interaction, so a plugin cannot act on its own.
+                self.contexts.lock().await.consume(
+                    params["context"].as_str().unwrap(),
+                    running.generation(),
+                    Instant::now(),
+                )?;
                 if operation.starts_with("composer") && context.composer.is_none() {
+                    // Panels bind a composer only when exactly one is open.
+                    let several = match &context.workspace {
+                        Some(w) => self.contexts.lock().await.composers_in(&w.id) > 1,
+                        None => false,
+                    };
                     return Err(ProtocolError::new(
                         ErrorCode::NoComposer,
-                        "No chat composer is available",
+                        if several {
+                            "Several chat composers are open. Use the Add-ons menu in the composer you want."
+                        } else {
+                            "No chat composer is available"
+                        },
                     ));
                 }
                 if context.workspace.is_none() {
@@ -1104,11 +1154,7 @@ impl Manager {
                     operation,
                     effect,
                     Some(context.cancel.clone()),
-                    if operation == "panels.open" {
-                        None
-                    } else {
-                        context.interaction_deadline()
-                    },
+                    context.interaction_deadline(),
                 )
                 .await
             }
@@ -1134,7 +1180,7 @@ impl Manager {
                 sender: tx,
                 cancel: cancel.clone(),
                 deadline,
-                claimed: false,
+                claimed: None,
             },
         );
         let _ = self.events.send(UiEvent::Effect {
@@ -1144,7 +1190,23 @@ impl Manager {
             operation: operation.into(),
             params,
         });
-        let result = tokio::select! {_ = cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::ContextStale,"Target closed")),result=tokio::time::timeout_at(deadline.into(),rx)=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"Host UI did not respond")).and_then(|r|r.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin stopped"))).and_then(|r|r)};
+        let mut rx = rx;
+        let mut expires = deadline;
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(ProtocolError::new(ErrorCode::ContextStale, "Target closed")),
+                result = &mut rx => break result.map_err(|_| ProtocolError::new(ErrorCode::PluginStopped, "Plugin stopped")).and_then(|r| r),
+                _ = tokio::time::sleep_until(expires.into()) => {
+                    // A claim just before the deadline extends only the wait
+                    // for its result, never the window for claiming it.
+                    match self.effects.lock().await.get(&id).map(PendingEffect::expires) {
+                        Some(extended) if extended > Instant::now() => expires = extended,
+                        _ => break rx.try_recv().unwrap_or_else(|_| Err(ProtocolError::new(ErrorCode::Timeout, "Host UI did not respond"))),
+                    }
+                }
+            }
+        };
         self.effects.lock().await.remove(&id);
         result
     }
@@ -1155,13 +1217,13 @@ impl Manager {
             .filter(|e| {
                 e.generation == generation
                     && !e.cancel.is_cancelled()
-                    && !e.claimed
+                    && e.claimed.is_none()
                     && Instant::now() < e.deadline
             })
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCode::ContextStale, "The add-on action expired")
             })?;
-        effect.claimed = true;
+        effect.claimed = Some(Instant::now());
         Ok(())
     }
     pub async fn effect_result(
@@ -1174,7 +1236,7 @@ impl Manager {
         if effects.get(id).is_none_or(|effect| {
             effect.generation != generation
                 || effect.cancel.is_cancelled()
-                || Instant::now() >= effect.deadline
+                || Instant::now() >= effect.expires()
         }) {
             return Err(ProtocolError::new(
                 ErrorCode::ContextStale,
@@ -1197,7 +1259,22 @@ impl Manager {
         }
         contexts.issue(running.generation(), workspace, composer)
     }
+    /// Takes ownership of a handle issued for this execution: it becomes the
+    /// command's interaction, or is revoked when the command cannot run.
     pub async fn execute(
+        &self,
+        running: &Running,
+        id: &str,
+        kind: &str,
+        context: &str,
+    ) -> Result<()> {
+        let result = self.send_command(running, id, kind, context).await;
+        if result.is_err() {
+            self.contexts.lock().await.revoke(context);
+        }
+        result
+    }
+    async fn send_command(
         &self,
         running: &Running,
         id: &str,
@@ -1245,22 +1322,36 @@ impl Manager {
                 "This command requires a local workspace",
             ));
         }
-        let interaction =
-            self.contexts
-                .lock()
-                .await
-                .interact(context, running.generation(), Instant::now())?;
+        self.contexts
+            .lock()
+            .await
+            .promote(context, running.generation(), Instant::now())?;
         *running.last_used.lock().await = Instant::now();
         running
             .host
             .send(
                 "command.execute",
-                json!({"id":id,"kind":kind,"context":interaction}),
+                json!({"id":id,"kind":kind,"context":context}),
             )
             .await?;
         Ok(())
     }
+    /// Takes ownership of a handle issued for this view; a failed mount
+    /// revokes it instead of leaving it until the next project switch.
     pub async fn mount(
+        &self,
+        running: &Running,
+        id: &str,
+        kind: &str,
+        context: &str,
+    ) -> Result<String> {
+        let result = self.mount_view(running, id, kind, context).await;
+        if result.is_err() {
+            self.contexts.lock().await.revoke(context);
+        }
+        result
+    }
+    async fn mount_view(
         &self,
         running: &Running,
         id: &str,
@@ -1292,10 +1383,13 @@ impl Manager {
             .await
             .get(context, running.generation())?;
         let mut views = running.views.lock().await;
-        if views.len() >= 4 {
+        if views.len() >= limits::VIEWS {
             return Err(ProtocolError::new(ErrorCode::ResourceLimit, "View limit"));
         }
-        let view_id = uuid::Uuid::new_v4().to_string();
+        let view_id = format!(
+            "view-{}",
+            running.issued_views.fetch_add(1, Ordering::AcqRel) + 1
+        );
         views.insert(
             view_id.clone(),
             View {
@@ -1306,13 +1400,17 @@ impl Manager {
             },
         );
         drop(views);
-        running
+        if let Err(error) = running
             .host
             .send(
                 "view.mount",
                 json!({"id":id,"kind":kind,"viewId":view_id,"context":context}),
             )
-            .await?;
+            .await
+        {
+            running.views.lock().await.remove(&view_id);
+            return Err(error);
+        }
         Ok(view_id)
     }
     pub async fn acknowledge(&self, running: &Running, view_id: &str, revision: u64) -> Result<()> {
