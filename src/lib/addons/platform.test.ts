@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 vi.mock("./bridge", () => ({
   addonInvoke: vi.fn(),
   addonInventory: vi.fn(),
@@ -17,6 +17,7 @@ import {
   useAddonPlatform,
 } from "./platform";
 import { registerAddonComposer } from "./composer-registry";
+import { useAddonComposerAdapter } from "./use-addon-composer-adapter";
 import {
   beginAddonRevocation,
   clearAddonContext,
@@ -335,6 +336,83 @@ describe("remote workspaces and clients", () => {
     } finally {
       delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
     }
+  });
+});
+describe("context races through the real composer adapter", () => {
+  /** A composer bound to the workspace, and an appendText aimed at it whose
+   *  claim is held until `release()`. */
+  async function delayedInsertion() {
+    const onDraftChange = vi.fn();
+    const composer = renderHook(
+      ({ threadId, draft }: { threadId: string; draft: string }) =>
+        useAddonComposerAdapter("workspace", threadId, draft, onDraftChange),
+      { initialProps: { threadId: "thread-1", draft: "unsent" } },
+    );
+    await waitFor(() => expect(composer.result.current.registered).toBe(true));
+    const claim = deferred<unknown>();
+    vi.mocked(addonInvoke).mockImplementation((command) =>
+      command === "addon_effect_claim" ? claim.promise : Promise.resolve(null),
+    );
+    const pending = applyAddonEffect(
+      effect("composer.appendText", {
+        composerId: composer.result.current.id,
+        text: "brief",
+      }),
+    );
+    return {
+      composer,
+      onDraftChange,
+      release: async () => {
+        claim.resolve(null);
+        await act(() => pending);
+      },
+    };
+  }
+  it("inserts after text the user typed while the request was delayed", async () => {
+    const { composer, onDraftChange, release } = await delayedInsertion();
+    composer.rerender({ threadId: "thread-1", draft: "unsent, then more" });
+    await release();
+    expect(onDraftChange).toHaveBeenCalledExactlyOnceWith(
+      "unsent, then more\nbrief",
+    );
+    expect(lastResult().error).toBeNull();
+    composer.unmount();
+  });
+  it("inserts nothing after a project switch", async () => {
+    const { composer, onDraftChange, release } = await delayedInsertion();
+    act(() => {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "other",
+          workspaces: [{ workspace_id: "workspace" }, { workspace_id: "other" }],
+        } as AppStateSnapshot,
+      });
+      clearAddonContext();
+    });
+    await release();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(lastResult().error).toMatchObject({ data: { code: "CONTEXT_STALE" } });
+    composer.unmount();
+  });
+  it("inserts nothing after the thread closes", async () => {
+    const { composer, onDraftChange, release } = await delayedInsertion();
+    composer.unmount();
+    await release();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      "Fixture couldn't add text to the draft",
+      expect.objectContaining({
+        description: "This chat composer is no longer available",
+      }),
+    );
+  });
+  it("inserts into neither draft after the surface moves to another thread", async () => {
+    const { composer, onDraftChange, release } = await delayedInsertion();
+    composer.rerender({ threadId: "thread-2", draft: "another thread" });
+    await release();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(lastResult().error).toMatchObject({ data: { code: "NO_COMPOSER" } });
+    composer.unmount();
   });
 });
 describe("saved add-on pane preferences", () => {
