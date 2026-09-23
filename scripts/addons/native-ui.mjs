@@ -253,7 +253,18 @@ async function clickElement(locate) {
       await wd("POST", `/element/${elementId(el)}/click`, {});
       return;
     } catch (error) {
-      if (attempt === 9 || !undispatched.test(String(error))) throw error;
+      if (!undispatched.test(String(error))) throw error;
+      if (attempt === 9) {
+        // WebKitWebDriver can keep reporting a control inside a nested scroll
+        // area as not interactable. Operate it from the keyboard instead, as a
+        // user can; the app's own handler still runs.
+        if (!String(error).includes('"error":"element not interactable"'))
+          throw error;
+        await script("arguments[0].focus()", el);
+        await pressKeys([""]);
+        evidence.keyboardActivations = (evidence.keyboardActivations ?? 0) + 1;
+        return;
+      }
       await delay(500);
     }
   }
