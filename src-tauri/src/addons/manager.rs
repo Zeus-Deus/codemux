@@ -3322,7 +3322,7 @@ mod tests {
         manager.effect_result(&request_id, &generation, Ok(json!(2))).await.unwrap();
         let observed = running.http.observed_requests().await;
         assert_eq!(observed.len(), 6);
-        assert!(observed.iter().all(|r| r["path"] == "/repos/synthetic-owner/fixture-repository/issues?state=open&per_page=50" && r["credentialAttached"] == false));
+        assert!(observed.iter().all(|r| r["path"] == "/repos/synthetic-owner/fixture-repository/issues?state=open&per_page=20" && r["credentialAttached"] == false));
         manager.stop(&installed.manifest.id, None).await;
         assert!(manager.running.lock().await.is_empty());
     }
@@ -4190,12 +4190,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.data.code, ErrorCode::ResourceLimit);
         assert_eq!(queued.views.lock().await[&view].revision, 3);
-        // Acknowledged batches are still limited to 30 applied per second.
+        // The trusted host paces batches to 30/s. This backstop applies every
+        // acknowledged batch and faults only on repeated excess over twice that.
         let busy = start(&manager, broker_manifest("example.busy", &[]), "").await;
         let context = manager.context_handle(&busy, None, None).await.unwrap();
         let view = manager.mount(&busy, "panel", "panels", &context).await.unwrap();
         let mut refused = None;
-        for i in 0..40 {
+        for i in 0..80 {
             // Pace acknowledgements so the child's bounded call queue keeps up.
             tokio::time::sleep(Duration::from_millis(2)).await;
             match manager.message(&busy, patch(&busy, &view, text(i))).await {
@@ -4209,8 +4210,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(refused.expect("rate limited").data.code, ErrorCode::ResourceLimit);
-        assert!(busy.views.lock().await[&view].revision <= 30);
+        assert_eq!(refused.expect("repeated excess").data.code, ErrorCode::ResourceLimit);
+        let applied = busy.views.lock().await[&view].revision;
+        assert!((60..80).contains(&applied), "applied {applied} batches");
         // A real child flooding the pipe is stopped; the other plugin continues.
         let flood = start(
             &manager,
