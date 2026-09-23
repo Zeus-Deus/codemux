@@ -590,6 +590,16 @@ impl Reviews {
                     Storage::open(&previous)?.snapshot(&data.join("state.sqlite"))?;
                 }
             }
+            // The probe and the first activation read settings from the registry,
+            // so restored values must be there before either starts. The orphan
+            // keeps its own row until the completion transaction retires it.
+            if let Some(retained) = retained {
+                super::cleanup::restore_settings(
+                    &manager.registry.lock().unwrap(),
+                    retained,
+                    &candidate,
+                )?;
+            }
             #[cfg(test)]
             self.checkpoint("data-snapshotted").await;
             if live() {
@@ -631,7 +641,6 @@ impl Reviews {
                     [format!("orphan:{}", retained.installation_id)],
                 )
                 .map_err(|_| unavailable())?;
-                super::cleanup::restore_settings(&tx, retained, &candidate)?;
                 super::cleanup::queue(&tx, retained, false)?;
                 queued = true;
             }
@@ -728,8 +737,9 @@ impl Manager {
         Ok(())
     }
     /// Failure path of an update or rollback: put back the previous tuple and
-    /// its enablement, or nothing for a new installation. The journal is
-    /// removed only once that is durable; otherwise startup recovery retries.
+    /// its enablement, or nothing for a new installation, and drop settings
+    /// restored for a new installation ID. The journal is removed only once
+    /// that is durable; otherwise startup recovery retries.
     fn restore(&self, old: Option<&Installation>, candidate: &Installation, journal: &Path) {
         let restored = match old {
             Some(old) => {
@@ -751,7 +761,13 @@ impl Manager {
                 )
                 .map(|_| ())
                 .map_err(|_| unavailable()),
-        };
+        }
+        .and_then(|()| {
+            super::cleanup::discard_candidate_settings(
+                &self.registry.lock().unwrap(),
+                &candidate.installation_id,
+            )
+        });
         if restored.is_ok() {
             let _ = std::fs::remove_dir_all(journal);
         }
@@ -844,6 +860,10 @@ impl Manager {
                         .map_err(|_| unavailable())?;
                 }
             }
+            super::cleanup::discard_candidate_settings(
+                &self.registry.lock().unwrap(),
+                &journal.candidate.installation_id,
+            )?;
             std::fs::remove_dir_all(entry.path()).map_err(|_| journal_error())?;
         }
         Ok(())
@@ -1328,6 +1348,83 @@ pub(crate) mod tests {
         std::fs::read_dir(root.join("recovery"))
             .map(|entries| entries.count())
             .unwrap_or(0)
+    }
+    fn journal_candidate(root: &Path) -> Installation {
+        let entry = std::fs::read_dir(root.join("recovery"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let journal: Journal =
+            serde_json::from_slice(&std::fs::read(entry.path().join("journal.json")).unwrap())
+                .unwrap();
+        journal.candidate
+    }
+    #[tokio::test]
+    async fn restored_settings_precede_the_candidate_and_leave_with_a_failed_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let manager = Manager::open(private.clone(), "unused".into()).unwrap();
+        let reviews = Reviews::default();
+        let file = root.path().join("fixture.cmxaddon");
+        std::fs::write(&file, with_setting().archive).unwrap();
+        let review = reviews.prepare_local(&manager, &file).unwrap();
+        let old = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        let chosen = serde_json::json!({"include-files": false});
+        manager
+            .set_settings(&old.manifest.id, chosen.clone())
+            .await
+            .unwrap();
+        manager.remove(&old.manifest.id, true).await.unwrap();
+        // The probe and the first activation read settings while the candidate
+        // is not yet installed, so the restored values must already be there.
+        let review = reviews.prepare_local(&manager, &file).unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *reviews.interruption.lock().unwrap() =
+            Some(("data-snapshotted", reached.clone(), Some(resume.clone())));
+        let candidate = {
+            let restore = reviews.accept_with_data(&manager, &review.token, false, false, true);
+            tokio::pin!(restore);
+            tokio::select! {
+                result = &mut restore => panic!("restore escaped checkpoint: {}", result.is_ok()),
+                _ = reached.notified() => {},
+            }
+            let candidate = journal_candidate(&private);
+            assert_ne!(candidate.installation_id, old.installation_id);
+            assert_eq!(manager.settings(&candidate).unwrap(), chosen);
+            // A failed restore drops the candidate's copy; the orphan keeps its own.
+            *reviews.fault.lock().unwrap() = Some("registry-switched");
+            resume.notify_one();
+            assert!(restore.await.is_err());
+            candidate
+        };
+        *reviews.fault.lock().unwrap() = None;
+        assert_eq!(settings_rows(&manager, &candidate.installation_id), 0);
+        assert_eq!(settings_rows(&manager, &old.installation_id), 1);
+        // An interruption at the same point is undone by startup recovery.
+        let review = reviews.prepare_local(&manager, &file).unwrap();
+        assert!(review.retained_data.is_some());
+        *reviews.interruption.lock().unwrap() = Some(("candidate-probed", reached.clone(), None));
+        tokio::select! {
+            result = reviews.accept_with_data(&manager, &review.token, false, false, true) => panic!("restore completed before interruption: {}", result.is_ok()),
+            _ = reached.notified() => {},
+        }
+        let candidate = journal_candidate(&private);
+        assert_eq!(settings_rows(&manager, &candidate.installation_id), 1);
+        drop(manager);
+        let manager = Manager::open(private, "unused".into()).unwrap();
+        assert!(manager.list().unwrap().is_empty());
+        assert_eq!(settings_rows(&manager, &candidate.installation_id), 0);
+        assert_eq!(settings_rows(&manager, &old.installation_id), 1);
+        let review = Reviews::default().prepare_local(&manager, &file).unwrap();
+        assert!(
+            review.retained_data.is_some(),
+            "retained data is still offered"
+        );
     }
     #[tokio::test]
     async fn failed_source_replacement_restores_the_installed_tuple_without_a_stale_journal() {

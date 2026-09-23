@@ -68,12 +68,12 @@ pub(super) fn queue(
 /// Copy retained settings to the installation that confirmed the restore,
 /// keeping only values the new manifest still declares and accepts.
 pub(super) fn restore_settings(
-    tx: &Transaction<'_>,
+    db: &rusqlite::Connection,
     retained: &Installation,
     candidate: &Installation,
 ) -> Result<()> {
     use rusqlite::OptionalExtension;
-    let saved: Option<String> = tx
+    let saved: Option<String> = db
         .query_row(
             "SELECT value FROM settings WHERE installation=?1",
             [&retained.installation_id],
@@ -95,12 +95,26 @@ pub(super) fn restore_settings(
                 .map(|value| (setting.id().to_owned(), value.clone()))
         })
         .collect();
-    tx.execute(
+    db.execute(
         "INSERT OR REPLACE INTO settings(installation,value) VALUES(?1,?2)",
         rusqlite::params![
             candidate.installation_id,
             serde_json::Value::Object(values).to_string()
         ],
+    )
+    .map_err(|_| unavailable())?;
+    Ok(())
+}
+/// Drop the settings row of a candidate installation that never took over.
+/// Keep it while a record or a retained-data orphan still uses that ID, as a
+/// same-installation update or rollback does.
+pub(super) fn discard_candidate_settings(
+    db: &rusqlite::Connection,
+    installation: &str,
+) -> Result<()> {
+    db.execute(
+        "DELETE FROM settings WHERE installation=?1 AND NOT EXISTS(SELECT 1 FROM installations WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM metadata WHERE key='orphan:'||?1)",
+        [installation],
     )
     .map_err(|_| unavailable())?;
     Ok(())
