@@ -43,8 +43,9 @@ pub struct Listing {
     pub publisher: String,
     pub repository: String,
     pub tier: Option<Tier>,
-    /// The cached catalog still lists this ID from the same publisher and repository.
-    pub listed: bool,
+    /// Whether the cached catalog still lists this ID from the same publisher
+    /// and repository; None when no usable cached catalog can say either way.
+    pub listed: Option<bool>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,11 +57,19 @@ pub struct UpdateCheck {
 }
 #[cfg(test)]
 pub(super) type Fetcher = Arc<dyn Fn(&str) -> Result<Vec<u8>> + Send + Sync>;
+/// The stored snapshot as last read. A damaged row stays damaged until a
+/// validated fetch replaces it, so it is not re-read on every call.
+#[derive(Clone)]
+enum Stored {
+    Absent,
+    Valid(Arc<Snapshot>),
+    Damaged,
+}
 /// Parsed-snapshot cache and background lifetime. The fetcher and clock
 /// replacements are compiled only into tests; no command can reach them.
 #[derive(Default)]
 pub struct CatalogState {
-    cache: StdMutex<Option<Option<Arc<Snapshot>>>>,
+    cache: StdMutex<Option<Stored>>,
     pub(super) stop: CancellationToken,
     #[cfg(test)]
     pub(super) fetch: StdMutex<Option<Fetcher>>,
@@ -109,7 +118,7 @@ impl Manager {
         }
         download(url, maximum, assets).await
     }
-    fn load_catalog(&self) -> Result<Option<Arc<Snapshot>>> {
+    fn load_catalog(&self) -> Result<Stored> {
         let db = self.registry.lock().unwrap();
         let value = db
             .query_row(
@@ -119,26 +128,34 @@ impl Manager {
             )
             .optional()
             .map_err(|_| storage_error())?;
-        value
-            .map(|value| {
-                if value.len() > MAX_BYTES + 256 {
-                    return Err(damaged());
-                }
-                let snapshot: Snapshot = serde_json::from_str(&value).map_err(|_| damaged())?;
-                snapshot.catalog.validate().map_err(|_| damaged())?;
-                Ok(Arc::new(snapshot))
-            })
-            .transpose()
-    }
-    /// Parse and validate the stored snapshot once, not on every activation.
-    fn cached_catalog(&self) -> Result<Option<Arc<Snapshot>>> {
-        let mut cache = self.catalog.cache.lock().unwrap();
-        if let Some(cached) = cache.as_ref() {
-            return Ok(cached.clone());
+        let Some(value) = value else {
+            return Ok(Stored::Absent);
+        };
+        if value.len() > MAX_BYTES + 256 {
+            return Ok(Stored::Damaged);
         }
-        let loaded = self.load_catalog()?;
-        *cache = Some(loaded.clone());
-        Ok(loaded)
+        Ok(serde_json::from_str::<Snapshot>(&value)
+            .ok()
+            .filter(|snapshot| snapshot.catalog.validate().is_ok())
+            .map_or(Stored::Damaged, |snapshot| {
+                Stored::Valid(Arc::new(snapshot))
+            }))
+    }
+    /// Parse and validate the stored snapshot once, not on every activation
+    /// or inventory row. A storage error is not remembered; it may pass.
+    fn cached_catalog(&self) -> Result<Option<Arc<Snapshot>>> {
+        let stored = {
+            let mut cache = self.catalog.cache.lock().unwrap();
+            match cache.as_ref() {
+                Some(stored) => stored.clone(),
+                None => cache.insert(self.load_catalog()?).clone(),
+            }
+        };
+        match stored {
+            Stored::Absent => Ok(None),
+            Stored::Valid(snapshot) => Ok(Some(snapshot)),
+            Stored::Damaged => Err(damaged()),
+        }
     }
     pub fn catalog_snapshot(&self) -> Result<Option<Snapshot>> {
         Ok(self.cached_catalog()?.map(|s| (*s).clone()))
@@ -212,7 +229,7 @@ impl Manager {
             .map_err(|_| storage_error())?;
             tx.commit().map_err(|_| storage_error())?;
         }
-        *self.catalog.cache.lock().unwrap() = Some(Some(snapshot.clone()));
+        *self.catalog.cache.lock().unwrap() = Some(Stored::Valid(snapshot.clone()));
         Ok(snapshot)
     }
     /// Disable and stop installations the accepted catalog now blocks.
@@ -359,7 +376,7 @@ impl Manager {
                 publisher: publisher.clone(),
                 repository: repository.clone(),
                 tier: plugin.map(|p| p.tier.clone()),
-                listed: plugin.is_some(),
+                listed: snapshot.as_ref().map(|_| plugin.is_some()),
             }),
             update,
         )
@@ -476,7 +493,7 @@ impl super::lifecycle::Reviews {
                 publisher: plugin.publisher.clone(),
                 repository: plugin.repository.clone(),
                 tier: Some(plugin.tier.clone()),
-                listed: true,
+                listed: Some(true),
             }),
         )
     }
@@ -721,7 +738,7 @@ pub(super) mod tests {
         let status = manager.catalog_status(&manager.installation("example.hello").unwrap());
         assert_eq!(status.1.as_deref(), Some("2.0.0"));
         let listing = status.0.unwrap();
-        assert!(listing.listed && matches!(listing.tier, Some(Tier::Community)));
+        assert!(listing.listed == Some(true) && matches!(listing.tier, Some(Tier::Community)));
         assert_eq!(listing.publisher, "Fixture publisher");
         assert!(!check.up_to_date);
         assert_eq!(check.available_version.as_deref(), Some("2.0.0"));
@@ -837,7 +854,8 @@ pub(super) mod tests {
         let root = tempfile::tempdir().unwrap();
         let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
         let v1 = package("1.0.0");
-        manager.accept_catalog(catalog(5, &[&v1])).unwrap();
+        serve(&manager, Some(&catalog(5, &[&v1])), &[&v1]);
+        let installed = install_from_catalog(&manager, &Reviews::default()).await;
         // Simulate a row written by a different schema: parsing now fails.
         manager
             .registry
@@ -855,6 +873,10 @@ pub(super) mod tests {
             .err()
             .unwrap();
         assert!(error.message.contains("Refresh"), "{}", error.message);
+        // Unknown, not delisted: nothing usable says either way.
+        let (listing, update) = manager.catalog_status(&installed);
+        let listing = listing.unwrap();
+        assert!(listing.listed.is_none() && listing.tier.is_none() && update.is_none());
         assert!(manager.accept_catalog(catalog(4, &[&v1])).is_err());
         serve(&manager, Some(&catalog(6, &[&v1])), &[]);
         let browse = manager.browse(false).await.unwrap();
@@ -862,6 +884,10 @@ pub(super) mod tests {
         manager
             .check_blocklist("example.hello", &v1.digest)
             .unwrap();
+        assert_eq!(
+            manager.catalog_status(&installed).0.unwrap().listed,
+            Some(true)
+        );
         drop(manager);
         let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
         assert_eq!(

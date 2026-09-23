@@ -51,7 +51,8 @@ export interface AddonListing {
   publisher: string;
   repository: string;
   tier: "official" | "community" | null;
-  listed: boolean;
+  /** null when no usable cached catalog says either way (absent or damaged). */
+  listed: boolean | null;
 }
 export interface AddonCompatibility {
   api: string;
