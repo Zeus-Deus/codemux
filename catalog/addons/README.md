@@ -26,6 +26,15 @@ cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- ge
 cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json
 ```
 
+Every shipped v1 desktop parses `catalog-v1.json` strictly and rejects the whole
+file, including its blocklist, if it contains an unknown field, platform,
+permission, HTTP method, credential type, or tier. `catalog-v1.json` must
+therefore stay readable by v1 desktops. Publish releases that need new fields or
+values in a new `catalog-vN.json` that newer desktops fetch, and keep publishing
+`catalog-v1.json` with its v1-compatible releases and the complete blocklist. The
+protocol contract test `catalog_v1_fields_and_values_are_pinned` fails when the
+v1 shape changes.
+
 Increment the envelope revision for every change, including revocations. Never
 reuse a catalog revision or release version with changed bytes. Keep historical
 release records so ownership and digest continuity can be checked. To revoke a

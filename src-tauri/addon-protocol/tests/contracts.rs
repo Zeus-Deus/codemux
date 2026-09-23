@@ -92,6 +92,47 @@ fn published_schemas_are_generated_from_the_rust_contracts() {
         );
     }
 }
+/// Shipped v1 desktops reject unknown catalog fields and values, so
+/// catalog-v1.json can never use new ones. Extending this shape needs a new
+/// catalog file (see catalog/addons/README.md), not an edit to this list.
+#[test]
+fn catalog_v1_fields_and_values_are_pinned() {
+    let schema = serde_json::to_value(schemars::schema_for!(Catalog)).unwrap();
+    let keys = |definition: &Value| {
+        let properties = definition["properties"].as_object();
+        properties.map(|p| json!(p.keys().collect::<Vec<_>>()))
+    };
+    let mut shape = Map::new();
+    shape.insert("Catalog".into(), keys(&schema).unwrap());
+    for (name, definition) in schema["definitions"].as_object().unwrap() {
+        let value = keys(definition).or_else(|| definition.get("enum").cloned());
+        shape.insert(name.clone(), value.unwrap());
+    }
+    assert_eq!(
+        Value::Object(shape),
+        json!({
+            "Catalog": ["blocked", "generatedAt", "plugins", "revision", "schemaVersion"],
+            "Blocked": ["date", "pluginId", "reason", "sha256"],
+            "Capabilities": ["credentials", "http", "permissions"],
+            "Credential": ["id", "label", "origin", "type"],
+            "CredentialType": ["bearer"],
+            "HttpGrant": ["credential", "methods", "origin"],
+            "HttpMethod": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            "Permission": ["workspace.read", "git.read", "composer.append", "external.open"],
+            "Platform": ["linux-x64", "windows-x64"],
+            "Plugin": [
+                "description", "id", "name", "publisher", "readme", "releases", "repository",
+                "tier"
+            ],
+            "Release": [
+                "api", "capabilities", "compressedBytes", "downloadUrl", "license", "platforms",
+                "publishedAt", "sha256", "sourceCommit", "version"
+            ],
+            "Tier": ["official", "community"],
+        }),
+        "catalog-v1.json must stay readable by shipped v1 desktops; publish new fields or values in a new catalog file"
+    );
+}
 #[test]
 fn rejects_unknown_capabilities_and_invalid_declarations() {
     let good = fixture();
