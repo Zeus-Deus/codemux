@@ -63,6 +63,12 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Release policy guard
+        # Catalog and add-on releases must not take the desktop's Latest
+        # release or v* tags; desktop releases upload only gated bundles.
+        if: matrix.os == 'ubuntu-latest'
+        run: node --test scripts/addons/release-policy-check.mjs
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
