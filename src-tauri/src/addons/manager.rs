@@ -21,7 +21,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{broadcast, oneshot, Mutex, Semaphore};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -137,19 +137,53 @@ pub struct Running {
     settings: StdMutex<Value>,
     views: Mutex<HashMap<String, View>>,
     disposed_views: Mutex<HashSet<String>>,
-    ui_rate: Mutex<limits::RateLimit>,
+    ui_rate: Mutex<(limits::RateLimit, VecDeque<Instant>)>,
     requests: Arc<Semaphore>,
     git: Git,
     http: Http,
-    last_used: Mutex<Instant>,
+    last_used: StdMutex<Instant>,
+    activity: Notify,
     notifications: Mutex<limits::RateLimit>,
-    logs: Mutex<VecDeque<String>>,
 }
 impl Running {
     pub fn generation(&self) -> &str {
         &self.host.generation
     }
+    /// Records use and wakes the idle supervisor to re-evaluate.
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+        self.activity.notify_one();
+    }
+    /// Activated, no mounted UI, and no pending call in either direction.
+    /// Both the idle stop and eviction use this one predicate.
+    fn is_idle(&self) -> bool {
+        self.activated.load(Ordering::Acquire)
+            && !self.probe
+            && !self.cancel.is_cancelled()
+            && self.requests.available_permits() == 16
+            && !self.host.pending_calls()
+            && self.views.try_lock().is_ok_and(|views| views.is_empty())
+    }
 }
+/// Sanitized per-installation log activity. It outlives the generation that
+/// produced it, so a stopped or crashed plugin keeps its diagnostics.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Diagnostics {
+    /// Entries received this session, including ones the ring evicted.
+    pub received: u64,
+    pub logs: VecDeque<LogEntry>,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    /// Milliseconds since the Unix epoch.
+    pub at: u64,
+    pub level: &'static str,
+    pub bytes: usize,
+}
+/// Each serialized entry is at most 64 bytes, bounding the ring to 64 KiB.
+const LOG_ENTRIES: usize = 65536 / 64;
 struct PendingEffect {
     generation: String,
     sender: oneshot::Sender<Result<Value>>,
@@ -169,6 +203,8 @@ pub struct Manager {
     effects: Mutex<HashMap<String, PendingEffect>>,
     pub events: broadcast::Sender<UiEvent>,
     paused: AtomicBool,
+    diagnostics: StdMutex<HashMap<String, Diagnostics>>,
+    idle: Duration,
 }
 fn storage_error(_: rusqlite::Error) -> ProtocolError {
     ProtocolError::new(
@@ -178,6 +214,10 @@ fn storage_error(_: rusqlite::Error) -> ProtocolError {
 }
 impl Manager {
     pub fn open(root: PathBuf, host_path: PathBuf) -> Result<Arc<Self>> {
+        Self::open_with_idle(root, host_path, Duration::from_secs(60))
+    }
+    /// The idle stop delay is a supervision test seam; it grants no authority.
+    fn open_with_idle(root: PathBuf, host_path: PathBuf, idle: Duration) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&root).map_err(|_| {
             ProtocolError::new(
                 ErrorCode::StorageUnavailable,
@@ -237,6 +277,8 @@ impl Manager {
                 stored_paused
                     || std::env::var_os("CODEMUX_DISABLE_ADDONS").is_some_and(|v| v == "1"),
             ),
+            diagnostics: StdMutex::new(HashMap::new()),
+            idle,
         });
         manager.recover()?;
         manager.recover_session()?;
@@ -256,6 +298,17 @@ impl Manager {
     }
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+    /// Log activity of the current installation this session, across generations.
+    pub fn diagnostics(&self, id: &str) -> Result<Diagnostics> {
+        let installation = self.installation(id)?;
+        Ok(self
+            .diagnostics
+            .lock()
+            .unwrap()
+            .get(&installation.installation_id)
+            .cloned()
+            .unwrap_or_default())
     }
     pub fn list(&self) -> Result<Vec<Installation>> {
         let connection = self.registry.lock().unwrap();
@@ -397,12 +450,12 @@ impl Manager {
             return Ok(running.clone());
         }
         if hosts.len() >= 8 {
+            // Evict the least recently used idle host; never one that is
+            // activating, rendering, or serving a call.
             let idle = hosts
                 .iter()
-                .find(|(_, r)| {
-                    r.requests.available_permits() == 16
-                        && r.views.try_lock().is_ok_and(|views| views.is_empty())
-                })
+                .filter(|(_, r)| r.is_idle())
+                .min_by_key(|(_, r)| *r.last_used.lock().unwrap())
                 .map(|(id, _)| id.clone());
             if let Some(id) = idle {
                 drop(hosts);
@@ -448,13 +501,13 @@ impl Manager {
             settings: StdMutex::new(settings),
             views: Mutex::new(HashMap::new()),
             disposed_views: Mutex::new(HashSet::new()),
-            ui_rate: Mutex::new(limits::RateLimit::default()),
+            ui_rate: Mutex::new(Default::default()),
             requests: Arc::new(Semaphore::new(16)),
             git: Git::default(),
             http: Http::default(),
-            last_used: Mutex::new(Instant::now()),
+            last_used: StdMutex::new(Instant::now()),
+            activity: Notify::new(),
             notifications: Mutex::new(limits::RateLimit::default()),
-            logs: Mutex::new(VecDeque::new()),
         });
         hosts.insert(installation.manifest.id.clone(), running.clone());
         drop(hosts);
@@ -464,19 +517,18 @@ impl Manager {
         tokio::spawn(async move {
             let mut ready = Some(ready);
             loop {
-                let idle_at = *instance.last_used.lock().await + Duration::from_secs(60);
-                let can_idle = instance.views.lock().await.is_empty()
-                    && instance.requests.available_permits() == 16;
-                let idle = async {
-                    if can_idle {
-                        tokio::time::sleep_until(idle_at.into()).await
-                    } else {
-                        std::future::pending::<()>().await
-                    }
+                // Stop 60 s after the last completed call with no mounted UI.
+                // A busy host re-checks after each activity and at least once
+                // per idle period.
+                let idle_at = if instance.is_idle() {
+                    *instance.last_used.lock().unwrap() + manager.idle
+                } else {
+                    Instant::now() + manager.idle
                 };
                 tokio::select! {
                  _=instance.cancel.cancelled()=>break,
-                 _=idle=>{if instance.views.lock().await.is_empty()&&instance.requests.available_permits()==16&&instance.last_used.lock().await.elapsed()>=Duration::from_secs(60){manager.stop(&instance.manifest.id,None).await;break}},
+                 _=instance.activity.notified()=>{},
+                 _=tokio::time::sleep_until(idle_at.into())=>{if instance.is_idle()&&instance.last_used.lock().unwrap().elapsed()>=manager.idle{manager.stop(&instance.manifest.id,None).await;break}},
                  event=events.recv()=>{let result=match event{
                   Some(Event::Message(message))=>{
                    if message.method.as_deref()==Some("ready")&&message.params.as_ref().is_some_and(|p|p["phase"]=="activated"){
@@ -554,11 +606,13 @@ impl Manager {
                 let manager = self.clone();
                 let instance = running.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     let operation = params["operation"].as_str().unwrap_or("");
                     let timeout = if operation == "http.fetch" { 30 } else { 15 };
                     let result = tokio::select! {_ = instance.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin stopped")),result=tokio::time::timeout(Duration::from_secs(timeout),manager.request(&instance,operation,params["params"].clone()))=>result.unwrap_or_else(|_|Err(ProtocolError::new(ErrorCode::Timeout,"Host request timed out")))};
                     let _ = instance.host.respond(id, result).await;
+                    // The idle period starts when the last call completes.
+                    drop(permit);
+                    instance.touch();
                 });
                 Ok(())
             }
@@ -572,17 +626,17 @@ impl Manager {
                 if running.disposed_views.lock().await.contains(view_id) {
                     return Ok(());
                 }
-                if !running
-                    .ui_rate
-                    .lock()
-                    .await
-                    .accept(Instant::now(), 30, 1800)
-                {
+                // The host already paces batches. Arrival jitter is tolerated
+                // here: only repeated excess stops, and no batch is dropped.
+                let now = Instant::now();
+                let mut rate = running.ui_rate.lock().await;
+                if !rate.0.accept(now, 30, 1800) && super::protocol::repeated(&mut rate.1, now) {
                     return Err(ProtocolError::new(
                         ErrorCode::ResourceLimit,
                         "UI traffic limit",
                     ));
                 }
+                drop(rate);
                 let mut views = running.views.lock().await;
                 let view = views
                     .get_mut(view_id)
@@ -606,19 +660,33 @@ impl Manager {
             }
             Some("log") => {
                 // Plugin-supplied text may contain service response bodies. Keep
-                // only an attributed diagnostic count, never raw author output.
-                let message = format!(
-                    "Plugin log received ({} bytes; content omitted)",
-                    params["message"].as_str().map_or(0, |s| s.len().min(1024))
-                );
-                let mut logs = running.logs.lock().await;
-                logs.push_back(message);
-                while logs.iter().map(String::len).sum::<usize>() > 65536 {
-                    logs.pop_front();
+                // only the time, level and size, never raw author output.
+                let level = ["info", "warn", "error", "debug"]
+                    .into_iter()
+                    .find(|known| params["level"].as_str() == Some(*known))
+                    .unwrap_or("log");
+                let entry = LogEntry {
+                    at: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    level,
+                    bytes: params["message"].as_str().map_or(0, str::len),
+                };
+                let mut diagnostics = self.diagnostics.lock().unwrap();
+                let ring = diagnostics
+                    .entry(running.installation_id.clone())
+                    .or_default();
+                ring.received += 1;
+                ring.logs.push_back(entry);
+                while ring.logs.len() > LOG_ENTRIES {
+                    ring.logs.pop_front();
                 }
                 Ok(())
             }
-            Some("ready") => Ok(()),
+            Some("ready") => {
+                if params["requestId"].is_u64() {
+                    running.touch();
+                }
+                Ok(())
+            }
             _ => Err(ProtocolError::invalid("Unknown child method")),
         }
     }
@@ -777,7 +845,7 @@ impl Manager {
             .host
             .send("view.unmount", json!({"viewId":view_id}))
             .await?;
-        *running.last_used.lock().await = Instant::now();
+        running.touch();
         Ok(())
     }
     pub async fn shutdown(&self) {
@@ -1250,7 +1318,7 @@ impl Manager {
                 .lock()
                 .await
                 .interact(context, running.generation(), Instant::now())?;
-        *running.last_used.lock().await = Instant::now();
+        running.touch();
         running
             .host
             .send(
@@ -1394,7 +1462,7 @@ impl Manager {
             Instant::now(),
         )?;
         drop(views);
-        *running.last_used.lock().await = Instant::now();
+        running.touch();
         running
             .host
             .send(
@@ -1456,6 +1524,173 @@ mod tests {
             failure: None,
             previous: None,
         }
+    }
+    /// A plugin with a command and a panel, as a real host would register it.
+    fn panel_plugin(id: &str) -> Installation {
+        let mut manifest: Value =
+            serde_json::from_slice(include_bytes!("../../addon-protocol/fixtures/hello.json"))
+                .unwrap();
+        manifest["id"] = json!(id);
+        manifest["contributes"]["panels"] =
+            json!([{"id":"view","title":"View","icon":"file-text"}]);
+        installed(Manifest::parse(&serde_json::to_vec(&manifest).unwrap(), None).unwrap())
+    }
+    const PANEL_SOURCE: &str = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello','panels/view']});else if(m.method==='command.execute')setTimeout(()=>send('host.request',{operation:'settings.get',params:{}},1),300);});";
+    async fn show(manager: &Manager, running: &Running) -> String {
+        let context = manager.context_handle(running, None, None).await.unwrap();
+        manager
+            .mount(running, "view", "panels", &context)
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_idle_stop_waits_for_views_and_the_last_completed_call() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open_with_idle(
+            root.path().into(),
+            test_host_path(),
+            Duration::from_millis(400),
+        )
+        .unwrap();
+        let installation = panel_plugin("example.idle");
+        manager.save(&installation).unwrap();
+        let running = manager
+            .activate(installation, PANEL_SOURCE.into(), false)
+            .await
+            .unwrap();
+        let view = show(&manager, &running).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!running.cancel.is_cancelled(), "a mounted view is not idle");
+        manager.unmount(&running, &view).await.unwrap();
+        // The command awaits a 300 ms timer and then calls the broker. The
+        // idle period starts when that call completes, not at the command.
+        let context = manager.context_handle(&running, None, None).await.unwrap();
+        let started = Instant::now();
+        manager
+            .execute(&running, "hello", "commands", &context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), running.stopped.cancelled())
+            .await
+            .expect("an idle host stops");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(650), "{elapsed:?}");
+        let installed = manager.installation(&running.manifest.id).unwrap();
+        assert!(matches!(installed.status, Status::EnabledIdle));
+        assert!(installed.failure.is_none());
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_log_diagnostics_are_sanitized_and_outlive_the_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let installation = installed(
+            Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap(),
+        );
+        manager.save(&installation).unwrap();
+        let source = "__codemuxRegister({}, ({send}) => m => {if(m.method!=='activate')return;\
+            console.warn('private response body');console.info('\u{e9}'.repeat(2000));\
+            send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let running = manager
+            .activate(installation, source.into(), false)
+            .await
+            .unwrap();
+        manager
+            .stop(&running.manifest.id, Some("Synthetic failure".into()))
+            .await;
+        let diagnostics = manager.diagnostics(&running.manifest.id).unwrap();
+        assert_eq!(diagnostics.received, 2);
+        let entries: Vec<_> = diagnostics
+            .logs
+            .iter()
+            .map(|entry| (entry.level, entry.bytes))
+            .collect();
+        // Actual UTF-8 sizes after the host's 1,024-character truncation.
+        assert_eq!(entries, [("warn", 21), ("info", 2048)]);
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!serialized.contains("private"));
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_ninth_activation_evicts_only_the_least_recently_used_idle_host() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let mut hosts = Vec::new();
+        for slot in 'a'..='h' {
+            let installation = panel_plugin(&format!("example.slot-{slot}"));
+            manager.save(&installation).unwrap();
+            hosts.push(
+                manager
+                    .activate(installation, PANEL_SOURCE.into(), false)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for running in &hosts[2..] {
+            show(&manager, running).await;
+        }
+        // Both remaining hosts are idle; the older one was used more recently.
+        let context = manager.context_handle(&hosts[0], None, None).await.unwrap();
+        manager
+            .execute(&hosts[0], "hello", "commands", &context)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let ninth = panel_plugin("example.slot-i");
+        manager.save(&ninth).unwrap();
+        let ninth = manager
+            .activate(ninth, PANEL_SOURCE.into(), false)
+            .await
+            .unwrap();
+        assert!(hosts[1].stopped.is_cancelled());
+        assert!(matches!(
+            manager.installation(&hosts[1].manifest.id).unwrap().status,
+            Status::EnabledIdle
+        ));
+        assert!(!hosts[0].cancel.is_cancelled());
+        // No host is idle: the remaining one shows a view and another is
+        // still activating. A further activation reports the limit.
+        manager.stop(&ninth.manifest.id, None).await;
+        show(&manager, &hosts[0]).await;
+        let pending = panel_plugin("example.slot-j");
+        manager.save(&pending).unwrap();
+        let activating = tokio::spawn({
+            let manager = manager.clone();
+            // Registers only when released, so it stays mid-activation.
+            let source = "__codemuxRegister({}, ({send}) => m => {if(m.method==='command.execute')send('ready',{phase:'activated',registrations:['commands/hello','panels/view']});});";
+            async move { manager.activate(pending, source.into(), false).await }
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(running) = manager.running.lock().await.get("example.slot-j").cloned() {
+                    break running;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("activation starts");
+        let tenth = panel_plugin("example.slot-k");
+        manager.save(&tenth).unwrap();
+        let error = manager
+            .activate(tenth, PANEL_SOURCE.into(), false)
+            .await
+            .err()
+            .expect("no idle host to evict");
+        assert_eq!(error.data.code, ErrorCode::ResourceLimit);
+        assert!(!pending.cancel.is_cancelled());
+        pending
+            .host
+            .send("command.execute", json!({"id":"hello"}))
+            .await
+            .unwrap();
+        activating.await.unwrap().unwrap();
+        manager.shutdown().await;
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
@@ -1762,15 +1997,25 @@ mod tests {
             .await
             .unwrap();
         let failing_installation = installed(manifest.clone());
-        for code in [
-            "throw Error('private failure details')",
-            "while(true){}",
-            "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
-            "function f(){f()} f()",
-            "new ArrayBuffer(128*1024*1024)",
+        let callback = ["Plugin host stopped: Plugin callback failed"];
+        let deadline = ["Plugin host stopped: Plugin CPU deadline exceeded"];
+        // The drain deadline trips either between jobs or inside one.
+        let microtasks = [
+            "Plugin host stopped: Microtask deadline exceeded",
+            deadline[0],
+        ];
+        for (code, reasons) in [
+            ("throw Error('private failure details')", &callback[..]),
+            ("while(true){}", &deadline[..]),
+            (
+                "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+                &microtasks[..],
+            ),
+            ("function f(){f()} f()", &callback[..]),
+            ("new ArrayBuffer(128*1024*1024)", &callback[..]),
             // Ask only the child to exit: the manager has no pending stop and
             // must treat the resulting EOF as an unexpected runtime failure.
-            "",
+            ("", &["Plugin pipe closed", "Plugin host exited"][..]),
         ] {
             let installation = failing_installation.clone();
             manager.save(&installation).unwrap();
@@ -1794,10 +2039,11 @@ mod tests {
                 .await
                 .expect("fault contained and child reaped within two seconds");
             assert!(start.elapsed() < Duration::from_secs(2));
-            assert!(matches!(
-                manager.installation(&manifest.id).unwrap().status,
-                Status::FailedDisabled
-            ));
+            let failed = manager.installation(&manifest.id).unwrap();
+            assert!(matches!(failed.status, Status::FailedDisabled));
+            // The fixed host reason is recorded; plugin text never is.
+            let failure = failed.failure.unwrap();
+            assert!(reasons.contains(&failure.as_str()), "{code}: {failure}");
             assert!(manager
                 .contexts
                 .lock()
