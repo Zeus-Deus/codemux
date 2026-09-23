@@ -7,6 +7,7 @@ import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { verify } from "./sdk-lock.mjs";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const output = resolve(process.argv[2] ?? "addon-author-release");
@@ -118,6 +119,12 @@ try {
       ],
       directory,
     );
+    // Bundled runtime packages must equal the reviewed SDK lockfile; the
+    // whole resolved author tree is recorded with the package.
+    const tree = await verify(
+      directory,
+      join(temporary, "packages/plugin-sdk/package-lock.json"),
+    );
     for (const command of ["build", "check", "pack"])
       run("npm", ["run", command], directory);
     const manifest = JSON.parse(
@@ -136,6 +143,7 @@ try {
       id: manifest.id,
       version: manifest.version,
       manifest,
+      dependencies: Object.fromEntries(tree.map((p) => [p.path, p.version])),
     });
   }
   await writeFile(

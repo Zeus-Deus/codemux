@@ -4,6 +4,7 @@ import { RemoteReceiver } from "@remote-dom/core/receivers";
 import { h, render, options } from "preact";
 import {
   PluginError,
+  type ErrorCode,
   type Plugin,
   type PluginContext,
   type ContextHandle,
@@ -14,6 +15,49 @@ import {
 options.debounceRendering = (fn) => Promise.resolve().then(fn);
 customElements.define("cmx-root", RemoteRootElement);
 type Kind = "commands" | "panels" | "composerActions" | "composerViews";
+// Stable host errors are ordinary outcomes of a handler or UI callback.
+const handled: Record<ErrorCode, true> = {
+  PERMISSION_DENIED: true,
+  CONTEXT_STALE: true,
+  NO_WORKSPACE: true,
+  REMOTE_UNSUPPORTED: true,
+  NO_COMPOSER: true,
+  INTERACTION_REQUIRED: true,
+  NOT_A_GIT_REPO: true,
+  INCOMPATIBLE_API: true,
+  RESOURCE_LIMIT: true,
+  TIMEOUT: true,
+  PLUGIN_STOPPED: true,
+  INVALID_MESSAGE: true,
+  CREDENTIAL_REQUIRED: true,
+  NETWORK_DENIED: true,
+  STORAGE_UNAVAILABLE: true,
+};
+// Sliding windows kept stricter than the native quotas. The parent counts on
+// arrival, so longer windows and lower counts absorb pipe jitter, millisecond
+// rounding and the 100 ms timer floor: a paced plugin never reaches a quota.
+function limiter(windows: [number, number][]) {
+  const span = Math.max(...windows.map(([ms]) => ms));
+  let times: number[] = [];
+  return {
+    // Earliest time one more event fits behind `queued` earlier FIFO events.
+    next(t: number, queued = 0) {
+      const list = times.filter((x) => x > t - span);
+      let at = t;
+      for (let n = 0; n <= queued; n++) {
+        for (const [ms, count] of windows)
+          if (list.length >= count)
+            at = Math.max(at, list[list.length - count] + ms);
+        list.push(at);
+      }
+      return at;
+    },
+    take(t: number) {
+      times = times.filter((x) => x > t - span);
+      times.push(t);
+    },
+  };
+}
 interface Manifest {
   id: string;
   contributes: Record<Kind, { id: string }[]>;
@@ -44,8 +88,10 @@ export function register(plugin: Plugin) {
 function adapter({ manifest, send, now }: Transport) {
   let seq = 0,
     callbackSeq = 0,
-    stopped = false;
-  const handlers = new Map<string, Handler | ViewRenderer>();
+    stopped = false,
+    activated = false;
+  // A null entry is a registration disposed after activation.
+  const handlers = new Map<string, Handler | ViewRenderer | null>();
   const workspaceListeners = new Set<(c: ContextHandle | null) => void>();
   const settingsListeners = new Set<(s: Record<string, Json>) => void>();
   const pending = new Map<
@@ -64,8 +110,77 @@ function adapter({ manifest, send, now }: Transport) {
       callbacks: Map<string, Function>;
       ids: Map<Function, string>;
       acknowledge(revision: number): void;
+      flush(): void;
     }
   >();
+  // Host quotas: 20 requests/s and 100/min, 30 UI batches/s, 5 logs/s.
+  const requestQuota = limiter([
+    [1200, 18],
+    [62000, 95],
+  ]);
+  const uiQuota = limiter([
+    [250, 4],
+    [1200, 20],
+  ]);
+  const logQuota = limiter([
+    [1200, 4],
+    [61000, 240],
+  ]);
+  const waiting: (() => void)[] = [];
+  let requestTimer: ReturnType<typeof setTimeout> | undefined;
+  let uiTimer: ReturnType<typeof setTimeout> | undefined;
+  const pace = (quota: ReturnType<typeof limiter>) => {
+    const t = now();
+    if (quota.next(t) > t) return false;
+    quota.take(t);
+    return true;
+  };
+  // Excess diagnostics are dropped locally rather than sent over quota.
+  const diagnose = (message: string) => {
+    if (pace(logQuota)) send("log", { message: message.slice(0, 1024) });
+  };
+  try {
+    const native = globalThis.console as unknown as Record<
+      string,
+      (...args: unknown[]) => void
+    >;
+    globalThis.console = Object.freeze(
+      Object.fromEntries(
+        ["log", "info", "warn", "error", "debug"].map((level) => [
+          level,
+          (...args: unknown[]) => {
+            if (pace(logQuota)) native[level](...args);
+          },
+        ]),
+      ),
+    ) as unknown as Console;
+  } catch {
+    // A host that freezes console keeps its own bounded logging.
+  }
+  // Report a stable host rejection from an author callback and keep running.
+  // Synchronous throws and any other rejection remain runtime faults.
+  const settle = (result: unknown, source: string) => {
+    if (!result || typeof (result as PromiseLike<unknown>).then !== "function")
+      return;
+    Promise.resolve(result).then(undefined, (error: unknown) => {
+      if (!(error instanceof PluginError) || handled[error.code] !== true)
+        throw error;
+      diagnose(`${source} rejected with ${error.code}: ${error.message}`);
+    });
+  };
+  const pump = () => {
+    requestTimer = undefined;
+    while (waiting.length && !stopped) {
+      const t = now(),
+        at = requestQuota.next(t);
+      if (at > t) {
+        requestTimer = setTimeout(pump, at - t);
+        return;
+      }
+      requestQuota.take(t);
+      waiting.shift()!();
+    }
+  };
   function request<T>(operation: string, params: unknown): Promise<T> {
     if (stopped)
       return Promise.reject(
@@ -74,6 +189,17 @@ function adapter({ manifest, send, now }: Transport) {
     if (pending.size >= 16)
       return Promise.reject(
         new PluginError("RESOURCE_LIMIT", "Too many outstanding requests"),
+      );
+    // Short bursts wait for the per-second window. A request that could only
+    // go once the per-minute window drains is rejected before it reaches the
+    // host.
+    const t = now();
+    if (requestQuota.next(t, waiting.length) - t > 1500)
+      return Promise.reject(
+        new PluginError(
+          "RESOURCE_LIMIT",
+          "Too many host requests in the last minute; try again later",
+        ),
       );
     const id = ++seq;
     return new Promise((resolve, reject) => {
@@ -85,7 +211,10 @@ function adapter({ manifest, send, now }: Transport) {
         operation === "http.fetch" ? 30000 : 15000,
       );
       pending.set(id, { resolve, reject, timer });
-      send("host.request", { operation, params }, id);
+      waiting.push(() => {
+        if (pending.has(id)) send("host.request", { operation, params }, id);
+      });
+      if (!requestTimer) pump();
     });
   }
   function registration(kind: Kind) {
@@ -93,7 +222,7 @@ function adapter({ manifest, send, now }: Transport) {
       const key = kind + "/" + id;
       if (
         !manifest.contributes[kind].some((d) => d.id === id) ||
-        handlers.has(key)
+        handlers.get(key)
       )
         throw new PluginError(
           "INVALID_MESSAGE",
@@ -101,7 +230,11 @@ function adapter({ manifest, send, now }: Transport) {
         );
       handlers.set(key, handler);
       return () => {
-        handlers.delete(key);
+        if (handlers.get(key) !== handler) return;
+        // Contributions are fixed once the host has the registration list;
+        // disposing afterwards only stops callbacks for this generation.
+        if (activated) handlers.set(key, null);
+        else handlers.delete(key);
       };
     };
   }
@@ -183,6 +316,7 @@ function adapter({ manifest, send, now }: Transport) {
           for (const kind of Object.keys(manifest.contributes) as Kind[])
             for (const { id } of manifest.contributes[kind])
               if (!handlers.has(kind + "/" + id)) fail();
+          activated = true;
           send("ready", {
             phase: "activated",
             registrations: [...handlers.keys()],
@@ -193,19 +327,20 @@ function adapter({ manifest, send, now }: Transport) {
       case "command.execute": {
         const kind =
           p.kind === "composerActions" ? "composerActions" : "commands";
-        const handler = handlers.get(kind + "/" + p.id) as Handler | undefined;
-        if (!handler) fail();
-        Promise.resolve(handler!(p.context)).catch(fail);
+        const key = kind + "/" + p.id;
+        if (!handlers.has(key)) fail();
+        const handler = handlers.get(key) as Handler | null;
+        if (!handler) diagnose(`${key} was disposed; the call was ignored`);
+        else settle(handler(p.context), key);
         break;
       }
       case "view.mount": {
         if (views.size >= 4 || views.has(p.viewId))
           throw new PluginError("RESOURCE_LIMIT", "View limit");
         const kind = p.kind === "composerViews" ? "composerViews" : "panels";
-        const renderer = handlers.get(kind + "/" + p.id) as
-          | ViewRenderer
-          | undefined;
-        if (!renderer) fail();
+        const key = kind + "/" + p.id;
+        if (!handlers.has(key)) fail();
+        const renderer = handlers.get(key) as ViewRenderer | null;
         const root = document.createElement("cmx-root") as RemoteRootElement;
         const receiver = new RemoteReceiver();
         const callbacks = new Map<string, Function>();
@@ -223,6 +358,7 @@ function adapter({ manifest, send, now }: Transport) {
             acknowledgedRevision = Math.max(acknowledgedRevision, revision);
             flush();
           },
+          flush: () => flush(),
         });
         // Preact can emit many individual mutations during one commit. Batch one
         // microtask, with a bound before enqueueing, so native validation sees the
@@ -237,10 +373,22 @@ function adapter({ manifest, send, now }: Transport) {
           }
           // One batch in flight; keep ordered, bounded mutations until the
           // trusted renderer acknowledges it. Slow rendering is not a fault.
-          if (acknowledgedRevision < sentRevision) return;
+          if (acknowledgedRevision < sentRevision || queued.length === 0)
+            return;
+          // All views share the plugin's batch rate. While paced, records keep
+          // coalescing and one shared timer retries every view.
+          const t = now(),
+            at = uiQuota.next(t);
+          if (at > t) {
+            uiTimer ??= setTimeout(() => {
+              uiTimer = undefined;
+              for (const view of views.values()) view.flush();
+            }, at - t);
+            return;
+          }
+          uiQuota.take(t);
           const records = queued;
           queued = [];
-          if (records.length === 0) return;
           receiver.connection.mutate(records);
           const live = new Set<Function>();
           const visit = (v: any): void => {
@@ -327,9 +475,23 @@ function adapter({ manifest, send, now }: Transport) {
         root.connect({
           mutate(records) {
             if (!views.has(p.viewId)) return;
-            if (queued.length + records.length > 1000)
+            for (const record of records) {
+              // Only the latest text or property value of a node matters while
+              // a batch waits, so held input cannot exhaust the mutation bound.
+              if (record[0] === 2 || record[0] === 3) {
+                const index = queued.findIndex(
+                  (r) =>
+                    r[0] === record[0] &&
+                    r[1] === record[1] &&
+                    (r[0] === 2 ||
+                      (r[2] === record[2] && (r[4] ?? 1) === (record[4] ?? 1))),
+                );
+                if (index >= 0) queued.splice(index, 1);
+              }
+              queued.push(record);
+            }
+            if (queued.length > 1000)
               throw new PluginError("RESOURCE_LIMIT", "Mutation limit");
-            queued.push(...records);
             if (!scheduled) {
               scheduled = true;
               Promise.resolve().then(flush);
@@ -342,7 +504,9 @@ function adapter({ manifest, send, now }: Transport) {
             );
           },
         });
-        render(h(renderer!, { viewId: p.viewId, context: p.context }), root);
+        if (renderer)
+          render(h(renderer, { viewId: p.viewId, context: p.context }), root);
+        else diagnose(`${key} was disposed; the view stays empty`);
         break;
       }
       case "view.unmount":
@@ -354,15 +518,18 @@ function adapter({ manifest, send, now }: Transport) {
       case "ui.event": {
         const fn = views.get(p.viewId)?.callbacks.get(p.callbackId);
         if (!fn) fail();
-        fn!({ context: p.context, value: p.value });
+        // Remote DOM returns the author's promise through the event response.
+        settle(fn!({ context: p.context, value: p.value }), "UI callback");
         break;
       }
       case "workspace.changed":
         for (const id of views.keys()) unmount(id);
-        for (const callback of workspaceListeners) callback(p.context);
+        for (const callback of workspaceListeners)
+          settle(callback(p.context), "workspace.subscribe");
         break;
       case "settings.changed":
-        for (const callback of settingsListeners) callback(p.settings);
+        for (const callback of settingsListeners)
+          settle(callback(p.settings), "settings.subscribe");
         break;
       case "deactivate": {
         stopped = true;
@@ -370,6 +537,9 @@ function adapter({ manifest, send, now }: Transport) {
         handlers.clear();
         workspaceListeners.clear();
         settingsListeners.clear();
+        waiting.length = 0;
+        clearTimeout(requestTimer);
+        clearTimeout(uiTimer);
         for (const call of pending.values()) {
           clearTimeout(call.timer);
           call.reject(new PluginError("PLUGIN_STOPPED", "Plugin stopped"));

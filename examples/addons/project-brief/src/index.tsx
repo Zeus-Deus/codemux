@@ -19,6 +19,8 @@ const message = (error: unknown) =>
   error instanceof Error ? error.message : "Project information is unavailable";
 export default definePlugin({
   activate(ctx) {
+    // Notifications are limited to three per minute; a rejected one is dropped.
+    const notify = (text: string) => ctx.ui.notify(text).catch(() => {});
     async function load(context: ContextHandle) {
       const workspace = await ctx.workspace.current(context);
       if (!workspace)
@@ -108,11 +110,15 @@ export default definePlugin({
                     checked={expanded}
                     onChange={async (event) => {
                       setExpanded(event.value === true);
-                      await ctx.storage.set(
-                        { scope: "global" },
-                        "show-paths",
-                        event.value === true,
-                      );
+                      try {
+                        await ctx.storage.set(
+                          { scope: "global" },
+                          "show-paths",
+                          event.value === true,
+                        );
+                      } catch (e) {
+                        setError(`Preference not saved: ${message(e)}`);
+                      }
                     }}
                   />
                   {expanded &&
@@ -139,11 +145,6 @@ export default definePlugin({
                 setError("");
                 try {
                   setData(await load(event.context));
-                  await ctx.storage.set(
-                    { scope: "workspace", context: event.context },
-                    "last-refreshed",
-                    Date.now(),
-                  );
                 } catch (e) {
                   setError(message(e));
                 } finally {
@@ -171,14 +172,18 @@ export default definePlugin({
       );
     }
     ctx.panels.register("brief", (props) => <Brief {...props} />);
-    ctx.commands.register("open", (context) =>
-      ctx.panels.open("brief", context),
-    );
+    ctx.commands.register("open", async (context) => {
+      try {
+        await ctx.panels.open("brief", context);
+      } catch (error) {
+        await notify(message(error));
+      }
+    });
     ctx.composerActions.register("insert", async (context) => {
       try {
         await insert(context);
       } catch (error) {
-        await ctx.ui.notify(message(error));
+        await notify(message(error));
       }
     });
   },

@@ -2061,7 +2061,7 @@ mod tests {
             assert_eq!(request["origin"], "https://api.github.com");
             assert_eq!(
                 request["path"],
-                "/repos/synthetic-owner/fixture-repository/issues?state=open&per_page=50"
+                "/repos/synthetic-owner/fixture-repository/issues?state=open&per_page=20"
             );
             assert_eq!(request["method"], "GET");
             assert_eq!(request["body"], Value::Null);
