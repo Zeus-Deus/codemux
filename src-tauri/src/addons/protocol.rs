@@ -225,6 +225,11 @@ impl Host {
     pub async fn reaped(&self) {
         self.done.cancelled().await;
     }
+    /// Calls the child has not yet yielded, for tests that pace long loops.
+    #[cfg(test)]
+    pub async fn outstanding(&self) -> usize {
+        self.progress.lock().await.len()
+    }
     pub fn revoke(&self) {
         self.cancel.cancel();
     }
