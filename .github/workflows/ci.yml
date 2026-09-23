@@ -450,6 +450,20 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/addons/full-filesystem.sh
 
+      - name: Install Linux Secret Service
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends gnome-keyring
+
+      - name: Linux native credential backend
+        if: runner.os == 'Linux'
+        # A private session bus with a throwaway, unlocked login collection
+        # proves a real Secret Service save/read/delete. The installed-app
+        # harness covers only the missing-service fallback on Linux.
+        shell: dbus-run-session -- bash --noprofile --norc -eo pipefail {0}
+        run: |
+          printf '%s' ci-only-keyring-password | gnome-keyring-daemon --unlock --components=secrets --daemonize > /dev/null
+          cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
+
       - name: Windows native credential backend
         if: runner.os == 'Windows'
         run: cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
