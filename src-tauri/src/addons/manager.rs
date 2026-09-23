@@ -186,6 +186,15 @@ pub struct LogEntry {
 }
 /// Each serialized entry is at most 64 bytes, bounding the ring to 64 KiB.
 const LOG_ENTRIES: usize = 65536 / 64;
+impl Diagnostics {
+    fn record(&mut self, entry: LogEntry) {
+        self.received += 1;
+        self.logs.push_back(entry);
+        while self.logs.len() > LOG_ENTRIES {
+            self.logs.pop_front();
+        }
+    }
+}
 /// The trusted host paces UI batches to 30/s and 1,800/min at the source. This
 /// backstop bounds only a broken host: it allows twice that to absorb arrival
 /// bunching, never drops a batch, and stops only on repeated excess.
@@ -703,15 +712,12 @@ impl Manager {
                     level,
                     bytes: params["message"].as_str().map_or(0, str::len),
                 };
-                let mut diagnostics = self.diagnostics.lock().unwrap();
-                let ring = diagnostics
+                self.diagnostics
+                    .lock()
+                    .unwrap()
                     .entry(running.installation_id.clone())
-                    .or_default();
-                ring.received += 1;
-                ring.logs.push_back(entry);
-                while ring.logs.len() > LOG_ENTRIES {
-                    ring.logs.pop_front();
-                }
+                    .or_default()
+                    .record(entry);
                 Ok(())
             }
             Some("ready") => {
@@ -1736,6 +1742,23 @@ mod tests {
                 assert!(ui_traffic(&mut rate, now).is_ok());
             }
         }
+    }
+    #[test]
+    fn log_ring_keeps_the_newest_entries_within_64_kib() {
+        let mut diagnostics = Diagnostics::default();
+        for index in 0..1100 {
+            diagnostics.record(LogEntry {
+                at: 4_102_444_800_000 + index,
+                level: "debug",
+                bytes: 4096,
+            });
+        }
+        assert_eq!(diagnostics.received, 1100);
+        assert_eq!(diagnostics.logs.len(), 1024);
+        assert_eq!(diagnostics.logs[0].at, 4_102_444_800_000 + 76);
+        // The largest entries (a 13-digit time, the longest level and the
+        // largest size) still fit the ring's 64 KiB bound.
+        assert!(serde_json::to_vec(&diagnostics.logs).unwrap().len() <= 65536);
     }
     #[test]
     fn supervision_uses_the_specified_delays() {
