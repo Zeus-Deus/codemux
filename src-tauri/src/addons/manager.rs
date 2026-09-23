@@ -2804,6 +2804,58 @@ mod tests {
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_registrations_that_differ_from_the_manifest_fail_and_disable_the_add_on() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let installation = installed(
+            Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap(),
+        );
+        let id = installation.manifest.id.clone();
+        // hello.json declares exactly one contribution, commands/hello.
+        for registrations in [
+            "['commands/other']",
+            "[]",
+            "['commands/hello','commands/other']",
+            "['commands/hello','commands/hello']",
+        ] {
+            manager.save(&installation).unwrap();
+            let source = format!("__codemuxRegister({{}}, ({{send}}) => m => {{if(m.method==='activate')send('ready',{{phase:'activated',registrations:{registrations}}});}});");
+            let error = manager
+                .activate(installation.clone(), source, false)
+                .await
+                .err()
+                .expect("a registration list unlike the manifest must fail activation");
+            assert_eq!(
+                error.message, "Plugin registration does not match its manifest",
+                "{registrations}"
+            );
+            assert_eq!(error.data.code, ErrorCode::InvalidMessage);
+            let failed = manager.installation(&id).unwrap();
+            assert!(
+                matches!(failed.status, Status::FailedDisabled),
+                "{registrations}"
+            );
+            assert_eq!(
+                failed.failure.as_deref(),
+                Some("Plugin registration does not match its manifest")
+            );
+            assert!(
+                manager.running.lock().await.is_empty(),
+                "the child is reaped"
+            );
+            assert!(
+                manager.ensure_active(&id).await.is_err(),
+                "a failed activation cannot restart on its own"
+            );
+        }
+        manager.shutdown().await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
     async fn native_update_candidate_failures_restore_the_previous_tuple_and_report_the_cause() {
         let healthy = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
         let throws = "__codemuxRegister({}, () => m => {if(m.method==='activate')throw Error('candidate failed');});";

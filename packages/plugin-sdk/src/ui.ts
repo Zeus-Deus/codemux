@@ -37,8 +37,8 @@ export interface TextFieldProps extends Styled {label?:string; value?:string; pl
 export interface SelectProps extends Styled {label?:string; value?:string; options:SelectOption[]; disabled?:boolean; onChange?:UiCallback<UiEvent&{value:string}>}
 export interface CheckboxProps extends Styled {label?:string; checked?:boolean; disabled?:boolean; onChange?:UiCallback<UiEvent&{value:boolean}>}
 export interface TabsProps extends Styled {label?:string; value?:string; options:SelectOption[]; disabled?:boolean; onChange?:UiCallback<UiEvent&{value:string}>}
-export interface ListProps extends Styled {items:string[]}
-export interface TableProps extends Styled {headers?:string[]; rows:string[][]}
+export interface ListProps extends Styled {label?:string; items:string[]}
+export interface TableProps extends Styled {label?:string; headers?:string[]; rows:string[][]}
 export interface ProgressProps extends Styled {label?:string; value?:number; max?:number}
 export interface IconProps {name:IconName; label?:string; color?:Color}
 export interface EmptyStateProps extends Styled {title?:string}
