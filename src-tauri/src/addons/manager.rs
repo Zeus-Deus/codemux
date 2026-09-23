@@ -1611,6 +1611,51 @@ mod tests {
         assert!(matches!(installed.status, Status::EnabledIdle));
         assert!(installed.failure.is_none());
     }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_ui_updates_faster_than_the_batch_limit_are_paced_not_quarantined() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let installation = panel_plugin("example.fast-ui");
+        manager.save(&installation).unwrap();
+        // Renders again as soon as each batch is acknowledged, with no pacing.
+        let source = "__codemuxRegister({}, ({send}) => m => {\
+            if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello','panels/view']});\
+            else if(m.method==='view.mount')send('ui.patch',{viewId:m.params.viewId,records:[[0,'~',{id:'a',type:1,element:'cmx-text',children:[{id:'b',type:3,data:'0'}]},0]]});\
+            else if(m.method==='ui.ack')send('ui.patch',{viewId:m.params.viewId,records:[[2,'b',String(m.params.revision)]]});});";
+        let running = manager
+            .activate(installation, source.into(), false)
+            .await
+            .unwrap();
+        let mut events = manager.events.subscribe();
+        let view = show(&manager, &running).await;
+        let started = Instant::now();
+        let mut applied = Vec::new();
+        while started.elapsed() < Duration::from_millis(2500) {
+            match tokio::time::timeout(Duration::from_millis(100), events.recv()).await {
+                Ok(Ok(UiEvent::Tree { revision, .. })) => {
+                    applied.push(Instant::now());
+                    manager
+                        .acknowledge(&running, &view, revision)
+                        .await
+                        .unwrap();
+                }
+                Ok(Ok(UiEvent::Stopped { message, .. })) => panic!("stopped: {message}"),
+                _ => {}
+            }
+        }
+        assert!(!running.cancel.is_cancelled());
+        assert!(applied.len() >= 50, "only {} batches", applied.len());
+        // The host defers batches; arrival jitter may add at most one.
+        for (index, at) in applied.iter().enumerate() {
+            let window = applied[index..]
+                .iter()
+                .take_while(|later| later.duration_since(*at) < Duration::from_secs(1))
+                .count();
+            assert!(window <= 31, "{window} batches within one second");
+        }
+        manager.shutdown().await;
+    }
     #[test]
     fn supervision_uses_the_specified_delays() {
         let timing = Timing::default();
