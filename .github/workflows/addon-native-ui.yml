@@ -3,7 +3,9 @@ on:
   pull_request:
     paths:
       - scripts/addons/native-ui.mjs
-      - scripts/addons/context-fixture.mjs
+      - scripts/addons/build-ci-fixtures.sh
+      - scripts/addons/fixtures/context-races/**
+      - scripts/addons/fixtures/activation-race/**
       - scripts/addons/reversion-fixture.mjs
       - scripts/addons/install-webdriver.ps1
       - scripts/addons/windows-*.ps1
@@ -82,6 +84,9 @@ jobs:
           name: addon-native-ui-inputs-${{ runner.os }}
           run-id: ${{ inputs.build_run_id }}
           github-token: ${{ github.token }}
+      - name: Build CI race fixtures from the harness revision
+        shell: bash
+        run: bash scripts/addons/build-ci-fixtures.sh
       - name: Native Linux dependencies
         if: runner.os == 'Linux'
         run: |

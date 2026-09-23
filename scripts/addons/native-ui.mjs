@@ -2,7 +2,6 @@
 // Never run on a developer profile. No embedded driver or production test hooks.
 import assert from "node:assert/strict";
 import { reversionFixture } from "./reversion-fixture.mjs";
-import { contextFixture } from "./context-fixture.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpus, totalmem, release, homedir } from "node:os";
@@ -695,22 +694,21 @@ async function openSettings() {
   await hasText("Import package");
 }
 async function checkContextRaces(originalWorkspace, assertNoSubmission) {
-  const bytes = contextFixture(
-    await readFile(
-      resolve(
-        "examples/addons/project-brief/codemux.project-brief-1.0.0.cmxaddon",
-      ),
-    ),
+  // Built by build-examples.sh with the packed public SDK/CLI. Outcomes are read
+  // from the fixture's own panel: the notification limit (three per minute)
+  // would otherwise hide them after the first case.
+  const path = resolve(
+    "scripts/addons/fixtures/context-races/example.context-races-1.0.0.cmxaddon",
   );
-  const path = join(root, "context-races.cmxaddon");
-  await writeFile(path, bytes);
+  const bytes = await readFile(path);
   evidence.seams.push(
-    "Synthetic delayed author definition using the input example's unchanged public SDK; normal native package import and SDK broker",
+    "CI-only delayed public-SDK package built with the packed author tools; normal native package import, SDK broker and plugin-rendered status panel",
   );
   evidence.contextRaces = {
     fixtureSha256: createHash("sha256").update(bytes).digest("hex"),
     delayMs: 4000,
     completed: [],
+    rejections: {},
   };
   await openSettings();
   await choosePackage(path);
@@ -782,17 +780,33 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     await openCommand(`CI delayed ${id}`);
     await hasText(`CI pending ${id}`);
   };
-  const cancelled = async (id) => {
-    await hasText(`CI cancelled ${id}: CONTEXT_STALE`);
+  // The context change itself must reject the late append, well before the
+  // 10 s interaction expires; an expiry would not prove cancellation.
+  const cancelled = async (id, codes) => {
+    const pattern = new RegExp(`CI cancelled ${id}: ([A-Z_]+)`);
+    const code = await until(
+      `CI cancelled ${id}`,
+      async () => (await text()).match(pattern)?.[1],
+    );
+    evidence.contextRaces.rejections[id] = code;
+    assert.ok(codes.includes(code), `${id} was rejected with ${code}`);
     assert.ok(
       (await drafts()).every((value) => !value.includes(`CI delayed ${id}.`)),
     );
     evidence.contextRaces.completed.push(id);
   };
+  // The panel belongs to each workspace's deck; outcomes are the plugin's own
+  // module state, so both decks show every outcome of the running generation.
+  const openStatus = async () => {
+    await openCommand("Open context race status");
+    await hasText("CI status ready");
+  };
   let pane = await createPane();
   await selectWorkspace(workspaceId, "context-race-project");
   await warmPane(pane);
+  await openStatus();
   await selectWorkspace(originalWorkspace, "synthetic-project");
+  await openStatus();
   await step("10-context-typing-preserved", async () => {
     await pending("typing");
     await typeComposer(" User race input.");
@@ -810,7 +824,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   await step("10-context-project-switch-cancels", async () => {
     await pending("workspace");
     await selectWorkspace(workspaceId, "context-race-project");
-    await cancelled("workspace");
+    await cancelled("workspace", ["CONTEXT_STALE"]);
     await selectWorkspace(originalWorkspace, "synthetic-project");
     assert.ok(
       (await drafts()).every(
@@ -822,7 +836,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   await step("10-context-thread-close-cancels", async () => {
     await pending("thread");
     await native("agent_chat_close_pane", { paneId: pane, select: true });
-    await cancelled("thread");
+    await cancelled("thread", ["CONTEXT_STALE", "NO_COMPOSER"]);
   });
   pane = await createPane();
   await selectWorkspace(workspaceId, "context-race-project");
@@ -832,7 +846,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     await native("agent_chat_close_pane", { paneId: pane, select: true });
     pane = await createPane();
     await selectWorkspace(workspaceId, "context-race-project");
-    await cancelled("replacement");
+    await cancelled("replacement", ["CONTEXT_STALE", "NO_COMPOSER"]);
     await warmPane(pane);
   });
   await step("10-context-disable-cancels", async () => {
@@ -878,6 +892,57 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     );
   await selectWorkspace(originalWorkspace, "synthetic-project");
   await assertNoSubmission();
+  await checkCoreTerminal();
+}
+async function checkRemovalDuringActivation() {
+  const id = "example.activation-race";
+  const path = resolve(
+    "scripts/addons/fixtures/activation-race/example.activation-race-1.0.0.cmxaddon",
+  );
+  const bytes = await readFile(path);
+  await openSettings();
+  await choosePackage(path);
+  await clickText("Import package");
+  await hasText("Review Activation Race Fixture");
+  await clickText("Accept and install");
+  await until("activation fixture installed", async () =>
+    (await native("addon_inventory")).installed.some(
+      (i) => i.manifest.id === id && i.desiredEnabled,
+    ),
+  );
+  await until("activation review closed", () =>
+    script(`return !document.querySelector('[role="dialog"]')`),
+  );
+  await click('[aria-label="Close settings"]');
+  // Installation ran its probe; make the palette command start a fresh host.
+  await native("addon_disable", { id });
+  await native("addon_enable", { id });
+  await until("no host before the command", async () => (await pluginHostCount()) === 0);
+  await openCommand("CI slow activation append");
+  const started = Date.now();
+  // Removal is requested while the fixture's activation is still waiting.
+  await native("addon_remove", { id, keepData: false });
+  const removalMs = Date.now() - started;
+  await until("activation fixture removed", async () =>
+    (await native("addon_inventory")).installed.every((i) => i.manifest.id !== id),
+  );
+  await until("activation host reaped", async () => (await pluginHostCount()) === 0, 2000);
+  await delay(1500);
+  assert.ok(
+    (
+      await script(
+        `return [...document.querySelectorAll(arguments[0])].map(e => e.value)`,
+        composer,
+      )
+    ).every((value) => !value.includes("CI activation race.")),
+    "Removal during activation must not let the command append",
+  );
+  assert.equal(await pluginHostCount(), 0);
+  evidence.removalDuringActivation = {
+    fixtureSha256: createHash("sha256").update(bytes).digest("hex"),
+    activationDelayMs: 700,
+    removalCompletedMs: removalMs,
+  };
   await checkCoreTerminal();
 }
 async function openCommand(title) {
@@ -1803,6 +1868,10 @@ try {
   });
   await step("10-delayed-public-sdk-context-races", () =>
     checkContextRaces(workspaceId, assertNoSubmission),
+  );
+  await step(
+    "10-remove-during-activation-leaves-no-host-or-draft",
+    checkRemovalDuringActivation,
   );
   await step(
     "11-corrupt-plugin-registry-does-not-block-core-startup",
