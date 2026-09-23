@@ -16,7 +16,10 @@ import {
   addonEnabled,
   addonError,
   addonMessage,
+  type AddonError,
   type AddonEvent,
+  type AddonInstallation,
+  type AddonInventory,
 } from "./types";
 export function activeAddonWorkspace(): string | null {
   const state = useAppStore.getState();
@@ -31,6 +34,35 @@ export function activeAddonWorkspace(): string | null {
     ? id
     : null;
 }
+/**
+ * Saved add-on pane IDs are dropped only when the user disabled or removed
+ * the add-on, or its release no longer declares the panel. Pause-all, a
+ * diagnostic launch without add-ons, recovery and a registry failure keep
+ * them: the right panel hides unavailable panes while they last, and they
+ * come back on resume or repair.
+ */
+function forgetUnwantedAddonPanes(inventory: AddonInventory) {
+  if (inventory.paused || inventory.error || inventory.registryError) return;
+  const wanted = new Set(
+    inventory.installed
+      .filter(
+        (i) =>
+          i.desiredEnabled &&
+          i.status !== "removing" &&
+          i.status !== "blocked-disabled",
+      )
+      .flatMap(({ manifest }) =>
+        manifest.contributes.panels.map(
+          (panel) => `addon:${manifest.id}:${panel.id}`,
+        ),
+      ),
+  );
+  useUIStore
+    .getState()
+    .forgetRightPanelPanes(
+      (pane) => pane.startsWith("addon:") && !wanted.has(pane),
+    );
+}
 let inventoryRevision = 0;
 let latestInventory: Promise<void> = Promise.resolve();
 export function refreshAddons(): Promise<void> {
@@ -40,19 +72,7 @@ export function refreshAddons(): Promise<void> {
       const inventory = await addonInventory();
       if (revision !== inventoryRevision) return;
       useAddonsStore.setState({ ...inventory, loaded: true });
-      const enabled = new Set(
-        inventory.paused
-          ? []
-          : inventory.installed
-              .filter((i) => addonEnabled(i) || i.status === "failed-disabled")
-              .map((i) => i.manifest.id),
-      );
-      const ui = useUIStore.getState();
-      for (const [workspace, panes] of Object.entries(ui.rightPanelPanes))
-        for (const pane of panes) {
-          if (pane.startsWith("addon:") && !enabled.has(pane.split(":")[1]))
-            ui.closeRightPanelPane(workspace, pane);
-        }
+      forgetUnwantedAddonPanes(inventory);
     } catch (error) {
       if (revision !== inventoryRevision) return;
       useAddonsStore.setState({
@@ -69,11 +89,47 @@ export function refreshAddons(): Promise<void> {
   return complete;
 }
 
+/** What the user asked for, in the words of the toast that explains why it
+ *  did not happen. Only effects a person started are listed. */
+const EFFECT_FAILURES: Record<string, string> = {
+  "composer.appendText": "couldn't add text to the draft",
+  "composerViews.open": "couldn't open its composer view",
+  "panels.open": "couldn't open its panel",
+  "links.open": "couldn't open the link",
+};
+function pluginName(id: string): string {
+  return (
+    useAddonsStore.getState().installed.find((i) => i.manifest.id === id)
+      ?.manifest.name ?? id
+  );
+}
+/** The normalized URL when it is an HTTPS link with a host and no user
+ *  info, as the broker accepts it; otherwise null. */
+function httpsLink(value: unknown): string | null {
+  try {
+    const url = new URL(String(value).trim());
+    return url.protocol === "https:" &&
+      url.hostname &&
+      !url.username &&
+      !url.password
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+function declares(
+  installation: AddonInstallation,
+  kind: "panels" | "composerViews",
+  id: unknown,
+): boolean {
+  return installation.manifest.contributes[kind].some((view) => view.id === id);
+}
 export async function applyAddonEffect(
   event: Extract<AddonEvent, { type: "effect" }>,
 ) {
   let value: unknown = null;
-  let error = null;
+  let error: AddonError | null = null;
   try {
     const before = useAddonsStore.getState().contextRevision;
     await addonInvoke("addon_effect_claim", {
@@ -84,15 +140,16 @@ export async function applyAddonEffect(
     const installation = state.installed.find(
       (i) => i.manifest.id === event.pluginId,
     );
+    if (state.paused || state.revoking["*"])
+      throw addonError("PLUGIN_STOPPED", "Add-ons are paused");
     if (
-      state.paused ||
-      state.revoking["*"] ||
       state.revoking[event.pluginId] ||
       !installation ||
-      !addonEnabled(installation) ||
-      state.failures[event.generation]
+      !addonEnabled(installation)
     )
-      throw addonError("PLUGIN_STOPPED", "Add-on stopped");
+      throw addonError("PLUGIN_STOPPED", "The add-on is disabled");
+    if (state.failures[event.generation])
+      throw addonError("PLUGIN_STOPPED", "The add-on stopped");
     const p = event.params;
     if (
       event.operation !== "ui.notify" &&
@@ -114,6 +171,11 @@ export async function applyAddonEffect(
       case "composerViews.open": {
         if (!useFeatureFlags.getState().enableAgentChat)
           throw addonError("NO_COMPOSER", "Chat GUI is disabled");
+        if (!declares(installation, "composerViews", p.id))
+          throw addonError(
+            "PERMISSION_DENIED",
+            "Contribution does not belong to this plugin",
+          );
         addonComposer(String(p.composerId), String(p.workspaceId));
         useAddonsStore.setState({
           accessory: {
@@ -126,6 +188,11 @@ export async function applyAddonEffect(
         break;
       }
       case "panels.open":
+        if (!declares(installation, "panels", p.id))
+          throw addonError(
+            "PERMISSION_DENIED",
+            "Contribution does not belong to this plugin",
+          );
         useUIStore
           .getState()
           .setRightPanelTab(
@@ -133,10 +200,23 @@ export async function applyAddonEffect(
             `addon:${event.pluginId}:${String(p.id)}`,
           );
         break;
-      case "links.open":
-        toast.info(`${installation.manifest.name}: opening external link`);
-        await openUrl(String(p.url));
+      case "links.open": {
+        const url = httpsLink(p.url);
+        if (!url)
+          throw addonError("NETWORK_DENIED", "Only HTTPS links can be opened");
+        toast.info(`${installation.manifest.name} is opening a link`, {
+          description: url,
+        });
+        try {
+          await openUrl(url);
+        } catch (cause) {
+          throw addonError(
+            "CONTEXT_STALE",
+            `The system could not open the link: ${addonMessage(cause)}`,
+          );
+        }
         break;
+      }
       case "ui.notify":
         toast.info(installation.manifest.name, {
           description: String(p.message),
@@ -148,8 +228,17 @@ export async function applyAddonEffect(
   } catch (cause) {
     error =
       typeof cause === "object" && cause !== null && "data" in cause
-        ? cause
+        ? (cause as AddonError)
         : addonError("CONTEXT_STALE", addonMessage(cause));
+    // The plugin gets the error too, but whether it tells the user depends
+    // on the plugin. The host always says what was refused and why. One
+    // toast per add-on, replaced in place, so a noisy plugin cannot stack them.
+    const failure = EFFECT_FAILURES[event.operation];
+    if (failure)
+      toast.error(`${pluginName(event.pluginId)} ${failure}`, {
+        id: `addon-effect:${event.pluginId}`,
+        description: addonMessage(error),
+      });
   }
   await addonInvoke("addon_effect_result", {
     requestId: event.requestId,
@@ -216,7 +305,8 @@ export async function executeAddon(
         composerId ?? (workspaceId ? composerForWorkspace(workspaceId) : null),
     });
   } catch (error) {
-    toast.error("Add-on action unavailable", {
+    toast.error(`${pluginName(id)} action unavailable`, {
+      id: `addon-effect:${id}`,
       description: addonMessage(error),
     });
   }

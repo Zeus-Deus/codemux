@@ -88,7 +88,12 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
   openConversationSearchResult: mocks.backend.openConversationSearchResult,
 }));
 
+vi.mock("@/lib/addons/platform", () => ({ executeAddon: vi.fn() }));
+
 import { CommandPalette } from "./command-palette";
+import { executeAddon } from "@/lib/addons/platform";
+import { useAddonsStore } from "@/stores/addons-store";
+import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import { BUILT_IN_THEMES, applyTheme } from "@/lib/themes";
 import { useOmarchyStore } from "@/stores/omarchy-store";
 import { useSettingsStore } from "@/stores/settings-store";
@@ -455,3 +460,108 @@ describe("command palette — conversation search", () => {
     expect(mocks.backend.agentChatSearch).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("command palette — add-on commands", () => {
+  const plugin = {
+    installationId: "installation",
+    manifest: {
+      id: "test.plugin",
+      name: "Fixture Brief",
+      contributes: {
+        commands: [
+          { id: "open", title: "Summarize fixture", requiresWorkspace: false },
+        ],
+        panels: [],
+        composerActions: [],
+        composerViews: [],
+      },
+    } as unknown as AddonManifest,
+    desiredEnabled: true,
+    status: "enabled-idle",
+  } as AddonInstallation;
+  const header = (label: string) =>
+    document.querySelector<HTMLElement>(`[data-palette-group="${label}"]`);
+  const count = (label: string) =>
+    header(label)?.querySelector("span:last-child")?.textContent;
+  const localWorkspace = {
+    workspace_id: "ws-1",
+    title: "Local",
+    cwd: "/repo",
+    git_branch: "main",
+    project_root: "/repo",
+    surfaces: [],
+    active_surface_id: "",
+  };
+  beforeEach(() => {
+    useAddonsStore.setState({ installed: [plugin], paused: false });
+  });
+  afterEach(() => {
+    useAddonsStore.setState({ installed: [] });
+    delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+  });
+
+  it("shows an add-on-only match under Add-ons alone, attributed", async () => {
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">fixture");
+    const user = userEvent.setup();
+    renderPalette();
+    expect(header("Commands")).toBeNull();
+    expect(count("Add-ons")).toBe("1");
+    // Nothing precedes it, so it takes the first-group spacing.
+    expect(header("Add-ons")).not.toHaveClass("mt-2");
+    const row = screen.getByRole("option", {
+      name: /Summarize fixture · Fixture Brief/,
+    });
+    await user.click(row);
+    expect(executeAddon).toHaveBeenCalledWith("test.plugin", "open", "commands");
+  });
+
+  it("counts core and add-on commands under their own headers", () => {
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">");
+    renderPalette();
+    const options = screen.getAllByRole("option");
+    expect(count("Add-ons")).toBe("1");
+    expect(Number(count("Commands"))).toBe(options.length - 1);
+    expect(header("Add-ons")).toHaveClass("mt-2");
+    // The add-on row renders after the core group, under its own header.
+    const addonRow = screen.getByRole("option", { name: /Fixture Brief/ });
+    expect(
+      header("Add-ons")!.compareDocumentPosition(addonRow) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("renders the core list exactly as before without add-ons", () => {
+    useAddonsStore.setState({ installed: [] });
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">");
+    renderPalette();
+    expect(Number(count("Commands"))).toBe(screen.getAllByRole("option").length);
+    expect(header("Add-ons")).toBeNull();
+  });
+
+  it.each([
+    ["while add-ons are paused", () => useAddonsStore.setState({ paused: true })],
+    [
+      "in a remote workspace",
+      () => {
+        mocks.app.appState = {
+          active_workspace_id: "ws-1",
+          pane_statuses: {},
+          workspaces: [{ ...localWorkspace, host_id: "host-1" }],
+        };
+      },
+    ],
+    [
+      "in a browser client",
+      () => {
+        (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+      },
+    ],
+  ])("offers no add-on commands %s", (_, arrange) => {
+    arrange();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">fixture");
+    renderPalette();
+    expect(header("Add-ons")).toBeNull();
+    expect(screen.queryByRole("option", { name: /Fixture Brief/ })).toBeNull();
+  });
+});
+
