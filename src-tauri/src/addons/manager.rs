@@ -204,7 +204,33 @@ pub struct Manager {
     pub events: broadcast::Sender<UiEvent>,
     paused: AtomicBool,
     diagnostics: StdMutex<HashMap<String, Diagnostics>>,
+    timing: Timing,
+}
+/// Supervision delays. Tests shorten them; they grant no authority.
+#[derive(Clone, Copy)]
+struct Timing {
+    /// Stop a host this long after its last call with no mounted UI.
     idle: Duration,
+    request: Duration,
+    fetch: Duration,
+}
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(60),
+            request: Duration::from_secs(15),
+            fetch: Duration::from_secs(30),
+        }
+    }
+}
+impl Timing {
+    fn request(&self, operation: &str) -> Duration {
+        if operation == "http.fetch" {
+            self.fetch
+        } else {
+            self.request
+        }
+    }
 }
 fn storage_error(_: rusqlite::Error) -> ProtocolError {
     ProtocolError::new(
@@ -214,10 +240,9 @@ fn storage_error(_: rusqlite::Error) -> ProtocolError {
 }
 impl Manager {
     pub fn open(root: PathBuf, host_path: PathBuf) -> Result<Arc<Self>> {
-        Self::open_with_idle(root, host_path, Duration::from_secs(60))
+        Self::open_with(root, host_path, Timing::default())
     }
-    /// The idle stop delay is a supervision test seam; it grants no authority.
-    fn open_with_idle(root: PathBuf, host_path: PathBuf, idle: Duration) -> Result<Arc<Self>> {
+    fn open_with(root: PathBuf, host_path: PathBuf, timing: Timing) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&root).map_err(|_| {
             ProtocolError::new(
                 ErrorCode::StorageUnavailable,
@@ -278,7 +303,7 @@ impl Manager {
                     || std::env::var_os("CODEMUX_DISABLE_ADDONS").is_some_and(|v| v == "1"),
             ),
             diagnostics: StdMutex::new(HashMap::new()),
-            idle,
+            timing,
         });
         manager.recover()?;
         manager.recover_session()?;
@@ -521,14 +546,14 @@ impl Manager {
                 // A busy host re-checks after each activity and at least once
                 // per idle period.
                 let idle_at = if instance.is_idle() {
-                    *instance.last_used.lock().unwrap() + manager.idle
+                    *instance.last_used.lock().unwrap() + manager.timing.idle
                 } else {
-                    Instant::now() + manager.idle
+                    Instant::now() + manager.timing.idle
                 };
                 tokio::select! {
                  _=instance.cancel.cancelled()=>break,
                  _=instance.activity.notified()=>{},
-                 _=tokio::time::sleep_until(idle_at.into())=>{if instance.is_idle()&&instance.last_used.lock().unwrap().elapsed()>=manager.idle{manager.stop(&instance.manifest.id,None).await;break}},
+                 _=tokio::time::sleep_until(idle_at.into())=>{if instance.is_idle()&&instance.last_used.lock().unwrap().elapsed()>=manager.timing.idle{manager.stop(&instance.manifest.id,None).await;break}},
                  event=events.recv()=>{let result=match event{
                   Some(Event::Message(message))=>{
                    if message.method.as_deref()==Some("ready")&&message.params.as_ref().is_some_and(|p|p["phase"]=="activated"){
@@ -614,8 +639,8 @@ impl Manager {
                 };
                 tokio::spawn(async move {
                     let operation = params["operation"].as_str().unwrap_or("");
-                    let timeout = if operation == "http.fetch" { 30 } else { 15 };
-                    let result = tokio::select! {_ = instance.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin stopped")),result=tokio::time::timeout(Duration::from_secs(timeout),manager.request(&instance,operation,params["params"].clone()))=>result.unwrap_or_else(|_|Err(ProtocolError::new(ErrorCode::Timeout,"Host request timed out")))};
+                    let timeout = manager.timing.request(operation);
+                    let result = tokio::select! {_ = instance.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin stopped")),result=tokio::time::timeout(timeout,manager.request(&instance,operation,params["params"].clone()))=>result.unwrap_or_else(|_|Err(ProtocolError::new(ErrorCode::Timeout,"Host request timed out")))};
                     let _ = instance.host.respond(id, result).await;
                     // The idle period starts when the last call completes.
                     drop(permit);
@@ -1554,12 +1579,11 @@ mod tests {
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
     async fn native_idle_stop_waits_for_views_and_the_last_completed_call() {
         let root = tempfile::tempdir().unwrap();
-        let manager = Manager::open_with_idle(
-            root.path().into(),
-            test_host_path(),
-            Duration::from_millis(400),
-        )
-        .unwrap();
+        let timing = Timing {
+            idle: Duration::from_millis(400),
+            ..Timing::default()
+        };
+        let manager = Manager::open_with(root.path().into(), test_host_path(), timing).unwrap();
         let installation = panel_plugin("example.idle");
         manager.save(&installation).unwrap();
         let running = manager
@@ -1586,6 +1610,63 @@ mod tests {
         let installed = manager.installation(&running.manifest.id).unwrap();
         assert!(matches!(installed.status, Status::EnabledIdle));
         assert!(installed.failure.is_none());
+    }
+    #[test]
+    fn supervision_uses_the_specified_delays() {
+        let timing = Timing::default();
+        assert_eq!(timing.idle, Duration::from_secs(60));
+        assert_eq!(timing.request("storage.set"), Duration::from_secs(15));
+        assert_eq!(timing.request("http.fetch"), Duration::from_secs(30));
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_stalled_host_request_times_out_with_a_stable_error() {
+        let root = tempfile::tempdir().unwrap();
+        let timing = Timing {
+            request: Duration::from_millis(300),
+            ..Timing::default()
+        };
+        let manager = Manager::open_with(root.path().into(), test_host_path(), timing).unwrap();
+        let installation = installed(
+            Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap(),
+        );
+        manager.save(&installation).unwrap();
+        // No renderer answers the notification, so the broker call stalls.
+        let source = "__codemuxRegister({}, ({send}) => m => {\
+            if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});\
+            else if(m.method==='command.execute')send('host.request',{operation:'ui.notify',params:{message:'Synthetic'}},1);\
+            else if(!m.method&&m.error)console.error(m.error.data.code);});";
+        let running = manager
+            .activate(installation, source.into(), false)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        running
+            .host
+            .send("command.execute", json!({"id":"hello"}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager
+                .diagnostics(&running.manifest.id)
+                .unwrap()
+                .logs
+                .iter()
+                .any(|entry| entry.level == "error" && entry.bytes == "TIMEOUT".len())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled request is answered with TIMEOUT");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(!running.cancel.is_cancelled());
+        assert_eq!(running.requests.available_permits(), 16);
+        manager.shutdown().await;
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
