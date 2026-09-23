@@ -19,6 +19,8 @@ export default defineConfig({
       "**/dist/**",
       "**/src-tauri/**",
       "sidecar/**",
+      // Author CLI suites use node:test and run from build-examples.sh.
+      "packages/plugin-cli/tests/**",
       // Agent worktrees carry stale full copies of the repo; without this
       // exclude Vitest crawls in and runs every copy's suite too.
       "**/.claude/**",
