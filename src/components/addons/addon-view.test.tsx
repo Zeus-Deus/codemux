@@ -299,6 +299,107 @@ describe("refused actions are transient", () => {
     );
   });
 });
+describe("typing that outruns the add-on", () => {
+  // An add-on that passes a new closure on every render gives its field a
+  // new callback each time, and the broker refuses an edit sent to the old one.
+  const field = (callbackId: string, value = "") => ({
+    ...element("query", "cmx-text-field", { label: "Query", value }),
+    eventListeners: { change: { callbackId } },
+  });
+  const edits = () =>
+    vi
+      .mocked(addonInvoke)
+      .mock.calls.filter(([command]) => command === "addon_ui_event")
+      .map(([, args]) => {
+        const { callbackId, value } = args as {
+          callbackId: string;
+          value: unknown;
+        };
+        return [callbackId, value];
+      });
+  function refuseCallback(stale: string) {
+    vi.mocked(addonInvoke).mockImplementation((command, args) =>
+      command === "addon_ui_event" &&
+      (args as { callbackId: string }).callbackId === stale
+        ? Promise.reject(refused("CONTEXT_STALE", "UI callback expired"))
+        : Promise.resolve(null),
+    );
+  }
+  it("sends the refused edit again to the field's next callback", async () => {
+    refuseCallback("cb-1");
+    render(<AddonView id="test.plugin" view="panel" workspaceId="workspace" />);
+    await waitFor(() => expect(mountAddon).toHaveBeenCalledTimes(1));
+    await showTree([field("cb-1")]);
+    const input = screen.getByRole("textbox", { name: "Query" });
+    fireEvent.change(input, { target: { value: "a" } });
+    fireEvent.change(input, { target: { value: "ab" } });
+    await act(async () => {});
+    // Nothing to "try again": the user is still typing and keeps the text.
+    expect(screen.queryByRole("status")).toBeNull();
+    await showTree([field("cb-2", "a")], 2);
+    await waitFor(() => expect(edits()).toContainEqual(["cb-2", "ab"]));
+    // Only the latest text is resent, once.
+    expect(edits()).toEqual([
+      ["cb-1", "a"],
+      ["cb-1", "ab"],
+      ["cb-2", "ab"],
+    ]);
+    expect(input).toHaveValue("ab");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+  it("resends at once when the new tree arrived before the refusal", async () => {
+    let refuse!: (reason: unknown) => void;
+    vi.mocked(addonInvoke).mockImplementation((command, args) =>
+      command === "addon_ui_event" &&
+      (args as { callbackId: string }).callbackId === "cb-1"
+        ? new Promise((_, reject) => {
+            refuse = reject;
+          })
+        : Promise.resolve(null),
+    );
+    render(<AddonView id="test.plugin" view="panel" workspaceId="workspace" />);
+    await waitFor(() => expect(mountAddon).toHaveBeenCalledTimes(1));
+    await showTree([field("cb-1")]);
+    fireEvent.change(screen.getByRole("textbox", { name: "Query" }), {
+      target: { value: "a" },
+    });
+    await showTree([field("cb-2")], 2);
+    await act(async () => {
+      refuse(refused("CONTEXT_STALE", "UI callback expired"));
+    });
+    await waitFor(() => expect(edits()).toContainEqual(["cb-2", "a"]));
+  });
+  it("does not resend a newer keystroke's text or an edit to a removed field", async () => {
+    refuseCallback("cb-1");
+    render(<AddonView id="test.plugin" view="panel" workspaceId="workspace" />);
+    await waitFor(() => expect(mountAddon).toHaveBeenCalledTimes(1));
+    await showTree([field("cb-1")]);
+    fireEvent.change(screen.getByRole("textbox", { name: "Query" }), {
+      target: { value: "a" },
+    });
+    await act(async () => {});
+    await showTree([element("done", "cmx-text", {}, [textNode("Saved")])], 2);
+    await act(async () => {});
+    expect(edits()).toEqual([["cb-1", "a"]]);
+  });
+  it("still explains a refused switch, which shows the add-on's value", async () => {
+    refuseCallback("cb-1");
+    render(<AddonView id="test.plugin" view="panel" workspaceId="workspace" />);
+    await waitFor(() => expect(mountAddon).toHaveBeenCalledTimes(1));
+    await showTree([
+      {
+        ...element("sync", "cmx-switch", { label: "Sync", checked: false }),
+        eventListeners: { change: { callbackId: "cb-1" } },
+      },
+    ]);
+    fireEvent.click(screen.getByRole("switch", { name: "Sync" }));
+    expect(
+      await screen.findByText(
+        "This view changed before your action reached the add-on. Try again.",
+      ),
+    ).toBeTruthy();
+  });
+});
 describe("add-on view containment and labels", () => {
   it("contains a render failure to the view and recovers on the next tree", async () => {
     const quiet = vi.spyOn(console, "error").mockImplementation(() => {});

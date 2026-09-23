@@ -35,6 +35,7 @@ interface AddonViewProps {
 }
 /** How long an explanation for a refused click stays in the view. */
 const NOTICE_MS = 8000;
+const TEXT_INPUTS = new Set(["cmx-text-field", "cmx-text-area"]);
 function errorCode(cause: unknown): unknown {
   return typeof cause === "object" && cause !== null && "data" in cause
     ? (cause as { data?: { code?: unknown } }).data?.code
@@ -48,6 +49,14 @@ function refusal(cause: unknown, link: boolean): string {
   if (link && code === "PERMISSION_DENIED")
     return "This add-on is not allowed to open links.";
   return addonMessage(cause);
+}
+function findNode(nodes: AddonNode[], id: string): AddonNode | undefined {
+  for (const node of nodes) {
+    if (node.id === id) return node;
+    const child = findNode(node.children, id);
+    if (child) return child;
+  }
+  return undefined;
 }
 function Diagnostic({ children }: { children: ReactNode }) {
   return (
@@ -163,10 +172,22 @@ function AddonViewBody({
   const failed = useAddonsStore((s) =>
     mounted ? s.failures[mounted.generation] : undefined,
   );
+  // Typing can outrun an add-on that re-renders on every change: the broker
+  // then refuses an edit sent to a callback the new tree already replaced.
+  // The field keeps the text, and its latest edit is sent again to the
+  // node's next callback, so the add-on ends up with what the user sees.
+  const edits = useRef({
+    sequence: 0,
+    latest: new Map<string, number>(),
+    unsent: new Map<string, { value: string; callbackId: string }>(),
+  });
+  const latestTree = useRef(tree);
   useEffect(() => {
     setMounted(null);
     setError(null);
     setNotice(null);
+    edits.current.latest.clear();
+    edits.current.unsent.clear();
     if (!ready || !canMount) return;
     let closed = false;
     let target: AddonMount | null = null;
@@ -232,6 +253,15 @@ function AddonViewBody({
     const callbackId = node.eventListeners[event]?.callbackId;
     if (!mounted || !callbackId) return;
     const current = mounted;
+    const text =
+      event === "change" &&
+      typeof value === "string" &&
+      TEXT_INPUTS.has(node.element ?? "");
+    const edit = text ? ++edits.current.sequence : 0;
+    if (text) {
+      edits.current.latest.set(node.id, edit);
+      edits.current.unsent.delete(node.id);
+    }
     void addonInvoke("addon_ui_event", {
       id,
       ...current,
@@ -240,9 +270,37 @@ function AddonViewBody({
       callbackId,
       value,
     }).catch((cause) => {
-      if (live.current === current) setNotice(refusal(cause, false));
+      if (live.current !== current) return;
+      if (text && errorCode(cause) === "CONTEXT_STALE") {
+        // A later edit carries the whole text; only the latest is resent.
+        if (edits.current.latest.get(node.id) === edit) {
+          edits.current.unsent.set(node.id, {
+            value: value as string,
+            callbackId,
+          });
+          resendEdits();
+        }
+        return;
+      }
+      setNotice(refusal(cause, false));
     });
   }
+  function resendEdits() {
+    const current = latestTree.current;
+    if (!current) return;
+    for (const [nodeId, edit] of edits.current.unsent) {
+      const node = findNode(current.tree.children, nodeId);
+      const callbackId = node?.eventListeners.change?.callbackId;
+      // The same callback: the tree that replaced it has not arrived yet.
+      if (callbackId === edit.callbackId) continue;
+      edits.current.unsent.delete(nodeId);
+      if (node && callbackId) event(node, "change", edit.value);
+    }
+  }
+  useEffect(() => {
+    latestTree.current = tree;
+    resendEdits();
+  }, [tree]);
   return (
     <ViewFrame label={label} region={region}>
       {error || failed || installation?.status === "failed-disabled" ? (
