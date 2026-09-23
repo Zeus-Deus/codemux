@@ -1279,6 +1279,19 @@ async function checkRemovalDuringActivation() {
     async () => (await pluginHostCount()) === 0,
   );
   await openCommand("CI slow activation append");
+  // The palette sends addon_execute without waiting for it. Remove only once
+  // that activation has begun, so this step cannot pass without the race.
+  const deadline = Date.now() + 5000;
+  let status;
+  while (status !== "activating") {
+    assert.ok(
+      Date.now() < deadline,
+      `No activation was in progress to remove (status ${status})`,
+    );
+    status = (await native("addon_inventory")).installed.find(
+      (i) => i.manifest.id === id,
+    )?.status;
+  }
   const started = Date.now();
   // Removal is requested while the fixture's activation is still waiting.
   await native("addon_remove", { id, keepData: false });
