@@ -401,6 +401,57 @@ try {
   console.log(
     "PASS: undeclared, duplicate and missing registrations fail activation",
   );
+  for (const [example, calls] of [
+    [
+      "project-brief",
+      [
+        ["commands", "open", "panels.open"],
+        ["composerActions", "insert", "workspace.current"],
+      ],
+    ],
+    [
+      "issue-companion",
+      [
+        ["commands", "open", "panels.open"],
+        ["composerActions", "browse", "composerViews.open"],
+      ],
+    ],
+  ]) {
+    // The examples handle their own host failures, including a rate-limited
+    // notification, so the SDK never has to report one for them.
+    const sdk = resolve(entry, "src/index.ts").replaceAll("\\", "/");
+    const source = await bundle(
+      `../../examples/addons/${example}/src/index.tsx`,
+      {
+        alias: { "@codemux/plugin-sdk": sdk },
+        nodePaths: [resolve(entry, "node_modules")],
+      },
+    );
+    const manifest = JSON.parse(
+      await readFile(`examples/addons/${example}/manifest.json`, "utf8"),
+    );
+    const host = await start(source, manifest);
+    await activated(host);
+    for (let n = 0; n < 5; n++)
+      for (const [kind, id, operation] of calls) {
+        host.send("command.execute", { id, kind, context: "stale-context" });
+        const call = await host.until((m) => m.method === "host.request");
+        assert.equal(call.params.operation, operation);
+        host.reject(call.id, "CONTEXT_STALE", "Context is no longer current");
+        const notify = await host.until((m) => m.method === "host.request");
+        assert.equal(notify.params.operation, "ui.notify");
+        host.reject(notify.id, "RESOURCE_LIMIT", "Notification limit");
+      }
+    await sleep(200);
+    assert.ok(host.alive(), `${example} must survive failing host calls`);
+    assert.ok(
+      !host.history.some(({ message }) => message.method === "log"),
+      `${example} must handle its own host failures`,
+    );
+  }
+  console.log(
+    "PASS: example commands and composer actions handle failing host calls",
+  );
   {
     // Author dependencies without an exports map, reading NODE_ENV.
     const modules = join(dir, "node_modules");
