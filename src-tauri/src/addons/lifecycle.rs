@@ -925,6 +925,9 @@ impl Manager {
         Ok(())
     }
     pub async fn remove(&self, id: &str, keep_data: bool) -> Result<Vec<String>> {
+        // Revoke first: an activation may hold the lock, and whatever the plugin
+        // queues behind it must not take effect once removal has begun.
+        let _revocation = self.revoke_access(id);
         let operation = self.operation(id).await;
         let _lock = operation.lock().await;
         let mut installation = self.installation(id)?;

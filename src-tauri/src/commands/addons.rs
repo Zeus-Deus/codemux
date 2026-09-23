@@ -204,8 +204,7 @@ pub fn addon_inventory<R: Runtime>(
                     installed: installed
                         .into_iter()
                         .map(|installation| {
-                            let (catalog, update_available) =
-                                manager.catalog_status(&installation);
+                            let (catalog, update_available) = manager.catalog_status(&installation);
                             InventoryItem {
                                 compatibility: installation.compatibility(),
                                 installation,
@@ -328,6 +327,8 @@ pub async fn addon_disable<R: Runtime>(
 ) -> Result<()> {
     let manager = state.get(&app)?;
     state.development.stop(Some(&id));
+    // Disable revokes broker access before waiting behind an activation.
+    let _revocation = manager.revoke_access(&id);
     let operation = manager.operation(&id).await;
     let _lock = operation.lock().await;
     let mut installation = manager.installation(&id)?;
@@ -565,7 +566,9 @@ pub async fn addon_credential_clear<R: Runtime>(
     let operation = manager.operation(&id).await;
     let _lock = operation.lock().await;
     let installation = manager.installation(&id)?;
-    manager.clear_credential(&installation, &credential_id).await
+    manager
+        .clear_credential(&installation, &credential_id)
+        .await
 }
 
 #[tauri::command]

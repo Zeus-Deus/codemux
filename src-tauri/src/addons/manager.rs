@@ -311,11 +311,30 @@ fn ui_traffic(rate: &mut (limits::RateLimit, VecDeque<Instant>), now: Instant) -
     Ok(())
 }
 struct PendingEffect {
+    plugin_id: String,
     generation: String,
     sender: oneshot::Sender<Result<Value>>,
     cancel: CancellationToken,
     deadline: Instant,
     claimed: Option<Instant>,
+}
+/// Broker access withdrawn the moment a disable or removal begins, while that
+/// operation still waits for the plugin's lock (for example behind a lazy
+/// activation). Nothing the plugin queued meanwhile can take effect.
+pub(crate) struct Revocation<'a> {
+    manager: &'a Manager,
+    id: String,
+}
+impl Drop for Revocation<'_> {
+    fn drop(&mut self) {
+        let mut revoked = self.manager.revoked.lock().unwrap();
+        if let Some(count) = revoked.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                revoked.remove(&self.id);
+            }
+        }
+    }
 }
 /// A claimed effect is being applied by the trusted UI. Its result may arrive
 /// shortly after the interaction deadline, which only bounds claiming.
@@ -340,6 +359,8 @@ pub struct Manager {
     pub events: broadcast::Sender<UiEvent>,
     paused: AtomicBool,
     pub(super) diagnostics: StdMutex<HashMap<String, Diagnostics>>,
+    /// Plugin IDs whose disable or removal has begun, counted per operation.
+    revoked: StdMutex<HashMap<String, usize>>,
     timing: Timing,
 }
 /// Supervision delays. Tests shorten them; they grant no authority.
@@ -443,6 +464,7 @@ impl Manager {
                     || std::env::var_os("CODEMUX_DISABLE_ADDONS").is_some_and(|v| v == "1"),
             ),
             diagnostics: StdMutex::new(HashMap::new()),
+            revoked: StdMutex::new(HashMap::new()),
             timing,
         });
         manager.recover()?;
@@ -460,6 +482,24 @@ impl Manager {
                 params![installation, id],
             )
             .map_err(storage_error)?;
+        Ok(())
+    }
+    /// Withdraws broker access at once. Keep the guard for the whole disable or
+    /// removal; the operation lock still serializes the registry changes.
+    pub(crate) fn revoke_access(&self, id: &str) -> Revocation<'_> {
+        *self.revoked.lock().unwrap().entry(id.into()).or_default() += 1;
+        Revocation {
+            manager: self,
+            id: id.into(),
+        }
+    }
+    fn check_access(&self, id: &str) -> Result<()> {
+        if self.revoked.lock().unwrap().contains_key(id) {
+            return Err(ProtocolError::new(
+                ErrorCode::PluginStopped,
+                "Add-on is being disabled or removed",
+            ));
+        }
         Ok(())
     }
     pub fn paused(&self) -> bool {
@@ -1272,6 +1312,7 @@ impl Manager {
             .cloned()
     }
     async fn request(&self, running: &Running, operation: &str, params: Value) -> Result<Value> {
+        self.check_access(&running.manifest.id)?;
         if !params.is_object() {
             return Err(ProtocolError::invalid(
                 "Operation parameters must be an object",
@@ -1520,6 +1561,7 @@ impl Manager {
         self.effects.lock().await.insert(
             id.clone(),
             PendingEffect {
+                plugin_id: running.manifest.id.clone(),
                 generation: running.generation().into(),
                 sender: tx,
                 cancel: cancel.clone(),
@@ -1556,6 +1598,9 @@ impl Manager {
     }
     pub async fn claim_effect(&self, id: &str, generation: &str) -> Result<()> {
         let mut effects = self.effects.lock().await;
+        if let Some(effect) = effects.get(id) {
+            self.check_access(&effect.plugin_id)?;
+        }
         let effect = effects
             .get_mut(id)
             .filter(|e| {
@@ -1597,6 +1642,7 @@ impl Manager {
         workspace: Option<Workspace>,
         composer: Option<String>,
     ) -> Result<String> {
+        self.check_access(&running.manifest.id)?;
         let mut contexts = self.contexts.lock().await;
         if let Some(id) = &composer {
             contexts.validate_composer(id, workspace.as_ref().map(|w| w.id.as_str()))?;
@@ -1612,7 +1658,10 @@ impl Manager {
         kind: &str,
         context: &str,
     ) -> Result<()> {
-        let result = self.send_command(running, id, kind, context).await;
+        let result = match self.check_access(&running.manifest.id) {
+            Ok(()) => self.send_command(running, id, kind, context).await,
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.contexts.lock().await.revoke(context);
         }
@@ -1689,6 +1738,7 @@ impl Manager {
         kind: &str,
         context: &str,
     ) -> Result<String> {
+        self.check_access(&running.manifest.id)?;
         let result = self.mount_view(running, id, kind, context).await;
         if result.is_err() {
             self.contexts.lock().await.revoke(context);
@@ -1783,6 +1833,7 @@ impl Manager {
         node_id: &str,
         url: &str,
     ) -> Result<()> {
+        self.check_access(&running.manifest.id)?;
         fn markdown(nodes: &[codemux_addon_protocol::ui::Node], id: &str) -> bool {
             nodes.iter().any(|n| {
                 (n.id == id && n.element.as_deref() == Some("cmx-markdown"))
@@ -1814,6 +1865,7 @@ impl Manager {
         callback_id: &str,
         value: Value,
     ) -> Result<()> {
+        self.check_access(&running.manifest.id)?;
         if !value.is_null()
             && !value.is_boolean()
             && !value.as_str().is_some_and(|s| s.len() <= 32768)
@@ -2477,12 +2529,25 @@ mod tests {
                 .send("command.execute", json!({"id":"hello"}))
                 .await
                 .unwrap();
-            let (activated, removed) = tokio::time::timeout(Duration::from_secs(2), async {
-                tokio::join!(&mut activation, &mut removal)
-            })
-            .await
-            .expect("activation and removal serialize");
-            activated.unwrap();
+            // Activation finishes while the removal still waits for the lock.
+            // Removal has begun, so a command queued behind the activation
+            // (the palette's execute) can no longer start or reach the app.
+            let activated = tokio::time::timeout(Duration::from_secs(2), &mut activation)
+                .await
+                .expect("activation completes")
+                .unwrap();
+            for error in [
+                manager.context_handle(&activated, None, None).await.unwrap_err(),
+                manager
+                    .execute(&activated, "hello", "commands", "unused")
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert_eq!(error.data.code, ErrorCode::PluginStopped);
+            }
+            let removed = tokio::time::timeout(Duration::from_secs(2), &mut removal)
+                .await
+                .expect("activation and removal serialize");
             let warnings = removed.unwrap();
             assert!(warnings.is_empty(), "Removal cleanup: {warnings:?}");
             assert!(running.stopped.is_cancelled());
