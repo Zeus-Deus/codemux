@@ -174,8 +174,8 @@ checking and are rejected by the desktop, which stops the plugin.
 | `Select` | `label`, `options` (`{label, value}[]`), `value`, `disabled`, `onChange` |
 | `Checkbox`, `Switch` | `label`, `checked`, `disabled`, `onChange` (`event.value` is a boolean) |
 | `Tabs` | `label`, `options`, `value`, `disabled`, `onChange`; children are the selected panel |
-| `List` | `items` (up to 500 strings) |
-| `Table` | `headers`, `rows` (up to 500 rows of up to 20 strings) |
+| `List` | `items` (up to 500 strings), `label` (the accessible name) |
+| `Table` | `headers`, `rows` (up to 500 rows of up to 20 strings), `label` |
 | `Progress` | `value`, `max`, `label` |
 | `Icon` | `name` (an `IconName`), `label`, `color` |
 | `Divider` | — |
