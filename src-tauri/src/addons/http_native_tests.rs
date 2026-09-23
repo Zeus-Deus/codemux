@@ -87,7 +87,7 @@ async fn finish(task: tokio::task::JoinHandle<String>) -> String {
 }
 #[tokio::test]
 async fn pinned_native_tls_preserves_hostname_credentials_and_safe_response_headers() {
-    let (http, task, _) = server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nETag: fixture\r\nSet-Cookie: hidden=value\r\nConnection: close\r\n\r\nok".to_vec(), Duration::ZERO).await;
+    let (http, task, _) = server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nX-RateLimit-Remaining: 59\r\nETag: fixture\r\nSet-Cookie: hidden=value\r\nConnection: close\r\n\r\nok".to_vec(), Duration::ZERO).await;
     let response = http
         .fetch(
             "test.http",
@@ -99,14 +99,19 @@ async fn pinned_native_tls_preserves_hostname_credentials_and_safe_response_head
         .await
         .unwrap();
     assert_eq!(response.body, "ok");
+    // Only content-type and rate-limit headers are returned (chapter 6).
     assert_eq!(
-        response.headers.get("etag").map(String::as_str),
-        Some("fixture")
+        response.headers,
+        BTreeMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("x-ratelimit-remaining".into(), "59".into()),
+        ])
     );
-    assert!(!response.headers.contains_key("set-cookie"));
     let headers = finish(task).await.to_ascii_lowercase();
     assert!(headers.contains("host: addon-http.invalid"));
     assert!(headers.contains("authorization: bearer synthetic-test-token"));
+    assert!(headers.contains("user-agent: codemux-addon/1 test.http\r\n"));
+    assert!(!headers.contains("cookie"));
     // .invalid has no public DNS: a successful real TLS connection proves the
     // client uses the pinned endpoint, not a second lookup of this hostname.
 }
