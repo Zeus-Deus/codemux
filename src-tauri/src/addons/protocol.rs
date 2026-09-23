@@ -112,6 +112,10 @@ pub struct Host {
     done: CancellationToken,
     sequence: Arc<AtomicU64>,
     progress: Arc<Mutex<Progress>>,
+    /// Holding this delays the reaped signal, as a kernel that is slow to
+    /// terminate the child would.
+    #[cfg(test)]
+    pub(super) reaping: Arc<tokio::sync::Mutex<()>>,
 }
 impl Host {
     pub async fn spawn(
@@ -177,7 +181,11 @@ impl Host {
             done: done.clone(),
             sequence: Arc::new(AtomicU64::new(1)),
             progress: progress.clone(),
+            #[cfg(test)]
+            reaping: Default::default(),
         };
+        #[cfg(test)]
+        let reaping = host.reaping.clone();
         let writing_cancel = cancel.clone();
         // A broken input pipe usually means the host is exiting. Stop writing
         // but let the reader observe the exit and its reason; later writes fail
@@ -248,6 +256,8 @@ impl Host {
             }
             drop(events);
             reap(&mut child).await;
+            #[cfg(test)]
+            drop(reaping.lock().await);
             done.cancel();
         });
         if source.len() > limits::BUNDLE {

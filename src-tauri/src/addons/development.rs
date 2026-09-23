@@ -114,7 +114,7 @@ impl Development {
                         .unwrap_or_else(|_|Err(ProtocolError::invalid("Development package validation failed")));
                     match result {
                         Ok(review) if review.digest==installation.digest=>reviews.cancel(&review.token),
-                        Ok(review) if review.expands_access=>{pending=Some(review.token.clone());let _=manager.events.send(UiEvent::DevelopmentReview{review});},
+                        Ok(review) if review.expands_access=>{pending=Some(review.token.clone());manager.announce_review(review);},
                         Ok(review)=>{
                             if stopped.is_cancelled(){reviews.cancel(&review.token);break}
                             if let Err(error)=reviews.accept(&manager,&review.token,true,false).await{let _=manager.events.send(UiEvent::DevelopmentError{message:error.message});}
@@ -207,7 +207,7 @@ mod tests {
         let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match events.recv().await.unwrap() {
-                    UiEvent::DevelopmentReview { review } => break review,
+                    UiEvent::DevelopmentReview { review, .. } => break review,
                     UiEvent::DevelopmentError { message } => panic!("{message}"),
                     _ => {}
                 }
@@ -267,7 +267,7 @@ mod tests {
         let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match events.recv().await.unwrap() {
-                    UiEvent::DevelopmentReview { review } => break review,
+                    UiEvent::DevelopmentReview { review, .. } => break review,
                     UiEvent::DevelopmentError { message } => panic!("{message}"),
                     _ => {}
                 }

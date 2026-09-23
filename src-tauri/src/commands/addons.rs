@@ -277,17 +277,24 @@ pub async fn addon_subscribe<R: Runtime>(
         old.cancel();
     }
     manager.change_workspace(None).await;
-    let events = manager.events.subscribe();
-    tauri::async_runtime::spawn(forward(manager, events, cancel, move |event| {
-        channel.send(event).is_ok()
-    }));
+    let subscription = manager.subscribe();
+    let reviews = state.reviews.clone();
+    tauri::async_runtime::spawn(forward(
+        manager,
+        reviews,
+        subscription,
+        cancel,
+        move |event| channel.send(event).is_ok(),
+    ));
     Ok(())
 }
 /// Forward add-on events to one webview. A slow receiver is a transport
-/// condition, not a user pause: missed events are replaced with current state.
+/// condition, not a user pause: missed events are replaced with current state
+/// and the one-shot events that still matter, each delivered once.
 async fn forward(
     manager: Arc<Manager>,
-    mut events: broadcast::Receiver<UiEvent>,
+    reviews: Arc<addons::lifecycle::Reviews>,
+    (mut events, mut seen): (broadcast::Receiver<UiEvent>, u64),
     cancel: CancellationToken,
     send: impl Fn(UiEvent) -> bool,
 ) {
@@ -295,11 +302,17 @@ async fn forward(
         let delivered = tokio::select! {
             _ = cancel.cancelled() => break,
             event = events.recv() => match event {
-                Ok(event) => send(event),
+                Ok(event) => {
+                    seen = event.sequence().unwrap_or(seen);
+                    send(event)
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Subscribe first, so everything after the snapshot follows it.
-                    events = manager.events.subscribe();
-                    manager.resync_events().await.into_iter().all(&send)
+                    // The new receiver starts right after the snapshot.
+                    let (receiver, sequence, missed) = manager
+                        .resubscribe(seen, |token| reviews.is_pending(token))
+                        .await;
+                    (events, seen) = (receiver, sequence);
+                    missed.into_iter().all(&send)
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -782,7 +795,7 @@ mod tests {
     async fn a_lagging_subscriber_resynchronizes_without_pausing_add_ons() {
         let root = tempfile::tempdir().unwrap();
         let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
-        let events = manager.events.subscribe();
+        let subscription = manager.subscribe();
         // Overflow the bounded broadcast buffer before the forwarder reads.
         for _ in 0..40 {
             assert!(manager.events.send(UiEvent::Inventory).is_ok());
@@ -792,7 +805,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let forwarder = tokio::spawn(forward(
             manager.clone(),
-            events,
+            Default::default(),
+            subscription,
             cancel.clone(),
             move |_| {
                 *counter.lock().unwrap() += 1;
@@ -823,5 +837,75 @@ mod tests {
         assert!(!Manager::open(root.path().into(), "unused".into())
             .unwrap()
             .paused());
+    }
+    #[tokio::test]
+    async fn a_lagging_subscriber_receives_each_missed_one_shot_event_once() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let reviews = Arc::new(addons::lifecycle::Reviews::default());
+        let package = root.path().join("fixture.cmxaddon");
+        std::fs::write(
+            &package,
+            addons::lifecycle::tests::package_with(|_| {}).archive,
+        )
+        .unwrap();
+        let review = || reviews.prepare_local(&manager, &package).unwrap();
+        // Sending without yielding outruns the forwarder, which then lags.
+        let overflow = || {
+            for _ in 0..40 {
+                assert!(manager.events.send(UiEvent::Inventory).is_ok());
+            }
+        };
+        let subscription = manager.subscribe();
+        let missed = review();
+        manager.announce_review(missed.clone());
+        overflow();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let log = received.clone();
+        let cancel = CancellationToken::new();
+        let forwarder = tokio::spawn(forward(
+            manager.clone(),
+            reviews.clone(),
+            subscription,
+            cancel.clone(),
+            move |event| {
+                if let UiEvent::DevelopmentReview { review, .. } = event {
+                    log.lock().unwrap().push(review.token);
+                }
+                true
+            },
+        ));
+        let delivered = |count: usize| {
+            let received = received.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while received.lock().unwrap().len() < count {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the review is delivered");
+            }
+        };
+        delivered(1).await;
+        let received_live = review();
+        manager.announce_review(received_live.clone());
+        delivered(2).await;
+        // Missed in the next lag: one review still awaits a decision, the
+        // other was decided. The one already received stays pending too.
+        let missed_again = review();
+        manager.announce_review(missed_again.clone());
+        let decided = review();
+        manager.announce_review(decided.clone());
+        reviews.cancel(&decided.token);
+        overflow();
+        delivered(3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            *received.lock().unwrap(),
+            [missed.token, received_live.token, missed_again.token]
+        );
+        cancel.cancel();
+        forwarder.await.unwrap();
     }
 }
