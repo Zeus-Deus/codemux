@@ -6,6 +6,7 @@ import {useAddonComposerAdapter,type AddonComposerBinding} from './use-addon-com
 import {addonComposer,composerForWorkspace,type ComposerTarget} from './composer-registry';
 import {addonInvoke} from './bridge';
 import {useAppStore} from '@/stores/app-store';
+import {useAddonsStore} from '@/stores/addons-store';
 import type {AppStateSnapshot} from '@/tauri/types';
 beforeEach(()=>{
   vi.mocked(addonInvoke).mockReset().mockResolvedValue(null);
@@ -69,6 +70,41 @@ describe('controlled composer adapter',()=>{
     await waitFor(()=>expect(hook.result.current.unavailable).toBe('Add-ons are unavailable in remote workspaces'));
     expect(hook.result.current.registered).toBe(false);
     expect(composerForWorkspace('workspace')).toBeNull();
+  });
+  it('tries a refused registration again once the add-on manager recovers',async()=>{
+    // The registry failed to open, so the broker refuses the draft. A reset
+    // (or resume) opens it again without any thread or workspace change.
+    const broken={message:'The add-on registry at /data/addons-v1 could not be opened: damaged. Reset it to start with no add-ons; the current files are kept as a backup.',data:{code:'STORAGE_UNAVAILABLE'}};
+    let healthy=false;
+    vi.mocked(addonInvoke).mockImplementation((command)=>command==='addon_composer_register'&&!healthy?Promise.reject(broken):Promise.resolve(null));
+    const registrations=()=>vi.mocked(addonInvoke).mock.calls.filter(([command])=>command==='addon_composer_register').length;
+    useAddonsStore.setState({loaded:false,error:null,registryError:null});
+    const hook=renderHook(()=>useAddonComposerAdapter('workspace','thread','',vi.fn()));
+    await waitFor(()=>expect(hook.result.current.unavailable).toBe(broken.message));
+    // The inventory then reports the failure; unrelated updates change nothing.
+    act(()=>{useAddonsStore.setState({loaded:true,paused:true,error:broken.message,registryError:{path:'/data/addons-v1',cause:'damaged'}});});
+    act(()=>{useAddonsStore.setState({installed:[]});});
+    expect(registrations()).toBe(1);
+    healthy=true;
+    act(()=>{useAddonsStore.setState({paused:false,error:null,registryError:null});});
+    await waitFor(()=>expect(hook.result.current.registered).toBe(true));
+    expect(registrations()).toBe(2);
+    expect(hook.result.current.unavailable).toBeNull();
+    expect(composerForWorkspace('workspace')).toBe(hook.result.current.id);
+    // Nothing was registered for the refused attempt, so nothing is closed.
+    expect(vi.mocked(addonInvoke).mock.calls.filter(([command])=>command==='addon_composer_closed')).toEqual([]);
+    hook.unmount();
+  });
+  it('never asks the broker from a browser client',()=>{
+    (window as {__CODEMUX_REMOTE__?:boolean}).__CODEMUX_REMOTE__=true;
+    try{
+      const hook=renderHook(()=>useAddonComposerAdapter('workspace','thread','',vi.fn()));
+      expect(hook.result.current).toEqual({id:'',registered:false,unavailable:'Add-ons run only in the desktop app'});
+      hook.unmount();
+      expect(addonInvoke).not.toHaveBeenCalled();
+    }finally{
+      delete (window as {__CODEMUX_REMOTE__?:boolean}).__CODEMUX_REMOTE__;
+    }
   });
   it('explains a draft outside any workspace without asking the broker',()=>{
     const hook=renderHook(()=>useAddonComposerAdapter(null,null,'',vi.fn()));
