@@ -424,8 +424,46 @@ describe("text fields keep what the user types", () => {
     expect(
       screen.getByText(/too long to send to the add-on/),
     ).toBeTruthy();
+    // The message describes the field; it is not part of its name.
+    expect(input).toHaveAccessibleName("Query");
+    expect(input).toHaveAccessibleDescription(
+      "This text is too long to send to the add-on (32 KiB at most).",
+    );
     fireEvent.change(input, { target: { value: "short" } });
     expect(sent(event)).toEqual(["short"]);
     expect(input).not.toHaveAttribute("aria-invalid");
+    expect(input).not.toHaveAttribute("aria-describedby");
+  });
+  it("never rolls back to a late echo after a long burst", () => {
+    // An add-on busy with other work answers only after dozens of edits.
+    const { input, event, echo } = setup({ value: "" });
+    const typed = "the quick brown fox jumps over the lazy dog, twice over";
+    for (let i = 1; i <= typed.length; i++)
+      fireEvent.change(input, { target: { value: typed.slice(0, i) } });
+    expect(sent(event)).toHaveLength(typed.length);
+    echo("t");
+    echo("the quick");
+    expect(input.value).toBe(typed);
+    echo(typed);
+    expect(input.value).toBe(typed);
+    // Afterwards a value the add-on sets itself still wins.
+    echo("");
+    expect(input.value).toBe("");
+  });
+});
+describe("add-on buttons", () => {
+  it("honors a full-height button and keeps a long label on one line", () => {
+    const label = "Refresh the project brief from the working tree";
+    render(
+      <AddonRenderer
+        nodes={[node("button", "cmx-button", { label, height: "full" })]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const button = screen.getByRole("button", { name: label });
+    expect(button).toHaveClass("h-full", "max-w-full");
+    expect(button).toHaveAttribute("title", label);
+    expect(button.querySelector(".truncate")).toHaveTextContent(label);
   });
 });

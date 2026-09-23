@@ -1,6 +1,7 @@
 import {
   Fragment,
   useCallback,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -111,9 +112,18 @@ interface Props {
 }
 /** The broker's limit for one UI event value (UTF-8 bytes). */
 const MAX_VALUE_BYTES = 32768;
-/** Echoes this field still expects from the add-on; older ones are dropped. */
-const MAX_PENDING_ECHOES = 32;
+/** Echoes this field still expects from the add-on. Only an add-on that has
+ *  stopped answering falls this far behind; its oldest echoes are forgotten. */
+const MAX_PENDING_ECHOES = 1024;
 const utf8 = new TextEncoder();
+/** A small stand-in for a reported value (its length and 32-bit FNV-1a
+ *  hash), so a long burst in a large text area keeps little memory. */
+function fingerprint(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++)
+    hash = Math.imul(hash ^ value.charCodeAt(i), 0x01000193);
+  return `${value.length}:${hash >>> 0}`;
+}
 /**
  * TextField / TextArea adapter. The field owns what the user is typing: each
  * edit updates it at once and is reported to the add-on, and the add-on's
@@ -141,15 +151,17 @@ function AddonTextInput({
 }) {
   const [draft, setDraft] = useState(value ?? "");
   const [tooLong, setTooLong] = useState(false);
+  const messageId = useId();
   const field = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
   const current = useRef(draft);
+  // Fingerprints of reported edits the add-on has not echoed yet, oldest first.
   const pending = useRef<string[]>([]);
   const composing = useRef(false);
   const deferred = useRef<string | undefined>(undefined);
   const caret = useRef<[number, number] | null>(null);
   const accept = (remote: string | undefined) => {
     if (remote === undefined) return;
-    const echo = pending.current.indexOf(remote);
+    const echo = pending.current.indexOf(fingerprint(remote));
     if (echo !== -1) {
       // One of our own edits coming back, possibly late: drop it and every
       // older one, but never let it overwrite what was typed since.
@@ -194,6 +206,7 @@ function AddonTextInput({
     placeholder,
     disabled,
     "aria-invalid": tooLong || undefined,
+    "aria-describedby": tooLong ? messageId : undefined,
     onChange: (
       e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
     ) => {
@@ -203,7 +216,7 @@ function AddonTextInput({
       const over = utf8.encode(next).byteLength > MAX_VALUE_BYTES;
       setTooLong(over);
       if (over) return;
-      pending.current.push(next);
+      pending.current.push(fingerprint(next));
       if (pending.current.length > MAX_PENDING_ECHOES) pending.current.shift();
       onValue(next);
     },
@@ -218,15 +231,17 @@ function AddonTextInput({
     },
   };
   return (
-    <label className={cn(className, "grid gap-1")}>
-      {label}
-      {multiline ? <Textarea {...props} rows={3} /> : <Input {...props} />}
+    <div className={cn(className, "grid gap-1")}>
+      <label className="grid gap-1">
+        {label}
+        {multiline ? <Textarea {...props} rows={3} /> : <Input {...props} />}
+      </label>
       {tooLong && (
-        <span className="text-label text-destructive">
+        <p id={messageId} className="text-label text-destructive">
           This text is too long to send to the add-on (32 KiB at most).
-        </span>
+        </p>
       )}
-    </label>
+    </div>
   );
 }
 function VirtualRows({
@@ -426,11 +441,17 @@ export function AddonRenderer({
               "min-w-0 max-w-full",
               !colorVariants[color] && colors[color],
               p.width === "full" && "w-full",
+              p.height === "full" && "h-full",
             )}
+            title={text("label") || undefined}
             disabled={disabled}
             onClick={() => event(node, "press", null)}
           >
-            {children.length ? children : text("label")}
+            {/* One line, like every app button; a long label is cut off
+                inside the panel instead of widening it. */}
+            <span className="min-w-0 truncate">
+              {children.length ? children : text("label")}
+            </span>
           </Button>
         );
       }
