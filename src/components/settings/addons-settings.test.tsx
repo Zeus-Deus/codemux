@@ -357,17 +357,45 @@ it("never offers Enable for blocked or incompatible releases and says why", () =
   render(<AddonsSettings />);
   const blocked = within(row("Issue Companion"));
   expect(blocked.queryByRole("button", { name: "Enable" })).toBeNull();
+  // Disabling would record the blocked release as merely disabled.
+  expect(blocked.queryByRole("button", { name: "Disable" })).toBeNull();
   expect(
     blocked.getByText("Catalog block: Sends data to an undeclared service"),
   ).toBeInTheDocument();
   expect(blocked.getByText(/No longer listed/)).toBeInTheDocument();
   const incompatible = within(row("Future Package"));
   expect(incompatible.queryByRole("button", { name: "Enable" })).toBeNull();
+  expect(incompatible.queryByRole("button", { name: "Disable" })).toBeNull();
   expect(
     incompatible.getByText(
       "Requires plugin API ^2.0.0; this CodeMux supports 1.0.0",
     ),
   ).toBeInTheDocument();
+});
+
+it("lets an incompatible add-on that is still meant to run be disabled", async () => {
+  answer({});
+  // The host keeps desiredEnabled while this CodeMux cannot run the release,
+  // so it would start again by itself after an upgrade.
+  useAddonsStore.setState({
+    installed: [
+      {
+        ...installation,
+        status: "incompatible-disabled",
+        failure: "Requires plugin API ^2.0.0; this CodeMux supports 1.0.0",
+      },
+    ],
+  });
+  render(<AddonsSettings />);
+  const item = within(row("Issue Companion"));
+  expect(item.queryByRole("button", { name: "Enable" })).toBeNull();
+  expect(item.queryByRole("button", { name: "Retry" })).toBeNull();
+  fireEvent.click(item.getByRole("button", { name: "Disable" }));
+  await waitFor(() =>
+    expect(addonInvoke).toHaveBeenCalledWith("addon_disable", {
+      id: "codemux.issue-companion",
+    }),
+  );
 });
 
 it("shows the reviewed catalog publisher, not the manifest author, as the identity", () => {

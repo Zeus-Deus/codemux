@@ -142,6 +142,17 @@ function InstalledRow({
               Disable
             </Button>
           </>
+        ) : item.status === "incompatible-disabled" && item.desiredEnabled ? (
+          // It starts again by itself once CodeMux is compatible; let the
+          // user turn it off before that.
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={onDisable}
+          >
+            Disable
+          </Button>
         ) : UNAVAILABLE.includes(item.status) ? null : (
           <Button
             size="sm"

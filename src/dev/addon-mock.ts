@@ -411,8 +411,8 @@ export function addonMockHandlers(): Record<string, Handler> {
           "Catalog block: Sends pasted snippets to an undeclared service",
         catalog: listing(formatter, "Example Labs", "community", false),
       }),
+      // Installed on a newer CodeMux, so it stays meant to run.
       item(nightly, { kind: "local", identity: "nightly-local" }, {
-        desiredEnabled: false,
         status: "incompatible-disabled",
         failure: compatibility(nightly).reason,
       }),
@@ -660,7 +660,10 @@ export function addonMockHandlers(): Record<string, Handler> {
     addon_disable: (args) => {
       const current = find(args.id);
       current.desiredEnabled = false;
-      current.status = "installed-disabled";
+      // Like the host, compatibility still decides the reported status.
+      current.status = compatibility(current.manifest).compatible
+        ? "installed-disabled"
+        : "incompatible-disabled";
       return null;
     },
     addon_remove: (args) => {
