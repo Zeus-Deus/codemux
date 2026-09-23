@@ -706,6 +706,70 @@ it("ends a review whose install failed instead of offering a retry that cannot w
   expect(again.queryByRole("status")).toBeNull();
 });
 
+const watchedReview = () =>
+  reviewOf({
+    token: "development-token",
+    development: true,
+    manifest: { ...(manifest as AddonManifest), name: "Watched Package" },
+  });
+
+it("holds a watched rebuild's review until the open review closes", async () => {
+  const fresh = reviewOf({ manifest: manifest as AddonManifest });
+  answer({ addon_catalog_review: () => fresh });
+  const dialog = within(await openReview(fresh));
+  await act(async () =>
+    useAddonsStore.setState({ developmentReview: watchedReview() }),
+  );
+  // The review the user is reading does not change under the pointer.
+  expect(
+    screen.getByRole("dialog", { name: "Review Issue Companion" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("dialog", { name: "Review Watched Package" }),
+  ).toBeNull();
+  fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+  expect(
+    await screen.findByRole("dialog", { name: "Review Watched Package" }),
+  ).toBeInTheDocument();
+  expect(addonInvoke).toHaveBeenCalledWith("addon_cancel_review", {
+    token: "review-token",
+  });
+  expect(addonInvoke).not.toHaveBeenCalledWith("addon_cancel_review", {
+    token: "development-token",
+  });
+  expect(useAddonsStore.getState().developmentReview).toBeNull();
+});
+
+it("shows a watched rebuild's review that arrives during an install once it finishes", async () => {
+  const fresh = reviewOf({ manifest: manifest as AddonManifest });
+  let finish!: () => void;
+  answer({
+    addon_catalog_review: () => fresh,
+    addon_accept_review: () =>
+      new Promise((resolve) => {
+        finish = () => resolve(installation);
+      }),
+  });
+  const dialog = within(await openReview(fresh));
+  fireEvent.click(dialog.getByRole("button", { name: "Install & enable" }));
+  await waitFor(() =>
+    expect(addonInvoke).toHaveBeenCalledWith(
+      "addon_accept_review",
+      expect.objectContaining({ token: "review-token" }),
+    ),
+  );
+  await act(async () =>
+    useAddonsStore.setState({ developmentReview: watchedReview() }),
+  );
+  expect(
+    screen.getByRole("dialog", { name: "Review Issue Companion" }),
+  ).toBeInTheDocument();
+  await act(async () => finish());
+  expect(
+    await screen.findByRole("dialog", { name: "Review Watched Package" }),
+  ).toBeInTheDocument();
+});
+
 it("shows each credential's state and clears a stored one", async () => {
   answer({
     addon_settings_get: () => ({ owner: "", repository: "" }),

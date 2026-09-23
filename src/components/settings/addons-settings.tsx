@@ -215,12 +215,16 @@ export function AddonsSettings() {
   useEffect(() => {
     void refreshAddons();
   }, []);
+  // A watched rebuild's review arrives on its own. It waits in the store until
+  // the open review and any operation have finished, so it never replaces
+  // the review under the user's pointer; the store keeps only the newest
+  // one, and the host cancels the one it replaces.
   useEffect(() => {
-    if (state.developmentReview) {
+    if (state.developmentReview && !review && !busy) {
       showReview(state.developmentReview);
       useAddonsStore.setState({ developmentReview: null });
     }
-  }, [state.developmentReview]);
+  }, [state.developmentReview, review, busy]);
   const perform = async (
     action: () => Promise<unknown>,
     options: { revoke?: string; dialog?: boolean } = {},
