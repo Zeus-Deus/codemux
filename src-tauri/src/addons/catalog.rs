@@ -767,6 +767,39 @@ pub(super) mod tests {
         );
     }
     #[tokio::test]
+    async fn release_metadata_that_differs_from_the_package_is_refused_before_review() {
+        let v1 = package("1.0.0");
+        let edits: [fn(&mut Release); 3] = [
+            |release| {
+                release
+                    .capabilities
+                    .permissions
+                    .push(codemux_addon_protocol::manifest::Permission::GitRead)
+            },
+            |release| release.license = "Apache-2.0".into(),
+            |release| release.api = "^1.0".into(),
+        ];
+        for edit in edits {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
+            // The asset matches the listed digest and size; only metadata differs.
+            let mut listed = catalog(1, &[&v1]);
+            edit(&mut listed.plugins[0].releases[0]);
+            let calls = serve(&manager, Some(&listed), &[&v1]);
+            let error = Reviews::default()
+                .prepare_catalog(&manager, "example.hello")
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.message,
+                "Parsed package metadata differs from the reviewed release"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "catalog and asset");
+            assert!(manager.list().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
     async fn refresh_blocks_an_installed_release_with_its_reason() {
         let root = tempfile::tempdir().unwrap();
         let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
@@ -800,6 +833,45 @@ pub(super) mod tests {
         assert!(matches!(reopened.status, Status::BlockedDisabled));
         assert_eq!(reopened.failure, disabled.failure);
         assert!(manager.ensure_active("example.hello").await.is_err());
+    }
+    #[tokio::test]
+    async fn a_block_is_judged_against_the_release_installed_when_it_applies() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
+        let reviews = Reviews::default();
+        let (v1, v2) = (package("1.0.0"), package("2.0.0"));
+        serve(&manager, Some(&catalog(1, &[&v1])), &[&v1]);
+        let installed = install_from_catalog(&manager, &reviews).await;
+        let mut blocked = catalog(2, &[&v1, &v2]);
+        blocked.blocked.push(Blocked {
+            plugin_id: None,
+            sha256: Some(v1.digest.clone()),
+            reason: "Revoked for testing".into(),
+            date: "2026-09-19T00:00:00Z".into(),
+        });
+        serve(&manager, Some(&blocked), &[]);
+        // An update holds the operation lock while the refresh finds v1 blocked.
+        let operation = manager.operation("example.hello").await;
+        let update = operation.lock().await;
+        let refresh = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.browse(true).await.map(|_| ()) }
+        });
+        // apply_blocks has listed v1 once it holds its own handle to the lock.
+        while Arc::strong_count(&operation) < 3 {
+            tokio::task::yield_now().await;
+        }
+        let mut updated = installed.clone();
+        updated.manifest = v2.manifest.clone();
+        updated.digest = v2.digest.clone();
+        updated.data_generation = uuid::Uuid::new_v4().to_string();
+        manager.save(&updated).unwrap();
+        drop(update);
+        refresh.await.unwrap().unwrap();
+        let current = manager.installation("example.hello").unwrap();
+        assert_eq!(current.digest, v2.digest);
+        assert!(matches!(current.status, Status::InstalledDisabled));
+        assert!(current.failure.is_none());
     }
     #[tokio::test]
     async fn background_recheck_is_rate_limited_and_needs_an_installation() {

@@ -1548,7 +1548,7 @@ pub(crate) mod tests {
         assert_eq!(recovery_entries(root.path()), 0);
     }
     #[tokio::test]
-    async fn updates_keep_enablement_and_paused_installs_start_after_resume() {
+    async fn updates_keep_enablement_and_paused_accepts_wait_for_resume() {
         let root = tempfile::tempdir().unwrap();
         let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
         let reviews = Reviews::default();
@@ -1603,7 +1603,26 @@ pub(crate) mod tests {
         // ...unless the user explicitly enables it.
         let (_, updated) = update("4.0.0", true).await;
         assert!(updated.desired_enabled);
-        assert!(manager.ensure_active(&installed.manifest.id).await.is_err());
+        let paused = manager
+            .ensure_active(&installed.manifest.id)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(paused.message, "Add-on is disabled or paused");
+        // After Resume the saved choice is acted on: activation is attempted
+        // (the real start is native_paused_installs_and_updates_start_normally_after_resume).
+        manager.resume().unwrap();
+        let attempted = manager
+            .ensure_active(&installed.manifest.id)
+            .await
+            .err()
+            .unwrap();
+        assert_ne!(attempted.message, paused.message);
+        assert!(manager
+            .installation(&installed.manifest.id)
+            .unwrap()
+            .previous
+            .is_some());
     }
     #[tokio::test]
     async fn update_marks_the_installed_record_updating_until_it_finishes() {

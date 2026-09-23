@@ -2146,6 +2146,160 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_restored_settings_reach_the_probe_and_the_running_add_on() {
+        // Activation fails unless the host serves the restored choice.
+        let source = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('host.request',{operation:'settings.get',params:{}},1);else if(m.id===1&&!m.method){if(m.result['include-files']!==false)throw Error('manifest defaults instead of restored settings');send('ready',{phase:'activated',registrations:['commands/hello']});}});";
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let file = root.path().join("settings.cmxaddon");
+        let package =
+            super::super::lifecycle::tests::package_with_source(source.as_bytes(), |manifest| {
+                manifest
+                    .settings
+                    .push(codemux_addon_protocol::manifest::Setting::Boolean {
+                        id: "include-files".into(),
+                        label: "Include changed filenames".into(),
+                        default: true,
+                    })
+            });
+        std::fs::write(&file, &package.archive).unwrap();
+        let review = reviews.prepare_local(&manager, &file).unwrap();
+        let old = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        let chosen = json!({"include-files": false});
+        manager
+            .set_settings(&old.manifest.id, chosen.clone())
+            .await
+            .unwrap();
+        manager.remove(&old.manifest.id, true).await.unwrap();
+        let review = reviews.prepare_local(&manager, &file).unwrap();
+        assert!(review.retained_data.is_some());
+        let restored = reviews
+            .accept_with_data(&manager, &review.token, true, false, true)
+            .await
+            .expect("probe and activation see the restored settings");
+        let running = manager.running.lock().await.get(&old.manifest.id).cloned();
+        let running = running.expect("the restored add-on is running");
+        assert!(!running.probe);
+        assert_eq!(running.installation_id, restored.installation_id);
+        assert_eq!(*running.settings.lock().unwrap(), chosen);
+        manager.shutdown().await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_paused_installs_and_updates_start_normally_after_resume() {
+        let healthy = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let throws = "__codemuxRegister({}, () => m => {if(m.method==='activate')throw Error('candidate failed');});";
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+        // An incompatible record beside it never blocks the healthy one.
+        let mut future = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        future.id = "example.future".into();
+        future.api = "^2.0.0".into();
+        manager.save(&installed(future)).unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let source = Source::Local {
+            identity: uuid::Uuid::new_v4().to_string(),
+        };
+        manager.pause_all().await;
+        let package =
+            super::super::lifecycle::tests::package_with_source(healthy.as_bytes(), |_| {});
+        let review = reviews.prepare(&manager, package, source.clone()).unwrap();
+        let first = reviews
+            .accept(&manager, &review.token, true, false)
+            .await
+            .unwrap();
+        assert!(
+            manager.running.lock().await.is_empty(),
+            "no probe while paused"
+        );
+        manager.resume().unwrap();
+        // The unclean-exit notice does not outlive a successful start.
+        let mut noticed = manager.installation(&first.manifest.id).unwrap();
+        noticed.failure = Some("CodeMux closed while this add-on was starting.".into());
+        manager.save(&noticed).unwrap();
+        let running = manager.ensure_active(&first.manifest.id).await.unwrap();
+        assert!(!running.probe);
+        let started = manager.installation(&first.manifest.id).unwrap();
+        assert!(matches!(started.status, Status::EnabledRunning));
+        assert!(started.failure.is_none());
+        assert!(matches!(
+            manager.installation("example.future").unwrap().status,
+            Status::IncompatibleDisabled
+        ));
+        // A paused update saves the choice; its first real start can fail, and
+        // the recorded rollback brings back the working release.
+        manager.pause_all().await;
+        let package = super::super::lifecycle::tests::package_with_source(throws.as_bytes(), |m| {
+            m.version = "2.0.0".into()
+        });
+        let review = reviews.prepare(&manager, package, source).unwrap();
+        let update = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        assert!(update.desired_enabled, "an update keeps the enabled choice");
+        manager.resume().unwrap();
+        assert!(manager.ensure_active(&first.manifest.id).await.is_err());
+        let failed = manager.installation(&first.manifest.id).unwrap();
+        assert!(matches!(failed.status, Status::FailedDisabled));
+        assert_eq!(failed.previous.as_ref().unwrap().digest, first.digest);
+        manager.rollback(&first.manifest.id).await.unwrap();
+        let rolled = manager.installation(&first.manifest.id).unwrap();
+        assert_eq!(rolled.digest, first.digest);
+        assert!(matches!(rolled.status, Status::EnabledRunning));
+        assert!(rolled.failure.is_none());
+        manager.shutdown().await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_a_catalog_block_stops_the_running_add_on() {
+        use super::super::catalog::tests::{catalog, serve};
+        let healthy = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let package =
+            super::super::lifecycle::tests::package_with_source(healthy.as_bytes(), |_| {});
+        serve(&manager, Some(&catalog(1, &[&package])), &[&package]);
+        let review = reviews
+            .prepare_catalog(&manager, "example.hello")
+            .await
+            .unwrap();
+        reviews
+            .accept(&manager, &review.token, true, false)
+            .await
+            .unwrap();
+        let running = manager.running.lock().await.get("example.hello").cloned();
+        let running = running.expect("the installed add-on is running");
+        let mut blocked = catalog(2, &[&package]);
+        blocked
+            .blocked
+            .push(codemux_addon_protocol::catalog::Blocked {
+                plugin_id: Some("example.hello".into()),
+                sha256: None,
+                reason: "Withdrawn".into(),
+                date: "2026-09-19T00:00:00Z".into(),
+            });
+        serve(&manager, Some(&blocked), &[]);
+        manager.browse(true).await.unwrap();
+        assert!(manager.running.lock().await.is_empty());
+        assert!(running.cancel.is_cancelled());
+        let current = manager.installation("example.hello").unwrap();
+        assert!(matches!(current.status, Status::BlockedDisabled));
+        assert_eq!(current.failure.as_deref(), Some("Catalog block: Withdrawn"));
+        assert!(manager.ensure_active("example.hello").await.is_err());
+        manager.shutdown().await;
+    }
+    #[tokio::test]
     #[ignore = "Build the independent Project Brief package and host first"]
     async fn native_project_brief_package_uses_installer_git_ui_and_composer_broker() {
         let root = tempfile::tempdir().unwrap();
