@@ -713,6 +713,43 @@ const watchedReview = () =>
     manifest: { ...(manifest as AddonManifest), name: "Watched Package" },
   });
 
+it("says that only Install & enable watches a selected development package", async () => {
+  // The host watches the file only from an accept that enables it; a later
+  // Enable on the row does not start watching.
+  useAddonsStore.setState({ developmentReview: watchedReview() });
+  render(<AddonsSettings />);
+  const dialog = within(
+    await screen.findByRole("dialog", { name: "Review Watched Package" }),
+  );
+  expect(
+    dialog.getByText(/^Development package\. Install & enable also watches/),
+  ).toHaveTextContent(
+    "Installing it disabled, or enabling it later, does not watch the file.",
+  );
+  expect(dialog.queryByText(/Once enabled/)).toBeNull();
+  expect(dialog.getByRole("button", { name: "Install" })).toBeEnabled();
+  expect(
+    dialog.getByRole("button", { name: "Install & enable" }),
+  ).toBeEnabled();
+  // A watched rebuild's own review keeps the watch it already has.
+  fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await act(async () =>
+    useAddonsStore.setState({
+      developmentReview: {
+        ...watchedReview(),
+        token: "reload-token",
+        installed: installedRelease(true),
+      },
+    }),
+  );
+  expect(
+    await screen.findByText(
+      /^Development package\. CodeMux keeps watching this selected file/,
+    ),
+  ).toBeInTheDocument();
+});
+
 it("holds a watched rebuild's review until the open review closes", async () => {
   const fresh = reviewOf({ manifest: manifest as AddonManifest });
   answer({ addon_catalog_review: () => fresh });

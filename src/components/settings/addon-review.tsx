@@ -119,9 +119,24 @@ function ReviewBody({
     <>
       <p className="text-body">{manifest.description}</p>
       {review.development && (
+        // The host starts watching only on an accept that enables the add-on
+        // and stops on disable; a later Enable does not watch the file again.
         <p className="rounded-sm border p-3 text-body">
-          Development package. Once enabled, CodeMux watches this selected file
-          for validated local rebuilds. Permission changes still need review.
+          Development package.{" "}
+          {update ? (
+            <>
+              CodeMux keeps watching this selected file for validated local
+              rebuilds until you disable the add-on or turn off Developer mode.
+            </>
+          ) : (
+            <>
+              Install &amp; enable also watches this selected file for
+              validated local rebuilds until you disable the add-on or turn off
+              Developer mode. Installing it disabled, or enabling it later,
+              does not watch the file.
+            </>
+          )}{" "}
+          Permission changes still need review.
         </p>
       )}
       <div className="grid gap-1 text-body">
