@@ -706,6 +706,46 @@ it("ends a review whose install failed instead of offering a retry that cannot w
   expect(again.queryByRole("status")).toBeNull();
 });
 
+it.each(["dismissing", "installing"])(
+  "returns focus to Install from link / ID after %s the review found from a link",
+  async (close) => {
+    const fresh = reviewOf({ manifest: manifest as AddonManifest });
+    answer({ addon_catalog_review: () => fresh });
+    render(<AddonsSettings />);
+    const opener = screen.getByRole("button", {
+      name: "Install from link / ID",
+    });
+    opener.focus();
+    fireEvent.click(opener);
+    const input = screen.getByRole("textbox", {
+      name: "Add-on install link or ID",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(input));
+    fireEvent.change(input, { target: { value: fresh.manifest.id } });
+    // Enter in the field: the link dialog, and the field with it, goes away
+    // as the review opens.
+    fireEvent.submit(input.closest("form")!);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review Issue Companion",
+    });
+    await waitFor(() =>
+      expect(dialog.contains(document.activeElement)).toBe(true),
+    );
+    await waitFor(() => expect(opener).toBeEnabled());
+    if (close === "dismissing")
+      fireEvent.keyDown(document.activeElement!, {
+        key: "Escape",
+        code: "Escape",
+      });
+    else
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Install & enable" }),
+      );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  },
+);
+
 const watchedReview = () =>
   reviewOf({
     token: "development-token",

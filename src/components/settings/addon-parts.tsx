@@ -12,18 +12,24 @@ import {
 
 // These controlled dialogs have no Radix Trigger. Restore their actual opener,
 // and keep Escape from also reaching the window-level Settings close shortcut.
-export function AddonDialogContent(
-  props: ComponentProps<typeof DialogContent>,
-) {
+export function AddonDialogContent({
+  returnFocus,
+  ...props
+}: ComponentProps<typeof DialogContent> & {
+  /** The opener to restore instead of the element focused as the dialog
+   *  opens, when that element belongs to a dialog this one replaces. */
+  returnFocus?: HTMLElement | null;
+}) {
   const opener = useRef<HTMLElement | null>(null);
   return (
     <DialogContent
       {...props}
       onOpenAutoFocus={() => {
         opener.current =
-          document.activeElement instanceof HTMLElement
+          returnFocus ??
+          (document.activeElement instanceof HTMLElement
             ? document.activeElement
-            : null;
+            : null);
       }}
       onCloseAutoFocus={(event) => {
         event.preventDefault();

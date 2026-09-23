@@ -44,6 +44,7 @@ export function AddonReviewDialog({
   paused,
   problem,
   ended,
+  returnFocus,
   onDismiss,
   onAccept,
 }: {
@@ -53,6 +54,7 @@ export function AddonReviewDialog({
   problem: AddonProblem | null;
   /** The host uses up a review on accept, even when the install then fails. */
   ended: boolean;
+  returnFocus: HTMLElement | null;
   onDismiss: () => void;
   onAccept: (choice: ReviewChoice) => void;
 }) {
@@ -63,7 +65,10 @@ export function AddonReviewDialog({
         if (!open && !busy) onDismiss();
       }}
     >
-      <AddonDialogContent className="max-h-[85vh] overflow-auto sm:max-w-lg">
+      <AddonDialogContent
+        className="max-h-[85vh] overflow-auto sm:max-w-lg"
+        returnFocus={returnFocus}
+      >
         <DialogHeader>
           <DialogTitle>Review {review?.manifest.name}</DialogTitle>
           <DialogDescription>{review && summary(review)}</DialogDescription>

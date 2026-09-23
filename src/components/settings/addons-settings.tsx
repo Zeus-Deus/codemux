@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { PackagePlus, Pause, Puzzle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -208,8 +208,17 @@ export function AddonsSettings() {
   const [tab, setTab] = useState<"installed" | "browse">("installed");
   const [target, setTarget] = useState("");
   const [linkOpen, setLinkOpen] = useState(false);
-  const showReview = (value: AddonReview) => {
+  const linkOpener = useRef<HTMLButtonElement>(null);
+  // Where focus returns when the review closes, when not to the element
+  // focused as it opened: a review found from a link replaces the link
+  // dialog, and what was focused there is gone by then.
+  const [reviewReturn, setReviewReturn] = useState<HTMLElement | null>(null);
+  const showReview = (
+    value: AddonReview,
+    returnFocus: HTMLElement | null = null,
+  ) => {
     setDialogProblem(null);
+    setReviewReturn(returnFocus);
     setReview(value);
   };
   useEffect(() => {
@@ -423,6 +432,7 @@ export function AddonsSettings() {
             </div>
             <div className="flex flex-wrap gap-2">
               <Button
+                ref={linkOpener}
                 variant="outline"
                 disabled={busy}
                 onClick={() => openDialog(() => setLinkOpen(true))}
@@ -614,7 +624,7 @@ export function AddonsSettings() {
                     { target: target.trim() },
                   );
                   setLinkOpen(false);
-                  showReview(found);
+                  showReview(found, linkOpener.current);
                 },
                 { dialog: true },
               );
@@ -641,6 +651,7 @@ export function AddonsSettings() {
         paused={state.paused}
         problem={dialogProblem}
         ended={review !== null && review.token === endedReview}
+        returnFocus={reviewReturn}
         onDismiss={() => {
           if (review)
             void addonInvoke("addon_cancel_review", {
