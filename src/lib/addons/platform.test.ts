@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderHook } from "@testing-library/react";
 vi.mock("./bridge", () => ({
   addonInvoke: vi.fn(),
   addonInventory: vi.fn(),
@@ -6,8 +7,15 @@ vi.mock("./bridge", () => ({
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("sonner", () => ({ toast: { info: vi.fn(), error: vi.fn() } }));
-import { addonInvoke, addonInventory } from "./bridge";
-import { applyAddonEffect, refreshAddons } from "./platform";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { toast } from "sonner";
+import { addonInvoke, addonInventory, subscribeAddons } from "./bridge";
+import {
+  activeAddonWorkspace,
+  applyAddonEffect,
+  refreshAddons,
+  useAddonPlatform,
+} from "./platform";
 import { registerAddonComposer } from "./composer-registry";
 import {
   beginAddonRevocation,
@@ -48,6 +56,14 @@ const event: Extract<AddonEvent, { type: "effect" }> = {
   operation: "composer.appendText",
   params: { workspaceId: "workspace", composerId: "composer", text: "brief" },
 };
+const effect = (
+  operation: string,
+  params: Record<string, unknown>,
+): Extract<AddonEvent, { type: "effect" }> => ({
+  ...event,
+  operation,
+  params: { workspaceId: "workspace", composerId: "composer", ...params },
+});
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((r) => {
@@ -55,6 +71,15 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+const lastResult = () => {
+  const results = vi
+    .mocked(addonInvoke)
+    .mock.calls.filter(([command]) => command === "addon_effect_result");
+  return results[results.length - 1]?.[1] as {
+    value: unknown;
+    error: { message: string } | null;
+  };
+};
 let unregister: () => void;
 const append = vi.fn(() => 1);
 beforeEach(() => {
@@ -74,6 +99,7 @@ beforeEach(() => {
     failures: {},
     revoking: {},
     error: null,
+    accessory: null,
   });
   unregister = registerAddonComposer("composer", {
     workspaceId: "workspace",
@@ -118,6 +144,7 @@ describe("delayed native effect completion", () => {
       "addon_effect_result",
       expect.objectContaining({ error: null, value: 1 }),
     );
+    expect(toast.error).not.toHaveBeenCalled();
   });
   it("does not let an old inventory response restore an enabled installation", async () => {
     const old = deferred<AddonInventory>(),
@@ -133,6 +160,181 @@ describe("delayed native effect completion", () => {
     await first;
     expect(useAddonsStore.getState().paused).toBe(true);
     expect(useAddonsStore.getState().installed).toEqual([]);
+  });
+});
+describe("rejected effects are explained to the user", () => {
+  it.each([
+    [
+      "composer.appendText",
+      { composerId: "closed-composer", text: "brief" },
+      "Fixture couldn't add text to the draft",
+      "This chat composer is no longer available",
+    ],
+    [
+      "composerViews.open",
+      { id: "someone-elses" },
+      "Fixture couldn't open its composer view",
+      "Contribution does not belong to this plugin",
+    ],
+    [
+      "panels.open",
+      { id: "undeclared" },
+      "Fixture couldn't open its panel",
+      "Contribution does not belong to this plugin",
+    ],
+    [
+      "links.open",
+      { url: "http://example.com" },
+      "Fixture couldn't open the link",
+      "Only HTTPS links can be opened",
+    ],
+  ])(
+    "%s: attributed toast with the specific reason, and the plugin gets it too",
+    async (operation, params, title, reason) => {
+      await applyAddonEffect(effect(operation, params));
+      expect(toast.error).toHaveBeenCalledExactlyOnceWith(title, {
+        id: "addon-effect:test.plugin",
+        description: reason,
+      });
+      expect(lastResult().error).toMatchObject({ message: reason });
+      expect(append).not.toHaveBeenCalled();
+      expect(openUrl).not.toHaveBeenCalled();
+    },
+  );
+  it("says the workspace changed when a delayed effect outlives its project", async () => {
+    const claim = deferred<unknown>();
+    vi.mocked(addonInvoke).mockImplementation((command) =>
+      command === "addon_effect_claim" ? claim.promise : Promise.resolve(null),
+    );
+    const pending = applyAddonEffect(event);
+    clearAddonContext();
+    claim.resolve(null);
+    await pending;
+    expect(toast.error).toHaveBeenCalledWith(
+      "Fixture couldn't add text to the draft",
+      expect.objectContaining({ description: "The active workspace changed" }),
+    );
+  });
+  it("names pause-all, not a generic stop, when effects are fenced", async () => {
+    useAddonsStore.setState({ paused: true });
+    await applyAddonEffect(effect("panels.open", { id: "brief" }));
+    expect(toast.error).toHaveBeenCalledWith(
+      "Fixture couldn't open its panel",
+      expect.objectContaining({ description: "Add-ons are paused" }),
+    );
+  });
+  it("explains an expired claim instead of failing silently", async () => {
+    vi.mocked(addonInvoke).mockImplementation((command) =>
+      command === "addon_effect_claim"
+        ? Promise.reject({
+            message: "The add-on action expired",
+            data: { code: "CONTEXT_STALE" },
+          })
+        : Promise.resolve(null),
+    );
+    await applyAddonEffect(effect("panels.open", { id: "brief" }));
+    expect(toast.error).toHaveBeenCalledWith(
+      "Fixture couldn't open its panel",
+      expect.objectContaining({ description: "The add-on action expired" }),
+    );
+  });
+  it("does not raise an error toast for a refused notification", async () => {
+    useAddonsStore.setState({ paused: true });
+    await applyAddonEffect(effect("ui.notify", { message: "hello" }));
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(lastResult().error).not.toBeNull();
+  });
+});
+describe("composer accessory and link effects", () => {
+  it("composerViews.open opens the declared accessory for the bound composer", async () => {
+    await applyAddonEffect(effect("composerViews.open", { id: "issues" }));
+    expect(useAddonsStore.getState().accessory).toEqual({
+      pluginId: "test.plugin",
+      view: "issues",
+      composerId: "composer",
+      workspaceId: "workspace",
+    });
+    expect(lastResult().error).toBeNull();
+  });
+  it("composerViews.open never targets a composer that has closed", async () => {
+    unregister();
+    await applyAddonEffect(effect("composerViews.open", { id: "issues" }));
+    expect(useAddonsStore.getState().accessory).toBeNull();
+    expect(lastResult().error).toMatchObject({
+      data: { code: "NO_COMPOSER" },
+    });
+  });
+  it("links.open attributes the link to the add-on and opens it", async () => {
+    await applyAddonEffect(
+      effect("links.open", { url: "https://example.com/issues/1" }),
+    );
+    expect(toast.info).toHaveBeenCalledWith("Fixture is opening a link", {
+      description: "https://example.com/issues/1",
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith(
+      "https://example.com/issues/1",
+    );
+    expect(lastResult().error).toBeNull();
+  });
+  it("links.open reports a failed system open to the user and the plugin", async () => {
+    vi.mocked(openUrl).mockRejectedValue("No handler");
+    await applyAddonEffect(effect("links.open", { url: "https://example.com" }));
+    expect(toast.error).toHaveBeenCalledWith(
+      "Fixture couldn't open the link",
+      expect.objectContaining({
+        description: "The system could not open the link: No handler",
+      }),
+    );
+    expect(lastResult().error).not.toBeNull();
+  });
+  it("panels.open activates the add-on's own pane in the bound workspace", async () => {
+    useUIStore.setState({ rightPanelPanes: {}, rightPanelTabs: {} });
+    await applyAddonEffect(effect("panels.open", { id: "brief" }));
+    expect(useUIStore.getState().rightPanelTabs.workspace).toBe(
+      "addon:test.plugin:brief",
+    );
+    expect(lastResult().error).toBeNull();
+  });
+});
+describe("remote workspaces and clients", () => {
+  it.each([
+    ["host_id", { host_id: "host-1" }],
+    ["remote_cwd", { remote_cwd: "/srv/project" }],
+    ["attach_only", { attach_only: true }],
+  ])(
+    "a %s workspace exposes no add-on workspace and rejects its effects",
+    async (_, remote) => {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "workspace",
+          workspaces: [{ workspace_id: "workspace", ...remote }],
+        } as unknown as AppStateSnapshot,
+      });
+      useUIStore.setState({ rightPanelPanes: {}, rightPanelTabs: {} });
+      expect(activeAddonWorkspace()).toBeNull();
+      await applyAddonEffect(event);
+      expect(append).not.toHaveBeenCalled();
+      expect(lastResult().error).toMatchObject({
+        data: { code: "CONTEXT_STALE" },
+      });
+      await applyAddonEffect(effect("panels.open", { id: "brief" }));
+      expect(useUIStore.getState().rightPanelTabs.workspace).toBeUndefined();
+      expect(lastResult().error).toMatchObject({
+        data: { code: "CONTEXT_STALE" },
+      });
+    },
+  );
+  it("a browser client never subscribes to add-ons or reads their inventory", () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    try {
+      const hook = renderHook(() => useAddonPlatform());
+      hook.unmount();
+      expect(subscribeAddons).not.toHaveBeenCalled();
+      expect(addonInventory).not.toHaveBeenCalled();
+      expect(addonInvoke).not.toHaveBeenCalled();
+    } finally {
+      delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+    }
   });
 });
 describe("saved add-on pane preferences", () => {
