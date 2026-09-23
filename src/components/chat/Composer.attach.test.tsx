@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -25,7 +26,22 @@ vi.mock("@/tauri/commands", async (importActual) => {
   };
 });
 
+// The add-on broker is native; the composer only needs its registration
+// answer. Views never finish mounting here.
+vi.mock("@/lib/addons/bridge", () => ({
+  addonInvoke: vi.fn().mockResolvedValue(null),
+  mountAddon: vi.fn(() => new Promise(() => {})),
+}));
+vi.mock("@/lib/addons/platform", async (importActual) => ({
+  ...((await importActual()) as Record<string, unknown>),
+  executeAddon: vi.fn(),
+}));
+
 import { Composer } from "./Composer";
+import { addonInvoke } from "@/lib/addons/bridge";
+import { executeAddon } from "@/lib/addons/platform";
+import { useAddonsStore } from "@/stores/addons-store";
+import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import {
   agentChatListSessionMentions,
   getGithubIssueByPath,
@@ -806,5 +822,140 @@ describe("+ menu → Chat…", () => {
     expect(row.getAttribute("data-disabled")).toBe("true");
     fireEvent.click(row);
     expect(listSessionMentionsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("+ menu → Add-ons", () => {
+  const addonInvokeMock = addonInvoke as unknown as ReturnType<typeof vi.fn>;
+  const plugin = {
+    installationId: "installation",
+    manifest: {
+      id: "test.plugin",
+      name: "Fixture Brief",
+      contributes: {
+        commands: [],
+        panels: [],
+        composerActions: [
+          { id: "insert", title: "Add project brief", icon: "file-text" },
+        ],
+        composerViews: [{ id: "issues", title: "Issues", icon: "github" }],
+      },
+    } as unknown as AddonManifest,
+    desiredEnabled: true,
+    status: "enabled-idle",
+  } as AddonInstallation;
+  /** The composer ID this instance registered with the broker. */
+  const registeredId = () =>
+    (
+      addonInvokeMock.mock.calls.find(
+        ([command]) => command === "addon_composer_register",
+      )?.[1] as { composerId: string } | undefined
+    )?.composerId;
+
+  beforeEach(() => {
+    vi.mocked(executeAddon).mockReset();
+    addonInvokeMock.mockReset().mockResolvedValue(null);
+    useAddonsStore.setState({ installed: [plugin], paused: false, accessory: null });
+  });
+  afterEach(() => {
+    useAddonsStore.setState({ installed: [], accessory: null });
+  });
+
+  it("lists the action under Add-ons and runs it for this composer's own draft", async () => {
+    const { getByTestId, findByTestId, getByText, queryByTestId } =
+      renderControlled({ workspaceId: "workspace-1", threadId: "thread-1" });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = await findByTestId("slash-item-addon:test.plugin:insert");
+    // cmdk writes data-disabled="false" on enabled rows.
+    await waitFor(() =>
+      expect(row.getAttribute("data-disabled")).not.toBe("true"),
+    );
+    expect(row).toHaveTextContent("Add project brief");
+    expect(row).toHaveTextContent("Fixture Brief");
+    expect(getByText("Add-ons")).toBeInTheDocument();
+
+    fireEvent.click(row);
+    expect(executeAddon).toHaveBeenCalledExactlyOnceWith(
+      "test.plugin",
+      "insert",
+      "composerActions",
+      registeredId(),
+    );
+    expect(registeredId()).toBeTruthy();
+    // The popup closes; nothing was sent.
+    expect(queryByTestId("slash-item-addon:test.plugin:insert")).toBeNull();
+  });
+
+  it("keeps the row visible but disabled, with the broker's reason", async () => {
+    addonInvokeMock.mockImplementation((command: string) =>
+      command === "addon_composer_register"
+        ? Promise.reject({
+            message: "Add-ons are unavailable in remote workspaces",
+            data: { code: "REMOTE_UNSUPPORTED" },
+          })
+        : Promise.resolve(null),
+    );
+    const { getByTestId, findByText } = renderControlled({
+      workspaceId: "workspace-1",
+      threadId: "thread-1",
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    expect(
+      await findByText("Add-ons are unavailable in remote workspaces · Fixture Brief"),
+    ).toBeInTheDocument();
+    const row = getByTestId("slash-item-addon:test.plugin:insert");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    fireEvent.click(row);
+    expect(executeAddon).not.toHaveBeenCalled();
+  });
+
+  it("adds no group when no add-on contributes an action", () => {
+    useAddonsStore.setState({ installed: [] });
+    const { getByTestId, queryByText } = renderControlled({
+      workspaceId: "workspace-1",
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    expect(queryByText("Add-ons")).toBeNull();
+  });
+
+  it("opens the accessory between the draft and the footer, and only for this composer", async () => {
+    const { getByTestId, queryByRole, findByRole } = renderControlled({
+      workspaceId: "workspace-1",
+      threadId: "thread-1",
+    });
+    await waitFor(() => expect(registeredId()).toBeTruthy());
+    // No accessory: the footer follows the draft directly, no empty wrapper.
+    expect(getByTestId("composer-body").nextElementSibling).toBe(
+      getByTestId("composer-controls-row"),
+    );
+    act(() => {
+      useAddonsStore.setState({
+        accessory: {
+          pluginId: "test.plugin",
+          view: "issues",
+          composerId: "someone-else",
+          workspaceId: "workspace-1",
+        },
+      });
+    });
+    expect(queryByRole("region", { name: "Issues — Fixture Brief" })).toBeNull();
+    act(() => {
+      useAddonsStore.setState({
+        accessory: {
+          pluginId: "test.plugin",
+          view: "issues",
+          composerId: registeredId()!,
+          workspaceId: "workspace-1",
+        },
+      });
+    });
+    const region = await findByRole("region", { name: "Issues — Fixture Brief" });
+    expect(getByTestId("composer-body").nextElementSibling).toBe(region);
+    expect(region.nextElementSibling).toBe(getByTestId("composer-controls-row"));
+    fireEvent.click(getByTestId("composer-addon-accessory").querySelector("button")!);
+    expect(useAddonsStore.getState().accessory).toBeNull();
+    expect(getByTestId("composer-body").nextElementSibling).toBe(
+      getByTestId("composer-controls-row"),
+    );
   });
 });

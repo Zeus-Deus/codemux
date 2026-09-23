@@ -476,7 +476,7 @@ export function Composer({
   const connectionStatus = useRemoteConnectionStore(s => s.status);
   const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
   const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
-  const addonActions = useAddonComposerActions(addonComposer.id, addonComposer.registered);
+  const addonActions = useAddonComposerActions(addonComposer);
   const configurationEnabled = sessionReady && configurationReady;
   // Named apart from the `provider` prop above, which is the AI agent
   // backend (claude/codex/…) — a different axis entirely.
@@ -3454,7 +3454,7 @@ export function Composer({
               Drop images to attach
             </div>
           ) : null}
-          <ComposerAddonAccessory composerId={addonComposer.id} />
+          <ComposerAddonAccessory composerId={addonComposer.id} onClose={() => textareaRef.current?.focus()} />
           <ComposerFooter
             provider={provider}
             model={model}
