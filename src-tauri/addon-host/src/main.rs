@@ -39,7 +39,32 @@ fn write(bytes: &[u8]) -> Result<(), &'static str> {
 fn emit(value: &impl serde::Serialize) -> Result<(), &'static str> {
     write(&encode(value)?)
 }
+/// Closes descriptors inherited from the app before any thread or plugin code
+/// exists. Doing it here keeps the parent on its fast spawn path.
+#[cfg(target_os = "linux")]
+fn close_inherited() {
+    // SAFETY: nothing in this process owns a descriptor above 2 yet.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+            // Kernels before 5.9: close a bounded descriptor range.
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let end = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                limit.rlim_cur.min(65536) as libc::c_int
+            } else {
+                65536
+            };
+            for fd in 3..end {
+                libc::close(fd);
+            }
+        }
+    }
+}
 fn main() {
+    #[cfg(target_os = "linux")]
+    close_inherited();
     // Every reason is a fixed host string; the supervisor accepts only known ones.
     if let Err(error) = run() {
         eprintln!("Plugin host stopped: {error}");

@@ -432,3 +432,32 @@ fn oversized_requests_are_answered_and_oversized_batches_stop_the_host() {
         "Plugin host stopped: Outgoing frame limit"
     );
 }
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_descriptors_are_closed_before_plugin_code_runs() {
+    // The shell leaves descriptor 9 open across exec, as a launcher might.
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "exec 9</dev/null; exec \"$0\"",
+        env!("CARGO_BIN_EXE_codemux-addon-host"),
+    ]);
+    let mut host = Host::with(command, "__codemuxRegister({},()=>()=>{});");
+    host.receive();
+    host.call(1, "activate", json!({}));
+    assert!(host.yielded(1));
+    let mut descriptors: Vec<u32> = std::fs::read_dir(format!("/proc/{}/fd", host.child.id()))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    descriptors.sort_unstable();
+    assert_eq!(descriptors, [0, 1, 2]);
+}

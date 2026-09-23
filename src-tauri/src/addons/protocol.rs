@@ -127,36 +127,8 @@ impl Host {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // Close unrelated inherited descriptors at exec. Only async-signal-safe
-        // system calls run between fork and exec. CLOEXEC (not close) keeps the
-        // standard library's exec-failure pipe working.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            command.pre_exec(|| {
-                if libc::syscall(
-                    libc::SYS_close_range,
-                    3u32,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                ) != 0
-                {
-                    // Kernels before 5.11: mark a bounded descriptor range.
-                    let mut limit = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    let end = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-                        limit.rlim_cur.min(65536) as libc::c_int
-                    } else {
-                        65536
-                    };
-                    for fd in 3..end {
-                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
-                }
-                Ok(())
-            });
-        }
+        // The host closes unrelated inherited descriptors itself before it
+        // starts, so this spawn keeps the fast path instead of forking the app.
         #[cfg(windows)]
         {
             if let Some(value) = std::env::var_os("SystemRoot") {
@@ -531,40 +503,6 @@ mod tests {
                 );
             }
         }
-    }
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn inherited_descriptors_are_closed_before_the_host_runs() {
-        use std::os::fd::AsRawFd;
-        let root = tempfile::tempdir().unwrap();
-        let leaked = std::fs::File::create(root.path().join("leaked")).unwrap();
-        assert_eq!(
-            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
-            0
-        );
-        let listing = root.path().join("descriptors");
-        let executable = script(
-            root.path(),
-            "listing-host",
-            &format!(
-                "/bin/ls /proc/self/fd > {}.tmp\n/bin/mv {0}.tmp {0}\nexec /bin/sleep 60",
-                listing.display()
-            ),
-        );
-        let (host, _events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
-        let until = Instant::now() + Duration::from_secs(2);
-        while !listing.exists() {
-            assert!(Instant::now() < until, "fake host did not list descriptors");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(host.stop().await);
-        // Standard streams plus the directory handle ls opens for the listing.
-        let descriptors = std::fs::read_to_string(&listing).unwrap();
-        assert_eq!(
-            descriptors.split_whitespace().collect::<Vec<_>>(),
-            ["0", "1", "2", "3"]
-        );
-        drop(leaked);
     }
     #[tokio::test]
     async fn unresponsive_child_is_reaped_inside_the_fault_and_shutdown_deadlines() {
