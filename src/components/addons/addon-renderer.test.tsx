@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { AddonNode } from "@/lib/addons/types";
-import { AddonRenderer } from "./addon-renderer";
+import { ADDON_ICON_NAMES, AddonRenderer } from "./addon-renderer";
 afterEach(cleanup);
 const node = (
   id: string,
@@ -194,5 +197,215 @@ describe("trusted add-on rendering", () => {
       "100",
     );
     expect(screen.getAllByRole("row")[1]).toHaveTextContent("98");
+  });
+  it("gives a labelled list or table its own accessible name", () => {
+    render(
+      <AddonRenderer
+        nodes={[
+          node("list", "cmx-list", { label: "Changed paths", items: ["a"] }),
+          node("table", "cmx-table", {
+            label: "Open issues",
+            headers: ["Title"],
+            rows: [["Crash"]],
+          }),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("list", { name: "Changed paths" })).toBeTruthy();
+    expect(screen.getByRole("table", { name: "Open issues" })).toBeTruthy();
+  });
+});
+
+describe("trusted adapters use CodeMux controls", () => {
+  it("renders Switch as the app's switch, labelled and keyboard operable", async () => {
+    const event = vi.fn();
+    render(
+      <AddonRenderer
+        nodes={[
+          node("switch", "cmx-switch", { label: "Include paths", checked: false }),
+          node("checkbox", "cmx-checkbox", { label: "Remember", checked: true }),
+        ]}
+        event={event}
+        link={vi.fn()}
+      />,
+    );
+    const toggle = screen.getByRole("switch", { name: "Include paths" });
+    expect(toggle).toHaveAttribute("data-slot", "switch");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    // A checkbox stays a checkbox; only Switch changed.
+    expect(screen.getByRole("checkbox", { name: "Remember" })).toBeChecked();
+    toggle.focus();
+    await userEvent.keyboard(" ");
+    expect(event).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "switch" }),
+      "change",
+      true,
+    );
+  });
+  it("maps Button, Badge and Divider to the shared components", () => {
+    const { container } = render(
+      <AddonRenderer
+        nodes={[
+          node("button", "cmx-button", { label: "Refresh" }),
+          node("danger", "cmx-button", { label: "Delete", color: "danger" }),
+          node("badge", "cmx-badge", {}, [text("3 open")]),
+          node("divider", "cmx-divider"),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    expect(refresh).toHaveAttribute("data-slot", "button");
+    expect(refresh).toHaveAttribute("data-variant", "outline");
+    expect(screen.getByRole("button", { name: "Delete" })).toHaveAttribute(
+      "data-variant",
+      "destructive",
+    );
+    expect(screen.getByText("3 open")).toHaveAttribute("data-slot", "badge");
+    expect(container.querySelector('[data-slot="separator"]')).not.toBeNull();
+  });
+  it("renders every allowlisted icon name with its own glyph", () => {
+    // The generated manifest schema carries the validators' icon list
+    // (manifest::ICONS); the renderer must know every name on it.
+    const schema = JSON.parse(
+      readFileSync(
+        resolve(process.cwd(), "packages/plugin-sdk/schema/manifest.json"),
+        "utf8",
+      ),
+    ) as {
+      definitions: { View: { properties: { icon: { enum: string[] } } } };
+    };
+    const allowed = schema.definitions.View.properties.icon.enum;
+    expect([...ADDON_ICON_NAMES].sort()).toEqual([...allowed].sort());
+    const { container } = render(
+      <AddonRenderer
+        nodes={allowed.map((name) => node(name, "cmx-icon", { name }))}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const glyphs = [...container.querySelectorAll("svg")].map(
+      (svg) => svg.getAttribute("class") ?? "",
+    );
+    expect(glyphs).toHaveLength(allowed.length);
+    allowed.forEach((name, index) =>
+      expect(glyphs[index]).toContain(`lucide-${name}`),
+    );
+  });
+  it("shows Markdown links as text when the add-on may not open links", () => {
+    render(
+      <AddonRenderer
+        nodes={[
+          node("markdown", "cmx-markdown", {}, [
+            text("[Docs](https://example.com)"),
+          ]),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+        linksAllowed={false}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Docs" })).toBeNull();
+    expect(screen.getByText("Docs")).toBeTruthy();
+  });
+});
+
+describe("text fields keep what the user types", () => {
+  const field = (properties: Record<string, unknown>) =>
+    node("field", "cmx-text-field", { label: "Query", ...properties });
+  function setup(properties: Record<string, unknown>, element = "cmx-text-field") {
+    const event = vi.fn();
+    const view = render(
+      <AddonRenderer
+        nodes={[{ ...field(properties), element }]}
+        event={event}
+        link={vi.fn()}
+      />,
+    );
+    const echo = (value: string) =>
+      view.rerender(
+        <AddonRenderer
+          nodes={[{ ...field({ ...properties, value }), element }]}
+          event={event}
+          link={vi.fn()}
+        />,
+      );
+    return {
+      event,
+      echo,
+      input: screen.getByRole("textbox", { name: "Query" }) as
+        | HTMLInputElement
+        | HTMLTextAreaElement,
+    };
+  }
+  const sent = (event: ReturnType<typeof vi.fn>) =>
+    event.mock.calls.map(([, , value]) => value);
+  it("holds typed text before the add-on echoes it", async () => {
+    const { input, event } = setup({ value: "" });
+    await userEvent.type(input, "abc");
+    expect(input.value).toBe("abc");
+    expect(sent(event)).toEqual(["a", "ab", "abc"]);
+  });
+  it("ignores late echoes of earlier keystrokes during a fast burst", async () => {
+    const { input, event, echo } = setup({ value: "" });
+    await userEvent.type(input, "abcd");
+    // The add-on's round trip lags behind: its echoes arrive one by one.
+    echo("a");
+    expect(input.value).toBe("abcd");
+    echo("abc");
+    expect(input.value).toBe("abcd");
+    await userEvent.type(input, "e");
+    echo("abcd");
+    expect(input.value).toBe("abcde");
+    expect(sent(event)).toEqual(["a", "ab", "abc", "abcd", "abcde"]);
+  });
+  it("keeps the caret for a mid-string edit and its echo", async () => {
+    const { input, echo } = setup({ value: "helo world" });
+    input.focus();
+    input.setSelectionRange(3, 3);
+    await userEvent.keyboard("l");
+    expect(input.value).toBe("hello world");
+    expect(input.selectionStart).toBe(4);
+    echo("hello world");
+    expect(input.value).toBe("hello world");
+    expect(input.selectionStart).toBe(4);
+  });
+  it("takes a value the add-on sets itself and keeps the caret there", async () => {
+    const { input, echo } = setup({ value: "hello world" });
+    input.focus();
+    input.setSelectionRange(5, 5);
+    echo("HELLO world");
+    expect(input.value).toBe("HELLO world");
+    expect(input.selectionStart).toBe(5);
+    // Clearing after a submit is a value the field never reported.
+    await userEvent.type(input, "!");
+    echo("");
+    expect(input.value).toBe("");
+  });
+  it("works uncontrolled when the add-on omits value", async () => {
+    const { input, event } = setup({}, "cmx-text-area");
+    expect(input.tagName).toBe("TEXTAREA");
+    await userEvent.type(input, "notes");
+    expect(input.value).toBe("notes");
+    expect(event).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "field" }),
+      "change",
+      "notes",
+    );
+  });
+  it("does not send text over the broker's 32 KiB event limit", () => {
+    const { input, event } = setup({ value: "" });
+    fireEvent.change(input, { target: { value: "é".repeat(16385) } });
+    expect(event).not.toHaveBeenCalled();
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(
+      screen.getByText(/too long to send to the add-on/),
+    ).toBeTruthy();
+    fireEvent.change(input, { target: { value: "short" } });
+    expect(sent(event)).toEqual(["short"]);
+    expect(input).not.toHaveAttribute("aria-invalid");
   });
 });
