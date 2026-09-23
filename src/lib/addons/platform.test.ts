@@ -189,6 +189,12 @@ describe("rejected effects are explained to the user", () => {
       "Fixture couldn't open the link",
       "Only HTTPS links can be opened",
     ],
+    [
+      "links.open",
+      { url: "https://user:secret@example.com/" },
+      "Fixture couldn't open the link",
+      "Only HTTPS links can be opened",
+    ],
   ])(
     "%s: attributed toast with the specific reason, and the plugin gets it too",
     async (operation, params, title, reason) => {
@@ -269,6 +275,21 @@ describe("composer accessory and link effects", () => {
     await applyAddonEffect(
       effect("links.open", { url: "https://example.com/issues/1" }),
     );
+    expect(toast.info).toHaveBeenCalledWith("Fixture is opening a link", {
+      description: "https://example.com/issues/1",
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith(
+      "https://example.com/issues/1",
+    );
+    expect(lastResult().error).toBeNull();
+  });
+  it("links.open accepts any link the broker accepts and opens its normalized form", async () => {
+    // The broker parses the URL, so the scheme's case and surrounding spaces
+    // do not matter there; they must not be refused here either.
+    await applyAddonEffect(
+      effect("links.open", { url: " HTTPS://Example.com/issues/1 " }),
+    );
+    expect(toast.error).not.toHaveBeenCalled();
     expect(toast.info).toHaveBeenCalledWith("Fixture is opening a link", {
       description: "https://example.com/issues/1",
     });

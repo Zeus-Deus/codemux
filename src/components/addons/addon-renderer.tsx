@@ -294,6 +294,14 @@ function VirtualRows({
     </div>
   );
 }
+/** Whether a Markdown link is one the broker may open (it checks again). */
+function httpsHref(href: string | undefined): boolean {
+  try {
+    return new URL(href ?? "").protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 function plainText(node: AddonNode): string {
   return node.type === 3
     ? (node.data ?? "")
@@ -393,7 +401,7 @@ export function AddonRenderer({
                     <button
                       type="button"
                       className="underline underline-offset-2"
-                      disabled={!href?.startsWith("https://")}
+                      disabled={!httpsHref(href)}
                       onClick={() => href && link(node, href)}
                     >
                       {children}

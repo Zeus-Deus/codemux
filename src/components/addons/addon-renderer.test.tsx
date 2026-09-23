@@ -311,6 +311,26 @@ describe("trusted adapters use CodeMux controls", () => {
     expect(screen.queryByRole("button", { name: "Docs" })).toBeNull();
     expect(screen.getByText("Docs")).toBeTruthy();
   });
+  it("opens a Markdown link whatever the case of its https scheme", () => {
+    const link = vi.fn();
+    render(
+      <AddonRenderer
+        nodes={[
+          node("markdown", "cmx-markdown", {}, [
+            text("[Docs](HTTPS://example.com/docs) and [Plain](http://example.com)"),
+          ]),
+        ]}
+        event={vi.fn()}
+        link={link}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Plain" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Docs" }));
+    expect(link).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "markdown" }),
+      "HTTPS://example.com/docs",
+    );
+  });
 });
 
 describe("text fields keep what the user types", () => {

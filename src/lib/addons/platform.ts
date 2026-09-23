@@ -103,6 +103,21 @@ function pluginName(id: string): string {
       ?.manifest.name ?? id
   );
 }
+/** The normalized URL when it is an HTTPS link with a host and no user
+ *  info, as the broker accepts it; otherwise null. */
+function httpsLink(value: unknown): string | null {
+  try {
+    const url = new URL(String(value).trim());
+    return url.protocol === "https:" &&
+      url.hostname &&
+      !url.username &&
+      !url.password
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
 function declares(
   installation: AddonInstallation,
   kind: "panels" | "composerViews",
@@ -186,8 +201,8 @@ export async function applyAddonEffect(
           );
         break;
       case "links.open": {
-        const url = String(p.url);
-        if (!url.startsWith("https://"))
+        const url = httpsLink(p.url);
+        if (!url)
           throw addonError("NETWORK_DENIED", "Only HTTPS links can be opened");
         toast.info(`${installation.manifest.name} is opening a link`, {
           description: url,
