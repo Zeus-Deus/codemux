@@ -54,9 +54,67 @@ pub(super) fn queue(
         [&installation.installation_id],
     )
     .map_err(|_| unavailable())?;
-    tx.execute(
-        "DELETE FROM settings WHERE installation=?1",
-        [&installation.installation_id],
+    // Settings are private data: "Keep data for reinstall" keeps them with
+    // the orphaned installation until a matching-source restore claims them.
+    if !keep_data {
+        tx.execute(
+            "DELETE FROM settings WHERE installation=?1",
+            [&installation.installation_id],
+        )
+        .map_err(|_| unavailable())?;
+    }
+    Ok(())
+}
+/// Copy retained settings to the installation that confirmed the restore,
+/// keeping only values the new manifest still declares and accepts.
+pub(super) fn restore_settings(
+    db: &rusqlite::Connection,
+    retained: &Installation,
+    candidate: &Installation,
+) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let saved: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE installation=?1",
+            [&retained.installation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| unavailable())?;
+    let Some(saved) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) else {
+        return Ok(());
+    };
+    let values: serde_json::Map<_, _> = candidate
+        .manifest
+        .settings
+        .iter()
+        .filter_map(|setting| {
+            saved
+                .get(setting.id())
+                .filter(|value| setting.accepts(value))
+                .map(|value| (setting.id().to_owned(), value.clone()))
+        })
+        .collect();
+    db.execute(
+        "INSERT OR REPLACE INTO settings(installation,value) VALUES(?1,?2)",
+        rusqlite::params![
+            candidate.installation_id,
+            serde_json::Value::Object(values).to_string()
+        ],
+    )
+    .map_err(|_| unavailable())?;
+    Ok(())
+}
+/// Drop the settings row of a candidate installation that never took over.
+/// Keep it while a record or a retained-data orphan still uses that ID, as a
+/// same-installation update or rollback does.
+pub(super) fn discard_candidate_settings(
+    db: &rusqlite::Connection,
+    installation: &str,
+) -> Result<()> {
+    db.execute(
+        "DELETE FROM settings WHERE installation=?1 AND NOT EXISTS(SELECT 1 FROM installations WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM metadata WHERE key='orphan:'||?1)",
+        [installation],
     )
     .map_err(|_| unavailable())?;
     Ok(())

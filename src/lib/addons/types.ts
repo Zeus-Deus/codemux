@@ -46,6 +46,22 @@ export interface AddonManifest {
 export type AddonSource =
   | { kind: "local"; identity: string }
   | { kind: "catalog"; publisher: string; repository: string };
+/** Reviewed catalog identity; `tier` and `listed` come from the cached catalog. */
+export interface AddonListing {
+  publisher: string;
+  repository: string;
+  tier: "official" | "community" | null;
+  /** null when no usable cached catalog says either way (absent or damaged). */
+  listed: boolean | null;
+}
+export interface AddonCompatibility {
+  api: string;
+  hostApi: string;
+  platforms: string[];
+  platform: string | null;
+  compatible: boolean;
+  reason: string | null;
+}
 export interface AddonInstallation {
   installationId: string;
   manifest: AddonManifest;
@@ -65,6 +81,11 @@ export interface AddonInstallation {
     | "removing";
   failure: string | null;
   previous: { manifest: AddonManifest } | null;
+  /** Newer compatible, unblocked catalog version from the cached snapshot. */
+  updateAvailable?: string | null;
+  /** Present for catalog-source installations only. */
+  catalog?: AddonListing | null;
+  compatibility?: AddonCompatibility;
 }
 /**
  * Host-owned state of one declared credential; never the secret itself.
@@ -86,6 +107,10 @@ export interface AddonInventory {
   developmentPackage?: string | null;
   /** Plugin ID -> declared credential ID -> state. */
   credentialStates?: Record<string, Record<string, AddonCredentialState>>;
+  /** Set when the registry could not be opened; `addon_registry_reset` recovers it. */
+  registryError?: { path: string; cause: string } | null;
+  /** Plugin IDs whose activation an unclean exit interrupted; cleared by Resume. */
+  interruptedActivations?: string[];
 }
 export interface AddonError {
   message: string;
@@ -128,16 +153,45 @@ export interface AddonMount {
   viewId: string;
   generation: string;
 }
+export interface AddonAccess {
+  permissions: string[];
+  http: { origin: string; methods: string[] }[];
+  credentials: { id: string; label: string; origin: string }[];
+}
 export interface AddonReview {
   token: string;
   manifest: AddonManifest;
   digest: string;
   source: AddonSource;
   replacesSource: boolean;
+  /** True only when `added` is non-empty. */
   expandsAccess: boolean;
   compressedBytes: number;
   development?: boolean;
   retainedData?: { version: string } | null;
+  /** The currently installed release, when this review updates or replaces it. */
+  installed?: {
+    version: string;
+    digest: string;
+    source: AddonSource;
+    desiredEnabled: boolean;
+    capabilities: {
+      permissions: string[];
+      http: AddonManifest["http"];
+      credentials: AddonManifest["credentials"];
+    };
+  } | null;
+  /** Access the candidate adds; all of it for a new installation or a source replacement. */
+  added?: AddonAccess;
+  /** Access the installed release has and the candidate drops. */
+  removed?: AddonAccess;
+  catalog?: AddonListing | null;
+}
+export interface AddonUpdateCheck {
+  upToDate: boolean;
+  installedVersion: string;
+  availableVersion: string | null;
+  review: AddonReview | null;
 }
 /** `addon_diagnostics` log entry. Plugin log text is never kept. */
 export interface AddonLogEntry {
