@@ -39,22 +39,29 @@ fn next_hop(
     }
     Ok(next)
 }
+/// Resolve a hop once; the connection is pinned to these addresses, all public.
+async fn public_addresses(url: &url::Url) -> Result<(String, Vec<std::net::SocketAddr>)> {
+    let host = url.host_str().ok_or_else(unavailable)?.to_owned();
+    // host_str keeps an IPv6 literal's brackets, which no resolver accepts.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addresses = tokio::net::lookup_host((bare, 443))
+        .await
+        .map_err(|_| unavailable())?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|a| !super::http::public_address(a.ip()))
+    {
+        return Err(unavailable());
+    }
+    Ok((host, addresses))
+}
 pub async fn download(start: &str, maximum: usize, assets: bool) -> Result<Vec<u8>> {
     let work = async {
         let mut url = url::Url::parse(start).map_err(|_| unavailable())?;
         for hop in 0..=3 {
-            let host = url.host_str().ok_or_else(unavailable)?.to_owned();
-            let addresses = tokio::net::lookup_host((host.as_str(), 443))
-                .await
-                .map_err(|_| unavailable())?
-                .collect::<Vec<_>>();
-            if addresses.is_empty()
-                || addresses
-                    .iter()
-                    .any(|a| !super::http::public_address(a.ip()))
-            {
-                return Err(unavailable());
-            }
+            let (host, addresses) = public_addresses(&url).await?;
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -138,6 +145,19 @@ mod tests {
     }
     #[tokio::test]
     async fn non_public_addresses_are_refused_before_connecting() {
+        // Literals resolve without DNS, so both families reach the address check.
+        for url in ["https://1.1.1.1/", "https://[2606:4700:4700::1111]/"] {
+            let url = url::Url::parse(url).unwrap();
+            assert_eq!(public_addresses(&url).await.unwrap().1.len(), 1, "{url}");
+        }
+        for url in [
+            "https://[::1]/",
+            "https://[fd00::1]/",
+            "https://[::ffff:10.0.0.1]/",
+        ] {
+            let url = url::Url::parse(url).unwrap();
+            assert!(public_addresses(&url).await.is_err(), "{url}");
+        }
         for url in [
             "https://127.0.0.1/addons/catalog-v1.json",
             "https://[::1]/addons/catalog-v1.json",
