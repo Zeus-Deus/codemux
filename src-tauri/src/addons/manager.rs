@@ -8,7 +8,11 @@ use super::{
     workspace::Workspace,
     ErrorCode, Manifest, ProtocolError, Result,
 };
-use codemux_addon_protocol::{limits, manifest::Permission, ui::Tree};
+use codemux_addon_protocol::{
+    limits,
+    manifest::{Permission, Platform},
+    ui::Tree,
+};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +55,31 @@ pub struct Installation {
     #[serde(default)]
     pub previous: Option<super::lifecycle::Previous>,
 }
+/// The plugin API this app provides.
+pub const HOST_API: semver::Version = semver::Version::new(1, 0, 0);
+/// Compatibility explanation for the Settings detail view.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Compatibility {
+    pub api: String,
+    pub host_api: String,
+    pub platforms: Vec<Platform>,
+    pub platform: Option<Platform>,
+    pub compatible: bool,
+    pub reason: Option<String>,
+}
+/// Structural manifest validation that tolerates another API range. A stored
+/// package for an unsupported API is a valid, inert record, not corruption.
+fn structural(manifest: &Manifest) -> Result<()> {
+    match manifest.validate(None) {
+        Err(error) if error.data.code == ErrorCode::IncompatibleApi => {
+            let mut supported = manifest.clone();
+            supported.api = format!("^{HOST_API}");
+            supported.validate(None)
+        }
+        result => result,
+    }
+}
 impl Installation {
     pub(super) fn validate_record(&self) -> Result<()> {
         fn uuid(value: &str) -> bool {
@@ -68,7 +97,7 @@ impl Installation {
                 "Invalid add-on registry identity; plugins are paused",
             ));
         }
-        self.manifest.validate(None)?;
+        structural(&self.manifest)?;
         if let Some(previous) = &self.previous {
             if !uuid(&previous.data_generation)
                 || !digest(&previous.digest)
@@ -80,9 +109,73 @@ impl Installation {
                     "Invalid add-on recovery snapshot",
                 ));
             }
-            previous.manifest.validate(None)?;
+            structural(&previous.manifest)?;
         }
         Ok(())
+    }
+    pub fn compatibility(&self) -> Compatibility {
+        let name = |p: &Platform| {
+            serde_json::to_value(p)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let platform = super::catalog::platform().ok();
+        let reason = if !semver::VersionReq::parse(&self.manifest.api)
+            .is_ok_and(|range| range.matches(&HOST_API))
+        {
+            Some(format!(
+                "Requires plugin API {}; this CodeMux supports {HOST_API}",
+                self.manifest.api
+            ))
+        } else if let Some(platform) = platform {
+            (!self.manifest.platforms.contains(&platform)).then(|| {
+                format!(
+                    "Built for {}; this device is {}",
+                    self.manifest
+                        .platforms
+                        .iter()
+                        .map(name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    name(&platform)
+                )
+            })
+        } else {
+            Some("Add-ons are unsupported on this platform".into())
+        };
+        Compatibility {
+            api: self.manifest.api.clone(),
+            host_api: HOST_API.to_string(),
+            platforms: self.manifest.platforms.clone(),
+            platform,
+            compatible: reason.is_none(),
+            reason,
+        }
+    }
+    /// Derive incompatible-disabled from the running app instead of storing
+    /// it, so an app upgrade or downgrade re-evaluates every record.
+    fn with_compatibility(mut self) -> Self {
+        if matches!(self.status, Status::BlockedDisabled | Status::Removing) {
+            return self;
+        }
+        match self.compatibility().reason {
+            Some(reason) => {
+                self.status = Status::IncompatibleDisabled;
+                self.failure = Some(reason);
+            }
+            None if matches!(self.status, Status::IncompatibleDisabled) => {
+                self.status = if self.desired_enabled {
+                    Status::EnabledIdle
+                } else {
+                    Status::InstalledDisabled
+                };
+                self.failure = None;
+            }
+            None => {}
+        }
+        self
     }
 }
 #[derive(Clone, Serialize)]
@@ -164,6 +257,7 @@ pub struct Manager {
     pub credentials: Credentials,
     pub contexts: Mutex<Contexts>,
     pub(super) catalog_serial: Mutex<()>,
+    pub(super) catalog: super::catalog::CatalogState,
     running: Arc<Mutex<HashMap<String, Arc<Running>>>>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     effects: Mutex<HashMap<String, PendingEffect>>,
@@ -211,7 +305,10 @@ impl Manager {
                 uuid::Uuid::parse_str(installation).is_err()
                     || !codemux_addon_protocol::catalog::hex(id, 64)
             }) {
-                return Err(ProtocolError::invalid("Invalid credential index"));
+                return Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "The add-on credential index is damaged",
+                ));
             }
             entries
         };
@@ -229,6 +326,7 @@ impl Manager {
             credentials: Credentials::with_configured(configured_credentials),
             contexts: Mutex::new(Contexts::default()),
             catalog_serial: Mutex::new(()),
+            catalog: Default::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
             operations: Mutex::new(HashMap::new()),
             effects: Mutex::new(HashMap::new()),
@@ -239,6 +337,7 @@ impl Manager {
             ),
         });
         manager.recover()?;
+        manager.finish_removals()?;
         manager.recover_session()?;
         manager.prune_unreferenced()?;
         Ok(manager)
@@ -275,7 +374,7 @@ impl Manager {
                     )
                 })?;
             record.validate_record()?;
-            list.push(record);
+            list.push(record.with_compatibility());
         }
         Ok(list)
     }
@@ -426,6 +525,11 @@ impl Manager {
         })?;
         let storage = Storage::open(&state.join("state.sqlite"))?;
         let settings = self.settings(&installation)?;
+        if !probe {
+            let mut activating = installation.clone();
+            activating.status = Status::Activating;
+            self.save(&activating)?;
+        }
         self.registry
             .lock()
             .unwrap()
@@ -435,7 +539,20 @@ impl Manager {
             )
             .map_err(storage_error)?;
         let (host, mut events) =
-            Host::spawn(&self.host_path, &installation.manifest, &source).await?;
+            match Host::spawn(&self.host_path, &installation.manifest, &source).await {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    // No child started: not an unclean exit, and not starting.
+                    let _ = self.registry.lock().unwrap().execute(
+                        "DELETE FROM metadata WHERE key=?1",
+                        [format!("activation:{}", installation.manifest.id)],
+                    );
+                    if !probe {
+                        let _ = self.save(&installation);
+                    }
+                    return Err(error);
+                }
+            };
         let running = Arc::new(Running {
             host,
             manifest: installation.manifest.clone(),
@@ -482,10 +599,10 @@ impl Manager {
                    if message.method.as_deref()==Some("ready")&&message.params.as_ref().is_some_and(|p|p["phase"]=="activated"){
                     let declarations=&instance.manifest.contributes;let mut expected=Vec::new();for c in &declarations.commands{expected.push(format!("commands/{}",c.id))}for (kind,views) in [("panels",&declarations.panels),("composerActions",&declarations.composer_actions),("composerViews",&declarations.composer_views)]{for v in views{expected.push(format!("{kind}/{}",v.id))}}expected.sort();
                     let mut actual:Vec<String>=serde_json::from_value(message.params.unwrap()["registrations"].clone()).unwrap_or_default();actual.sort();
-                    if actual!=expected{Err(ProtocolError::invalid("Plugin registration does not match its manifest"))}else{instance.activated.store(true,Ordering::Release);if let Some(ready)=ready.take(){let _=ready.send(());}Ok(())}
+                    if actual!=expected{Err(ProtocolError::invalid("Plugin registration does not match its manifest"))}else{instance.activated.store(true,Ordering::Release);if let Some(ready)=ready.take(){let _=ready.send(Ok(()));}Ok(())}
                    }else{manager.message(&instance,message).await}
                   },Some(Event::Stopped(error))=>Err(error),None=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin host exited"))};
-                  if let Err(error)=result{manager.stop(&instance.manifest.id,Some(error.message)).await;break}
+                  if let Err(error)=result{if let Some(ready)=ready.take(){let _=ready.send(Err(error.clone()));}manager.stop(&instance.manifest.id,Some(error.message)).await;break}
                  }
                 }
             }
@@ -495,19 +612,36 @@ impl Manager {
                 .await;
             return Err(error);
         }
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(2), readiness).await,
-            Ok(Ok(()))
-        ) {
-            self.stop(
-                &installation.manifest.id,
-                Some("Plugin did not activate".into()),
-            )
-            .await;
-            return Err(ProtocolError::new(
-                ErrorCode::Timeout,
-                "Plugin did not activate",
-            ));
+        match tokio::time::timeout(Duration::from_secs(2), readiness).await {
+            Ok(Ok(Ok(()))) => {}
+            // The supervisor already stops this generation with the specific
+            // cause. Report it; a second stop would overwrite the stored reason
+            // or, for a probe, touch the installed record.
+            Ok(Ok(Err(error))) => {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled()).await;
+                return Err(error);
+            }
+            // Another operation (pause, disable, removal) stopped it first.
+            Ok(Err(_)) => {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled()).await;
+                return Err(ProtocolError::new(
+                    ErrorCode::PluginStopped,
+                    "Add-on stopped during activation",
+                ));
+            }
+            Err(_) => {
+                self.stop(
+                    &installation.manifest.id,
+                    Some("Plugin did not activate".into()),
+                )
+                .await;
+                return Err(ProtocolError::new(
+                    ErrorCode::Timeout,
+                    "Plugin did not activate",
+                ));
+            }
         }
         if self.paused() || running.cancel.is_cancelled() {
             self.stop(&installation.manifest.id, None).await;
@@ -704,7 +838,10 @@ impl Manager {
                 Status::FailedDisabled
             } else if matches!(
                 installation.status,
-                Status::BlockedDisabled | Status::IncompatibleDisabled | Status::Removing
+                Status::BlockedDisabled
+                    | Status::IncompatibleDisabled
+                    | Status::Removing
+                    | Status::Updating
             ) {
                 installation.status
             } else if installation.desired_enabled {
@@ -781,6 +918,7 @@ impl Manager {
         Ok(())
     }
     pub async fn shutdown(&self) {
+        self.catalog.stop.cancel();
         self.paused.store(true, Ordering::Release);
         let ids: Vec<_> = self.running.lock().await.keys().cloned().collect();
         futures_util::future::join_all(ids.iter().map(|id| self.stop(id, None))).await;
@@ -795,47 +933,118 @@ impl Manager {
         self.registry
             .lock()
             .unwrap()
-            .execute(
-                "INSERT OR REPLACE INTO metadata(key,value) VALUES('paused','false')",
-                [],
+            .execute_batch(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES('paused','false'); DELETE FROM metadata WHERE key='interrupted';",
             )
             .map_err(storage_error)?;
         self.paused.store(false, Ordering::Release);
         let _ = self.events.send(UiEvent::Inventory);
         Ok(())
     }
-    fn recover_session(&self) -> Result<()> {
-        let pending: bool = self
-            .registry
+    /// Add-ons whose activation an unclean exit interrupted, until Resume.
+    pub fn interrupted_activations(&self) -> Vec<String> {
+        self.registry
             .lock()
             .unwrap()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key LIKE 'activation:%')",
+                "SELECT value FROM metadata WHERE key='interrupted'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default()
+    }
+    fn recover_session(&self) -> Result<()> {
+        let interrupted: Vec<String> = {
+            let db = self.registry.lock().unwrap();
+            let mut query = db
+                .prepare("SELECT key FROM metadata WHERE key LIKE 'activation:%' LIMIT 1000")
+                .map_err(storage_error)?;
+            let keys = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?;
+            keys.into_iter()
+                .filter_map(|key| key.strip_prefix("activation:").map(str::to_owned))
+                .collect()
+        };
+        if !interrupted.is_empty() {
+            let db = self.registry.lock().unwrap();
+            db.execute_batch("INSERT OR REPLACE INTO metadata(key,value) VALUES('paused','true'); DELETE FROM metadata WHERE key LIKE 'activation:%';").map_err(storage_error)?;
+            db.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES('interrupted',?1)",
+                [serde_json::to_string(&interrupted).unwrap()],
             )
             .map_err(storage_error)?;
-        if pending {
-            self.registry.lock().unwrap().execute_batch("INSERT OR REPLACE INTO metadata(key,value) VALUES('paused','true'); DELETE FROM metadata WHERE key LIKE 'activation:%';").map_err(storage_error)?;
             self.paused.store(true, Ordering::Release);
         }
         for mut installation in self.list()? {
-            if matches!(
+            let starting = interrupted.contains(&installation.manifest.id);
+            let running = matches!(
                 installation.status,
                 Status::Activating | Status::EnabledRunning | Status::Updating
-            ) {
+            );
+            if running {
                 installation.status = if installation.desired_enabled {
                     Status::EnabledIdle
                 } else {
                     Status::InstalledDisabled
                 };
-                if pending {
-                    installation.failure=Some("The app stopped before an add-on activation checkpoint. All add-ons are paused; review them before resuming.".into());
-                }
+            }
+            // Attribute the unclean exit to the add-on that was starting only.
+            if starting {
+                installation.failure = Some(
+                    "CodeMux closed while this add-on was starting. Add-ons are paused; review it before resuming.".into(),
+                );
+            }
+            if running || starting {
                 self.save(&installation)?;
             }
         }
         Ok(())
+    }
+    /// Current state for a subscriber that missed broadcast events: inventory
+    /// plus the latest tree of every mounted view.
+    pub async fn resync_events(&self) -> Vec<UiEvent> {
+        let mut events = vec![UiEvent::Inventory];
+        let hosts: Vec<_> = self.running.lock().await.values().cloned().collect();
+        for running in hosts {
+            for (view_id, view) in running.views.lock().await.iter() {
+                events.push(UiEvent::Tree {
+                    plugin_id: running.manifest.id.clone(),
+                    generation: running.generation().into(),
+                    view_id: view_id.clone(),
+                    revision: view.revision,
+                    tree: view.tree.clone(),
+                });
+            }
+        }
+        events
+    }
+    /// Move an unreadable add-on directory aside, whole, so a fresh registry
+    /// can open without pruning its packages or private data. Returns the backup.
+    pub fn reset_registry(root: &std::path::Path) -> Result<PathBuf> {
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "addons".into());
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let mut backup = root.with_file_name(format!("{name}-backup-{stamp}"));
+        if backup.exists() {
+            backup = root.with_file_name(format!("{name}-backup-{stamp}-{}", uuid::Uuid::new_v4()));
+        }
+        std::fs::rename(root, &backup).map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                format!(
+                    "Could not move {} aside. Close other CodeMux windows and retry.",
+                    root.display()
+                ),
+            )
+        })?;
+        Ok(backup)
     }
     pub async fn pause_all(&self) {
         let _ = self.registry.lock().unwrap().execute(
@@ -1834,6 +2043,82 @@ mod tests {
         assert!(manager.running.lock().await.is_empty());
     }
     #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_update_candidate_failures_restore_the_previous_tuple_and_report_the_cause() {
+        let healthy = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let throws = "__codemuxRegister({}, () => m => {if(m.method==='activate')throw Error('candidate failed');});";
+        let mismatch = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/other']});});";
+        // The probe records itself in the candidate generation, so only the
+        // normal activation after the registry switch fails.
+        let after_switch = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('host.request',{operation:'storage.get',params:{scope:'global',key:'probed'}},1);else if(m.id===1&&!m.method){if(m.result===true)throw Error('second activation failed');send('host.request',{operation:'storage.set',params:{scope:'global',key:'probed',value:true}},2);}else if(m.id===2&&!m.method)send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        for (candidate, expected, replace) in [
+            (throws, None, false),
+            (
+                mismatch,
+                Some("Plugin registration does not match its manifest"),
+                false,
+            ),
+            (after_switch, None, false),
+            (throws, None, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+            let reviews = super::super::lifecycle::Reviews::default();
+            let file = root.path().join("healthy.cmxaddon");
+            std::fs::write(
+                &file,
+                super::super::package::fixture_archive_with_source(healthy.as_bytes()),
+            )
+            .unwrap();
+            let review = reviews.prepare_local(&manager, &file).unwrap();
+            let old = reviews
+                .accept(&manager, &review.token, true, false)
+                .await
+                .unwrap();
+            assert!(old.desired_enabled);
+            let package = super::super::lifecycle::tests::package_with_source(
+                candidate.as_bytes(),
+                |manifest| manifest.version = "2.0.0".into(),
+            );
+            let source = if replace {
+                Source::Local {
+                    identity: uuid::Uuid::new_v4().to_string(),
+                }
+            } else {
+                old.source.clone()
+            };
+            let review = reviews.prepare(&manager, package, source).unwrap();
+            // A same-source update keeps the enabled choice; a replacement
+            // must ask for it explicitly.
+            let error = reviews
+                .accept(&manager, &review.token, replace, replace)
+                .await
+                .err()
+                .expect("candidate must fail");
+            assert_ne!(error.message, "Plugin did not activate", "specific cause");
+            if let Some(expected) = expected {
+                assert_eq!(error.message, expected);
+            }
+            let restored = manager.installation(&old.manifest.id).unwrap();
+            assert_eq!(restored.installation_id, old.installation_id);
+            assert_eq!(restored.digest, old.digest);
+            assert_eq!(restored.data_generation, old.data_generation);
+            assert_eq!(restored.grant.as_ref().unwrap().digest, old.digest);
+            assert!(restored.desired_enabled, "prior enablement is restored");
+            assert!(matches!(restored.status, Status::EnabledIdle));
+            assert!(restored.failure.is_none());
+            assert_eq!(
+                std::fs::read_dir(root.path().join("private/recovery"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(manager.running.lock().await.is_empty());
+            manager.ensure_active(&old.manifest.id).await.unwrap();
+            manager.shutdown().await;
+        }
+    }
+    #[tokio::test]
     #[ignore = "Build the independent Project Brief package and host first"]
     async fn native_project_brief_package_uses_installer_git_ui_and_composer_broker() {
         let root = tempfile::tempdir().unwrap();
@@ -2089,5 +2374,112 @@ mod tests {
         )
         .unwrap();
         assert!(Manager::open(root.path().into(), PathBuf::from("unused")).is_err());
+    }
+    #[test]
+    fn registry_reset_moves_the_damaged_folder_aside_and_opens_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let addons = root.path().join("addons-v1");
+        std::fs::create_dir_all(addons.join("state").join(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        std::fs::write(addons.join("registry.sqlite"), b"not a sqlite database").unwrap();
+        assert!(Manager::open(addons.clone(), PathBuf::from("unused")).is_err());
+        let backup = Manager::reset_registry(&addons).unwrap();
+        assert_eq!(
+            std::fs::read(backup.join("registry.sqlite")).unwrap(),
+            b"not a sqlite database"
+        );
+        assert!(backup.join("state").is_dir(), "private data is kept");
+        let manager = Manager::open(addons.clone(), PathBuf::from("unused")).unwrap();
+        assert!(manager.list().unwrap().is_empty());
+        assert!(!manager.paused());
+    }
+    #[tokio::test]
+    async fn unsupported_api_record_is_incompatible_without_breaking_the_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), PathBuf::from("unused")).unwrap();
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let healthy = installed(manifest.clone());
+        manager.save(&healthy).unwrap();
+        let mut future = manifest;
+        future.id = "example.future".into();
+        future.api = "^2.0.0".into();
+        manager.save(&installed(future)).unwrap();
+        drop(manager);
+        let manager = Manager::open(root.path().into(), PathBuf::from("unused")).unwrap();
+        assert_eq!(manager.list().unwrap().len(), 2);
+        assert!(matches!(
+            manager.installation("example.hello").unwrap().status,
+            Status::EnabledIdle
+        ));
+        let future = manager.installation("example.future").unwrap();
+        assert!(matches!(future.status, Status::IncompatibleDisabled));
+        assert_eq!(
+            future.failure.as_deref(),
+            Some("Requires plugin API ^2.0.0; this CodeMux supports 1.0.0")
+        );
+        assert!(!future.compatibility().compatible);
+        assert!(healthy.compatibility().compatible);
+        assert!(manager
+            .activate(future.clone(), String::new(), false)
+            .await
+            .is_err());
+        // Retained data of an incompatible record is tolerated at startup too.
+        manager.remove("example.future", true).await.unwrap();
+        drop(manager);
+        let manager = Manager::open(root.path().into(), PathBuf::from("unused")).unwrap();
+        assert_eq!(manager.list().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn tampered_installed_package_is_refused_before_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), PathBuf::from("unused")).unwrap();
+        let package = root.path().join("fixture.cmxaddon");
+        std::fs::write(&package, super::super::package::fixture_archive()).unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let review = reviews.prepare_local(&manager, &package).unwrap();
+        let mut installation = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        installation.desired_enabled = true;
+        installation.status = Status::EnabledIdle;
+        manager.save(&installation).unwrap();
+        let stored = root
+            .path()
+            .join("packages")
+            .join(&installation.manifest.id)
+            .join(&installation.digest)
+            .join("package.cmxaddon");
+        let original = std::fs::read(&stored).unwrap();
+        std::fs::write(
+            &stored,
+            super::super::package::fixture_archive_with_source(b"globalThis.modified = true;"),
+        )
+        .unwrap();
+        let error = manager
+            .ensure_active(&installation.manifest.id)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.message,
+            "Package digest does not match the accepted release"
+        );
+        assert!(manager.running.lock().await.is_empty());
+        std::fs::write(&stored, original).unwrap();
+        let mut edited = installation.clone();
+        edited.manifest.name = "Renamed".into();
+        manager.save(&edited).unwrap();
+        let error = manager
+            .ensure_active(&installation.manifest.id)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.message, "Installed manifest was modified");
+        assert!(manager.running.lock().await.is_empty());
     }
 }
