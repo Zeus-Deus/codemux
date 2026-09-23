@@ -168,7 +168,7 @@ export interface AddonReview {
       credentials: AddonManifest["credentials"];
     };
   } | null;
-  /** Access the candidate adds, or all of it for a new installation. */
+  /** Access the candidate adds; all of it for a new installation or a source replacement. */
   added?: AddonAccess;
   /** Access the installed release has and the candidate drops. */
   removed?: AddonAccess;

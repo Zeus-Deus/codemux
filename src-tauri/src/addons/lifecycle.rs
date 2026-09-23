@@ -269,7 +269,14 @@ impl Reviews {
         } else {
             None
         };
-        let added = Access::missing(old.as_ref().map(|i| &i.manifest), &package.manifest);
+        // A source replacement gets a new identity and a fresh grant, so all of
+        // its access is new even where the retired installation had the same.
+        let added = Access::missing(
+            old.as_ref()
+                .filter(|_| !replaces_source)
+                .map(|i| &i.manifest),
+            &package.manifest,
+        );
         let removed = old
             .as_ref()
             .map(|i| Access::missing(Some(&package.manifest), &i.manifest))
@@ -1789,12 +1796,31 @@ pub(crate) mod tests {
         let source = Source::Local {
             identity: Uuid::new_v4().to_string(),
         };
+        let base_manifest = base.manifest.clone();
         let first = reviews.prepare(&manager, base, source.clone()).unwrap();
         assert!(first.expands_access && first.installed.is_none());
         reviews
             .accept(&manager, &first.token, false, false)
             .await
             .unwrap();
+        // The same access from another source is a fresh grant, not a reuse.
+        let replacement = package_with(|m| *m = base_manifest.clone());
+        let replaced = reviews
+            .prepare(
+                &manager,
+                replacement,
+                Source::Local {
+                    identity: Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap();
+        assert!(replaced.replaces_source && replaced.expands_access);
+        assert_eq!(
+            name(&replaced.added),
+            name(&Access::missing(None, &base_manifest))
+        );
+        assert!(replaced.removed.is_empty());
+        reviews.cancel(&replaced.token);
         let expanded = reviews.prepare(&manager, wider, source.clone()).unwrap();
         assert!(expanded.expands_access);
         assert_eq!(expanded.installed.as_ref().unwrap().version, "1.0.0");
