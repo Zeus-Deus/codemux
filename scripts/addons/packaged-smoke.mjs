@@ -55,14 +55,29 @@ function run(command, args, options = {}) {
 try {
   const bundles = await files(bundleRoot);
   const formats =
-    process.platform === "win32" ? [".exe"] : [".deb", ".AppImage"];
+    process.platform === "win32" ? [".exe"] : [".deb", ".AppImage", ".rpm"];
   for (const format of formats) {
     const matches = bundles.filter((file) => file.endsWith(format));
+    // A release uploads every installer in the bundle directory, so an rpm is
+    // verified whenever one was built.
+    if (format === ".rpm" && matches.length === 0) continue;
     assert.equal(matches.length, 1, `Expected exactly one ${format} installer`);
     const unpack = join(root, format.slice(1));
     const { mkdir } = await import("node:fs/promises");
     await mkdir(unpack);
     if (format === ".deb") run("dpkg-deb", ["-x", matches[0], unpack]);
+    else if (format === ".rpm")
+      run(
+        "bash",
+        [
+          "-o",
+          "pipefail",
+          "-c",
+          'rpm2cpio "$0" | cpio -idm --quiet --no-absolute-filenames',
+          matches[0],
+        ],
+        { cwd: unpack },
+      );
     else if (format === ".AppImage")
       run(matches[0], ["--appimage-extract"], { cwd: unpack, stdio: "ignore" });
     else run(matches[0], ["/S", `/D=${unpack}`]);

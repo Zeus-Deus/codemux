@@ -15,6 +15,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          # A pull request's default checkout is a synthetic merge commit that no
+          # release tag can reference. Record the proposed head commit instead.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -25,6 +29,8 @@ jobs:
         run: sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: addon-author-release-${{ github.sha }}
+          # Pull request output is only a review candidate. Release assets come
+          # from a dispatch (or local run) on the exact commit that will be tagged.
+          name: ${{ github.event_name == 'pull_request' && format('addon-author-candidate-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('addon-author-release-{0}', github.sha) }}
           path: addon-author-release/
           if-no-files-found: error

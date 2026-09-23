@@ -10,17 +10,29 @@ on:
         "src/components/addons/**",
         "src/components/settings/addons-settings*",
         "src/components/chat/Composer.tsx",
+        "src/components/chat/ComposerFooter.tsx",
+        "src/components/chat/AgentChatPane.tsx",
+        "src/components/chat/DraftChatSurface.tsx",
         "src/components/layout/right-panel.tsx",
+        "src/components/layout/right-panel/pane-registry.ts",
+        "src/components/layout/right-panel/pane-picker.tsx",
+        "src/components/layout/right-panel/pane-tab-strip.tsx",
         "src/components/overlays/command-palette.tsx",
+        "src/components/settings/settings-view.tsx",
         "src/lib/addons/**",
+        "src/lib/settings-sections.ts",
         "src/stores/addons-store.ts",
+        "src/stores/ui-store.ts",
         "src-tauri/src/addons/**",
         "src-tauri/src/commands/addons.rs",
+        "src-tauri/src/web_remote/dispatch.rs",
         "src-tauri/addon-protocol/**",
         "src-tauri/addon-host/**",
+        "src-tauri/Cargo.lock",
         "src-tauri/tauri.conf.json",
         "scripts/build-addon-host.sh",
         ".github/workflows/addon-packaged.yml",
+        ".github/workflows/release.yml",
       ]
 permissions:
   contents: read
@@ -54,7 +66,7 @@ jobs:
             librsvg2-dev \
             patchelf \
             libfuse2 \
-            file webkit2gtk-driver xvfb dbus-x11 imagemagick
+            file rpm2cpio cpio webkit2gtk-driver xvfb dbus-x11 imagemagick
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -194,15 +206,15 @@ jobs:
           chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
           ls -la ~/.cache/tauri/
 
-      - name: Build installers without publishing
+      # The same build-then-verify command that the release workflow gives
+      # tauri-action, so every installer format it publishes is gated here first.
+      - name: Build installers and verify bundled host and runtime deadlines
         shell: bash
         env:
           NO_STRIP: "true"
         run: |
-          if [ "$RUNNER_OS" = Windows ]; then formats=nsis; else formats=deb,appimage; fi
-          npm run tauri -- build --verbose --bundles "$formats" --config '{"bundle":{"createUpdaterArtifacts":false}}'
-      - name: Verify bundled host and runtime deadlines
-        run: node scripts/addons/packaged-smoke.mjs src-tauri/target/release/bundle
+          if [ "$RUNNER_OS" = Windows ]; then formats=nsis; else formats=deb,rpm,appimage; fi
+          node scripts/addons/verified-tauri-build.mjs build --verbose --bundles "$formats" --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Record installer build revision
         run: node -e "require('node:fs').writeFileSync('addon-native-ui-build.json', JSON.stringify({commit:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,platform:process.platform}))"
       - name: Preserve built acceptance inputs for harness-only retries

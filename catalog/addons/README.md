@@ -49,8 +49,11 @@ and an RFC3339 date. Desktop refresh disables matching installations; offline
 devices cannot learn new revocations until they reconnect. Local imports are also
 checked against the last accepted blocklist.
 
-After a reviewed merge, CI publishes `catalog-v1.json` and its SHA-256 as assets on
-the immutable `addons-catalog-r<revision>` release. The website pins that artifact
+A reviewed merge is validated but never published by itself. A maintainer then
+dispatches the catalog workflow on `main` with that revision, through its approved
+`addon-catalog` environment, to publish `catalog-v1.json` and its SHA-256 as assets
+on the immutable `addons-catalog-r<revision>` release. That release is never marked
+Latest, which stays the desktop `v*` release. The website pins that artifact
 and digest in a separate reviewed change; it never reads a mutable branch during
 page requests. New desktop installs and updates require a successful online refresh.
 
