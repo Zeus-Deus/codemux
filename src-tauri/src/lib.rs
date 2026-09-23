@@ -2314,6 +2314,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::addons::addon_effect_claim,
             commands::addons::addon_settings_set,
             commands::addons::addon_credential_set,
+            commands::addons::addon_credential_clear,
             diagnostics::get_performance_diagnostics,
             commands::get_current_theme,
             commands::get_omarchy_theme,

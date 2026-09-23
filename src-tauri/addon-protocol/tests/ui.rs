@@ -103,3 +103,74 @@ fn escaped_content_updates_cannot_exceed_the_intermediate_tree_limit() {
         assert!(tree.children[0].properties.is_empty());
     }
 }
+
+#[test]
+fn malformed_and_duplicate_ids_and_disallowed_events_are_rejected() {
+    let mut tree = Tree::default();
+    tree.apply(&[json!([0,"~",{"id":"root","type":1,"element":"cmx-stack"},0])])
+        .unwrap();
+    let long = "a".repeat(65);
+    for id in ["", long.as_str(), "a/b", "a_b", "a b", "é"] {
+        assert!(
+            tree.apply(&[json!([0,"root",{"id":id,"type":3,"data":"x"},0])])
+                .is_err(),
+            "{id:?}"
+        );
+    }
+    tree.apply(&[json!([0,"root",{"id":"a".repeat(64),"type":3,"data":"x"},0])])
+        .unwrap();
+    for record in [
+        // Duplicate node IDs inside one inserted subtree, and across the tree.
+        json!([0,"root",{"id":"card","type":1,"element":"cmx-card","children":[{"id":"twin","type":3,"data":"x"},{"id":"twin","type":3,"data":"y"}]},0]),
+        json!([0,"root",{"id":"card","type":1,"element":"cmx-card","children":[{"id":"root","type":3,"data":"x"}]},0]),
+        // A callback ID is unique within its view.
+        json!([0,"root",{"id":"pair","type":1,"element":"cmx-stack","children":[
+            {"id":"first","type":1,"element":"cmx-button","eventListeners":{"press":{"callbackId":"same"}}},
+            {"id":"second","type":1,"element":"cmx-button","eventListeners":{"press":{"callbackId":"same"}}}
+        ]},0]),
+        json!([0,"root",{"id":"bad","type":1,"element":"cmx-button","eventListeners":{"press":{"callbackId":"a_b"}}},0]),
+        json!([0,"root",{"id":"extra","type":1,"element":"cmx-button","eventListeners":{"press":{"callbackId":"a","capture":true}}},0]),
+        // Events belong only to tags that can raise them.
+        json!([0,"root",{"id":"label","type":1,"element":"cmx-text","eventListeners":{"press":{"callbackId":"a"}}},0]),
+        json!([0,"root",{"id":"field","type":1,"element":"cmx-text-field","eventListeners":{"press":{"callbackId":"a"}}},0]),
+        json!([0,"root",{"id":"hover","type":1,"element":"cmx-button","eventListeners":{"hover":{"callbackId":"a"}}},0]),
+    ] {
+        assert!(tree.apply(std::slice::from_ref(&record)).is_err(), "{record}");
+    }
+    assert_eq!(tree.children[0].children.len(), 1);
+    assert_eq!(tree.callback_count(), 0);
+}
+
+#[test]
+fn plugin_callback_budget_rejects_the_whole_batch() {
+    let buttons = (0..10)
+        .map(|i| json!({"id":format!("b{i}"),"type":1,"element":"cmx-button","eventListeners":{"press":{"callbackId":format!("c{i}")}}}))
+        .collect::<Vec<_>>();
+    let mut tree = Tree::default();
+    tree.apply_within(
+        &[json!([0,"~",{"id":"root","type":1,"element":"cmx-stack","children":buttons},0])],
+        10,
+    )
+    .unwrap();
+    assert_eq!(tree.callback_count(), 10);
+    let error = tree
+        .apply_within(
+            &[
+                json!([3, "b0", "label", "not committed"]),
+                json!([0,"root",{"id":"more","type":1,"element":"cmx-button","eventListeners":{"press":{"callbackId":"extra"}}},0]),
+            ],
+            10,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.data.code,
+        codemux_addon_protocol::ErrorCode::ResourceLimit
+    );
+    assert_eq!(tree.children[0].children.len(), 10);
+    assert!(tree.children[0].children[0].properties.is_empty());
+    // Replacing a listener keeps the count; removing a node frees budget.
+    tree.apply_within(&[json!([3,"b0","press",{"callbackId":"new"},3])], 10)
+        .unwrap();
+    tree.apply_within(&[json!([1, "root", 0])], 9).unwrap();
+    assert_eq!(tree.callback_count(), 9);
+}

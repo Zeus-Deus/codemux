@@ -1,16 +1,32 @@
 //! Secrets are host-only. No value from this module is serialized into plugin IPC.
-use super::{ErrorCode, ProtocolError, Result};
+use super::{
+    manager::{Installation, Manager, UiEvent},
+    ErrorCode, ProtocolError, Result,
+};
+use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct Credentials {
     backend: Arc<dyn CredentialStore>,
-    session: Arc<Mutex<HashMap<(String, String), String>>>,
+    // Held only briefly and never across an await, so Settings can read the
+    // state synchronously without touching the OS store or the secret.
+    session: Arc<StdMutex<HashMap<(String, String), String>>>,
     serial: Arc<Mutex<()>>,
-    configured: Arc<Mutex<HashSet<(String, String)>>>,
+    configured: Arc<StdMutex<HashSet<(String, String)>>>,
+}
+/// What Settings can show about a declared credential, without its value.
+/// A credential that was never configured leaves requests unauthenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialState {
+    NotConfigured,
+    Saved,
+    SessionOnly,
+    CleanupPending,
 }
 trait CredentialStore: Send + Sync {
     fn set(&self, service: &str, id: &str, value: &str) -> Result<()>;
@@ -66,9 +82,25 @@ impl Credentials {
     }
     pub fn with_configured(entries: Vec<(String, String)>) -> Self {
         Self {
-            configured: Arc::new(Mutex::new(entries.into_iter().collect())),
+            configured: Arc::new(StdMutex::new(entries.into_iter().collect())),
             ..Self::default()
         }
+    }
+    fn stored(&self, installation: &str, id: &str) -> Option<CredentialState> {
+        let key = (installation.to_owned(), id.to_owned());
+        if self.session.lock().unwrap().contains_key(&key) {
+            Some(CredentialState::SessionOnly)
+        } else if self.configured.lock().unwrap().contains(&key) {
+            Some(CredentialState::Saved)
+        } else {
+            None
+        }
+    }
+    fn forget_session(&self, installation: &str, id: &str) {
+        self.session
+            .lock()
+            .unwrap()
+            .remove(&(installation.into(), id.into()));
     }
     pub async fn set(
         &self,
@@ -83,7 +115,7 @@ impl Credentials {
         let lock = self.serial.clone().lock_owned().await;
         let key = (installation.into(), id.into());
         if session_only {
-            self.session.lock().await.insert(key, secret);
+            self.session.lock().unwrap().insert(key, secret);
             return Ok(());
         }
         let service = format!("{}.addons.{}", crate::APP_DIR_NAME, installation);
@@ -96,8 +128,8 @@ impl Credentials {
             // corresponding memory update inside this task even if IPC closes.
             let _lock = lock;
             backend.set(&service, &id, &secret)?;
-            session.blocking_lock().remove(&key);
-            configured.blocking_lock().insert(key);
+            session.lock().unwrap().remove(&key);
+            configured.lock().unwrap().insert(key);
             Ok(())
         })
         .await
@@ -108,15 +140,17 @@ impl Credentials {
         if let Some(value) = self
             .session
             .lock()
-            .await
+            .unwrap()
             .get(&(installation.into(), id.into()))
         {
             return Ok(Some(value.clone()));
         }
+        // Never configured: the request stays unauthenticated. A saved value
+        // that the store cannot read fails with CREDENTIAL_REQUIRED below.
         if !self
             .configured
             .lock()
-            .await
+            .unwrap()
             .contains(&(installation.into(), id.into()))
         {
             return Ok(None);
@@ -136,18 +170,18 @@ impl Credentials {
         let _lock = self.serial.lock().await;
         self.session
             .lock()
-            .await
+            .unwrap()
             .retain(|(owner, _), _| owner != installation);
     }
     pub async fn delete(&self, installation: &str, id: &str) -> Result<()> {
         let lock = self.serial.clone().lock_owned().await;
         self.session
             .lock()
-            .await
+            .unwrap()
             .remove(&(installation.into(), id.into()));
         self.configured
             .lock()
-            .await
+            .unwrap()
             .remove(&(installation.into(), id.into()));
         let service = format!("{}.addons.{}", crate::APP_DIR_NAME, installation);
         let id = id.to_owned();
@@ -159,49 +193,184 @@ impl Credentials {
         .await
         .map_err(|_| unavailable())?
     }
+    #[cfg(test)]
+    pub(super) fn recorded(backend: Arc<RecordedStore>) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+}
+fn registry_unavailable(_: rusqlite::Error) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "Add-on registry is unavailable",
+    )
+}
+fn declared_key(installation: &Installation, credential: &str) -> Result<String> {
+    installation
+        .manifest
+        .credentials
+        .iter()
+        .find(|c| c.id == credential)
+        .map(|c| Credentials::key(&c.id, &c.origin))
+        .ok_or_else(|| ProtocolError::new(ErrorCode::PermissionDenied, "Credential was not declared"))
+}
+impl Manager {
+    /// Per declared credential ID. Reads only host indexes, never a secret.
+    pub fn credential_states(
+        &self,
+        installation: &Installation,
+    ) -> Result<BTreeMap<String, CredentialState>> {
+        let db = self.registry.lock().unwrap();
+        let mut states = BTreeMap::new();
+        for declaration in &installation.manifest.credentials {
+            let key = Credentials::key(&declaration.id, &declaration.origin);
+            let state = match self.credentials.stored(&installation.installation_id, &key) {
+                Some(state) => state,
+                None if db
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM cleanup WHERE installation=?1 AND credential=?2)",
+                        rusqlite::params![installation.installation_id, key],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(registry_unavailable)? =>
+                {
+                    CredentialState::CleanupPending
+                }
+                None => CredentialState::NotConfigured,
+            };
+            states.insert(declaration.id.clone(), state);
+        }
+        Ok(states)
+    }
+    /// The caller holds the installation's operation lock.
+    pub async fn save_credential(
+        &self,
+        installation: &Installation,
+        credential: &str,
+        value: String,
+        session_only: bool,
+    ) -> Result<()> {
+        let key = declared_key(installation, credential)?;
+        // Persist the host-owned index before the non-cancellable OS write. If
+        // this IPC task is dropped, uninstall/restart can still find the credential.
+        if !session_only {
+            self.record_credential(&installation.installation_id, &key)?;
+        }
+        self.credentials
+            .set(&installation.installation_id, &key, value, session_only)
+            .await?;
+        if !session_only {
+            // The new value replaced any earlier one awaiting removal. A kept
+            // tombstone would delete the credential the user just saved.
+            self.registry
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM cleanup WHERE installation=?1 AND credential=?2",
+                    rusqlite::params![installation.installation_id, key],
+                )
+                .map_err(registry_unavailable)?;
+        }
+        let _ = self.events.send(UiEvent::Inventory);
+        Ok(())
+    }
+    /// Removes a saved or session-only credential; later requests to its
+    /// origin are unauthenticated. The caller holds the operation lock. A
+    /// locked OS store keeps a retryable tombstone, as uninstall does.
+    pub async fn clear_credential(
+        &self,
+        installation: &Installation,
+        credential: &str,
+    ) -> Result<Vec<String>> {
+        let key = declared_key(installation, credential)?;
+        let stored = {
+            let mut db = self.registry.lock().unwrap();
+            let tx = db.transaction().map_err(registry_unavailable)?;
+            tx.execute("INSERT OR IGNORE INTO cleanup(installation,credential) SELECT installation,id FROM credential_entries WHERE installation=?1 AND id=?2",rusqlite::params![installation.installation_id,key]).map_err(registry_unavailable)?;
+            tx.execute(
+                "DELETE FROM credential_entries WHERE installation=?1 AND id=?2",
+                rusqlite::params![installation.installation_id, key],
+            )
+            .map_err(registry_unavailable)?;
+            let stored = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cleanup WHERE installation=?1 AND credential=?2)",
+                    rusqlite::params![installation.installation_id, key],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(registry_unavailable)?;
+            tx.commit().map_err(registry_unavailable)?;
+            stored
+        };
+        if !stored {
+            // Session-only values never reached the OS credential store.
+            self.credentials
+                .forget_session(&installation.installation_id, &key);
+        } else if self
+            .credentials
+            .delete(&installation.installation_id, &key)
+            .await
+            .is_ok()
+        {
+            self.registry
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM cleanup WHERE installation=?1 AND credential=?2",
+                    rusqlite::params![installation.installation_id, key],
+                )
+                .map_err(registry_unavailable)?;
+        }
+        let _ = self.events.send(UiEvent::Inventory);
+        self.cleanup_warnings()
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct RecordedStore {
+    pub(super) locked: std::sync::atomic::AtomicBool,
+    pub(super) values: std::sync::Mutex<HashMap<(String, String), String>>,
+}
+#[cfg(test)]
+impl CredentialStore for RecordedStore {
+    fn set(&self, service: &str, id: &str, value: &str) -> Result<()> {
+        if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(unavailable());
+        }
+        self.values
+            .lock()
+            .unwrap()
+            .insert((service.into(), id.into()), value.into());
+        Ok(())
+    }
+    fn get(&self, service: &str, id: &str) -> Result<Option<String>> {
+        if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(unavailable());
+        }
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .get(&(service.into(), id.into()))
+            .cloned())
+    }
+    fn delete(&self, service: &str, id: &str) -> Result<()> {
+        if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(unavailable());
+        }
+        self.values
+            .lock()
+            .unwrap()
+            .remove(&(service.into(), id.into()));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[derive(Default)]
-    struct RecordedStore {
-        locked: std::sync::atomic::AtomicBool,
-        values: std::sync::Mutex<HashMap<(String, String), String>>,
-    }
-    impl CredentialStore for RecordedStore {
-        fn set(&self, service: &str, id: &str, value: &str) -> Result<()> {
-            if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(unavailable());
-            }
-            self.values
-                .lock()
-                .unwrap()
-                .insert((service.into(), id.into()), value.into());
-            Ok(())
-        }
-        fn get(&self, service: &str, id: &str) -> Result<Option<String>> {
-            if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(unavailable());
-            }
-            Ok(self
-                .values
-                .lock()
-                .unwrap()
-                .get(&(service.into(), id.into()))
-                .cloned())
-        }
-        fn delete(&self, service: &str, id: &str) -> Result<()> {
-            if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(unavailable());
-            }
-            self.values
-                .lock()
-                .unwrap()
-                .remove(&(service.into(), id.into()));
-            Ok(())
-        }
-    }
     #[tokio::test]
     async fn locked_store_requires_explicit_session_fallback_and_removed_keys_stay_inaccessible() {
         let backend = Arc::new(RecordedStore::default());
@@ -304,6 +473,111 @@ mod tests {
             );
             assert!(manager.cleanup_warnings().unwrap().is_empty());
         }
+    }
+    #[tokio::test]
+    async fn settings_see_each_credential_state_and_clear_removes_saved_values() {
+        use super::super::{lifecycle::Reviews, package::fixture_archive, Manifest};
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let backend = Arc::new(RecordedStore::default());
+        Arc::get_mut(&mut manager).unwrap().credentials = Credentials::recorded(backend.clone());
+        let package = root.path().join("fixture.cmxaddon");
+        std::fs::write(&package, fixture_archive()).unwrap();
+        let reviews = Reviews::default();
+        let review = reviews.prepare_local(&manager, &package).unwrap();
+        let mut installed = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        let declarations = Manifest::parse(
+            include_bytes!("../../../examples/addons/issue-companion/manifest.json"),
+            None,
+        )
+        .unwrap();
+        installed.manifest.credentials = declarations.credentials;
+        installed.manifest.http = declarations.http;
+        manager.save(&installed).unwrap();
+        let field = installed.manifest.credentials[0].clone();
+        let key = Credentials::key(&field.id, &field.origin);
+        let state = |manager: &Manager| manager.credential_states(&installed).unwrap()[&field.id];
+        assert_eq!(state(&manager), CredentialState::NotConfigured);
+        // Session-only values never need the OS store, even to clear them.
+        backend.locked.store(true, SeqCst);
+        manager
+            .save_credential(&installed, &field.id, "synthetic-session".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(state(&manager), CredentialState::SessionOnly);
+        assert!(manager
+            .clear_credential(&installed, &field.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(state(&manager), CredentialState::NotConfigured);
+        backend.locked.store(false, SeqCst);
+        manager
+            .save_credential(&installed, &field.id, "synthetic-saved".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(state(&manager), CredentialState::Saved);
+        // A locked store keeps a retryable tombstone; the value is unusable now.
+        backend.locked.store(true, SeqCst);
+        assert!(!manager
+            .clear_credential(&installed, &field.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(state(&manager), CredentialState::CleanupPending);
+        assert_eq!(
+            manager
+                .credentials
+                .get(&installed.installation_id, &key)
+                .await
+                .unwrap(),
+            None
+        );
+        // Saving again replaces the pending value; cleanup must not remove it.
+        backend.locked.store(false, SeqCst);
+        manager
+            .save_credential(&installed, &field.id, "synthetic-replacement".into(), false)
+            .await
+            .unwrap();
+        assert!(manager.retry_cleanup().await.unwrap().is_empty());
+        assert_eq!(
+            manager
+                .credentials
+                .get(&installed.installation_id, &key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-replacement")
+        );
+        drop(manager);
+        let mut manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let configured = manager.credentials.configured.clone();
+        Arc::get_mut(&mut manager).unwrap().credentials = Credentials {
+            backend: backend.clone(),
+            configured,
+            ..Credentials::default()
+        };
+        assert_eq!(state(&manager), CredentialState::Saved);
+        assert!(manager
+            .clear_credential(&installed, &field.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(state(&manager), CredentialState::NotConfigured);
+        assert!(backend.values.lock().unwrap().is_empty());
+        assert_eq!(
+            manager
+                .clear_credential(&installed, "undeclared")
+                .await
+                .unwrap_err()
+                .data
+                .code,
+            ErrorCode::PermissionDenied
+        );
     }
     #[tokio::test]
     async fn uninstall_retries_credentials_removed_from_later_manifests_even_when_data_is_kept() {

@@ -334,6 +334,11 @@ impl Host {
         let progress = self.progress.lock().unwrap();
         progress.pending.is_empty().then_some(progress.settled)
     }
+    /// Calls the child has not yet yielded, for tests that pace long loops.
+    #[cfg(test)]
+    pub async fn outstanding(&self) -> usize {
+        self.progress.lock().unwrap().pending.len()
+    }
     pub fn revoke(&self) {
         self.cancel.cancel();
     }

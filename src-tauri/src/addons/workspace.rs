@@ -40,3 +40,13 @@ pub fn current(state: &crate::state::AppStateStore, id: &str) -> Result<Workspac
         root,
     })
 }
+/// Private storage namespace for one project. AppState workspace IDs are
+/// process counters that a later project can receive again, so the scope is
+/// derived from the authorized canonical root instead. It never leaves Rust.
+pub fn storage_scope(workspace: &Workspace) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "workspace-root:{:x}",
+        Sha256::digest(workspace.root.as_os_str().as_encoded_bytes())
+    )
+}

@@ -6,7 +6,10 @@ use crate::addons::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+};
 use tauri::{ipc::Channel, Manager as _, Runtime, State};
 use tokio_util::sync::CancellationToken;
 #[derive(Default)]
@@ -25,6 +28,8 @@ pub struct Inventory {
     warnings: Vec<String>,
     developer_mode: bool,
     development_package: Option<String>,
+    /// Plugin ID -> declared credential ID -> state. Never contains a secret.
+    credential_states: HashMap<String, BTreeMap<String, addons::credentials::CredentialState>>,
 }
 impl AddonState {
     pub fn get<R: Runtime>(&self, app: &tauri::AppHandle<R>) -> Result<Arc<Manager>> {
@@ -97,16 +102,30 @@ pub fn addon_inventory<R: Runtime>(
 ) -> Inventory {
     match state.get(&app) {
         Ok(manager) => match manager.list() {
-            Ok(installed) => Inventory {
-                developer_mode: state.development.enabled(),
-                development_package: state.development.package(),
-                paused: manager.paused(),
-                installed,
-                error: None,
-                warnings: manager
+            Ok(installed) => {
+                let mut warnings = manager
                     .cleanup_warnings()
-                    .unwrap_or_else(|error| vec![error.message]),
-            },
+                    .unwrap_or_else(|error| vec![error.message]);
+                let mut credential_states = HashMap::new();
+                for installation in &installed {
+                    match manager.credential_states(installation) {
+                        Ok(states) => {
+                            credential_states.insert(installation.manifest.id.clone(), states);
+                        }
+                        Err(error) => warnings.push(error.message),
+                    }
+                }
+                warnings.dedup();
+                Inventory {
+                    developer_mode: state.development.enabled(),
+                    development_package: state.development.package(),
+                    paused: manager.paused(),
+                    installed,
+                    error: None,
+                    warnings,
+                    credential_states,
+                }
+            }
             Err(error) => Inventory {
                 developer_mode: false,
                 development_package: None,
@@ -114,6 +133,7 @@ pub fn addon_inventory<R: Runtime>(
                 installed: vec![],
                 error: Some(error.message),
                 warnings: vec![],
+                credential_states: HashMap::new(),
             },
         },
         Err(error) => Inventory {
@@ -123,6 +143,7 @@ pub fn addon_inventory<R: Runtime>(
             installed: vec![],
             error: Some(error.message),
             warnings: vec![],
+            credential_states: HashMap::new(),
         },
     }
 }
@@ -383,40 +404,24 @@ pub async fn addon_credential_set<R: Runtime>(
     let operation = manager.operation(&id).await;
     let _lock = operation.lock().await;
     let installation = manager.installation(&id)?;
-    if !installation
-        .manifest
-        .credentials
-        .iter()
-        .any(|c| c.id == credential_id)
-    {
-        return Err(ProtocolError::new(
-            ErrorCode::PermissionDenied,
-            "Credential was not declared",
-        ));
-    }
-    let origin = &installation
-        .manifest
-        .credentials
-        .iter()
-        .find(|c| c.id == credential_id)
-        .unwrap()
-        .origin;
-    let credential_id = super::super::addons::credentials::Credentials::key(&credential_id, origin);
-    // Persist the host-owned index before the non-cancellable OS write. If
-    // this IPC task is dropped, uninstall/restart can still find the credential.
-    if !session_only {
-        manager.record_credential(&installation.installation_id, &credential_id)?;
-    }
     manager
-        .credentials
-        .set(
-            &installation.installation_id,
-            &credential_id,
-            value,
-            session_only,
-        )
-        .await?;
-    Ok(())
+        .save_credential(&installation, &credential_id, value, session_only)
+        .await
+}
+/// Removes a saved credential; requests to its origin become unauthenticated.
+/// Returns cleanup warnings, like removal, when the OS store is locked.
+#[tauri::command]
+pub async fn addon_credential_clear<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AddonState>,
+    id: String,
+    credential_id: String,
+) -> Result<Vec<String>> {
+    let manager = state.get(&app)?;
+    let operation = manager.operation(&id).await;
+    let _lock = operation.lock().await;
+    let installation = manager.installation(&id)?;
+    manager.clear_credential(&installation, &credential_id).await
 }
 
 #[tauri::command]

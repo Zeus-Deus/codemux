@@ -1,5 +1,8 @@
 use super::{ErrorCode, ProtocolError, Result};
-use codemux_addon_protocol::manifest::{HttpGrant, HttpMethod};
+use codemux_addon_protocol::{
+    limits,
+    manifest::{HttpGrant, HttpMethod},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -48,6 +51,8 @@ pub struct Http {
     #[cfg(test)]
     fixture: Arc<Mutex<Option<VecDeque<Response>>>>,
     #[cfg(test)]
+    fixture_delay: Arc<std::sync::Mutex<Duration>>,
+    #[cfg(test)]
     observed: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 impl Default for Http {
@@ -60,9 +65,32 @@ impl Default for Http {
             #[cfg(test)]
             fixture: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            fixture_delay: Arc::new(std::sync::Mutex::new(Duration::from_millis(20))),
+            #[cfg(test)]
             observed: Arc::new(Mutex::new(Vec::new())),
         }
     }
+}
+/// Only content-type and rate-limit headers reach the plugin.
+const RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "retry-after",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+];
+/// JSON escaping can expand a body within 512 KiB (a control character becomes
+/// six bytes). The complete result must still fit one frame with its envelope.
+fn framed(response: Response) -> Result<Response> {
+    let encoded = serde_json::to_vec(&response)
+        .map_err(|_| ProtocolError::invalid("Cannot encode HTTP response"))?;
+    if encoded.len() > limits::FRAME - 4096 {
+        return Err(ProtocolError::new(
+            ErrorCode::ResourceLimit,
+            "HTTP response exceeds the 1 MiB message limit once encoded",
+        ));
+    }
+    Ok(response)
 }
 fn denied() -> ProtocolError {
     ProtocolError::new(
@@ -117,13 +145,7 @@ pub fn validate(request: &Request, grant: &HttpGrant) -> Result<url::Url> {
     }
     for (key, value) in &request.headers {
         let lower = key.to_ascii_lowercase();
-        if ![
-            "accept",
-            "content-type",
-            "if-none-match",
-            "if-modified-since",
-        ]
-        .contains(&lower.as_str())
+        if !["accept", "content-type"].contains(&lower.as_str())
             || key.len() > 64
             || value.len() > 4096
             || value.chars().any(char::is_control)
@@ -143,6 +165,15 @@ impl Http {
     #[cfg(test)]
     pub(super) async fn observed_requests(&self) -> Vec<serde_json::Value> {
         self.observed.lock().await.clone()
+    }
+    /// Holds recorded responses in flight, to race them against disposal.
+    #[cfg(test)]
+    pub(super) fn recorded_delay(&self, delay: Duration) {
+        *self.fixture_delay.lock().unwrap() = delay;
+    }
+    #[cfg(test)]
+    pub(super) fn available_slots(&self) -> usize {
+        self.slots.available_permits()
     }
     async fn charge(&self, size: usize) -> Result<()> {
         let mut traffic = self.traffic.lock().await;
@@ -210,7 +241,8 @@ impl Http {
                     self.observed.lock().await.push(serde_json::json!({"origin":request.origin,"path":request.path,"method":request.method,"body":request.body,"credentialAttached":credential.is_some()}));
                     self.charge(request.body.as_ref().map_or(0, String::len))
                         .await?;
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let delay = *self.fixture_delay.lock().unwrap();
+                    tokio::time::sleep(delay).await;
                     if response.body.len() > 512 * 1024 {
                         return Err(ProtocolError::new(
                             ErrorCode::ResourceLimit,
@@ -222,18 +254,9 @@ impl Http {
                         return Err(denied());
                     }
                     response.headers.retain(|key, value| {
-                        [
-                            "content-type",
-                            "etag",
-                            "retry-after",
-                            "x-ratelimit-limit",
-                            "x-ratelimit-remaining",
-                            "x-ratelimit-reset",
-                        ]
-                        .contains(&key.as_str())
-                            && value.len() <= 4096
+                        RESPONSE_HEADERS.contains(&key.as_str()) && value.len() <= 4096
                     });
-                    return Ok(response);
+                    return framed(response);
                 }
             }
             let resolve = async {
@@ -321,14 +344,7 @@ impl Http {
             }
             let status = response.status().as_u16();
             let mut headers = BTreeMap::new();
-            for name in [
-                "content-type",
-                "etag",
-                "retry-after",
-                "x-ratelimit-limit",
-                "x-ratelimit-remaining",
-                "x-ratelimit-reset",
-            ] {
+            for name in RESPONSE_HEADERS.iter().copied() {
                 if let Some(value) = response
                     .headers()
                     .get(name)
@@ -351,7 +367,7 @@ impl Http {
             }
             let body = String::from_utf8(body)
                 .map_err(|_| ProtocolError::invalid("HTTP body is not UTF-8"))?;
-            Ok(Response {
+            framed(Response {
                 status,
                 headers,
                 body,
@@ -406,9 +422,20 @@ mod tests {
             "fe80::1",
             "fc00::1",
             "2002:7f00:1::",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "ff02::1",
+            "::",
+            "2001:db8::1",
+            "::ffff:10.0.0.1",
         ] {
             assert!(!public_address(ip.parse().unwrap()), "{ip}")
         }
+        assert!(public_address("172.32.0.1".parse().unwrap()));
         assert!(public_address("8.8.8.8".parse().unwrap()));
         assert!(public_address("2606:4700:4700::1111".parse().unwrap()));
     }
@@ -438,6 +465,105 @@ mod tests {
         request.headers.clear();
         request.method = HttpMethod::POST;
         assert!(validate(&request, &grant).is_err());
+        request.method = HttpMethod::GET;
+        for path in [
+            "/a\r\nHost: evil",
+            "/a\nb",
+            "/a\\b",
+            "/#fragment",
+            "/@evil.example",
+            "relative",
+            "/%0d%0aX:1",
+        ] {
+            request.path = path.into();
+            let accepted = validate(&request, &grant);
+            // Percent-encoded bytes stay inside the path of the granted origin.
+            if path.starts_with("/%") || path == "/@evil.example" {
+                assert_eq!(
+                    accepted.unwrap().origin().ascii_serialization(),
+                    grant.origin,
+                    "{path}"
+                );
+            } else {
+                assert!(accepted.is_err(), "{path}");
+            }
+        }
+        request.path = "/issues".into();
+        for (key, value) in [
+            ("Cookie", "session=1"),
+            ("Host", "evil.example"),
+            ("Proxy-Authorization", "Basic x"),
+            ("User-Agent", "spoofed"),
+            ("If-None-Match", "\"etag\""),
+            ("Accept", "text/plain\r\nX-Injected: 1"),
+            ("Accept", "text/plain\n"),
+        ] {
+            request.headers = BTreeMap::from([(key.into(), value.into())]);
+            assert!(validate(&request, &grant).is_err(), "{key}: {value:?}");
+        }
+        request.headers = BTreeMap::from([("Accept".into(), "application/json".into())]);
+        assert!(validate(&request, &grant).is_ok());
+        request.headers.clear();
+        request.method = HttpMethod::POST;
+        let writable = HttpGrant {
+            methods: vec![HttpMethod::POST],
+            ..grant.clone()
+        };
+        request.body = Some("x".repeat(256 * 1024));
+        assert!(validate(&request, &writable).is_ok());
+        request.body = Some("x".repeat(256 * 1024 + 1));
+        assert!(validate(&request, &writable).is_err());
+        request.body = None;
+        request.origin = "https://api.example.com".into();
+        assert!(validate(&request, &writable).is_err());
+    }
+    #[tokio::test]
+    async fn escaped_response_that_exceeds_the_frame_fails_with_resource_limit() {
+        let grant = HttpGrant {
+            origin: "https://api.github.com".into(),
+            methods: vec![HttpMethod::GET],
+            credential: None,
+        };
+        let http = Http::default();
+        // Within the 512 KiB body limit, but each control byte encodes as \u0001.
+        http.recorded_responses(vec![
+            Response {
+                status: 200,
+                headers: BTreeMap::from([
+                    ("content-type".into(), "text/plain".into()),
+                    ("etag".into(), "\"fixture\"".into()),
+                ]),
+                body: "\u{1}".repeat(300 * 1024),
+            },
+            Response {
+                status: 200,
+                headers: BTreeMap::from([("etag".into(), "\"fixture\"".into())]),
+                body: "ok".into(),
+            },
+        ])
+        .await;
+        let request = || Request {
+            context: "handle".into(),
+            origin: grant.origin.clone(),
+            path: "/issues".into(),
+            method: HttpMethod::GET,
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let started = Instant::now();
+        let error = http
+            .fetch("test.http", request(), &grant, None, &CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.data.code, ErrorCode::ResourceLimit);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let response = http
+            .fetch("test.http", request(), &grant, None, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(response.headers.is_empty(), "ETag is not a safe header");
+        assert!(serde_json::to_vec(&response).unwrap().len() < limits::FRAME);
     }
 }
 

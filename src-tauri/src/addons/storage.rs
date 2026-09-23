@@ -15,6 +15,12 @@ impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path).map_err(unavailable)?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv(scope TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(scope,key));").map_err(unavailable)?;
+        // Earlier builds keyed project data by a reusable AppState workspace
+        // ID. Those rows cannot be attributed to a project safely, so they are
+        // dropped rather than migrated; scopes now use workspace::storage_scope.
+        connection
+            .execute("DELETE FROM kv WHERE scope LIKE 'workspace:%'", [])
+            .map_err(unavailable)?;
         Ok(Self { connection })
     }
     fn key(key: &str) -> Result<()> {
@@ -104,5 +110,63 @@ mod tests {
         drop(store);
         let store = Storage::open(&path).unwrap();
         assert_eq!(store.get("global", "key").unwrap(), "safe");
+    }
+    #[test]
+    fn keys_and_total_size_are_bounded_without_losing_committed_values() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Storage::open(&root.path().join("state.sqlite")).unwrap();
+        let long = "k".repeat(129);
+        for key in ["", long.as_str(), "clé", "line\nbreak"] {
+            assert_eq!(
+                store
+                    .set("global", key, &serde_json::json!(1))
+                    .unwrap_err()
+                    .data
+                    .code,
+                ErrorCode::InvalidMessage,
+                "{key:?}"
+            );
+        }
+        store
+            .set("global", &"k".repeat(128), &serde_json::json!(1))
+            .unwrap();
+        let value = serde_json::json!("x".repeat(60 * 1024));
+        let mut stored = 0;
+        let error = loop {
+            match store.set("global", &format!("fill-{stored}"), &value) {
+                Ok(()) => stored += 1,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.data.code, ErrorCode::ResourceLimit);
+        assert!((80..=90).contains(&stored), "{stored} values stored");
+        assert_eq!(
+            store.get("global", &format!("fill-{stored}")).unwrap(),
+            Value::Null
+        );
+        assert_eq!(store.get("global", "fill-0").unwrap(), value);
+        store
+            .set("global", "fill-0", &serde_json::json!("smaller"))
+            .unwrap();
+    }
+    #[test]
+    fn project_data_keyed_by_a_reusable_workspace_id_is_dropped_on_open() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let mut store = Storage::open(&path).unwrap();
+        for scope in ["workspace:workspace-1", "workspace-root:current", "global"] {
+            store.set(scope, "key", &serde_json::json!(scope)).unwrap();
+        }
+        drop(store);
+        let store = Storage::open(&path).unwrap();
+        assert_eq!(
+            store.get("workspace:workspace-1", "key").unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            store.get("workspace-root:current", "key").unwrap(),
+            "workspace-root:current"
+        );
+        assert_eq!(store.get("global", "key").unwrap(), "global");
     }
 }

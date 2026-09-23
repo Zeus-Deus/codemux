@@ -66,6 +66,17 @@ export interface AddonInstallation {
   failure: string | null;
   previous: { manifest: AddonManifest } | null;
 }
+/**
+ * Host-owned state of one declared credential; never the secret itself.
+ * "not-configured" means requests to its origin are sent unauthenticated.
+ * "cleanup-pending" means a cleared saved value still awaits OS-store removal;
+ * it is already unusable and `addon_retry_cleanup` retries the removal.
+ */
+export type AddonCredentialState =
+  | "not-configured"
+  | "saved"
+  | "session-only"
+  | "cleanup-pending";
 export interface AddonInventory {
   paused: boolean;
   installed: AddonInstallation[];
@@ -73,6 +84,8 @@ export interface AddonInventory {
   warnings?: string[];
   developerMode?: boolean;
   developmentPackage?: string | null;
+  /** Plugin ID -> declared credential ID -> state. */
+  credentialStates?: Record<string, Record<string, AddonCredentialState>>;
 }
 export interface AddonError {
   message: string;
