@@ -1,19 +1,12 @@
-import { useEffect, useRef, useState, type ComponentProps } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import {
-  ArrowLeft,
-  PackagePlus,
-  Pause,
-  Puzzle,
-  RefreshCw,
-  ShieldCheck,
-} from "lucide-react";
+import { PackagePlus, Pause, Puzzle, RefreshCw, ShieldCheck } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
-  DialogContent,
   DialogHeader,
   DialogTitle,
   DialogDescription,
@@ -22,333 +15,187 @@ import {
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { AddonCatalog } from "@/components/addons/addon-catalog";
 import { beginAddonRevocation, useAddonsStore } from "@/stores/addons-store";
-import { addonInvoke } from "@/lib/addons/bridge";
-import { refreshAddons } from "@/lib/addons/platform";
+import { addonInvoke, resubscribeAddons } from "@/lib/addons/bridge";
+import { activeAddonWorkspace, refreshAddons } from "@/lib/addons/platform";
 import {
   addonMessage,
   type AddonInstallation,
-  type AddonManifest,
   type AddonReview,
+  type AddonUpdateCheck,
 } from "@/lib/addons/types";
-// These controlled dialogs have no Radix Trigger. Restore their actual opener,
-// and keep Escape from also reaching the window-level Settings close shortcut.
-function AddonDialogContent(props: ComponentProps<typeof DialogContent>) {
-  const opener = useRef<HTMLElement | null>(null);
-  return (
-    <DialogContent
-      {...props}
-      onOpenAutoFocus={() => {
-        opener.current =
-          document.activeElement instanceof HTMLElement
-            ? document.activeElement
-            : null;
-      }}
-      onCloseAutoFocus={(event) => {
-        event.preventDefault();
-        if (opener.current?.isConnected) opener.current.focus();
-      }}
-      onEscapeKeyDown={(event) => event.stopPropagation()}
-    />
-  );
+import { AddonDetail } from "./addon-detail";
+import { AddonDialogContent, ProblemAlert } from "./addon-parts";
+import {
+  TIER_LABELS,
+  addonProblem,
+  sourceIdentity,
+  type AddonProblem,
+} from "./addon-presentation";
+import { AddonReviewDialog } from "./addon-review";
+
+/** The outcome of the last "Check for update" on one release of a row. */
+type UpdateCheck = { release: string } & (
+  | { upToDate: true }
+  | { problem: AddonProblem }
+);
+const releaseKey = (item: AddonInstallation) =>
+  `${item.installationId}/${item.digest}`;
+/** The catalog or the app forbids enabling these; Enable could never work. */
+const UNAVAILABLE = ["blocked-disabled", "incompatible-disabled", "removing"];
+
+function names(values: string[]) {
+  return values.length < 2
+    ? values.join("")
+    : `${values.slice(0, -1).join(", ")} and ${values[values.length - 1]}`;
 }
-function Capabilities({ manifest }: { manifest: AddonManifest }) {
-  return (
-    <div className="space-y-3 text-body">
-      <h4 className="font-medium">Requested access</h4>
-      {!manifest.permissions.length && !manifest.http.length ? (
-        <p className="text-muted-foreground">
-          Private settings, storage, and declared UI only.
-        </p>
-      ) : (
-        <ul className="list-inside list-disc space-y-1">
-          {manifest.permissions.map((p) => (
-            <li key={p}>
-              {(
-                {
-                  "workspace.read": "Read local project metadata",
-                  "git.read": "Read a bounded Git summary",
-                  "composer.append": "Append text after your interaction",
-                  "external.open": "Open HTTPS links after your interaction",
-                } as Record<string, string>
-              )[p] ?? p}
-            </li>
-          ))}
-          {manifest.http.map((grant) => (
-            <li key={grant.origin}>
-              {grant.methods.join(", ")} {grant.origin}
-              {grant.credential ? " · host-managed credential" : ""}
-            </li>
-          ))}
-        </ul>
-      )}
-      <p className="text-muted-foreground">
-        {manifest.contributes.commands.length} commands ·{" "}
-        {manifest.contributes.panels.length} panels ·{" "}
-        {manifest.contributes.composerActions.length} composer actions
-      </p>
-      {manifest.http.some((grant) =>
-        grant.methods.some((method) => method !== "GET"),
-      ) && (
-        <p className="text-muted-foreground">
-          This add-on can write to the listed external services using the
-          declared methods.
-        </p>
-      )}
-      {manifest.http.length > 0 && (
-        <p className="text-muted-foreground">
-          Data sent to an external service cannot be recalled by removing the
-          add-on.
-        </p>
-      )}
-    </div>
-  );
-}
-function Credentials({
-  installation,
-  onError,
+
+function InstalledRow({
+  item,
+  busy,
+  check,
+  onConfigure,
+  onCheck,
+  onEnable,
+  onDisable,
+  onRollback,
+  onRemove,
 }: {
-  installation: AddonInstallation;
-  onError: (message: string) => void;
+  item: AddonInstallation;
+  busy: boolean;
+  check: UpdateCheck | undefined;
+  onConfigure: () => void;
+  onCheck: () => void;
+  onEnable: () => void;
+  onDisable: () => void;
+  onRollback: () => void;
+  onRemove: () => void;
 }) {
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [session, setSession] = useState(false);
-  const [busy, setBusy] = useState(false);
-  if (!installation.manifest.credentials.length) return null;
+  const current = check?.release === releaseKey(item) ? check : undefined;
+  const reason =
+    item.failure ??
+    (item.compatibility && !item.compatibility.compatible
+      ? item.compatibility.reason
+      : null);
   return (
-    <section className="space-y-3 border-t pt-5">
-      <h3 className="font-medium">Credentials</h3>
-      <p className="text-body text-muted-foreground">
-        Values stay in CodeMux’s credential store and are attached only to the
-        declared service. Add-ons cannot read them.
-      </p>
-      {installation.manifest.credentials.map((field) => (
-        <div key={field.id} className="space-y-2">
-          <label className="text-body" htmlFor={`credential-${field.id}`}>
-            {field.label}
-          </label>
-          <div className="flex gap-2">
-            <Input
-              id={`credential-${field.id}`}
-              type="password"
-              autoComplete="off"
-              value={values[field.id] ?? ""}
-              placeholder="Enter a new value"
-              onChange={(e) =>
-                setValues({ ...values, [field.id]: e.target.value })
-              }
-            />
-            <Button
-              disabled={busy || !values[field.id]}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  await addonInvoke("addon_credential_set", {
-                    id: installation.manifest.id,
-                    credentialId: field.id,
-                    value: values[field.id],
-                    sessionOnly: session,
-                  });
-                  setValues({ ...values, [field.id]: "" });
-                  onError("");
-                } catch (e) {
-                  onError(addonMessage(e));
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              Save
-            </Button>
-          </div>
-          <p className="text-label text-muted-foreground">{field.origin}</p>
+    <article className="space-y-3 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="font-medium">
+            {item.manifest.name}{" "}
+            <span className="font-normal text-muted-foreground">
+              {item.manifest.version}
+            </span>
+          </h3>
+          <p className="mt-1 text-label text-muted-foreground">
+            {item.source.kind === "local"
+              ? `${item.manifest.author.name} · Local / unverified`
+              : sourceIdentity(item.source, item.catalog)}
+            {item.catalog?.tier && ` · ${TIER_LABELS[item.catalog.tier]}`}
+            {item.catalog?.listed === false && " · No longer listed"} ·{" "}
+            {item.status.replace(/-/g, " ")}
+          </p>
         </div>
-      ))}
-      <label className="flex items-center gap-2 text-body">
-        <input
-          type="checkbox"
-          checked={session}
-          onChange={(e) => setSession(e.target.checked)}
-        />
-        Store new values for this session only
-      </label>
-    </section>
-  );
-}
-function Configure({
-  installation,
-  back,
-  onError,
-}: {
-  installation: AddonInstallation;
-  back: () => void;
-  onError: (message: string) => void;
-}) {
-  const [settings, setSettings] = useState<Record<string, unknown>>({});
-  const [configuration, setConfiguration] = useState<
-    "loading" | "ready" | "failed"
-  >("loading");
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
-  useEffect(() => {
-    let live = true;
-    void addonInvoke<Record<string, unknown>>("addon_settings_get", {
-      id: installation.manifest.id,
-    })
-      .then((value) => {
-        if (!live) return;
-        setSettings(value);
-        setConfiguration("ready");
-      })
-      .catch((e) => {
-        if (!live) return;
-        setConfiguration("failed");
-        onError(addonMessage(e));
-      });
-    return () => {
-      live = false;
-    };
-  }, [installation.installationId]);
-  return (
-    <div className="space-y-6">
-      <Button variant="ghost" onClick={back}>
-        <ArrowLeft className="size-4" /> Installed
-      </Button>
-      <div>
-        <h2 className="text-xl font-semibold">{installation.manifest.name}</h2>
-        <p className="mt-1 text-body text-muted-foreground">
-          {installation.manifest.description}
-        </p>
-      </div>
-      <div className="grid gap-1 text-body">
-        <span>
-          {installation.source.kind === "catalog"
-            ? "Catalog source"
-            : "Local / unverified"}{" "}
-          · {installation.manifest.version} · API {installation.manifest.api}
-        </span>
-        <span className="break-all text-muted-foreground">
-          {installation.manifest.repository}
-        </span>
-        <code className="break-all text-label text-muted-foreground">
-          SHA-256 {installation.digest}
-        </code>
-      </div>
-      <Capabilities manifest={installation.manifest} />
-      {installation.manifest.settings.length > 0 && (
-        <form
-          className="space-y-4 border-t pt-5"
-          onSubmit={async (e) => {
-            e.preventDefault();
-            if (configuration !== "ready" || busy) return;
-            setBusy(true);
-            setSaved(false);
-            try {
-              await addonInvoke("addon_settings_set", {
-                id: installation.manifest.id,
-                settings,
-              });
-              setSaved(true);
-            } catch (error) {
-              onError(addonMessage(error));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          <h3 className="font-medium">Configuration</h3>
-          {configuration === "loading" && (
-            <p role="status" className="text-body text-muted-foreground">
-              Loading configuration…
-            </p>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          {item.updateAvailable && (
+            <Badge variant="secondary">
+              Update {item.updateAvailable} available
+            </Badge>
           )}
-          {installation.manifest.settings.map((field) => (
-            <label key={field.id} className="grid gap-2 text-body">
-              {field.label}
-              {field.type === "boolean" ? (
-                <Switch
-                  disabled={configuration !== "ready" || busy}
-                  aria-label={field.label}
-                  checked={settings[field.id] === true}
-                  onCheckedChange={(value) =>
-                    setSettings({ ...settings, [field.id]: value })
-                  }
-                />
-              ) : field.type === "enum" ? (
-                <select
-                  disabled={configuration !== "ready" || busy}
-                  className="rounded-md border bg-background p-2"
-                  value={String(settings[field.id] ?? field.default)}
-                  onChange={(e) =>
-                    setSettings({ ...settings, [field.id]: e.target.value })
-                  }
-                >
-                  {field.values.map((value) => (
-                    <option key={value}>{value}</option>
-                  ))}
-                </select>
-              ) : (
-                <Input
-                  disabled={configuration !== "ready" || busy}
-                  type={field.type === "integer" ? "number" : "text"}
-                  min={field.type === "integer" ? field.min : undefined}
-                  max={field.type === "integer" ? field.max : undefined}
-                  value={String(settings[field.id] ?? field.default)}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      [field.id]:
-                        field.type === "integer"
-                          ? Number(e.target.value)
-                          : e.target.value,
-                    })
-                  }
-                />
-              )}
-            </label>
-          ))}
-          <div className="flex items-center gap-3">
-            <Button disabled={configuration !== "ready" || busy}>
-              Save settings
-            </Button>
-            {saved && (
-              <span role="status" className="text-body text-muted-foreground">
-                Saved
-              </span>
-            )}
-          </div>
-        </form>
-      )}
-      <Credentials installation={installation} onError={onError} />
-      {installation.failure && (
-        <div
-          role="alert"
-          className="rounded-lg border border-destructive/30 p-3 text-body"
-        >
-          {installation.failure}
+          {item.catalog?.tier === "official" && (
+            <ShieldCheck
+              className="size-4 text-muted-foreground"
+              role="img"
+              aria-label="Official"
+            />
+          )}
         </div>
+      </div>
+      <p className="text-body text-muted-foreground">
+        {item.manifest.description}
+      </p>
+      {reason && <p className="text-body text-destructive">{reason}</p>}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button size="sm" variant="outline" onClick={onConfigure}>
+          Configure / Permissions
+        </Button>
+        {item.source.kind === "catalog" && (
+          <Button size="sm" variant="outline" disabled={busy} onClick={onCheck}>
+            Check for update
+          </Button>
+        )}
+        {item.status === "failed-disabled" ? (
+          <>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={onEnable}
+            >
+              Retry
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={onDisable}
+            >
+              Disable
+            </Button>
+          </>
+        ) : UNAVAILABLE.includes(item.status) ? null : (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={item.desiredEnabled ? onDisable : onEnable}
+          >
+            {item.desiredEnabled ? "Disable" : "Enable"}
+          </Button>
+        )}
+        {item.previous && (
+          <Button size="sm" variant="outline" onClick={onRollback}>
+            <RefreshCw className="size-3" />
+            Rollback
+          </Button>
+        )}
+        <Button size="sm" variant="ghost" onClick={onRemove}>
+          Remove
+        </Button>
+        {current && "upToDate" in current && (
+          <span role="status" className="text-label text-muted-foreground">
+            Up to date
+          </span>
+        )}
+      </div>
+      {current && "problem" in current && (
+        <ProblemAlert problem={current.problem} />
       )}
-    </div>
+    </article>
   );
 }
+
 export function AddonsSettings() {
   const state = useAddonsStore();
   const [selected, setSelected] = useState<string | null>(null);
   const [review, setReview] = useState<AddonReview | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  // Failures of the open dialog's operation render inside that dialog; the
+  // page behind a modal is hidden from assistive technology.
+  const [dialogProblem, setDialogProblem] = useState<AddonProblem | null>(
+    null,
+  );
   const [busy, setBusy] = useState(false);
-  const [replace, setReplace] = useState(false);
-  const [enable, setEnable] = useState(true);
   const [remove, setRemove] = useState<AddonInstallation | null>(null);
   const [keep, setKeep] = useState(false);
-  const [restoreData, setRestoreData] = useState(false);
   const [rollback, setRollback] = useState<AddonInstallation | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [checks, setChecks] = useState<Record<string, UpdateCheck>>({});
   const [tab, setTab] = useState<"installed" | "browse">("installed");
   const [target, setTarget] = useState("");
   const [linkOpen, setLinkOpen] = useState(false);
   const showReview = (value: AddonReview) => {
-    setRestoreData(false);
-    setReplace(false);
-    setEnable(true);
+    setDialogProblem(null);
     setReview(value);
   };
   useEffect(() => {
@@ -360,21 +207,61 @@ export function AddonsSettings() {
       useAddonsStore.setState({ developmentReview: null });
     }
   }, [state.developmentReview]);
-  const perform = async (action: () => Promise<unknown>, revoke?: string) => {
-    const release = revoke ? beginAddonRevocation(revoke) : undefined;
+  const perform = async (
+    action: () => Promise<unknown>,
+    options: { revoke?: string; dialog?: boolean } = {},
+  ) => {
+    const release = options.revoke
+      ? beginAddonRevocation(options.revoke)
+      : undefined;
     setBusy(true);
-    setError("");
+    if (options.dialog) setDialogProblem(null);
+    else {
+      setError("");
+      setNotice("");
+    }
     try {
       await action();
     } catch (cause) {
-      setError(addonMessage(cause));
+      if (options.dialog) setDialogProblem(addonProblem(cause));
+      else setError(addonMessage(cause));
     } finally {
       await refreshAddons();
       release?.();
       setBusy(false);
     }
   };
+  const openDialog = (show: () => void) => {
+    setDialogProblem(null);
+    show();
+  };
+  const setCheck = (id: string, value: UpdateCheck | null) =>
+    setChecks((all) => {
+      const next = { ...all };
+      if (value) next[id] = value;
+      else delete next[id];
+      return next;
+    });
+  const checkForUpdate = (item: AddonInstallation) =>
+    void perform(async () => {
+      const id = item.manifest.id;
+      const release = releaseKey(item);
+      setCheck(id, null);
+      try {
+        const result = await addonInvoke<AddonUpdateCheck>(
+          "addon_check_update",
+          { id },
+        );
+        if (result.review && !result.upToDate) showReview(result.review);
+        else setCheck(id, { release, upToDate: true });
+      } catch (cause) {
+        setCheck(id, { release, problem: addonProblem(cause) });
+      }
+    });
   const installation = state.installed.find((i) => i.manifest.id === selected);
+  const interrupted = (state.interruptedActivations ?? []).map(
+    (id) => state.installed.find((i) => i.manifest.id === id)?.manifest.name ?? id,
+  );
   if (isRemoteClient())
     return (
       <div className="space-y-3">
@@ -399,9 +286,14 @@ export function AddonsSettings() {
           disabled={busy}
           onClick={() => {
             void perform(
-              () =>
-                addonInvoke(state.paused ? "addon_resume" : "addon_pause_all"),
-              state.paused ? undefined : "*",
+              async () => {
+                if (!state.paused) return addonInvoke("addon_pause_all");
+                // Resuming also retries a manager that failed to open, whose
+                // event stream then has to be opened again.
+                await addonInvoke("addon_resume");
+                await resubscribeAddons(activeAddonWorkspace);
+              },
+              { revoke: state.paused ? undefined : "*" },
             );
           }}
         >
@@ -409,19 +301,57 @@ export function AddonsSettings() {
           {state.paused ? "Resume add-ons" : "Pause all add-ons"}
         </Button>
       </header>
-      {(error || state.error) && (
-        <p
-          role="alert"
-          className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-body"
-        >
-          {error || state.error}
-        </p>
-      )}
-      {state.paused && (
+      <ProblemAlert
+        problem={
+          state.registryError
+            ? // The registry panel below already shows the open failure.
+              error && error !== state.error
+              ? error
+              : null
+            : error || state.error
+        }
+      />
+      {notice && (
         <p role="status" className="rounded-lg border bg-muted/40 p-3 text-body">
-          All add-ons are paused. Your installed packages and settings are kept.
+          {notice}
         </p>
       )}
+      {state.registryError && (
+        <div
+          role="alert"
+          className="space-y-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-body"
+        >
+          <p className="font-medium">The add-on registry could not be opened</p>
+          <p>{state.error}</p>
+          <p className="text-muted-foreground">
+            Add-ons stay off until it is repaired. The rest of CodeMux is not
+            affected.
+          </p>
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => openDialog(() => setResetOpen(true))}
+          >
+            Reset add-on registry
+          </Button>
+        </div>
+      )}
+      {state.paused &&
+        !state.error &&
+        (interrupted.length ? (
+          <p role="status" className="rounded-lg border bg-muted/40 p-3 text-body">
+            CodeMux closed while {names(interrupted)}{" "}
+            {interrupted.length > 1 ? "were" : "was"} starting. All add-ons
+            are paused so you can review{" "}
+            {interrupted.length > 1 ? "them" : "it"} first; choose Resume
+            add-ons when you are ready.
+          </p>
+        ) : (
+          <p role="status" className="rounded-lg border bg-muted/40 p-3 text-body">
+            All add-ons are paused. Your installed packages and settings are
+            kept.
+          </p>
+        ))}
       {!!state.warnings?.length && (
         <div role="status" className="space-y-2 rounded-lg border p-3 text-body">
           {state.warnings.map((warning) => (
@@ -439,12 +369,14 @@ export function AddonsSettings() {
           </Button>
         </div>
       )}
-      {installation ? (
-        <Configure
+      {state.registryError ? null : installation ? (
+        <AddonDetail
           key={`${installation.installationId}/${installation.digest}/${installation.dataGeneration}`}
           installation={installation}
+          credentialStates={state.credentialStates?.[installation.manifest.id]}
           back={() => setSelected(null)}
           onError={setError}
+          onRollback={(item) => openDialog(() => setRollback(item))}
         />
       ) : (
         <>
@@ -474,7 +406,7 @@ export function AddonsSettings() {
               <Button
                 variant="outline"
                 disabled={busy}
-                onClick={() => setLinkOpen(true)}
+                onClick={() => openDialog(() => setLinkOpen(true))}
               >
                 Install from link / ID
               </Button>
@@ -492,15 +424,12 @@ export function AddonsSettings() {
                         },
                       ],
                     });
-                    if (typeof path === "string") {
-                      setReplace(false);
-                      setEnable(true);
-                      setReview(
+                    if (typeof path === "string")
+                      showReview(
                         await addonInvoke<AddonReview>("addon_import_review", {
                           path,
                         }),
                       );
-                    }
                   })
                 }
               >
@@ -533,112 +462,39 @@ export function AddonsSettings() {
           ) : (
             <div className="divide-y rounded-lg border">
               {state.installed.map((item) => (
-                <article key={item.installationId} className="space-y-3 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="font-medium">
-                        {item.manifest.name}{" "}
-                        <span className="font-normal text-muted-foreground">
-                          {item.manifest.version}
-                        </span>
-                      </h3>
-                      <p className="mt-1 text-label text-muted-foreground">
-                        {item.manifest.author.name} ·{" "}
-                        {item.source.kind === "local"
-                          ? "Local / unverified"
-                          : "Catalog source"}{" "}
-                        · {item.status.replace(/-/g, " ")}
-                      </p>
-                    </div>
-                    {item.source.kind === "catalog" && (
-                      <ShieldCheck className="size-4 text-muted-foreground" />
-                    )}
-                  </div>
-                  <p className="text-body text-muted-foreground">
-                    {item.manifest.description}
-                  </p>
-                  {item.failure && (
-                    <p className="text-body text-destructive">{item.failure}</p>
-                  )}
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => setSelected(item.manifest.id)}
-                    >
-                      Configure / Permissions
-                    </Button>
-                    {item.source.kind === "catalog" && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() =>
-                          void perform(async () =>
-                            showReview(
-                              await addonInvoke<AddonReview>(
-                                "addon_catalog_review",
-                                { target: item.manifest.id },
-                              ),
-                            ),
-                          )
-                        }
-                      >
-                        Check for update
-                      </Button>
-                    )}
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={busy}
-                      onClick={() =>
-                        void perform(
-                          () =>
-                            addonInvoke(
-                              item.desiredEnabled &&
-                                item.status !== "failed-disabled"
-                                ? "addon_disable"
-                                : "addon_enable",
-                              { id: item.manifest.id },
-                            ),
-                          item.desiredEnabled ? item.manifest.id : undefined,
-                        )
-                      }
-                    >
-                      {item.status === "failed-disabled"
-                        ? "Retry"
-                        : item.desiredEnabled
-                          ? "Disable"
-                          : "Enable"}
-                    </Button>
-                    {item.previous && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => setRollback(item)}
-                      >
-                        <RefreshCw className="size-3" />
-                        Rollback
-                      </Button>
-                    )}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => {
-                        setKeep(false);
-                        setRemove(item);
-                      }}
-                    >
-                      Remove
-                    </Button>
-                  </div>
-                </article>
+                <InstalledRow
+                  key={item.installationId}
+                  item={item}
+                  busy={busy}
+                  check={checks[item.manifest.id]}
+                  onConfigure={() => setSelected(item.manifest.id)}
+                  onCheck={() => checkForUpdate(item)}
+                  onEnable={() =>
+                    void perform(() =>
+                      addonInvoke("addon_enable", { id: item.manifest.id }),
+                    )
+                  }
+                  onDisable={() =>
+                    void perform(
+                      () =>
+                        addonInvoke("addon_disable", { id: item.manifest.id }),
+                      { revoke: item.manifest.id },
+                    )
+                  }
+                  onRollback={() => openDialog(() => setRollback(item))}
+                  onRemove={() =>
+                    openDialog(() => {
+                      setKeep(false);
+                      setRemove(item);
+                    })
+                  }
+                />
               ))}
             </div>
           )}
         </>
       )}
-      {!installation && (
+      {!installation && !state.registryError && (
         <section className="space-y-3 border-t pt-5">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -713,7 +569,13 @@ export function AddonsSettings() {
           )}
         </section>
       )}
-      <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
+      <Dialog
+        open={linkOpen}
+        onOpenChange={(value) => {
+          setLinkOpen(value);
+          if (!value) setDialogProblem(null);
+        }}
+      >
         <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>Install from link or ID</DialogTitle>
@@ -726,14 +588,17 @@ export function AddonsSettings() {
             className="space-y-4"
             onSubmit={(e) => {
               e.preventDefault();
-              void perform(async () => {
-                showReview(
-                  await addonInvoke<AddonReview>("addon_catalog_review", {
-                    target: target.trim(),
-                  }),
-                );
-                setLinkOpen(false);
-              });
+              void perform(
+                async () => {
+                  const found = await addonInvoke<AddonReview>(
+                    "addon_catalog_review",
+                    { target: target.trim() },
+                  );
+                  setLinkOpen(false);
+                  showReview(found);
+                },
+                { dialog: true },
+              );
             }}
           >
             <Input
@@ -742,6 +607,7 @@ export function AddonsSettings() {
               onChange={(e) => setTarget(e.target.value)}
               placeholder="codemux.project-brief"
             />
+            <ProblemAlert problem={dialogProblem} />
             <DialogFooter>
               <Button type="submit" disabled={busy || !target.trim()}>
                 Find release
@@ -750,94 +616,33 @@ export function AddonsSettings() {
           </form>
         </AddonDialogContent>
       </Dialog>
-      <Dialog
-        open={review !== null}
-        onOpenChange={(value) => {
-          if (!value && !busy && review) {
-            void addonInvoke("addon_cancel_review", { token: review.token });
-            setReview(null);
-          }
+      <AddonReviewDialog
+        review={review}
+        busy={busy}
+        paused={state.paused}
+        problem={dialogProblem}
+        onDismiss={() => {
+          if (review)
+            void addonInvoke("addon_cancel_review", {
+              token: review.token,
+            }).catch(() => {});
+          setReview(null);
+          setDialogProblem(null);
         }}
-      >
-        <AddonDialogContent className="max-h-[85vh] overflow-auto">
-          <DialogHeader>
-            <DialogTitle>Review {review?.manifest.name}</DialogTitle>
-            <DialogDescription>
-              {review?.manifest.version} ·{" "}
-              {review?.source.kind === "local"
-                ? "Local / unverified"
-                : "Catalog source"}
-            </DialogDescription>
-          </DialogHeader>
-          {review && (
-            <>
-              <p className="text-body">{review.manifest.description}</p>
-              {review.development && (
-                <p className="rounded-sm border p-3 text-body">
-                  Development package. Once enabled, CodeMux watches this
-                  selected file for validated local rebuilds. Permission changes
-                  still need review.
-                </p>
-              )}
-              <p className="text-label text-muted-foreground">
-                Author: {review.manifest.author.name} · License:{" "}
-                {review.manifest.license}
-              </p>
-              <Capabilities manifest={review.manifest} />
-              <code className="break-all text-label">SHA-256 {review.digest}</code>
-              {review.replacesSource && (
-                <label className="flex items-start gap-2 text-body">
-                  <input
-                    type="checkbox"
-                    checked={replace}
-                    onChange={(e) => setReplace(e.target.checked)}
-                  />
-                  Replace the existing source with this package. Its previous
-                  grants and private data will not carry over.
-                </label>
-              )}
-              <label className="flex items-center gap-2 text-body">
-                <input
-                  type="checkbox"
-                  checked={enable}
-                  onChange={(e) => setEnable(e.target.checked)}
-                />
-                Enable after installation
-              </label>
-              {review.retainedData && (
-                <label className="flex items-start gap-2 text-body">
-                  <input
-                    type="checkbox"
-                    checked={restoreData}
-                    onChange={(e) => setRestoreData(e.target.checked)}
-                  />
-                  Restore private data retained from version{" "}
-                  {review.retainedData.version} of this same source. Credentials
-                  are not restored.
-                </label>
-              )}
-              <DialogFooter>
-                <Button
-                  disabled={busy || (review.replacesSource && !replace)}
-                  onClick={() =>
-                    void perform(async () => {
-                      await addonInvoke("addon_accept_review", {
-                        token: review.token,
-                        enable,
-                        replaceSource: replace,
-                        restoreData,
-                      });
-                      setReview(null);
-                    })
-                  }
-                >
-                  Accept and install
-                </Button>
-              </DialogFooter>
-            </>
-          )}
-        </AddonDialogContent>
-      </Dialog>
+        onAccept={(choice) => {
+          if (!review) return;
+          void perform(
+            async () => {
+              await addonInvoke("addon_accept_review", {
+                token: review.token,
+                ...choice,
+              });
+              setReview(null);
+            },
+            { dialog: true },
+          );
+        }}
+      />
       <Dialog
         open={remove !== null}
         onOpenChange={(value) => {
@@ -860,19 +665,24 @@ export function AddonsSettings() {
             />
             Keep data for reinstall from the same source
           </label>
+          <ProblemAlert problem={dialogProblem} />
           <DialogFooter>
             <Button
               variant="destructive"
               disabled={busy}
               onClick={() =>
-                void perform(async () => {
-                  const warnings = await addonInvoke<string[]>("addon_remove", {
-                    id: remove!.manifest.id,
-                    keepData: keep,
-                  });
-                  setRemove(null);
-                  if (warnings.length) setError(warnings.join(" "));
-                }, remove!.manifest.id)
+                void perform(
+                  async () => {
+                    const warnings = await addonInvoke<string[]>(
+                      "addon_remove",
+                      { id: remove!.manifest.id, keepData: keep },
+                    );
+                    setRemove(null);
+                    if (selected === remove!.manifest.id) setSelected(null);
+                    if (warnings?.length) setError(warnings.join(" "));
+                  },
+                  { revoke: remove!.manifest.id, dialog: true },
+                )
               }
             >
               Remove add-on
@@ -897,19 +707,71 @@ export function AddonsSettings() {
               actions are not undone.
             </DialogDescription>
           </DialogHeader>
+          <ProblemAlert problem={dialogProblem} />
           <DialogFooter>
             <Button
               disabled={busy}
               onClick={() =>
-                void perform(async () => {
-                  await addonInvoke("addon_rollback", {
-                    id: rollback!.manifest.id,
-                  });
-                  setRollback(null);
-                })
+                void perform(
+                  async () => {
+                    await addonInvoke("addon_rollback", {
+                      id: rollback!.manifest.id,
+                    });
+                    setRollback(null);
+                  },
+                  { dialog: true },
+                )
               }
             >
               Restore previous release
+            </Button>
+          </DialogFooter>
+        </AddonDialogContent>
+      </Dialog>
+      <Dialog
+        open={resetOpen}
+        onOpenChange={(value) => {
+          if (!value && !busy) setResetOpen(false);
+        }}
+      >
+        <AddonDialogContent>
+          <DialogHeader>
+            <DialogTitle>Reset the add-on registry?</DialogTitle>
+            <DialogDescription>
+              CodeMux moves the current add-on folder aside as a backup and
+              starts with no add-ons. Nothing is deleted; install the add-ons
+              you use again afterwards.
+            </DialogDescription>
+          </DialogHeader>
+          {state.registryError && (
+            <code className="break-all text-label text-muted-foreground">
+              {state.registryError.path}
+            </code>
+          )}
+          <ProblemAlert problem={dialogProblem} />
+          <DialogFooter>
+            <Button
+              disabled={busy}
+              onClick={() =>
+                void perform(
+                  async () => {
+                    const backup = await addonInvoke<string>(
+                      "addon_registry_reset",
+                    );
+                    setResetOpen(false);
+                    setNotice(
+                      `The add-on registry was reset. The previous files were moved to ${backup}.`,
+                    );
+                    // The first subscription failed with the registry.
+                    await resubscribeAddons(activeAddonWorkspace).catch(
+                      (cause) => setError(addonMessage(cause)),
+                    );
+                  },
+                  { dialog: true },
+                )
+              }
+            >
+              Reset registry
             </Button>
           </DialogFooter>
         </AddonDialogContent>
