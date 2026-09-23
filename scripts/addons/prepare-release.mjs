@@ -39,6 +39,19 @@ assert.equal(
   "",
   "Commit author package changes before preparing release provenance",
 );
+// A release tag must reference a commit that stays on main. Other output, such
+// as a pull request head or a local branch, is only a review candidate.
+if (
+  !run(
+    "git",
+    ["branch", "--remotes", "--contains", sourceCommit, "--list", "*/main"],
+    repository,
+    true,
+  )
+)
+  console.warn(
+    `Warning: ${sourceCommit} is not on a fetched remote main branch. Treat this output as a review candidate; prepare release assets from the exact main commit that will be tagged.`,
+  );
 // Refuse to replace an existing release directory or its assets.
 await mkdir(output);
 const temporary = await mkdtemp(join(tmpdir(), "codemux-author-release-"));
