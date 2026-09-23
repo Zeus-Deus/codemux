@@ -575,7 +575,7 @@ impl Manager {
         });
         hosts.insert(installation.manifest.id.clone(), running.clone());
         drop(hosts);
-        let (ready, readiness) = oneshot::channel();
+        let (ready, mut readiness) = oneshot::channel();
         let manager = self.clone();
         let instance = running.clone();
         tokio::spawn(async move {
@@ -608,8 +608,20 @@ impl Manager {
             }
         });
         if let Err(error) = running.host.send("activate", json!({})).await {
-            self.stop(&installation.manifest.id, Some(error.message.clone()))
-                .await;
+            // A child that died at once may already be stopped by the supervisor
+            // with its cause. Stop only a generation nobody is stopping: without
+            // an instance, stop cannot tell a probe from the installed record.
+            let error = match readiness.try_recv() {
+                Ok(Err(cause)) => cause,
+                _ => error,
+            };
+            if running.cancel.is_cancelled() {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled()).await;
+            } else {
+                self.stop(&installation.manifest.id, Some(error.message.clone()))
+                    .await;
+            }
             return Err(error);
         }
         match tokio::time::timeout(Duration::from_secs(2), readiness).await {
@@ -622,10 +634,16 @@ impl Manager {
                     tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled()).await;
                 return Err(error);
             }
-            // Another operation (pause, disable, removal) stopped it first.
+            // Another operation (pause, disable, removal) stopped it first. A
+            // supervisor that ended without stopping it leaves it to this caller.
             Ok(Err(_)) => {
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled()).await;
+                if running.cancel.is_cancelled() {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), running.stopped.cancelled())
+                            .await;
+                } else {
+                    self.stop(&installation.manifest.id, None).await;
+                }
                 return Err(ProtocolError::new(
                     ErrorCode::PluginStopped,
                     "Add-on stopped during activation",
@@ -661,6 +679,8 @@ impl Manager {
         if !probe {
             let mut installation = installation;
             installation.status = Status::EnabledRunning;
+            // Including the notice that an earlier start was interrupted.
+            installation.failure = None;
             self.save(&installation)?;
         }
         Ok(running)
@@ -970,17 +990,24 @@ impl Manager {
                 .filter_map(|key| key.strip_prefix("activation:").map(str::to_owned))
                 .collect()
         };
+        let installed = self.list()?;
         if !interrupted.is_empty() {
+            // A probe for an installation that recovery rolled back still
+            // pauses, but only installed add-ons can be named.
+            let named: Vec<&String> = interrupted
+                .iter()
+                .filter(|id| installed.iter().any(|i| &&i.manifest.id == id))
+                .collect();
             let db = self.registry.lock().unwrap();
             db.execute_batch("INSERT OR REPLACE INTO metadata(key,value) VALUES('paused','true'); DELETE FROM metadata WHERE key LIKE 'activation:%';").map_err(storage_error)?;
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key,value) VALUES('interrupted',?1)",
-                [serde_json::to_string(&interrupted).unwrap()],
+                [serde_json::to_string(&named).unwrap()],
             )
             .map_err(storage_error)?;
             self.paused.store(true, Ordering::Release);
         }
-        for mut installation in self.list()? {
+        for mut installation in installed {
             let starting = interrupted.contains(&installation.manifest.id);
             let running = matches!(
                 installation.status,

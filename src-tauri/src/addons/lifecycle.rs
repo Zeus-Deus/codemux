@@ -2308,9 +2308,10 @@ pub(crate) mod tests {
             .registry
             .lock()
             .unwrap()
-            .execute(
-                "INSERT INTO metadata(key,value) VALUES('activation:example.hello','pending')",
-                [],
+            .execute_batch(
+                // The second marker is a probe whose fresh install was rolled back.
+                "INSERT INTO metadata(key,value) VALUES('activation:example.hello','pending');
+                 INSERT INTO metadata(key,value) VALUES('activation:example.gone','pending');",
             )
             .unwrap();
         drop(manager);
