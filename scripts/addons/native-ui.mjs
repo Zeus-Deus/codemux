@@ -211,8 +211,22 @@ async function clickText(value, scope = "document") {
   await wd("POST", `/element/${elementId(el)}/click`, {});
 }
 async function click(css) {
-  const el = await element(css);
-  await wd("POST", `/element/${elementId(el)}/click`, {});
+  // The app may replace a node between locating and clicking it (for example
+  // a chat pane's first focus swaps its composer). The driver dispatches no
+  // click on a stale reference, so only that rejection is retried.
+  for (let attempt = 0; ; attempt++) {
+    const el = await element(css);
+    try {
+      await wd("POST", `/element/${elementId(el)}/click`, {});
+      return;
+    } catch (error) {
+      if (
+        attempt === 2 ||
+        !String(error).includes('"error":"stale element reference"')
+      )
+        throw error;
+    }
+  }
 }
 async function type(css, value) {
   const el = await element(css);
