@@ -600,11 +600,18 @@ impl Manager {
                 let id = message
                     .id
                     .ok_or_else(|| ProtocolError::invalid("Host operation requires an ID"))?;
-                let permit = running.requests.clone().try_acquire_owned().map_err(|_| {
-                    ProtocolError::new(ErrorCode::ResourceLimit, "Too many host requests")
-                })?;
                 let manager = self.clone();
                 let instance = running.clone();
+                // Like the rate quota, the outstanding bound answers instead of
+                // stopping; that quota also bounds these rejections.
+                let Ok(permit) = running.requests.clone().try_acquire_owned() else {
+                    tokio::spawn(async move {
+                        let error =
+                            ProtocolError::new(ErrorCode::ResourceLimit, "Too many host requests");
+                        let _ = instance.host.respond(id, Err(error)).await;
+                    });
+                    return Ok(());
+                };
                 tokio::spawn(async move {
                     let operation = params["operation"].as_str().unwrap_or("");
                     let timeout = if operation == "http.fetch" { 30 } else { 15 };
@@ -1579,6 +1586,93 @@ mod tests {
         let installed = manager.installation(&running.manifest.id).unwrap();
         assert!(matches!(installed.status, Status::EnabledIdle));
         assert!(installed.failure.is_none());
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_outstanding_host_requests_are_bounded_without_quarantine() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let mut manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        manifest.permissions.push(Permission::ComposerAppend);
+        let installation = installed(manifest);
+        manager.save(&installation).unwrap();
+        // Each token becomes one append that waits on the host UI. All permits
+        // are held, so the plugin reports the seventeenth reply as an error log.
+        let source = "__codemuxRegister({}, ({send}) => m => {\
+            if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});\
+            else if(m.method==='command.execute')m.params.tokens.forEach((context,i)=>send('host.request',{operation:'composer.appendText',params:{context,text:'x'}},i+1));\
+            else if(!m.method&&m.id===17)console.error(m.error.data.code);});";
+        let running = manager
+            .activate(installation, source.into(), false)
+            .await
+            .unwrap();
+        let composer = uuid::Uuid::new_v4().to_string();
+        manager
+            .contexts
+            .lock()
+            .await
+            .register_composer(composer.clone(), "project".into())
+            .unwrap();
+        let workspace = Workspace {
+            id: "project".into(),
+            name: "Synthetic project".into(),
+            root_name: "project".into(),
+            location: "local",
+            root: root.path().into(),
+        };
+        let base = manager
+            .context_handle(&running, Some(workspace), Some(composer))
+            .await
+            .unwrap();
+        let mut tokens = Vec::new();
+        for _ in 0..17 {
+            tokens.push(
+                manager
+                    .contexts
+                    .lock()
+                    .await
+                    .interact(&base, running.generation(), Instant::now())
+                    .unwrap(),
+            );
+        }
+        let mut events = manager.events.subscribe();
+        running
+            .host
+            .send("command.execute", json!({"id":"hello","tokens":tokens}))
+            .await
+            .unwrap();
+        let mut effects = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while effects < 16 {
+                if let Ok(UiEvent::Effect { .. }) = events.recv().await {
+                    effects += 1;
+                }
+            }
+        })
+        .await
+        .expect("sixteen requests reach the broker");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let diagnostics = manager.diagnostics(&running.manifest.id).unwrap();
+                if diagnostics
+                    .logs
+                    .iter()
+                    .any(|entry| entry.level == "error" && entry.bytes == "RESOURCE_LIMIT".len())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the seventeenth request is answered with RESOURCE_LIMIT");
+        assert!(!running.cancel.is_cancelled());
+        assert_eq!(effects, 16);
+        manager.shutdown().await;
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
