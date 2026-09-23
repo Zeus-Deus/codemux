@@ -1,4 +1,5 @@
 import {readFile} from 'node:fs/promises';
+import {isUtf8} from 'node:buffer';
 import Ajv from 'ajv';
 // Mirrors the desktop's authoritative validator (addon-protocol manifest.rs),
 // so `check` and `pack` accept exactly the manifests the app imports.
@@ -14,8 +15,9 @@ const integer=(object,key)=>sourceIntegers.get(object)?.get(key)??(Number.isInte
 // is an integer field, and serde_json reads a fraction, an exponent, -0 or a value
 // outside 64 bits as a float, which no such field accepts.
 export function parse(bytes) {
- let source;
- try {source=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes)} catch {throw Error('manifest.json is not valid UTF-8')}
+ if(!isUtf8(bytes))throw Error('manifest.json is not valid UTF-8');
+ // Buffer decoding needs no ICU and keeps a byte order mark, which JSON.parse rejects.
+ const source=Buffer.from(bytes).toString('utf8');
  JSON.parse(source);
  // The grammar is valid, so each token is a string, a literal, a number or a bracket.
  const tokens=source.match(/"(?:[^"\\]|\\.)*"|[{}[\]]|[^\s"{}[\],:]+/g);

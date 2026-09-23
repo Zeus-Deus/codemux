@@ -83,3 +83,17 @@ test('manifest bytes are read as strictly as the desktop reads them', () => {
   assert.throws(() => validate(copy), /author\.url and repository must be HTTPS URLs/, field);
  }
 });
+// Node built without ICU rejects TextDecoder's `fatal` option.
+test('manifest bytes are read without ICU', () => {
+ const {TextDecoder} = globalThis;
+ globalThis.TextDecoder = class extends TextDecoder {
+  constructor(label, options) {
+   if (options?.fatal) throw Object.assign(new TypeError('"fatal" option is not supported on Node.js compiled without ICU'), {code: 'ERR_NO_ICU'});
+   super(label, options);
+  }
+ };
+ try {
+  assert.equal(validate(parse(Buffer.from(JSON.stringify(base)))).id, base.id);
+  assert.throws(() => parse(Buffer.from([0x7b, 0xff, 0x7d])), /not valid UTF-8/);
+ } finally {globalThis.TextDecoder = TextDecoder;}
+});
