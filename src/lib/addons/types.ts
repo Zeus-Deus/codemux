@@ -126,6 +126,21 @@ export interface AddonReview {
   development?: boolean;
   retainedData?: { version: string } | null;
 }
+/** `addon_diagnostics` log entry. Plugin log text is never kept. */
+export interface AddonLogEntry {
+  /** Milliseconds since the Unix epoch. */
+  at: number;
+  level: "log" | "info" | "warn" | "error" | "debug";
+  /** UTF-8 size of the entry after host truncation (at most 1,024 characters). */
+  bytes: number;
+}
+/** Current installation's log activity this session, kept across stops and crashes. */
+export interface AddonDiagnostics {
+  /** Entries received this session, including ones the ring evicted. */
+  received: number;
+  /** Oldest first; at most 1,024 entries (a 64 KiB ring). */
+  logs: AddonLogEntry[];
+}
 export function addonMessage(error: unknown): string {
   return typeof error === "object" &&
     error !== null &&

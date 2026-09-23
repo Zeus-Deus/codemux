@@ -2297,6 +2297,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::addons::addon_development_review,
             commands::addons::addon_development_reload,
             commands::addons::addon_settings_get,
+            commands::addons::addon_diagnostics,
             commands::addons::addon_subscribe,
             commands::addons::addon_pause_all,
             commands::addons::addon_disable,

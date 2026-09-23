@@ -604,3 +604,12 @@ pub fn addon_settings_get<R: Runtime>(
     let manager = state.get(&app)?;
     manager.settings(&manager.installation(&id)?)
 }
+/// Bounded, sanitized log activity for the Settings detail view.
+#[tauri::command]
+pub fn addon_diagnostics<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AddonState>,
+    id: String,
+) -> Result<addons::manager::Diagnostics> {
+    state.get(&app)?.diagnostics(&id)
+}
