@@ -46,6 +46,12 @@ pub const RELOAD_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The always-available recovery shortcut. The keyboard-shortcuts page lists
 /// it as the `reloadInterface` entry in `src/lib/keybind-registry.ts`.
 pub const RECOVERY_SHORTCUT: &str = "Ctrl+Alt+R";
+/// How long one "renderer unresponsive" report counts. WebView2 repeats the
+/// report every few seconds while the renderer stays hung but never says
+/// when it recovers, so a report has to expire on its own; otherwise a brief
+/// hang would leave Ctrl+R and F5 reloading the page instead of reaching a
+/// terminal long after the renderer came back.
+pub const UNRESPONSIVE_REPORT_TTL: Duration = Duration::from_secs(10);
 
 /// Short pause before an automatic reload, so WebKit finishes tearing down
 /// the dead process before a new one is spawned.
@@ -144,8 +150,13 @@ struct PendingReload {
 pub struct RecoveryState {
     /// True from renderer exit until a new page commits.
     renderer_dead: bool,
-    /// True while the engine reports the renderer as not answering.
+    /// True while the engine reports the renderer as not answering. For
+    /// engines that signal both directions (WebKit).
     renderer_unresponsive: bool,
+    /// When the engine last reported the renderer as not answering, for
+    /// engines that never report recovery (WebView2). Counts for
+    /// [`UNRESPONSIVE_REPORT_TTL`].
+    unresponsive_reported: Option<Instant>,
     /// When recent automatic reloads ran, for the loop cap.
     auto_reloads: Vec<Instant>,
     /// A reload that has not produced a new page yet.
@@ -154,18 +165,29 @@ pub struct RecoveryState {
 }
 
 impl RecoveryState {
-    pub fn health(&self) -> RendererHealth {
+    pub fn health(&self, now: Instant) -> RendererHealth {
+        let recently_reported = self
+            .unresponsive_reported
+            .is_some_and(|at| now.saturating_duration_since(at) < UNRESPONSIVE_REPORT_TTL);
         if self.renderer_dead {
             RendererHealth::Dead
-        } else if self.renderer_unresponsive {
+        } else if self.renderer_unresponsive || recently_reported {
             RendererHealth::Unresponsive
         } else {
             RendererHealth::Healthy
         }
     }
 
+    /// The engine says the renderer stopped or started answering again.
     pub fn set_responsive(&mut self, responsive: bool) {
         self.renderer_unresponsive = !responsive;
+    }
+
+    /// The engine says the renderer is not answering, with no matching
+    /// "responsive again" signal to follow. Counts as unresponsive for
+    /// [`UNRESPONSIVE_REPORT_TTL`]; an ongoing hang keeps renewing it.
+    pub fn report_unresponsive(&mut self, now: Instant) {
+        self.unresponsive_reported = Some(now);
     }
 
     /// The renderer process exited. `by_app` is true when the app terminated
@@ -173,6 +195,7 @@ impl RecoveryState {
     pub fn renderer_terminated(&mut self, by_app: bool, now: Instant) -> AutoReload {
         self.renderer_dead = true;
         self.renderer_unresponsive = false;
+        self.unresponsive_reported = None;
         if by_app {
             return AutoReload::NotNeeded;
         }
@@ -191,6 +214,7 @@ impl RecoveryState {
     pub fn page_committed(&mut self) {
         self.renderer_dead = false;
         self.renderer_unresponsive = false;
+        self.unresponsive_reported = None;
         self.pending = None;
     }
 
@@ -202,7 +226,7 @@ impl RecoveryState {
                 return None;
             }
         }
-        let method = match self.health() {
+        let method = match self.health(now) {
             RendererHealth::Unresponsive => ReloadMethod::RestartRenderer,
             RendererHealth::Healthy | RendererHealth::Dead => ReloadMethod::Reload,
         };
@@ -472,7 +496,8 @@ mod linux {
                     gdk::ModifierType::SUPER_MASK | gdk::ModifierType::MOD4_MASK,
                 ),
             };
-            if route_key(press, || state.borrow().health()) == KeyAction::PassThrough {
+            let health = || state.borrow().health(Instant::now());
+            if route_key(press, health) == KeyAction::PassThrough {
                 return glib::Propagation::Proceed;
             }
             if let Some(view) = weak_view.upgrade() {
@@ -619,7 +644,8 @@ mod webview2 {
                     alt: key_down(VK_LMENU),
                     logo: key_down(VK_LWIN) || key_down(VK_RWIN),
                 };
-                if route_key(press, || state.borrow().health()) == KeyAction::PassThrough {
+                let health = || state.borrow().health(Instant::now());
+                if route_key(press, health) == KeyAction::PassThrough {
                     return Ok(());
                 }
                 unsafe { args.SetHandled(true)? };
@@ -643,7 +669,7 @@ mod webview2 {
                     log::warn!(
                         "[codemux::webview] renderer stopped responding; press Ctrl+R to reload"
                     );
-                    state.borrow_mut().set_responsive(false);
+                    state.borrow_mut().report_unresponsive(Instant::now());
                     return Ok(());
                 }
                 if kind != COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
@@ -836,13 +862,13 @@ mod tests {
 
         let mut hung = RecoveryState::default();
         hung.set_responsive(false);
-        assert_eq!(hung.health(), RendererHealth::Unresponsive);
+        assert_eq!(hung.health(now), RendererHealth::Unresponsive);
         assert_eq!(hung.begin_reload(now).unwrap().method, ReloadMethod::RestartRenderer);
 
         let mut dead = RecoveryState::default();
         dead.set_responsive(false);
         assert_eq!(dead.renderer_terminated(false, now), AutoReload::Reload);
-        assert_eq!(dead.health(), RendererHealth::Dead);
+        assert_eq!(dead.health(now), RendererHealth::Dead);
         assert_eq!(dead.begin_reload(now).unwrap().method, ReloadMethod::Reload);
     }
 
@@ -888,13 +914,65 @@ mod tests {
         let now = Instant::now();
         let mut state = RecoveryState::default();
         state.renderer_terminated(false, now);
-        assert_eq!(state.health(), RendererHealth::Dead);
+        assert_eq!(state.health(now), RendererHealth::Dead);
         state.page_committed();
-        assert_eq!(state.health(), RendererHealth::Healthy);
+        assert_eq!(state.health(now), RendererHealth::Healthy);
 
         state.set_responsive(false);
         state.page_committed();
-        assert_eq!(state.health(), RendererHealth::Healthy);
+        assert_eq!(state.health(now), RendererHealth::Healthy);
+    }
+
+    #[test]
+    fn unresponsive_report_expires_on_its_own() {
+        let now = Instant::now();
+        let mut state = RecoveryState::default();
+        state.report_unresponsive(now);
+        assert_eq!(state.health(now), RendererHealth::Unresponsive);
+        assert_eq!(state.begin_reload(now).unwrap().method, ReloadMethod::RestartRenderer);
+        state.page_committed();
+
+        // A hang that keeps being reported stays unresponsive.
+        let mut state = RecoveryState::default();
+        state.report_unresponsive(now);
+        let renewed = now + UNRESPONSIVE_REPORT_TTL - Duration::from_secs(1);
+        state.report_unresponsive(renewed);
+        let later = now + UNRESPONSIVE_REPORT_TTL + Duration::from_secs(1);
+        assert_eq!(state.health(later), RendererHealth::Unresponsive);
+
+        // Once the reports stop, the renderer has recovered and the page
+        // gets its Ctrl+R and F5 back.
+        let recovered = renewed + UNRESPONSIVE_REPORT_TTL;
+        assert_eq!(state.health(recovered), RendererHealth::Healthy);
+        for key in [ctrl(ShortcutKey::R), bare(ShortcutKey::F5)] {
+            assert_eq!(route_key(key, || state.health(recovered)), KeyAction::PassThrough);
+        }
+        assert_eq!(state.begin_reload(recovered).unwrap().method, ReloadMethod::Reload);
+    }
+
+    #[test]
+    fn explicit_unresponsive_signal_does_not_expire() {
+        let now = Instant::now();
+        let mut state = RecoveryState::default();
+        state.set_responsive(false);
+        let later = now + UNRESPONSIVE_REPORT_TTL * 10;
+        assert_eq!(state.health(later), RendererHealth::Unresponsive);
+        state.set_responsive(true);
+        assert_eq!(state.health(later), RendererHealth::Healthy);
+    }
+
+    #[test]
+    fn page_commit_and_exit_clear_an_unresponsive_report() {
+        let now = Instant::now();
+        let mut state = RecoveryState::default();
+        state.report_unresponsive(now);
+        state.page_committed();
+        assert_eq!(state.health(now), RendererHealth::Healthy);
+
+        state.report_unresponsive(now);
+        state.renderer_terminated(false, now);
+        state.page_committed();
+        assert_eq!(state.health(now), RendererHealth::Healthy);
     }
 
     #[test]
@@ -934,7 +1012,7 @@ mod tests {
         assert_eq!(state.renderer_terminated(false, at), AutoReload::Paused);
 
         // Manual recovery still works while auto-reload is paused.
-        assert_eq!(route_key(ctrl(ShortcutKey::R), || state.health()), KeyAction::Reload);
+        assert_eq!(route_key(ctrl(ShortcutKey::R), || state.health(now)), KeyAction::Reload);
         assert!(state.begin_reload(at).is_some());
     }
 
