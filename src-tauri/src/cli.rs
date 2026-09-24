@@ -144,6 +144,10 @@ pub enum CommandSet {
     /// Print the account this machine is signed in as. Exits 1 when there
     /// is no live session.
     Whoami,
+    /// Reload the Codemux window's interface without restarting the app.
+    /// Recovers a blank or frozen window; the backend, terminals, and agents
+    /// keep running. Same as pressing Ctrl+Alt+R in the window.
+    ReloadUi,
     /// Print recent lines from the desktop app's log file
     Logs {
         /// Number of lines from the end of the log to print
@@ -957,6 +961,20 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
         }
         Some(CommandSet::Whoami) => {
             crate::auth::cli_login::run_whoami()?;
+            Ok(true)
+        }
+        Some(CommandSet::ReloadUi) => {
+            let response = send_control_request(ControlRequest {
+                command: "reload_ui".into(),
+                params: json!({}),
+            })
+            .await?;
+            if !response.ok {
+                return Err(response
+                    .error
+                    .unwrap_or_else(|| "Codemux could not reload its interface".to_string()));
+            }
+            println!("Reloading the Codemux interface. Terminals and agents keep running.");
             Ok(true)
         }
         Some(CommandSet::Logs { tail }) => {

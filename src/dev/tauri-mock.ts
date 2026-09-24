@@ -3560,6 +3560,11 @@ const handlers: Record<string, Handler> = {
   // has no such window, so this is a no-op here — present only to keep the
   // "no handler" warning off the console on every theme change.
   set_window_background: () => null,
+  // The desktop reloads its webview natively; the browser tab is the page here.
+  reload_interface: () => {
+    window.location.reload();
+    return null;
+  },
 
   // The Marketplace import panel, without the network. Two hits, and an
   // extension that ships both a light and a dark variant — the case the

@@ -1700,6 +1700,21 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 .await
                 .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string())),
         },
+        // Reload the desktop window's page from the app process
+        // (`codemux reload-ui`): recovery for a blank or frozen window that
+        // cannot take keyboard input. Only the webview reloads; the backend,
+        // terminals, and agents keep running.
+        "reload_ui" => (|| -> Result<Value, String> {
+            crate::ensure_gui_mode(app)?;
+            let window = app
+                .get_webview_window("main")
+                .ok_or_else(|| "The Codemux window is not open".to_string())?;
+            crate::webview_recovery::request_reload(
+                &window,
+                crate::webview_recovery::Trigger::ControlCommand,
+            )?;
+            Ok(serde_json::json!({ "requested": true }))
+        })(),
         // Disable web remote access from the terminal (`codemux remote disable`).
         "web_remote_disable" => crate::web_remote::control_disable(app)
             .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string())),
@@ -1930,6 +1945,26 @@ mod tests {
     // `AppStateSnapshot::detected_ports`. The MCP tool of the same name
     // forwards the optional `workspace_id` argument unchanged, so anything
     // we promise here is also the MCP-tool contract.
+
+    /// `codemux reload-ui` only ever reloads the desktop webview. Headless
+    /// `codemux serve` has none and must say so instead of doing anything.
+    #[tokio::test]
+    async fn reload_ui_is_refused_without_a_desktop_window() {
+        let serve = tauri::test::mock_app();
+        serve.manage(crate::AppMode::ServeHeadless);
+        let request = || ControlRequest {
+            command: "reload_ui".into(),
+            params: serde_json::json!({}),
+        };
+        let response = dispatch_request(serve.handle(), request()).await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("not available in headless serve mode"));
+
+        let windowless = tauri::test::mock_app();
+        let response = dispatch_request(windowless.handle(), request()).await;
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("The Codemux window is not open"));
+    }
 
     #[test]
     fn port_list_filter_no_filter_returns_all() {

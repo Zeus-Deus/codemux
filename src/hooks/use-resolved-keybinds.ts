@@ -32,7 +32,10 @@ export function resolveKeybinds(
   const reverseMap = new Map<string, string[]>();
 
   for (const entry of KEYBIND_REGISTRY) {
-    const hasOverride = entry.id in overrides;
+    // Native shortcuts are handled by the desktop app and can't be rebound,
+    // so a stray override (hand-edited settings) must not change what the
+    // shortcuts page claims.
+    const hasOverride = !entry.native && entry.id in overrides;
     const activeKeys = hasOverride ? overrides[entry.id] : entry.defaultKeys;
     const isCustom = hasOverride && overrides[entry.id] !== entry.defaultKeys;
 

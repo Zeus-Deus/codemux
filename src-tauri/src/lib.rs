@@ -544,7 +544,12 @@ fn build_core_app<R: tauri::Runtime>(
         // armed before GTK init. `mode` is `Copy`, so the setup closure below
         // still captures it too.
         .on_page_load(move |webview, payload| {
-            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                // A new document is replacing the main page, so the old
+                // page's output subscribers are dead weight from here on.
+                if mode == AppMode::Gui && webview.label() == "main" {
+                    webview_recovery::release_page_subscribers(webview.app_handle());
+                }
                 return;
             }
             webview_tuning::apply_to_webview(webview);
@@ -755,8 +760,9 @@ fn build_core_app<R: tauri::Runtime>(
             // flip it at runtime via the `set_smooth_scrolling` command.
             webview_tuning::refresh_all(&handle);
 
-            // A dead WebKit web process leaves the window blank while the
-            // backend and agents keep running. Reload the page instead.
+            // A dead or hung renderer leaves the window blank while the
+            // backend and agents keep running. Recover by reloading the page
+            // from the app process (see `webview_recovery.rs`).
             if let Some(window) = app.get_webview_window("main") {
                 webview_recovery::install(&window);
             }
@@ -2663,6 +2669,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            // "Reload interface" in the command palette: reloads only the
+            // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
+            webview_recovery::reload_interface,
             // Native window background, so a light palette doesn't launch
             // behind `tauri.conf.json`'s near-black default.
             set_window_background,
