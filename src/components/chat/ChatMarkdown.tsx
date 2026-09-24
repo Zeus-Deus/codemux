@@ -21,6 +21,7 @@ import {
   rehypeChatFileLinks,
   resolveChatFileLink,
 } from "@/lib/agent-chat/file-links";
+import { textReferencePaths } from "@/lib/agent-chat/reference-cwd";
 import { rehypeSelectionSafeText } from "@/lib/agent-chat/selection-safe-text";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
@@ -240,20 +241,33 @@ export function ChatMarkdown({
   const plugins = useMemo(() => ({ code }), [code]);
   const wrap = useSettingsStore(selectChatCodeWrap);
   const inheritedFileContext = useChatFileLinkContext();
+  // Absolute paths the message itself names are fallback candidates too:
+  // "`/tmp/shots/a.png`, plus `b.gif` in the same folder" must open b.gif.
+  // Only read once the text settles, so a streaming delta does not rebuild
+  // the list (and re-render every chip) on each frame.
+  const messagePaths = useMemo(
+    () => (streaming ? null : textReferencePaths(children)),
+    [children, streaming],
+  );
+  const baseReferencePaths = referencePaths ?? inheritedFileContext.referencePaths;
   const fileContext = useMemo(
     () => ({
       workspaceId: workspaceId ?? inheritedFileContext.workspaceId,
       cwd: cwd ?? inheritedFileContext.cwd,
       workspaceCwd: workspaceCwd ?? inheritedFileContext.workspaceCwd,
-      referencePaths: referencePaths ?? inheritedFileContext.referencePaths,
+      // Message paths last: resolution walks newest-first, and the prose
+      // is the most direct statement of where its files live.
+      referencePaths: messagePaths?.length
+        ? [...(baseReferencePaths ?? []), ...messagePaths]
+        : baseReferencePaths,
     }),
     [
+      baseReferencePaths,
       cwd,
       inheritedFileContext.cwd,
-      inheritedFileContext.referencePaths,
       inheritedFileContext.workspaceCwd,
       inheritedFileContext.workspaceId,
-      referencePaths,
+      messagePaths,
       workspaceCwd,
       workspaceId,
     ],
