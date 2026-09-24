@@ -60,6 +60,19 @@ fn identity(path: &Path) -> Result<String, String> {
     }
 }
 
+/// Canonical executable path for a configured installation (bare names use PATH).
+pub fn resolve_installation(installation: &Path) -> Result<PathBuf, String> {
+    if installation.components().count() == 1 {
+        which::which(installation).map_err(|_| {
+            "setup_required: install official Hermes with ACP dependencies".to_string()
+        })?
+    } else {
+        installation.to_path_buf()
+    }
+    .canonicalize()
+    .map_err(|_| "setup_required: Hermes executable is missing".to_string())
+}
+
 pub fn resolve(installation: &Path, root: &Path, id: &str) -> Result<Profile, String> {
     if !valid_id(id) {
         return Err("unsupported: invalid Hermes profile ID".into());
@@ -78,15 +91,7 @@ pub fn resolve(installation: &Path, root: &Path, id: &str) -> Result<Profile, St
     let home = path
         .canonicalize()
         .map_err(|_| "repair_required: Hermes profile is missing".to_string())?;
-    let installation = if installation.components().count() == 1 {
-        which::which(installation).map_err(|_| {
-            "setup_required: install official Hermes with ACP dependencies".to_string()
-        })?
-    } else {
-        installation.to_path_buf()
-    }
-    .canonicalize()
-    .map_err(|_| "setup_required: Hermes executable is missing".to_string())?;
+    let installation = resolve_installation(installation)?;
     Ok(Profile {
         schema_version: 1,
         host: "local".into(),

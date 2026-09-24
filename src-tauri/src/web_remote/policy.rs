@@ -269,7 +269,8 @@ mod tests {
     fn hermes_remote_profile_workflow_is_explicitly_allowed() {
         // Paired clients already run and configure agent chats. Hermes exposes
         // profile identity/catalog/binding metadata and runtime disconnect only;
-        // authentication remains in the official Hermes runtime.
+        // authentication remains in the official Hermes runtime. The executable
+        // always comes from host settings, never from the caller's profile.
         for cmd in [
             "hermes_profiles",
             "hermes_catalog",

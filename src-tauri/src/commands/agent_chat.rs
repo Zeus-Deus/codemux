@@ -745,6 +745,15 @@ pub async fn agent_chat_start_session<R: Runtime>(
         if state.snapshot().workspaces.iter().any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some()) {
             return Err("unsupported: Hermes v1 runs on local workspaces only".into());
         }
+        // A new chat binds the caller's profile; an existing binding is host-owned.
+        let db: State<'_, DatabaseStore> = app.state();
+        if db.hermes_binding(&input.thread_id.0)?.is_none() {
+            if let Some(profile) = input.extra.get("hermes_profile") {
+                let profile: crate::agent_provider::hermes::profile::Profile =
+                    serde_json::from_value(profile.clone()).map_err(|e| e.to_string())?;
+                crate::commands::hermes::require_configured_installation(&db, &profile)?;
+            }
+        }
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
