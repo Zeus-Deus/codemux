@@ -94,23 +94,33 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
         // 3. Bind the web-remote server (shared enable path + flag merge).
         let result = serve_startup(&handle, &opts).await?;
 
-        // 4. Startup banner + pairing code.
+        // 4. Startup banner + pairing code. Relay-only has no pairing link:
+        //    nothing listens on the network for it to point at.
         print_banner(&handle, &result);
-        match web_remote::control_pair(&handle, None) {
-            Ok(pairing) => {
-                let value = serde_json::to_value(&pairing).unwrap_or(serde_json::Value::Null);
-                crate::cli::print_pairing(&value);
-            }
-            Err(e) => {
-                // Shouldn't happen once the server is enabled — keep serving so
-                // `codemux remote pair` from another session can still work.
-                eprintln!(
-                    "[codemux serve] could not mint a pairing code: {e} \
-                     (the server is still running — run `codemux remote pair` to try again)"
-                );
+        let relay_only = !result.status.lan_enabled;
+        if relay_only {
+            println!();
+            println!(
+                "Open https://app.codemux.org in a browser signed into your Codemux account \
+                 and pick this machine."
+            );
+        } else {
+            match web_remote::control_pair(&handle, None) {
+                Ok(pairing) => {
+                    let value = serde_json::to_value(&pairing).unwrap_or(serde_json::Value::Null);
+                    crate::cli::print_pairing(&value);
+                }
+                Err(e) => {
+                    // Shouldn't happen once the server is enabled — keep serving so
+                    // `codemux remote pair` from another session can still work.
+                    eprintln!(
+                        "[codemux serve] could not mint a pairing code: {e} \
+                         (the server is still running — run `codemux remote pair` to try again)"
+                    );
+                }
             }
         }
-        print_footer();
+        print_footer(relay_only);
 
         // 5. Keep-alive: block until SIGINT / SIGTERM. Still no `app.run()` —
         //    `MockRuntime::run` is an infinite polling loop with no windowing
@@ -156,7 +166,9 @@ fn resolve_scope(explicit: Option<String>, persisted_enabled: bool) -> Option<St
 /// so the integration suite can drive the exact production startup sequence
 /// against a seeded settings row.
 ///
-/// Everything persisted is authoritative unless a flag overrides it: the app
+/// Everything persisted is authoritative unless a flag overrides it — including
+/// an explicit relay-only setup, which stays relay-only (nothing listens on the
+/// network) unless `--scope` / `--port` asks for the listener. The app
 /// hydrated the settings row during `setup` (`restore_on_boot`), and
 /// `control_enable` re-checks that before folding in `--scope` / `--port`, so a
 /// bare `codemux serve` re-binds exactly what the user configured — including
@@ -185,7 +197,10 @@ pub async fn serve_startup<R: tauri::Runtime>(
         }
     }
 
-    web_remote::control_enable(handle, scope, opts.port)
+    // As configured, not "open the listener": a relay-only setup (the user
+    // switched "On my network" off) must not come back listening on the LAN
+    // after a restart. Explicit `--scope` / `--port` still turn it on.
+    web_remote::control_enable_as_configured(handle, scope, opts.port)
         .await
         .map_err(|e| format!("could not enable the web-remote server: {e}"))
 }
@@ -210,6 +225,16 @@ fn print_banner<R: tauri::Runtime>(
     } else {
         println!("Codemux headless server started.");
     }
+    if !result.status.lan_enabled {
+        // An explicit relay-only setup, kept as configured: there is no port
+        // or scope to report, and no address to list.
+        println!("  Mode:         relay only — nothing listens on your network");
+        println!(
+            "  Relay:        {}",
+            if result.status.relay_running { "up" } else { "starting" }
+        );
+        return;
+    }
     println!("  Port:         {port}");
     println!("  Access scope: {scope} ({scope_note})");
     if let Some(err) = &result.status.bind_error {
@@ -232,11 +257,15 @@ fn print_banner<R: tauri::Runtime>(
     }
 }
 
-/// Print the closing lines: how to mint more codes, the account-mode note, and
-/// the stop hint.
-fn print_footer() {
+/// Print the closing lines: how to mint more codes (or, relay-only, how to add
+/// the network listener), the account-mode note, and the stop hint.
+fn print_footer(relay_only: bool) {
     println!();
-    println!("Run `codemux remote pair` from another SSH session to mint more pairing codes.");
+    if relay_only {
+        println!("Run `codemux remote enable` from another SSH session to also listen on your network.");
+    } else {
+        println!("Run `codemux remote pair` from another SSH session to mint more pairing codes.");
+    }
     println!("Account-mode / hosted access continues to work if it was configured.");
     println!("Press Ctrl-C (or send SIGTERM) to stop the server.");
 }

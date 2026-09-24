@@ -589,6 +589,11 @@ pub fn service_state(host: &dyn ServiceHost) -> ServiceState {
 /// Fold a `codemux connect` request into the persisted config: remote access
 /// on, relay mode on, plus any explicit scope/port.
 ///
+/// `connect` is about the relay, so it switches the LAN listener on only on a
+/// fresh config (remote access off) or when a `--scope` / `--port` flag asks
+/// for it — a relay-only setup stays relay-only (see
+/// [`super::enable_opens_lan`]).
+///
 /// Rejects an unknown scope before touching anything — the caller persists
 /// only on `Ok`, so a typo can never leave a config the bind logic refuses to
 /// honour. Scope/port are left alone when not passed, which is what makes a
@@ -598,7 +603,13 @@ pub fn apply_connect_request(
     scope: Option<String>,
     port: Option<u16>,
 ) -> Result<(), String> {
+    let opens_lan = {
+        let mut after = cfg.clone();
+        after.relay_mode_enabled = true;
+        super::enable_opens_lan(&after, false, scope.is_some() || port.is_some())
+    };
     super::apply_enable_request(cfg, scope, port)?;
+    cfg.lan_enabled = opens_lan;
     cfg.relay_mode_enabled = true;
     Ok(())
 }
@@ -630,6 +641,8 @@ pub struct ConnectReport {
     pub identity: String,
     pub scope: String,
     pub port: u16,
+    /// Whether the LAN listener is switched on (`false` for relay-only).
+    pub lan_enabled: bool,
     pub service: ServiceReport,
 }
 
@@ -638,10 +651,16 @@ pub struct ConnectReport {
 pub fn format_connect_report(report: &ConnectReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("✓ Signed in as {}\n", report.identity));
-    out.push_str(&format!(
-        "✓ Remote access configured (relay mode on, scope {}, port {})\n",
-        report.scope, report.port
-    ));
+    if report.lan_enabled {
+        out.push_str(&format!(
+            "✓ Remote access configured (relay mode on, scope {}, port {})\n",
+            report.scope, report.port
+        ));
+    } else {
+        out.push_str(
+            "✓ Remote access configured (relay only — nothing listens on your network)\n",
+        );
+    }
     match &report.service {
         ServiceReport::Installed(install) => {
             out.push_str(
@@ -967,6 +986,7 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
             identity,
             scope: cfg.bind_scope.clone(),
             port: cfg.port,
+            lan_enabled: cfg.lan_enabled,
             service,
         })
     );
@@ -994,7 +1014,9 @@ async fn configure_via_control_socket(
             .unwrap_or_else(|| "the running Codemux instance refused to enable relay mode".into()));
     }
 
-    let mut params = json!({});
+    // `keep_relay_only`: this is `connect`, not `remote enable`, so a relay-only
+    // setup stays relay-only unless a scope/port flag asks for the listener.
+    let mut params = json!({ "keep_relay_only": true });
     if let Some(s) = scope {
         params["scope"] = json!(s);
     }
@@ -1678,6 +1700,54 @@ mod tests {
     }
 
     #[test]
+    fn connect_opens_the_listener_on_a_fresh_config() {
+        let mut cfg = WebRemoteConfig::default();
+        assert!(!cfg.lan_enabled);
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.lan_enabled, "first run: the listener comes on too");
+    }
+
+    #[test]
+    fn connect_keeps_a_relay_only_setup_relay_only() {
+        // The user switched "On my network" off. Re-running `connect` (or its
+        // service restarting) must not put the machine back on the LAN.
+        let relay_only = WebRemoteConfig {
+            enabled: true,
+            lan_enabled: false,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        };
+        let mut cfg = relay_only.clone();
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.enabled && cfg.relay_mode_enabled);
+        assert!(!cfg.lan_enabled, "nothing listens on the network");
+
+        // An explicit LAN flag is a request for the listener.
+        let mut cfg = relay_only.clone();
+        apply_connect_request(&mut cfg, None, Some(5100)).unwrap();
+        assert!(cfg.lan_enabled && cfg.port == 5100);
+
+        // Kill switch on with neither way in: connect adds the relay only.
+        let mut cfg = WebRemoteConfig {
+            enabled: true,
+            lan_enabled: false,
+            ..WebRemoteConfig::default()
+        };
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.relay_mode_enabled && !cfg.lan_enabled);
+    }
+
+    #[test]
+    fn connect_report_says_relay_only_instead_of_a_port() {
+        let text = format_connect_report(&ConnectReport {
+            lan_enabled: false,
+            ..installed_report()
+        });
+        assert!(text.contains("relay only — nothing listens on your network"), "{text}");
+        assert!(!text.contains("port"), "{text}");
+    }
+
+    #[test]
     fn connect_rejects_an_unknown_scope_without_mutating_anything() {
         let mut cfg = WebRemoteConfig::default();
         let err = apply_connect_request(&mut cfg, Some("wan".to_string()), None).unwrap_err();
@@ -1737,6 +1807,7 @@ mod tests {
             identity: "user@example.com".to_string(),
             scope: super::super::BIND_SCOPE_ALL.to_string(),
             port: DEFAULT_PORT,
+            lan_enabled: true,
             service: ServiceReport::Installed(InstallReport {
                 unit_path: "/home/u/.config/systemd/user/codemux.service".to_string(),
                 linger: LingerOutcome::Enabled,
