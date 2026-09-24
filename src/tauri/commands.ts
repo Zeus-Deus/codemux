@@ -390,6 +390,10 @@ export const listLaunchGeminiModels = () =>
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
 
+/** Reload the desktop window's page from the app process, the same native
+ *  reload as Ctrl+Alt+R. The backend, terminals, and agents keep running. */
+export const reloadInterface = () => invoke<void>("reload_interface");
+
 /** Repair deferred MCP config writes for inactive workspaces. This may touch
  * disk and must be called only after the renderer's useful first paint. */
 export const repairInactiveMcpConfigs = () =>
@@ -3154,8 +3158,10 @@ export const webRemoteStatus = () =>
 
 /** Turn the kill switch on: persists `enabled=true` and starts every way in
  *  that is switched on underneath it (LAN listener, relay). A way in that
- *  can't start reports why in `lan_error` / `relay_error` rather than failing
- *  the call. Calling it again while on retries a failed way in. */
+ *  can't start reports why in `bind_error` / `registration_error` rather than
+ *  failing the call — except a LAN bind failure with relay mode off, which
+ *  rolls the switch back and rejects (nothing would be running). To retry a
+ *  failed way in, use {@link webRemoteRetry}. */
 export const webRemoteEnable = () =>
   invoke<WebRemoteStatus>("web_remote_enable");
 
@@ -3193,6 +3199,13 @@ export const webRemoteSetConfig = (opts: {
     relayModeEnabled: opts.relayModeEnabled ?? null,
     lanEnabled: opts.lanEnabled ?? null,
   });
+
+/** Retry bringing remote access up now: re-attempts the LAN listener bind
+ *  when that way in is switched on (rejecting with the reason if it still
+ *  fails — the backend keeps retrying in the background) and re-runs relay
+ *  registration when relay mode is on. */
+export const webRemoteRetry = () =>
+  invoke<WebRemoteStatus>("web_remote_retry");
 
 /** The device's stable iroh `node_id` (its `EndpointId`) — the address a
  *  hosted-origin browser dials to reach this desktop over the relay transport.

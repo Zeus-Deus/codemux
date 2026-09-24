@@ -1647,9 +1647,6 @@ export interface WebRemoteStatus {
    *  so legacy fixtures need not enumerate it; absent means on (before the
    *  split, `enabled` *was* the listener). */
   lan_enabled?: boolean;
-  /** Why the LAN listener is wanted but not bound (port taken, no tailnet
-   *  address, …). `null` when bound or switched off. */
-  lan_error?: string | null;
   port: number;
   require_approval: boolean;
   /** Which interfaces the server binds: `all` | `tailscale` | `loopback`.
@@ -1698,13 +1695,19 @@ export interface WebRemoteStatus {
    *  attempt has run. `null` before then. Mirrors the same-named field on
    *  {@link WebRemoteRegistrationStatus}. */
   device_id?: string | null;
-  /** Whether the iroh relay endpoint (the "From anywhere" way in) is bound. */
+  /** Why the LAN listener is not bound even though remote access and its own
+   *  switch are on (port in use, no tailnet address for the `tailscale`
+   *  scope…). `null` while it is bound or not wanted. The backend keeps
+   *  retrying while set. */
+  bind_error?: string | null;
+  /** Whether the from-anywhere (relay) endpoint is actually up — unlike
+   *  `relay_mode_enabled`, which is only the persisted intent. Independent of
+   *  `running`: relay mode needs no LAN listener. */
   relay_running?: boolean;
-  /** Why the relay transport is wanted but not bound. `null` when bound or
-   *  switched off. */
-  relay_error?: string | null;
-  /** The last device-registration error, carried on the broadcast so the
-   *  readout refreshes when the reason changes. `null` when healthy. */
+  /** The last device-registration failure, carried live on every broadcast
+   *  (`null` when registered, not yet attempted, or relay is off). Also covers
+   *  the relay endpoint failing to start ("relay transport couldn't start: …"),
+   *  so there is no separate relay error. */
   registration_error?: string | null;
 }
 

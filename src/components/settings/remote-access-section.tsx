@@ -49,6 +49,7 @@ import {
   webRemoteListEndpoints,
   webRemoteRegistrationStatus,
   webRemoteRejectSession,
+  webRemoteRetry,
   webRemoteRevokeSession,
   webRemoteSetConfig,
   webRemoteStatus,
@@ -964,13 +965,15 @@ export function RemoteAccessSection() {
   const enabled = status?.enabled ?? false;
   const running = status?.running ?? false;
   const lanEnabled = lanEnabledOf(status);
-  const lanError = status?.lan_error ?? null;
+  // Why the listener isn't bound even though it's switched on. The backend
+  // keeps retrying while this is set; the card shows it instead of an
+  // open-ended "starting".
+  const bindError = status?.bind_error ?? null;
   const requireApproval = status?.require_approval ?? false;
   const accountModeEnabled = status?.account_mode_enabled ?? false;
   const trustAccountBrowsers = status?.trust_account_browsers ?? false;
   const accountSignedIn = status?.account_signed_in ?? false;
   const relayModeEnabled = status?.relay_mode_enabled ?? false;
-  const relayError = status?.relay_error ?? null;
   // Coarse signals the status broadcast carries. They double as the refetch
   // trigger for the richer registration read and as its fallback.
   const deviceRegistered = status?.device_registered ?? false;
@@ -1026,7 +1029,12 @@ export function RemoteAccessSection() {
   const relayDisplayName = machineName || relayDeviceId;
   const relayNodeId = registration?.node_id ?? irohNodeId;
   const relayLastRegisteredAt = registration?.last_registered_at ?? null;
-  const relayLastError = registration?.last_error ?? registrationError;
+  // The live broadcast carries the current failure (including the relay
+  // endpoint itself failing to start); the dedicated read is the fallback for
+  // a backend that doesn't broadcast it.
+  const relayLastError = relayRegistered
+    ? null
+    : (registrationError ?? registration?.last_error ?? null);
 
   const portValidation = validatePort(portDraft);
   const portDirty = status != null && portDraft !== String(status.port);
@@ -1038,8 +1046,8 @@ export function RemoteAccessSection() {
   /** After a change that (re)starts the listener, say so if it didn't come up. */
   const reportLanOutcome = useCallback(
     (result: WebRemoteStatus, success: string) => {
-      if (result.lan_error) {
-        toast.error(`Saved, but the listener couldn't start: ${result.lan_error}`);
+      if (result.bind_error) {
+        toast.error(`Saved, but the listener couldn't start: ${result.bind_error}`);
       } else {
         toast.success(success);
       }
@@ -1085,27 +1093,34 @@ export function RemoteAccessSection() {
     [applyMaster, transport],
   );
 
-  /** Retry a way in that is switched on but failed to start. Enabling again
-   *  while on re-runs each transport's start. */
-  const handleRetry = useCallback(async () => {
-    setRetryPending(true);
-    try {
-      const result = await webRemoteEnable();
-      applyStatus(result, { detectPending: false });
-      if (result.running) void refreshEndpoints();
-      if (result.lan_error || result.relay_error) {
-        toast.error(
-          `Still couldn't start: ${result.lan_error ?? result.relay_error}`,
-        );
-      } else {
-        toast.success("Started.");
+  /** Retry a way in that is switched on but failed to start, right now
+   *  instead of waiting for the backend's own retry schedule: re-attempts the
+   *  listener bind (when it's on) and relay registration (when it's on). */
+  const handleRetry = useCallback(
+    async (what: "server" | "registration") => {
+      setRetryPending(true);
+      try {
+        const result = await webRemoteRetry();
+        applyStatus(result, { detectPending: false });
+        if (result.running) void refreshEndpoints();
+        if (what === "server") toast.success("Listening on your network again.");
+      } catch (err) {
+        console.error("[remote-access] retry failed:", err);
+        if (what === "server") {
+          toast.error(`Still couldn't start the server: ${String(err)}`);
+        } else {
+          // The rejection is about the listener; registration was retried
+          // regardless and reports back through the live status.
+          void webRemoteStatus()
+            .then((fresh) => applyStatus(fresh, { detectPending: false }))
+            .catch(() => undefined);
+        }
+      } finally {
+        setRetryPending(false);
       }
-    } catch (err) {
-      toast.error(`Retry failed: ${String(err)}`);
-    } finally {
-      setRetryPending(false);
-    }
-  }, [applyStatus, refreshEndpoints]);
+    },
+    [applyStatus, refreshEndpoints],
+  );
 
   const handleApplyPort = useCallback(async () => {
     if (!portValidation.valid || portValidation.value == null) return;
@@ -1347,8 +1362,8 @@ export function RemoteAccessSection() {
       try {
         const result = await webRemoteSetConfig({ relayModeEnabled: next });
         applyStatus(result, { detectPending: false });
-        if (next && result.relay_error) {
-          toast.error(`The relay couldn't start: ${result.relay_error}`);
+        if (next && !result.relay_running && result.registration_error) {
+          toast.error(`Saved, but ${result.registration_error}`);
         } else {
           toast.success(
             next
@@ -1478,14 +1493,6 @@ export function RemoteAccessSection() {
       This desktop isn't signed into a Codemux account, so it can't register for
       from-anywhere access. Sign in from the account menu to activate it.
     </AttentionNote>
-  ) : relayError ? (
-    <FailureCallout
-      title="The relay couldn't start"
-      reason={relayError}
-      onRetry={handleRetry}
-      retrying={retryPending}
-      retryLabel="Retry starting the relay"
-    />
   ) : (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
@@ -1509,13 +1516,31 @@ export function RemoteAccessSection() {
           </span>
         )}
       </div>
-      <p className="text-body-sm leading-relaxed text-muted-foreground/80">
-        {relayRegistered
-          ? "Listed with your account. Open app.codemux.org in any browser signed into it, then pick this device."
-          : relayLastError
-            ? `Last attempt failed: ${relayLastError}`
+      {relayLastError ? (
+        <div className="flex items-start justify-between gap-3">
+          <p className="min-w-0 break-words text-body-sm leading-relaxed text-status-attention">
+            Last attempt failed: {relayLastError}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={retryPending}
+            onClick={() => void handleRetry("registration")}
+            aria-label="Retry registering this device"
+          >
+            <RefreshCw className={cn("size-3.5", retryPending && "animate-spin")} />
+            Retry
+          </Button>
+        </div>
+      ) : (
+        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+          {relayRegistered
+            ? "Listed with your account. Open app.codemux.org in any browser signed into it, then pick this device."
             : "Listing this device with your account. This takes a moment."}
-      </p>
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <Button
           type="button"
@@ -1676,12 +1701,16 @@ export function RemoteAccessSection() {
               disabled={lanPending}
               switchLabel="Toggle access on my network"
             >
-              {lanError ? (
+              {bindError ? (
                 <FailureCallout
                   title="The server couldn't start listening"
-                  reason={lanError}
-                  hint="Pick another port or change where it's visible below, then retry."
-                  onRetry={handleRetry}
+                  reason={bindError}
+                  hint={
+                    relayModeEnabled && status?.relay_running
+                      ? "Codemux keeps retrying on its own, and from-anywhere access is unaffected. Pick another port or change where it's visible below, or retry now."
+                      : "Codemux keeps retrying on its own. Pick another port or change where it's visible below, or retry now."
+                  }
+                  onRetry={() => void handleRetry("server")}
                   retrying={retryPending}
                   retryLabel="Retry starting the server"
                 />

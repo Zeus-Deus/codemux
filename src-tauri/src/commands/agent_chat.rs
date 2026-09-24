@@ -347,6 +347,22 @@ impl AgentChatChannelRegistry {
         removed
     }
 
+    /// Drop every subscriber whose channel id `keep` rejects, returning how
+    /// many went. Used when the desktop page is replaced: its channels stay
+    /// "sendable" after a reload (sends just go nowhere), so without this
+    /// every reload would leave a dead subscriber per open thread.
+    pub fn retain_channels(&self, keep: impl Fn(u32) -> bool) -> usize {
+        let mut channels = self.channels.lock().expect("channel registry poisoned");
+        let mut removed = 0;
+        channels.retain(|_, entries| {
+            let before = entries.len();
+            entries.retain(|entry| keep(entry.channel.id()));
+            removed += before - entries.len();
+            !entries.is_empty()
+        });
+        removed
+    }
+
     /// Clone every live channel for `thread_id`. Cloning is cheap (the
     /// `Channel` is internally ref-counted) and keeps the lock scope
     /// tight on the hot streaming path — the caller sends outside the
@@ -8958,6 +8974,28 @@ mod tests {
         assert!(registry.channels_for("t1").is_empty());
         // Idempotent on repeat.
         assert!(!registry.detach("t1", generation));
+    }
+
+    #[test]
+    fn registry_retain_channels_drops_rejected_subscribers() {
+        let registry = AgentChatChannelRegistry::default();
+        let (dead_page, dead_captured) = capture_channel();
+        let (remote, remote_captured) = capture_channel();
+        let remote_id = remote.id();
+        registry.attach("t1", dead_page);
+        registry.attach("t1", remote);
+        let (other, _) = capture_channel();
+        registry.attach("t2", other);
+
+        assert_eq!(registry.retain_channels(|id| id == remote_id), 2);
+        fan_out(&registry, "t1", delta_payload("t1", "after"));
+        assert!(dead_captured.lock().unwrap().is_empty());
+        assert_eq!(remote_captured.lock().unwrap().len(), 1);
+        assert!(registry.channels_for("t2").is_empty());
+        assert!(
+            !registry.channels.lock().unwrap().contains_key("t2"),
+            "emptied threads are dropped from the map"
+        );
     }
 
     #[test]

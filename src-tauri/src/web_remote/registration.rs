@@ -41,6 +41,18 @@ const DEVICE_ID_KEY: &str = "web_remote.device_id";
 /// registry's "last seen" is a useful liveness signal for the device picker.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// First retry delay after a failed cycle; doubles per consecutive failure up
+/// to [`REFRESH_INTERVAL`]. A failed registration used to wait the full five
+/// minutes before trying again, so a transient blip at boot looked permanent.
+const RETRY_BASE: Duration = Duration::from_secs(10);
+
+/// How long to wait after `consecutive_failures` failed cycles in a row
+/// (`>= 1`): 10s, 20s, 40s, 80s, 160s, then capped at [`REFRESH_INTERVAL`].
+fn retry_delay(consecutive_failures: u32) -> Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(8);
+    (RETRY_BASE * 2u32.pow(doublings)).min(REFRESH_INTERVAL)
+}
+
 /// The `POST /api/devices` request body. camelCase on the wire per the shared
 /// device-registry contract (the rest of the desktop's Tauri surface is
 /// snake_case; only this API body is camelCase).
@@ -87,6 +99,9 @@ struct RegistrationInner {
     /// The periodic-refresh task, kept so `stop` can abort it. `Some` while
     /// relay-mode registration is active.
     refresh: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Bumped by every [`start`] that spawns a loop, so a loop ending on its
+    /// own only clears `refresh` if no newer loop has replaced it.
+    generation: u64,
 }
 
 /// Owns the device-registration lifecycle (the periodic refresh task + the last
@@ -110,6 +125,7 @@ impl RegistrationManager {
         status
     }
 
+    #[cfg(test)]
     fn is_running(&self) -> bool {
         self.inner.lock().unwrap().refresh.is_some()
     }
@@ -122,6 +138,13 @@ impl RegistrationManager {
         inner.status.node_id = Some(reg.node_id.clone());
         inner.status.last_registered_at = Some(chrono::Utc::now().to_rfc3339());
         inner.status.last_error = None;
+    }
+
+    /// Record that the relay transport itself (the iroh endpoint) failed to
+    /// start, so the Settings pane names the cause instead of implying
+    /// registration is merely pending. The supervisor retries the endpoint.
+    pub(crate) fn note_transport_error(&self, error: &str) {
+        self.record_error(None, format!("relay transport couldn't start: {error}"));
     }
 
     fn record_error(&self, device_id: Option<String>, error: impl Into<String>) {
@@ -145,7 +168,7 @@ fn stable_device_id(db: &DatabaseStore) -> String {
     }
     let id = uuid::Uuid::new_v4().to_string();
     if let Err(e) = db.set_setting(DEVICE_ID_KEY, &id) {
-        eprintln!("[codemux::web_remote] persisting device id failed: {e}");
+        log::warn!("[codemux::web_remote] persisting device id failed: {e}");
     }
     id
 }
@@ -210,18 +233,10 @@ struct DeviceListResponse {
     devices: Vec<Value>,
 }
 
-/// One registration attempt, then a status broadcast — on every outcome,
-/// including the skip paths (no node id, signed out), so Settings always shows
-/// the current reason rather than a stale one.
-async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
-    register_attempt(app, shared).await;
-    super::emit_state_changed(app);
-}
-
 /// Run one registration attempt: gather the node id + bearer + device id, POST,
-/// and update the status. Signed out (no bearer) or no node id → skip quietly
-/// (record the reason, don't error). Never panics.
-async fn register_attempt<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
+/// and update the status. Signed out (no bearer) or no node id → skip (record
+/// the reason). Returns whether the device is now registered. Never panics.
+async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> bool {
     // Snapshot every input synchronously so no DB/State guard is held across
     // the network await below (mirrors the account-mode admission discipline).
     let (bearer, reg) = {
@@ -240,55 +255,111 @@ async fn register_attempt<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
         Some(r) => r,
         None => {
             // Relay mode's identity key hasn't been generated yet — nothing to
-            // register. A later refresh tick will pick it up.
+            // register. The supervisor re-tries the endpoint on its next tick.
             shared
                 .registration
-                .record_error(None, "no iroh node_id yet");
-            return;
+                .record_error(None, "relay transport has no device address yet");
+            super::emit_state_changed(app);
+            return false;
         }
     };
 
     let bearer = match bearer {
         None => {
-            // Signed out: there is no account to register against. Not an error
-            // condition — just nothing to do.
+            // Signed out: there is no account to register against.
             shared
                 .registration
                 .record_error(Some(reg.device_id.clone()), "desktop signed out");
-            return;
+            super::emit_state_changed(app);
+            return false;
         }
         Some(b) => b,
     };
 
     let base = crate::auth::api_base_url();
-    match post_registration(&base, &bearer, &reg).await {
-        Ok(()) => shared.registration.record_success(&reg),
+    let ok = match post_registration(&base, &bearer, &reg).await {
+        Ok(()) => {
+            shared.registration.record_success(&reg);
+            true
+        }
         Err(e) => {
-            eprintln!("[codemux::web_remote] {e}");
+            log::warn!("[codemux::web_remote] {e}");
             shared
                 .registration
                 .record_error(Some(reg.device_id.clone()), e);
+            false
         }
+    };
+    super::emit_state_changed(app);
+    ok
+}
+
+/// One supervisor cycle: make sure the relay transport is actually up — a
+/// device must never be advertised at an address nothing is listening on, and
+/// an endpoint that failed to bind (or was never started) is retried here
+/// rather than waiting for an app restart — then register. Returns whether
+/// the cycle ended registered.
+async fn supervise_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> bool {
+    if !shared.iroh.is_running() {
+        match super::iroh::start(app, shared).await {
+            Ok(()) => super::emit_state_changed(app),
+            Err(e) => {
+                log::warn!("[codemux::web_remote] relay transport start failed: {e}");
+                shared.registration.note_transport_error(&e);
+                super::emit_state_changed(app);
+                return false;
+            }
+        }
+    }
+    register_once(app, shared).await
+}
+
+/// The supervisor loop [`start`] spawns. Each cycle first checks that relay is
+/// still wanted: if relay (or remote access) was switched off without this
+/// loop being aborted — `stop_relay` ran before the loop existed — it ends
+/// rather than keep advertising the persisted node id.
+async fn supervise<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, generation: u64) {
+    let mut failures = 0u32;
+    while super::relay_wanted(&shared.config.lock().unwrap()) {
+        if supervise_once(&app, &shared).await {
+            failures = 0;
+            tokio::time::sleep(REFRESH_INTERVAL).await;
+        } else {
+            failures = failures.saturating_add(1);
+            tokio::time::sleep(retry_delay(failures)).await;
+        }
+    }
+    {
+        let mut inner = shared.registration.inner.lock().unwrap();
+        if inner.generation != generation {
+            return; // superseded by a newer loop
+        }
+        inner.refresh = None;
+        inner.status.registered = false;
+    }
+    // `refresh` is cleared first, so a `start` that no-op'd against this
+    // exiting loop is caught here: relay was turned back on → run a fresh loop.
+    // (No endpoint teardown: `iroh::start` never installs an unwanted one, and
+    // a stop here could kill the endpoint a concurrent re-enable just bound.)
+    if super::relay_wanted(&shared.config.lock().unwrap()) {
+        start(&app, &shared);
     }
 }
 
-/// Start device registration: register immediately, then refresh `lastSeenAt`
-/// on [`REFRESH_INTERVAL`] until [`stop`]. Idempotent — a second call while the
-/// refresh task is live is a no-op. Non-blocking (the initial POST runs on the
-/// spawned task), so enabling relay mode never waits on the network.
+/// Start the relay supervisor: bring the endpoint up if needed and register
+/// immediately, then refresh `lastSeenAt` every [`REFRESH_INTERVAL`] — or, after
+/// a failed cycle, retry on a short backoff ([`retry_delay`]). Runs until
+/// [`stop`] or until relay is no longer wanted. Idempotent — a second call
+/// while the task is live is a no-op. Non-blocking (the first cycle runs on
+/// the spawned task), so enabling relay mode never waits on the network.
 pub(crate) fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
-    if shared.registration.is_running() {
+    let mut inner = shared.registration.inner.lock().unwrap();
+    if inner.refresh.is_some() {
         return;
     }
-    let app = app.clone();
-    let shared_task = shared.clone();
-    let handle = tauri::async_runtime::spawn(async move {
-        loop {
-            register_once(&app, &shared_task).await;
-            tokio::time::sleep(REFRESH_INTERVAL).await;
-        }
-    });
-    shared.registration.inner.lock().unwrap().refresh = Some(handle);
+    inner.generation += 1;
+    let task = supervise(app.clone(), shared.clone(), inner.generation);
+    inner.refresh = Some(tauri::async_runtime::spawn(task));
 }
 
 /// Stop device registration: abort the refresh task and mark the desktop
@@ -326,6 +397,64 @@ mod tests {
         assert!(v.get("device_id").is_none(), "no snake_case leakage");
         assert!(v.get("node_id").is_none());
         assert_eq!(v.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn failed_cycles_retry_on_a_short_capped_backoff() {
+        // A failure must not wait the full refresh interval (that is what made
+        // a transient boot failure look permanent), but must back off.
+        assert_eq!(retry_delay(1), Duration::from_secs(10));
+        assert_eq!(retry_delay(2), Duration::from_secs(20));
+        assert_eq!(retry_delay(3), Duration::from_secs(40));
+        assert_eq!(retry_delay(5), Duration::from_secs(160));
+        assert_eq!(retry_delay(6), REFRESH_INTERVAL, "capped at the refresh interval");
+        assert_eq!(retry_delay(u32::MAX), REFRESH_INTERVAL, "never overflows");
+    }
+
+    #[tokio::test]
+    async fn supervisor_ends_when_relay_is_off_and_a_later_start_runs_fresh() {
+        // Relay was switched off before the loop could be aborted (the
+        // mid-bind race): the loop must end on its own instead of POSTing the
+        // persisted node id, and clear "already running" so a later enable
+        // starts a new loop rather than no-op'ing.
+        let app = tauri::test::mock_app();
+        let shared = Arc::new(Shared::default());
+        assert!(!super::super::relay_wanted(&shared.config.lock().unwrap()));
+        let generation = {
+            let mut inner = shared.registration.inner.lock().unwrap();
+            inner.generation += 1;
+            inner.refresh = Some(tauri::async_runtime::spawn(async {}));
+            inner.generation
+        };
+        assert!(shared.registration.is_running());
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            supervise(app.handle().clone(), shared.clone(), generation),
+        )
+        .await
+        .expect("the supervisor must end once relay is not wanted");
+        assert!(!shared.registration.is_running(), "the ended loop clears its handle");
+        assert!(!shared.iroh.is_running(), "no endpoint was bound");
+
+        start(app.handle(), &shared);
+        assert_eq!(
+            shared.registration.inner.lock().unwrap().generation,
+            generation + 1,
+            "a later start spawns a fresh loop instead of no-op'ing"
+        );
+    }
+
+    #[test]
+    fn transport_error_is_reported_as_the_registration_error() {
+        let mgr = RegistrationManager::default();
+        mgr.note_transport_error("iroh endpoint bind failed: no network");
+        let status = mgr.status();
+        assert!(!status.registered);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("relay transport couldn't start: iroh endpoint bind failed: no network")
+        );
     }
 
     #[test]

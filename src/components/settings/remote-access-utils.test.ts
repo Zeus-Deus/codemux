@@ -534,7 +534,7 @@ describe("describeExposure", () => {
   });
 
   it("never claims a listener that failed to bind is exposed", () => {
-    const failed = { lan_enabled: true, lan_error: "port taken", running: false };
+    const failed = { lan_enabled: true, bind_error: "port taken", running: false };
     expect(describeExposure(base(failed))).toMatch(
       /couldn't start listening, so nothing can reach this machine/,
     );

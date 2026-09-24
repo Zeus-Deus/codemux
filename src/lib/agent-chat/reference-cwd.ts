@@ -173,6 +173,13 @@ export function toolCallReferencePaths(input: unknown): string[] {
   return paths;
 }
 
+/** Every absolute file path spelled out in prose, in reading order. */
+export function textReferencePaths(text: string): string[] {
+  const paths: string[] = [];
+  pathsFromString(text, paths);
+  return paths;
+}
+
 // Per-call memo. Both scans are regex-heavy and the transcript is rebuilt on
 // every streaming delta, so re-deriving history each frame is pure waste; the
 // reducer keeps unchanged items object-identical (the same property the

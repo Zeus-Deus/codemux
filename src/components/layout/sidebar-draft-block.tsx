@@ -348,7 +348,7 @@ export const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
   catalog: SidebarDraftCatalog;
   filterPath: string | null;
   /** Owned by the inbox (`useFrozenActiveDraftRow`) so the rows below and the
-   *  "Nothing active" placeholder agree on whether the active draft shows. */
+   *  empty state agree on whether the active draft shows. */
   frozenActive: FrozenActiveDraftRow;
 }) {
   const draftsById = useChatDraftStore((state) => state.draftsById);

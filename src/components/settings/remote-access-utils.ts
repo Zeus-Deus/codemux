@@ -95,7 +95,7 @@ export function describeExposure(status: WebRemoteStatus | null): string {
   }
   // Once on, describe what is actually live: a listener that failed to bind
   // exposes nothing, whatever its switch says.
-  const listening = lan && !status?.lan_error;
+  const listening = lan && !status?.bind_error;
   if (listening && relay) return `The server listens on ${where}, and ${relayClause}.`;
   if (listening) {
     return `The server listens on ${where}. Nothing is reachable from outside those networks.`;

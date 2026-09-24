@@ -502,6 +502,28 @@ describe("ChatMarkdown source references", () => {
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 
+  it("opens a bare filename from the folder of a path the message named", async () => {
+    const gif = "/tmp/empty-preview/signal.gif";
+    mocks.fileExists.mockImplementation(async (path: unknown) => path === gif);
+
+    const { getByRole } = render(
+      <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+        {
+          "See `/tmp/empty-preview/overview.png`. There is also `signal.gif` in the same folder."
+        }
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(getByRole("button", { name: "signal.gif" }));
+
+    await waitFor(() =>
+      expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+        docPaneId(gif),
+      ),
+    );
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
   it("falls back to the workspace root when the tool ran in a subdirectory", async () => {
     // The turn's last command ran in `<workspace>/src-tauri`, so the chip
     // resolves there first, but the answer names the repo-root file.

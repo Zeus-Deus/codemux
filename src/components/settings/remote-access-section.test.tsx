@@ -50,6 +50,7 @@ const cmds = vi.hoisted(() => ({
   webRemoteApproveSession: vi.fn(),
   webRemoteRejectSession: vi.fn(),
   webRemoteRegistrationStatus: vi.fn(),
+  webRemoteRetry: vi.fn(),
 }));
 vi.mock("@/tauri/commands", () => cmds);
 
@@ -711,10 +712,10 @@ describe("RemoteAccessSection — ways to connect", () => {
     cmds.webRemoteStatus.mockResolvedValue(
       ways({
         running: false,
-        lan_error: "bind 0.0.0.0:4377: Address already in use (os error 98)",
+        bind_error: "bind 0.0.0.0:4377: Address already in use (os error 98)",
       }),
     );
-    cmds.webRemoteEnable.mockResolvedValue(ways());
+    cmds.webRemoteRetry.mockResolvedValue(ways());
     render(<RemoteAccessSection />);
 
     expect(
@@ -728,9 +729,45 @@ describe("RemoteAccessSection — ways to connect", () => {
     expect(screen.queryByText(/Starting the server/i)).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /retry starting the server/i }));
-    await waitFor(() => expect(cmds.webRemoteEnable).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(cmds.webRemoteRetry).toHaveBeenCalledTimes(1));
+    expect(cmds.webRemoteEnable).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(screen.getByText(/Listening on port 4377/)).toBeInTheDocument(),
+    );
+    expect(toast.success).toHaveBeenCalledWith("Listening on your network again.");
+  });
+
+  it("Retry surfaces a bind that still fails", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({ running: false, bind_error: "No Tailscale address found" }),
+    );
+    cmds.webRemoteRetry.mockRejectedValue("Address already in use");
+    render(<RemoteAccessSection />);
+
+    await user.click(
+      await screen.findByRole("button", { name: /retry starting the server/i }),
+    );
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Still couldn't start the server: Address already in use",
+      ),
+    );
+  });
+
+  it("says from-anywhere still works while only the listener is down", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({
+        running: false,
+        bind_error: "No Tailscale address found",
+        relay_mode_enabled: true,
+        relay_running: true,
+      }),
+    );
+    render(<RemoteAccessSection />);
+    const lan = await screen.findByRole("region", { name: "On my network" });
+    expect(within(lan).getByRole("alert")).toHaveTextContent(
+      /from-anywhere access is unaffected/i,
     );
   });
 
@@ -738,7 +775,7 @@ describe("RemoteAccessSection — ways to connect", () => {
     cmds.webRemoteStatus.mockResolvedValue(
       ways({
         running: false,
-        lan_error: "No Tailscale address found",
+        bind_error: "No Tailscale address found",
         relay_mode_enabled: true,
         relay_running: true,
         device_registered: true,
@@ -758,16 +795,35 @@ describe("RemoteAccessSection — ways to connect", () => {
     expect(within(lan).getByText("No Tailscale address found")).toBeInTheDocument();
   });
 
-  it("shows a relay start failure with a retry", async () => {
+  it("shows the live registration error with a Retry that calls webRemoteRetry", async () => {
+    const user = userEvent.setup();
     cmds.webRemoteStatus.mockResolvedValue(
-      ways({ relay_mode_enabled: true, relay_error: "iroh endpoint bind failed" }),
+      ways({
+        relay_mode_enabled: true,
+        relay_running: false,
+        device_registered: false,
+        registration_error: "relay transport couldn't start: iroh endpoint bind failed",
+      }),
+    );
+    // The dedicated read has no error (stale); the broadcast wins.
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({ registered: false });
+    cmds.webRemoteRetry.mockResolvedValue(
+      ways({ relay_mode_enabled: true, relay_running: true, device_registered: true }),
     );
     render(<RemoteAccessSection />);
 
-    expect(await screen.findByText("iroh endpoint bind failed")).toBeInTheDocument();
+    const relay = await screen.findByRole("region", { name: "From anywhere" });
     expect(
-      screen.getByRole("button", { name: /retry starting the relay/i }),
+      await within(relay).findByText(
+        /last attempt failed: relay transport couldn't start: iroh endpoint bind failed/i,
+      ),
     ).toBeInTheDocument();
+    expect(within(relay).getByText("Not registered yet")).toBeInTheDocument();
+
+    await user.click(
+      within(relay).getByRole("button", { name: /retry registering this device/i }),
+    );
+    await waitFor(() => expect(cmds.webRemoteRetry).toHaveBeenCalledTimes(1));
   });
 
   it("opens app.codemux.org from the relay card", async () => {

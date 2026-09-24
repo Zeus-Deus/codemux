@@ -182,7 +182,7 @@ zbus = "5"
 # back a `webkit2gtk::WebView` from *that* build, and a mismatch would not
 # type-check.
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
-# Key events on the main GTK window for the dead-renderer reload shortcut
+# Key events on the main GTK window for the native reload shortcuts
 # (`webview_recovery.rs`). Same 0.18 line Tauri already builds, so it adds
 # no new crate to the tree.
 gtk = "0.18"
@@ -192,6 +192,10 @@ gtk = "0.18"
 # requiring users/builders to provide a system OpenSSL installation.
 openssl = { version = "0.10", features = ["vendored"] }
 tauri-plugin-dialog = { version = "2" }
+# WebView2 key and renderer-failure events for native reload recovery
+# (`webview_recovery.rs`). Pinned to the version wry builds so
+# `PlatformWebview::controller()` hands back a type from this same crate.
+webview2-com = "=0.38.2"
 # Used only by os_input.rs Tier-3 input injection — EnumWindows,
 # QueryFullProcessImageNameW, SetCursorPos, SendInput. Already in the
 # transitive tree; the explicit dep just lets us call the functions.

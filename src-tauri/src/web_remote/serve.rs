@@ -172,24 +172,22 @@ pub async fn serve_startup<R: tauri::Runtime>(
     let persisted_enabled = web_remote::web_remote_status(handle.clone()).enabled;
     let scope = resolve_scope(opts.scope.clone(), persisted_enabled);
 
-    let mut result = web_remote::control_enable(handle, scope, opts.port)
-        .await
-        .map_err(|e| format!("could not enable the web-remote server: {e}"))?;
-
-    // `--relay`: flip relay mode on through the same config path the Settings
-    // pane uses; because the server is now running, `set_config_core` also
-    // starts the iroh endpoint + registration. (When relay was already
-    // persisted-on, `control_enable` above started it and this is a no-op —
-    // note it is NOT passed as `Some(false)` when the flag is absent, so an
-    // omitted `--relay` can never turn a persisted relay off.)
+    // `--relay` first: flip relay mode on through the same config path the
+    // Settings pane uses, BEFORE binding. Relay mode does not need the LAN
+    // listener, so with it on, the enable below keeps running (relay-only)
+    // even if the listener can't bind — ordering it after the enable would let
+    // a taken port abort serve before relay mode was ever recorded. The flag is
+    // NOT passed as `Some(false)` when absent, so an omitted `--relay` can
+    // never turn a persisted relay off.
     if opts.relay {
-        match web_remote::control_set_relay(handle, true).await {
-            Ok(status) => result.status = status,
-            Err(e) => eprintln!("[codemux serve] relay transport could not be enabled: {e}"),
+        if let Err(e) = web_remote::control_set_relay(handle, true).await {
+            eprintln!("[codemux serve] relay transport could not be enabled: {e}");
         }
     }
 
-    Ok(result)
+    web_remote::control_enable(handle, scope, opts.port)
+        .await
+        .map_err(|e| format!("could not enable the web-remote server: {e}"))
 }
 
 /// Print the "server bound" portion of the startup banner: port, bind scope,
@@ -214,6 +212,13 @@ fn print_banner<R: tauri::Runtime>(
     }
     println!("  Port:         {port}");
     println!("  Access scope: {scope} ({scope_note})");
+    if let Some(err) = &result.status.bind_error {
+        // Relay mode kept the server up without its LAN listener; say so
+        // rather than printing addresses nothing is listening on.
+        println!("  LAN listener: not running — {err}");
+        println!("                (retrying in the background; relay access is unaffected)");
+        return;
+    }
 
     // Enumerate the reachable endpoints (the same list the Settings pane and
     // `codemux remote enable` surface).
