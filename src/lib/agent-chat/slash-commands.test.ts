@@ -261,6 +261,38 @@ describe("filterSlashItems", () => {
     // The display-only scope suffix is not searchable.
     expect(filterSlashItems(withSkills, "codex")).toEqual([]);
   });
+
+  it("keeps the flat order in step with the drawn groups", () => {
+    const item = (
+      id: string,
+      group: string,
+      searchDescription?: string,
+    ): SlashCommandItem => ({
+      id,
+      label: id,
+      searchDescription,
+      command: `/${id}`,
+      group,
+      onSelect: () => {},
+    });
+    const mixed = [
+      item("update-personal-desktop", "SKILLS", "Update the Hermes fork"),
+      item("hermes-notes", "SKILLS"),
+      item("hermes-sync", "COMMANDS"),
+      item("deploy", "COMMANDS", "Ship Hermes builds"),
+    ];
+    const filtered = filterSlashItems(mixed, "herme");
+    // Arrow keys walk the flat list; the popup draws grouped rows.
+    expect(filtered.map((i) => i.id)).toEqual(
+      groupSlashItems(filtered).flatMap((g) => g.items.map((i) => i.id)),
+    );
+    expect(filtered.map((i) => i.id)).toEqual([
+      "hermes-notes",
+      "update-personal-desktop",
+      "hermes-sync",
+      "deploy",
+    ]);
+  });
 });
 
 describe("buildModeCommands", () => {

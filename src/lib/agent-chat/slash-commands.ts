@@ -405,9 +405,9 @@ const DESCRIPTION_MATCH_MIN_LENGTH = 3;
  * anywhere in the label (`pla` → `Plan`). Case-insensitive.
  *
  * Queries of three or more characters also match descriptions, ranked
- * after name matches. A skill's name is often not the word the user
- * remembers: `update-personal-desktop` is "the Hermes one", and the
- * Codex CLI finds it that way too.
+ * after name matches within the same group. A skill's name is often not
+ * the word the user remembers: `update-personal-desktop` is "the Hermes
+ * one", and the Codex CLI finds it that way too.
  */
 export function filterSlashItems(
   items: SlashCommandItem[],
@@ -415,25 +415,38 @@ export function filterSlashItems(
 ): SlashCommandItem[] {
   if (!query) return items;
   const q = query.toLowerCase();
-  const nameMatches: SlashCommandItem[] = [];
-  const descriptionMatches: SlashCommandItem[] = [];
+  // Rank within each group so the flat list stays group-contiguous:
+  // the popup draws rows via `groupSlashItems`, and arrow keys walk
+  // this array, so the two orders must agree.
+  const groups = new Map<
+    string,
+    { names: SlashCommandItem[]; descriptions: SlashCommandItem[] }
+  >();
+  const bucketFor = (group: string) => {
+    let bucket = groups.get(group);
+    if (!bucket) {
+      bucket = { names: [], descriptions: [] };
+      groups.set(group, bucket);
+    }
+    return bucket;
+  };
   const searchDescriptions = q.length >= DESCRIPTION_MATCH_MIN_LENGTH;
   for (const item of items) {
     if (
       item.command.toLowerCase().startsWith(`/${q}`) ||
       item.label.toLowerCase().includes(q)
     ) {
-      nameMatches.push(item);
+      bucketFor(item.group).names.push(item);
     } else if (
       searchDescriptions &&
       (item.searchDescription ?? item.description)
         ?.toLowerCase()
         .includes(q)
     ) {
-      descriptionMatches.push(item);
+      bucketFor(item.group).descriptions.push(item);
     }
   }
-  return [...nameMatches, ...descriptionMatches];
+  return [...groups.values()].flatMap((b) => [...b.names, ...b.descriptions]);
 }
 
 /**
