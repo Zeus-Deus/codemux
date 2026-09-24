@@ -132,7 +132,13 @@ function readLastPlate(): number {
 function Plate({ src }: { src: string }) {
   const layers = `url(${src}), radial-gradient(closest-side, #000 38%, transparent)`;
   return (
-    <div aria-hidden className="cm-plate relative size-[200px] opacity-65">
+    // Fluid up to 200px: the sidebar can be dragged down to 180px, where a
+    // fixed-size plate would spill out of the content area and scroll it
+    // sideways. overflow-hidden keeps the drift's scale inside the box.
+    <div
+      aria-hidden
+      className="cm-plate relative aspect-square w-full max-w-[200px] shrink-0 overflow-hidden opacity-65"
+    >
       <div className="cm-plate-drift absolute inset-0">
         <div
           className="absolute inset-0 overflow-hidden"
@@ -182,7 +188,7 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
   return (
     <div
       data-sidebar-empty
-      className="flex min-h-[360px] flex-1 flex-col items-center justify-center gap-4 px-3 py-8 text-center"
+      className="flex min-h-[360px] min-w-0 flex-1 flex-col items-center justify-center gap-4 px-3 py-8 text-center wrap-anywhere"
     >
       <Plate src={plate.src} />
       <span className="font-mono text-micro uppercase tracking-[0.14em] text-muted-foreground/80">
@@ -205,16 +211,20 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
         </span>
       )}
       {/* Square, mono, outlined — the site's button, scaled to the sidebar.
-          Hovering it wakes the plate (see `.cm-plate` in globals.css). */}
+          Hovering it wakes the plate (see `.cm-plate` in globals.css). In a
+          narrow sidebar the shortcut drops to its own line and the label
+          wraps, rather than the button overflowing. */}
       <button
         type="button"
         data-cta
         onClick={handleNewAgent}
-        className="mt-1 inline-flex h-8 items-center gap-2.5 border border-border px-3 font-mono text-caption uppercase tracking-[0.1em] text-foreground/85 transition-colors duration-150 hover:border-foreground/60 hover:bg-surface-2 hover:text-foreground"
+        className="mt-1 inline-flex min-h-8 max-w-full flex-wrap items-center justify-center gap-x-2.5 gap-y-0.5 border border-border px-3 py-1.5 font-mono text-caption uppercase leading-tight tracking-[0.1em] text-foreground/85 transition-colors duration-150 hover:border-foreground/60 hover:bg-surface-2 hover:text-foreground"
       >
-        Put them to work
+        <span className="text-balance">Put them to work</span>
         {newAgentKeys && (
-          <span className="text-muted-foreground/70">{formatKeyCombo(newAgentKeys)}</span>
+          <span className="whitespace-nowrap text-muted-foreground/70">
+            {formatKeyCombo(newAgentKeys)}
+          </span>
         )}
       </button>
     </div>

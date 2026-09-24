@@ -1291,7 +1291,9 @@ body.pane-resizing iframe {
   }
 }
 .cm-plate {
-  animation: cm-plate-in 1.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  /* backwards, not both: a held end state would keep the animation owning
+   * opacity, so the hover change below would jump instead of transition. */
+  animation: cm-plate-in 1.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
   transition: opacity 0.6s ease;
 }
 @keyframes cm-plate-drift {
