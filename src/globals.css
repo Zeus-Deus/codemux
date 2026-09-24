@@ -435,7 +435,7 @@
   transition: opacity 120ms ease-out;
   /* Both islands are 32px tall inset 4px from the top of the 40px band, so
      -4px pins the wash to the physical top of the window. It stays solid
-     down to the island's bottom edge and feathers out over the next 28px. */
+     down to the bottom of the 40px band and feathers out over the next 28px. */
   top: -4px;
   height: 68px;
   background: var(--background);
@@ -443,16 +443,19 @@
   mask-composite: intersect;
 }
 
-/* Tab run. Spills 40px past both island edges and feathers over exactly
-   that spill, so the whole island sits on solid background. */
+/* Tab run. The left edge stops at the sidebar (-6px is the band's inset
+   from it), mirroring how the action run stops at the open panel: nothing
+   paints over the sidebar or its floating toggle, and a solid edge flush
+   against the sidebar shows no seam. Only the right side feathers, over a
+   40px spill, so the whole island sits on solid background. */
 .titlebar-overlap-wash-start::before {
-  left: -40px;
+  left: -6px;
   right: -40px;
   -webkit-mask-image:
-    linear-gradient(to right, transparent, #000 40px, #000 calc(100% - 40px), transparent),
+    linear-gradient(to left, transparent, #000 40px),
     linear-gradient(to bottom, #000 40px, transparent);
   mask-image:
-    linear-gradient(to right, transparent, #000 40px, #000 calc(100% - 40px), transparent),
+    linear-gradient(to left, transparent, #000 40px),
     linear-gradient(to bottom, #000 40px, transparent);
 }
 
