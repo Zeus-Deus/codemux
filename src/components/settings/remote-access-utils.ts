@@ -93,16 +93,31 @@ export function describeExposure(status: WebRemoteStatus | null): string {
     }
     return "Turning this on doesn't open anything by itself — you choose how devices connect next.";
   }
-  // Once on, describe what is actually live: a listener that failed to bind
-  // exposes nothing, whatever its switch says.
-  const listening = lan && !status?.bind_error;
-  if (listening && relay) return `The server listens on ${where}, and ${relayClause}.`;
+  // Once on, describe what is actually live, whatever the switches say: a
+  // listener counts only while it is bound, and the relay only while its
+  // endpoint is up and nothing is failing (a relay endpoint that couldn't
+  // start, or a device the account can't list, reaches nobody).
+  const listening = lan && (status?.running ?? false);
+  const relayLive =
+    relay && (status?.relay_running ?? false) && !status?.registration_error;
+  if (listening && relayLive) return `The server listens on ${where}, and ${relayClause}.`;
   if (listening) {
-    return `The server listens on ${where}. Nothing is reachable from outside those networks.`;
+    return relay
+      ? `The server listens on ${where}. From-anywhere access isn't working right now, so nothing is reachable from outside those networks.`
+      : `The server listens on ${where}. Nothing is reachable from outside those networks.`;
   }
-  if (relay) return `Nothing listens on your network — ${relayClause}.`;
-  if (lan) {
-    return "The server couldn't start listening, so nothing can reach this machine right now.";
+  if (relayLive) return `Nothing listens on your network — ${relayClause}.`;
+  if (lan || relay) {
+    const lanDown = status?.bind_error
+      ? "the server couldn't start listening"
+      : "the server isn't listening yet";
+    if (lan && relay) {
+      return `Neither way in is working right now — ${lanDown} and from-anywhere access is down — so nothing can reach this machine.`;
+    }
+    if (lan) {
+      return `${lanDown.charAt(0).toUpperCase()}${lanDown.slice(1)}, so nothing can reach this machine right now.`;
+    }
+    return "From-anywhere access isn't working right now, and nothing listens on your network, so nothing can reach this machine.";
   }
   return "Nothing can reach this machine yet — turn on a way to connect below.";
 }
