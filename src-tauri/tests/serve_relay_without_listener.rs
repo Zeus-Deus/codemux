@@ -16,6 +16,8 @@
 //!   2. the device registers with the (mocked) control plane under the live
 //!      relay `node_id`,
 //!   3. pairing refuses with the bind reason instead of minting a dead link,
+//!      and re-enabling with another taken `--port` stays relay-only (the bind
+//!      failure is the status's `bind_error`, not a failed enable),
 //!   4. once the port frees up, the background retry binds the listener
 //!      without a restart and the error clears,
 //!   5. with relay mode OFF, the same bind failure still rolls the enable back
@@ -169,6 +171,27 @@ fn relay_registers_while_the_lan_listener_cannot_bind() {
     // ── 3. No dead pairing links while nothing listens. ──
     let err = web_remote::control_pair(&handle, None).expect_err("pairing must refuse");
     assert!(err.contains("isn't listening"), "names the cause: {err}");
+
+    // ── 3b. Re-enabling at another taken port stays relay-only, not an error
+    //        (`codemux serve --relay --port <taken>` / `codemux connect --port`). ──
+    let blocker2 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind second blocker");
+    let port2 = blocker2.local_addr().expect("second blocker addr").port();
+    let enabled = tauri::async_runtime::block_on(web_remote::control_enable(
+        &handle,
+        None,
+        Some(port2),
+    ))
+    .expect("with relay on, a taken --port must not fail the enable");
+    assert_eq!(enabled.status.port, port2, "the new port is kept");
+    assert!(!enabled.status.running, "the new port is taken too");
+    assert!(
+        enabled.status.bind_error.is_some(),
+        "the bind failure is reported as the status's bind_error"
+    );
+    assert!(enabled.status.relay_running, "relay stays up");
+    let port = port2;
+    drop(blocker);
+    let blocker = blocker2;
 
     // ── 4. The port frees up → the retry loop binds without a restart. ──
     drop(blocker);

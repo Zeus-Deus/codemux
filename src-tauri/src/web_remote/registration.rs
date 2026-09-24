@@ -338,12 +338,11 @@ async fn supervise<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, generatio
         inner.status.registered = false;
     }
     // `refresh` is cleared first, so a `start` that no-op'd against this
-    // exiting loop is caught here: relay was turned back on → run a fresh
-    // loop; still off → drop any endpoint a racing bind left installed.
+    // exiting loop is caught here: relay was turned back on → run a fresh loop.
+    // (No endpoint teardown: `iroh::start` never installs an unwanted one, and
+    // a stop here could kill the endpoint a concurrent re-enable just bound.)
     if super::relay_wanted(&shared.config.lock().unwrap()) {
         start(&app, &shared);
-    } else {
-        super::iroh::stop(&shared);
     }
 }
 

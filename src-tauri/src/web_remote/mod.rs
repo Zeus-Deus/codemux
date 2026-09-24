@@ -569,16 +569,26 @@ pub async fn control_enable<R: Runtime>(
         if scope.is_some() || port.is_some() {
             // A scope/port change while running rebinds via the same path a
             // port change from the Settings pane uses (drops existing sockets).
-            let status =
-                set_config_core(app, &shared, port, None, scope, None, None, None).await?;
+            let changed = set_config_core(app, &shared, port, None, scope, None, None, None).await;
             if already_bound {
-                (status, false)
+                (changed?, false)
             } else {
                 // Persisted-enabled but nothing bound (headless serve leaves
                 // boot-time binding to its awaited startup path). `set_config_core`
                 // only *rebinds* an already-running listener, so an enable with
                 // flags would otherwise persist the new scope/port and leave the
                 // server off. Bind through the shared path instead.
+                //
+                // Its bind attempt at the new scope/port may fail. With relay
+                // mode on that is not fatal — `enable_core` keeps relay up and
+                // reports the failure as the status's `bind_error` — so only a
+                // non-bind error (an invalid scope) or relay-off fails here.
+                if let Err(e) = changed {
+                    let bind_failed = shared.bind_error.lock().unwrap().as_deref() == Some(e.as_str());
+                    if !(bind_failed && shared.config.lock().unwrap().relay_mode_enabled) {
+                        return Err(e);
+                    }
+                }
                 (enable_core(app, &shared).await?, false)
             }
         } else if already_bound {
@@ -909,18 +919,35 @@ async fn bind_listeners<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) ->
         listeners.push(server::bind(*addr).await?);
     }
 
+    // One shutdown signal shared by every listener's graceful-shutdown future.
+    // Receivers are subscribed before the runtime is installed, so a
+    // `stop_server` racing the spawns below still reaches every listener.
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let servers: Vec<_> = listeners
+        .into_iter()
+        .map(|listener| (listener, shutdown_tx.subscribe()))
+        .collect();
+
     // Remote access may have been turned off while the bind was in flight (a
     // background retry racing a disable). Disabling is a security action, so
-    // never install a listener it has already torn down.
-    if !shared.config.lock().unwrap().enabled {
-        return Err("remote access was turned off".to_string());
+    // never install a listener it has already torn down. Check and install
+    // under one config-lock hold: every disable writes the config before
+    // `stop_server` takes the runtime, so either that stop sees this install
+    // or this check sees the disable.
+    {
+        let cfg = shared.config.lock().unwrap();
+        if !cfg.enabled {
+            return Err("remote access was turned off".to_string());
+        }
+        *shared.runtime.lock().unwrap() = Some(RunningServer {
+            port,
+            scope,
+            shutdown: shutdown_tx,
+        });
     }
 
-    // One shutdown signal shared by every listener's graceful-shutdown future.
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-    for listener in listeners {
+    for (listener, mut shutdown_rx) in servers {
         let router = server::router(app.clone());
-        let mut shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
             let result = axum::serve(listener, service)
@@ -934,12 +961,6 @@ async fn bind_listeners<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) ->
             }
         });
     }
-
-    *shared.runtime.lock().unwrap() = Some(RunningServer {
-        port,
-        scope,
-        shutdown: shutdown_tx,
-    });
     Ok(())
 }
 
@@ -1050,14 +1071,8 @@ async fn start_relay<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
         log::warn!("[codemux::web_remote] relay transport start failed: {e}");
         shared.registration.note_transport_error(&e);
     }
-    // Relay (or remote access) may have been switched off while the bind was
-    // in flight — `stop_relay` found nothing to tear down then. Don't start a
-    // registration loop that would list the device at an address nothing
-    // listens on, and drop any endpoint that got installed after that stop.
-    if !relay_wanted(&shared.config.lock().unwrap()) {
-        iroh::stop(shared);
-        return;
-    }
+    // If relay was switched off while the bind was in flight, `iroh::start`
+    // installed nothing and the supervisor ends on its first relay check.
     registration::start(app, shared);
 }
 

@@ -723,15 +723,33 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
         .await
         .map_err(|e| format!("iroh endpoint bind failed: {e}"))?;
 
-    // Relay mode may have been switched off while the bind was in flight (the
-    // stop path found nothing to tear down yet). Don't install an endpoint
-    // nobody wants.
-    if !super::relay_wanted(&shared.config.lock().unwrap()) {
+    // Relay (or remote access) may have been switched off while the bind was
+    // in flight. Check and install under one config-lock hold: every disable
+    // writes the config before `stop` takes the endpoint, so either that stop
+    // sees this install or this check sees the disable. The accept loop starts
+    // only once installed, so an unwanted endpoint never accepts anything.
+    let node_id = endpoint.id().to_string();
+    let installed = {
+        let cfg = shared.config.lock().unwrap();
+        let wanted = super::relay_wanted(&cfg);
+        if wanted {
+            let accept = tauri::async_runtime::spawn(accept_loop(
+                app.clone(),
+                shared.clone(),
+                endpoint.clone(),
+            ));
+            let running = RunningIroh {
+                endpoint: endpoint.clone(),
+                accept,
+            };
+            shared.iroh.install(running, node_id.clone());
+        }
+        wanted
+    };
+    if !installed {
         endpoint.close().await;
         return Ok(());
     }
-
-    let node_id = endpoint.id().to_string();
     log::info!("[codemux::web_remote] iroh relay transport enabled: node_id={node_id}");
 
     // Log the home relay once one is established (proof the relay accepted us).
@@ -752,15 +770,6 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
             );
         });
     }
-
-    let accept = {
-        let app = app.clone();
-        let shared = shared.clone();
-        let ep = endpoint.clone();
-        tauri::async_runtime::spawn(accept_loop(app, shared, ep))
-    };
-
-    shared.iroh.install(RunningIroh { endpoint, accept }, node_id);
     Ok(())
 }
 
