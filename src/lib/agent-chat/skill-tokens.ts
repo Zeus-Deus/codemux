@@ -28,7 +28,7 @@ const SKILL_TOKEN_RE =
 /** Match chat adapters to the projection the backend invokes for them. */
 function projectionProviderForChat(
   provider: AgentChatProviderKind,
-): SkillProvider {
+): SkillProvider | null {
   switch (provider) {
     case "claude":
     case "codex":
@@ -36,6 +36,8 @@ function projectionProviderForChat(
       return provider;
     // Cursor and Grok have no native SKILL.md inventory. The backend feeds
     // both the portable `.agents/skills` / Codex projection.
+    case "hermes":
+      return null;
     case "cursor":
     case "grok":
       return "codex";
@@ -50,6 +52,7 @@ export function skillsForProvider(
   provider: AgentChatProviderKind,
 ): Skill[] {
   const targetProvider = projectionProviderForChat(provider);
+  if (!targetProvider) return [];
   return skills.filter((skill) => {
     // Old cached/test records can predate projections entirely. Keep their
     // legacy availability, but once a record supplies a projection table an

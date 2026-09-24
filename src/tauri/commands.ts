@@ -1672,18 +1672,19 @@ export const agentChatCreatePane = async (
  *
  *  A rejected claim never spawns anything and reports a JSON
  *  `pane_already_bound` error — see `parsePaneAlreadyBound`. */
-export const agentChatStartSession = (
+export const agentChatStartSession = async (
   paneId: string,
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
   expectedThread: string | null = null,
-) =>
-  invoke<string>("agent_chat_start_session", {
-    paneId,
-    provider,
-    input,
-    expectedThread,
-  });
+) => {
+  if (provider === "hermes") {
+    const { useHermes } = await import("@/stores/hermes-store");
+    const profile = useHermes.getState().selections[input.thread_id];
+    if (profile) input = { ...input, permission_mode: useHermes.getState().modes[input.thread_id] ?? input.permission_mode, extra: { hermes_profile: profile } };
+  }
+  return invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+};
 
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,

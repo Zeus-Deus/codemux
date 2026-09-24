@@ -3448,6 +3448,8 @@ export function Composer({
             </div>
           ) : null}
           <ComposerFooter
+            hermesThreadId={threadId}
+            hermesProjectPath={cwd}
             provider={provider}
             model={model}
             permissionMode={permissionMode}

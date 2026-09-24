@@ -1204,6 +1204,12 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
 ) -> Result<(), String> {
+    // Fast refusal while the workspace is still intact. Not under the
+    // Hermes lifecycle lock: teardown must not serialize every close, so
+    // the hold is re-checked under the lock right before the delete.
+    if remove_worktree && db.hermes_cleanup_pending(&workspace_id)? {
+        return Err("Hermes worktree cleanup pending: the official runtime has no background-drain acknowledgment. Close or archive without deleting files.".into());
+    }
     let force = force_delete.unwrap_or(false);
 
     // One pre-close snapshot serves both the file-deletion guard and
@@ -1227,6 +1233,11 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id);
         if remove_worktree {
+            if let Some(ws) = ws {
+                if db.hermes_cleanup_pending_path(&ws.cwd)? {
+                    return Err("Hermes worktree cleanup pending: files retained until background completion can be verified.".into());
+                }
+            }
             if let Some(ws) = ws {
                 if let Some(reason) = refuse_worktree_removal(ws) {
                     return Err(reason);
@@ -1262,15 +1273,29 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
                     crate::git::ensure_worktree_removable(Path::new(&wt_path))
                 })
                 .await
-                .map_err(|e| {
-                    format!("worktree removal pre-flight task join failed: {e}")
-                })??;
+                .map_err(|e| format!("worktree removal pre-flight task join failed: {e}"))??;
             }
         }
     }
 
+    // Hermes owns background work with no drain acknowledgment. Await foreground
+    // cancellation, retain files and defer teardown scripts while cleanup is pending.
+    let hermes_pending = db.hermes_cleanup_pending(&workspace_id)? || {
+        let snapshot = state.snapshot();
+        match snapshot.workspaces.iter().find(|w| w.workspace_id.0 == workspace_id) {
+            Some(ws) => db.hermes_cleanup_pending_path(&ws.cwd)?,
+            None => false,
+        }
+    };
+    if let Some(registry) = app.try_state::<crate::commands::agent_chat::ProviderRegistry>() {
+        if let Some(provider) = registry.get(crate::agent_provider::types::ProviderKind::Hermes).await {
+            for thread in db.hermes_workspace_threads(&workspace_id)? {
+                provider.stop_session(crate::agent_provider::types::ThreadId(thread)).await.map_err(|e| e.to_string())?;
+            }
+        }
+    }
     // Run teardown scripts before closing
-    if !force {
+    if !force && !hermes_pending {
         if let Some(ref wt_path) = worktree_path {
             if let Err(e) = crate::scripts::run_teardown_scripts(
                 Path::new(wt_path),
@@ -1402,6 +1427,14 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             // with no live row left to escalate from. Forcing here closes
             // that hole; the pre-flight remains the only place uncommitted
             // work can block the close.
+            //
+            // Hermes startup commits its cleanup hold under the same lock, so
+            // either the hold is visible here or the start finds the
+            // directory gone. Held only for this check and the delete.
+            let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+            if db.hermes_cleanup_pending(&workspace_id)? || db.hermes_cleanup_pending_path(&wt_path)? {
+                return Err("Hermes worktree cleanup pending: files retained until background completion can be verified.".into());
+            }
             tokio::task::spawn_blocking(move || {
                 crate::git::git_remove_worktree(
                     Path::new(&wt_path),
@@ -1679,6 +1712,8 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
             .map(|w| w.workspace_id.0.clone())
     };
     if let Some(existing_id) = existing {
+        db.restore_hermes_chat_history(&entry.workspace_id, &existing_id,
+            entry.worktree_path.as_deref().unwrap_or(&entry.cwd))?;
         // Carry the ORIGINAL pin timestamp across, not a fresh one: the
         // archived entry records when the user actually pinned. Only ever
         // re-applies a pin — an unpinned archive entry must not silently
@@ -1816,6 +1851,8 @@ pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
         state.restore_workspace_pinned_at(&restored_id, entry.pinned_at)?;
     }
 
+    db.restore_hermes_chat_history(&entry.workspace_id, &restored_id,
+        entry.worktree_path.as_deref().unwrap_or(&entry.cwd))?;
     let _ = state.remove_archived_workspace(&archive_id);
     if select { activate_workspace_impl(app.clone(), state, restored_id.clone())?; }
     crate::state::emit_app_state(&app);
@@ -1836,9 +1873,23 @@ pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
     delete_branch: bool,
     force_delete: bool,
 ) -> Result<(), String> {
+    let _hermes_lifecycle = if delete_worktree {
+        Some(crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await)
+    } else { None };
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+
+    if delete_worktree
+        && (app
+            .state::<crate::database::DatabaseStore>()
+            .hermes_cleanup_pending(&entry.workspace_id)?
+            || app
+                .state::<crate::database::DatabaseStore>()
+                .hermes_cleanup_pending_path(&entry.cwd)?)
+    {
+        return Err("Hermes worktree cleanup pending: background completion cannot be verified; files have been retained.".into());
+    }
 
     if delete_worktree {
         // Root checkouts and entries without a worktree must never have
@@ -2165,8 +2216,24 @@ pub async fn close_workspace<R: tauri::Runtime>(
         )
     };
 
+    // Hermes owns background work with no drain acknowledgment. Await foreground
+    // cancellation, retain files and defer teardown scripts while cleanup is pending.
+    let hermes_pending = db.hermes_cleanup_pending(&workspace_id)? || {
+        let snapshot = state.snapshot();
+        match snapshot.workspaces.iter().find(|w| w.workspace_id.0 == workspace_id) {
+            Some(ws) => db.hermes_cleanup_pending_path(&ws.cwd)?,
+            None => false,
+        }
+    };
+    if let Some(registry) = app.try_state::<crate::commands::agent_chat::ProviderRegistry>() {
+        if let Some(provider) = registry.get(crate::agent_provider::types::ProviderKind::Hermes).await {
+            for thread in db.hermes_workspace_threads(&workspace_id)? {
+                provider.stop_session(crate::agent_provider::types::ThreadId(thread)).await.map_err(|e| e.to_string())?;
+            }
+        }
+    }
     // Run teardown scripts before closing
-    if !force {
+    if !force && !hermes_pending {
         if let Some((ref cwd, ref title)) = workspace_cwd {
             if let Err(e) = crate::scripts::run_teardown_scripts(
                 Path::new(cwd),

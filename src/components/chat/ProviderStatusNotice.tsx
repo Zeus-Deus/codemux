@@ -13,6 +13,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  hermes: "Hermes",
   opencode: "OpenCode",
 };
 
@@ -41,7 +42,9 @@ export function ProviderStatusNotice({
     selectVisibleHealthReport(s, provider),
   );
   const dismiss = useProviderHealth((s) => s.dismiss);
-  if (!report) return null;
+  // Hermes health is profile-scoped and displayed by its picker. A provider-wide
+  // setup banner remains stale after selecting a healthy profile.
+  if (!report || provider === "hermes") return null;
   const label = PROVIDER_LABEL[report.provider];
   const isError = report.status === "error";
   return (

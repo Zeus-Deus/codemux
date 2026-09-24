@@ -1182,6 +1182,12 @@ fn build_core_app<R: tauri::Runtime>(
                             .set_grok(std::sync::Arc::new(grok) as _)
                             .await;
 
+                        let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new(
+                            std::sync::Arc::new(agent_provider::hermes::binding::AppBindingStore(registry_handle.clone())),
+                        ));
+                        registry_handle.manage(hermes.clone());
+                        registry.set_hermes(hermes).await;
+
                         // OpenCode provider — Step 12 Stage 8. Shares
                         // the singleton OpenCodeServerManager held in
                         // Tauri-managed state (registered as
@@ -2425,6 +2431,10 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_set_fast_mode,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
+            commands::hermes::hermes_profiles,
+            commands::hermes::hermes_binding,
+            commands::hermes::hermes_catalog,
+            commands::hermes::hermes_disconnect,
             commands::agent_chat_provider_health,
             commands::list_chat_slash_commands,
             commands::list_launch_gemini_models,

@@ -3699,6 +3699,10 @@ const handlers: Record<string, Handler> = {
   // ── Agent chat (mocked end-to-end for the seeded chat workspaces) ──
   // start_session echoes back the frontend-minted thread id;
   // send_turn answers with the channel-streamed mock reply.
+  hermes_profiles: () => ["coding", "research"].map(id => ({ schema_version: 1, host: "local", installation: "/mock/bin/hermes", root: "/mock/hermes", id, home: `/mock/hermes/profiles/${id}`, identity: `mock-${id}` })),
+  hermes_binding: () => null,
+  hermes_disconnect: () => null,
+  hermes_catalog: (a) => ({ state: "ready", message: null, session: { models: { currentModelId: (a.profile as {id:string}).id === "research" ? "service:research-model" : "service:coding-model", availableModels: [{ modelId: "service:coding-model", name: "Example service · Coding model", description: "Synthetic UI fixture", _meta: {provider:"Example service"} }, { modelId: "service:research-model", name: "Example service · Research model", description: "Synthetic UI fixture", _meta: {provider:"Example service"} }] } } }),
   list_chat_provider_capabilities: (a) =>
     ({ ... (a.provider === "claude"
       ? CLAUDE_CAPABILITIES

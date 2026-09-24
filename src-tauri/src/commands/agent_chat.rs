@@ -112,6 +112,7 @@ pub struct ProviderRegistry {
     codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     grok: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    hermes: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
 }
 
@@ -140,6 +141,11 @@ impl ProviderRegistry {
         *self.cursor.write().await = Some(provider);
     }
 
+    /// Inject the profile-scoped official Hermes provider.
+    pub async fn set_hermes(&self, provider: Arc<dyn AgentProvider>) {
+        *self.hermes.write().await = Some(provider);
+    }
+
     /// Inject the Grok Build ACP provider.
     pub async fn set_grok(&self, provider: Arc<dyn AgentProvider>) {
         *self.grok.write().await = Some(provider);
@@ -161,6 +167,7 @@ impl ProviderRegistry {
             ProviderKind::Codex => self.codex.read().await.clone(),
             ProviderKind::Cursor => self.cursor.read().await.clone(),
             ProviderKind::Grok => self.grok.read().await.clone(),
+            ProviderKind::Hermes => self.hermes.read().await.clone(),
             ProviderKind::OpenCode => self.opencode.read().await.clone(),
         }
     }
@@ -177,6 +184,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.cursor.read().await.clone() {
             out.push((ProviderKind::Cursor, p));
+        }
+        if let Some(p) = self.hermes.read().await.clone() {
+            out.push((ProviderKind::Hermes, p));
         }
         if let Some(p) = self.grok.read().await.clone() {
             out.push((ProviderKind::Grok, p));
@@ -729,6 +739,22 @@ pub async fn agent_chat_start_session<R: Runtime>(
     mut input: StartSessionInput,
     expected_thread: Option<String>,
 ) -> Result<ThreadId, String> {
+    if provider == ProviderKind::Hermes {
+        let state: State<'_, AppStateStore> = app.state();
+        let workspace = state.workspace_id_for_pane(&pane_id);
+        if state.snapshot().workspaces.iter().any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some()) {
+            return Err("unsupported: Hermes v1 runs on local workspaces only".into());
+        }
+        // A new chat binds the caller's profile; an existing binding is host-owned.
+        let db: State<'_, DatabaseStore> = app.state();
+        if db.hermes_binding(&input.thread_id.0)?.is_none() {
+            if let Some(profile) = input.extra.get("hermes_profile") {
+                let profile: crate::agent_provider::hermes::profile::Profile =
+                    serde_json::from_value(profile.clone()).map_err(|e| e.to_string())?;
+                crate::commands::hermes::require_configured_installation(&db, &profile)?;
+            }
+        }
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -798,6 +824,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
+            ProviderKind::Hermes => "hermes",
             ProviderKind::OpenCode => "opencode",
         };
         let persisted_sdk_session_id = {
@@ -1002,6 +1029,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
+            ProviderKind::Hermes => "hermes",
             ProviderKind::OpenCode => "opencode",
         };
         // A CodeMux thread can keep its transcript while changing provider,
@@ -1581,6 +1609,7 @@ fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
         "codex" => Ok(ProviderKind::Codex),
         "cursor" => Ok(ProviderKind::Cursor),
         "grok" => Ok(ProviderKind::Grok),
+        "hermes" => Ok(ProviderKind::Hermes),
         "opencode" => Ok(ProviderKind::OpenCode),
         other => Err(format!("unsupported provider stored for chat: {other}")),
     }
@@ -1828,6 +1857,29 @@ fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+// Stop must also cancel a send waiting for lazy resume, before a provider turn
+// exists. Keep the final enqueue and interrupt ordered, without holding this
+// gate during startup (which may wait behind another chat's approval).
+#[derive(Default)]
+struct HermesSendGate {
+    cancelled: AtomicU64,
+    dispatch: tokio::sync::Mutex<()>,
+}
+fn hermes_send_gate(thread_id: &str) -> Arc<HermesSendGate> {
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<HermesSendGate>>>> = OnceLock::new();
+    GATES.get_or_init(Default::default).lock().unwrap()
+        .entry(thread_id.into()).or_default().clone()
+}
+impl HermesSendGate {
+    async fn before_dispatch(&self, generation: u64) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        let guard = self.dispatch.lock().await;
+        if self.cancelled.load(Ordering::SeqCst) != generation {
+            return Err("cancelled: Hermes send stopped before dispatch".into());
+        }
+        Ok(guard)
+    }
+}
+
 /// The provider default permission mode used to heal a session row whose
 /// persisted `permission_mode` is NULL.
 ///
@@ -1855,6 +1907,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
         ProviderKind::Codex => Some("danger-full-access"),
         ProviderKind::Cursor => Some("agent"),
         ProviderKind::Grok => Some("agent"),
+        ProviderKind::Hermes => None,
         ProviderKind::OpenCode => None,
     }
 }
@@ -2007,6 +2060,13 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         return Ok(());
     };
 
+    if provider_kind == ProviderKind::Hermes {
+        let state: State<'_, AppStateStore> = app.state();
+        if state.snapshot().workspaces.iter().any(|w| w.workspace_id.0 == record.workspace_id && w.host_id.is_some()) {
+            return Err("unsupported: Hermes v1 runs on local workspaces only".into());
+        }
+    }
+
     let cwd = record
         .cwd
         .as_deref()
@@ -2117,7 +2177,11 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         .await
     {
         Ok(_) => Ok(()),
-        Err(err) if resume_cursor.is_some() && !require_original => {
+        Err(err)
+            if resume_cursor.is_some()
+                && !require_original
+                && provider_kind != ProviderKind::Hermes =>
+        {
             // Resume-start failed — retry once as a fresh session. The
             // transcript already hydrates from the DB, so the user keeps
             // their visible history.
@@ -2196,6 +2260,7 @@ fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
         ProviderKind::Cursor => crate::skills::SkillProvider::Codex,
         // Grok also consumes the portable `.agents/skills` projection.
         ProviderKind::Grok => crate::skills::SkillProvider::Codex,
+        ProviderKind::Hermes => crate::skills::SkillProvider::Codex,
         ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
     }
 }
@@ -2324,8 +2389,13 @@ pub async fn send_turn_with_origin<R: Runtime>(
     mut input: SendTurnCommandInput,
     origin: TurnOrigin,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
+    if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
+        return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    let hermes_gate = (provider == ProviderKind::Hermes).then(|| hermes_send_gate(&input.thread_id.0));
+    let send_generation = hermes_gate.as_ref().map(|gate| gate.cancelled.load(Ordering::SeqCst));
     if origin == TurnOrigin::User {
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
@@ -2473,6 +2543,10 @@ pub async fn send_turn_with_origin<R: Runtime>(
         client_nonce: input.client_nonce.clone(),
         turn_checkpoint,
     };
+    let dispatch_guard = match (&hermes_gate, send_generation) {
+        (Some(gate), Some(generation)) => Some(gate.before_dispatch(generation).await?),
+        _ => None,
+    };
     // Register attachments before the provider can emit TurnQueued and
     // immediately dispatch it. The event bridge and RPC return race to
     // transfer this entry, so exactly one owns its deferred persistence.
@@ -2513,6 +2587,7 @@ pub async fn send_turn_with_origin<R: Runtime>(
             }
         }
     }
+    drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
     if input.delivery == MessageDelivery::Steer && !result.steered {
         let tracker: State<'_, SubagentTracker> = app.state();
@@ -3440,6 +3515,12 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    let hermes_gate = (provider == ProviderKind::Hermes && turn_id.is_none())
+        .then(|| hermes_send_gate(&thread_id.0));
+    let _dispatch_guard = if let Some(gate) = hermes_gate.as_ref() {
+        gate.cancelled.fetch_add(1, Ordering::SeqCst);
+        Some(gate.dispatch.lock().await)
+    } else { None };
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -3701,6 +3782,17 @@ pub async fn agent_chat_set_model<R: Runtime>(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     let model = model.ok_or_else(|| "validation_error: model required".to_string())?;
+    if provider == ProviderKind::Hermes {
+        let lock = resume_lock_for(&thread_id.0);
+        let _guard = lock.lock().await;
+        let hermes = app.state::<Arc<crate::agent_provider::hermes::HermesProvider>>();
+        hermes.validate_intent(&thread_id.0, Some(&model), None).map_err(provider_err)?;
+        if impl_.has_session(&thread_id).await {
+            impl_.set_model(thread_id.clone(), model.clone()).await.map_err(provider_err)?;
+        }
+        return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, Some(&model), None);
+    }
+
     // Persist first so a restart / next auto-resume uses the new model
     // even if no live session exists to apply it to right now.
     {
@@ -3775,6 +3867,16 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    if provider == ProviderKind::Hermes {
+        let lock = resume_lock_for(&thread_id.0);
+        let _guard = lock.lock().await;
+        let hermes = app.state::<Arc<crate::agent_provider::hermes::HermesProvider>>();
+        hermes.validate_intent(&thread_id.0, None, Some(&mode)).map_err(provider_err)?;
+        if impl_.has_session(&thread_id).await {
+            impl_.set_permission_mode(thread_id.clone(), mode.clone()).await.map_err(provider_err)?;
+        }
+        return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, None, Some(&mode));
+    }
     // Persist first so the value survives a restart / next auto-resume.
     {
         let db: State<'_, DatabaseStore> = app.state();
@@ -3910,6 +4012,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 .await
                 .map_err(|error| error.to_command_string())
         }
+        ProviderKind::Hermes => Err("Select a Hermes profile to discover its models".into()),
         ProviderKind::OpenCode => {
             crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
                 opencode_manager.inner().as_ref(),
@@ -4005,6 +4108,8 @@ pub async fn list_chat_slash_commands(
         // model, so they mean nothing sent over the app-server protocol
         // Codemux drives.
         ProviderKind::Codex => Ok(Vec::new()),
+        // Hermes owns its native skills; there is no slash catalogue to serve.
+        ProviderKind::Hermes => Ok(Vec::new()),
     }
 }
 
@@ -4644,6 +4749,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         "codex" => ProviderKind::Codex,
         "cursor" => ProviderKind::Cursor,
         "grok" => ProviderKind::Grok,
+        "hermes" => ProviderKind::Hermes,
         "opencode" => ProviderKind::OpenCode,
         other => return Err(format!("unsupported_provider: {other}")),
     };
@@ -4767,6 +4873,12 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     db: State<'_, DatabaseStore>,
     thread_id: String,
 ) -> Result<(), String> {
+    if db.hermes_binding(&thread_id)?.is_some() {
+        let registry: State<'_, ProviderRegistry> = app.state();
+        if let Some(provider) = registry.get(ProviderKind::Hermes).await {
+            provider.stop_session(ThreadId(thread_id.clone())).await.map_err(|e| e.to_string())?;
+        }
+    }
     // Best-effort: drop the thread's on-disk image directory alongside the
     // DB rows. The messages cascade via FK, but the image files live
     // outside SQLite, so nothing else would ever reclaim them. A failure
@@ -7237,6 +7349,24 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn hermes_stop_during_lazy_resume_prevents_later_dispatch() {
+        let gate = hermes_send_gate("hermes-pending-send-test");
+        let pending_generation = gate.cancelled.load(Ordering::SeqCst);
+        // The send is awaiting an unrelated foreground approval during resume.
+        gate.cancelled.fetch_add(1, Ordering::SeqCst);
+        assert!(gate.before_dispatch(pending_generation).await.is_err());
+        // An explicit new send after Stop is allowed; another profile is independent.
+        assert!(gate.before_dispatch(gate.cancelled.load(Ordering::SeqCst)).await.is_ok());
+        assert!(hermes_send_gate("hermes-independent-send-test").before_dispatch(0).await.is_ok());
+        // Stop must order behind an enqueue that has already committed to dispatch.
+        let dispatch = gate.before_dispatch(gate.cancelled.load(Ordering::SeqCst)).await.unwrap();
+        gate.cancelled.fetch_add(1, Ordering::SeqCst);
+        assert!(gate.dispatch.try_lock().is_err());
+        drop(dispatch);
+        assert!(gate.dispatch.try_lock().is_ok());
+    }
 
     /// The losing client parses this string to explain who owns the pane,
     /// so the shape (and the lowercase provider kind) is a contract.
