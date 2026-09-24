@@ -163,6 +163,7 @@ export const onSyncStateChanged = (
 // is identical on both transports.
 
 export type ApprovalDecision =
+  | { decision: "provider_option"; option_id: string }
   | {
       decision: "allow";
       updated_input?: unknown;

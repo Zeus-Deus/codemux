@@ -1,6 +1,7 @@
 import { MobileInstall } from "@/components/mobile/mobile-install";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { HermesSetting } from "./hermes-setting";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
@@ -2002,6 +2003,7 @@ export function SettingsView() {
                 description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
               >
                 <UtilityAgentSetting />
+                <HermesSetting />
               </SettingRow>
               <Separator />
               <SettingRow

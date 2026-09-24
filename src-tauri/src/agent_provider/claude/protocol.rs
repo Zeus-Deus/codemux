@@ -199,7 +199,7 @@ impl From<ApprovalDecision> for SidecarDecision {
                 message: Some(message),
                 interrupt: None,
             },
-            ApprovalDecision::Cancel => Self {
+            ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => Self {
                 behavior: "deny".into(),
                 updated_input: None,
                 updated_permissions: None,

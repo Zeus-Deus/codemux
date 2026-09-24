@@ -63,6 +63,7 @@ import {
   useAgentChatStore,
 } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
+import { useHermes } from "@/stores/hermes-store";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -126,6 +127,22 @@ afterEach(() => {
 });
 
 describe("useAgentChatSessionActions — handleNewChat", () => {
+  it("carries the restored Hermes profile into an explicitly new conversation", async () => {
+    const profile = {schema_version:1,host:"local",installation:"/official/hermes",root:"/test",id:"coder",home:"/test/profiles/coder",identity:"synthetic"};
+    const restore = vi.spyOn(useHermes.getState(), "restore").mockImplementation(async () => {
+      useHermes.setState({selections:{"thread-old":profile}});
+    });
+    try {
+      const { result } = renderHook(() => useAgentChatSessionActions(makePane({provider:"hermes"})));
+      await result.current.handleNewChat();
+      const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(provider).toBe("hermes");
+      expect(input.thread_id).not.toBe("thread-old");
+      expect(input.extra).toEqual({hermes_profile:profile});
+      expect(useHermes.getState().selections[input.thread_id]).toEqual(profile);
+      expect(input.permission_mode).toBeNull();
+    } finally { restore.mockRestore(); }
+  });
   it("starts the session in bypassPermissions, never null", async () => {
     const { result } = renderHook(() =>
       useAgentChatSessionActions(makePane()),
@@ -186,6 +203,17 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
 });
 
 describe("useAgentChatSessionActions — handleSelect (resume)", () => {
+  it("reopens Hermes history using its original durable binding identity", async () => {
+    const { result } = renderHook(() => useAgentChatSessionActions(makePane({provider:"hermes"})));
+    const record = makeRecord({provider:"hermes",model:"profile_default"});
+    await result.current.handleSelect(record);
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("hermes");
+    expect(input.thread_id).toBe(record.thread_id);
+    expect(input.resume_cursor).toEqual({resume:record.sdk_session_id});
+    expect(input.permission_mode).toBeNull();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
   it("uses the selected record's provider for its model and native cursor", async () => {
     const record = makeRecord({
       provider: "grok",

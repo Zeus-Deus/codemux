@@ -1,3 +1,4 @@
+import { HermesPermissionOptions, isHermesPermission } from "./HermesPermissionOptions";
 import { memo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -45,6 +46,8 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
       </div>
     );
   }
+
+  if (isHermesPermission(item.payload)) return <HermesPermissionOptions payload={item.payload} onDecide={onDecide} />;
 
   const toolName = readToolName(item.payload);
   const toolInput = readToolInput(item.payload);
@@ -141,6 +144,8 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
 
 function resolvedLabel(decision: ApprovalDecision): string {
   switch (decision.decision) {
+    case "provider_option":
+      return `Hermes permission: ${decision.option_id}`;
     case "allow":
       return "Allowed";
     case "allow_for_session":

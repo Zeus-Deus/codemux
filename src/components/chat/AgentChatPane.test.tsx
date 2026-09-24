@@ -98,6 +98,7 @@ vi.mock("./ChatHomeLanding", () => ({
 vi.mock("./ChatTranscript", () => ({
   ChatTranscript: ({
     messages,
+    streaming,
     sessionStartedAt,
     sendAnchor,
     threadKey,
@@ -108,6 +109,7 @@ vi.mock("./ChatTranscript", () => ({
     onSendQueuedNow,
   }: {
     messages: unknown[];
+    streaming?: boolean;
     sessionStartedAt?: number;
     sendAnchor?: { clientNonce: string; nonce: number } | null;
     threadKey?: string | null;
@@ -119,6 +121,7 @@ vi.mock("./ChatTranscript", () => ({
   }) => (
     <div
       data-testid="transcript"
+      data-streaming={String(streaming ?? false)}
       data-message-count={messages.length}
       // The new-turn scroll contract's navigation intent. Empty string
       // encodes "no anchor" (nothing reserved / rolled back).
@@ -1094,6 +1097,15 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     });
     expect(anchorClientNonce(container)).not.toBe("");
     expect(anchorNonce(container)).toBe("1");
+  });
+
+  it("settles the optimistic spinner when a profile queues an otherwise idle chat", async () => {
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendTurn).mockResolvedValue({turn_id:"", queued_id:"profile-queue"});
+    const { container } = render(<AgentChatPane pane={{...pane,provider:"hermes"}} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(agentChatSendTurn).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(container.querySelector('[data-testid="transcript"]')).toHaveAttribute("data-streaming", "false"));
   });
 
   it("gives the one-click Continue run the same contract", async () => {

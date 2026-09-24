@@ -568,3 +568,5 @@ pub fn kill_port(port: u16) -> Result<(), String> {
         Err(format!("Failed to kill PID {pid}: {stderr}"))
     }
 }
+
+pub mod hermes;

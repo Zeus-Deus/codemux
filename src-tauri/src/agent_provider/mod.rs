@@ -18,6 +18,7 @@ pub mod errors;
 pub mod events;
 pub mod grok;
 pub mod health;
+pub mod hermes;
 pub mod instance;
 pub mod opencode;
 pub mod pricing;
@@ -26,7 +27,6 @@ pub mod types;
 
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
-pub use health::{ProviderHealthReport, ProviderHealthStatus};
 pub use events::{
     child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot, CostSource,
     PlanAuthMode, PlanUsageWindow, PlanWindowKind, ProviderRuntimeEvent, RequestResponseFailureReason, SubagentSnapshot, SubagentStatus,
@@ -34,6 +34,7 @@ pub use events::{
     UserMessageImage, WorkflowPhaseSnapshot, WorkflowSnapshot, CHILD_EXITED_SUBTYPE,
     WATCH_LOOP_TASK_TYPES,
 };
+pub use health::{ProviderHealthReport, ProviderHealthStatus};
 pub use instance::ProviderInstanceId;
 pub use provider::{AgentProvider, ProviderEventStream};
 pub use types::{

@@ -1,3 +1,4 @@
+import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
 import { memo, useEffect, useRef, useState } from "react";
 import {
   Check,
@@ -71,7 +72,7 @@ export const ToolCallCard = memo(function ToolCallCard({
   const isResponding = resolution?.state === "responding";
   const isRequestFailed = resolution?.state === "failed";
   const isDenied =
-    resolution?.state === "resolved" && resolution.decision.decision !== "allow";
+    resolution?.state === "resolved" && resolution.decision.decision !== "allow" && resolution.decision.decision !== "allow_for_session" && !(resolution.decision.decision === "provider_option" && hermesPermissionAllowed(approval?.payload, resolution.decision.option_id));
   const isExecuting =
     !isPendingApproval &&
     !isResponding &&
@@ -149,6 +150,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           )}
         >
           <ToolCallStatus item={item} />
+          {item.status === "unconfirmed" && <span className="ml-2 text-xs text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
         </div>
         {glyph && (
           <glyph.Icon
@@ -176,14 +178,14 @@ export const ToolCallCard = memo(function ToolCallCard({
           a fresh approval (different request_id) remounts the footer
           and clears the deny textarea / dropdown state — otherwise
           stale text from a prior denial leaks into the next prompt. */}
-      {isPendingApproval && approval && (
+      {isPendingApproval && approval && (isHermesPermission(approval.payload) ? <HermesPermissionOptions key={approval.request_id} payload={approval.payload} onDecide={onDecide} /> : (
         <ApprovalFooter
           key={approval.request_id}
           inputText={inputText}
           onDecide={onDecide}
           toolName={item.tool_name}
         />
-      )}
+      ))}
 
       {/* In-flight decision marker */}
       {isResponding && (
@@ -420,6 +422,8 @@ function glyphForState(states: {
 
 function denialLabel(decision: ApprovalDecision): string {
   switch (decision.decision) {
+    case "provider_option":
+      return `Hermes permission: ${decision.option_id}`;
     case "deny":
       return `Denied${decision.message ? `: ${decision.message}` : ""}`;
     case "cancel":

@@ -104,6 +104,7 @@ const INTENT_REHARVEST_INTERVAL_MS: Partial<
 > = {
   cursor: CURSOR_CAPABILITY_REFRESH_MS,
   grok: GROK_CAPABILITY_REFRESH_MS,
+  hermes: Infinity,
 };
 export const PROVIDER_CAPABILITIES_STORAGE_KEY =
   "codemux:provider-capabilities:v1";
@@ -123,6 +124,7 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
       opencodeError: null,
       loadedProviders: {},
       refresh: (provider) => {
+        if (provider === "hermes") return Promise.resolve();
         const existing = providerRefreshInFlight.get(provider);
         if (existing) return existing;
 
@@ -288,6 +290,8 @@ export function selectCapabilities(
       return state.codex;
     case "cursor":
       return state.cursor;
+    case "hermes":
+      return null; // Hermes catalogs are profile-scoped, never a singleton.
     case "grok":
       return state.grok;
     case "opencode":
@@ -307,6 +311,8 @@ export function selectError(
       return state.codexError;
     case "cursor":
       return state.cursorError;
+    case "hermes":
+      return null;
     case "grok":
       return state.grokError;
     case "opencode":

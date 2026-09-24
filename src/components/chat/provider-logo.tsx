@@ -17,6 +17,7 @@ const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   codex: codexIcon,
   cursor: cursorIcon,
   grok: grokIcon,
+  hermes: new URL("../../assets/preset-icons/hermes.svg", import.meta.url).href,
   opencode: opencodeIcon,
 };
 
@@ -25,6 +26,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  hermes: "Hermes",
   opencode: "OpenCode",
 };
 

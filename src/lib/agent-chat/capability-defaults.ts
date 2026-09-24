@@ -26,6 +26,7 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> 
   // means "leave ACP on its provider-native default" until that catalogue
   // hydrates, so new Grok releases never require a Codemux update.
   grok: "default",
+  hermes: "profile_default",
   // Step 12 Stage 1 placeholder. OpenCode capabilities are harvested
   // live in Stage 2 and effectively zero out this fallback once the
   // store hydrates; the slug here follows OpenCode's own
@@ -53,6 +54,7 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
   codex: "danger-full-access",
   cursor: "agent",
   grok: "agent",
+  hermes: null,
   opencode: null,
 };
 
@@ -100,6 +102,7 @@ const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
   codex: false,
   cursor: false,
   grok: false,
+  hermes: false,
   opencode: true,
 };
 

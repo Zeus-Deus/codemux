@@ -111,7 +111,9 @@ pub fn approval_decision_to_permission_reply(decision: &ApprovalDecision) -> Per
         ApprovalDecision::Allow { .. } => PermissionReply::Once,
         ApprovalDecision::AllowForSession => PermissionReply::Always,
         ApprovalDecision::Deny { .. } => PermissionReply::Reject,
-        ApprovalDecision::Cancel => PermissionReply::Reject,
+        ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => {
+            PermissionReply::Reject
+        }
     }
 }
 
