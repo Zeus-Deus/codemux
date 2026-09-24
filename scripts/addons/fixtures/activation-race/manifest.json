@@ -1,0 +1,33 @@
+{
+  "format": "codemux.feature-plugin",
+  "manifestVersion": 1,
+  "id": "example.activation-race",
+  "name": "Activation Race Fixture",
+  "description": "CI-only slow activation used to verify removal while a native add-on host is starting.",
+  "version": "1.0.0",
+  "api": "^1.0.0",
+  "entry": "plugin.js",
+  "platforms": ["linux-x64", "windows-x64"],
+  "author": {
+    "name": "CodeMux CI",
+    "url": "https://codemux.org"
+  },
+  "repository": "https://github.com/Zeus-Deus/codemux",
+  "license": "MIT",
+  "permissions": ["composer.append"],
+  "http": [],
+  "credentials": [],
+  "settings": [],
+  "contributes": {
+    "commands": [
+      {
+        "id": "append",
+        "title": "CI slow activation append",
+        "requiresWorkspace": true
+      }
+    ],
+    "panels": [],
+    "composerActions": [],
+    "composerViews": []
+  }
+}

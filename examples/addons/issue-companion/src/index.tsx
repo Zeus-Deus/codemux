@@ -7,12 +7,26 @@ import {
   Select,
   useEffect,
   useState,
+  PluginError,
   type ViewProps,
   type ContextHandle,
 } from "@codemux/plugin-sdk";
 type Issue = { number: number; title: string; html_url: string };
+const describe = (error: unknown) =>
+  error instanceof Error ? error.message : "Issue Companion is unavailable";
+// GitHub reports when a limit resets in seconds, either relative or absolute.
+function retryHint(headers: Record<string, string>) {
+  const retry = Number(headers["retry-after"]) * 1000;
+  const reset = Number(headers["x-ratelimit-reset"]) * 1000 - Date.now();
+  const wait = retry > 0 ? retry : reset > 0 ? reset : 0;
+  if (!wait) return "Wait before refreshing";
+  const minutes = Math.ceil(wait / 60000);
+  return `Try again in about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
 export default definePlugin({
   activate(ctx) {
+    // Notifications are limited to three per minute; a rejected one is dropped.
+    const notify = (text: string) => ctx.ui.notify(text).catch(() => {});
     async function fetchIssues(context: ContextHandle): Promise<Issue[]> {
       const settings = await ctx.settings.get();
       const owner = settings.owner,
@@ -26,23 +40,47 @@ export default definePlugin({
         throw new Error(
           "Configure a repository owner and name in Add-ons settings.",
         );
-      const response = await ctx.http.fetch(context, {
-        origin: "https://api.github.com",
-        path: `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=open&per_page=50`,
-        method: "GET",
-        headers: { Accept: "application/vnd.github+json" },
-      });
+      let response;
+      try {
+        // Twenty issues keep typical responses well below the 512 KiB limit.
+        response = await ctx.http.fetch(context, {
+          origin: "https://api.github.com",
+          path: `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=open&per_page=20`,
+          method: "GET",
+          headers: { Accept: "application/vnd.github+json" },
+        });
+      } catch (error) {
+        if (
+          error instanceof PluginError &&
+          error.code === "CREDENTIAL_REQUIRED"
+        )
+          throw new Error(
+            "The saved GitHub token cannot be read. Unlock the system keyring or enter the token again in Add-ons settings.",
+          );
+        if (error instanceof PluginError && error.code === "RESOURCE_LIMIT")
+          throw new Error(
+            `Issues could not be loaded within add-on limits (${error.message}). Try again shortly.`,
+          );
+        throw error;
+      }
       if (response.status === 401)
         throw new Error(
           "GitHub did not accept the configured credential. Update it in Add-ons settings.",
         );
+      // GitHub signals primary and secondary rate limits with 429, or with 403
+      // plus an exhausted quota or a retry-after header.
       if (
         response.status === 429 ||
         (response.status === 403 &&
-          response.headers["x-ratelimit-remaining"] === "0")
+          (response.headers["x-ratelimit-remaining"] === "0" ||
+            response.headers["retry-after"] !== undefined))
       )
         throw new Error(
-          "GitHub rate limit reached. Wait before refreshing or configure a token.",
+          `GitHub rate limit reached. ${retryHint(response.headers)}, or configure a token for a higher limit.`,
+        );
+      if (response.status === 403)
+        throw new Error(
+          "GitHub denied access to this repository. Check that the configured token may read it, or remove the token to use public access.",
         );
       if (response.status === 404)
         throw new Error(
@@ -67,7 +105,7 @@ export default definePlugin({
             typeof item.html_url === "string" &&
             item.html_url.startsWith("https://github.com/"),
         )
-        .slice(0, 50);
+        .slice(0, 20);
     }
     function Issues({ context }: ViewProps) {
       const [issues, setIssues] = useState<Issue[]>([]),
@@ -84,7 +122,7 @@ export default definePlugin({
             }
           })
           .catch((e) => {
-            if (live) setError(e.message);
+            if (live) setError(describe(e));
           })
           .finally(() => {
             if (live) setLoading(false);
@@ -172,13 +210,21 @@ export default definePlugin({
         </Stack>
       );
     }
-    ctx.commands.register("open", (context) =>
-      ctx.panels.open("issues", context),
-    );
+    ctx.commands.register("open", async (context) => {
+      try {
+        await ctx.panels.open("issues", context);
+      } catch (error) {
+        await notify(describe(error));
+      }
+    });
     ctx.panels.register("issues", (props) => <Issues {...props} />);
-    ctx.composerActions.register("browse", (context) =>
-      ctx.composerViews.open("issues", context),
-    );
+    ctx.composerActions.register("browse", async (context) => {
+      try {
+        await ctx.composerViews.open("issues", context);
+      } catch (error) {
+        await notify(describe(error));
+      }
+    });
     ctx.composerViews.register("issues", (props) => <Issues {...props} />);
   },
 });

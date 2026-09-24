@@ -5,6 +5,14 @@ on:
   push:
     branches: [main]
     paths: ['catalog/addons/**']
+  # Merging only validates. Publishing a revision is a separate maintainer
+  # dispatch on main, approved through the addon-catalog environment.
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Catalog revision to publish; must equal the revision in catalog/addons/catalog-v1.json on main
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
@@ -25,20 +33,39 @@ jobs:
       - name: Check accepted history and inert release provenance
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # Read-only token for the validator's GitHub API provenance lookups,
+          # which would otherwise share the anonymous per-IP rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if git show "$BASE_SHA:catalog/addons/catalog-v1.json" > /tmp/previous-catalog.json 2>/dev/null; then
-            cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json /tmp/previous-catalog.json
-          else
-            cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json
+          previous=()
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            # A publication must succeed the newest revision already published.
+            published=$(gh release list --limit 1000 --json tagName --jq '[.[].tagName | select(test("^addons-catalog-r[0-9]+$")) | ltrimstr("addons-catalog-r") | tonumber] | max // empty')
+            if [ -n "$published" ]; then
+              gh release download "addons-catalog-r$published" --pattern catalog-v1.json --output /tmp/previous-catalog.json
+              previous=(/tmp/previous-catalog.json)
+            fi
+          elif [ -n "$BASE_SHA" ] && git show "$BASE_SHA:catalog/addons/catalog-v1.json" > /tmp/previous-catalog.json 2>/dev/null; then
+            previous=(/tmp/previous-catalog.json)
           fi
+          cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json "${previous[@]}"
       - uses: actions/upload-artifact@v4
         with:
           name: reviewed-addon-catalog
           path: catalog/addons/catalog-v1.json
   publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Never runs for a pull request or merge; only an explicit dispatch on main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-22.04
+    # Configure required reviewers for this environment in the repository
+    # settings so that a dispatch alone cannot publish.
+    environment: addon-catalog
+    concurrency:
+      group: addon-catalog-publish
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -49,15 +76,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          REQUESTED_REVISION: ${{ inputs.revision }}
         run: |
           revision=$(jq -er '.revision' catalog-v1.json)
+          if [ "$revision" != "$REQUESTED_REVISION" ]; then
+            echo "::error::main contains catalog revision $revision, not the requested revision $REQUESTED_REVISION"
+            exit 1
+          fi
           tag="addons-catalog-r$revision"
           sha256sum catalog-v1.json > catalog-v1.json.sha256
+          # The desktop updater, install.sh and hosted-client deploys all read
+          # the repository's Latest release, which must stay a desktop v* release.
+          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          if [[ ! $latest =~ ^v[0-9] ]]; then
+            echo "::error::The Latest release is $latest, not a desktop release; refusing to publish"
+            exit 1
+          fi
           # Existing tags are never overwritten, even on workflow reruns.
           if gh release view "$tag" >/dev/null 2>&1; then
             mkdir accepted
             gh release download "$tag" --pattern catalog-v1.json --dir accepted
             cmp catalog-v1.json accepted/catalog-v1.json
           else
-            gh release create "$tag" catalog-v1.json catalog-v1.json.sha256 --target "$GITHUB_SHA" --title "Add-on catalog revision $revision" --notes "Reviewed feature add-on catalog. Package releases remain independent of the desktop app."
+            gh release create "$tag" catalog-v1.json catalog-v1.json.sha256 --target "$GITHUB_SHA" --latest=false --title "Add-on catalog revision $revision" --notes "Reviewed feature add-on catalog. Package releases remain independent of the desktop app."
+          fi
+          after=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          # A desktop release published meanwhile rightly takes Latest; restore
+          # only when Latest moved to the catalog or another non-desktop release.
+          if [[ ! $after =~ ^v[0-9] ]]; then
+            gh release edit "$latest" --latest
+            echo "::error::Publishing $tag changed the Latest release to $after; restored $latest"
+            exit 1
           fi

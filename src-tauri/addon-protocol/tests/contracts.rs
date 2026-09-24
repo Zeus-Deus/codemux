@@ -1,16 +1,137 @@
 use codemux_addon_protocol::{
+    catalog::Catalog,
     limits::{self, RateLimit},
     manifest::Platform,
     wire::{read_frame, Envelope},
-    Manifest,
+    ErrorCode, Manifest,
 };
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::{
     io::{BufReader, Cursor},
+    path::Path,
     time::{Duration, Instant},
 };
 fn fixture() -> serde_json::Value {
     serde_json::from_str(include_str!("../fixtures/hello.json")).unwrap()
+}
+fn parent<'a>(manifest: &'a mut Value, pointer: &str) -> (&'a mut Map<String, Value>, String) {
+    let (parent, key) = pointer.rsplit_once('/').unwrap();
+    let parent = manifest.pointer_mut(parent).and_then(Value::as_object_mut);
+    (parent.unwrap(), key.into())
+}
+/// Shared accept/reject cases for every manifest validator. A case replaces
+/// `base` with `manifest` or edits it: `set` inserts values at object paths and
+/// `remove` deletes keys. `error` is the desktop's message, or null when valid.
+#[test]
+fn shared_manifest_cases_match_the_desktop_validator() {
+    let cases: Value =
+        serde_json::from_str(include_str!("../fixtures/manifest-cases.json")).unwrap();
+    assert_eq!(cases["base"], "hello.json");
+    for case in cases["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let mut manifest = case.get("manifest").cloned().unwrap_or_else(fixture);
+        let set = case.get("set").and_then(Value::as_object);
+        for (pointer, value) in set.into_iter().flatten() {
+            let (object, key) = parent(&mut manifest, pointer);
+            object.insert(key, value.clone());
+        }
+        let remove = case.get("remove").and_then(Value::as_array);
+        for pointer in remove.into_iter().flatten() {
+            let (object, key) = parent(&mut manifest, pointer.as_str().unwrap());
+            assert!(object.remove(&key).is_some(), "{name}");
+        }
+        let result = Manifest::parse(&serde_json::to_vec(&manifest).unwrap(), None);
+        assert_eq!(
+            result.err().map(|e| e.message),
+            case["error"].as_str().map(String::from),
+            "{name}"
+        );
+    }
+}
+#[test]
+fn manifest_size_api_and_platform_are_checked_before_use() {
+    let mut padded = serde_json::to_vec(&fixture()).unwrap();
+    padded.resize(limits::MANIFEST, b' ');
+    assert!(Manifest::parse(&padded, None).is_ok());
+    padded.push(b' ');
+    assert_eq!(
+        Manifest::parse(&padded, None).unwrap_err().message,
+        "Manifest exceeds 64 KiB"
+    );
+    let mut manifest = fixture();
+    manifest["api"] = json!("^2.0.0");
+    let error = Manifest::parse(&serde_json::to_vec(&manifest).unwrap(), None).unwrap_err();
+    assert_eq!(error.data.code, ErrorCode::IncompatibleApi);
+    manifest["api"] = json!("^1.0.0");
+    manifest["platforms"] = json!(["linux-x64"]);
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    assert!(Manifest::parse(&bytes, Some(Platform::LinuxX64)).is_ok());
+    assert_eq!(
+        Manifest::parse(&bytes, Some(Platform::WindowsX64))
+            .unwrap_err()
+            .message,
+        "Unsupported platform"
+    );
+}
+#[test]
+fn published_schemas_are_generated_from_the_rust_contracts() {
+    let manifest = serde_json::to_value(schemars::schema_for!(Manifest)).unwrap();
+    let catalog = serde_json::to_value(schemars::schema_for!(Catalog)).unwrap();
+    for (path, generated) in [
+        ("../../packages/plugin-sdk/schema/manifest.json", &manifest),
+        ("../../packages/plugin-cli/schema/manifest.json", &manifest),
+        ("../../catalog/addons/schema/catalog-v1.json", &catalog),
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let committed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            committed == *generated,
+            "{} is stale; regenerate it with the addon-protocol schema examples",
+            path.display()
+        );
+    }
+}
+/// Shipped v1 desktops reject unknown catalog fields and values, so
+/// catalog-v1.json can never use new ones. Extending this shape needs a new
+/// catalog file (see catalog/addons/README.md), not an edit to this list.
+#[test]
+fn catalog_v1_fields_and_values_are_pinned() {
+    let schema = serde_json::to_value(schemars::schema_for!(Catalog)).unwrap();
+    let keys = |definition: &Value| {
+        let properties = definition["properties"].as_object();
+        properties.map(|p| json!(p.keys().collect::<Vec<_>>()))
+    };
+    let mut shape = Map::new();
+    shape.insert("Catalog".into(), keys(&schema).unwrap());
+    for (name, definition) in schema["definitions"].as_object().unwrap() {
+        let value = keys(definition).or_else(|| definition.get("enum").cloned());
+        shape.insert(name.clone(), value.unwrap());
+    }
+    assert_eq!(
+        Value::Object(shape),
+        json!({
+            "Catalog": ["blocked", "generatedAt", "plugins", "revision", "schemaVersion"],
+            "Blocked": ["date", "pluginId", "reason", "sha256"],
+            "Capabilities": ["credentials", "http", "permissions"],
+            "Credential": ["id", "label", "origin", "type"],
+            "CredentialType": ["bearer"],
+            "HttpGrant": ["credential", "methods", "origin"],
+            "HttpMethod": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            "Permission": ["workspace.read", "git.read", "composer.append", "external.open"],
+            "Platform": ["linux-x64", "windows-x64"],
+            "Plugin": [
+                "description", "id", "name", "publisher", "readme", "releases", "repository",
+                "tier"
+            ],
+            "Release": [
+                "api", "capabilities", "compressedBytes", "downloadUrl", "license", "platforms",
+                "publishedAt", "sha256", "sourceCommit", "version"
+            ],
+            "Tier": ["official", "community"],
+        }),
+        "catalog-v1.json must stay readable by shipped v1 desktops; publish new fields or values in a new catalog file"
+    );
 }
 #[test]
 fn rejects_unknown_capabilities_and_invalid_declarations() {
@@ -61,6 +182,14 @@ fn direction_generation_and_response_shape_are_enforced() {
     assert!(Envelope::parse(&bytes, Some("current"), true).is_ok());
     assert!(Envelope::parse(&bytes, Some("stale"), true).is_err());
     assert!(Envelope::parse(&bytes, Some("current"), false).is_err());
+    let acknowledgement = serde_json::to_vec(&json!({
+        "jsonrpc":"2.0", "generation":"current", "id":2, "method":"ui.ack",
+        "params":{"viewId":"view", "revision":1}
+    }))
+    .unwrap();
+    assert!(Envelope::parse(&acknowledgement, Some("current"), false).is_ok());
+    assert!(Envelope::parse(&acknowledgement, Some("current"), true).is_err());
+    assert!(Envelope::parse(&acknowledgement, Some("stale"), false).is_err());
     for extra in [
         json!({"result":null}),
         json!({"id":"1"}),

@@ -1,8 +1,11 @@
 //! Validate the entire Remote DOM batch before committing a normalized tree.
-use crate::{limits, ProtocolError};
+use crate::{limits, ErrorCode, ProtocolError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::{Duration, Instant},
+};
 type Result<T> = std::result::Result<T, ProtocolError>;
 fn invalid() -> ProtocolError {
     ProtocolError::invalid("Invalid plugin UI")
@@ -135,11 +138,41 @@ fn property(key: &str, v: &Value) -> bool {
 }
 impl Tree {
     pub fn apply(&mut self, records: &[Value]) -> Result<()> {
+        self.apply_within(records, limits::CALLBACKS)
+    }
+    /// Applies a batch only if the committed tree holds at most `callbacks`
+    /// live callbacks: the remainder of the plugin-wide budget for this view.
+    pub fn apply_within(&mut self, records: &[Value], callbacks: usize) -> Result<()> {
+        self.apply_started(records, Instant::now(), callbacks)
+    }
+    fn apply_started(
+        &mut self,
+        records: &[Value],
+        started: Instant,
+        allowed_callbacks: usize,
+    ) -> Result<()> {
+        let budget = || {
+            if started.elapsed() > Duration::from_millis(50) {
+                Err(ProtocolError::new(
+                    ErrorCode::ResourceLimit,
+                    "Plugin UI validation budget exceeded",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        budget()?;
         if records.len() > limits::MUTATIONS {
             return Err(invalid());
         }
         let mut candidate = self.clone();
+        // Content-only updates cannot change callbacks; every structural or
+        // listener change revalidates the candidate and recounts them.
+        let mut callbacks = candidate.validate_counted()?;
+        let mut bytes = serde_json::to_vec(&candidate).map_err(|_| invalid())?.len();
         for record in records {
+            budget()?;
+            let mut content_only = false;
             let r = record.as_array().ok_or_else(invalid)?;
             let kind = r.first().and_then(Value::as_u64).ok_or_else(invalid)?;
             let id = r.get(1).and_then(Value::as_str).ok_or_else(invalid)?;
@@ -171,7 +204,13 @@ impl Tree {
                     if ![3, 8].contains(&node.kind) {
                         return Err(invalid());
                     }
-                    node.data = Some(r[2].as_str().ok_or_else(invalid)?.into());
+                    if !string(&r[2], 32768) {
+                        return Err(invalid());
+                    }
+                    let next = r[2].as_str().ok_or_else(invalid)?;
+                    bytes = bytes - json_len(&node.data)? + json_len(&next)?;
+                    node.data = Some(next.into());
+                    content_only = true;
                 }
                 3 if r.len() == 4 || r.len() == 5 => {
                     let node = find_mut(&mut candidate.children, id).ok_or_else(invalid)?;
@@ -179,13 +218,24 @@ impl Tree {
                         return Err(invalid());
                     }
                     let key = r[2].as_str().ok_or_else(invalid)?.to_string();
-                    let target = match r.get(4).and_then(Value::as_u64).unwrap_or(1) {
+                    let mutation_kind = match r.get(4) {
+                        None => 1,
+                        Some(value) => value.as_u64().ok_or_else(invalid)?,
+                    };
+                    let target = match mutation_kind {
                         1 if property(&key, &r[3]) => &mut node.properties,
                         3 if matches!(key.as_str(), "press" | "change") => {
                             &mut node.event_listeners
                         }
                         _ => return Err(invalid()),
                     };
+                    // Ordinary properties cannot change node/callback identity.
+                    // Account for the exact JSON key/value and comma delta rather
+                    // than serializing unrelated rows/text after every update.
+                    if mutation_kind == 1 {
+                        bytes = object_update_bytes(bytes, target, &key, &r[3])?;
+                        content_only = true;
+                    }
                     if r[3].is_null() {
                         target.remove(&key);
                     } else {
@@ -195,12 +245,30 @@ impl Tree {
                 _ => return Err(invalid()),
             }
             // Bound growth during the batch, as well as the final committed state.
-            candidate.validate()?;
+            if content_only {
+                if bytes > limits::TREE {
+                    return Err(invalid());
+                }
+            } else {
+                callbacks = candidate.validate_counted()?;
+                bytes = serde_json::to_vec(&candidate).map_err(|_| invalid())?.len();
+            }
+            budget()?;
+        }
+        budget()?;
+        if callbacks > allowed_callbacks {
+            return Err(ProtocolError::new(
+                ErrorCode::ResourceLimit,
+                "Plugin callback limit exceeded",
+            ));
         }
         *self = candidate;
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_counted().map(|_| ())
+    }
+    fn validate_counted(&self) -> Result<usize> {
         let mut ids = HashSet::new();
         let mut callbacks = HashSet::new();
         for node in &self.children {
@@ -209,12 +277,90 @@ impl Tree {
         if serde_json::to_vec(self).map_err(|_| invalid())?.len() > limits::TREE {
             return Err(invalid());
         }
-        Ok(())
+        Ok(callbacks.len())
+    }
+    /// Live callback IDs in this validated tree.
+    pub fn callback_count(&self) -> usize {
+        fn count(nodes: &[Node]) -> usize {
+            nodes
+                .iter()
+                .map(|n| n.event_listeners.len() + count(&n.children))
+                .sum()
+        }
+        count(&self.children)
     }
     pub fn callback(&self, node_id: &str, event: &str, callback_id: &str) -> bool {
         find(&self.children, node_id)
             .and_then(|n| n.event_listeners.get(event))
             .is_some_and(|v| v["callbackId"].as_str() == Some(callback_id))
+    }
+}
+fn json_len(value: &impl Serialize) -> Result<usize> {
+    Ok(serde_json::to_vec(value).map_err(|_| invalid())?.len())
+}
+fn object_update_bytes(
+    total: usize,
+    object: &BTreeMap<String, Value>,
+    key: &str,
+    value: &Value,
+) -> Result<usize> {
+    match (object.get(key), value.is_null()) {
+        (Some(old), false) => Ok(total - json_len(old)? + json_len(value)?),
+        (Some(old), true) => {
+            Ok(total - json_len(&key)? - 1 - json_len(old)? - usize::from(object.len() > 1))
+        }
+        (None, false) => {
+            Ok(total + json_len(&key)? + 1 + json_len(value)? + usize::from(!object.is_empty()))
+        }
+        (None, true) => Ok(total),
+    }
+}
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn incremental_property_sizes_match_actual_json_for_insert_replace_and_remove() {
+        for initial in [
+            BTreeMap::new(),
+            BTreeMap::from([("label".to_string(), serde_json::json!("old"))]),
+            BTreeMap::from([
+                ("label".to_string(), serde_json::json!("old")),
+                ("title".into(), serde_json::json!("retained")),
+            ]),
+        ] {
+            for key in ["label", "new\"key"] {
+                for value in [
+                    serde_json::json!("escaped\n雪\""),
+                    serde_json::json!(["first", "second"]),
+                    Value::Null,
+                ] {
+                    let expected = object_update_bytes(
+                        100 + json_len(&initial).unwrap(),
+                        &initial,
+                        key,
+                        &value,
+                    )
+                    .unwrap();
+                    let mut changed = initial.clone();
+                    if value.is_null() {
+                        changed.remove(key);
+                    } else {
+                        changed.insert(key.into(), value);
+                    }
+                    assert_eq!(expected, 100 + json_len(&changed).unwrap());
+                }
+            }
+        }
+    }
+    #[test]
+    fn exhausted_budget_cannot_commit_any_mutation() {
+        let mut tree = Tree::default();
+        let expired = Instant::now() - Duration::from_millis(51);
+        let error = tree
+            .apply_started(&[], expired, limits::CALLBACKS)
+            .unwrap_err();
+        assert_eq!(error.data.code, ErrorCode::ResourceLimit);
+        assert!(tree.children.is_empty());
     }
 }
 fn validate_node<'a>(

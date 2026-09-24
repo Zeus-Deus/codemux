@@ -1037,6 +1037,15 @@ describe("Default base branch", () => {
 
     const dialog = await screen.findByRole("dialog");
 
+    // The dialog focuses the prompt on a 100ms timer, and that focus move
+    // dismisses an open popover. Wait for it so it can't close the picker
+    // between opening it and clicking a row on a slow runner.
+    await waitFor(() => {
+      expect(
+        within(dialog).getByPlaceholderText("What do you want to do?"),
+      ).toHaveFocus();
+    });
+
     // Open the pill and pick `feature-x`
     const pillButton = within(dialog).getByText("main").closest("button")!;
     fireEvent.click(pillButton);

@@ -6,6 +6,8 @@ import type {
 } from "@/lib/addons/types";
 interface AddonsState extends AddonInventory {
   developmentReview: AddonReview | null;
+  revoking: Record<string, number>;
+  hostEpochs: Record<string, number>;
   loaded: boolean;
   ready: boolean;
   contextRevision: number;
@@ -20,9 +22,14 @@ interface AddonsState extends AddonInventory {
 }
 export const useAddonsStore = create<AddonsState>(() => ({
   developmentReview: null,
+  revoking: {},
+  hostEpochs: {},
   paused: false,
   installed: [],
   error: null,
+  credentialStates: {},
+  registryError: null,
+  interruptedActivations: [],
   loaded: false,
   ready: false,
   contextRevision: 0,
@@ -39,4 +46,22 @@ export function clearAddonContext() {
     accessory: null,
     contextRevision: s.contextRevision + 1,
   }));
+}
+
+/** Fence frontend effects synchronously when the user starts a stop operation. */
+export function beginAddonRevocation(id: string) {
+  useAddonsStore.setState((s) => ({
+    revoking: { ...s.revoking, [id]: (s.revoking[id] ?? 0) + 1 },
+  }));
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    useAddonsStore.setState((s) => {
+      const revoking = { ...s.revoking };
+      if ((revoking[id] ?? 0) <= 1) delete revoking[id];
+      else revoking[id] -= 1;
+      return { revoking };
+    });
+  };
 }

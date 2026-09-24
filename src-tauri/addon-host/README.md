@@ -1,7 +1,8 @@
 # Standalone add-on host
 
 This crate has no Tauri dependency. Build and test it with its own manifest and
-`-j 2`. It accepts JSON-RPC 2.0 over inherited pipes only. Each envelope has a
+`-j 2`. It accepts JSON-RPC 2.0 over inherited pipes only; on Linux it closes
+every other inherited descriptor before it starts. Each envelope has a
 parent-selected generation. It exits when the parent closes stdin.
 
 The first `initialize` carries protocolVersion 1, a validated manifest, a source

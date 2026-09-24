@@ -6,12 +6,24 @@ use crate::addons::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tauri::{ipc::Channel, Manager as _, Runtime, State};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+/// A failed open. `root` is set when the add-on registry itself could not be
+/// opened, which the reset action can recover without a restart.
+struct Failure {
+    error: ProtocolError,
+    root: Option<PathBuf>,
+    cause: String,
+}
 #[derive(Default)]
 pub struct AddonState {
-    manager: Mutex<Option<Result<Arc<Manager>>>>,
+    manager: Mutex<Option<std::result::Result<Arc<Manager>, Failure>>>,
     subscription: Mutex<Option<CancellationToken>>,
     reviews: Arc<addons::lifecycle::Reviews>,
     development: addons::development::Development,
@@ -20,11 +32,32 @@ pub struct AddonState {
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
     paused: bool,
-    installed: Vec<Installation>,
+    installed: Vec<InventoryItem>,
     error: Option<String>,
     warnings: Vec<String>,
     developer_mode: bool,
     development_package: Option<String>,
+    /// Plugin ID -> declared credential ID -> state. Never contains a secret.
+    credential_states: HashMap<String, BTreeMap<String, addons::credentials::CredentialState>>,
+    registry_error: Option<RegistryError>,
+    interrupted_activations: Vec<String>,
+}
+/// An installation plus values derived from the running app and the cached
+/// catalog. Nothing here is downloaded or activated to build it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryItem {
+    #[serde(flatten)]
+    installation: Installation,
+    update_available: Option<String>,
+    catalog: Option<addons::catalog::Listing>,
+    compatibility: addons::manager::Compatibility,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryError {
+    path: String,
+    cause: String,
 }
 impl AddonState {
     pub fn get<R: Runtime>(&self, app: &tauri::AppHandle<R>) -> Result<Arc<Manager>> {
@@ -37,12 +70,17 @@ impl AddonState {
         let mut manager = self.manager.lock().unwrap();
         if manager.is_none() {
             let result = (|| {
+                let fail = |error: ProtocolError| Failure {
+                    cause: error.message.clone(),
+                    error,
+                    root: None,
+                };
                 let root = dirs::data_dir()
                     .ok_or_else(|| {
-                        ProtocolError::new(
+                        fail(ProtocolError::new(
                             ErrorCode::StorageUnavailable,
                             "App data directory is unavailable",
-                        )
+                        ))
                     })?
                     .join(crate::APP_DIR_NAME)
                     .join("addons-v1");
@@ -51,19 +89,19 @@ impl AddonState {
                 } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
                     "codemux-addon-host-windows-x64.exe"
                 } else {
-                    return Err(ProtocolError::new(
+                    return Err(fail(ProtocolError::new(
                         ErrorCode::IncompatibleApi,
                         "Add-ons are not supported on this platform",
-                    ));
+                    )));
                 };
                 let host = app
                     .path()
                     .resource_dir()
                     .map_err(|_| {
-                        ProtocolError::new(
+                        fail(ProtocolError::new(
                             ErrorCode::PluginStopped,
                             "App resources are unavailable",
-                        )
+                        ))
                     })?
                     .join("binaries")
                     .join(filename);
@@ -75,11 +113,48 @@ impl AddonState {
                         .join("binaries")
                         .join(filename)
                 };
-                Manager::open(root, host)
+                Manager::open(root.clone(), host).map_err(|cause| Failure {
+                    error: ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        format!(
+                            "The add-on registry at {} could not be opened: {}. Reset it to start with no add-ons; the current files are kept as a backup.",
+                            root.display(),
+                            cause.message.trim_end_matches('.')
+                        ),
+                    ),
+                    root: Some(root),
+                    cause: cause.message,
+                })
             })();
+            if let Ok(opened) = &result {
+                opened.start_catalog_recheck();
+            }
             *manager = Some(result);
         }
-        manager.as_ref().unwrap().clone()
+        match manager.as_ref().unwrap() {
+            Ok(opened) => Ok(opened.clone()),
+            Err(failure) => Err(failure.error.clone()),
+        }
+    }
+    /// Forget a failed open so an explicit user action retries it.
+    fn retry(&self) {
+        let mut manager = self.manager.lock().unwrap();
+        if matches!(manager.as_ref(), Some(Err(_))) {
+            *manager = None;
+        }
+    }
+    fn registry_error(&self) -> Option<RegistryError> {
+        match self.manager.lock().unwrap().as_ref() {
+            Some(Err(Failure {
+                root: Some(root),
+                cause,
+                ..
+            })) => Some(RegistryError {
+                path: root.display().to_string(),
+                cause: cause.clone(),
+            }),
+            _ => None,
+        }
     }
     pub fn existing(&self) -> Option<Arc<Manager>> {
         self.manager
@@ -95,36 +170,100 @@ pub fn addon_inventory<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AddonState>,
 ) -> Inventory {
+    let unavailable = |error: ProtocolError, registry_error| Inventory {
+        developer_mode: false,
+        development_package: None,
+        paused: true,
+        installed: vec![],
+        error: Some(error.message),
+        warnings: vec![],
+        registry_error,
+        interrupted_activations: vec![],
+        credential_states: HashMap::new(),
+    };
     match state.get(&app) {
         Ok(manager) => match manager.list() {
-            Ok(installed) => Inventory {
-                developer_mode: state.development.enabled(),
-                development_package: state.development.package(),
-                paused: manager.paused(),
-                installed,
-                error: None,
-                warnings: manager
+            Ok(installed) => {
+                let mut warnings = manager
                     .cleanup_warnings()
-                    .unwrap_or_else(|error| vec![error.message]),
-            },
-            Err(error) => Inventory {
-                developer_mode: false,
-                development_package: None,
-                paused: true,
-                installed: vec![],
-                error: Some(error.message),
-                warnings: vec![],
-            },
+                    .unwrap_or_else(|error| vec![error.message]);
+                let mut credential_states = HashMap::new();
+                for installation in &installed {
+                    match manager.credential_states(installation) {
+                        Ok(states) => {
+                            credential_states.insert(installation.manifest.id.clone(), states);
+                        }
+                        Err(error) => warnings.push(error.message),
+                    }
+                }
+                warnings.dedup();
+                Inventory {
+                    developer_mode: state.development.enabled(),
+                    development_package: state.development.package(),
+                    paused: manager.paused(),
+                    installed: installed
+                        .into_iter()
+                        .map(|installation| {
+                            let (catalog, update_available) = manager.catalog_status(&installation);
+                            InventoryItem {
+                                compatibility: installation.compatibility(),
+                                installation,
+                                update_available,
+                                catalog,
+                            }
+                        })
+                        .collect(),
+                    error: None,
+                    warnings,
+                    registry_error: None,
+                    interrupted_activations: manager.interrupted_activations(),
+                    credential_states,
+                }
+            }
+            Err(error) => unavailable(error, None),
         },
-        Err(error) => Inventory {
-            developer_mode: false,
-            development_package: None,
-            paused: true,
-            installed: vec![],
-            error: Some(error.message),
-            warnings: vec![],
-        },
+        Err(error) => unavailable(error, state.registry_error()),
     }
+}
+/// Move an unreadable add-on registry aside and open a fresh one without a
+/// restart. Returns the backup folder, which keeps every previous file.
+#[tauri::command]
+pub fn addon_registry_reset<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AddonState>,
+) -> Result<String> {
+    crate::ensure_gui_mode(&app).map_err(|_| {
+        ProtocolError::new(
+            ErrorCode::RemoteUnsupported,
+            "Add-ons are available only in the desktop app",
+        )
+    })?;
+    let backup = {
+        let mut manager = state.manager.lock().unwrap();
+        let Some(Err(Failure {
+            root: Some(root), ..
+        })) = manager.as_ref()
+        else {
+            return Err(ProtocolError::invalid(
+                "The add-on registry has not failed to open; nothing was reset",
+            ));
+        };
+        let backup = Manager::reset_registry(root)?;
+        *manager = None;
+        backup
+    };
+    // The move already happened; never lose where the previous files went.
+    state.get(&app).map_err(|error| {
+        ProtocolError::new(
+            error.data.code,
+            format!(
+                "{} The previous add-on files were moved to {}.",
+                error.message,
+                backup.display()
+            ),
+        )
+    })?;
+    Ok(backup.display().to_string())
 }
 #[tauri::command]
 pub async fn addon_subscribe<R: Runtime>(
@@ -138,13 +277,51 @@ pub async fn addon_subscribe<R: Runtime>(
         old.cancel();
     }
     manager.change_workspace(None).await;
-    let mut events = manager.events.subscribe();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::select! {_ = cancel.cancelled()=>break,event=events.recv()=>{match event{Ok(event)=>if channel.send(event).is_err(){manager.change_workspace(None).await;break},Err(_)=>{manager.pause_all().await;break}}}}
-        }
-    });
+    let subscription = manager.subscribe();
+    let reviews = state.reviews.clone();
+    tauri::async_runtime::spawn(forward(
+        manager,
+        reviews,
+        subscription,
+        cancel,
+        move |event| channel.send(event).is_ok(),
+    ));
     Ok(())
+}
+/// Forward add-on events to one webview. A slow receiver is a transport
+/// condition, not a user pause: missed events are replaced with current state
+/// and the one-shot events that still matter, each delivered once.
+async fn forward(
+    manager: Arc<Manager>,
+    reviews: Arc<addons::lifecycle::Reviews>,
+    (mut events, mut seen): (broadcast::Receiver<UiEvent>, u64),
+    cancel: CancellationToken,
+    send: impl Fn(UiEvent) -> bool,
+) {
+    loop {
+        let delivered = tokio::select! {
+            _ = cancel.cancelled() => break,
+            event = events.recv() => match event {
+                Ok(event) => {
+                    seen = event.sequence().unwrap_or(seen);
+                    send(event)
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // The new receiver starts right after the snapshot.
+                    let (receiver, sequence, missed) = manager
+                        .resubscribe(seen, |token| reviews.is_pending(token))
+                        .await;
+                    (events, seen) = (receiver, sequence);
+                    missed.into_iter().all(&send)
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        };
+        if !delivered {
+            manager.change_workspace(None).await;
+            break;
+        }
+    }
 }
 #[tauri::command]
 pub async fn addon_pause_all<R: Runtime>(
@@ -163,6 +340,8 @@ pub async fn addon_disable<R: Runtime>(
 ) -> Result<()> {
     let manager = state.get(&app)?;
     state.development.stop(Some(&id));
+    // Disable revokes broker access before waiting behind an activation.
+    let _revocation = manager.revoke_access(&id);
     let operation = manager.operation(&id).await;
     let _lock = operation.lock().await;
     let mut installation = manager.installation(&id)?;
@@ -383,32 +562,26 @@ pub async fn addon_credential_set<R: Runtime>(
     let operation = manager.operation(&id).await;
     let _lock = operation.lock().await;
     let installation = manager.installation(&id)?;
-    if !installation
-        .manifest
-        .credentials
-        .iter()
-        .any(|c| c.id == credential_id)
-    {
-        return Err(ProtocolError::new(
-            ErrorCode::PermissionDenied,
-            "Credential was not declared",
-        ));
-    }
-    // Persist the host-owned index before the non-cancellable OS write. If
-    // this IPC task is dropped, uninstall/restart can still find the credential.
-    if !session_only {
-        manager.record_credential(&installation.installation_id, &credential_id)?;
-    }
     manager
-        .credentials
-        .set(
-            &installation.installation_id,
-            &credential_id,
-            value,
-            session_only,
-        )
-        .await?;
-    Ok(())
+        .save_credential(&installation, &credential_id, value, session_only)
+        .await
+}
+/// Removes a saved credential; requests to its origin become unauthenticated.
+/// Returns cleanup warnings, like removal, when the OS store is locked.
+#[tauri::command]
+pub async fn addon_credential_clear<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AddonState>,
+    id: String,
+    credential_id: String,
+) -> Result<Vec<String>> {
+    let manager = state.get(&app)?;
+    let operation = manager.operation(&id).await;
+    let _lock = operation.lock().await;
+    let installation = manager.installation(&id)?;
+    manager
+        .clear_credential(&installation, &credential_id)
+        .await
 }
 
 #[tauri::command]
@@ -537,7 +710,7 @@ pub async fn addon_enable<R: Runtime>(
     let mut installation = manager.installation(&id)?;
     if matches!(
         installation.status,
-        Status::BlockedDisabled | Status::IncompatibleDisabled
+        Status::BlockedDisabled | Status::IncompatibleDisabled | Status::Removing
     ) {
         return Err(ProtocolError::new(
             ErrorCode::PermissionDenied,
@@ -566,6 +739,8 @@ pub fn addon_resume<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AddonState>,
 ) -> Result<()> {
+    // Resuming also retries an add-on registry that failed to open.
+    state.retry();
     state.get(&app)?.resume()
 }
 #[tauri::command]
@@ -575,6 +750,14 @@ pub async fn addon_catalog<R: Runtime>(
     refresh: bool,
 ) -> Result<addons::catalog::Browse> {
     state.get(&app)?.browse(refresh).await
+}
+#[tauri::command]
+pub async fn addon_check_update<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AddonState>,
+    id: String,
+) -> Result<addons::catalog::UpdateCheck> {
+    state.reviews.check_update(&state.get(&app)?, &id).await
 }
 #[tauri::command]
 pub async fn addon_catalog_review<R: Runtime>(
@@ -595,4 +778,134 @@ pub fn addon_settings_get<R: Runtime>(
 ) -> Result<Value> {
     let manager = state.get(&app)?;
     manager.settings(&manager.installation(&id)?)
+}
+/// Bounded, sanitized log activity for the Settings detail view.
+#[tauri::command]
+pub fn addon_diagnostics<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AddonState>,
+    id: String,
+) -> Result<addons::manager::Diagnostics> {
+    state.get(&app)?.diagnostics(&id)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_lagging_subscriber_resynchronizes_without_pausing_add_ons() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), "unused".into()).unwrap();
+        let subscription = manager.subscribe();
+        // Overflow the bounded broadcast buffer before the forwarder reads.
+        for _ in 0..40 {
+            assert!(manager.events.send(UiEvent::Inventory).is_ok());
+        }
+        let received = Arc::new(Mutex::new(0usize));
+        let counter = received.clone();
+        let cancel = CancellationToken::new();
+        let forwarder = tokio::spawn(forward(
+            manager.clone(),
+            Default::default(),
+            subscription,
+            cancel.clone(),
+            move |_| {
+                *counter.lock().unwrap() += 1;
+                true
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while *received.lock().unwrap() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("resynchronized state is delivered");
+        // Forwarding continues after the lag.
+        let before = *received.lock().unwrap();
+        assert!(manager.events.send(UiEvent::Inventory).is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while *received.lock().unwrap() == before {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("later events still arrive");
+        cancel.cancel();
+        forwarder.await.unwrap();
+        assert!(!manager.paused());
+        drop(manager);
+        assert!(!Manager::open(root.path().into(), "unused".into())
+            .unwrap()
+            .paused());
+    }
+    #[tokio::test]
+    async fn a_lagging_subscriber_receives_each_missed_one_shot_event_once() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let reviews = Arc::new(addons::lifecycle::Reviews::default());
+        let package = root.path().join("fixture.cmxaddon");
+        std::fs::write(
+            &package,
+            addons::lifecycle::tests::package_with(|_| {}).archive,
+        )
+        .unwrap();
+        let review = || reviews.prepare_local(&manager, &package).unwrap();
+        // Sending without yielding outruns the forwarder, which then lags.
+        let overflow = || {
+            for _ in 0..40 {
+                assert!(manager.events.send(UiEvent::Inventory).is_ok());
+            }
+        };
+        let subscription = manager.subscribe();
+        let missed = review();
+        manager.announce_review(missed.clone());
+        overflow();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let log = received.clone();
+        let cancel = CancellationToken::new();
+        let forwarder = tokio::spawn(forward(
+            manager.clone(),
+            reviews.clone(),
+            subscription,
+            cancel.clone(),
+            move |event| {
+                if let UiEvent::DevelopmentReview { review, .. } = event {
+                    log.lock().unwrap().push(review.token);
+                }
+                true
+            },
+        ));
+        let delivered = |count: usize| {
+            let received = received.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while received.lock().unwrap().len() < count {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the review is delivered");
+            }
+        };
+        delivered(1).await;
+        let received_live = review();
+        manager.announce_review(received_live.clone());
+        delivered(2).await;
+        // Missed in the next lag: one review still awaits a decision, the
+        // other was decided. The one already received stays pending too.
+        let missed_again = review();
+        manager.announce_review(missed_again.clone());
+        let decided = review();
+        manager.announce_review(decided.clone());
+        reviews.cancel(&decided.token);
+        overflow();
+        delivered(3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            *received.lock().unwrap(),
+            [missed.token, received_live.token, missed_again.token]
+        );
+        cancel.cancel();
+        forwarder.await.unwrap();
+    }
 }

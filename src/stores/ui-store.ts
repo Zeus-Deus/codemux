@@ -212,6 +212,11 @@ interface UIStore {
    *  availability auto-open for tasks/orchestration/subagents. */
   addRightPanelPane: (workspaceId: string, pane: RightPanelTab) => void;
   closeRightPanelPane: (workspaceId: string, pane: RightPanelTab) => void;
+  /** Forget panes in every workspace, as if they had never been opened:
+   *  no dismissal is recorded and an active one hands focus to its
+   *  neighbour. Used when an add-on is disabled or removed, which is the
+   *  only time its saved pane preferences go away. */
+  forgetRightPanelPanes: (forget: (pane: RightPanelTab) => boolean) => void;
   /** Drag-to-reorder from the deck's tab strip. `order` is the strip's new
    *  order — which may be only the *visible* subset of the open panes,
    *  since availability-gated panes drop out of the strip while their
@@ -447,6 +452,54 @@ export const useUIStore = create<UIStore>()(
                   : active,
             },
           };
+        }),
+
+      forgetRightPanelPanes: (forget) =>
+        set((s) => {
+          const panes = { ...s.rightPanelPanes };
+          const dismissed = { ...s.rightPanelDismissedPanes };
+          const tabs = { ...s.rightPanelTabs };
+          const lastTabs = { ...s.rightPanelLastTabs };
+          let changed = false;
+          for (const [workspaceId, list] of Object.entries(s.rightPanelPanes)) {
+            if (!list.some(forget)) continue;
+            changed = true;
+            const next = list.filter((p) => !forget(p));
+            panes[workspaceId] = next;
+            const active = s.rightPanelTabs[workspaceId] ?? null;
+            if (active !== null && forget(active)) {
+              const index = list.indexOf(active);
+              const kept = list.slice(0, index).filter((p) => !forget(p));
+              tabs[workspaceId] =
+                next[Math.min(kept.length, next.length - 1)] ??
+                RIGHT_PANEL_EMPTY;
+            }
+          }
+          for (const [workspaceId, tab] of Object.entries(tabs)) {
+            if (tab === null || !forget(tab)) continue;
+            changed = true;
+            tabs[workspaceId] =
+              (panes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES)[0] ??
+              RIGHT_PANEL_EMPTY;
+          }
+          for (const [workspaceId, list] of Object.entries(dismissed)) {
+            if (!list.some(forget)) continue;
+            changed = true;
+            dismissed[workspaceId] = list.filter((p) => !forget(p));
+          }
+          for (const [workspaceId, tab] of Object.entries(lastTabs)) {
+            if (!forget(tab)) continue;
+            changed = true;
+            delete lastTabs[workspaceId];
+          }
+          return changed
+            ? {
+                rightPanelPanes: panes,
+                rightPanelDismissedPanes: dismissed,
+                rightPanelTabs: tabs,
+                rightPanelLastTabs: lastTabs,
+              }
+            : s;
         }),
 
       reorderRightPanelPanes: (workspaceId, order) =>

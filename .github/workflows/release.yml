@@ -40,10 +40,12 @@ jobs:
             librsvg2-dev \
             patchelf \
             libfuse2 \
-            file
+            file \
+            libarchive-tools
         # libfuse2 is required by tauri build's AppImage packager; kept here
         # (unlike ci.yml which excludes it) because this workflow produces
-        # actual bundles, not just type-checks.
+        # actual bundles, not just type-checks. libarchive-tools (bsdtar)
+        # unpacks the rpm for the add-on runtime gate.
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,6 +69,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: '"C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+
+      - name: Select native Perl for MSVC dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/addons/windows-native-perl.ps1
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -311,6 +318,17 @@ jobs:
           chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
           ls -la ~/.cache/tauri/
 
+      # ── Add-on runtime gate ──────────────────────────────────────────
+      #
+      # Both Build and release steps set `tauriScript` to
+      # scripts/addons/verified-tauri-build.mjs. tauri-action runs it in place
+      # of `tauri build` and uploads what it leaves in the bundle directory.
+      # The script builds once, then runs packaged-smoke.mjs against those
+      # exact deb/rpm/AppImage or NSIS files: bundled host provenance, SDK
+      # callbacks and hostile-runtime deadlines. A failed check fails the step
+      # before tauri-action creates the release or uploads any asset, so the
+      # published installers are the verified bytes, not a separate rebuild.
+
       - name: Build and release (Linux)
         if: matrix.os == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@action-v0.6.2
@@ -330,6 +348,9 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # Builds, then verifies the exact bundles before any upload. See the
+          # add-on runtime gate note above.
+          tauriScript: node scripts/addons/verified-tauri-build.mjs
           # Diagnostic: tauri build's bundler captures linuxdeploy's stderr
           # but only prints it when verbose. Without this flag, linuxdeploy
           # failures appear as the opaque "failed to run linuxdeploy" with
@@ -359,6 +380,9 @@ jobs:
           # Build and release steps for the merge mechanics and race
           # analysis.
           includeUpdaterJson: true
+          # Builds, then verifies the exact bundle before any upload. See the
+          # add-on runtime gate note above.
+          tauriScript: node scripts/addons/verified-tauri-build.mjs
           # Restrict to the NSIS bundle. `bundle.targets = "all"` in
           # tauri.conf.json would otherwise build both NSIS and MSI on
           # Windows, and MSI requires the WiX Toolset which is NOT
@@ -378,6 +402,14 @@ jobs:
           # — Authenticode is what Windows SmartScreen checks on install,
           # Ed25519 is what the Tauri auto-updater checks before applying
           # an update.
+
+      - name: Preserve add-on runtime gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-addon-runtime-evidence-${{ matrix.os }}
+          path: addon-packaged-evidence.json
+          if-no-files-found: warn
 
   hosted-web:
     name: hosted web release asset

@@ -1,6 +1,7 @@
 import { useAddonsStore } from "@/stores/addons-store";
 import { addonEnabled } from "@/lib/addons/types";
 import { executeAddon } from "@/lib/addons/platform";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Puzzle } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
@@ -446,10 +447,40 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // ── Command rows ───────────────────────────────────────────────────────
   const addonInstalled = useAddonsStore(s => s.installed);
   const addonsPaused = useAddonsStore(s => s.paused);
-  const addonCommands = useMemo<PaletteCommand[]>(()=>addonsPaused || activeWorkspace?.host_id || activeWorkspace?.remote_cwd || activeWorkspace?.attach_only ? [] : addonInstalled.filter(addonEnabled).flatMap(({manifest})=>manifest.contributes.commands.map(command=>({id:`addon:${manifest.id}:${command.id}`,label:`${command.title} · ${manifest.name}`,icon:Puzzle,requiresWorkspace:command.requiresWorkspace,addon:true,run:()=>{void executeAddon(manifest.id,command.id,'commands');}}))),[addonInstalled,addonsPaused,activeWorkspace?.host_id,activeWorkspace?.remote_cwd,activeWorkspace?.attach_only]);
+  // Add-on commands are attributed ("title · add-on") and never get a
+  // keybinding. They are absent in a browser client and while the active
+  // workspace is remote, where add-ons cannot act on it.
+  const addonCommands = useMemo<PaletteCommand[]>(
+    () =>
+      addonsPaused ||
+      isRemoteClient() ||
+      activeWorkspace?.host_id ||
+      activeWorkspace?.remote_cwd ||
+      activeWorkspace?.attach_only
+        ? []
+        : addonInstalled.filter(addonEnabled).flatMap(({ manifest }) =>
+            manifest.contributes.commands.map((command) => ({
+              id: `addon:${manifest.id}:${command.id}`,
+              label: `${command.title} · ${manifest.name}`,
+              icon: Puzzle,
+              requiresWorkspace: command.requiresWorkspace,
+              addon: true,
+              run: () => {
+                void executeAddon(manifest.id, command.id, "commands");
+              },
+            })),
+          ),
+    [
+      addonInstalled,
+      addonsPaused,
+      activeWorkspace?.host_id,
+      activeWorkspace?.remote_cwd,
+      activeWorkspace?.attach_only,
+    ],
+  );
   const commandRows = useMemo<CommandRow[]>(
     () =>
-      [...COMMANDS,...addonCommands].filter((c) => !c.requiresWorkspace || activeWorkspace !== null).map((command) => ({
+      [...COMMANDS, ...addonCommands].filter((c) => !c.requiresWorkspace || activeWorkspace !== null).map((command) => ({
         kind: "command" as const,
         key: `cmd:${command.id}`,
         command,
@@ -631,6 +662,21 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     openedForThemesRef.current &&
     rawQuery === "theme" &&
     matchedThemes.length + matchedThemeStudio.length > 0;
+  // Add-on commands rank with the core ones but render in their own
+  // "Add-ons" group, so each header counts only its own rows.
+  const matchedCoreCommands = useMemo(
+    () => matchedCommands.filter((row) => !row.command.addon),
+    [matchedCommands],
+  );
+  const matchedAddonCommands = useMemo(
+    () => matchedCommands.filter((row) => row.command.addon),
+    [matchedCommands],
+  );
+  const nothingBeforeCommands =
+    shownWorkspaces.length === 0 &&
+    shownProjects.length === 0 &&
+    conversationRows.length === 0 &&
+    matchedThemes.length + matchedThemeStudio.length === 0;
 
   // Every keystroke re-ranks the list and cmdk re-selects the first row, but
   // it only scrolls on arrow navigation. Resetting here keeps ordinary search
@@ -915,23 +961,26 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
           {!themeResultsFirst && themeResults}
 
-          {matchedCommands.length > 0 && (
+          {matchedCoreCommands.length > 0 && (
             <GroupHeader
               label="Commands"
-              count={`${matchedCommands.length}`}
-              first={
-                shownWorkspaces.length === 0 &&
-                shownProjects.length === 0 &&
-                conversationRows.length === 0 &&
-                matchedThemes.length + matchedThemeStudio.length === 0
-              }
+              count={`${matchedCoreCommands.length}`}
+              first={nothingBeforeCommands}
             />
           )}
-          {matchedCommands.filter(row=>!row.command.addon).map((row) => (
+          {matchedCoreCommands.map((row) => (
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
-          {matchedCommands.some(row=>row.command.addon) && <GroupHeader label="Add-ons" count={`${matchedCommands.filter(row=>row.command.addon).length}`} first={false} />}
-          {matchedCommands.filter(row=>row.command.addon).map(row=><CommandItemRow key={row.key} row={row} onSelect={()=>runCommand(row.command)} />)}
+          {matchedAddonCommands.length > 0 && (
+            <GroupHeader
+              label="Add-ons"
+              count={`${matchedAddonCommands.length}`}
+              first={nothingBeforeCommands && matchedCoreCommands.length === 0}
+            />
+          )}
+          {matchedAddonCommands.map((row) => (
+            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+          ))}
         </CommandPrimitive.List>
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-5 bg-gradient-to-b from-transparent to-popover" />
       </div>

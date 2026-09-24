@@ -1,7 +1,7 @@
 //! Reviewed, inert release metadata shared by the installer and publication tools.
 use crate::{
-    manifest::{self, Credential, HttpGrant, Permission, Platform},
-    Manifest, ProtocolError,
+    manifest::{self, Credential, HttpGrant, Permission, Platform, API},
+    ErrorCode, Manifest, ProtocolError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ fn invalid() -> ProtocolError {
     ProtocolError::invalid("Invalid reviewed add-on catalog")
 }
 fn bounded(s: &str, max: usize) -> bool {
-    !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)
+    !s.is_empty() && s.chars().count() <= max && !s.chars().any(char::is_control)
 }
 pub fn hex(s: &str, length: usize) -> bool {
     s.len() == length
@@ -290,37 +290,81 @@ impl Catalog {
         }
         Ok(())
     }
+    /// An ID selects the highest installable release; an explicit version resolves
+    /// exactly. A refusal names its cause: a missing entry or version, a block, the
+    /// platform, or the plugin API. Without a version, it reports the newest
+    /// release that came closest to installable.
     pub fn select(&self, target: &str, platform: Platform) -> Result<(&Plugin, &Release)> {
         let (id, version) = install_target(target)?;
-        let plugin = self
-            .plugins
-            .iter()
-            .find(|p| p.id == id)
-            .ok_or_else(|| ProtocolError::invalid("Add-on is not listed in the catalog"))?;
-        let release = plugin
+        let plugin = self.plugins.iter().find(|p| p.id == id).ok_or_else(|| {
+            ProtocolError::invalid(format!("{id} is not listed in the add-on catalog"))
+        })?;
+        let mut candidates = plugin
             .releases
             .iter()
-            .filter(|r| {
-                version.as_ref().is_none_or(|v| v == &r.version)
-                    && r.platforms.contains(&platform)
-                    && semver::VersionReq::parse(&r.api)
-                        .is_ok_and(|v| v.matches(&semver::Version::new(1, 0, 0)))
-                    && self.blocked_reason(&id, &r.sha256).is_none()
-            })
-            .max_by_key(|r| semver::Version::parse(&r.version).unwrap())
-            .ok_or_else(|| {
-                ProtocolError::invalid(
-                    "The requested release is unavailable, blocked, or incompatible",
-                )
-            })?;
-        Ok((plugin, release))
+            .filter(|r| version.as_ref().is_none_or(|v| v == &r.version))
+            .collect::<Vec<_>>();
+        candidates
+            .sort_by_cached_key(|r| std::cmp::Reverse(semver::Version::parse(&r.version).ok()));
+        // 0: blocked, 1: other platform, 2: incompatible API.
+        let mut closest: Option<(u8, &Release)> = None;
+        for release in candidates {
+            let stage = if self.blocked_reason(&id, &release.sha256).is_some() {
+                0
+            } else if !release.platforms.contains(&platform) {
+                1
+            } else if !semver::VersionReq::parse(&release.api).is_ok_and(|r| r.matches(&API)) {
+                2
+            } else {
+                return Ok((plugin, release));
+            };
+            if closest.is_none_or(|(best, _)| stage > best) {
+                closest = Some((stage, release));
+            }
+        }
+        let incompatible = |message| Err(ProtocolError::new(ErrorCode::IncompatibleApi, message));
+        match (closest, version) {
+            (None, Some(version)) => Err(ProtocolError::invalid(format!(
+                "Version {version} of {id} is not listed in the add-on catalog"
+            ))),
+            (None, None) => Err(ProtocolError::invalid(format!(
+                "{id} has no releases in the add-on catalog"
+            ))),
+            (Some((0, release)), _) => Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                format!(
+                    "This release is blocked: {}",
+                    self.blocked_reason(&id, &release.sha256)
+                        .unwrap_or_default()
+                ),
+            )),
+            (Some((1, _)), Some(version)) => incompatible(format!(
+                "Version {version} of {id} is not available for {}",
+                platform.label()
+            )),
+            (Some((1, _)), None) => incompatible(format!(
+                "No release of {id} is available for {}",
+                platform.label()
+            )),
+            (Some((_, release)), Some(version)) => incompatible(format!(
+                "Version {version} of {id} requires add-on API {}; this CodeMux provides {API}",
+                release.api
+            )),
+            (Some((_, release)), None) => incompatible(format!(
+                "No release of {id} supports add-on API {API}; version {} requires {}",
+                release.version, release.api
+            )),
+        }
     }
+}
+fn target_error() -> ProtocolError {
+    ProtocolError::invalid("Use a catalog ID or a codemux.org add-on install link")
 }
 pub fn install_target(target: &str) -> Result<(String, Option<String>)> {
     if manifest::plugin_id(target) {
         return Ok((target.into(), None));
     }
-    let u = url::Url::parse(target).map_err(|_| invalid())?;
+    let u = url::Url::parse(target).map_err(|_| target_error())?;
     if u.scheme() != "https"
         || u.host_str() != Some("codemux.org")
         || u.port().is_some()
@@ -328,24 +372,30 @@ pub fn install_target(target: &str) -> Result<(String, Option<String>)> {
         || u.password().is_some()
         || u.fragment().is_some()
     {
-        return Err(ProtocolError::invalid(
-            "Use a catalog ID or a codemux.org add-on install link",
-        ));
+        return Err(target_error());
     }
     let id = u
         .path()
         .strip_prefix("/addons/")
         .filter(|id| manifest::plugin_id(id))
-        .ok_or_else(invalid)?;
+        .ok_or_else(target_error)?;
     let query = u.query_pairs().collect::<Vec<_>>();
-    if query.len() > 1
-        || query
-            .first()
-            .is_some_and(|(k, v)| k != "version" || semver::Version::parse(v).is_err())
-    {
-        return Err(invalid());
+    if query.len() > 1 || query.first().is_some_and(|(k, _)| k != "version") {
+        return Err(target_error());
     }
-    Ok((id.into(), query.first().map(|(_, v)| v.to_string())))
+    let version = query.first().map(|(_, v)| v.to_string());
+    if let Some(version) = &version {
+        let parsed = semver::Version::parse(version).map_err(|_| {
+            ProtocolError::invalid("The install link version is not a semantic version")
+        })?;
+        // Echoed in later messages, so keep it to the bounded stable form.
+        if !parsed.pre.is_empty() || !parsed.build.is_empty() {
+            return Err(ProtocolError::invalid(
+                "The add-on catalog lists only stable release versions",
+            ));
+        }
+    }
+    Ok((id.into(), version))
 }
 #[cfg(test)]
 mod tests {
@@ -460,6 +510,186 @@ mod tests {
             "https://github.com/example/plugins/releases/download/v1/test.cmxaddon?token=secret",
         ] {
             assert!(!asset_url(repo, value));
+        }
+    }
+    fn release(version: &str, platforms: &[Platform], api: &str, digest: char) -> Release {
+        let manifest = Manifest::parse(include_bytes!("../fixtures/hello.json"), None).unwrap();
+        Release {
+            version: version.into(),
+            api: api.into(),
+            platforms: platforms.to_vec(),
+            source_commit: "a".repeat(40),
+            download_url: format!(
+                "https://github.com/example/plugins/releases/download/v{version}/hello.cmxaddon"
+            ),
+            sha256: digest.to_string().repeat(64),
+            compressed_bytes: 100,
+            published_at: "2026-09-18T00:00:00Z".into(),
+            license: "MIT".into(),
+            capabilities: Capabilities::from_manifest(&manifest),
+        }
+    }
+    fn listed(releases: Vec<Release>) -> Catalog {
+        let mut catalog = empty();
+        catalog.plugins.push(Plugin {
+            id: "example.hello".into(),
+            name: "Hello".into(),
+            publisher: "Fixture".into(),
+            tier: Tier::Community,
+            repository: "https://github.com/example/plugins".into(),
+            description: "Synthetic catalog fixture".into(),
+            readme: "Fixture".into(),
+            releases,
+        });
+        catalog
+    }
+    #[test]
+    fn identity_versions_and_digests_are_unique() {
+        const BOTH: &[Platform] = &[Platform::LinuxX64, Platform::WindowsX64];
+        let good = listed(vec![release("1.0.0", BOTH, "^1.0", 'a')]);
+        good.validate().unwrap();
+        let mut bad = good.clone();
+        bad.plugins[0]
+            .releases
+            .push(release("1.0.0", BOTH, "^1.0", 'b'));
+        assert!(bad.validate().is_err(), "duplicate version");
+        let mut bad = good.clone();
+        bad.plugins.push(bad.plugins[0].clone());
+        assert!(bad.validate().is_err(), "duplicate plugin ID");
+        let mut bad = good.clone();
+        let mut other = bad.plugins[0].clone();
+        other.id = "example.other".into();
+        bad.plugins.push(other);
+        assert!(bad.validate().is_err(), "digest reused by another plugin");
+        for version in ["1.1.0-beta.1", "1.1.0+build", "v1.1.0"] {
+            let mut bad = good.clone();
+            bad.plugins[0]
+                .releases
+                .push(release(version, BOTH, "^1.0", 'b'));
+            assert!(bad.validate().is_err(), "{version}");
+        }
+        for id in ["con.tools", "example.nul", "Example.hello"] {
+            let mut bad = good.clone();
+            bad.plugins[0].id = id.into();
+            assert!(bad.validate().is_err(), "{id}");
+        }
+        // Text limits count characters, as the manifest does.
+        let mut wide = good.clone();
+        wide.plugins[0].name = "\u{00e9}".repeat(80);
+        wide.validate().unwrap();
+        wide.plugins[0].name.push('\u{00e9}');
+        assert!(wide.validate().is_err());
+    }
+    #[test]
+    fn selection_is_exact_and_names_each_refusal() {
+        use Platform::{LinuxX64 as Linux, WindowsX64 as Windows};
+        let catalog = listed(vec![
+            release("1.0.0", &[Linux, Windows], "^1.0", 'a'),
+            release("1.1.0", &[Linux, Windows], "^1.0", 'b'),
+            release("1.2.0", &[Linux], "^1.0", 'c'),
+            release("1.3.0", &[Windows], "^1.0", 'd'),
+            release("2.0.0", &[Linux, Windows], "^2.0", 'e'),
+        ]);
+        let mut catalog = catalog;
+        catalog.blocked.push(Blocked {
+            plugin_id: None,
+            sha256: Some("b".repeat(64)),
+            reason: "Revoked build".into(),
+            date: "2026-09-18T00:00:00Z".into(),
+        });
+        catalog.validate().unwrap();
+        let version = |target: &str, platform| {
+            catalog
+                .select(target, platform)
+                .map(|(_, r)| r.version.clone())
+        };
+        let refusal = |target: &str, platform| catalog.select(target, platform).unwrap_err();
+        assert_eq!(version("example.hello", Linux).unwrap(), "1.2.0");
+        assert_eq!(version("example.hello", Windows).unwrap(), "1.3.0");
+        let link = "https://codemux.org/addons/example.hello?version=";
+        assert_eq!(version(&format!("{link}1.0.0"), Linux).unwrap(), "1.0.0");
+        for (target, code, message) in [
+            (
+                format!("{link}9.9.9"),
+                ErrorCode::InvalidMessage,
+                "Version 9.9.9 of example.hello is not listed in the add-on catalog",
+            ),
+            (
+                format!("{link}1.1.0"),
+                ErrorCode::PermissionDenied,
+                "This release is blocked: Revoked build",
+            ),
+            (
+                format!("{link}1.3.0"),
+                ErrorCode::IncompatibleApi,
+                "Version 1.3.0 of example.hello is not available for Linux x64",
+            ),
+            (
+                format!("{link}2.0.0"),
+                ErrorCode::IncompatibleApi,
+                "Version 2.0.0 of example.hello requires add-on API ^2.0; this CodeMux provides 1.0.0",
+            ),
+            (
+                format!("{link}1.3.0-beta.1"),
+                ErrorCode::InvalidMessage,
+                "The add-on catalog lists only stable release versions",
+            ),
+            (
+                format!("{link}latest"),
+                ErrorCode::InvalidMessage,
+                "The install link version is not a semantic version",
+            ),
+            (
+                "example.other".into(),
+                ErrorCode::InvalidMessage,
+                "example.other is not listed in the add-on catalog",
+            ),
+            (
+                "con.tools".into(),
+                ErrorCode::InvalidMessage,
+                "Use a catalog ID or a codemux.org add-on install link",
+            ),
+        ] {
+            let error = refusal(&target, Linux);
+            assert_eq!((error.data.code, error.message.as_str()), (code, message));
+        }
+        // Without a version, report the newest release that came closest.
+        let only = |releases| {
+            let mut catalog = listed(releases);
+            catalog.blocked = vec![Blocked {
+                plugin_id: None,
+                sha256: Some("b".repeat(64)),
+                reason: "Revoked build".into(),
+                date: "2026-09-18T00:00:00Z".into(),
+            }];
+            catalog.select("example.hello", Linux).unwrap_err()
+        };
+        for (releases, code, message) in [
+            (
+                vec![release("1.0.0", &[Linux], "^1.0", 'b')],
+                ErrorCode::PermissionDenied,
+                "This release is blocked: Revoked build",
+            ),
+            (
+                vec![
+                    release("1.0.0", &[Linux], "^1.0", 'b'),
+                    release("1.1.0", &[Windows], "^1.0", 'c'),
+                ],
+                ErrorCode::IncompatibleApi,
+                "No release of example.hello is available for Linux x64",
+            ),
+            (
+                vec![
+                    release("1.0.0", &[Windows], "^1.0", 'a'),
+                    release("2.0.0", &[Linux], "^2.0", 'c'),
+                    release("3.0.0", &[Linux], "^3.0", 'b'),
+                ],
+                ErrorCode::IncompatibleApi,
+                "No release of example.hello supports add-on API 1.0.0; version 2.0.0 requires ^2.0",
+            ),
+        ] {
+            let error = only(releases);
+            assert_eq!((error.data.code, error.message.as_str()), (code, message));
         }
     }
 }

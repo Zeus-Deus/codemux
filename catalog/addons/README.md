@@ -23,8 +23,23 @@ Run:
 
 ```sh
 cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- generate catalog/addons/catalog-v1.json catalog/addons/entries
-cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json
+cargo run -j 2 --locked --manifest-path src-tauri/addon-catalog/Cargo.toml -- online catalog/addons/catalog-v1.json [previous-catalog-v1.json]
 ```
+
+`online` downloads and hashes every unblocked release. With a previous catalog it
+resolves tag provenance only for releases added since then, because accepted
+releases are immutable. Set `GITHUB_TOKEN` (or `GH_TOKEN`) to authenticate those
+GitHub API requests and avoid the anonymous rate limit; the token is sent only to
+`api.github.com`, never with release downloads.
+
+Every shipped v1 desktop parses `catalog-v1.json` strictly and rejects the whole
+file, including its blocklist, if it contains an unknown field, platform,
+permission, HTTP method, credential type, or tier. `catalog-v1.json` must
+therefore stay readable by v1 desktops. Publish releases that need new fields or
+values in a new `catalog-vN.json` that newer desktops fetch, and keep publishing
+`catalog-v1.json` with its v1-compatible releases and the complete blocklist. The
+protocol contract test `catalog_v1_fields_and_values_are_pinned` fails when the
+v1 shape changes.
 
 Increment the envelope revision for every change, including revocations. Never
 reuse a catalog revision or release version with changed bytes. Keep historical
@@ -34,8 +49,11 @@ and an RFC3339 date. Desktop refresh disables matching installations; offline
 devices cannot learn new revocations until they reconnect. Local imports are also
 checked against the last accepted blocklist.
 
-After a reviewed merge, CI publishes `catalog-v1.json` and its SHA-256 as assets on
-the immutable `addons-catalog-r<revision>` release. The website pins that artifact
+A reviewed merge is validated but never published by itself. A maintainer then
+dispatches the catalog workflow on `main` with that revision, through its approved
+`addon-catalog` environment, to publish `catalog-v1.json` and its SHA-256 as assets
+on the immutable `addons-catalog-r<revision>` release. That release is never marked
+Latest, which stays the desktop `v*` release. The website pins that artifact
 and digest in a separate reviewed change; it never reads a mutable branch during
 page requests. New desktop installs and updates require a successful online refresh.
 

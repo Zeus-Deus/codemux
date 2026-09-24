@@ -46,11 +46,28 @@ export interface AddonManifest {
 export type AddonSource =
   | { kind: "local"; identity: string }
   | { kind: "catalog"; publisher: string; repository: string };
+/** Reviewed catalog identity; `tier` and `listed` come from the cached catalog. */
+export interface AddonListing {
+  publisher: string;
+  repository: string;
+  tier: "official" | "community" | null;
+  /** null when no usable cached catalog says either way (absent or damaged). */
+  listed: boolean | null;
+}
+export interface AddonCompatibility {
+  api: string;
+  hostApi: string;
+  platforms: string[];
+  platform: string | null;
+  compatible: boolean;
+  reason: string | null;
+}
 export interface AddonInstallation {
   installationId: string;
   manifest: AddonManifest;
   source: AddonSource;
   digest: string;
+  dataGeneration: string;
   desiredEnabled: boolean;
   status:
     | "installed-disabled"
@@ -63,8 +80,28 @@ export interface AddonInstallation {
     | "blocked-disabled"
     | "removing";
   failure: string | null;
-  previous: { manifest: AddonManifest } | null;
+  previous: {
+    manifest: AddonManifest;
+    digest?: string;
+    dataGeneration?: string;
+  } | null;
+  /** Newer compatible, unblocked catalog version from the cached snapshot. */
+  updateAvailable?: string | null;
+  /** Present for catalog-source installations only. */
+  catalog?: AddonListing | null;
+  compatibility?: AddonCompatibility;
 }
+/**
+ * Host-owned state of one declared credential; never the secret itself.
+ * "not-configured" means requests to its origin are sent unauthenticated.
+ * "cleanup-pending" means a cleared saved value still awaits OS-store removal;
+ * it is already unusable and `addon_retry_cleanup` retries the removal.
+ */
+export type AddonCredentialState =
+  | "not-configured"
+  | "saved"
+  | "session-only"
+  | "cleanup-pending";
 export interface AddonInventory {
   paused: boolean;
   installed: AddonInstallation[];
@@ -72,11 +109,18 @@ export interface AddonInventory {
   warnings?: string[];
   developerMode?: boolean;
   developmentPackage?: string | null;
+  /** Plugin ID -> declared credential ID -> state. */
+  credentialStates?: Record<string, Record<string, AddonCredentialState>>;
+  /** Set when the registry could not be opened; `addon_registry_reset` recovers it. */
+  registryError?: { path: string; cause: string } | null;
+  /** Plugin IDs whose activation an unclean exit interrupted; cleared by Resume. */
+  interruptedActivations?: string[];
 }
+/** The host's protocol error; `addon_effect_result` accepts only this shape. */
 export interface AddonError {
+  code: number;
   message: string;
   data: { code: string };
-  code?: number;
 }
 export interface AddonNode {
   id: string;
@@ -114,16 +158,89 @@ export interface AddonMount {
   viewId: string;
   generation: string;
 }
+export interface AddonAccess {
+  permissions: string[];
+  http: { origin: string; methods: string[] }[];
+  credentials: { id: string; label: string; origin: string }[];
+}
 export interface AddonReview {
   token: string;
   manifest: AddonManifest;
   digest: string;
   source: AddonSource;
   replacesSource: boolean;
+  /** True only when `added` is non-empty. */
   expandsAccess: boolean;
   compressedBytes: number;
   development?: boolean;
   retainedData?: { version: string } | null;
+  /** The currently installed release, when this review updates or replaces it. */
+  installed?: {
+    version: string;
+    digest: string;
+    source: AddonSource;
+    desiredEnabled: boolean;
+    capabilities: {
+      permissions: string[];
+      http: AddonManifest["http"];
+      credentials: AddonManifest["credentials"];
+    };
+  } | null;
+  /** Access the candidate adds; all of it for a new installation or a source replacement. */
+  added?: AddonAccess;
+  /** Access the installed release has and the candidate drops. */
+  removed?: AddonAccess;
+  catalog?: AddonListing | null;
+}
+/** One reviewed release in the cached catalog (`addon_catalog`). */
+export interface AddonCatalogRelease {
+  version: string;
+  api: string;
+  platforms: string[];
+  sha256: string;
+  publishedAt: string;
+  capabilities: Pick<AddonManifest, "permissions" | "http" | "credentials">;
+}
+export interface AddonCatalogPlugin {
+  id: string;
+  name: string;
+  publisher: string;
+  tier: "official" | "community";
+  description: string;
+  repository: string;
+  readme: string;
+  releases: AddonCatalogRelease[];
+}
+/** `addon_catalog` result: the cached snapshot, and why a refresh failed. */
+export interface AddonCatalogBrowse {
+  snapshot: {
+    /** Seconds since the Unix epoch. */
+    fetchedAt: number;
+    catalog: { revision: number; plugins: AddonCatalogPlugin[] };
+  } | null;
+  error: string | null;
+  stale: boolean;
+}
+export interface AddonUpdateCheck {
+  upToDate: boolean;
+  installedVersion: string;
+  availableVersion: string | null;
+  review: AddonReview | null;
+}
+/** `addon_diagnostics` log entry. Plugin log text is never kept. */
+export interface AddonLogEntry {
+  /** Milliseconds since the Unix epoch. */
+  at: number;
+  level: "log" | "info" | "warn" | "error" | "debug";
+  /** UTF-8 size of the entry after host truncation (at most 1,024 characters). */
+  bytes: number;
+}
+/** Current installation's log activity this session, kept across stops and crashes. */
+export interface AddonDiagnostics {
+  /** Entries received this session, including ones the ring evicted. */
+  received: number;
+  /** Oldest first; at most 1,024 entries (a 64 KiB ring). */
+  logs: AddonLogEntry[];
 }
 export function addonMessage(error: unknown): string {
   return typeof error === "object" &&
@@ -135,8 +252,20 @@ export function addonMessage(error: unknown): string {
       ? error
       : "The add-on operation failed";
 }
+/** The stable host error code of a rejection, when it carries one. */
+export function addonCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("data" in error))
+    return null;
+  const data = (error as { data: unknown }).data;
+  return typeof data === "object" &&
+    data !== null &&
+    "code" in data &&
+    typeof data.code === "string"
+    ? data.code
+    : null;
+}
 export function addonError(code: string, message: string): AddonError {
-  return { message, data: { code } };
+  return { code: -32000, message, data: { code } };
 }
 export function addonEnabled(installation: AddonInstallation): boolean {
   return (

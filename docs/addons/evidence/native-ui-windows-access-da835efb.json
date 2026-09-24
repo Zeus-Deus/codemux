@@ -1,0 +1,83 @@
+{
+  "commit": "40593c6dca7524b851d4b3887e473ed10b0353f3",
+  "platform": "win32",
+  "hardware": {
+    "osRelease": "10.0.26100",
+    "cpu": "AMD EPYC 7763 64-Core Processor                ",
+    "logicalCpus": 4,
+    "memoryBytes": 17174360064
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "11-corrupt-plugin-registry-does-not-block-core-startup"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "da835efb4571b600465920b78ea946c980bc8f1a",
+    "run": "35386904258",
+    "platform": "win32"
+  },
+  "installerSha256": "5ee93418900dd3b7c0333e27676913afafd786d19fc65d64d348afe741d1a288",
+  "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 734.7642000000051
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 743.5630999999994
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 858.625
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 838.3570000000036
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 816.6590999999971
+    }
+  ],
+  "status": "passed"
+}

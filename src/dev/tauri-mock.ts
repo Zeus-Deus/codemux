@@ -34,6 +34,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { addonMockHandlers } from "./addon-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
@@ -3303,8 +3304,6 @@ const MOCK_MARKETPLACE_VARIANTS: Record<string, unknown[]> = {
   ],
 };
 
-let mockAddonPaused = false;
-let mockAddonDeveloperMode = false;
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
@@ -3428,16 +3427,9 @@ const handlers: Record<string, Handler> = {
   }),
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
-  // Empty by default: plugins never alter a clean core-only UI.
-  addon_inventory: () => ({paused:mockAddonPaused,installed:[],error:null,warnings:[],developerMode:mockAddonDeveloperMode,developmentPackage:null}),
-  addon_pause_all: () => { mockAddonPaused = true; return null; },
-  addon_resume: () => { mockAddonPaused = false; return null; },
-  addon_developer_mode: (args) => { mockAddonDeveloperMode = !!args.enabled; return null; },
-  addon_catalog: () => ({ snapshot: null, stale: true, error: "The catalog is unavailable in the browser preview. Use the desktop app to install packages." }),
-  addon_subscribe: () => null,
-  addon_context_changed: () => null,
-  addon_composer_register: () => null,
-  addon_composer_closed: () => null,
+  // Empty by default: plugins never alter a clean core-only UI. Synthetic
+  // manager states are opt-in with `?addons=…` (see ./addon-mock).
+  ...addonMockHandlers(),
   get_package_format: () => "AppImage",
 
   // ── Settings ──
@@ -6488,6 +6480,14 @@ async function invoke(
 
   const viaPlugin = routePlugin(cmd, args);
   if (viaPlugin !== MISS) return viaPlugin;
+
+  // An add-on command resolving `null` would look like success to the
+  // manager UI. Reject the way the host rejects an unavailable operation.
+  if (cmd.startsWith("addon_"))
+    throw {
+      message: `${cmd} is unavailable in the browser preview`,
+      data: { code: "REMOTE_UNSUPPORTED" },
+    };
 
   return defaultResult(cmd);
 }

@@ -3,36 +3,119 @@ use super::{ErrorCode, Manifest, ProtocolError, Result};
 use codemux_addon_protocol::{limits, wire::Envelope};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::Path,
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Child,
-    sync::{mpsc, Mutex},
+    sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
 pub enum Event {
     Message(Envelope),
     Stopped(ProtocolError),
 }
+/// Fixed reasons the trusted host prints to stderr before exiting. Nothing else
+/// from that stream is surfaced, so plugin data cannot reach diagnostics.
+const HOST_STOPS: &[(&str, ErrorCode)] = &[
+    ("Plugin initialization failed", ErrorCode::PluginStopped),
+    ("Plugin callback failed", ErrorCode::PluginStopped),
+    ("Plugin promise failed", ErrorCode::PluginStopped),
+    (
+        "Unhandled plugin promise rejection",
+        ErrorCode::PluginStopped,
+    ),
+    ("Plugin CPU deadline exceeded", ErrorCode::ResourceLimit),
+    ("Microtask deadline exceeded", ErrorCode::ResourceLimit),
+    ("Active CPU budget exceeded", ErrorCode::ResourceLimit),
+    (
+        "Repeated protocol or quota violations",
+        ErrorCode::ResourceLimit,
+    ),
+    ("UI update queue overflow", ErrorCode::ResourceLimit),
+    ("Outgoing frame limit", ErrorCode::ResourceLimit),
+    ("Bundle limit", ErrorCode::ResourceLimit),
+    ("Serialization failed", ErrorCode::InvalidMessage),
+    ("Invalid parent message", ErrorCode::InvalidMessage),
+    ("Invalid initialization", ErrorCode::InvalidMessage),
+    ("Invalid source frame", ErrorCode::InvalidMessage),
+    ("Invalid manifest", ErrorCode::InvalidMessage),
+    ("Expected initialize", ErrorCode::InvalidMessage),
+    ("Expected source chunk", ErrorCode::InvalidMessage),
+    ("Missing initialization", ErrorCode::InvalidMessage),
+    ("Missing source chunk", ErrorCode::InvalidMessage),
+    ("Incompatible protocol", ErrorCode::IncompatibleApi),
+    ("Initialization deadline", ErrorCode::Timeout),
+    ("Engine initialization failed", ErrorCode::PluginStopped),
+    ("Context initialization failed", ErrorCode::PluginStopped),
+];
+fn host_stop(stderr: &[u8]) -> Option<ProtocolError> {
+    String::from_utf8_lossy(stderr).lines().find_map(|line| {
+        let reason = line.strip_prefix("Plugin host stopped: ")?;
+        HOST_STOPS
+            .iter()
+            .find(|(known, _)| *known == reason)
+            .map(|(known, code)| ProtocolError::new(*code, format!("Plugin host stopped: {known}")))
+    })
+}
+/// An exiting host explains itself on stderr; wait briefly for that line.
+async fn explained(
+    reason: &mut tokio::task::JoinHandle<Option<ProtocolError>>,
+    error: ProtocolError,
+) -> ProtocolError {
+    match tokio::time::timeout(Duration::from_millis(250), reason).await {
+        Ok(Ok(Some(reason))) => reason,
+        _ => error,
+    }
+}
+/// At least five violations within 10 s.
+pub(super) fn repeated(violations: &mut VecDeque<Instant>, now: Instant) -> bool {
+    while violations
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(10))
+    {
+        violations.pop_front();
+    }
+    violations.push_back(now);
+    violations.len() >= 5
+}
 struct Outbound {
     bytes: Vec<u8>,
 }
+/// Parent calls the child accepted but has not yielded, and when the last
+/// one yielded. One lock keeps the two consistent for idle checks.
+struct Progress {
+    pending: HashMap<u64, Instant>,
+    settled: Instant,
+}
+struct HostLease(CancellationToken);
+impl Drop for HostLease {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 #[derive(Clone)]
 pub struct Host {
+    // The supervising task owns the child, not this lease. Losing the last
+    // caller (including a cancelled/failed initialization) must reap the child.
+    _lease: Arc<HostLease>,
     pub generation: String,
     writer: mpsc::Sender<Outbound>,
     cancel: CancellationToken,
     done: CancellationToken,
     sequence: Arc<AtomicU64>,
-    progress: Arc<Mutex<HashMap<u64, Instant>>>,
+    progress: Arc<Mutex<Progress>>,
+    /// Holding this delays the reaped signal, as a kernel that is slow to
+    /// terminate the child would.
+    #[cfg(test)]
+    pub(super) reaping: Arc<tokio::sync::Mutex<()>>,
 }
 impl Host {
     pub async fn spawn(
@@ -52,8 +135,10 @@ impl Host {
             .current_dir(directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // The host closes unrelated inherited descriptors itself before it
+        // starts, so this spawn keeps the fast path instead of forking the app.
         #[cfg(windows)]
         {
             if let Some(value) = std::env::var_os("SystemRoot") {
@@ -69,65 +154,110 @@ impl Host {
         })?;
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        // Drain stderr so the host never blocks on it; keep only the first 1 KiB.
+        let mut reason = tokio::spawn(async move {
+            let (mut kept, mut buffer) = (Vec::new(), [0; 4096]);
+            while let Ok(count @ 1..) = stderr.read(&mut buffer).await {
+                let room = 1024usize.saturating_sub(kept.len());
+                kept.extend_from_slice(&buffer[..count.min(room)]);
+            }
+            host_stop(&kept)
+        });
         let (writer, mut writes) = mpsc::channel::<Outbound>(2);
         let (events, received) = mpsc::channel(2);
         let cancel = CancellationToken::new();
         let done = CancellationToken::new();
         let generation = uuid::Uuid::new_v4().to_string();
-        let progress = Arc::new(Mutex::new(HashMap::new()));
+        let progress = Arc::new(Mutex::new(Progress {
+            pending: HashMap::new(),
+            settled: Instant::now(),
+        }));
         let host = Self {
+            _lease: Arc::new(HostLease(cancel.clone())),
             generation: generation.clone(),
             writer,
             cancel: cancel.clone(),
             done: done.clone(),
             sequence: Arc::new(AtomicU64::new(1)),
             progress: progress.clone(),
+            #[cfg(test)]
+            reaping: Default::default(),
         };
+        #[cfg(test)]
+        let reaping = host.reaping.clone();
         let writing_cancel = cancel.clone();
+        // A broken input pipe usually means the host is exiting. Stop writing
+        // but let the reader observe the exit and its reason; later writes fail
+        // and pending calls still reach the watchdog.
         let write_task = tokio::spawn(async move {
             loop {
-                tokio::select! {_ = writing_cancel.cancelled()=>break,write=writes.recv()=>{let Some(write)=write else{break};if stdin.write_all(&write.bytes).await.is_err(){writing_cancel.cancel();break}}}
+                tokio::select! {_ = writing_cancel.cancelled()=>break,write=writes.recv()=>{let Some(write)=write else{break};if stdin.write_all(&write.bytes).await.is_err(){break}}}
             }
         });
+        let replies = host.writer.clone();
         tokio::spawn(async move {
             let _private_directory = directory;
             let mut reader = BufReader::new(stdout);
             let mut frame = Vec::new();
-            let mut violations = limits::RateLimit::default();
+            let mut requests = limits::RateLimit::default();
+            let mut violations = VecDeque::new();
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             let mut system = sysinfo::System::new();
             let pid = child.id().map(sysinfo::Pid::from_u32);
             let result:Result<()>=async{loop{
-    let next_deadline = progress.lock().await.values().min().map(|time| *time + Duration::from_secs(2));
+    let next_deadline = progress.lock().unwrap().pending.values().min().map(|time| *time + Duration::from_millis(1500));
     let watchdog = async { match next_deadline { Some(deadline) => tokio::time::sleep_until(deadline.into()).await, None => std::future::pending::<()>().await } };
     tokio::select!{
      biased;
      _ = cancel.cancelled()=>return Ok(()),
      _ = watchdog=>return Err(ProtocolError::new(ErrorCode::Timeout,"Plugin host stopped responding")),
      _ = interval.tick()=>{
-      if child.try_wait().map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin host exited"))?.is_some(){return Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin host exited"))}
+      if child.try_wait().map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin host exited"))?.is_some(){return Err(explained(&mut reason,ProtocolError::new(ErrorCode::PluginStopped,"Plugin host exited")).await)}
       if let Some(pid)=pid{system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]),true,sysinfo::ProcessRefreshKind::nothing().with_memory());if system.process(pid).is_some_and(|p|p.memory()>192*1024*1024){return Err(ProtocolError::new(ErrorCode::ResourceLimit,"Plugin host memory limit"))}}
      },
      result=read_frame(&mut reader,&mut frame)=>{
-      result?;
+      if let Err(error)=result{return Err(if error.data.code==ErrorCode::PluginStopped{explained(&mut reason,error).await}else{error})}
+      // The trusted host validates every plugin frame, so a malformed one here
+      // means the host itself is compromised or broken: stop at once.
       let message=Envelope::parse(&frame,Some(&generation),true)?;frame.clear();
-      if message.method.is_none() { if let Some(error)=message.error { return Err(error) } continue; }
-      if message.method.as_deref()==Some("host.request")&&!violations.accept(Instant::now(),20,100){return Err(ProtocolError::new(ErrorCode::ResourceLimit,"Plugin request quota exceeded"))}
+      // The host accepts every parent call itself, so an error response means
+      // it is broken. Stop with a fixed reason; never surface the frame's text.
+      if message.method.is_none() { if message.error.is_some() { return Err(ProtocolError::invalid("Unexpected plugin host response")) } continue; }
+      // The host enforces the exact quota at the source. This backstop bounds
+      // only a broken host: it allows twice that to absorb arrival bunching,
+      // answers excess requests, and stops only on repeated violations.
+      if message.method.as_deref()==Some("host.request")&&!requests.accept(Instant::now(),40,200){
+       let quota=ProtocolError::new(ErrorCode::ResourceLimit,"Plugin request quota exceeded");
+       if repeated(&mut violations,Instant::now()){return Err(quota)}
+       // Violations bound these replies to four per 10 s, so each may wait for
+       // the input queue in its own task while the reader moves on.
+       if let Some(id)=message.id{let mut bytes=serde_json::to_vec(&Envelope::response(&generation,id,Err(quota))).unwrap();bytes.push(b'\n');let (replies,cancel)=(replies.clone(),cancel.clone());tokio::spawn(async move{tokio::select!{_=cancel.cancelled()=>{},_=tokio::time::timeout(Duration::from_millis(1500),replies.send(Outbound{bytes}))=>{}}});}
+       continue;
+      }
+      // Only a yield that ends a pending call is progress; others carry nothing.
       if message.method.as_deref()==Some("ready")&&message.params.as_ref().is_some_and(|p|p["phase"]=="yielded"){
-       if let Some(id)=message.params.as_ref().and_then(|p|p["requestId"].as_u64()){progress.lock().await.remove(&id);}
+       let pending=message.params.as_ref().and_then(|p|p["requestId"].as_u64()).is_some_and(|id|{let mut progress=progress.lock().unwrap();let ended=progress.pending.remove(&id).is_some();if ended{progress.settled=Instant::now()}ended});
+       if !pending{continue}
       }
       // Bounded backpressure; never discard a patch and continue a corrupt tree.
-      tokio::select!{_ = cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),events.send(Event::Message(message)))=>{result.map_err(|_|ProtocolError::new(ErrorCode::ResourceLimit,"Plugin event queue overflow"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin receiver closed"))?;}}
+      tokio::select!{_ = cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_millis(1500),events.send(Event::Message(message)))=>{result.map_err(|_|ProtocolError::new(ErrorCode::ResourceLimit,"Plugin event queue overflow"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin receiver closed"))?;}}
      }
     }
    }}.await;
             cancel.cancel();
             write_task.abort();
             let _ = write_task.await;
-            reap(&mut child).await;
+            // Revoke broker authority even if the kernel delays termination.
+            // Closing a full event queue also makes the manager stop after it
+            // drains the already-bounded messages; it cannot wait on reaping.
             if let Err(error) = result {
                 let _ = events.try_send(Event::Stopped(error));
             }
+            drop(events);
+            reap(&mut child).await;
+            #[cfg(test)]
+            drop(reaping.lock().await);
             done.cancel();
         });
         if source.len() > limits::BUNDLE {
@@ -160,14 +290,14 @@ impl Host {
     pub async fn send(&self, method: &str, params: Value) -> Result<u64> {
         let id = self.sequence.fetch_add(1, Ordering::Relaxed);
         if method != "initialize" {
-            let mut progress = self.progress.lock().await;
-            if progress.len() >= 16 {
+            let mut progress = self.progress.lock().unwrap();
+            if progress.pending.len() >= 16 {
                 return Err(ProtocolError::new(
                     ErrorCode::ResourceLimit,
                     "Too many host calls",
                 ));
             }
-            progress.insert(id, Instant::now());
+            progress.pending.insert(id, Instant::now());
         }
         self.write(json!({"jsonrpc":"2.0","generation":self.generation,"id":id,"method":method,"params":params})).await?;
         Ok(id)
@@ -192,19 +322,34 @@ impl Host {
             ));
         }
         bytes.push(b'\n');
-        tokio::select! {_ = self.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin is stopped")),result=tokio::time::timeout(Duration::from_secs(2),self.writer.send(Outbound{bytes}))=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"Plugin input queue timed out"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin input closed"))}
+        tokio::select! {_ = self.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin is stopped")),result=tokio::time::timeout(Duration::from_millis(1500),self.writer.send(Outbound{bytes}))=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"Plugin input queue timed out"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin input closed"))}
     }
-    pub async fn stop(&self) {
+    pub async fn stop(&self) -> bool {
         let finished = tokio::time::timeout(Duration::from_millis(500), async {
             let _ = self.send("deactivate", json!({})).await;
             self.done.cancelled().await;
         })
         .await;
         if finished.is_ok() {
-            return;
+            return true;
         }
         self.cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_millis(1500), self.done.cancelled()).await;
+        tokio::time::timeout(Duration::from_millis(1500), self.done.cancelled())
+            .await
+            .is_ok()
+    }
+    pub async fn reaped(&self) {
+        self.done.cancelled().await;
+    }
+    /// When the last parent call yielded, or None while one is pending.
+    pub fn settled(&self) -> Option<Instant> {
+        let progress = self.progress.lock().unwrap();
+        progress.pending.is_empty().then_some(progress.settled)
+    }
+    /// Calls the child has not yet yielded, for tests that pace long loops.
+    #[cfg(test)]
+    pub async fn outstanding(&self) -> usize {
+        self.progress.lock().unwrap().pending.len()
     }
     pub fn revoke(&self) {
         self.cancel.cancel();
@@ -242,5 +387,253 @@ async fn read_frame(
         if end.is_some() {
             return Ok(());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn unresponsive(root: &Path) -> std::path::PathBuf {
+        script(root, "unresponsive-host", "exec /bin/sleep 60")
+    }
+    /// A fake host. The environment is cleared, so commands use absolute paths.
+    fn script(root: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = root.join(name);
+        // exec replaces the shell: the supervisor owns the only process.
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+    fn manifest() -> Manifest {
+        Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap()
+    }
+    /// The stop reason, or None when a full event queue dropped it (the
+    /// manager then reports the exit), and the messages forwarded before it.
+    async fn stopped(events: &mut mpsc::Receiver<Event>) -> (Option<ProtocolError>, usize) {
+        let mut messages = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .expect("fault must stop the generation")
+            {
+                Some(Event::Message(_)) => messages += 1,
+                Some(Event::Stopped(error)) => return (Some(error), messages),
+                None => return (None, messages),
+            }
+        }
+    }
+    // Reads the generation from the first initialize frame, floods requests
+    // between pauses in which it reads nothing else, then records replies
+    // while keeping its output pipe open on fd 3.
+    const REQUESTS: &str = "IFS= read -r line\n\
+        generation=$(printf '%s' \"$line\" | /bin/sed 's/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/')\n\
+        /bin/sleep PAUSE\n\
+        i=1; while [ $i -le COUNT ]; do printf '{\"jsonrpc\":\"2.0\",\"generation\":\"%s\",\"id\":%d,\"method\":\"host.request\",\"params\":{\"operation\":\"settings.get\",\"params\":{}}}\\n' \"$generation\" $i; i=$((i+1)); done\n\
+        /bin/sleep PAUSE\n\
+        exec 3>&1\nexec /bin/cat > OUT";
+    #[tokio::test]
+    async fn oversized_and_malformed_child_frames_stop_the_generation() {
+        let root = tempfile::tempdir().unwrap();
+        for (body, code, message) in [
+            (
+                "/bin/head -c 1100000 /dev/zero | /bin/tr '\\0' x\nexec /bin/sleep 60",
+                ErrorCode::ResourceLimit,
+                "Plugin frame exceeds 1 MiB",
+            ),
+            (
+                "printf 'not json\\n'\nexec /bin/sleep 60",
+                ErrorCode::InvalidMessage,
+                "Invalid JSON",
+            ),
+        ] {
+            let executable = script(root.path(), "fake-host", body);
+            let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+            let error = stopped(&mut events).await.0.expect("stop reason");
+            assert_eq!((error.data.code, error.message.as_str()), (code, message));
+        }
+    }
+    #[tokio::test]
+    async fn child_error_responses_stop_with_a_fixed_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let body = "IFS= read -r line\n\
+            generation=$(printf '%s' \"$line\" | /bin/sed 's/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/')\n\
+            printf '{\"jsonrpc\":\"2.0\",\"generation\":\"%s\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"forged host text\",\"data\":{\"code\":\"TIMEOUT\"}}}\\n' \"$generation\"\n\
+            exec /bin/sleep 60";
+        let executable = script(root.path(), "responding-host", body);
+        let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+        let error = stopped(&mut events).await.0.expect("stop reason");
+        assert_eq!(
+            (error.data.code, error.message.as_str()),
+            (ErrorCode::InvalidMessage, "Unexpected plugin host response")
+        );
+    }
+    #[tokio::test]
+    async fn parent_request_quota_answers_excess_and_stops_repeated_violations() {
+        let root = tempfile::tempdir().unwrap();
+        let replies = root.path().join("replies");
+        let body = REQUESTS
+            .replace("COUNT", "42")
+            .replace("PAUSE", "0.5")
+            .replace("OUT", replies.to_str().unwrap());
+        let executable = script(root.path(), "flooding-host", &body);
+        let (host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+        // While the host reads nothing, fill its pipe and the input queue so
+        // the quota replies below cannot be queued at once.
+        for id in 1000..1003 {
+            host.respond(id, Ok(json!("x".repeat(600_000))))
+                .await
+                .unwrap();
+        }
+        // The backstop allows twice the host's own quota before answering.
+        for _ in 0..40 {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
+            assert!(matches!(event, Ok(Some(Event::Message(_)))));
+        }
+        // Two excess requests are answered with a bounded error, not fatal.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), events.recv())
+                .await
+                .is_err()
+        );
+        let until = Instant::now() + Duration::from_secs(3);
+        let rejected = loop {
+            let written = std::fs::read_to_string(&replies).unwrap_or_default();
+            let rejected: Vec<Value> = written
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .filter(|reply: &Value| reply["error"]["data"]["code"] == "RESOURCE_LIMIT")
+                .map(|reply| reply["id"].clone())
+                .collect();
+            if rejected.len() >= 2 || Instant::now() >= until {
+                break rejected;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(rejected, [json!(41), json!(42)]);
+        assert!(host.stop().await);
+        let body = REQUESTS
+            .replace("COUNT", "45")
+            .replace("PAUSE", "0")
+            .replace("OUT", "/dev/null");
+        let executable = script(root.path(), "flooding-host", &body);
+        let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+        let (error, messages) = stopped(&mut events).await;
+        assert_eq!(messages, 40);
+        assert!(error.is_none_or(|e| e.message == "Plugin request quota exceeded"));
+    }
+    #[tokio::test]
+    async fn only_yields_that_end_a_pending_call_are_forwarded() {
+        let root = tempfile::tempdir().unwrap();
+        // Yields a call that was never made, then the real activation call.
+        let yields = "IFS= read -r line\n\
+            generation=$(printf '%s' \"$line\" | /bin/sed 's/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/')\n\
+            IFS= read -r line\n\
+            for id in 99 2; do printf '{\"jsonrpc\":\"2.0\",\"generation\":\"%s\",\"method\":\"ready\",\"params\":{\"phase\":\"yielded\",\"requestId\":%d}}\\n' \"$generation\" $id; done\n\
+            exec /bin/sleep 60";
+        let executable = script(root.path(), "yielding-host", yields);
+        let (host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+        assert_eq!(host.send("activate", json!({})).await.unwrap(), 2);
+        let Ok(Some(Event::Message(message))) =
+            tokio::time::timeout(Duration::from_secs(2), events.recv()).await
+        else {
+            panic!("the real yield is forwarded");
+        };
+        assert_eq!(message.params.unwrap()["requestId"], 2);
+        assert!(host.settled().is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(host.stop().await);
+    }
+    #[tokio::test]
+    async fn child_memory_above_the_limit_stops_it() {
+        let root = tempfile::tempdir().unwrap();
+        // dd keeps refilling one touched 220 MiB block until it is stopped. It
+        // reopens of= on stdout, so fd 3 keeps the output pipe open.
+        let executable = script(
+            root.path(),
+            "growing-host",
+            "exec 3>&1\nexec /bin/dd if=/dev/zero of=/dev/null bs=220M count=1000 status=none",
+        );
+        let started = Instant::now();
+        let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+        let error = stopped(&mut events).await.0.expect("stop reason");
+        assert_eq!(error.message, "Plugin host memory limit");
+        // Sampled every 500 ms and contained within the 2 s fault deadline.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+    #[tokio::test]
+    async fn only_known_host_stop_reasons_are_reported() {
+        let root = tempfile::tempdir().unwrap();
+        for (line, known) in [
+            (
+                "Plugin host stopped: Unhandled plugin promise rejection",
+                true,
+            ),
+            ("Plugin host stopped: private token 1234", false),
+            ("private plugin output", false),
+        ] {
+            let executable = script(
+                root.path(),
+                "exiting-host",
+                &format!("IFS= read -r line\nprintf '%s\\n' '{line}' >&2\nexit 1"),
+            );
+            let (_host, mut events) = Host::spawn(&executable, &manifest(), "").await.unwrap();
+            let error = stopped(&mut events).await.0.expect("stop reason");
+            if known {
+                assert_eq!(error.message, line);
+            } else {
+                // Either exit observation is generic; stderr text never leaks.
+                assert!(
+                    ["Plugin pipe closed", "Plugin host exited"].contains(&error.message.as_str())
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn unresponsive_child_is_reaped_inside_the_fault_and_shutdown_deadlines() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = unresponsive(root.path());
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let (host, mut events) = Host::spawn(&executable, &manifest, "").await.unwrap();
+        let start = Instant::now();
+        host.send("activate", json!({})).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("fault must be contained within 2 s");
+        assert!(matches!(event, Some(Event::Stopped(_))));
+        host.reaped().await;
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let (host, _events) = Host::spawn(&executable, &manifest, "").await.unwrap();
+        let start = Instant::now();
+        assert!(host.stop().await);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[tokio::test]
+    async fn dropped_initialization_cancels_supervision_and_reaps_the_owned_child() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = unresponsive(root.path());
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let (host, _events) = Host::spawn(&executable, &manifest, "").await.unwrap();
+        let reaped = host.done.clone();
+        drop(host);
+        tokio::time::timeout(Duration::from_secs(2), reaped.cancelled())
+            .await
+            .expect("last host handle must not leak a process");
     }
 }

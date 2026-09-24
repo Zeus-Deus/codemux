@@ -1,0 +1,65 @@
+{
+  "platform": "linux",
+  "os": "6.8.0-1064-azure",
+  "cpu": "AMD EPYC 9V74 80-Core Processor",
+  "logicalCpus": 4,
+  "hostSha256": "596d0feca78ac8d29f757023b025cf6834393878c43837919cc9d5bb3a8cb24a",
+  "bundles": [
+    {
+      "format": ".deb",
+      "packagedSha256": "596d0feca78ac8d29f757023b025cf6834393878c43837919cc9d5bb3a8cb24a",
+      "provenance": "exact-sha256",
+      "hostPath": "usr/lib/codemux/binaries/codemux-addon-host-linux-x64",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1005.3854839999999
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 3.4434689999998227
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 2.564151999999922
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1002.983788
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 3.0863899999999376
+        }
+      ]
+    },
+    {
+      "format": ".AppImage",
+      "packagedSha256": "99deefd50560c56c965e1c431ee3b10dc891d50a4dca1bc7632ccbc9d7221ac3",
+      "provenance": "elf-sections-and-dynamic-metadata",
+      "hostPath": "squashfs-root/usr/lib/codemux/binaries/codemux-addon-host-linux-x64",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1003.4534299999996
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 3.559374000000389
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 2.632434000000103
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1003.2999260000006
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 3.2605430000003253
+        }
+      ]
+    }
+  ]
+}

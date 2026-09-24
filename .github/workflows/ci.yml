@@ -13,6 +13,7 @@ on:
   pull_request:
     branches:
       - main
+      - 'codex/addons-*'
 
 # Cancel in-flight runs for the same branch when a new commit is pushed.
 concurrency:
@@ -61,6 +62,12 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
+
+      - name: Release policy guard
+        # Catalog and add-on releases must not take the desktop's Latest
+        # release or v* tags; desktop releases upload only gated bundles.
+        if: matrix.os == 'ubuntu-latest'
+        run: node --test scripts/addons/release-policy-check.mjs
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -444,3 +451,25 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then suffix=windows-x64.exe; fi
           export CODEMUX_TEST_ADDON_HOST="$PWD/src-tauri/binaries/codemux-addon-host-$suffix"
           cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::manager::tests::native_ -- --ignored --test-threads=2
+
+      - name: Native full-filesystem add-on recovery
+        if: runner.os == 'Linux'
+        run: bash scripts/addons/full-filesystem.sh
+
+      - name: Install Linux Secret Service
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends gnome-keyring
+
+      - name: Linux native credential backend
+        if: runner.os == 'Linux'
+        # A private session bus with a throwaway, unlocked login collection
+        # proves a real Secret Service save/read/delete. The installed-app
+        # harness covers only the missing-service fallback on Linux.
+        shell: dbus-run-session -- bash --noprofile --norc -eo pipefail {0}
+        run: |
+          printf '%s' ci-only-keyring-password | gnome-keyring-daemon --unlock --components=secrets --daemonize > /dev/null
+          cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
+
+      - name: Windows native credential backend
+        if: runner.os == 'Windows'
+        run: cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
