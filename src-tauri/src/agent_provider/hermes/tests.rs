@@ -630,30 +630,80 @@ async fn hermes_workspace_delete_is_blocked_even_with_force() {
     assert!(sentinel.is_file());
 }
 
+/// The close path must not hold the lifecycle lock across teardown, yet a
+/// hold committed after teardown and before the delete must still win.
 #[tokio::test]
-async fn hermes_deletion_waits_for_startup_cleanup_hold() {
+async fn hermes_deletion_rechecks_cleanup_hold_under_lifecycle_lock() {
+    use tauri::Manager;
     let root = tempfile::tempdir().unwrap();
-    let db = crate::database::init_test_database();
-    let state = crate::state::AppStateStore::default();
+    let repo = root.path().join("repo");
+    let work = root.path().join("work");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec![
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        vec!["worktree", "add", "-b", "fixture", work.to_str().unwrap()],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let app = tauri::test::mock_app();
+    app.manage(crate::state::AppStateStore::default());
+    app.manage(crate::database::init_test_database());
+    app.manage(crate::terminal::PtyState::default());
+    let state = app.state::<crate::state::AppStateStore>();
+    let db = app.state::<crate::database::DatabaseStore>();
+    let workspace = state.create_workspace_at_path(work.clone());
+    state.set_workspace_worktree(&workspace.0, work.display().to_string(), "fixture".into());
     let starting = WORKTREE_LIFECYCLE.lock().await;
     let deleting = crate::commands::workspace::close_workspace_with_worktree_impl(
         app.handle().clone(),
         &state,
         &db,
-        "workspace".into(),
+        workspace.0.clone(),
         true,
         None,
         Some(true),
     );
     tokio::pin!(deleting);
-    assert!(futures_util::poll!(&mut deleting).is_pending());
-    db.save_hermes_binding(&test_binding(root.path())).unwrap();
+    // Everything before the delete, including the state close, proceeds
+    // while a Hermes start holds the lock.
+    for _ in 0..1000 {
+        assert!(futures_util::poll!(&mut deleting).is_pending());
+        if !state.snapshot().workspaces.iter().any(|w| w.workspace_id == workspace) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!state.snapshot().workspaces.iter().any(|w| w.workspace_id == workspace));
+    let mut binding = test_binding(root.path());
+    binding.workspace_id = None;
+    binding.cwd = work.canonicalize().unwrap();
+    db.save_hermes_binding(&binding).unwrap();
     drop(starting);
     assert!(deleting
         .await
         .unwrap_err()
         .contains("Hermes worktree cleanup pending"));
+    assert!(work.is_dir());
 }
 
 /// The failing executable is a transport-failure fixture, never a substitute Hermes.

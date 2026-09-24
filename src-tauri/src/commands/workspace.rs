@@ -1204,7 +1204,9 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
 ) -> Result<(), String> {
-    let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+    // Fast refusal while the workspace is still intact. Not under the
+    // Hermes lifecycle lock: teardown must not serialize every close, so
+    // the hold is re-checked under the lock right before the delete.
     if remove_worktree && db.hermes_cleanup_pending(&workspace_id)? {
         return Err("Hermes worktree cleanup pending: the official runtime has no background-drain acknowledgment. Close or archive without deleting files.".into());
     }
@@ -1425,6 +1427,14 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
             // with no live row left to escalate from. Forcing here closes
             // that hole; the pre-flight remains the only place uncommitted
             // work can block the close.
+            //
+            // Hermes startup commits its cleanup hold under the same lock, so
+            // either the hold is visible here or the start finds the
+            // directory gone. Held only for this check and the delete.
+            let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+            if db.hermes_cleanup_pending(&workspace_id)? || db.hermes_cleanup_pending_path(&wt_path)? {
+                return Err("Hermes worktree cleanup pending: files retained until background completion can be verified.".into());
+            }
             tokio::task::spawn_blocking(move || {
                 crate::git::git_remove_worktree(
                     Path::new(&wt_path),
@@ -2189,7 +2199,6 @@ pub async fn close_workspace<R: tauri::Runtime>(
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
-    let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
     let force = force_delete.unwrap_or(false);
 
     // We still need cwd + title for teardown + MCP cleanup before the
