@@ -405,14 +405,19 @@
 /* The GUI titlebar remains fully transparent by default. When runtime
  * geometry says its controls physically intersect the centered chat column
  * AND that transcript has scrolled underneath, each control run lights a
- * soft radial wash of the window background centred on itself.
+ * soft wash of the window background behind itself.
  *
  * A wash, not a plate: there is no rectangle, no border and no shadow, so
  * nothing reads as a floating card sitting on the conversation — the light
- * just fades out in every direction until the transcript is untouched.
- * Crucially each island lights only its own neighbourhood, so between the
- * two runs the transcript still runs clean to the very top edge; there is
- * no full-width layer anywhere in this treatment. */
+ * just fades out until the transcript is untouched. Crucially each island
+ * lights only its own neighbourhood, so between the two runs the transcript
+ * still runs clean to the very top edge; there is no full-width layer
+ * anywhere in this treatment.
+ *
+ * The fade is a mask on a flat fill rather than a gradient background: a
+ * mask reaches alpha 0 exactly at the box edge, so the box can never clip
+ * the fade into a visible straight line, and the solid area stays pinned
+ * under the controls regardless of the island's width. */
 .titlebar-overlap-wash {
   /* Positioning context + own stacking context, so the z-index: -1 wash
      below tucks under this island's controls without falling behind the
@@ -428,42 +433,47 @@
   pointer-events: none;
   opacity: 0;
   transition: opacity 120ms ease-out;
+  /* Both islands are 32px tall inset 4px from the top of the 40px band, so
+     -4px pins the wash to the physical top of the window. It stays solid
+     down to the bottom of the 40px band and feathers out over the next 28px. */
+  top: -4px;
+  height: 68px;
+  background: var(--background);
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
 }
 
-/* Tab run. The islands are 32px tall inset 4px from the top of the 40px
-   band, so -4px pins the wash to the physical top of the window; it spills
-   past both island edges to give the fade room to resolve. */
+/* Tab run. The left edge stops at the sidebar (-6px is the band's inset
+   from it), mirroring how the action run stops at the open panel: nothing
+   paints over the sidebar or its floating toggle, and a solid edge flush
+   against the sidebar shows no seam. Only the right side feathers, over a
+   40px spill, so the whole island sits on solid background. */
 .titlebar-overlap-wash-start::before {
-  top: -4px;
-  left: -24px;
-  right: -24px;
-  height: 44px;
-  background: radial-gradient(
-    120% 150% at 50% 0%,
-    var(--background) 0%,
-    var(--background) 46%,
-    color-mix(in oklch, var(--background) 62%, transparent) 72%,
-    transparent 100%
-  );
+  left: -6px;
+  right: -40px;
+  -webkit-mask-image:
+    linear-gradient(to left, transparent, #000 40px),
+    linear-gradient(to bottom, #000 40px, transparent);
+  mask-image:
+    linear-gradient(to left, transparent, #000 40px),
+    linear-gradient(to bottom, #000 40px, transparent);
 }
 
-/* Action run. Centred on the top-right corner and extended out to the
-   window's right edge (`--wash-right-extend` is set inline from the title
-   bar and equals the band's own right inset), so the panel toggle and the
-   native window buttons sit in the same light as the actions themselves
-   instead of being stranded on bare transcript. */
+/* Action run. Extended out to the window's right edge (`--wash-right-extend`
+   is set inline from the title bar and equals the band's own right inset),
+   so the panel toggle and the native window buttons sit in the same light as
+   the actions themselves instead of being stranded on bare transcript. That
+   side meets the window (or the open panel's own background), so only the
+   left side feathers. */
 .titlebar-overlap-wash-end::before {
-  top: -4px;
-  left: -28px;
+  left: -40px;
   right: calc(-1 * var(--wash-right-extend, 28px));
-  height: 48px;
-  background: radial-gradient(
-    155% 165% at 100% 0%,
-    var(--background) 0%,
-    var(--background) 50%,
-    color-mix(in oklch, var(--background) 60%, transparent) 74%,
-    transparent 100%
-  );
+  -webkit-mask-image:
+    linear-gradient(to right, transparent, #000 40px),
+    linear-gradient(to bottom, #000 40px, transparent);
+  mask-image:
+    linear-gradient(to right, transparent, #000 40px),
+    linear-gradient(to bottom, #000 40px, transparent);
 }
 
 [data-chat-overlap="true"] .titlebar-overlap-wash::before {
