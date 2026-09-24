@@ -13,6 +13,9 @@
 //!   2. nothing is bound on the configured port,
 //!   3. `lan_enabled` is still `false` on disk,
 //!   4. pairing refuses (a pairing link would point at nothing),
+//!   4b. the same holds after remote access is switched off: relay-only with
+//!      the kill switch off is still relay-only, not a first run — a bare serve
+//!      keeps the listener off and the persisted scope (no `all` default),
 //!   5. an explicit `--port` is a request for the listener and opens it.
 //!
 //! Isolation matches the other headless-serve tests: every state-dir resolver
@@ -116,6 +119,35 @@ fn bare_serve_keeps_a_relay_only_setup_off_the_network() {
     // ── 4. No pairing link without a listener. ──
     let err = web_remote::control_pair(&handle, None).expect_err("pairing must refuse");
     assert!(err.contains("On my network"), "names the switch: {err}");
+
+    // ── 4b. Kill switch off (`codemux remote disable`), then a bare serve —
+    //        the `codemux connect` unit at the next boot. ──
+    web_remote::control_disable(&handle).expect("disable");
+    let cfg = persisted();
+    assert!(!cfg.enabled && cfg.relay_mode_enabled && !cfg.lan_enabled);
+    let result = tauri::async_runtime::block_on(serve_startup(
+        &handle,
+        &ServeOptions {
+            scope: None,
+            port: None,
+            relay: false,
+        },
+    ))
+    .expect("relay-only serve startup succeeds with the kill switch off");
+    assert!(result.status.enabled, "serve turns remote access back on");
+    assert!(!result.status.lan_enabled && !result.status.running);
+    assert_eq!(
+        result.status.bind_scope,
+        web_remote::BIND_SCOPE_LOOPBACK,
+        "the persisted scope is kept, not reset to `all`"
+    );
+    assert!(result.status.relay_running, "the relay transport is up");
+    let probe = std::net::TcpListener::bind(("127.0.0.1", port))
+        .expect("the relay-only serve must not hold the LAN port");
+    drop(probe);
+    let cfg = persisted();
+    assert!(cfg.enabled && !cfg.lan_enabled, "lan_enabled is still false on disk");
+    assert_eq!(cfg.bind_scope, web_remote::BIND_SCOPE_LOOPBACK);
 
     // ── 5. An explicit `--port` asks for the listener. ──
     let result = tauri::async_runtime::block_on(serve_startup(

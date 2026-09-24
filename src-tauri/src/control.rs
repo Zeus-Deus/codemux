@@ -1689,19 +1689,18 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 .get("port")
                 .and_then(Value::as_u64)
                 .and_then(|p| u16::try_from(p).ok());
-            // `codemux connect` sets `keep_relay_only`: it brings remote access
-            // up as configured, so a relay-only setup stays off the LAN.
-            // `codemux remote enable` omits it — that command opens the listener.
+            // `codemux connect` sends `keep_relay_only`, decided on the config
+            // as it was before it turned relay mode on, so a relay-only setup
+            // stays off the LAN. `codemux remote enable` omits it — that
+            // command opens the listener.
             let keep_relay_only = request
                 .params
                 .get("keep_relay_only")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let result = if keep_relay_only {
-                crate::web_remote::control_enable_as_configured(app, scope, port).await
-            } else {
-                crate::web_remote::control_enable(app, scope, port).await
-            };
+            let result =
+                crate::web_remote::control_enable_as_configured(app, scope, port, keep_relay_only)
+                    .await;
             result.and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
         }
         // Turn the from-anywhere relay transport on/off in this running

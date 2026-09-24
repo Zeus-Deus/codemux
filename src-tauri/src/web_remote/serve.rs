@@ -181,8 +181,22 @@ pub async fn serve_startup<R: tauri::Runtime>(
 ) -> Result<web_remote::ControlEnableResult, String> {
     // `restore_on_boot` may already have bound the server (GUI mode); under
     // serve it only hydrates, and `control_enable` handles both (`already_running`).
-    let persisted_enabled = web_remote::web_remote_status(handle.clone()).enabled;
-    let scope = resolve_scope(opts.scope.clone(), persisted_enabled);
+    let persisted = web_remote::web_remote_status(handle.clone());
+    // Decide relay-only on the switches as persisted, BEFORE `--relay` below
+    // turns relay mode on (which would make a fresh config look relay-only).
+    // An explicit relay-only setup stays relay-only even with the kill switch
+    // off, and then keeps its persisted scope too — the first-run `all`
+    // default below exists to open a listener.
+    let keep_relay_only = web_remote::keeps_relay_only(
+        persisted.relay_mode_enabled,
+        persisted.lan_enabled,
+        opts.scope.is_some() || opts.port.is_some(),
+    );
+    let scope = if keep_relay_only {
+        None
+    } else {
+        resolve_scope(opts.scope.clone(), persisted.enabled)
+    };
 
     // `--relay` first: flip relay mode on through the same config path the
     // Settings pane uses, BEFORE binding. Relay mode does not need the LAN
@@ -200,7 +214,7 @@ pub async fn serve_startup<R: tauri::Runtime>(
     // As configured, not "open the listener": a relay-only setup (the user
     // switched "On my network" off) must not come back listening on the LAN
     // after a restart. Explicit `--scope` / `--port` still turn it on.
-    web_remote::control_enable_as_configured(handle, scope, opts.port)
+    web_remote::control_enable_as_configured(handle, scope, opts.port, keep_relay_only)
         .await
         .map_err(|e| format!("could not enable the web-remote server: {e}"))
 }

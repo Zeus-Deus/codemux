@@ -546,7 +546,7 @@ pub struct ControlEnableResult {
 
 /// Validate an enable request's scope and fold it (plus the port) into `cfg`,
 /// flipping `enabled` and the LAN listener (`lan_enabled`) on. Callers that
-/// may keep a relay-only setup decide that first (see [`enable_opens_lan`]).
+/// may keep a relay-only setup decide that first (see [`keeps_relay_only`]).
 /// Pure so the config side of [`control_enable`] is
 /// unit-testable without an `AppHandle`. On an unknown scope it returns a clear
 /// error and leaves `cfg` untouched (nothing is persisted).
@@ -571,18 +571,22 @@ fn apply_enable_request(
     Ok(())
 }
 
-/// Whether an enable request switches the LAN listener on. `codemux remote
-/// enable` (`open_lan`) always does, and so does any `--scope` / `--port` flag
-/// (`has_lan_flags`) — both are about the listener. Otherwise (`codemux serve` /
-/// `codemux connect` with no LAN flags) an explicit relay-only setup — remote
-/// access on, relay mode on, listener off — is kept as the user configured it,
-/// and the listener comes on only when nothing else would be reachable: on a
-/// first run (remote access off) or with relay mode off.
+/// Whether a `codemux serve` / `codemux connect` request keeps a relay-only
+/// setup relay-only instead of switching the LAN listener on.
 ///
-/// `cfg` must already carry the request's relay intent (`codemux connect` turns
-/// relay mode on; `serve --relay` has applied it). Pure so it is unit-testable.
-pub(crate) fn enable_opens_lan(cfg: &WebRemoteConfig, open_lan: bool, has_lan_flags: bool) -> bool {
-    open_lan || has_lan_flags || cfg.lan_enabled || !cfg.enabled || !cfg.relay_mode_enabled
+/// Relay-only is an explicit choice — relay mode on, "On my network" off — and
+/// it survives the kill switch: a user who set it up and then turned remote
+/// access off has still chosen that nothing listens on their network. So it is
+/// kept whether `enabled` is on or off. Anything else opens the listener (a
+/// fresh config has both switches off, so a first run still does), and so do
+/// explicit `--scope` / `--port` flags. `codemux remote enable` never asks.
+///
+/// Callers must pass the relay and LAN switches as persisted **before** the
+/// request changed anything — `connect` and `serve --relay` turn relay mode on
+/// first, which would otherwise make a fresh config look relay-only. Pure so
+/// it is unit-testable.
+pub fn keeps_relay_only(relay_mode_enabled: bool, lan_enabled: bool, has_lan_flags: bool) -> bool {
+    !has_lan_flags && relay_mode_enabled && !lan_enabled
 }
 
 /// The recommended reachable endpoint for `port`: the single `recommended` pick
@@ -615,26 +619,29 @@ pub async fn control_enable<R: Runtime>(
     scope: Option<String>,
     port: Option<u16>,
 ) -> Result<ControlEnableResult, String> {
-    enable_request(app, scope, port, true).await
+    enable_request(app, scope, port, false).await
 }
 
 /// [`control_enable`] for `codemux serve` and `codemux connect`, which bring
 /// remote access up as the user configured it rather than to open the LAN
-/// listener: with no `scope`/`port`, a relay-only setup stays relay-only and
-/// nothing listens on the network (see [`enable_opens_lan`]).
+/// listener. `keep_relay_only` is the caller's [`keeps_relay_only`] decision,
+/// taken on the config as it was before the request touched it: when set (and
+/// no `scope`/`port` is passed) remote access comes on relay-only and nothing
+/// listens on the network. Otherwise this is exactly [`control_enable`].
 pub async fn control_enable_as_configured<R: Runtime>(
     app: &AppHandle<R>,
     scope: Option<String>,
     port: Option<u16>,
+    keep_relay_only: bool,
 ) -> Result<ControlEnableResult, String> {
-    enable_request(app, scope, port, false).await
+    enable_request(app, scope, port, keep_relay_only).await
 }
 
 async fn enable_request<R: Runtime>(
     app: &AppHandle<R>,
     scope: Option<String>,
     port: Option<u16>,
-    open_lan: bool,
+    keep_relay_only: bool,
 ) -> Result<ControlEnableResult, String> {
     let shared = app.state::<WebRemoteState>().shared();
     // Decide against the persisted config, never against the pre-boot default:
@@ -645,13 +652,9 @@ async fn enable_request<R: Runtime>(
     // open it, so a relay-only setup takes the off → on path below.
     let already_enabled = lan_wanted(&shared.config.lock().unwrap());
     let already_bound = shared.runtime.lock().unwrap().is_some();
-    let opens_lan = enable_opens_lan(
-        &shared.config.lock().unwrap(),
-        open_lan,
-        scope.is_some() || port.is_some(),
-    );
+    let relay_only = keep_relay_only && scope.is_none() && port.is_none();
 
-    let (status, already_running) = if !opens_lan {
+    let (status, already_running) = if relay_only {
         // Relay-only, kept as configured: make sure the relay is up (a no-op
         // for the listener, which stays off).
         let relay_was_up = shared.iroh.is_running();
@@ -2517,22 +2520,17 @@ mod tests {
 
     #[test]
     fn serve_and_connect_keep_a_relay_only_setup_without_lan_flags() {
-        let cfg = |enabled, lan_enabled, relay_mode_enabled| WebRemoteConfig {
-            enabled,
-            lan_enabled,
-            relay_mode_enabled,
-            ..WebRemoteConfig::default()
-        };
-        let relay_only = cfg(true, false, true);
-        assert!(!enable_opens_lan(&relay_only, false, false), "relay-only is kept");
-        assert!(enable_opens_lan(&relay_only, false, true), "a --scope/--port flag opens it");
-        assert!(enable_opens_lan(&relay_only, true, false), "`remote enable` opens it");
-        // Nothing else would be reachable: first run, or relay mode off.
-        assert!(enable_opens_lan(&cfg(false, false, true), false, false));
-        assert!(enable_opens_lan(&cfg(true, false, false), false, false));
-        assert!(enable_opens_lan(&WebRemoteConfig::default(), false, false));
-        // An already-on listener stays on.
-        assert!(enable_opens_lan(&cfg(true, true, true), false, false));
+        // (relay_mode_enabled, lan_enabled, has_lan_flags), as persisted
+        // before the request.
+        assert!(keeps_relay_only(true, false, false), "relay-only is kept");
+        assert!(!keeps_relay_only(true, false, true), "a --scope/--port flag opens it");
+        // A fresh config has both switches off: a first run opens the listener
+        // (the relay intent `connect` / `serve --relay` add comes after).
+        assert!(!keeps_relay_only(false, false, false));
+        assert!(!keeps_relay_only(true, true, false), "an on listener stays on");
+        assert!(!keeps_relay_only(false, true, false));
+        // The kill switch is not an input: relay-only set up and then switched
+        // off is still relay-only (see the `enabled`-less signature).
     }
 
     #[test]
