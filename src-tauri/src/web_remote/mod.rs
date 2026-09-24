@@ -1050,6 +1050,14 @@ async fn start_relay<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
         log::warn!("[codemux::web_remote] relay transport start failed: {e}");
         shared.registration.note_transport_error(&e);
     }
+    // Relay (or remote access) may have been switched off while the bind was
+    // in flight — `stop_relay` found nothing to tear down then. Don't start a
+    // registration loop that would list the device at an address nothing
+    // listens on, and drop any endpoint that got installed after that stop.
+    if !relay_wanted(&shared.config.lock().unwrap()) {
+        iroh::stop(shared);
+        return;
+    }
     registration::start(app, shared);
 }
 

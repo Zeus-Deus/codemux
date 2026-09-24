@@ -99,6 +99,9 @@ struct RegistrationInner {
     /// The periodic-refresh task, kept so `stop` can abort it. `Some` while
     /// relay-mode registration is active.
     refresh: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Bumped by every [`start`] that spawns a loop, so a loop ending on its
+    /// own only clears `refresh` if no newer loop has replaced it.
+    generation: u64,
 }
 
 /// Owns the device-registration lifecycle (the periodic refresh task + the last
@@ -122,6 +125,7 @@ impl RegistrationManager {
         status
     }
 
+    #[cfg(test)]
     fn is_running(&self) -> bool {
         self.inner.lock().unwrap().refresh.is_some()
     }
@@ -310,31 +314,53 @@ async fn supervise_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) ->
     register_once(app, shared).await
 }
 
+/// The supervisor loop [`start`] spawns. Each cycle first checks that relay is
+/// still wanted: if relay (or remote access) was switched off without this
+/// loop being aborted — `stop_relay` ran before the loop existed — it ends
+/// rather than keep advertising the persisted node id.
+async fn supervise<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, generation: u64) {
+    let mut failures = 0u32;
+    while super::relay_wanted(&shared.config.lock().unwrap()) {
+        if supervise_once(&app, &shared).await {
+            failures = 0;
+            tokio::time::sleep(REFRESH_INTERVAL).await;
+        } else {
+            failures = failures.saturating_add(1);
+            tokio::time::sleep(retry_delay(failures)).await;
+        }
+    }
+    {
+        let mut inner = shared.registration.inner.lock().unwrap();
+        if inner.generation != generation {
+            return; // superseded by a newer loop
+        }
+        inner.refresh = None;
+        inner.status.registered = false;
+    }
+    // `refresh` is cleared first, so a `start` that no-op'd against this
+    // exiting loop is caught here: relay was turned back on → run a fresh
+    // loop; still off → drop any endpoint a racing bind left installed.
+    if super::relay_wanted(&shared.config.lock().unwrap()) {
+        start(&app, &shared);
+    } else {
+        super::iroh::stop(&shared);
+    }
+}
+
 /// Start the relay supervisor: bring the endpoint up if needed and register
 /// immediately, then refresh `lastSeenAt` every [`REFRESH_INTERVAL`] — or, after
 /// a failed cycle, retry on a short backoff ([`retry_delay`]). Runs until
-/// [`stop`]. Idempotent — a second call while the task is live is a no-op.
-/// Non-blocking (the first cycle runs on the spawned task), so enabling relay
-/// mode never waits on the network.
+/// [`stop`] or until relay is no longer wanted. Idempotent — a second call
+/// while the task is live is a no-op. Non-blocking (the first cycle runs on
+/// the spawned task), so enabling relay mode never waits on the network.
 pub(crate) fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
-    if shared.registration.is_running() {
+    let mut inner = shared.registration.inner.lock().unwrap();
+    if inner.refresh.is_some() {
         return;
     }
-    let app = app.clone();
-    let shared_task = shared.clone();
-    let handle = tauri::async_runtime::spawn(async move {
-        let mut failures = 0u32;
-        loop {
-            if supervise_once(&app, &shared_task).await {
-                failures = 0;
-                tokio::time::sleep(REFRESH_INTERVAL).await;
-            } else {
-                failures = failures.saturating_add(1);
-                tokio::time::sleep(retry_delay(failures)).await;
-            }
-        }
-    });
-    shared.registration.inner.lock().unwrap().refresh = Some(handle);
+    inner.generation += 1;
+    let task = supervise(app.clone(), shared.clone(), inner.generation);
+    inner.refresh = Some(tauri::async_runtime::spawn(task));
 }
 
 /// Stop device registration: abort the refresh task and mark the desktop
@@ -384,6 +410,40 @@ mod tests {
         assert_eq!(retry_delay(5), Duration::from_secs(160));
         assert_eq!(retry_delay(6), REFRESH_INTERVAL, "capped at the refresh interval");
         assert_eq!(retry_delay(u32::MAX), REFRESH_INTERVAL, "never overflows");
+    }
+
+    #[tokio::test]
+    async fn supervisor_ends_when_relay_is_off_and_a_later_start_runs_fresh() {
+        // Relay was switched off before the loop could be aborted (the
+        // mid-bind race): the loop must end on its own instead of POSTing the
+        // persisted node id, and clear "already running" so a later enable
+        // starts a new loop rather than no-op'ing.
+        let app = tauri::test::mock_app();
+        let shared = Arc::new(Shared::default());
+        assert!(!super::super::relay_wanted(&shared.config.lock().unwrap()));
+        let generation = {
+            let mut inner = shared.registration.inner.lock().unwrap();
+            inner.generation += 1;
+            inner.refresh = Some(tauri::async_runtime::spawn(async {}));
+            inner.generation
+        };
+        assert!(shared.registration.is_running());
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            supervise(app.handle().clone(), shared.clone(), generation),
+        )
+        .await
+        .expect("the supervisor must end once relay is not wanted");
+        assert!(!shared.registration.is_running(), "the ended loop clears its handle");
+        assert!(!shared.iroh.is_running(), "no endpoint was bound");
+
+        start(app.handle(), &shared);
+        assert_eq!(
+            shared.registration.inner.lock().unwrap().generation,
+            generation + 1,
+            "a later start spawns a fresh loop instead of no-op'ing"
+        );
     }
 
     #[test]

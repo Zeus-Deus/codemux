@@ -710,6 +710,11 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
     if shared.iroh.is_running() {
         return Ok(());
     }
+    // A caller that queued behind `start_lock` may be stale: relay mode could
+    // have been switched off meanwhile. Don't bind an endpoint nobody wants.
+    if !super::relay_wanted(&shared.config.lock().unwrap()) {
+        return Ok(());
+    }
     let key = load_or_create_secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(key)
