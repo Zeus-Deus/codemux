@@ -1639,8 +1639,14 @@ export interface WebRemoteSessionView {
  *  emitted as the `web-remote-state-changed` payload. Mirrors
  *  `web_remote::WebRemoteStatus`. */
 export interface WebRemoteStatus {
+  /** Kill switch for every way in. Off → nothing listens or registers. */
   enabled: boolean;
+  /** Whether the LAN listener (the "On my network" way in) is bound now. */
   running: boolean;
+  /** Whether the LAN listener is switched on under the kill switch. Optional
+   *  so legacy fixtures need not enumerate it; absent means on (before the
+   *  split, `enabled` *was* the listener). */
+  lan_enabled?: boolean;
   port: number;
   require_approval: boolean;
   /** Which interfaces the server binds: `all` | `tailscale` | `loopback`.
@@ -1689,16 +1695,19 @@ export interface WebRemoteStatus {
    *  attempt has run. `null` before then. Mirrors the same-named field on
    *  {@link WebRemoteRegistrationStatus}. */
   device_id?: string | null;
-  /** Why the LAN listener is not bound even though remote access is on (port
-   *  in use, no tailnet address for the `tailscale` scope…). `null` while it
-   *  is bound or remote access is off. The backend keeps retrying while set. */
+  /** Why the LAN listener is not bound even though remote access and its own
+   *  switch are on (port in use, no tailnet address for the `tailscale`
+   *  scope…). `null` while it is bound or not wanted. The backend keeps
+   *  retrying while set. */
   bind_error?: string | null;
   /** Whether the from-anywhere (relay) endpoint is actually up — unlike
    *  `relay_mode_enabled`, which is only the persisted intent. Independent of
    *  `running`: relay mode needs no LAN listener. */
   relay_running?: boolean;
   /** The last device-registration failure, carried live on every broadcast
-   *  (`null` when registered or not yet attempted). */
+   *  (`null` when registered, not yet attempted, or relay is off). Also covers
+   *  the relay endpoint failing to start ("relay transport couldn't start: …"),
+   *  so there is no separate relay error. */
   registration_error?: string | null;
 }
 

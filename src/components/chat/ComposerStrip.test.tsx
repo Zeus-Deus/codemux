@@ -655,6 +655,10 @@ describe("ComposerStrip — usage limit", () => {
     document.querySelector<HTMLElement>('[data-kind="usage"]')!;
 
   it("armed: counts down to the automatic resume with Cancel and Try now", () => {
+    // Pin the clock to midday: 72 minutes after a late-evening "now" crosses
+    // midnight, and the resume time then reads "Wed 00:52" instead of "00:52".
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 14, 12, 0, 0));
     const at = Date.now() + 72 * MIN;
     render(<UsageHarness usageLimit={limit({ resetsAtMs: at - MIN, autoResumeAtMs: at })} />);
     expect(screen.getByTestId("composer-strip")).toHaveAttribute("data-lead", "usage");

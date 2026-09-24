@@ -1,13 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  render,
-  screen,
-  waitFor,
-  within,
-} from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type {
@@ -60,6 +53,9 @@ const cmds = vi.hoisted(() => ({
   webRemoteRetry: vi.fn(),
 }));
 vi.mock("@/tauri/commands", () => cmds);
+
+const opener = vi.hoisted(() => ({ openUrl: vi.fn(() => Promise.resolve()) }));
+vi.mock("@tauri-apps/plugin-opener", () => opener);
 
 import { toast } from "@/lib/toast";
 import { RemoteAccessSection } from "./remote-access-section";
@@ -204,18 +200,29 @@ beforeEach(() => {
 // ── Tests ────────────────────────────────────────────────────────────
 
 describe("RemoteAccessSection — disabled", () => {
-  it("shows the header, an unchecked master toggle, and the exposure warning; hides the server/device panels", async () => {
+  it("shows the header, an unchecked master toggle, and the exposure warning; hides the ways in and devices", async () => {
     render(<RemoteAccessSection />);
     await waitFor(() => expect(cmds.webRemoteStatus).toHaveBeenCalled());
 
     expect(screen.getByRole("heading", { name: /^Remote Access$/i })).toBeInTheDocument();
     const toggle = screen.getByRole("switch", { name: /toggle remote access/i });
     expect(toggle).toHaveAttribute("data-state", "unchecked");
+    // A legacy config (no `lan_enabled`) still has its listener on, scoped to
+    // all networks — so turning this on really would open every interface.
     expect(screen.getByText(/every network interface/i)).toBeInTheDocument();
 
     // Collapsed while off.
-    expect(screen.queryByText(/Reachable at/i)).toBeNull();
-    expect(screen.queryByText(/Paired devices/i)).toBeNull();
+    expect(screen.queryByText(/Ways to connect/i)).toBeNull();
+    expect(screen.queryByText(/^Devices$/)).toBeNull();
+  });
+
+  it("previews that a fresh setup opens nothing by itself", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(status({ lan_enabled: false }));
+    render(<RemoteAccessSection />);
+    expect(
+      await screen.findByText(/doesn't open anything by itself/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/every network interface/i)).toBeNull();
   });
 
   it("enabling calls webRemoteEnable", async () => {
@@ -238,13 +245,15 @@ describe("RemoteAccessSection — enabled", () => {
     await waitFor(() =>
       expect(screen.getByText("http://127.0.0.1:4377")).toBeInTheDocument(),
     );
-    expect(screen.getByText("http://192.168.1.42:4377")).toBeInTheDocument();
+    // The primary address is shown in the card and again in the full list.
+    expect(screen.getAllByText("http://192.168.1.42:4377").length).toBe(2);
     expect(screen.getByText("Secure")).toBeInTheDocument();
     expect(screen.getByText("Limited")).toBeInTheDocument();
-    // Grouped headers + the recommended chip on the primary LAN endpoint.
+    // Grouped headers + the recommended chip on the primary LAN endpoint
+    // (the relay card carries its own "Recommended" badge too).
     expect(screen.getByText("This device")).toBeInTheDocument();
     expect(screen.getByText("Local network")).toBeInTheDocument();
-    expect(screen.getByText("Recommended")).toBeInTheDocument();
+    expect(screen.getAllByText("Recommended").length).toBe(2);
     // The insecure hint spells out the clipboard/notifications degradation.
     expect(
       screen.getByText(/browser clipboard and notifications are disabled/i),
@@ -254,10 +263,12 @@ describe("RemoteAccessSection — enabled", () => {
   it("shows the Tailscale group and hides 'other' addresses behind a disclosure", async () => {
     cmds.webRemoteListEndpoints.mockResolvedValue(groupedEndpoints());
     render(<RemoteAccessSection />);
+    // The recommended MagicDNS address is the card's primary address and
+    // also appears in the full list.
     await waitFor(() =>
       expect(
-        screen.getByText("https://mac-studio.tail9c2f.ts.net:4377"),
-      ).toBeInTheDocument(),
+        screen.getAllByText("https://mac-studio.tail9c2f.ts.net:4377").length,
+      ).toBe(2),
     );
     // Tailscale section header + its explanation are visible.
     expect(screen.getByText("Tailscale")).toBeInTheDocument();
@@ -405,16 +416,16 @@ describe("RemoteAccessSection — account access", () => {
       ...p,
     });
 
-  it("shows the account toggle and the approval opt-out when account mode is on", async () => {
+  it("shows the account toggle and the account approval switch when account mode is on", async () => {
     cmds.webRemoteStatus.mockResolvedValue(accountStatus());
     render(<RemoteAccessSection />);
     expect(
       await screen.findByLabelText(/toggle account sign-in/i),
     ).toBeChecked();
-    // The "trust browsers without approval" opt-out is visible + off.
+    // Approval for account browsers is on (the trust opt-out is off).
     expect(
-      screen.getByLabelText(/toggle trust account browsers/i),
-    ).not.toBeChecked();
+      screen.getByLabelText(/toggle approval for account browsers/i),
+    ).toBeChecked();
   });
 
   it("toggling account sign-in calls webRemoteSetConfig({ accountModeEnabled })", async () => {
@@ -434,13 +445,13 @@ describe("RemoteAccessSection — account access", () => {
     );
   });
 
-  it("toggling the opt-out calls webRemoteSetConfig({ trustAccountBrowsers })", async () => {
+  it("turning account approval off calls webRemoteSetConfig({ trustAccountBrowsers: true })", async () => {
     const user = userEvent.setup();
     cmds.webRemoteStatus.mockResolvedValue(accountStatus());
     render(<RemoteAccessSection />);
 
     await user.click(
-      await screen.findByLabelText(/toggle trust account browsers/i),
+      await screen.findByLabelText(/toggle approval for account browsers/i),
     );
     await waitFor(() =>
       expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({
@@ -482,19 +493,17 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
       ...p,
     });
 
-  it("is off by default and doesn't read registration state", async () => {
+  it("is off by default and shows no registration readout", async () => {
     cmds.webRemoteStatus.mockResolvedValue(relayStatus());
     render(<RemoteAccessSection />);
 
     const toggle = await screen.findByLabelText(/toggle from-anywhere access/i);
     expect(toggle).not.toBeChecked();
     // No readout while off…
-    expect(screen.queryByText(/device registration/i)).toBeNull();
-    // …and the section explains what turning it on does.
-    expect(
-      screen.getByText(/end-to-end encrypted between that browser/i),
-    ).toBeInTheDocument();
-    expect(cmds.webRemoteRegistrationStatus).not.toHaveBeenCalled();
+    expect(screen.queryByText(/^Registered$/)).toBeNull();
+    expect(screen.queryByText(/Registering/)).toBeNull();
+    // …and the card explains what turning it on does.
+    expect(screen.getByText(/End-to-end encrypted/i)).toBeInTheDocument();
   });
 
   it("toggling calls webRemoteSetConfig({ relayModeEnabled })", async () => {
@@ -529,7 +538,7 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
     expect(screen.getByText("device-abc123")).toBeInTheDocument();
     expect(screen.getByText("node-xyz789")).toBeInTheDocument();
     expect(
-      screen.getByText(/listed with your account, so a browser signed into it/i),
+      screen.getByText(/Listed with your account\. Open app\.codemux\.org/i),
     ).toBeInTheDocument();
   });
 
@@ -587,7 +596,8 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
       await screen.findByText(/can't register for from-anywhere access/i),
     ).toBeInTheDocument();
     // The registration readout is replaced by the sign-in warning.
-    expect(screen.queryByText(/device registration/i)).toBeNull();
+    expect(screen.queryByText(/^Registered$/)).toBeNull();
+    expect(screen.queryByText(/Registering/)).toBeNull();
   });
 
   it("live-updates the readout when the state-changed event flips registration", async () => {
@@ -599,8 +609,9 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
       device_id: "device-abc123",
     });
     render(<RemoteAccessSection />);
+    // No error yet — an honest "in progress" rather than a failure.
     await waitFor(() =>
-      expect(screen.getByText(/not registered yet/i)).toBeInTheDocument(),
+      expect(screen.getByText(/Registering…/)).toBeInTheDocument(),
     );
 
     cmds.webRemoteRegistrationStatus.mockResolvedValue({
@@ -636,63 +647,107 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
   });
 });
 
-// Issue #404: a failed LAN bind used to render as "Starting the server…"
-// forever and relay registration reassured the user it "usually settles in a
-// moment". Both must now show the real reason.
-describe("RemoteAccessSection — failure states (#404)", () => {
-  const failedBind = (p: Partial<WebRemoteStatus> = {}) =>
+// Issue #405: one kill switch, then one card per way in, each owning its own
+// switch, settings, and live state.
+describe("RemoteAccessSection — ways to connect", () => {
+  const ways = (p: Partial<WebRemoteStatus> = {}) =>
     status({
       enabled: true,
-      running: false,
-      bind_error: "No Tailscale address found",
+      running: true,
+      lan_enabled: true,
       account_signed_in: true,
       sessions: [],
       ...p,
     });
 
-  it("shows the bind error with a Retry instead of 'Starting the server…'", async () => {
-    cmds.webRemoteStatus.mockResolvedValue(failedBind());
+  it("lists From anywhere first, marked Recommended, then On my network", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(ways());
     render(<RemoteAccessSection />);
 
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent(/isn't listening on your networks/i);
-    expect(alert).toHaveTextContent("No Tailscale address found");
-    expect(screen.getByText(/^Not listening$/)).toBeInTheDocument();
-    expect(screen.queryByText(/Starting the server/i)).toBeNull();
-    expect(cmds.webRemoteListEndpoints).not.toHaveBeenCalled();
+    const relay = await screen.findByRole("region", { name: "From anywhere" });
+    const lan = screen.getByRole("region", { name: "On my network" });
+    // Document order: relay card precedes the LAN card.
+    expect(
+      relay.compareDocumentPosition(lan) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(within(relay).getByText("Recommended")).toBeInTheDocument();
   });
 
-  it("says relay still works when the relay transport is up", async () => {
-    cmds.webRemoteStatus.mockResolvedValue(
-      failedBind({ relay_mode_enabled: true, relay_running: true }),
-    );
+  it("scopes every listener control to the On my network card", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(ways());
     render(<RemoteAccessSection />);
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      /from-anywhere access is unaffected/i,
-    );
+
+    const lan = await screen.findByRole("region", { name: "On my network" });
+    expect(within(lan).getByRole("radiogroup", { name: /visible on/i })).toBeInTheDocument();
+    expect(within(lan).getByLabelText(/server port/i)).toBeInTheDocument();
+    expect(within(lan).getByLabelText(/toggle approval mode/i)).toBeInTheDocument();
+    expect(within(lan).getByLabelText(/toggle account sign-in/i)).toBeInTheDocument();
+    expect(
+      within(lan).getByRole("button", { name: /create pairing link/i }),
+    ).toBeInTheDocument();
+    // None of it is in the relay card.
+    const relay = screen.getByRole("region", { name: "From anywhere" });
+    expect(within(relay).queryByRole("radiogroup")).toBeNull();
+    expect(within(relay).queryByLabelText(/server port/i)).toBeNull();
   });
 
-  it("Retry calls webRemoteRetry and clears the alert when the bind succeeds", async () => {
+  it("toggling On my network calls webRemoteSetConfig({ lanEnabled })", async () => {
     const user = userEvent.setup();
-    cmds.webRemoteStatus.mockResolvedValue(failedBind());
-    cmds.webRemoteRetry.mockResolvedValue(enabledStatus());
+    cmds.webRemoteStatus.mockResolvedValue(ways());
+    cmds.webRemoteSetConfig.mockResolvedValue(ways({ lan_enabled: false, running: false }));
     render(<RemoteAccessSection />);
 
-    const alert = await screen.findByRole("alert");
-    await user.click(within(alert).getByRole("button", { name: /retry/i }));
+    await user.click(await screen.findByLabelText(/toggle access on my network/i));
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ lanEnabled: false }),
+    );
+    // Its settings collapse with it.
+    await waitFor(() =>
+      expect(screen.queryByRole("radiogroup", { name: /visible on/i })).toBeNull(),
+    );
+  });
+
+  it("shows a failed bind's real reason with a retry, never an endless 'starting'", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({
+        running: false,
+        bind_error: "bind 0.0.0.0:4377: Address already in use (os error 98)",
+      }),
+    );
+    cmds.webRemoteRetry.mockResolvedValue(ways());
+    render(<RemoteAccessSection />);
+
+    expect(
+      await screen.findByText(/Address already in use/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("The server couldn't start listening")).toBeInTheDocument();
+    // The exposure banner tells the truth: nothing is listening.
+    expect(
+      screen.getByText(/nothing can reach this machine right now/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Starting the server/i)).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /retry starting the server/i }));
     await waitFor(() => expect(cmds.webRemoteRetry).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
-    expect(toast.success).toHaveBeenCalledWith("Remote access is listening again.");
+    expect(cmds.webRemoteEnable).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(screen.getByText(/Listening on port 4377/)).toBeInTheDocument(),
+    );
+    expect(toast.success).toHaveBeenCalledWith("Listening on your network again.");
   });
 
   it("Retry surfaces a bind that still fails", async () => {
     const user = userEvent.setup();
-    cmds.webRemoteStatus.mockResolvedValue(failedBind());
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({ running: false, bind_error: "No Tailscale address found" }),
+    );
     cmds.webRemoteRetry.mockRejectedValue("Address already in use");
     render(<RemoteAccessSection />);
 
-    const alert = await screen.findByRole("alert");
-    await user.click(within(alert).getByRole("button", { name: /retry/i }));
+    await user.click(
+      await screen.findByRole("button", { name: /retry starting the server/i }),
+    );
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith(
         "Still couldn't start the server: Address already in use",
@@ -700,30 +755,195 @@ describe("RemoteAccessSection — failure states (#404)", () => {
     );
   });
 
-  it("renders the live registration error instead of 'usually settles'", async () => {
+  it("says from-anywhere still works while only the listener is down", async () => {
     cmds.webRemoteStatus.mockResolvedValue(
-      status({
-        enabled: true,
-        running: true,
-        account_signed_in: true,
+      ways({
+        running: false,
+        bind_error: "No Tailscale address found",
         relay_mode_enabled: true,
         relay_running: true,
+      }),
+    );
+    render(<RemoteAccessSection />);
+    const lan = await screen.findByRole("region", { name: "On my network" });
+    expect(within(lan).getByRole("alert")).toHaveTextContent(
+      /from-anywhere access is unaffected/i,
+    );
+  });
+
+  it("keeps the relay registered while the LAN listener has failed", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({
+        running: false,
+        bind_error: "No Tailscale address found",
+        relay_mode_enabled: true,
+        relay_running: true,
+        device_registered: true,
+      }),
+    );
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: true,
+      name: "mac-studio",
+    });
+    render(<RemoteAccessSection />);
+
+    const relay = await screen.findByRole("region", { name: "From anywhere" });
+    await waitFor(() =>
+      expect(within(relay).getByText(/^Registered$/)).toBeInTheDocument(),
+    );
+    const lan = screen.getByRole("region", { name: "On my network" });
+    expect(within(lan).getByText("No Tailscale address found")).toBeInTheDocument();
+  });
+
+  it("shows the live registration error with a Retry that calls webRemoteRetry", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({
+        relay_mode_enabled: true,
+        relay_running: false,
         device_registered: false,
-        registration_error: "device registration returned 503 Service Unavailable",
-        sessions: [],
+        registration_error: "relay transport couldn't start: iroh endpoint bind failed",
       }),
     );
     // The dedicated read has no error (stale); the broadcast wins.
     cmds.webRemoteRegistrationStatus.mockResolvedValue({ registered: false });
+    cmds.webRemoteRetry.mockResolvedValue(
+      ways({ relay_mode_enabled: true, relay_running: true, device_registered: true }),
+    );
     render(<RemoteAccessSection />);
 
+    const relay = await screen.findByRole("region", { name: "From anywhere" });
     expect(
-      await screen.findByText(
-        /last attempt failed: device registration returned 503/i,
+      await within(relay).findByText(
+        /last attempt failed: relay transport couldn't start: iroh endpoint bind failed/i,
       ),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/usually settles/i)).toBeNull();
-    expect(screen.getByText(/codemux retries on its own/i)).toBeInTheDocument();
+    expect(within(relay).getByText("Not registered yet")).toBeInTheDocument();
+
+    await user.click(
+      within(relay).getByRole("button", { name: /retry registering this device/i }),
+    );
+    await waitFor(() => expect(cmds.webRemoteRetry).toHaveBeenCalledTimes(1));
+  });
+
+  it("opens app.codemux.org from the relay card", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({ relay_mode_enabled: true, device_registered: true }),
+    );
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({ registered: true });
+    render(<RemoteAccessSection />);
+
+    await user.click(
+      await screen.findByRole("button", { name: /open app\.codemux\.org/i }),
+    );
+    expect(opener.openUrl).toHaveBeenCalledWith("https://app.codemux.org");
+  });
+
+  it("names the machine in the header once remote access is on", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(ways());
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: false,
+      name: "mac-studio",
+    });
+    render(<RemoteAccessSection />);
+    expect(await screen.findByText("“mac-studio”")).toBeInTheDocument();
+  });
+
+  it("matches the exposure warning to the configured scope", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(ways({ bind_scope: "tailscale" }));
+    render(<RemoteAccessSection />);
+    expect(
+      await screen.findByText(/listens on your Tailscale address and this device only/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/every network interface/i)).toBeNull();
+  });
+
+  it("says nothing listens on the network in a relay-only setup", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({ running: false, lan_enabled: false, relay_mode_enabled: true }),
+    );
+    render(<RemoteAccessSection />);
+    expect(
+      await screen.findByText(/Nothing listens on your network/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/every network interface/i)).toBeNull();
+  });
+
+  it("lists paired devices and account browsers together under Devices", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      ways({
+        sessions: [
+          sess({ id: "a", name: "Work laptop", approved: true, source: "account" }),
+          sess({ id: "p", name: "Phone", approved: true, source: "pair" }),
+          sess({ id: "w", name: "Tablet", approved: false, source: "account" }),
+        ],
+      }),
+    );
+    render(<RemoteAccessSection />);
+
+    await screen.findByText("Work laptop");
+    expect(screen.getByText(/^Devices$/)).toBeInTheDocument();
+    expect(screen.getByText("Phone")).toBeInTheDocument();
+    expect(screen.getByText("Tablet")).toBeInTheDocument();
+    expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument();
+  });
+
+  it("shows one empty state when nothing is connected yet", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(ways());
+    render(<RemoteAccessSection />);
+    expect(await screen.findByText(/No devices yet/)).toBeInTheDocument();
+  });
+});
+
+describe("RemoteAccessSection — changes that would cut off this browser", () => {
+  afterEach(() => {
+    delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+  });
+
+  it("asks before a browser on the network listener turns that listener off", async () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      status({ enabled: true, running: true, lan_enabled: true }),
+    );
+    render(<RemoteAccessSection />);
+
+    await user.click(await screen.findByLabelText(/toggle access on my network/i));
+    expect(await screen.findByText(/Disconnect this device\?/)).toBeInTheDocument();
+    expect(cmds.webRemoteSetConfig).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ lanEnabled: false }),
+    );
+  });
+
+  it("asks before a browser turns remote access off entirely", async () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(status({ enabled: true, running: true }));
+    render(<RemoteAccessSection />);
+
+    await user.click(await screen.findByRole("switch", { name: /toggle remote access/i }));
+    expect(
+      await screen.findByText(/disconnects every device, including this one/i),
+    ).toBeInTheDocument();
+    expect(cmds.webRemoteDisable).not.toHaveBeenCalled();
+  });
+
+  it("the desktop turns a way in off without a confirmation", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      status({ enabled: true, running: true, lan_enabled: true }),
+    );
+    render(<RemoteAccessSection />);
+
+    await user.click(await screen.findByLabelText(/toggle access on my network/i));
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ lanEnabled: false }),
+    );
+    expect(screen.queryByText(/Disconnect this device\?/)).toBeNull();
   });
 });
 

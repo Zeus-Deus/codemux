@@ -160,6 +160,7 @@ mod tests {
         let status = super::super::WebRemoteStatus {
             enabled: true,
             running: true,
+            lan_enabled: true,
             port: super::super::DEFAULT_PORT,
             require_approval: false,
             bind_scope: super::super::BIND_SCOPE_ALL.to_string(),

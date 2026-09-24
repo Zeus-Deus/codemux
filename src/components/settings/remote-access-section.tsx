@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Check,
   Copy,
+  ExternalLink,
+  Globe,
   Laptop,
   Link2,
   Loader2,
@@ -14,6 +17,7 @@ import {
   Smartphone,
   Tablet,
   Trash2,
+  Wifi,
   WifiOff,
 } from "lucide-react";
 
@@ -35,6 +39,7 @@ import { cn } from "@/lib/utils";
 import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { isHostedOrigin } from "@/remote/hosted";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import {
   webRemoteApproveSession,
@@ -68,10 +73,13 @@ import {
   composePairUrl,
   connectedSessionCount,
   describeDevice,
+  describeExposure,
   endpointSecurityHint,
   formatCountdown,
   groupEndpoints,
   isRebindDisconnectError,
+  lanEnabledOf,
+  lanExposurePhrase,
   msUntil,
   newlyPendingSessionIds,
   originHostSurvivesScope,
@@ -553,13 +561,206 @@ function DeviceRow({
   );
 }
 
+// ── Ways-to-connect card ─────────────────────────────────────────────
+//
+// One card per way in. Each owns its switch, its settings, and its live
+// state, so every control on the page is visually scoped to the one
+// transport it changes.
+
+function WayCard({
+  icon: Icon,
+  title,
+  badge,
+  description,
+  checked,
+  onCheckedChange,
+  disabled,
+  switchLabel,
+  children,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  badge?: React.ReactNode;
+  description: React.ReactNode;
+  checked: boolean;
+  onCheckedChange: (next: boolean) => void;
+  disabled?: boolean;
+  switchLabel: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <section
+      aria-label={title}
+      className={cn(
+        "rounded-lg border p-4 transition-colors duration-150",
+        checked ? "border-border bg-muted/20" : "border-border/60",
+      )}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 flex-1 gap-3">
+          <Icon
+            className={cn(
+              "mt-0.5 size-4 shrink-0",
+              checked ? "text-accent-ember" : "text-muted-foreground",
+            )}
+          />
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-body font-semibold text-foreground">{title}</h3>
+              {badge}
+            </div>
+            <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+              {description}
+            </p>
+          </div>
+        </div>
+        <Switch
+          checked={checked}
+          onCheckedChange={onCheckedChange}
+          disabled={disabled}
+          aria-label={switchLabel}
+        />
+      </div>
+      {checked && children ? (
+        <div className="mt-4 space-y-4 border-t border-border/60 pt-4 sm:ml-7">
+          {children}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+type LiveTone = "ok" | "pending" | "error";
+
+/** A dot + label reporting what a transport is actually doing right now. */
+function LiveState({ tone, children }: { tone: LiveTone; children: React.ReactNode }) {
+  return (
+    <span
+      role="status"
+      className={cn(
+        "inline-flex items-center gap-1.5 text-label font-medium",
+        tone === "ok" && "text-status-open",
+        tone === "pending" && "text-status-working",
+        tone === "error" && "text-status-attention",
+      )}
+    >
+      {tone === "pending" ? (
+        <Loader2 className="size-3 animate-spin" />
+      ) : (
+        <span
+          className={cn(
+            "inline-block size-1.5 rounded-full",
+            tone === "ok" ? "bg-status-open" : "bg-status-attention",
+          )}
+        />
+      )}
+      {children}
+    </span>
+  );
+}
+
+/** A transport that is switched on but couldn't start: the real reason, plus
+ *  a retry. Replaces any optimistic "starting…" copy. */
+function FailureCallout({
+  title,
+  reason,
+  hint,
+  onRetry,
+  retrying,
+  retryLabel,
+}: {
+  title: string;
+  reason: string;
+  hint?: string;
+  onRetry: () => void;
+  retrying: boolean;
+  retryLabel: string;
+}) {
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3"
+    >
+      <ShieldAlert className="mt-0.5 size-4 shrink-0 text-status-attention" />
+      <div className="min-w-0 flex-1 space-y-1">
+        <p className="text-body font-medium text-status-attention">{title}</p>
+        <p className="break-words font-mono text-body-sm text-foreground/90">
+          {reason}
+        </p>
+        {hint && (
+          <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+            {hint}
+          </p>
+        )}
+      </div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="shrink-0"
+        disabled={retrying}
+        onClick={onRetry}
+        aria-label={retryLabel}
+      >
+        <RefreshCw className={cn("size-3.5", retrying && "animate-spin")} />
+        Retry
+      </Button>
+    </div>
+  );
+}
+
+function AttentionNote({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      role="status"
+      className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
+    >
+      <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+      <span>{children}</span>
+    </div>
+  );
+}
+
+/** A labelled switch row inside a card. */
+function SettingRow({
+  title,
+  detail,
+  checked,
+  onCheckedChange,
+  disabled,
+  switchLabel,
+}: {
+  title: string;
+  detail: React.ReactNode;
+  checked: boolean;
+  onCheckedChange: (next: boolean) => void;
+  disabled?: boolean;
+  switchLabel: string;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-8">
+      <div className="min-w-0 space-y-1">
+        <p className="text-body font-medium leading-tight text-foreground">{title}</p>
+        <p className="text-body-sm leading-relaxed text-muted-foreground/80">{detail}</p>
+      </div>
+      <Switch
+        checked={checked}
+        onCheckedChange={onCheckedChange}
+        disabled={disabled}
+        aria-label={switchLabel}
+      />
+    </div>
+  );
+}
+
 // ── Remote rebind lifecycle ──────────────────────────────────────────
 //
-// A port or scope change from a *web* client rebinds the server, dropping
-// this browser's socket before `web_remote_set_config` can answer — so the
-// invoke rejects with a transport disconnect, NOT because the change failed.
-// Rather than surfacing that as an error and snapping the control back, we
-// reflect the requested value optimistically and drive a small lifecycle:
+// A port or scope change from a browser connected over the *network listener*
+// rebinds that listener, dropping this browser's socket before
+// `web_remote_set_config` can answer — so the invoke rejects with a transport
+// disconnect, NOT because the change failed. Rather than surfacing that as an
+// error and snapping the control back, we reflect the requested value
+// optimistically and drive a small lifecycle:
 //
 //   applying     → set_config in flight (socket may still be up).
 //   reconnecting → the expected disconnect landed; the shim's reconnect loop
@@ -569,7 +770,8 @@ function DeviceRow({
 //                  origin, or the reconnect never succeeded). A clear terminal
 //                  message replaces the endless spinner.
 //
-// The desktop path never rebinds its own IPC, so none of this runs there.
+// The desktop never rebinds its own IPC, and a browser on app.codemux.org
+// rides the relay (which a LAN rebind doesn't touch), so neither runs this.
 type RebindPhase =
   | { status: "applying" }
   | { status: "reconnecting"; kind: "port" | "scope"; requestedPort?: number }
@@ -585,6 +787,23 @@ const REBIND_RECONNECT_CAP_MS = 12_000;
 const SCOPE_CUTOFF_MESSAGE =
   "Access scope changed — this device can no longer reach the server. Reconnect from an allowed endpoint to continue.";
 
+/** Where browsers signed into the account find and open this machine. */
+const HOSTED_CLIENT_URL = "https://app.codemux.org";
+
+/** A change that would disconnect the browser making it. Confirmed first. */
+type PendingCutoff =
+  | { kind: "scope"; scope: WebRemoteBindScope }
+  | { kind: "lan" }
+  | { kind: "relay" }
+  | { kind: "master" };
+
+/** Which way in this UI itself is using: the desktop's own IPC, the network
+ *  listener, or the relay. Decides which changes would cut it off. */
+function currentTransport(): "desktop" | "lan" | "relay" {
+  if (!isRemoteClient()) return "desktop";
+  return isHostedOrigin() ? "relay" : "lan";
+}
+
 // ── Main section ─────────────────────────────────────────────────────
 
 export function RemoteAccessSection() {
@@ -593,6 +812,7 @@ export function RemoteAccessSection() {
   const [pairing, setPairing] = useState<WebRemotePairingInfo | null>(null);
   const [portDraft, setPortDraft] = useState("");
   const [togglePending, setTogglePending] = useState(false);
+  const [retryPending, setRetryPending] = useState(false);
   const [portPending, setPortPending] = useState(false);
   const [scopePending, setScopePending] = useState(false);
   // Web-client rebind lifecycle (see RebindPhase). Null on desktop / at rest.
@@ -600,8 +820,7 @@ export function RemoteAccessSection() {
     null,
   );
   const [rebindPhase, setRebindPhase] = useState<RebindPhase | null>(null);
-  const [pendingScopeCutoff, setPendingScopeCutoff] =
-    useState<WebRemoteBindScope | null>(null);
+  const [pendingCutoff, setPendingCutoff] = useState<PendingCutoff | null>(null);
   // Live transport status (populated only on the web client). Drives the
   // reconnect-and-reconcile step after a rebind-induced disconnect.
   const connectionStatus = useRemoteConnectionStore((s) => s.status);
@@ -609,9 +828,9 @@ export function RemoteAccessSection() {
   const [accountModePending, setAccountModePending] = useState(false);
   const [trustAccountPending, setTrustAccountPending] = useState(false);
   const [relayModePending, setRelayModePending] = useState(false);
-  const [retryPending, setRetryPending] = useState(false);
-  // Control-plane registration state for the from-anywhere transport. Null
-  // while relay mode is off (or when the read failed — see the effect below).
+  const [lanPending, setLanPending] = useState(false);
+  // Control-plane registration state for the relay (plus this machine's
+  // display name). Null until read, or when the read failed.
   const [registration, setRegistration] =
     useState<WebRemoteRegistrationStatus | null>(null);
   const [pairingPending, setPairingPending] = useState(false);
@@ -633,7 +852,7 @@ export function RemoteAccessSection() {
           const s = next.sessions.find((x) => x.id === id);
           const d = describeDevice(s?.name ?? null, s?.user_agent ?? null);
           toast.info(`${d.title} wants to connect`, {
-            description: "Approve it below to grant access.",
+            description: "Approve it under Devices to grant access.",
           });
         }
       }
@@ -745,6 +964,11 @@ export function RemoteAccessSection() {
 
   const enabled = status?.enabled ?? false;
   const running = status?.running ?? false;
+  const lanEnabled = lanEnabledOf(status);
+  // Why the listener isn't bound even though it's switched on. The backend
+  // keeps retrying while this is set; the card shows it instead of an
+  // open-ended "starting".
+  const bindError = status?.bind_error ?? null;
   const requireApproval = status?.require_approval ?? false;
   const accountModeEnabled = status?.account_mode_enabled ?? false;
   const trustAccountBrowsers = status?.trust_account_browsers ?? false;
@@ -754,28 +978,23 @@ export function RemoteAccessSection() {
   // trigger for the richer registration read and as its fallback.
   const deviceRegistered = status?.device_registered ?? false;
   const irohNodeId = status?.iroh_node_id ?? null;
-  // Why nothing is listening even though remote access is on. The backend
-  // keeps retrying while this is set; the pane shows it instead of an
-  // open-ended "starting".
-  const bindError = enabled && !running ? (status?.bind_error ?? null) : null;
-  const relayRunning = status?.relay_running ?? false;
-  const liveRegistrationError = status?.registration_error ?? null;
+  const registrationError = status?.registration_error ?? null;
   // While a web-client rebind settles, show the requested scope optimistically
   // rather than the server's last-broadcast value.
   const bindScope = scopeOverride ?? bindScopeOf(status);
   const pending = useMemo(() => pendingSessions(status), [status]);
   const approved = useMemo(() => approvedSessions(status), [status]);
   const connectedCount = connectedSessionCount(status);
+  const exposure = describeExposure(status);
+  const transport = currentTransport();
 
-  // The status broadcast carries only a coarse `device_registered` flag; the
-  // dedicated read adds the ids, the last heartbeat, and the last error. Refetch
-  // whenever relay mode, the broadcast registration signal, the node id, or the
-  // sign-in state changes — those are exactly the transitions that can move the
-  // registration. A failed read (older backend, or the registry unreachable)
+  // The dedicated registration read adds the ids, the last heartbeat, the last
+  // error, and this machine's display name. Refetch whenever one of the
+  // broadcast signals that can move it changes. A failed read (older backend)
   // degrades to the status flags rather than surfacing a raw error.
   const relayLive = enabled && relayModeEnabled;
   useEffect(() => {
-    if (!relayLive) {
+    if (!enabled) {
       setRegistration(null);
       return;
     }
@@ -793,35 +1012,50 @@ export function RemoteAccessSection() {
       cancelled = true;
     };
   }, [
+    enabled,
     relayLive,
     deviceRegistered,
     irohNodeId,
     accountSignedIn,
-    liveRegistrationError,
+    registrationError,
   ]);
 
   // Prefer the dedicated read, fall back to the live status broadcast.
   const relayRegistered = registration?.registered ?? deviceRegistered;
   const relayDeviceId = registration?.device_id ?? status?.device_id ?? null;
   // The hostname reads as "this machine" to a human; the device id only means
-  // something when two hosts share a name. Fall back to the id when an older
-  // backend sends no name.
-  const relayDisplayName = registration?.name || relayDeviceId;
+  // something when two hosts share a name.
+  const machineName = registration?.name || null;
+  const relayDisplayName = machineName || relayDeviceId;
   const relayNodeId = registration?.node_id ?? irohNodeId;
   const relayLastRegisteredAt = registration?.last_registered_at ?? null;
-  // The live broadcast carries the current failure; the dedicated read is
-  // the fallback for a backend that doesn't broadcast it.
+  // The live broadcast carries the current failure (including the relay
+  // endpoint itself failing to start); the dedicated read is the fallback for
+  // a backend that doesn't broadcast it.
   const relayLastError = relayRegistered
     ? null
-    : (liveRegistrationError ?? registration?.last_error ?? null);
+    : (registrationError ?? registration?.last_error ?? null);
 
   const portValidation = validatePort(portDraft);
   const portDirty = status != null && portDraft !== String(status.port);
   // A web-client rebind is settling (or has cut this device off): freeze the
-  // server controls so a second change can't stack on the in-flight one.
+  // listener controls so a second change can't stack on the in-flight one.
   const rebindBusy = rebindPhase !== null;
+  const primaryEndpoint = pickPrimaryEndpoint(endpoints);
 
-  const handleToggle = useCallback(
+  /** After a change that (re)starts the listener, say so if it didn't come up. */
+  const reportLanOutcome = useCallback(
+    (result: WebRemoteStatus, success: string) => {
+      if (result.bind_error) {
+        toast.error(`Saved, but the listener couldn't start: ${result.bind_error}`);
+      } else {
+        toast.success(success);
+      }
+    },
+    [],
+  );
+
+  const applyMaster = useCallback(
     async (next: boolean) => {
       setTogglePending(true);
       try {
@@ -834,8 +1068,8 @@ export function RemoteAccessSection() {
         }
         toast.success(
           next
-            ? "Remote access is on — pair a device to connect."
-            : "Remote access is off. The server is no longer listening.",
+            ? "Remote access is on — choose how devices connect."
+            : "Remote access is off. Nothing can reach this machine.",
         );
       } catch (err) {
         console.error("[remote-access] toggle failed:", err);
@@ -847,15 +1081,56 @@ export function RemoteAccessSection() {
     [applyStatus, refreshEndpoints],
   );
 
+  const handleToggle = useCallback(
+    (next: boolean) => {
+      // Any browser is cut off when everything turns off — confirm first.
+      if (!next && transport !== "desktop") {
+        setPendingCutoff({ kind: "master" });
+        return;
+      }
+      void applyMaster(next);
+    },
+    [applyMaster, transport],
+  );
+
+  /** Retry a way in that is switched on but failed to start, right now
+   *  instead of waiting for the backend's own retry schedule: re-attempts the
+   *  listener bind (when it's on) and relay registration (when it's on). */
+  const handleRetry = useCallback(
+    async (what: "server" | "registration") => {
+      setRetryPending(true);
+      try {
+        const result = await webRemoteRetry();
+        applyStatus(result, { detectPending: false });
+        if (result.running) void refreshEndpoints();
+        if (what === "server") toast.success("Listening on your network again.");
+      } catch (err) {
+        console.error("[remote-access] retry failed:", err);
+        if (what === "server") {
+          toast.error(`Still couldn't start the server: ${String(err)}`);
+        } else {
+          // The rejection is about the listener; registration was retried
+          // regardless and reports back through the live status.
+          void webRemoteStatus()
+            .then((fresh) => applyStatus(fresh, { detectPending: false }))
+            .catch(() => undefined);
+        }
+      } finally {
+        setRetryPending(false);
+      }
+    },
+    [applyStatus, refreshEndpoints],
+  );
+
   const handleApplyPort = useCallback(async () => {
     if (!portValidation.valid || portValidation.value == null) return;
     const nextPort = portValidation.value;
     setPortPending(true);
 
-    // Web client: the rebind drops this browser's socket before set_config can
-    // answer. Reflect the new port optimistically and settle on reconnect,
-    // rather than treating the expected disconnect as a failure.
-    if (isRemoteClient()) {
+    // Browser on the network listener: the rebind drops this socket before
+    // set_config can answer. Reflect the new port optimistically and settle on
+    // reconnect, rather than treating the expected disconnect as a failure.
+    if (transport === "lan") {
       setPortDraft(String(nextPort));
       setRebindPhase({ status: "applying" });
       try {
@@ -881,7 +1156,7 @@ export function RemoteAccessSection() {
       return;
     }
 
-    // Desktop (native IPC never drops the transport): unchanged.
+    // Desktop (native IPC) or relay: this UI's own transport is unaffected.
     try {
       const result = await webRemoteSetConfig({ port: nextPort });
       applyStatus(result, { detectPending: false });
@@ -889,14 +1164,22 @@ export function RemoteAccessSection() {
       if (result.running) void refreshEndpoints();
       // A port change invalidates any composed pairing URL.
       setPairing(null);
-      toast.success(`Port set to ${result.port}.`);
+      reportLanOutcome(result, `Port set to ${result.port}.`);
     } catch (err) {
       console.error("[remote-access] set port failed:", err);
       toast.error(`Couldn't change the port: ${String(err)}`);
     } finally {
       setPortPending(false);
     }
-  }, [applyStatus, portValidation, reconcileAfterRebind, refreshEndpoints, status]);
+  }, [
+    applyStatus,
+    portValidation,
+    reconcileAfterRebind,
+    refreshEndpoints,
+    reportLanOutcome,
+    status,
+    transport,
+  ]);
 
   // Web-client scope apply: reflect optimistically, then either settle on
   // reconnect (reachable) or trip the terminal cutoff (excluded / capped out).
@@ -922,7 +1205,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set scope failed:", err);
           setScopeOverride(null);
           setRebindPhase(null);
-          toast.error(`Couldn't change the access scope: ${String(err)}`);
+          toast.error(`Couldn't change where the server is visible: ${String(err)}`);
         }
       } finally {
         setScopePending(false);
@@ -935,19 +1218,19 @@ export function RemoteAccessSection() {
     async (next: WebRemoteBindScope) => {
       if (next === bindScope) return;
 
-      // Web client: a scope change rebinds and drops this browser. If the new
-      // scope would exclude the origin we loaded from, confirm the intentional
-      // cutoff first; otherwise apply optimistically and settle on reconnect.
-      if (isRemoteClient()) {
+      // Browser on the network listener: a scope change rebinds and drops it.
+      // If the new scope would exclude the origin we loaded from, confirm the
+      // intentional cutoff first; otherwise apply and settle on reconnect.
+      if (transport === "lan") {
         if (!originHostSurvivesScope(window.location.hostname, next)) {
-          setPendingScopeCutoff(next);
+          setPendingCutoff({ kind: "scope", scope: next });
           return;
         }
         void applyScopeRemote(next, { expectCutoff: false });
         return;
       }
 
-      // Desktop (native IPC never drops the transport): unchanged.
+      // Desktop (native IPC) or relay: this UI's own transport is unaffected.
       setScopePending(true);
       try {
         const result = await webRemoteSetConfig({ bindScope: next });
@@ -956,30 +1239,55 @@ export function RemoteAccessSection() {
         if (result.running) void refreshEndpoints();
         // A rebind drops any composed pairing URL (the old address may be gone).
         setPairing(null);
-        toast.success(
-          next === "all"
-            ? "Now listening on every network interface."
-            : next === "tailscale"
-              ? "Now listening on Tailscale only (plus this device)."
-              : "Now listening on this device only.",
+        reportLanOutcome(
+          result,
+          `Now visible on ${lanExposurePhrase(next).replace(" of this machine", "")}.`,
         );
       } catch (err) {
         console.error("[remote-access] set scope failed:", err);
         // The backend keeps the previous, working scope on failure and the
         // status it broadcasts reflects that, so the control snaps back.
-        toast.error(`Couldn't change the access scope: ${String(err)}`);
+        toast.error(`Couldn't change where the server is visible: ${String(err)}`);
       } finally {
         setScopePending(false);
       }
     },
-    [applyScopeRemote, applyStatus, bindScope, refreshEndpoints],
+    [applyScopeRemote, applyStatus, bindScope, refreshEndpoints, reportLanOutcome, transport],
   );
 
-  const confirmScopeCutoff = useCallback(() => {
-    const next = pendingScopeCutoff;
-    setPendingScopeCutoff(null);
-    if (next) void applyScopeRemote(next, { expectCutoff: true });
-  }, [applyScopeRemote, pendingScopeCutoff]);
+  const applyLan = useCallback(
+    async (next: boolean) => {
+      setLanPending(true);
+      try {
+        const result = await webRemoteSetConfig({ lanEnabled: next });
+        applyStatus(result, { detectPending: false });
+        if (result.running) void refreshEndpoints();
+        else {
+          setEndpoints([]);
+          setPairing(null);
+        }
+        if (next) reportLanOutcome(result, "Listening on your network.");
+        else toast.success("Stopped listening on your network.");
+      } catch (err) {
+        console.error("[remote-access] set LAN listener failed:", err);
+        toast.error(`Couldn't change network access: ${String(err)}`);
+      } finally {
+        setLanPending(false);
+      }
+    },
+    [applyStatus, refreshEndpoints, reportLanOutcome],
+  );
+
+  const handleToggleLan = useCallback(
+    (next: boolean) => {
+      if (!next && transport === "lan") {
+        setPendingCutoff({ kind: "lan" });
+        return;
+      }
+      void applyLan(next);
+    },
+    [applyLan, transport],
+  );
 
   const handleToggleApproval = useCallback(
     async (next: boolean) => {
@@ -989,8 +1297,8 @@ export function RemoteAccessSection() {
         applyStatus(result, { detectPending: false });
         toast.success(
           next
-            ? "Approval mode on — new devices wait for you to approve them."
-            : "Approval mode off — a valid pairing link connects immediately.",
+            ? "Pairing links now wait for your approval."
+            : "A valid pairing link now connects immediately.",
         );
       } catch (err) {
         console.error("[remote-access] set approval failed:", err);
@@ -1010,8 +1318,8 @@ export function RemoteAccessSection() {
         applyStatus(result, { detectPending: false });
         toast.success(
           next
-            ? "Account sign-in is on — browsers can connect with your Codemux account."
-            : "Account sign-in is off — only pairing codes connect now.",
+            ? "Browsers on your network can now sign in with your Codemux account."
+            : "Account sign-in on your network is off — only pairing links connect there.",
         );
       } catch (err) {
         console.error("[remote-access] set account mode failed:", err);
@@ -1023,16 +1331,20 @@ export function RemoteAccessSection() {
     [applyStatus],
   );
 
-  const handleToggleTrustAccount = useCallback(
-    async (next: boolean) => {
+  /** "Approve browsers on my account" is the inverse of the stored
+   *  `trust_account_browsers` opt-out. */
+  const handleToggleAccountApproval = useCallback(
+    async (requireApprovalNext: boolean) => {
       setTrustAccountPending(true);
       try {
-        const result = await webRemoteSetConfig({ trustAccountBrowsers: next });
+        const result = await webRemoteSetConfig({
+          trustAccountBrowsers: !requireApprovalNext,
+        });
         applyStatus(result, { detectPending: false });
         toast.success(
-          next
-            ? "Trusted — browsers on your account connect without approval."
-            : "Browsers on your account now wait for approval.",
+          requireApprovalNext
+            ? "Browsers on your account now wait for your approval."
+            : "Browsers on your account now connect without approval.",
         );
       } catch (err) {
         console.error("[remote-access] set trust-account failed:", err);
@@ -1044,17 +1356,21 @@ export function RemoteAccessSection() {
     [applyStatus],
   );
 
-  const handleToggleRelayMode = useCallback(
+  const applyRelay = useCallback(
     async (next: boolean) => {
       setRelayModePending(true);
       try {
         const result = await webRemoteSetConfig({ relayModeEnabled: next });
         applyStatus(result, { detectPending: false });
-        toast.success(
-          next
-            ? "From-anywhere access is on — this device is registering with your account."
-            : "From-anywhere access is off — this device is reachable on the networks above only.",
-        );
+        if (next && !result.relay_running && result.registration_error) {
+          toast.error(`Saved, but ${result.registration_error}`);
+        } else {
+          toast.success(
+            next
+              ? "From anywhere is on — this device is registering with your account."
+              : "From anywhere is off.",
+          );
+        }
       } catch (err) {
         console.error("[remote-access] set relay mode failed:", err);
         toast.error(`Couldn't change from-anywhere access: ${String(err)}`);
@@ -1065,33 +1381,26 @@ export function RemoteAccessSection() {
     [applyStatus],
   );
 
-  // Retry the LAN listener bind (and relay registration) right now instead of
-  // waiting for the backend's own retry schedule.
-  const handleRetry = useCallback(
-    async (what: "server" | "registration") => {
-      setRetryPending(true);
-      try {
-        const result = await webRemoteRetry();
-        applyStatus(result, { detectPending: false });
-        if (result.running) void refreshEndpoints();
-        if (what === "server") toast.success("Remote access is listening again.");
-      } catch (err) {
-        console.error("[remote-access] retry failed:", err);
-        if (what === "server") {
-          toast.error(`Still couldn't start the server: ${String(err)}`);
-        } else {
-          // The rejection is about the LAN listener; registration was retried
-          // regardless and reports back through the live status.
-          void webRemoteStatus()
-            .then((fresh) => applyStatus(fresh, { detectPending: false }))
-            .catch(() => undefined);
-        }
-      } finally {
-        setRetryPending(false);
+  const handleToggleRelayMode = useCallback(
+    (next: boolean) => {
+      if (!next && transport === "relay") {
+        setPendingCutoff({ kind: "relay" });
+        return;
       }
+      void applyRelay(next);
     },
-    [applyStatus, refreshEndpoints],
+    [applyRelay, transport],
   );
+
+  const confirmCutoff = useCallback(() => {
+    const cut = pendingCutoff;
+    setPendingCutoff(null);
+    if (!cut) return;
+    if (cut.kind === "scope") void applyScopeRemote(cut.scope, { expectCutoff: true });
+    else if (cut.kind === "lan") void applyLan(false);
+    else if (cut.kind === "relay") void applyRelay(false);
+    else void applyMaster(false);
+  }, [applyLan, applyMaster, applyRelay, applyScopeRemote, pendingCutoff]);
 
   const handleCreatePairing = useCallback(async () => {
     setPairingPending(true);
@@ -1158,7 +1467,7 @@ export function RemoteAccessSection() {
         last = await webRemoteRevokeSession(s.id);
       }
       if (last) applyStatus(last, { detectPending: false });
-      toast.success("Revoked every paired device.");
+      toast.success("Revoked every device.");
     } catch (err) {
       toast.error(`Couldn't revoke every device: ${String(err)}`);
     } finally {
@@ -1166,57 +1475,133 @@ export function RemoteAccessSection() {
     }
   }, [applyStatus, approved]);
 
-  return (
-    <div className="space-y-8">
-      {/* Header */}
-      <div>
-        <div className="flex items-center gap-2">
-          <MonitorSmartphone className="size-4 text-accent-ember" />
-          <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
-            Remote Access
-          </h2>
-        </div>
-        <p className="mt-1.5 max-w-prose text-body-lg leading-relaxed text-muted-foreground/80">
-          Open this desktop to a browser on another device — a laptop or phone
-          on your network or mesh VPN — and drive the same projects, sessions,
-          and agents from there.
-        </p>
-      </div>
+  // Shared by both cards: the one setting that governs every browser signing
+  // in with the account, whichever way in it used.
+  const accountApprovalRow = (
+    <SettingRow
+      title="Approve browsers that sign in with your account"
+      detail="A new browser on your account waits under Devices until you approve it. Applies to both ways in."
+      checked={!trustAccountBrowsers}
+      onCheckedChange={handleToggleAccountApproval}
+      disabled={trustAccountPending}
+      switchLabel="Toggle approval for account browsers"
+    />
+  );
 
-      {/* Master toggle + exposure warning */}
-      <div className="space-y-3 rounded-lg border border-warning/30 bg-warning/5 p-4">
+  const relayCardBody = !accountSignedIn ? (
+    <AttentionNote>
+      This desktop isn't signed into a Codemux account, so it can't register for
+      from-anywhere access. Sign in from the account menu to activate it.
+    </AttentionNote>
+  ) : (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        {relayRegistered ? (
+          <LiveState tone="ok">Registered</LiveState>
+        ) : relayLastError ? (
+          <LiveState tone="error">Not registered yet</LiveState>
+        ) : (
+          <LiveState tone="pending">Registering…</LiveState>
+        )}
+        {relayDisplayName && (
+          <span className="flex min-w-0 items-center gap-1 text-body-sm text-muted-foreground/80">
+            as
+            <code className="truncate font-mono text-foreground">{relayDisplayName}</code>
+            <CopyButton text={relayDisplayName} label="Copy device name" />
+          </span>
+        )}
+        {relayRegistered && relayLastRegisteredAt && (
+          <span className="text-body-sm text-muted-foreground/70">
+            · confirmed {relativeTime(relayLastRegisteredAt)}
+          </span>
+        )}
+      </div>
+      {relayLastError ? (
+        <div className="flex items-start justify-between gap-3">
+          <p className="min-w-0 break-words text-body-sm leading-relaxed text-status-attention">
+            Last attempt failed: {relayLastError}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={retryPending}
+            onClick={() => void handleRetry("registration")}
+            aria-label="Retry registering this device"
+          >
+            <RefreshCw className={cn("size-3.5", retryPending && "animate-spin")} />
+            Retry
+          </Button>
+        </div>
+      ) : (
+        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
+          {relayRegistered
+            ? "Listed with your account. Open app.codemux.org in any browser signed into it, then pick this device."
+            : "Listing this device with your account. This takes a moment."}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          onClick={() => void openUrl(HOSTED_CLIENT_URL)}
+        >
+          <ExternalLink className="size-3.5" />
+          Open app.codemux.org
+        </Button>
+      </div>
+      {relayNodeId && (
+        <details className="group">
+          <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-label font-medium text-muted-foreground marker:content-none hover:text-foreground">
+            <span className="transition-transform duration-150 group-open:rotate-90">›</span>
+            Connection details
+          </summary>
+          <div className="mt-1.5 flex items-center gap-2">
+            <span className="shrink-0 text-body-sm text-muted-foreground/70">Address</span>
+            <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
+              {relayNodeId}
+            </code>
+            <CopyButton text={relayNodeId} label="Copy device address" />
+          </div>
+        </details>
+      )}
+    </div>
+  );
+
+  return (
+    // Inline-size containment: the settings scroll area sizes its content like
+    // a table (to the widest min-content), so the long truncated addresses and
+    // device lines would otherwise push this pane past a phone's width instead
+    // of truncating.
+    <div className="space-y-8 [contain:inline-size]">
+      {/* Header + kill switch */}
+      <div className="space-y-4">
         <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0 flex-1 space-y-1.5">
+          <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h3 className="text-body font-medium">Enable remote access</h3>
-              {running && (
-                <Badge
-                  variant="outline"
-                  className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
-                >
-                  <span className="inline-block size-1.5 rounded-full bg-status-open" />
-                  Listening on {status?.port}
-                </Badge>
-              )}
-              {bindError && (
-                <Badge
-                  variant="outline"
-                  className="gap-1 border-status-attention/30 bg-status-attention/10 text-caption text-status-attention"
-                >
-                  <span className="inline-block size-1.5 rounded-full bg-status-attention" />
-                  Not listening
-                </Badge>
-              )}
+              <MonitorSmartphone className="size-4 text-accent-ember" />
+              <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
+                Remote Access
+              </h2>
             </div>
-            <p className="text-label leading-relaxed text-muted-foreground">
-              Turning this on starts a server that listens on{" "}
-              <span className="font-medium text-foreground">
-                every network interface
-              </span>{" "}
-              of this machine. Anyone you pair gets full control of this
-              computer — open terminals, run agents, and read or edit your files,
-              exactly as if they were sitting here. Pair only devices you trust,
-              and revoke them the moment you're done.
+            <p className="mt-1.5 max-w-prose text-body-lg leading-relaxed text-muted-foreground/80">
+              {enabled ? (
+                <>
+                  {machineName ? (
+                    <>
+                      Reachable as{" "}
+                      <span className="font-medium text-foreground">
+                        “{machineName}”
+                      </span>
+                      .{" "}
+                    </>
+                  ) : null}
+                  Choose how devices reach it.
+                </>
+              ) : (
+                "Open this desktop in a browser on your phone or another computer, and drive the same projects, sessions, and agents from there."
+              )}
             </p>
           </div>
           <Switch
@@ -1224,469 +1609,308 @@ export function RemoteAccessSection() {
             onCheckedChange={handleToggle}
             disabled={togglePending}
             aria-label="Toggle remote access"
+            className="mt-1.5"
           />
+        </div>
+
+        {/* Exposure — what this configuration actually opens. */}
+        <div className="flex items-start gap-2.5 rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3">
+          <ShieldAlert className="mt-0.5 size-4 shrink-0 text-warning" />
+          <div className="space-y-1 text-label leading-relaxed text-muted-foreground">
+            <p className="font-medium text-foreground">{exposure}</p>
+            <p>
+              Anyone you let in gets full control of this computer — open
+              terminals, run agents, and read or edit your files. Let in only
+              devices you trust, and revoke them when you're done.
+            </p>
+          </div>
         </div>
       </div>
 
-      {/* A failed bind is a real state, not "starting": name the reason, say
-          what still works, and offer a retry. */}
-      {bindError && (
-        <div
-          role="alert"
-          className="flex items-start gap-3 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3"
-        >
-          <WifiOff className="mt-0.5 size-4 shrink-0 text-status-attention" />
-          <div className="min-w-0 flex-1 space-y-1">
-            <p className="text-body font-medium text-status-attention">
-              The server isn't listening on your networks
-            </p>
-            <p className="break-words font-mono text-body-sm text-foreground/90">
-              {bindError}
-            </p>
-            <p className="text-body-sm leading-relaxed text-muted-foreground">
-              Codemux keeps retrying on its own
-              {relayModeEnabled && relayRunning
-                ? " — from-anywhere access is unaffected and still works."
-                : "."}
-            </p>
-          </div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            disabled={retryPending}
-            onClick={() => void handleRetry("server")}
-          >
-            {retryPending ? (
-              <Loader2 className="size-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="size-3.5" />
-            )}
-            Retry
-          </Button>
-        </div>
-      )}
-
       {enabled && (
         <>
-          {/* Server config */}
-          <section className="space-y-4">
-            <SubHeading>Server</SubHeading>
-
-            {/* Web-client rebind lifecycle. A port/scope change from a browser
-                drops this socket before the backend can answer; rather than a
-                false error, show that the change is applying + reconnecting, or
-                a clear terminal state if this device was cut off. */}
-            {rebindPhase && rebindPhase.status !== "applying" ? (
-              rebindPhase.status === "cutoff" ? (
-                <div
-                  role="status"
-                  className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
-                >
-                  <WifiOff className="mt-0.5 size-4 shrink-0" />
-                  <span>{rebindPhase.message}</span>
-                </div>
-              ) : (
-                <div
-                  role="status"
-                  className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-body text-status-working"
-                >
-                  <Loader2 className="size-4 shrink-0 animate-spin" />
-                  <span>Applying change — reconnecting to this device…</span>
-                </div>
-              )
-            ) : null}
-
-            {/* Access scope — which interfaces the server binds. Narrowing it
-                keeps the port off untrusted networks entirely. Changing it
-                rebinds immediately (same drop-connections path as a port
-                change). */}
-            <div className="space-y-2">
-              <p className="text-body font-medium leading-none text-foreground">
-                Who can connect
-              </p>
+          {/* Web-client rebind lifecycle. A port/scope change from a browser
+              on the network listener drops this socket before the backend
+              can answer; rather than a false error, show that the change is
+              applying + reconnecting, or a clear terminal state if this
+              device was cut off. */}
+          {rebindPhase && rebindPhase.status !== "applying" ? (
+            rebindPhase.status === "cutoff" ? (
               <div
-                role="radiogroup"
-                aria-label="Access scope"
-                className="inline-flex rounded-lg border border-border/60 bg-muted/30 p-0.5"
+                role="status"
+                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
               >
-                {BIND_SCOPE_OPTIONS.map((opt) => {
-                  const active = opt.value === bindScope;
-                  return (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      role="radio"
-                      aria-checked={active}
-                      disabled={scopePending || rebindBusy}
-                      onClick={() => handleSetScope(opt.value)}
-                      className={cn(
-                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors duration-150 disabled:opacity-60",
-                        active
-                          ? "bg-accent-ember/15 text-accent-ember shadow-sm"
-                          : "text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      {opt.label}
-                    </button>
-                  );
-                })}
+                <WifiOff className="mt-0.5 size-4 shrink-0" />
+                <span>{rebindPhase.message}</span>
               </div>
-              <p className="text-body-sm leading-relaxed text-muted-foreground/85">
-                {BIND_SCOPE_OPTIONS.find((o) => o.value === bindScope)?.detail}
-              </p>
-            </div>
+            ) : (
+              <div
+                role="status"
+                className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-body text-status-working"
+              >
+                <Loader2 className="size-4 shrink-0 animate-spin" />
+                <span>Applying change — reconnecting to this device…</span>
+              </div>
+            )
+          ) : null}
 
-            <div className="flex items-end justify-between gap-4 border-t border-border/60 pt-4">
-              <div className="min-w-0 flex-1 space-y-1">
-                <label
-                  htmlFor="web-remote-port"
-                  className="block text-body font-medium leading-none text-foreground"
-                >
-                  Port
-                </label>
-                <p className="text-body-sm leading-relaxed text-muted-foreground/85">
-                  The port the server binds. Changing it rebinds immediately and
-                  invalidates any open pairing link.
-                </p>
-                {portDraft !== "" && !portValidation.valid && (
-                  <p className="text-body-sm text-status-attention">
-                    {portValidation.error}
-                  </p>
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                <Input
-                  id="web-remote-port"
-                  inputMode="numeric"
-                  value={portDraft}
-                  onChange={(e) => setPortDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && portDirty && portValidation.valid) {
-                      void handleApplyPort();
-                    }
-                  }}
-                  aria-label="Server port"
-                  aria-invalid={portDraft !== "" && !portValidation.valid}
-                  className="h-9 w-28 font-mono"
-                />
-                <Button
-                  type="button"
+          <div className="space-y-3">
+            <SubHeading>Ways to connect</SubHeading>
+
+            {/* From anywhere — first and recommended: the easiest path, and
+                the only one that works off your own network. */}
+            <WayCard
+              icon={Globe}
+              title="From anywhere"
+              badge={
+                <Badge
                   variant="outline"
-                  size="default"
-                  disabled={
-                    !portDirty || !portValidation.valid || portPending || rebindBusy
-                  }
-                  onClick={handleApplyPort}
+                  className="border-accent-ember/30 bg-accent-ember/10 text-caption font-medium text-accent-ember"
                 >
-                  Apply
-                </Button>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between gap-8 border-t border-border/60 pt-4">
-              <div className="min-w-0 space-y-1">
-                <p className="text-body font-medium leading-tight text-foreground">
-                  Require approval for new devices
-                </p>
-                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
-                  When on, a device that opens a valid pairing link waits here
-                  until you approve it. When off, a valid link connects right
-                  away.
-                </p>
-              </div>
-              <Switch
-                checked={requireApproval}
-                onCheckedChange={handleToggleApproval}
-                disabled={approvalPending}
-                aria-label="Toggle approval mode"
-              />
-            </div>
-          </section>
-
-          {/* Account access */}
-          <section className="space-y-4">
-            <SubHeading>Account access</SubHeading>
-
-            <div className="flex items-center justify-between gap-8">
-              <div className="min-w-0 space-y-1">
-                <p className="text-body font-medium leading-tight text-foreground">
-                  Sign in with a Codemux account
-                </p>
-                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
-                  Let a browser that reaches this machine connect by signing into{" "}
+                  Recommended
+                </Badge>
+              }
+              description={
+                <>
+                  Any browser signed into{" "}
                   <span className="font-medium text-foreground">
-                    the same Codemux account
-                  </span>{" "}
-                  this desktop is signed into — no pairing code to copy. The
-                  desktop must stay signed in for this to work.
-                </p>
-              </div>
-              <Switch
-                checked={accountModeEnabled}
-                onCheckedChange={handleToggleAccountMode}
-                disabled={accountModePending}
-                aria-label="Toggle account sign-in"
-              />
-            </div>
+                    your Codemux account
+                  </span>
+                  , on any network — no shared Wi-Fi, VPN, or port forwarding.
+                  End-to-end encrypted; the relay only passes along traffic it
+                  can't read.
+                </>
+              }
+              checked={relayModeEnabled}
+              onCheckedChange={handleToggleRelayMode}
+              disabled={relayModePending}
+              switchLabel="Toggle from-anywhere access"
+            >
+              {relayCardBody}
+              <div className="border-t border-border/60 pt-4">{accountApprovalRow}</div>
+            </WayCard>
 
-            {accountModeEnabled && !accountSignedIn && (
-              <div
-                role="status"
-                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
-              >
-                <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-                <span>
-                  This desktop isn't signed into a Codemux account, so account
-                  sign-in can't verify anyone yet. Sign in from the account menu
-                  to activate it.
-                </span>
-              </div>
-            )}
-
-            {accountModeEnabled && (
-              <div className="flex items-center justify-between gap-8 border-t border-border/60 pt-4">
-                <div className="min-w-0 space-y-1">
-                  <p className="text-body font-medium leading-tight text-foreground">
-                    Trust browsers on my account without approval
-                  </p>
-                  <p className="text-body-sm leading-relaxed text-muted-foreground/80">
-                    Off by default: a browser that signs in with your account
-                    still waits for you to approve it here. Turn on to let it
-                    connect immediately — only do this if your account is well
-                    protected.
-                  </p>
-                </div>
-                <Switch
-                  checked={trustAccountBrowsers}
-                  onCheckedChange={handleToggleTrustAccount}
-                  disabled={trustAccountPending}
-                  aria-label="Toggle trust account browsers"
+            {/* On my network — the direct LAN / tailnet listener. Every
+                listener setting lives here, next to the only thing it affects. */}
+            <WayCard
+              icon={Wifi}
+              title="On my network"
+              description="Connect directly from a device on the same network or tailnet, using a one-time pairing link."
+              checked={lanEnabled}
+              onCheckedChange={handleToggleLan}
+              disabled={lanPending}
+              switchLabel="Toggle access on my network"
+            >
+              {bindError ? (
+                <FailureCallout
+                  title="The server couldn't start listening"
+                  reason={bindError}
+                  hint={
+                    relayModeEnabled && status?.relay_running
+                      ? "Codemux keeps retrying on its own, and from-anywhere access is unaffected. Pick another port or change where it's visible below, or retry now."
+                      : "Codemux keeps retrying on its own. Pick another port or change where it's visible below, or retry now."
+                  }
+                  onRetry={() => void handleRetry("server")}
+                  retrying={retryPending}
+                  retryLabel="Retry starting the server"
                 />
-              </div>
-            )}
-          </section>
-
-          {/* From anywhere (relay) — the account-scoped iroh transport. Off by
-              default. It needs no LAN listener (it runs even when the server
-              above can't bind), but the master switch still gates it, so it
-              lives inside the enabled block alongside account access. */}
-          <section className="space-y-4">
-            <SubHeading>From anywhere (relay)</SubHeading>
-
-            <div className="flex items-center justify-between gap-8">
-              <div className="min-w-0 space-y-1">
-                <p className="text-body font-medium leading-tight text-foreground">
-                  Reach this device from any network
-                </p>
-                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
-                  Let a browser signed into{" "}
-                  <span className="font-medium text-foreground">
-                    the same Codemux account
-                  </span>{" "}
-                  reach this desktop from any network — no shared Wi-Fi, no VPN,
-                  no port forwarding. The connection is end-to-end encrypted
-                  between that browser and this machine; the relay that carries
-                  it only ever passes along encrypted traffic and can't read
-                  your terminals, files, or agents.
-                </p>
-              </div>
-              <Switch
-                checked={relayModeEnabled}
-                onCheckedChange={handleToggleRelayMode}
-                disabled={relayModePending}
-                aria-label="Toggle from-anywhere access"
-              />
-            </div>
-
-            {relayModeEnabled && !accountSignedIn && (
-              <div
-                role="status"
-                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
-              >
-                <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-                <span>
-                  This desktop isn't signed into a Codemux account, so it can't
-                  register for from-anywhere access. Sign in from the account
-                  menu to activate it.
-                </span>
-              </div>
-            )}
-
-            {relayModeEnabled && accountSignedIn && (
-              <div className="space-y-2 rounded-lg border border-border/60 bg-muted/30 px-3.5 py-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-body font-semibold text-foreground">
-                    Device registration
-                  </p>
-                  {relayRegistered ? (
-                    <Badge
-                      variant="outline"
-                      className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
-                    >
-                      <ShieldCheck className="size-3" />
-                      Registered
-                    </Badge>
-                  ) : (
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        "gap-1 text-caption",
-                        relayLastError
-                          ? "border-status-attention/30 bg-status-attention/10 text-status-attention"
-                          : "border-status-working/30 bg-status-working/10 text-status-working",
-                      )}
-                    >
-                      <ShieldAlert className="size-3" />
-                      Not registered yet
-                    </Badge>
+              ) : running ? (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                  <LiveState tone="ok">Listening on port {status?.port}</LiveState>
+                  {primaryEndpoint && (
+                    <span className="flex min-w-0 items-center gap-1">
+                      <code className="truncate font-mono text-body-sm text-foreground">
+                        {primaryEndpoint.url}
+                      </code>
+                      <CopyButton
+                        text={primaryEndpoint.url}
+                        label={`Copy ${primaryEndpoint.url} address`}
+                      />
+                    </span>
                   )}
                 </div>
-                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
-                  {relayRegistered
-                    ? "This device is listed with your account, so a browser signed into it can find and dial this machine from anywhere."
-                    : relayLastError
-                      ? "A browser signed into your account can't find this machine until it's listed. Codemux retries on its own."
-                      : "Listing this device with your account…"}
+              ) : (
+                <LiveState tone="pending">Starting the server…</LiveState>
+              )}
+
+              {/* Visible on — which interfaces the listener binds. Changing
+                  it rebinds immediately (same path as a port change). */}
+              <div className="space-y-2">
+                <p className="text-body font-medium leading-none text-foreground">
+                  Visible on
                 </p>
+                <div
+                  role="radiogroup"
+                  aria-label="Visible on"
+                  className="inline-flex flex-wrap rounded-lg border border-border/60 bg-muted/30 p-0.5"
+                >
+                  {BIND_SCOPE_OPTIONS.map((opt) => {
+                    const active = opt.value === bindScope;
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        disabled={scopePending || rebindBusy}
+                        onClick={() => handleSetScope(opt.value)}
+                        className={cn(
+                          "rounded-md px-3 py-1.5 text-body font-medium transition-colors duration-150 disabled:opacity-60",
+                          active
+                            ? "bg-accent-ember/15 text-accent-ember shadow-sm"
+                            : "text-muted-foreground hover:text-foreground",
+                        )}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+                  {BIND_SCOPE_OPTIONS.find((o) => o.value === bindScope)?.detail}
+                </p>
+              </div>
 
-                {relayDisplayName && (
-                  <div className="flex items-center gap-2">
-                    <span className="shrink-0 text-body-sm text-muted-foreground/70">
-                      {relayRegistered ? "Registered as" : "Registers as"}
-                    </span>
-                    <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
-                      {relayDisplayName}
-                    </code>
-                    <CopyButton
-                      text={relayDisplayName}
-                      label="Copy device name"
-                    />
-                  </div>
-                )}
-
-                {relayNodeId && (
-                  <div className="flex items-center gap-2">
-                    <span className="shrink-0 text-body-sm text-muted-foreground/70">
-                      Address
-                    </span>
-                    <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
-                      {relayNodeId}
-                    </code>
-                    <CopyButton text={relayNodeId} label="Copy device address" />
-                  </div>
-                )}
-
-                {relayLastRegisteredAt && (
-                  <p className="text-body-sm text-muted-foreground/70">
-                    Last confirmed {relativeTime(relayLastRegisteredAt)}.
-                  </p>
-                )}
-
-                {relayLastError && (
-                  <div className="flex items-start justify-between gap-3">
-                    <p className="min-w-0 break-words text-body-sm leading-relaxed text-status-attention">
-                      Last attempt failed: {relayLastError}
+              {/* Pair a device */}
+              <div className="space-y-2">
+                <p className="text-body font-medium leading-none text-foreground">
+                  Pair a device
+                </p>
+                {pairing ? (
+                  <PairingPanel
+                    pairing={pairing}
+                    endpoints={endpoints}
+                    regenerating={pairingPending}
+                    onRegenerate={handleCreatePairing}
+                  />
+                ) : (
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+                      Create a one-time link, then scan its QR code or open it
+                      on the other device.
                     </p>
                     <Button
                       type="button"
-                      variant="outline"
                       size="sm"
                       className="shrink-0"
-                      disabled={retryPending}
-                      onClick={() => void handleRetry("registration")}
+                      disabled={pairingPending || !running}
+                      onClick={handleCreatePairing}
                     >
-                      {retryPending ? (
-                        <Loader2 className="size-3.5 animate-spin" />
-                      ) : (
-                        <RefreshCw className="size-3.5" />
-                      )}
-                      Retry
+                      <Link2 className="size-3.5" />
+                      Create pairing link
                     </Button>
                   </div>
                 )}
               </div>
-            )}
-          </section>
 
-          {/* Endpoints */}
-          <section className="space-y-2">
-            <SubHeading>Reachable at</SubHeading>
-            {endpoints.length === 0 ? (
-              <p className="py-2 text-body text-muted-foreground/70">
-                {running
-                  ? "No reachable endpoints found."
-                  : bindError
-                    ? "Nothing is reachable on your networks until the server can listen — see above."
-                    : "Starting the server…"}
-              </p>
-            ) : (
-              <GroupedEndpoints endpoints={endpoints} />
-            )}
-          </section>
+              {endpoints.length > 0 && (
+                <details className="group">
+                  <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-label font-medium text-muted-foreground marker:content-none hover:text-foreground">
+                    <span className="transition-transform duration-150 group-open:rotate-90">
+                      ›
+                    </span>
+                    Reachable at ({endpoints.length})
+                  </summary>
+                  <div className="mt-3">
+                    <GroupedEndpoints endpoints={endpoints} />
+                  </div>
+                </details>
+              )}
 
-          {/* Pairing */}
-          <section className="space-y-3">
-            <SubHeading>Pair a device</SubHeading>
-            {pairing ? (
-              <PairingPanel
-                pairing={pairing}
-                endpoints={endpoints}
-                regenerating={pairingPending}
-                onRegenerate={handleCreatePairing}
-              />
-            ) : (
-              <div className="flex items-center justify-between gap-4 rounded-lg border border-border/60 bg-muted/30 p-4">
-                <p className="text-body leading-relaxed text-muted-foreground/85">
-                  Create a one-time link, then scan its QR code or open it on the
-                  other device to pair.
-                </p>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="shrink-0"
-                  disabled={pairingPending}
-                  onClick={handleCreatePairing}
-                >
-                  <Link2 className="size-3.5" />
-                  Create pairing link
-                </Button>
-              </div>
-            )}
-          </section>
-
-          {/* Pending approvals */}
-          {pending.length > 0 && (
-            <section className="space-y-2.5">
-              <div className="flex items-center gap-2">
-                <SubHeading>Waiting for approval</SubHeading>
-                <Badge
-                  variant="outline"
-                  className="border-status-working/30 bg-status-working/10 text-caption text-status-working"
-                >
-                  {pending.length}
-                </Badge>
-              </div>
-              <div className="space-y-2">
-                {pending.map((s) => (
-                  <PendingRow
-                    key={s.id}
-                    session={s}
-                    busy={sessionBusy === s.id}
-                    onApprove={() => handleApprove(s.id)}
-                    onReject={() => handleReject(s.id)}
+              <div className="flex items-end justify-between gap-4 border-t border-border/60 pt-4">
+                <div className="min-w-0 flex-1 space-y-1">
+                  <label
+                    htmlFor="web-remote-port"
+                    className="block text-body font-medium leading-none text-foreground"
+                  >
+                    Port
+                  </label>
+                  <p className="text-body-sm leading-relaxed text-muted-foreground/85">
+                    Changing it restarts the server immediately and invalidates
+                    any open pairing link.
+                  </p>
+                  {portDraft !== "" && !portValidation.valid && (
+                    <p className="text-body-sm text-status-attention">
+                      {portValidation.error}
+                    </p>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Input
+                    id="web-remote-port"
+                    inputMode="numeric"
+                    value={portDraft}
+                    onChange={(e) => setPortDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && portDirty && portValidation.valid) {
+                        void handleApplyPort();
+                      }
+                    }}
+                    aria-label="Server port"
+                    aria-invalid={portDraft !== "" && !portValidation.valid}
+                    className="h-9 w-28 font-mono"
                   />
-                ))}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="default"
+                    disabled={
+                      !portDirty || !portValidation.valid || portPending || rebindBusy
+                    }
+                    onClick={handleApplyPort}
+                  >
+                    Apply
+                  </Button>
+                </div>
               </div>
-            </section>
-          )}
 
-          {/* Paired devices */}
+              <div className="border-t border-border/60 pt-4">
+                <SettingRow
+                  title="Approve devices that use a pairing link"
+                  detail="A device that opens a valid pairing link waits under Devices until you approve it. When off, the link connects right away."
+                  checked={requireApproval}
+                  onCheckedChange={handleToggleApproval}
+                  disabled={approvalPending}
+                  switchLabel="Toggle approval mode"
+                />
+              </div>
+
+              <div className="space-y-4 border-t border-border/60 pt-4">
+                <SettingRow
+                  title="Allow account sign-in instead of a pairing link"
+                  detail={
+                    <>
+                      A browser that reaches this address can sign in with{" "}
+                      <span className="font-medium text-foreground">
+                        the Codemux account
+                      </span>{" "}
+                      this desktop uses — no pairing link to copy. Only affects
+                      this way in; From anywhere always uses your account.
+                    </>
+                  }
+                  checked={accountModeEnabled}
+                  onCheckedChange={handleToggleAccountMode}
+                  disabled={accountModePending}
+                  switchLabel="Toggle account sign-in"
+                />
+                {accountModeEnabled && !accountSignedIn && (
+                  <AttentionNote>
+                    This desktop isn't signed into a Codemux account, so account
+                    sign-in can't verify anyone yet. Sign in from the account
+                    menu to activate it.
+                  </AttentionNote>
+                )}
+                {accountModeEnabled && accountApprovalRow}
+              </div>
+            </WayCard>
+          </div>
+
+          {/* Devices — one answer to "what can reach this machine": paired
+              devices and account browsers, from either way in. */}
           <section className="space-y-2">
             <div className="flex items-center justify-between gap-4">
               <div className="flex items-center gap-2">
-                <SubHeading>Paired devices</SubHeading>
+                <SubHeading>Devices</SubHeading>
                 {connectedCount > 0 && (
                   <span className="text-label font-medium text-status-open tabular-nums">
                     {connectedCount} connected
@@ -1707,12 +1931,40 @@ export function RemoteAccessSection() {
                 </Button>
               )}
             </div>
-            {approved.length === 0 ? (
-              <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-muted-foreground/70">
-                <Server className="size-4" />
-                No devices paired yet. Create a pairing link above to connect
-                one.
+
+            {pending.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <p className="text-body-sm font-medium text-status-working">
+                    Waiting for approval
+                  </p>
+                  <Badge
+                    variant="outline"
+                    className="border-status-working/30 bg-status-working/10 text-caption text-status-working"
+                  >
+                    {pending.length}
+                  </Badge>
+                </div>
+                {pending.map((s) => (
+                  <PendingRow
+                    key={s.id}
+                    session={s}
+                    busy={sessionBusy === s.id}
+                    onApprove={() => handleApprove(s.id)}
+                    onReject={() => handleReject(s.id)}
+                  />
+                ))}
               </div>
+            )}
+
+            {approved.length === 0 ? (
+              pending.length === 0 && (
+                <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-muted-foreground/70">
+                  <Server className="size-4" />
+                  No devices yet. Connect one from app.codemux.org or with a
+                  pairing link.
+                </div>
+              )
             ) : (
               <div className="divide-y divide-border/50">
                 {approved.map((s) => (
@@ -1729,35 +1981,46 @@ export function RemoteAccessSection() {
         </>
       )}
 
-      {/* Cutoff confirm — a scope that excludes the origin this browser loaded
-          from would sever it with no way back on this address. Ask first. */}
+      {/* Cutoff confirm — a change that would sever the browser making it,
+          with no way back on its current address. Ask first. */}
       <AlertDialog
-        open={pendingScopeCutoff !== null}
+        open={pendingCutoff !== null}
         onOpenChange={(open) => {
-          if (!open) setPendingScopeCutoff(null);
+          if (!open) setPendingCutoff(null);
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Disconnect this device?</AlertDialogTitle>
             <AlertDialogDescription>
-              {pendingScopeCutoff && (
+              {pendingCutoff?.kind === "scope" && (
                 <>
                   This will disconnect this device — you're connected over{" "}
                   <span className="font-mono text-foreground">
                     {window.location.host}
                   </span>
-                  , which "{bindScopeLabel(pendingScopeCutoff)}" no longer
+                  , which "{bindScopeLabel(pendingCutoff.scope)}" no longer
                   allows. You'll need to reconnect from an allowed address.
                 </>
               )}
+              {pendingCutoff?.kind === "lan" && (
+                <>
+                  You're connected over{" "}
+                  <span className="font-mono text-foreground">
+                    {window.location.host}
+                  </span>
+                  . Turning off "On my network" disconnects this device.
+                </>
+              )}
+              {pendingCutoff?.kind === "relay" &&
+                'You\'re connected through the relay. Turning off "From anywhere" disconnects this device.'}
+              {pendingCutoff?.kind === "master" &&
+                "Turning remote access off disconnects every device, including this one."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmScopeCutoff}>
-              Continue
-            </AlertDialogAction>
+            <AlertDialogAction onClick={confirmCutoff}>Continue</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
