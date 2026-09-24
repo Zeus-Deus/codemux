@@ -12,16 +12,10 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
 
-export function SidebarActionRow() {
-  const { state } = useSidebar();
-  // Only the floating titlebar overlays this header. With legacy chrome the
-  // in-flow `h-9` bar already sits above the sidebar, so the extra clearance
-  // would just be dead padding above the search row.
-  const titlebarOverlay = useTitlebarOverlay();
-  const { getKeysForAction } = useResolvedKeybinds();
-  const newAgentKeys = getKeysForAction("newAgent");
-  const paletteKeys = getKeysForAction("commandPalette");
-  const setShowCommandPalette = useUIStore((s) => s.setShowCommandPalette);
+/** The "New agent" gesture shared by the sidebar header and its empty state:
+ *  a home-directory chat draft when agent chat is on, otherwise (or with
+ *  Shift held) the new-workspace dialog. */
+export function useNewAgentAction() {
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const enableLazyWorkspaceCreation = useFeatureFlags(
@@ -47,6 +41,20 @@ export function SidebarActionRow() {
     }
     setShowNewWorkspaceDialog(true);
   };
+  return handleNewAgent;
+}
+
+export function SidebarActionRow() {
+  const { state } = useSidebar();
+  // Only the floating titlebar overlays this header. With legacy chrome the
+  // in-flow `h-9` bar already sits above the sidebar, so the extra clearance
+  // would just be dead padding above the search row.
+  const titlebarOverlay = useTitlebarOverlay();
+  const { getKeysForAction } = useResolvedKeybinds();
+  const newAgentKeys = getKeysForAction("newAgent");
+  const paletteKeys = getKeysForAction("commandPalette");
+  const setShowCommandPalette = useUIStore((s) => s.setShowCommandPalette);
+  const handleNewAgent = useNewAgentAction();
 
   // Collapsed icon rail header: just the two create/find affordances,
   // centered and each labelled by a right-side tooltip. New agent is a neutral
