@@ -1689,6 +1689,17 @@ export interface WebRemoteStatus {
    *  attempt has run. `null` before then. Mirrors the same-named field on
    *  {@link WebRemoteRegistrationStatus}. */
   device_id?: string | null;
+  /** Why the LAN listener is not bound even though remote access is on (port
+   *  in use, no tailnet address for the `tailscale` scope…). `null` while it
+   *  is bound or remote access is off. The backend keeps retrying while set. */
+  bind_error?: string | null;
+  /** Whether the from-anywhere (relay) endpoint is actually up — unlike
+   *  `relay_mode_enabled`, which is only the persisted intent. Independent of
+   *  `running`: relay mode needs no LAN listener. */
+  relay_running?: boolean;
+  /** The last device-registration failure, carried live on every broadcast
+   *  (`null` when registered or not yet attempted). */
+  registration_error?: string | null;
 }
 
 /** Control-plane registration state for the from-anywhere iroh transport.

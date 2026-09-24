@@ -44,6 +44,7 @@ import {
   webRemoteListEndpoints,
   webRemoteRegistrationStatus,
   webRemoteRejectSession,
+  webRemoteRetry,
   webRemoteRevokeSession,
   webRemoteSetConfig,
   webRemoteStatus,
@@ -608,6 +609,7 @@ export function RemoteAccessSection() {
   const [accountModePending, setAccountModePending] = useState(false);
   const [trustAccountPending, setTrustAccountPending] = useState(false);
   const [relayModePending, setRelayModePending] = useState(false);
+  const [retryPending, setRetryPending] = useState(false);
   // Control-plane registration state for the from-anywhere transport. Null
   // while relay mode is off (or when the read failed — see the effect below).
   const [registration, setRegistration] =
@@ -752,6 +754,12 @@ export function RemoteAccessSection() {
   // trigger for the richer registration read and as its fallback.
   const deviceRegistered = status?.device_registered ?? false;
   const irohNodeId = status?.iroh_node_id ?? null;
+  // Why nothing is listening even though remote access is on. The backend
+  // keeps retrying while this is set; the pane shows it instead of an
+  // open-ended "starting".
+  const bindError = enabled && !running ? (status?.bind_error ?? null) : null;
+  const relayRunning = status?.relay_running ?? false;
+  const liveRegistrationError = status?.registration_error ?? null;
   // While a web-client rebind settles, show the requested scope optimistically
   // rather than the server's last-broadcast value.
   const bindScope = scopeOverride ?? bindScopeOf(status);
@@ -784,7 +792,13 @@ export function RemoteAccessSection() {
     return () => {
       cancelled = true;
     };
-  }, [relayLive, deviceRegistered, irohNodeId, accountSignedIn]);
+  }, [
+    relayLive,
+    deviceRegistered,
+    irohNodeId,
+    accountSignedIn,
+    liveRegistrationError,
+  ]);
 
   // Prefer the dedicated read, fall back to the live status broadcast.
   const relayRegistered = registration?.registered ?? deviceRegistered;
@@ -795,7 +809,11 @@ export function RemoteAccessSection() {
   const relayDisplayName = registration?.name || relayDeviceId;
   const relayNodeId = registration?.node_id ?? irohNodeId;
   const relayLastRegisteredAt = registration?.last_registered_at ?? null;
-  const relayLastError = registration?.last_error ?? null;
+  // The live broadcast carries the current failure; the dedicated read is
+  // the fallback for a backend that doesn't broadcast it.
+  const relayLastError = relayRegistered
+    ? null
+    : (liveRegistrationError ?? registration?.last_error ?? null);
 
   const portValidation = validatePort(portDraft);
   const portDirty = status != null && portDraft !== String(status.port);
@@ -1047,6 +1065,34 @@ export function RemoteAccessSection() {
     [applyStatus],
   );
 
+  // Retry the LAN listener bind (and relay registration) right now instead of
+  // waiting for the backend's own retry schedule.
+  const handleRetry = useCallback(
+    async (what: "server" | "registration") => {
+      setRetryPending(true);
+      try {
+        const result = await webRemoteRetry();
+        applyStatus(result, { detectPending: false });
+        if (result.running) void refreshEndpoints();
+        if (what === "server") toast.success("Remote access is listening again.");
+      } catch (err) {
+        console.error("[remote-access] retry failed:", err);
+        if (what === "server") {
+          toast.error(`Still couldn't start the server: ${String(err)}`);
+        } else {
+          // The rejection is about the LAN listener; registration was retried
+          // regardless and reports back through the live status.
+          void webRemoteStatus()
+            .then((fresh) => applyStatus(fresh, { detectPending: false }))
+            .catch(() => undefined);
+        }
+      } finally {
+        setRetryPending(false);
+      }
+    },
+    [applyStatus, refreshEndpoints],
+  );
+
   const handleCreatePairing = useCallback(async () => {
     setPairingPending(true);
     try {
@@ -1152,6 +1198,15 @@ export function RemoteAccessSection() {
                   Listening on {status?.port}
                 </Badge>
               )}
+              {bindError && (
+                <Badge
+                  variant="outline"
+                  className="gap-1 border-status-attention/30 bg-status-attention/10 text-caption text-status-attention"
+                >
+                  <span className="inline-block size-1.5 rounded-full bg-status-attention" />
+                  Not listening
+                </Badge>
+              )}
             </div>
             <p className="text-label leading-relaxed text-muted-foreground">
               Turning this on starts a server that listens on{" "}
@@ -1172,6 +1227,46 @@ export function RemoteAccessSection() {
           />
         </div>
       </div>
+
+      {/* A failed bind is a real state, not "starting": name the reason, say
+          what still works, and offer a retry. */}
+      {bindError && (
+        <div
+          role="alert"
+          className="flex items-start gap-3 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3"
+        >
+          <WifiOff className="mt-0.5 size-4 shrink-0 text-status-attention" />
+          <div className="min-w-0 flex-1 space-y-1">
+            <p className="text-body font-medium text-status-attention">
+              The server isn't listening on your networks
+            </p>
+            <p className="break-words font-mono text-body-sm text-foreground/90">
+              {bindError}
+            </p>
+            <p className="text-body-sm leading-relaxed text-muted-foreground">
+              Codemux keeps retrying on its own
+              {relayModeEnabled && relayRunning
+                ? " — from-anywhere access is unaffected and still works."
+                : "."}
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={retryPending}
+            onClick={() => void handleRetry("server")}
+          >
+            {retryPending ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3.5" />
+            )}
+            Retry
+          </Button>
+        </div>
+      )}
 
       {enabled && (
         <>
@@ -1374,7 +1469,8 @@ export function RemoteAccessSection() {
           </section>
 
           {/* From anywhere (relay) — the account-scoped iroh transport. Off by
-              default; only meaningful while the server itself is on, so it
+              default. It needs no LAN listener (it runs even when the server
+              above can't bind), but the master switch still gates it, so it
               lives inside the enabled block alongside account access. */}
           <section className="space-y-4">
             <SubHeading>From anywhere (relay)</SubHeading>
@@ -1435,7 +1531,12 @@ export function RemoteAccessSection() {
                   ) : (
                     <Badge
                       variant="outline"
-                      className="gap-1 border-status-working/30 bg-status-working/10 text-caption text-status-working"
+                      className={cn(
+                        "gap-1 text-caption",
+                        relayLastError
+                          ? "border-status-attention/30 bg-status-attention/10 text-status-attention"
+                          : "border-status-working/30 bg-status-working/10 text-status-working",
+                      )}
                     >
                       <ShieldAlert className="size-3" />
                       Not registered yet
@@ -1445,13 +1546,15 @@ export function RemoteAccessSection() {
                 <p className="text-body-sm leading-relaxed text-muted-foreground/80">
                   {relayRegistered
                     ? "This device is listed with your account, so a browser signed into it can find and dial this machine from anywhere."
-                    : "This device isn't listed with your account yet. Registration runs on its own and usually settles in a moment — until then, only the addresses above reach it."}
+                    : relayLastError
+                      ? "A browser signed into your account can't find this machine until it's listed. Codemux retries on its own."
+                      : "Listing this device with your account…"}
                 </p>
 
                 {relayDisplayName && (
                   <div className="flex items-center gap-2">
                     <span className="shrink-0 text-body-sm text-muted-foreground/70">
-                      Registered as
+                      {relayRegistered ? "Registered as" : "Registers as"}
                     </span>
                     <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
                       {relayDisplayName}
@@ -1481,10 +1584,27 @@ export function RemoteAccessSection() {
                   </p>
                 )}
 
-                {!relayRegistered && relayLastError && (
-                  <p className="text-body-sm leading-relaxed text-status-attention">
-                    Last attempt failed: {relayLastError}
-                  </p>
+                {relayLastError && (
+                  <div className="flex items-start justify-between gap-3">
+                    <p className="min-w-0 break-words text-body-sm leading-relaxed text-status-attention">
+                      Last attempt failed: {relayLastError}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0"
+                      disabled={retryPending}
+                      onClick={() => void handleRetry("registration")}
+                    >
+                      {retryPending ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="size-3.5" />
+                      )}
+                      Retry
+                    </Button>
+                  </div>
                 )}
               </div>
             )}
@@ -1497,7 +1617,9 @@ export function RemoteAccessSection() {
               <p className="py-2 text-body text-muted-foreground/70">
                 {running
                   ? "No reachable endpoints found."
-                  : "Starting the server…"}
+                  : bindError
+                    ? "Nothing is reachable on your networks until the server can listen — see above."
+                    : "Starting the server…"}
               </p>
             ) : (
               <GroupedEndpoints endpoints={endpoints} />

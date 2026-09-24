@@ -1667,6 +1667,12 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
             crate::web_remote::control_pair(app, name)
                 .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
         }
+        // The live remote-access status (`codemux connect status`): what is
+        // actually bound and registered, not just what the config says.
+        "web_remote_status" => {
+            serde_json::to_value(crate::web_remote::web_remote_status(app.clone()))
+                .map_err(|error| error.to_string())
+        }
         // Enable web remote access from the terminal (`codemux remote enable`),
         // optionally selecting the bind scope and port. Shares the exact
         // bind/rollback + state-emission paths the Settings pane uses; returns

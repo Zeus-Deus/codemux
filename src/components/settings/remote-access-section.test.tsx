@@ -1,6 +1,13 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type {
@@ -50,6 +57,7 @@ const cmds = vi.hoisted(() => ({
   webRemoteApproveSession: vi.fn(),
   webRemoteRejectSession: vi.fn(),
   webRemoteRegistrationStatus: vi.fn(),
+  webRemoteRetry: vi.fn(),
 }));
 vi.mock("@/tauri/commands", () => cmds);
 
@@ -625,6 +633,97 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
 
     await waitFor(() => expect(screen.getByText(/^Registered$/)).toBeInTheDocument());
     expect(screen.getByText("node-from-status")).toBeInTheDocument();
+  });
+});
+
+// Issue #404: a failed LAN bind used to render as "Starting the server…"
+// forever and relay registration reassured the user it "usually settles in a
+// moment". Both must now show the real reason.
+describe("RemoteAccessSection — failure states (#404)", () => {
+  const failedBind = (p: Partial<WebRemoteStatus> = {}) =>
+    status({
+      enabled: true,
+      running: false,
+      bind_error: "No Tailscale address found",
+      account_signed_in: true,
+      sessions: [],
+      ...p,
+    });
+
+  it("shows the bind error with a Retry instead of 'Starting the server…'", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(failedBind());
+    render(<RemoteAccessSection />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/isn't listening on your networks/i);
+    expect(alert).toHaveTextContent("No Tailscale address found");
+    expect(screen.getByText(/^Not listening$/)).toBeInTheDocument();
+    expect(screen.queryByText(/Starting the server/i)).toBeNull();
+    expect(cmds.webRemoteListEndpoints).not.toHaveBeenCalled();
+  });
+
+  it("says relay still works when the relay transport is up", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      failedBind({ relay_mode_enabled: true, relay_running: true }),
+    );
+    render(<RemoteAccessSection />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /from-anywhere access is unaffected/i,
+    );
+  });
+
+  it("Retry calls webRemoteRetry and clears the alert when the bind succeeds", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(failedBind());
+    cmds.webRemoteRetry.mockResolvedValue(enabledStatus());
+    render(<RemoteAccessSection />);
+
+    const alert = await screen.findByRole("alert");
+    await user.click(within(alert).getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(cmds.webRemoteRetry).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(toast.success).toHaveBeenCalledWith("Remote access is listening again.");
+  });
+
+  it("Retry surfaces a bind that still fails", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(failedBind());
+    cmds.webRemoteRetry.mockRejectedValue("Address already in use");
+    render(<RemoteAccessSection />);
+
+    const alert = await screen.findByRole("alert");
+    await user.click(within(alert).getByRole("button", { name: /retry/i }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Still couldn't start the server: Address already in use",
+      ),
+    );
+  });
+
+  it("renders the live registration error instead of 'usually settles'", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      status({
+        enabled: true,
+        running: true,
+        account_signed_in: true,
+        relay_mode_enabled: true,
+        relay_running: true,
+        device_registered: false,
+        registration_error: "device registration returned 503 Service Unavailable",
+        sessions: [],
+      }),
+    );
+    // The dedicated read has no error (stale); the broadcast wins.
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({ registered: false });
+    render(<RemoteAccessSection />);
+
+    expect(
+      await screen.findByText(
+        /last attempt failed: device registration returned 503/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/usually settles/i)).toBeNull();
+    expect(screen.getByText(/codemux retries on its own/i)).toBeInTheDocument();
   });
 });
 
