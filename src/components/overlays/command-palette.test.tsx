@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   backend: {
     agentChatSearch: vi.fn(),
     openConversationSearchResult: vi.fn(),
+    reloadInterface: vi.fn(),
   },
 }));
 
@@ -68,7 +69,9 @@ vi.mock("@/components/layout/use-project-appearance", () => ({
 
 vi.mock("@/lib/use-coarse-clock", () => ({ useCoarseClock: () => 0 }));
 vi.mock("@/hooks/use-resolved-keybinds", () => ({
-  useResolvedKeybinds: () => ({ getKeysForAction: () => "" }),
+  useResolvedKeybinds: () => ({
+    getKeysForAction: (id: string) => (id === "reloadInterface" ? "Ctrl+Alt+R" : ""),
+  }),
 }));
 vi.mock("@/hooks/use-keyboard-shortcuts", () => ({ dispatch: vi.fn() }));
 vi.mock("@/lib/perf/instrumented-activate", () => ({
@@ -81,6 +84,7 @@ vi.mock("@/tauri/commands", () => ({
   cyclePane: vi.fn(),
   getPresets: vi.fn().mockResolvedValue({ bar_visible: false }),
   regenerateMcpConfig: vi.fn(),
+  reloadInterface: mocks.backend.reloadInterface,
   setPresetBarVisible: vi.fn(),
 }));
 
@@ -131,6 +135,7 @@ beforeEach(() => {
   mocks.app.appState = null;
   mocks.backend.agentChatSearch.mockResolvedValue([]);
   mocks.backend.openConversationSearchResult.mockResolvedValue(undefined);
+  mocks.backend.reloadInterface.mockResolvedValue(undefined);
   mocks.ui.takeCommandPaletteQuery.mockReturnValue(null);
   applyTheme(GRAPHITE, { animate: false, persist: false });
 });
@@ -453,5 +458,18 @@ describe("command palette — conversation search", () => {
       ),
     );
     expect(mocks.backend.agentChatSearch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("command palette — reload interface", () => {
+  it("shows the native shortcut and reloads through the app process", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "reload interface");
+
+    const row = screen.getByText("Reload interface").closest("[cmdk-item]");
+    expect(row).toHaveTextContent("Ctrl+Alt+R");
+    await user.click(screen.getByText("Reload interface"));
+    expect(mocks.backend.reloadInterface).toHaveBeenCalledTimes(1);
   });
 });

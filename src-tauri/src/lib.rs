@@ -2669,6 +2669,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            // "Reload interface" in the command palette: reloads only the
+            // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
+            webview_recovery::reload_interface,
             // Native window background, so a light palette doesn't launch
             // behind `tauri.conf.json`'s near-black default.
             set_window_background,

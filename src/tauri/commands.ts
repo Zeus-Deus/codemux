@@ -390,6 +390,10 @@ export const listLaunchGeminiModels = () =>
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
 
+/** Reload the desktop window's page from the app process, the same native
+ *  reload as Ctrl+Alt+R. The backend, terminals, and agents keep running. */
+export const reloadInterface = () => invoke<void>("reload_interface");
+
 /** Repair deferred MCP config writes for inactive workspaces. This may touch
  * disk and must be called only after the renderer's useful first paint. */
 export const repairInactiveMcpConfigs = () =>

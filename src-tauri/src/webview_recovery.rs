@@ -22,6 +22,8 @@
 //!    consumed before the page sees it, so it never reaches a terminal.
 //! 4. **`codemux reload-ui`** asks the running app to reload over the control
 //!    socket, for when the window cannot take keyboard input at all.
+//! 5. **"Reload interface"** in the command palette calls
+//!    [`reload_interface`], for a page that still runs but looks wrong.
 //!
 //! A reload only ever touches the main webview: it reloads the page, and
 //! restarts the web content process first when that process is unresponsive.
@@ -77,6 +79,8 @@ pub enum Trigger {
     Shortcut,
     /// `codemux reload-ui` over the control socket.
     ControlCommand,
+    /// The command palette's "Reload interface" entry.
+    CommandPalette,
 }
 
 impl fmt::Display for Trigger {
@@ -85,6 +89,7 @@ impl fmt::Display for Trigger {
             Trigger::Crash => "renderer exited",
             Trigger::Shortcut => "keyboard shortcut",
             Trigger::ControlCommand => "codemux reload-ui",
+            Trigger::CommandPalette => "command palette",
         })
     }
 }
@@ -358,6 +363,17 @@ pub fn request_reload<R: tauri::Runtime>(
         log::warn!("[codemux::webview] reloading interface ({trigger})");
         window.reload().map_err(|error| error.to_string())
     }
+}
+
+/// Reload the main window's page from the command palette. Goes through the
+/// same native path as the recovery shortcut, so only the webview reloads.
+#[tauri::command]
+pub fn reload_interface<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+    use tauri::Manager;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "The Codemux window is not open".to_string())?;
+    request_reload(&window, Trigger::CommandPalette)
 }
 
 /// The main page is being replaced (a reload, a recovery, a dev-server

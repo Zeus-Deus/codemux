@@ -66,9 +66,11 @@ import {
   getPresets,
   agentChatSearch,
   regenerateMcpConfig,
+  reloadInterface,
   setPresetBarVisible,
   type AgentChatSearchResult,
 } from "@/tauri/commands";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
@@ -239,6 +241,21 @@ const COMMANDS: PaletteCommand[] = [
     run: () => useUIStore.getState().setShowDevices(true),
   },
   { id: "settings", label: "Settings", icon: Settings, actionId: "openSettings", keywords: "preferences config" },
+  {
+    id: "reload-interface",
+    label: "Reload interface",
+    icon: RefreshCw,
+    // Only for the shortcut hint: the frontend never dispatches this native
+    // action, so the row runs the reload itself.
+    actionId: "reloadInterface",
+    keywords: "refresh recover blank frozen stuck unresponsive ui",
+    // A web remote client has no desktop webview of its own, and must never
+    // reload the desktop's; its browser tab is the interface there.
+    run: () => {
+      if (isRemoteClient()) window.location.reload();
+      else void reloadInterface().catch(console.error);
+    },
+  },
   {
     id: "regen-mcp",
     label: "Regenerate MCP config",
