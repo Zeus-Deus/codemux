@@ -150,7 +150,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           )}
         >
           <ToolCallStatus item={item} />
-          {item.status === "unconfirmed" && <span className="ml-2 text-xs text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
+          {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
         </div>
         {glyph && (
           <glyph.Icon
