@@ -20,6 +20,8 @@
 //!      failure is the status's `bind_error`, not a failed enable),
 //!   4. once the port frees up, the background retry binds the listener
 //!      without a restart and the error clears,
+//!   4b. switching only the LAN listener off stops it and leaves the relay up
+//!      (a relay-only setup), and switching it back on rebinds,
 //!   5. with relay mode OFF, the same bind failure still rolls the enable back
 //!      (nothing would be running, so the switch must not read "on").
 //!
@@ -209,6 +211,31 @@ fn relay_registers_while_the_lan_listener_cannot_bind() {
     let status = web_remote::web_remote_status(handle.clone());
     assert_eq!(status.bind_error, None, "the error clears once bound");
     assert!(status.relay_running, "relay was never interrupted");
+
+    // ── 4b. The LAN listener has its own switch; the relay doesn't care. ──
+    let lan_setting = |on: bool| {
+        tauri::async_runtime::block_on(web_remote::web_remote_set_config(
+            handle.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(on),
+        ))
+    };
+    let status = lan_setting(false).expect("LAN listener off");
+    assert!(status.enabled && !status.lan_enabled, "kill switch stays on");
+    assert!(!status.running && status.bind_error.is_none());
+    assert!(status.relay_running, "relay-only: the relay stays up");
+    assert!(!healthy(port), "nothing listens on the LAN port any more");
+    let err = web_remote::control_pair(&handle, None).expect_err("no pairing link without the listener");
+    assert!(err.contains("On my network"), "names the switch: {err}");
+    let status = lan_setting(true).expect("LAN listener back on");
+    assert!(status.running, "the listener rebinds right away");
+    assert!(healthy(port));
+    assert!(status.relay_running);
 
     // ── 5. Relay OFF: the same failure rolls the enable back. ──
     web_remote::control_disable(&handle).expect("disable");
