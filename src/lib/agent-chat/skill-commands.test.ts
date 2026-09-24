@@ -64,6 +64,23 @@ describe("buildSkillCommands", () => {
     expect(onInvoke).toHaveBeenCalledExactlyOnceWith(skill);
   });
 
+  it("searches the SKILL.md description, not the scope suffix", () => {
+    const [item] = buildSkillCommands({
+      skills: [
+        makeSkill({
+          provider: "codex",
+          scope: "project",
+          description: "Update the personal Hermes Agent fork",
+        }),
+      ],
+      onInvoke: () => {},
+    });
+    expect(item.searchDescription).toBe(
+      "Update the personal Hermes Agent fork",
+    );
+    expect(item.description).not.toBe(item.searchDescription);
+  });
+
   it("group is always SKILLS", () => {
     const items = buildSkillCommands({
       skills: [
