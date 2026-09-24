@@ -706,6 +706,18 @@ async fn hermes_deletion_rechecks_cleanup_hold_under_lifecycle_lock() {
     assert!(work.is_dir());
 }
 
+/// An executable that exits non-zero without reading stdin. Windows has no
+/// `/bin/false`, and std runs a `.cmd` through cmd.exe.
+fn failing_executable(dir: &Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let script = dir.join("fail.cmd");
+        std::fs::write(&script, "@exit /b 1\r\n").unwrap();
+        script
+    } else {
+        "/bin/false".into()
+    }
+}
+
 /// The failing executable is a transport-failure fixture, never a substitute Hermes.
 #[tokio::test]
 async fn hermes_failed_initialization_does_not_hold_worktree() {
@@ -715,7 +727,7 @@ async fn hermes_failed_initialization_does_not_hold_worktree() {
         "model:\n  provider: custom\n",
     )
     .unwrap();
-    let profile = profile::resolve(Path::new("/bin/false"), root.path(), "default").unwrap();
+    let profile = profile::resolve(&failing_executable(root.path()), root.path(), "default").unwrap();
     let repo = root.path().join("repo");
     let work = root.path().join("work");
     std::fs::create_dir(&repo).unwrap();

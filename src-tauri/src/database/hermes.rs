@@ -101,9 +101,7 @@ impl DatabaseStore {
 
     pub fn hermes_cleanup_pending_path(&self, cwd: &str) -> Result<bool, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let path = std::path::Path::new(cwd)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(cwd));
+        let path = hold_key(std::path::Path::new(cwd));
         let mut stmt = conn
             .prepare("SELECT cwd FROM hermes_bindings WHERE cleanup_pending=1")
             .map_err(|e| e.to_string())?;
@@ -111,7 +109,7 @@ impl DatabaseStore {
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
         for row in rows {
-            if std::path::Path::new(&row.map_err(|e| e.to_string())?).starts_with(&path) {
+            if hold_key(std::path::Path::new(&row.map_err(|e| e.to_string())?)).starts_with(&path) {
                 return Ok(true);
             }
         }
@@ -122,4 +120,25 @@ impl DatabaseStore {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.query_row("SELECT EXISTS(SELECT 1 FROM hermes_bindings WHERE workspace_id=?1 AND cleanup_pending=1)", [workspace], |r| r.get(0)).map_err(|e| e.to_string())
     }
+}
+
+/// One comparable spelling for both sides of a cleanup-hold match. Holds are
+/// written canonical, but callers pass paths as the user or Git spelled them,
+/// and a row must match however it was written. On Windows `canonicalize`
+/// yields `\\?\C:\...` and expands 8.3 short names (`RUNNER~1`), and a path
+/// that no longer resolves falls back to its raw form; component comparison
+/// treats `\\?\C:` and `C:` as different prefixes, so a mixed pair would
+/// silently not hold. Resolve what exists, then drop the verbatim prefix,
+/// separators and case, all of which Windows ignores.
+fn hold_key(path: &std::path::Path) -> PathBuf {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !cfg!(windows) {
+        return resolved;
+    }
+    let raw = resolved.to_string_lossy().replace('/', "\\");
+    let plain = match raw.strip_prefix(r"\\?\UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string(),
+    };
+    PathBuf::from(plain.to_lowercase())
 }
