@@ -210,7 +210,7 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
         type="button"
         data-cta
         onClick={handleNewAgent}
-        className="mt-1 inline-flex h-8 items-center gap-2.5 border border-border px-3 font-mono text-caption uppercase tracking-[0.1em] text-foreground/85 transition-colors duration-150 hover:border-foreground/60 hover:bg-foreground/5 hover:text-foreground"
+        className="mt-1 inline-flex h-8 items-center gap-2.5 border border-border px-3 font-mono text-caption uppercase tracking-[0.1em] text-foreground/85 transition-colors duration-150 hover:border-foreground/60 hover:bg-surface-2 hover:text-foreground"
       >
         Put them to work
         {newAgentKeys && (
