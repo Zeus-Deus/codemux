@@ -79,6 +79,9 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
   const accent = mix(background, c.accent, 0.18);
   const sidebar = surfaces.dark_background ?? mix(background, dark ? "#000000" : foreground, dark ? 0.25 : 0.05);
   const sidebarForeground = readableOn([sidebar], foreground, dark ? "#ffffff" : "#000000");
+  // Stepped off the sidebar itself: light palettes recess it *darker* than the
+  // canvas, where a canvas-based hairline would vanish into it.
+  const sidebarBorder = mix(sidebar, foreground, 0.08);
   const sidebarAccent = surfaces.selection ?? mix(sidebar, c.accent, 0.18);
   const mutedForeground = readableOn([background, sidebar], mix(background, foreground, 0.72), foreground);
   const primaryForeground = readable(c.accent, background);
@@ -100,7 +103,7 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
       sidebar, sidebarForeground,
       sidebarPrimary: c.accent, sidebarPrimaryForeground: primaryForeground,
       sidebarAccent, sidebarAccentForeground: readable(sidebarAccent, sidebarForeground),
-      sidebarBorder: border, sidebarRing: c.accent, brandAccent: c.accent,
+      sidebarBorder, sidebarRing: c.accent, brandAccent: c.accent,
     },
   };
 }

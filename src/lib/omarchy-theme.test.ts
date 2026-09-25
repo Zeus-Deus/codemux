@@ -24,6 +24,9 @@ describe.each(["dark", "light"] as const)("%s Omarchy palette", (scheme) => {
     expect(theme.ansi.red).toBe(colors.color1);
     expect(contrastRatio(theme.roles.mutedForeground, theme.roles.background)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(theme.roles.primaryForeground, theme.roles.primary)).toBeGreaterThanOrEqual(4.5);
+    // Hairlines stay visible on the surface they sit on, whichever way the sidebar recesses.
+    expect(contrastRatio(theme.roles.border, theme.roles.background)).toBeGreaterThan(1.1);
+    expect(contrastRatio(theme.roles.sidebarBorder, theme.roles.sidebar)).toBeGreaterThan(1.1);
     applyTheme(theme, { animate: false });
     expect(document.documentElement.classList.contains("dark")).toBe(scheme === "dark");
     expect(document.documentElement.style.colorScheme).toBe(scheme);
@@ -42,7 +45,7 @@ it("layers the shell with Omarchy's own shades and derives them when absent", ()
   expect(roles.input).toBe(surfaces.muted);
   // Hairlines stay a quiet step off the canvas, well below Omarchy's muted text shade.
   expect(contrastRatio(roles.border, roles.background)).toBeLessThan(contrastRatio(surfaces.muted, roles.background));
-  expect(roles.sidebarBorder).toBe(roles.border);
+  expect(contrastRatio(roles.sidebarBorder, roles.sidebar)).toBeLessThan(contrastRatio(surfaces.muted, roles.sidebar));
   for (const surface of [roles.background, roles.sidebar]) {
     expect(contrastRatio(roles.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
   }
