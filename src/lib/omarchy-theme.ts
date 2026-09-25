@@ -58,8 +58,8 @@ function readableOn(surfaces: string[], preferred: string, ink: string): string 
 /**
  * Keep the desktop's palette and layer the shell the way Omarchy's own app
  * themes do: a recessed sidebar (`dark_background`), selection-colored
- * sidebar highlights, `muted` hairlines, and raised surfaces stepped toward
- * an accent-tinted foreground. Missing shades fall back to derived ones.
+ * sidebar highlights, `muted` control outlines, and raised surfaces stepped
+ * toward an accent-tinted foreground. Missing shades fall back to derived ones.
  */
 export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: OmarchyTheme): ThemeDefinition {
   const dark = scheme === "dark";
@@ -70,7 +70,12 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
   const popover = mix(background, ink, 0.09);
   const secondary = mix(background, ink, 0.1);
   const muted = mix(background, ink, 0.16);
-  const border = surfaces.muted ?? mix(background, foreground, 0.19);
+  // Omarchy's `muted` is a secondary *text* shade (vantablack sets #7a7a7a on
+  // black), so as a structural hairline it reads as a heavy rule. Dividers
+  // take a small fixed step off the canvas instead; inputs keep `muted` so
+  // form controls stay clearly outlined.
+  const border = mix(background, foreground, 0.08);
+  const input = surfaces.muted ?? mix(background, foreground, 0.19);
   const accent = mix(background, c.accent, 0.18);
   const sidebar = surfaces.dark_background ?? mix(background, dark ? "#000000" : foreground, dark ? 0.25 : 0.05);
   const sidebarForeground = readableOn([sidebar], foreground, dark ? "#ffffff" : "#000000");
@@ -91,7 +96,7 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
       secondary, secondaryForeground: readable(secondary, foreground),
       muted, mutedForeground,
       accent, accentForeground: readable(accent, foreground),
-      border, input: border, ring: c.accent,
+      border, input, ring: c.accent,
       sidebar, sidebarForeground,
       sidebarPrimary: c.accent, sidebarPrimaryForeground: primaryForeground,
       sidebarAccent, sidebarAccentForeground: readable(sidebarAccent, sidebarForeground),

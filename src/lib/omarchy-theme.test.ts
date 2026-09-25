@@ -39,7 +39,10 @@ it("layers the shell with Omarchy's own shades and derives them when absent", ()
   const { roles } = omarchyToTheme({ name: "Tokyo Night", scheme: "dark", colors, surfaces });
   expect(roles.sidebar).toBe(surfaces.dark_background);
   expect(roles.sidebarAccent).toBe(surfaces.selection);
-  expect(roles.border).toBe(surfaces.muted);
+  expect(roles.input).toBe(surfaces.muted);
+  // Hairlines stay a quiet step off the canvas, well below Omarchy's muted text shade.
+  expect(contrastRatio(roles.border, roles.background)).toBeLessThan(contrastRatio(surfaces.muted, roles.background));
+  expect(roles.sidebarBorder).toBe(roles.border);
   for (const surface of [roles.background, roles.sidebar]) {
     expect(contrastRatio(roles.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
   }
