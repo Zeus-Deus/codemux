@@ -455,3 +455,29 @@ describe("VS Code light import", () => {
     expect(contrastRatio(theme.roles.foreground, theme.roles.background)).toBeGreaterThanOrEqual(7);
   });
 });
+
+describe("dividers", () => {
+  // A divider separates regions; past ~1.3:1 it reads as a heavy rule.
+  const quiet = (line: string, surface: string) => {
+    const ratio = contrastRatio(line, surface);
+    expect(ratio).toBeGreaterThan(1.1);
+    expect(ratio).toBeLessThan(1.3);
+  };
+
+  it.each(BUILT_IN_THEMES.map((theme) => [theme.id, theme] as const))("stay quiet in %s", (_id, theme) => {
+    const { roles } = theme;
+    const background = normalizeColor(roles.background)!;
+    const sidebar = normalizeColor(roles.sidebar)!;
+    quiet(normalizeColor(roles.border, background)!, background);
+    quiet(normalizeColor(roles.sidebarBorder, sidebar)!, sidebar);
+  });
+
+  it.each(["#000000", "#101315", "#1e1e2e", "#3a3a3a", "#faf4ed", "#ffffff"])(
+    "land in the same band on a generated %s canvas",
+    (canvas) => {
+      const { roles } = createGeneratedTheme("Probe", canvas, "#e07850");
+      quiet(roles.border, roles.background);
+      quiet(roles.sidebarBorder, roles.sidebar);
+    },
+  );
+});
