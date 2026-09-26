@@ -59,3 +59,12 @@ it("layers the shell with Omarchy's own shades and derives them when absent", ()
   expect(derived.sidebar).not.toBe(derived.background);
   expect(contrastRatio(derived.sidebar, "#000000")).toBeLessThan(contrastRatio(derived.background, "#000000"));
 });
+
+it("caps a loud Omarchy muted shade on control outlines", () => {
+  // Vantablack's muted is #7a7a7a on pure black: fine for text, glaring as an outline.
+  const colors = { ...fallbackTheme, background: "#000000", foreground: "#ffffff", accent: "#8d8d8d" };
+  const surfaces = { dark_background: "#090909", selection: "#1a1a1a", muted: "#7a7a7a" };
+  const { roles } = omarchyToTheme({ name: "Vantablack", scheme: "dark", colors, surfaces });
+  expect(contrastRatio(roles.input, roles.background)).toBeLessThanOrEqual(2.5);
+  expect(contrastRatio(roles.input, roles.background)).toBeGreaterThan(contrastRatio(roles.border, roles.background));
+});

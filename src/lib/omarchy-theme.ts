@@ -1,5 +1,15 @@
 import type { ThemeColors } from "@/tauri/types";
-import { ANSI_SLOTS, contrastRatio, type AnsiPalette, type ThemeDefinition } from "./themes";
+import {
+  ANSI_SLOTS,
+  DIVIDER_CONTRAST,
+  SIDEBAR_DIVIDER_CONTRAST,
+  contrastRatio,
+  type AnsiPalette,
+  type ThemeDefinition,
+} from "./themes";
+
+/** Loudest a control outline may get: clearly visible, never a heavy rule. */
+const MAX_CONTROL_OUTLINE_CONTRAST = 2.5;
 
 export const OMARCHY_THEME_ID = "omarchy";
 export const THEME_SOURCE_KEY = "appearance.theme_source";
@@ -55,6 +65,24 @@ function readableOn(surfaces: string[], preferred: string, ink: string): string 
   return readable(surfaces[0], ink);
 }
 
+/** Nearest mix from `surface` toward `ink` that stands `target` off the surface. */
+function dividerOn(surface: string, ink: string, target: number): string {
+  for (let step = 1; step <= 100; step++) {
+    const candidate = mix(surface, ink, step / 200);
+    if (contrastRatio(candidate, surface) >= target) return candidate;
+  }
+  return mix(surface, ink, 0.5);
+}
+
+/** `color`, pulled back toward `surface` until it is no louder than `max`. */
+function capContrast(color: string, surface: string, max: number): string {
+  for (let step = 0; step <= 20; step++) {
+    const candidate = mix(color, surface, step / 20);
+    if (contrastRatio(candidate, surface) <= max) return candidate;
+  }
+  return surface;
+}
+
 /**
  * Keep the desktop's palette and layer the shell the way Omarchy's own app
  * themes do: a recessed sidebar (`dark_background`), selection-colored
@@ -72,16 +100,16 @@ export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: Omarc
   const muted = mix(background, ink, 0.16);
   // Omarchy's `muted` is a secondary *text* shade (vantablack sets #7a7a7a on
   // black), so as a structural hairline it reads as a heavy rule. Dividers
-  // take a small fixed step off the canvas instead; inputs keep `muted` so
-  // form controls stay clearly outlined.
-  const border = mix(background, foreground, 0.08);
-  const input = surfaces.muted ?? mix(background, foreground, 0.19);
+  // stand a fixed contrast off the canvas instead; inputs keep `muted` so
+  // form controls stay clearly outlined, capped so they never shout.
+  const border = dividerOn(background, foreground, DIVIDER_CONTRAST);
+  const input = capContrast(surfaces.muted ?? mix(background, foreground, 0.19), background, MAX_CONTROL_OUTLINE_CONTRAST);
   const accent = mix(background, c.accent, 0.18);
   const sidebar = surfaces.dark_background ?? mix(background, dark ? "#000000" : foreground, dark ? 0.25 : 0.05);
   const sidebarForeground = readableOn([sidebar], foreground, dark ? "#ffffff" : "#000000");
   // Stepped off the sidebar itself: light palettes recess it *darker* than the
   // canvas, where a canvas-based hairline would vanish into it.
-  const sidebarBorder = mix(sidebar, foreground, 0.08);
+  const sidebarBorder = dividerOn(sidebar, foreground, SIDEBAR_DIVIDER_CONTRAST);
   const sidebarAccent = surfaces.selection ?? mix(sidebar, c.accent, 0.18);
   const mutedForeground = readableOn([background, sidebar], mix(background, foreground, 0.72), foreground);
   const primaryForeground = readable(c.accent, background);
