@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
+import { cleanup, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { NewWorkspaceDialog } from "./new-workspace-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
@@ -247,6 +247,11 @@ function renderDialog(open: boolean, onOpenChange = vi.fn()) {
 }
 
 // ── Tests ──
+
+// Vitest globals are off, so Testing Library's auto-cleanup never runs.
+// Without this, every earlier test's dialog stays mounted and keeps
+// reacting to shared mocks, which made later tests slow and flaky on CI.
+afterEach(cleanup);
 
 beforeEach(() => {
   vi.clearAllMocks();
