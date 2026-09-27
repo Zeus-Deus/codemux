@@ -1006,8 +1006,9 @@ fn concrete_name_from_description(description: &str) -> Option<String> {
 ///   fable   → `"Claude Fable 5"` + `"<blurb>"`
 ///
 /// The concrete name comes from the row's version-bearing description
-/// (see [`concrete_name_from_description`]), falling back to the
-/// canonical maintained entry's label. Non-alias rows and alias rows
+/// (see [`concrete_name_from_description`]), then from a versioned
+/// display name (`"Opus 5.5"`), and only then from the canonical
+/// maintained entry's label. Non-alias rows and alias rows
 /// with no resolvable concrete name pass through untouched. The version
 /// segment promoted into the label is dropped from the description so
 /// the subtitle doesn't repeat it; the `default` alias keeps its
@@ -1033,7 +1034,16 @@ fn promote_alias_row(
         .as_deref()
         .and_then(concrete_name_from_description);
     let desc_carries_name = from_desc.is_some();
-    let Some(concrete) = from_desc.or_else(|| {
+    // Newer CLIs put the resolved version in the alias row's display
+    // name instead (`opus` → "Opus 5.5", description "Most capable for
+    // ambitious work"). That live answer must beat the maintained
+    // canonical table, which lags behind whatever the CLI re-points
+    // the alias at.
+    let from_label = (!label_is_versionless)
+        .then(|| base_model_name(&label))
+        .map(|name| name.strip_prefix("Claude ").unwrap_or(name))
+        .and_then(concrete_name_from_description);
+    let Some(concrete) = from_desc.or(from_label).or_else(|| {
         alias_canonical
             .and_then(|cid| maintained.get(cid))
             .or_else(|| maintained.get(base_id))
@@ -2185,6 +2195,38 @@ mod tests {
             row("haiku").description.as_deref(),
             Some("Fastest and cheapest"),
         );
+    }
+
+    #[test]
+    fn alias_row_keeps_versioned_display_name_over_canonical_table() {
+        // Roster shape reported by Claude Code 2.1.282: alias versions
+        // live in `displayName`, descriptions are version-free blurbs.
+        // Rows must render the CLI's versions, not the maintained
+        // table's stale Opus 4.8 / Sonnet 4.6.
+        let live: ListModelsResponse = serde_json::from_value(json!({ "models": [
+            { "value": "default", "displayName": "Default (recommended)",
+              "description": "Opus 5.5 · Best for everyday, complex tasks" },
+            { "value": "opus", "displayName": "Opus 5.5",
+              "description": "Most capable for ambitious work" },
+            { "value": "sonnet", "displayName": "Sonnet 5",
+              "description": "Most efficient for everyday tasks" },
+            { "value": "claude-opus-4-8", "displayName": "Opus 4.8",
+              "description": "Best for everyday, complex tasks" },
+        ]}))
+        .unwrap();
+        let caps = build_capabilities_from_sdk(live.models);
+        let label = |id: &str| caps.models.iter().find(|m| m.id == id).unwrap().label.as_str();
+
+        // `default` resolves to the same model and folds into `opus`.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        assert_eq!(caps.models[0].id, "opus");
+        assert_eq!(caps.models[0].label, "Claude Opus 5.5");
+        assert_eq!(
+            caps.models[0].description.as_deref(),
+            Some("Recommended · Most capable for ambitious work"),
+        );
+        assert_eq!(label("sonnet"), "Claude Sonnet 5");
+        assert_eq!(label("claude-opus-4-8"), "Opus 4.8");
     }
 
     #[test]
