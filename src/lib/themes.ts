@@ -300,14 +300,14 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       mutedForeground: "oklch(0.725 0.006 56)",
       accent: "oklch(0.272 0.006 55)",
       accentForeground: "oklch(0.935 0.004 67)",
-      border: "oklch(0.315 0.006 55)",
+      border: "oklch(0.263 0.006 56)",
       input: "oklch(0.315 0.006 55)",
       ring: "oklch(0.55 0.009 56)",
       sidebar: "oklch(0.165 0.006 50)",
       sidebarForeground: "oklch(0.935 0.004 67)",
       sidebarAccent: "oklch(0.255 0.006 58)",
       sidebarAccentForeground: "oklch(0.935 0.004 67)",
-      sidebarBorder: "oklch(0.272 0.006 55)",
+      sidebarBorder: "oklch(0.25 0.006 56)",
       sidebarRing: "oklch(0.55 0.009 56)",
     }),
     ansi: ansi({ black: "#151110", white: "#eae5e1" }),
@@ -331,7 +331,7 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       mutedForeground: "#a8a5a3",
       accent: "#2a2827",
       accentForeground: "#eae8e6",
-      border: "#383330",
+      border: "#292422",
       input: "#383330",
       ring: "#5d5753",
       sidebar: "#1a1716",
@@ -365,7 +365,7 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       mutedForeground: "#89aeb4",
       accent: "#153945",
       accentForeground: "#d9edf0",
-      border: "#20414a",
+      border: "#122930",
       input: "#28505a",
       ring: "#4f7d84",
       sidebar: "#051116",
@@ -374,7 +374,7 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       sidebarPrimaryForeground: "#061418",
       sidebarAccent: "#102a33",
       sidebarAccentForeground: "#d9edf0",
-      sidebarBorder: "#18353e",
+      sidebarBorder: "#0f252c",
       sidebarRing: "#4f7d84",
       brandAccent: "#78d6df",
     }),
@@ -403,7 +403,7 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       mutedForeground: "#aa9bbd",
       accent: "#352747",
       accentForeground: "#f2ebfa",
-      border: "#413451",
+      border: "#2a2236",
       input: "#4a3a5d",
       ring: "#756486",
       sidebar: "#100c17",
@@ -412,7 +412,7 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
       sidebarPrimaryForeground: "#1b1325",
       sidebarAccent: "#281e35",
       sidebarAccentForeground: "#eee9f5",
-      sidebarBorder: "#352945",
+      sidebarBorder: "#261d33",
       sidebarRing: "#756486",
       brandAccent: "#c9a7ff",
     }),
@@ -559,6 +559,14 @@ function readableOn(background: string, tintedHue?: number): string {
  */
 const LIGHT_SURFACE_SCALE = 0.6;
 
+/**
+ * How far a divider stands off the surface it sits on. Dividers separate
+ * regions; they should not compete with content. The built-in palettes sit
+ * in this band too.
+ */
+export const DIVIDER_CONTRAST = 1.22;
+export const SIDEBAR_DIVIDER_CONTRAST = 1.2;
+
 function surface(canvas: Oklch, hue: number, chroma: number, delta: number, scheme: ThemeScheme): string {
   const L =
     scheme === "dark"
@@ -696,7 +704,13 @@ export function createGeneratedTheme(
   const sidebar = step(tint * 1.2, 0.025);
   const card = step(tint, 0.055);
   const secondary = step(surfaceChroma(1.3, 0.06), 0.1);
-  const border = step(surfaceChroma(1.1, 0.05), 0.16);
+  // Dividers are solved to a contrast target rather than stepped a fixed
+  // lightness: a fixed step reads as a heavy rule on a mid-dark canvas and
+  // vanishes on pure black. Sidebar dividers solve against the sidebar they
+  // sit on.
+  const border = solveLightness(
+    { L: canvas.L, C: surfaceChroma(1.1, 0.05), h: hue }, background, DIVIDER_CONTRAST, ink,
+  );
   const input = step(surfaceChroma(1.2, 0.055), 0.2);
   const themeRoles = roles({
     background,
@@ -722,7 +736,9 @@ export function createGeneratedTheme(
     sidebarPrimaryForeground: accentForeground,
     sidebarAccent: step(surfaceChroma(1.25, 0.055), 0.09),
     sidebarAccentForeground: foreground,
-    sidebarBorder: step(surfaceChroma(1.0, 0.045), 0.13),
+    sidebarBorder: solveLightness(
+      { ...rgbToOklch(parseHex(sidebar)!), C: surfaceChroma(1.0, 0.045), h: hue }, sidebar, SIDEBAR_DIVIDER_CONTRAST, ink,
+    ),
     sidebarRing: step(tint, 0.3),
     brandAccent: accent,
   });
