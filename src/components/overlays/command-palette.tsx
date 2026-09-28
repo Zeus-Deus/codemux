@@ -1,7 +1,6 @@
 import { useAddonsStore } from "@/stores/addons-store";
 import { addonEnabled } from "@/lib/addons/types";
 import { executeAddon } from "@/lib/addons/platform";
-import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Puzzle } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
