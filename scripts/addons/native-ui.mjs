@@ -1419,6 +1419,7 @@ async function checkRemoteBoundary() {
       accountModeEnabled: false,
       trustAccountBrowsers: false,
       relayModeEnabled: false,
+      lanEnabled: true,
     });
     const status = await native("web_remote_enable");
     assert.equal(status.bind_scope, "loopback");
