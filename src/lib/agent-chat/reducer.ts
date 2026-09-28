@@ -1805,6 +1805,15 @@ function applyEventInner(
       state = sealTrailingReasoning(state, now);
       // Seal any still-streaming assistant message for this turn.
       let messages = state.messages;
+      // Official Hermes can omit foreground completion events. A completed turn
+      // ends the spinner but does not prove that any individual tool succeeded.
+      for (let i = 0; i < messages.length; i++) {
+        const item = messages[i];
+        if (item.kind === "tool_call" && item.turn_id === event.turn_id && item.status === "running"
+          && item.input && typeof item.input === "object" && "hermesAcp" in item.input) {
+          messages = replaceItem(messages, i, { ...item, status: "unconfirmed", completed_at: now() });
+        }
+      }
       const existing = findTrailingAssistant(messages, event.turn_id);
       if (existing && existing.item.streaming) {
         const sealed: AssistantMessageItem = {

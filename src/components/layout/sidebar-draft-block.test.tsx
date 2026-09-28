@@ -29,7 +29,7 @@ const catalog: SidebarDraftCatalog = {
 };
 
 /** Mirrors how the sidebar inbox wires the block: one frozen snapshot feeds
- *  both the rendered rows and the count behind the "Nothing active"
+ *  both the rendered rows and the count behind the empty state
  *  placeholder, so every test also asserts they cannot disagree. */
 function DraftBlockHarness(props: { filterPath: string | null }) {
   const frozenActive = useFrozenActiveDraftRow(catalog, props.filterPath);
@@ -202,7 +202,7 @@ describe("SidebarDraftBlock", () => {
     });
 
     // Frozen-null: the block deliberately renders nothing, so the count must
-    // stay 0 or the inbox hides its "Nothing active" placeholder for a row
+    // stay 0 or the inbox hides its empty state for a row
     // that does not exist.
     expect(screen.queryByTestId("sidebar-draft-block")).not.toBeInTheDocument();
     expect(expectCountMatchesRows()).toBe(0);

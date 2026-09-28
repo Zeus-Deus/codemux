@@ -148,7 +148,7 @@ export interface ToolCallItem {
   tool_use_id: string;
   tool_name: string;
   input: unknown;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "unconfirmed";
   result_content: unknown | null;
   /** When a permission request is tied to this tool call via
    *  `tool_use_id`, the reducer stores the request's id here so the

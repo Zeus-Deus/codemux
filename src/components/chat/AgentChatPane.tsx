@@ -198,6 +198,7 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  hermes: "Hermes",
   opencode: "OpenCode",
 };
 
@@ -1809,6 +1810,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           for (const attachment of freshAttachments) {
             useAgentChatStore.getState().removeStagedAttachment(threadId, attachment.id);
           }
+        }
+        if (result?.queued_id) {
+          // Hermes can queue behind another chat in its profile. This chat
+          // has no Running event yet, so the optimistic flag must settle now.
+          sendInFlightRef.current = false;
+          setIsSending(false);
         }
         if (result.steered) toast.success("Guidance accepted", { description: "The agent will use it at its next safe opportunity." });
         // The turn was accepted, so the provider runtime is alive and

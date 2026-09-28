@@ -3020,7 +3020,9 @@ fn cursor_question_response(questions: &[AcpQuestion], decision: &ApprovalDecisi
                 "reason": message
             }
         }),
-        ApprovalDecision::AllowForSession | ApprovalDecision::Cancel => {
+        ApprovalDecision::AllowForSession
+        | ApprovalDecision::Cancel
+        | ApprovalDecision::ProviderOption { .. } => {
             json!({ "outcome": { "outcome": "cancelled" } })
         }
     }
@@ -3155,7 +3157,9 @@ fn cursor_plan_response(decision: &ApprovalDecision) -> Value {
                 "reason": message
             }
         }),
-        ApprovalDecision::Cancel => json!({ "outcome": { "outcome": "cancelled" } }),
+        ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => {
+            json!({ "outcome": { "outcome": "cancelled" } })
+        }
     }
 }
 
@@ -3186,7 +3190,9 @@ fn xai_plan_response(decision: &ApprovalDecision) -> Value {
             "outcome": "cancelled",
             "feedback": message
         }),
-        ApprovalDecision::Cancel => json!({ "outcome": "abandoned" }),
+        ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => {
+            json!({ "outcome": "abandoned" })
+        }
     }
 }
 
@@ -3195,7 +3201,9 @@ fn permission_outcome(options: &[Value], decision: &ApprovalDecision) -> Value {
         ApprovalDecision::AllowForSession => &["allow_always", "allow_once"],
         ApprovalDecision::Allow { .. } => &["allow_once", "allow_always"],
         ApprovalDecision::Deny { .. } => &["reject_once", "reject_always"],
-        ApprovalDecision::Cancel => return json!({ "outcome": "cancelled" }),
+        ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => {
+            return json!({ "outcome": "cancelled" })
+        }
     };
     select_permission_option(options, kinds)
         .map(|option_id| json!({ "outcome": "selected", "optionId": option_id }))

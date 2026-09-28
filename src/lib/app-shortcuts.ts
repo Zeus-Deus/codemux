@@ -32,8 +32,10 @@ export function updateAppShortcuts(overrides: Record<string, string>) {
     // `terminal` shortcuts are handled inside xterm, and `non-terminal` ones
     // deliberately yield to a focused pty — neither belongs in the list of
     // combos the terminal has to give up.
+    // `native` ones are consumed by the desktop app before the page sees them.
     const reg = KEYBIND_REGISTRY.find((e) => e.id === id);
     if (reg?.when === "terminal" || reg?.when === "non-terminal") continue;
+    if (reg?.native) continue;
     if (!entry.activeKeys) continue;
 
     const parsed = parseKeyCombo(entry.activeKeys);

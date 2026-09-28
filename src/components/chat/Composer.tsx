@@ -3456,6 +3456,8 @@ export function Composer({
           ) : null}
           <ComposerAddonAccessory composerId={addonComposer.id} onClose={() => textareaRef.current?.focus()} />
           <ComposerFooter
+            hermesThreadId={threadId}
+            hermesProjectPath={cwd}
             provider={provider}
             model={model}
             permissionMode={permissionMode}

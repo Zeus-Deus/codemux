@@ -33,6 +33,9 @@ export function buildSkillCommands({
     id: `skill:${skill.id}${(idCounts.get(skill.id) ?? 0) > 1 ? `:${index}` : ""}`,
     label: skill.name,
     description: formatSkillDescription(skill),
+    // Search the skill's own prose, not the `provider · scope` suffix,
+    // or `/codex` would match every Codex skill.
+    searchDescription: skill.description ?? "",
     command: skillTokenFor(skill, skills),
     icon: BookOpen,
     group: "SKILLS",

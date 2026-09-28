@@ -271,7 +271,11 @@ pub async fn create_worktree(path: String, branch: String, new_branch: bool, bas
 }
 
 #[tauri::command]
-pub async fn remove_worktree(worktree_path: String, branch: Option<String>, force: Option<bool>) -> Result<(), String> {
+pub async fn remove_worktree(db: tauri::State<'_, crate::database::DatabaseStore>, worktree_path: String, branch: Option<String>, force: Option<bool>) -> Result<(), String> {
+    let _hermes_lifecycle = crate::agent_provider::hermes::WORKTREE_LIFECYCLE.lock().await;
+    if db.hermes_cleanup_pending_path(&worktree_path)? {
+        return Err("Hermes worktree cleanup pending: background completion cannot be verified; files have been retained.".into());
+    }
     tokio::task::spawn_blocking(move || {
         crate::git::git_remove_worktree(Path::new(&worktree_path), branch.as_deref(), force.unwrap_or(false))
     })

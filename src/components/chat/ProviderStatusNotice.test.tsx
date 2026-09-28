@@ -51,6 +51,7 @@ function resetStore() {
         codex: emptyHealthSlot(),
         cursor: emptyHealthSlot(),
         grok: emptyHealthSlot(),
+        hermes: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
       },
     });
@@ -60,6 +61,18 @@ function resetStore() {
 describe("ProviderStatusNotice", () => {
   beforeEach(resetStore);
   afterEach(cleanup);
+
+  it("leaves Hermes health to its profile-specific picker", () => {
+    render(<ProviderStatusNotice provider="hermes" />);
+    seedReport({
+      provider: "hermes",
+      status: "warning",
+      installed: true,
+      message: "Select a Hermes profile to check its runtime.",
+      version: null,
+    });
+    expect(screen.queryByTestId("provider-status-notice")).not.toBeInTheDocument();
+  });
 
   it("does not probe provider health merely because a surface mounted", () => {
     render(<ProviderStatusNotice provider="claude" />);

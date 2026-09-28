@@ -10,6 +10,7 @@ import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
+import { useHermes } from "@/stores/hermes-store";
 import {
   agentChatListMessagesAfter,
   agentChatStartSession,
@@ -118,7 +119,11 @@ export function useAgentChatSessionActions(
           // previous chat's messages while the resumed session boots.
           useAgentChatStore.getState().resetThread(threadId);
         }
-        const newLocalThreadId = `chat-${paneId}-${Date.now()}`;
+        // Hermes history is identified by the durable local binding. A new local
+        // id would lose that binding and cannot safely resume the native history.
+        const newLocalThreadId = targetProvider === "hermes"
+          ? record.thread_id
+          : `chat-${paneId}-${Date.now()}`;
         // Hydrate the new slice with the picked session's persisted
         // transcript BEFORE we kick off the provider — that way the
         // pane renders the full history immediately, instead of going
@@ -221,6 +226,13 @@ export function useAgentChatSessionActions(
       return;
     }
     try {
+      if (provider === "hermes" && threadId) await useHermes.getState().restore(threadId);
+      const hermesProfile = provider === "hermes"
+        ? (threadId ? useHermes.getState().selections[threadId] : useHermes.getState().preferred[cwd])
+        : null;
+      if (provider === "hermes" && !hermesProfile) {
+        throw new Error("Choose a Hermes profile before starting a new chat.");
+      }
       if (threadId) {
         await agentChatStopSession(provider, threadId).catch(() => {});
         // Clear the old slice so the transcript doesn't flash the
@@ -228,6 +240,7 @@ export function useAgentChatSessionActions(
         useAgentChatStore.getState().resetThread(threadId);
       }
       const newLocalThreadId = `chat-${paneId}-${Date.now()}`;
+      if (hermesProfile) useHermes.getState().select(newLocalThreadId, cwd, hermesProfile);
       // Launch in the provider default mode (Full access) — the same mode
       // the fresh store slice advertises in the footer pill. Passing `null`
       // here would boot the provider in `default` (prompt-for-every-tool)
@@ -247,6 +260,7 @@ export function useAgentChatSessionActions(
           fast_mode: false,
           additional_directories: [],
           env: null,
+          ...(hermesProfile ? { extra: { hermes_profile: hermesProfile } } : {}),
         },
         // Same as resume: the pane still carries the thread we just
         // stopped, and the new chat arrives under a different id.

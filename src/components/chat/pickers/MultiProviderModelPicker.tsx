@@ -1,3 +1,5 @@
+import { useHermes, hermesProfileKey } from "@/stores/hermes-store";
+import { HermesProfileModels } from "./HermesProfileModels";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Star } from "lucide-react";
 
@@ -82,6 +84,7 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "codex", label: "Codex" },
   { kind: "cursor", label: "Cursor" },
   { kind: "grok", label: "Grok" },
+  { kind: "hermes", label: "Hermes" },
   { kind: "opencode", label: "OpenCode" },
 ];
 
@@ -170,6 +173,8 @@ function providerErrorTooltipLabel(parsed: ParsedProviderError): string {
 }
 
 interface Props {
+  hermesThreadId?: string | null;
+  hermesProjectPath?: string | null;
   provider: AgentChatProviderKind;
   model: string | null;
   onProviderModelChange: (
@@ -217,6 +222,7 @@ const IS_MAC =
 const JUMP_MOD_LABEL = IS_MAC ? "⌘" : "Ctrl+";
 
 export function MultiProviderModelPicker({
+  hermesThreadId, hermesProjectPath,
   provider,
   model,
   onProviderModelChange,
@@ -269,6 +275,10 @@ export function MultiProviderModelPicker({
   }, [open, provider]);
 
   const allCaps = useProviderCapabilities();
+  const hermesModelLabel = useHermes(s => {
+    const profile = hermesThreadId ? s.selections[hermesThreadId] : undefined;
+    return profile ? s.catalogs[hermesProfileKey(profile)]?.value?.session.models?.availableModels.find(m => m.modelId === model)?.name : undefined;
+  });
   const claudeCaps = allCaps.claude;
   const codexCaps = allCaps.codex;
   const cursorCaps = allCaps.cursor;
@@ -322,6 +332,7 @@ export function MultiProviderModelPicker({
       codex: rowsFromCaps("codex", codexCaps),
       cursor: rowsFromCaps("cursor", cursorCaps),
       grok: rowsFromCaps("grok", grokCaps),
+      hermes: [],
       opencode: rowsFromCaps("opencode", opencodeCaps),
     };
   }, [claudeCaps, codexCaps, cursorCaps, grokCaps, opencodeCaps]);
@@ -425,11 +436,13 @@ export function MultiProviderModelPicker({
   const resolvedModelId = resolvedModel?.id ?? model;
 
   const triggerLabel = useMemo(() => {
+    if (provider === "hermes" && model === "profile_default") return "Profile default";
+    if (provider === "hermes" && hermesModelLabel) return hermesModelLabel;
     if (!capsForCurrentProvider && !model) return "Loading…";
     if (resolvedModel) return resolvedModel.label;
     if (model) return model;
     return "Select model";
-  }, [capsForCurrentProvider, model, resolvedModel]);
+  }, [capsForCurrentProvider, model, resolvedModel, provider, hermesModelLabel]);
 
   const triggerSubtitle = resolvedModel?.sub_provider ?? null;
 
@@ -520,7 +533,7 @@ export function MultiProviderModelPicker({
             }}
           />
           <div className="flex min-h-0 min-w-0 flex-col">
-            <Command shouldFilter={false}>
+            {railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false}>
               <CommandInput
                 placeholder="Search models..."
                 value={query}
@@ -604,7 +617,7 @@ export function MultiProviderModelPicker({
                   })
                 )}
               </CommandList>
-            </Command>
+            </Command>}
           </div>
         </div>
         {/* Defensive: keep the cmdk-required outer Command wrapper out of
@@ -777,6 +790,7 @@ function capsForRail(
       return grokCaps;
     case "opencode":
       return opencodeCaps;
+    case "hermes":
     case "favorites":
       return null;
   }
@@ -1154,6 +1168,8 @@ function providerDisplayLabel(provider: AgentChatProviderKind): string {
       return "Codex";
     case "cursor":
       return "Cursor";
+    case "hermes":
+      return "Hermes";
     case "grok":
       return "Grok";
     case "opencode":

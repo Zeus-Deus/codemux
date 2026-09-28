@@ -31,6 +31,8 @@ const ROUND_CONTROL =
   "inline-flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-full";
 
 interface Props {
+  hermesThreadId?: string | null;
+  hermesProjectPath?: string | null;
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
@@ -109,6 +111,7 @@ interface Props {
  * send pinned right, a flexible gap in between.
  */
 export function ComposerFooter({
+  hermesThreadId, hermesProjectPath,
   provider,
   model,
   permissionMode,
@@ -260,8 +263,10 @@ export function ComposerFooter({
           </>
         )}
 
-        {showProviderPicker ? (
+        {showProviderPicker || provider === "hermes" ? (
           <MultiProviderModelPicker
+            hermesThreadId={hermesThreadId}
+            hermesProjectPath={hermesProjectPath}
             provider={provider}
             model={model}
             onProviderModelChange={onProviderModelChange}

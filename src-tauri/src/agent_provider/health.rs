@@ -90,6 +90,7 @@ pub async fn check_provider_health(provider: ProviderKind) -> ProviderHealthRepo
         ProviderKind::Codex => check_codex_health().await,
         ProviderKind::Cursor => check_cursor_health().await,
         ProviderKind::Grok => check_grok_health().await,
+        ProviderKind::Hermes => ProviderHealthReport::warning(ProviderKind::Hermes, None, "Select an existing Hermes profile to probe its official ACP runtime. Configure credentials and ACP dependencies in Hermes.".into()),
         ProviderKind::OpenCode => check_opencode_health().await,
     }
 }

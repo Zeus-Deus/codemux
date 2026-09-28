@@ -115,4 +115,56 @@ describe("resolveExistingFileTarget", () => {
     );
     expect(target).toBeNull();
   });
+
+  describe("bare filename next to a referenced file", () => {
+    const bare = (filePath: string): ChatFileLinkMeta => ({
+      ...meta(filePath),
+      displayPath: filePath.split("/").pop() ?? filePath,
+    });
+
+    it("finds the file in the folder of a path the message named", async () => {
+      const target = await resolveExistingFileTarget(
+        bare("/repo/signal.gif"),
+        ["/tmp/empty-preview/overview.png"],
+        existsIn(["/tmp/empty-preview/overview.png", "/tmp/empty-preview/signal.gif"]),
+      );
+      expect(target).toBe("/tmp/empty-preview/signal.gif");
+    });
+
+    it("prefers an exact basename match over a sibling guess", async () => {
+      const target = await resolveExistingFileTarget(
+        bare("/repo/signal.gif"),
+        ["/tmp/exact/signal.gif", "/tmp/sibling/overview.png"],
+        existsIn(["/tmp/exact/signal.gif", "/tmp/sibling/signal.gif"]),
+      );
+      expect(target).toBe("/tmp/exact/signal.gif");
+    });
+
+    it("tries the newest folder first", async () => {
+      const target = await resolveExistingFileTarget(
+        bare("/repo/signal.gif"),
+        ["/tmp/old/a.png", "/tmp/new/b.png"],
+        existsIn(["/tmp/old/signal.gif", "/tmp/new/signal.gif"]),
+      );
+      expect(target).toBe("/tmp/new/signal.gif");
+    });
+
+    it("keeps Windows separators", async () => {
+      const target = await resolveExistingFileTarget(
+        { filePath: "C:/repo/signal.gif", basename: "signal.gif", displayPath: "signal.gif" },
+        ["C:\\temp\\preview\\overview.png"],
+        existsIn(["C:\\temp\\preview\\signal.gif"]),
+      );
+      expect(target).toBe("C:\\temp\\preview\\signal.gif");
+    });
+
+    it("does not guess siblings for a path with a directory", async () => {
+      const target = await resolveExistingFileTarget(
+        meta("/repo/src/signal.gif"),
+        ["/tmp/empty-preview/overview.png"],
+        existsIn(["/tmp/empty-preview/signal.gif"]),
+      );
+      expect(target).toBeNull();
+    });
+  });
 });

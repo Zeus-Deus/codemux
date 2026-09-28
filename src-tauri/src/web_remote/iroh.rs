@@ -26,7 +26,8 @@
 //! [`axum::extract::ws::Message`]s the [`super::dispatch::ChannelRouter`] and
 //! [`super::events::EventHub`] already produce, re-encoded onto the wire. The
 //! connection registers in the **shared** [`super::server::ConnectionRegistry`],
-//! so revocation and `close_all` sever iroh sessions exactly as they do WS ones.
+//! so revocation and `close_all` sever iroh sessions exactly as they do WS ones
+//! (tagged as the relay transport, so turning relay off severs only these).
 //!
 //! ## Wire codec (kind-tagged, length-delimited)
 //!
@@ -627,7 +628,7 @@ fn load_or_create_secret_key() -> Result<SecretKey, String> {
                 return Ok(SecretKey::from_bytes(&arr));
             }
         }
-        eprintln!(
+        log::warn!(
             "[codemux::web_remote] iroh identity key at {} unreadable; regenerating",
             path.display()
         );
@@ -670,6 +671,10 @@ struct RunningIroh {
 #[derive(Default)]
 pub struct IrohManager {
     inner: Mutex<Option<RunningIroh>>,
+    /// Serialises [`start`]: the enable path, the Settings toggle, and the
+    /// registration supervisor can all try to bring the endpoint up at once,
+    /// and two concurrent binds would leak the loser's endpoint.
+    start_lock: tokio::sync::Mutex<()>,
     /// `node_id` of the running endpoint (cached so the command can answer
     /// without touching the endpoint).
     node_id: Mutex<Option<String>>,
@@ -702,7 +707,13 @@ impl IrohManager {
 /// Bind the desktop iroh endpoint and start accepting connections. Idempotent.
 /// Runs on the app's existing tokio runtime — no second runtime is spawned.
 pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<(), String> {
+    let _start = shared.iroh.start_lock.lock().await;
     if shared.iroh.is_running() {
+        return Ok(());
+    }
+    // A caller that queued behind `start_lock` may be stale: relay mode could
+    // have been switched off meanwhile. Don't bind an endpoint nobody wants.
+    if !super::relay_wanted(&shared.config.lock().unwrap()) {
         return Ok(());
     }
     let key = load_or_create_secret_key()?;
@@ -713,8 +724,34 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
         .await
         .map_err(|e| format!("iroh endpoint bind failed: {e}"))?;
 
+    // Relay (or remote access) may have been switched off while the bind was
+    // in flight. Check and install under one config-lock hold: every disable
+    // writes the config before `stop` takes the endpoint, so either that stop
+    // sees this install or this check sees the disable. The accept loop starts
+    // only once installed, so an unwanted endpoint never accepts anything.
     let node_id = endpoint.id().to_string();
-    eprintln!("[codemux::web_remote] iroh relay transport enabled: node_id={node_id}");
+    let installed = {
+        let cfg = shared.config.lock().unwrap();
+        let wanted = super::relay_wanted(&cfg);
+        if wanted {
+            let accept = tauri::async_runtime::spawn(accept_loop(
+                app.clone(),
+                shared.clone(),
+                endpoint.clone(),
+            ));
+            let running = RunningIroh {
+                endpoint: endpoint.clone(),
+                accept,
+            };
+            shared.iroh.install(running, node_id.clone());
+        }
+        wanted
+    };
+    if !installed {
+        endpoint.close().await;
+        return Ok(());
+    }
+    log::info!("[codemux::web_remote] iroh relay transport enabled: node_id={node_id}");
 
     // Log the home relay once one is established (proof the relay accepted us).
     // Non-blocking: enabling must not wait on the relay handshake.
@@ -728,28 +765,20 @@ pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) 
                 .next()
                 .map(|u| u.to_string())
                 .unwrap_or_else(|| "<none>".to_string());
-            eprintln!(
+            log::info!(
                 "[codemux::web_remote] iroh home relay for node {}: {relay}",
                 ep.id()
             );
         });
     }
-
-    let accept = {
-        let app = app.clone();
-        let shared = shared.clone();
-        let ep = endpoint.clone();
-        tauri::async_runtime::spawn(accept_loop(app, shared, ep))
-    };
-
-    shared.iroh.install(RunningIroh { endpoint, accept }, node_id);
     Ok(())
 }
 
 /// Stop the iroh endpoint (abort its accept loop and close it gracefully). Live
 /// iroh sessions are severed separately via the shared [`ConnectionRegistry`]
-/// (`close_all`), exactly like the WS transport — this just stops accepting new
-/// connections and releases the endpoint. Safe to call when not running.
+/// (`close_transport(Relay)` / `close_all`), exactly like the WS transport — this
+/// just stops accepting new connections and releases the endpoint. Safe to call
+/// when not running.
 ///
 /// [`ConnectionRegistry`]: super::server::ConnectionRegistry
 pub(crate) fn stop(shared: &Arc<Shared>) {
@@ -868,7 +897,7 @@ async fn handle_bi_stream<R: Runtime>(
     let (close_tx, mut close_rx) = watch::channel(false);
     let conn_id = shared
         .connections
-        .register(&session_id, out_tx.clone(), close_tx.clone());
+        .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
     super::emit_state_changed(&app);
 
     // 3. Acknowledge, then hand the send half to the writer task.
@@ -1575,7 +1604,7 @@ mod tests {
         let (close_tx, mut close_rx) = watch::channel(false);
         let conn_id = shared
             .connections
-            .register(&session_id, out_tx.clone(), close_tx.clone());
+            .register(&session_id, crate::web_remote::server::Transport::Relay, out_tx.clone(), close_tx.clone());
 
         let _ = write_frame(&mut send, KIND_TEXT, &welcome_frame_bytes(&session_id)).await;
         let writer = tokio::spawn(writer_loop(send, out_rx));

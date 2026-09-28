@@ -1,3 +1,4 @@
+import { hermesLearningLabel } from "@/lib/agent-chat/hermes-learning";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
 /**
@@ -52,6 +53,8 @@ const VERB_MAP: Record<string, string> = {
 };
 
 export function describeToolCall(item: ToolCallItem): ToolDescription {
+  const learning = hermesLearningLabel(item);
+  if (learning) return { verb: learning, target: null, targetMono: false, argument: null };
   const verb = VERB_MAP[item.tool_name] ?? `Called ${item.tool_name}`;
   const inputRecord = isRecord(item.input) ? item.input : {};
   const toolName = item.tool_name;

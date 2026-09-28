@@ -44,6 +44,10 @@ export interface SlashCommandItem {
   label: string;
   /** Optional one-line description shown muted next to the label. */
   description?: string;
+  /** Prose searched by {@link filterSlashItems} instead of
+   *  `description`. Set when the displayed description carries
+   *  decoration (scope suffixes, fallback text) that shouldn't match. */
+  searchDescription?: string;
   /** The literal command string (`"/plan"`) — used for filtering and
    *  shown right-aligned as a hint. */
   command: string;
@@ -392,10 +396,18 @@ export function findMentionAtCursor(
   return findTriggerAtCursor(value, cursor, "@");
 }
 
+/** Shortest query that also searches descriptions. */
+const DESCRIPTION_MATCH_MIN_LENGTH = 3;
+
 /**
  * Filter slash items by query. Matches when the typed string is a
  * prefix of the literal command (`/pl` → `/plan`) OR when it appears
  * anywhere in the label (`pla` → `Plan`). Case-insensitive.
+ *
+ * Queries of three or more characters also match descriptions, ranked
+ * after name matches within the same group. A skill's name is often not
+ * the word the user remembers: `update-personal-desktop` is "the Hermes
+ * one", and the Codex CLI finds it that way too.
  */
 export function filterSlashItems(
   items: SlashCommandItem[],
@@ -403,11 +415,38 @@ export function filterSlashItems(
 ): SlashCommandItem[] {
   if (!query) return items;
   const q = query.toLowerCase();
-  return items.filter(
-    (item) =>
+  // Rank within each group so the flat list stays group-contiguous:
+  // the popup draws rows via `groupSlashItems`, and arrow keys walk
+  // this array, so the two orders must agree.
+  const groups = new Map<
+    string,
+    { names: SlashCommandItem[]; descriptions: SlashCommandItem[] }
+  >();
+  const bucketFor = (group: string) => {
+    let bucket = groups.get(group);
+    if (!bucket) {
+      bucket = { names: [], descriptions: [] };
+      groups.set(group, bucket);
+    }
+    return bucket;
+  };
+  const searchDescriptions = q.length >= DESCRIPTION_MATCH_MIN_LENGTH;
+  for (const item of items) {
+    if (
       item.command.toLowerCase().startsWith(`/${q}`) ||
-      item.label.toLowerCase().includes(q),
-  );
+      item.label.toLowerCase().includes(q)
+    ) {
+      bucketFor(item.group).names.push(item);
+    } else if (
+      searchDescriptions &&
+      (item.searchDescription ?? item.description)
+        ?.toLowerCase()
+        .includes(q)
+    ) {
+      bucketFor(item.group).descriptions.push(item);
+    }
+  }
+  return [...groups.values()].flatMap((b) => [...b.names, ...b.descriptions]);
 }
 
 /**
@@ -605,6 +644,7 @@ export function buildProviderCommands({
       description:
         c.description ||
         (c.argumentHint ? `/${c.name} ${c.argumentHint}` : "Provider command"),
+      searchDescription: c.description,
       command: `/${c.name}`,
       argumentHint:
         c.argumentHint && subcommandsFor(c.name).length === 0

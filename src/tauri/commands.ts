@@ -390,6 +390,10 @@ export const listLaunchGeminiModels = () =>
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
 
+/** Reload the desktop window's page from the app process, the same native
+ *  reload as Ctrl+Alt+R. The backend, terminals, and agents keep running. */
+export const reloadInterface = () => invoke<void>("reload_interface");
+
 /** Repair deferred MCP config writes for inactive workspaces. This may touch
  * disk and must be called only after the renderer's useful first paint. */
 export const repairInactiveMcpConfigs = () =>
@@ -1668,18 +1672,19 @@ export const agentChatCreatePane = async (
  *
  *  A rejected claim never spawns anything and reports a JSON
  *  `pane_already_bound` error — see `parsePaneAlreadyBound`. */
-export const agentChatStartSession = (
+export const agentChatStartSession = async (
   paneId: string,
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
   expectedThread: string | null = null,
-) =>
-  invoke<string>("agent_chat_start_session", {
-    paneId,
-    provider,
-    input,
-    expectedThread,
-  });
+) => {
+  if (provider === "hermes") {
+    const { useHermes } = await import("@/stores/hermes-store");
+    const profile = useHermes.getState().selections[input.thread_id];
+    if (profile) input = { ...input, permission_mode: useHermes.getState().modes[input.thread_id] ?? input.permission_mode, extra: { hermes_profile: profile } };
+  }
+  return invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+};
 
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
@@ -3152,13 +3157,18 @@ export const workspaceOpenOnHost = (syncRowId: number) =>
 export const webRemoteStatus = () =>
   invoke<WebRemoteStatus>("web_remote_status");
 
-/** Turn the server on: binds the listener and persists `enabled=true`, so
- *  it is restored on the next app boot. */
+/** Turn the kill switch on: persists `enabled=true` and starts every way in
+ *  that is switched on underneath it (LAN listener, relay). A way in that
+ *  can't start reports why in `bind_error` / `registration_error` rather than
+ *  failing the call — except a LAN bind failure with relay mode off, which
+ *  rolls the switch back and rejects (nothing would be running). To retry a
+ *  failed way in, use {@link webRemoteRetry}. */
 export const webRemoteEnable = () =>
   invoke<WebRemoteStatus>("web_remote_enable");
 
-/** Turn the server off: tears the listener down and persists
- *  `enabled=false`. Paired devices are kept (revoke to remove them). */
+/** Turn the kill switch off: stops every way in, severs every connected
+ *  device, and persists `enabled=false`. Paired devices are kept (revoke to
+ *  remove them). */
 export const webRemoteDisable = () =>
   invoke<WebRemoteStatus>("web_remote_disable");
 
@@ -3169,9 +3179,9 @@ export const webRemoteDisable = () =>
  *  `accountModeEnabled` toggles the account sign-in admission path
  *  (`POST /api/pair-account`), and `trustAccountBrowsers` is the "trust
  *  browsers on my account without approval" opt-out — neither rebinds the
- *  listener. `relayModeEnabled` starts/stops the parallel from-anywhere iroh
- *  endpoint (never a rebind of the axum listener). Omitted fields are left
- *  unchanged. */
+ *  listener. `relayModeEnabled` starts/stops the from-anywhere iroh endpoint
+ *  and `lanEnabled` starts/stops the LAN listener — each independently of the
+ *  other. Omitted fields are left unchanged. */
 export const webRemoteSetConfig = (opts: {
   port?: number;
   requireApproval?: boolean;
@@ -3179,6 +3189,7 @@ export const webRemoteSetConfig = (opts: {
   accountModeEnabled?: boolean;
   trustAccountBrowsers?: boolean;
   relayModeEnabled?: boolean;
+  lanEnabled?: boolean;
 }) =>
   invoke<WebRemoteStatus>("web_remote_set_config", {
     port: opts.port ?? null,
@@ -3187,7 +3198,15 @@ export const webRemoteSetConfig = (opts: {
     accountModeEnabled: opts.accountModeEnabled ?? null,
     trustAccountBrowsers: opts.trustAccountBrowsers ?? null,
     relayModeEnabled: opts.relayModeEnabled ?? null,
+    lanEnabled: opts.lanEnabled ?? null,
   });
+
+/** Retry bringing remote access up now: re-attempts the LAN listener bind
+ *  when that way in is switched on (rejecting with the reason if it still
+ *  fails — the backend keeps retrying in the background) and re-runs relay
+ *  registration when relay mode is on. */
+export const webRemoteRetry = () =>
+  invoke<WebRemoteStatus>("web_remote_retry");
 
 /** The device's stable iroh `node_id` (its `EndpointId`) — the address a
  *  hosted-origin browser dials to reach this desktop over the relay transport.

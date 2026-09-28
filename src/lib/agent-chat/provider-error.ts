@@ -16,6 +16,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   grok: "Grok",
+  hermes: "Hermes",
   opencode: "OpenCode",
 };
 

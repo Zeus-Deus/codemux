@@ -20,7 +20,7 @@ import { describeToolCall } from "./ToolCallStatus";
  * and exported so they can be unit-tested without rendering.
  */
 
-export type StepStatus = "running" | "done" | "error";
+export type StepStatus = "running" | "done" | "error" | "unconfirmed";
 
 export interface StepView {
   id: string;
@@ -58,6 +58,7 @@ function firstLine(text: string): string {
 
 export function stepStatus(step: ActivityStep): StepStatus {
   if (isReasoning(step)) return step.streaming ? "running" : "done";
+  if (step.status === "unconfirmed") return "unconfirmed";
   if (step.status === "running") return "running";
   if (step.status === "error") return "error";
   return "done";
@@ -77,6 +78,7 @@ export function describeStep(step: ActivityStep): { verb: string; summary: strin
 /** Right-aligned mono meta for a step row. */
 export function stepMeta(step: ActivityStep): string {
   const status = stepStatus(step);
+  if (status === "unconfirmed") return "outcome unconfirmed";
   if (status === "running") return "running";
   if (status === "error") return "failed";
   if (isReasoning(step)) return "";

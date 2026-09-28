@@ -28,6 +28,8 @@ pub enum ProviderKind {
     Cursor,
     /// Grok Build via its official Agent Client Protocol server.
     Grok,
+    /// Official Hermes ACP, bound to an existing local profile.
+    Hermes,
     /// OpenCode via the `opencode` HTTP server. Step 12 Stage 1 scaffold —
     /// the runtime adapter is not implemented yet and command dispatch
     /// returns a placeholder error.
@@ -482,6 +484,8 @@ pub enum SendOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ApprovalDecision {
+    /// Exact provider-advertised option; adapters must validate against the pending request.
+    ProviderOption { option_id: String },
     /// Approve the request. `updated_input` may override the tool input the
     /// model provided (e.g. the user edited the command before running).
     /// `updated_permissions` carries opaque SDK-shaped `PermissionUpdate[]`

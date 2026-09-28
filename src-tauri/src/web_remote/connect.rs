@@ -47,7 +47,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{WebRemoteConfig, DEFAULT_PORT};
 use crate::auth::cli_login;
@@ -589,6 +589,12 @@ pub fn service_state(host: &dyn ServiceHost) -> ServiceState {
 /// Fold a `codemux connect` request into the persisted config: remote access
 /// on, relay mode on, plus any explicit scope/port.
 ///
+/// `connect` is about the relay, so an explicit relay-only setup stays
+/// relay-only — even one whose kill switch was off — unless a `--scope` /
+/// `--port` flag asks for the listener. Anything else, a fresh config
+/// included, gets the listener too (see [`super::keeps_relay_only`], decided
+/// here before relay mode is forced on).
+///
 /// Rejects an unknown scope before touching anything — the caller persists
 /// only on `Ok`, so a typo can never leave a config the bind logic refuses to
 /// honour. Scope/port are left alone when not passed, which is what makes a
@@ -598,7 +604,13 @@ pub fn apply_connect_request(
     scope: Option<String>,
     port: Option<u16>,
 ) -> Result<(), String> {
+    let keep_relay_only = super::keeps_relay_only(
+        cfg.relay_mode_enabled,
+        cfg.lan_enabled,
+        scope.is_some() || port.is_some(),
+    );
     super::apply_enable_request(cfg, scope, port)?;
+    cfg.lan_enabled = !keep_relay_only;
     cfg.relay_mode_enabled = true;
     Ok(())
 }
@@ -630,6 +642,8 @@ pub struct ConnectReport {
     pub identity: String,
     pub scope: String,
     pub port: u16,
+    /// Whether the LAN listener is switched on (`false` for relay-only).
+    pub lan_enabled: bool,
     pub service: ServiceReport,
 }
 
@@ -638,10 +652,16 @@ pub struct ConnectReport {
 pub fn format_connect_report(report: &ConnectReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("✓ Signed in as {}\n", report.identity));
-    out.push_str(&format!(
-        "✓ Remote access configured (relay mode on, scope {}, port {})\n",
-        report.scope, report.port
-    ));
+    if report.lan_enabled {
+        out.push_str(&format!(
+            "✓ Remote access configured (relay mode on, scope {}, port {})\n",
+            report.scope, report.port
+        ));
+    } else {
+        out.push_str(
+            "✓ Remote access configured (relay only — nothing listens on your network)\n",
+        );
+    }
     match &report.service {
         ServiceReport::Installed(install) => {
             out.push_str(
@@ -685,6 +705,40 @@ pub struct ConnectStatus {
     pub instance_running: bool,
     pub device_name: String,
     pub device_id: Option<String>,
+    /// What the running instance is actually doing, when one is running.
+    /// `None` when nothing is running (then only the persisted config is
+    /// known). The config alone can read "enabled, relay on" while nothing is
+    /// listening — the gap #404 fell into.
+    pub live: Option<LiveRemoteState>,
+}
+
+/// The live remote-access runtime of a running instance, from its
+/// `web_remote_status` control command.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveRemoteState {
+    pub enabled: bool,
+    pub relay_mode_enabled: bool,
+    pub listening: bool,
+    pub bind_error: Option<String>,
+    pub relay_running: bool,
+    pub registered: bool,
+    pub registration_error: Option<String>,
+}
+
+/// Parse the `web_remote_status` control response. Missing fields read as
+/// "not running" so an older instance can never be reported healthier than
+/// it is.
+fn live_state_from_status(v: &Value) -> LiveRemoteState {
+    let opt_str = |key: &str| v[key].as_str().map(str::to_string);
+    LiveRemoteState {
+        enabled: v["enabled"].as_bool().unwrap_or(false),
+        relay_mode_enabled: v["relay_mode_enabled"].as_bool().unwrap_or(false),
+        listening: v["running"].as_bool().unwrap_or(false),
+        bind_error: opt_str("bind_error"),
+        relay_running: v["relay_running"].as_bool().unwrap_or(false),
+        registered: v["device_registered"].as_bool().unwrap_or(false),
+        registration_error: opt_str("registration_error"),
+    }
 }
 
 /// Human-readable gloss for a bind scope, matching the CLI's existing copy.
@@ -720,6 +774,26 @@ pub fn format_connect_status(status: &ConnectStatus) -> String {
         scope_note(&status.scope)
     ));
     out.push_str(&format!("  Port:         {}\n", status.port));
+    if let Some(live) = status.live.as_ref().filter(|l| l.enabled) {
+        match (&live.bind_error, live.listening) {
+            (_, true) => out.push_str("  Listener:     listening\n"),
+            (Some(e), false) => out.push_str(&format!(
+                "  Listener:     not running — {e} (retrying in the background)\n"
+            )),
+            (None, false) => out.push_str("  Listener:     not running\n"),
+        }
+        if live.relay_mode_enabled {
+            out.push_str(&format!(
+                "  Relay:        {}\n",
+                if live.relay_running { "up" } else { "down" }
+            ));
+            match (&live.registration_error, live.registered) {
+                (_, true) => out.push_str("  Registered:   yes\n"),
+                (Some(e), false) => out.push_str(&format!("  Registered:   no — {e}\n")),
+                (None, false) => out.push_str("  Registered:   not yet\n"),
+            }
+        }
+    }
 
     out.push_str("\nBackground service\n");
     if !status.service_supported {
@@ -913,21 +987,56 @@ pub async fn run_connect(opts: ConnectOptions) -> Result<(), String> {
             identity,
             scope: cfg.bind_scope.clone(),
             port: cfg.port,
+            lan_enabled: cfg.lan_enabled,
             service,
         })
     );
     Ok(())
 }
 
-/// Configure a RUNNING instance: enable web remote (with any scope/port), then
-/// flip relay mode on. Two calls because they are two different concerns in
-/// the running app — binding the listener and starting the parallel iroh
-/// endpoint — and each has its own rollback semantics there.
+/// Configure a RUNNING instance: flip relay mode on, then enable web remote
+/// (with any scope/port). Two calls because they are two different concerns in
+/// the running app — the parallel iroh endpoint and the LAN listener. Relay
+/// goes first because it does not depend on the listener: with it on, a
+/// listener that can't bind (port taken, no tailnet yet) leaves the instance
+/// serving relay-only instead of rolling the whole enable back.
 async fn configure_via_control_socket(
     scope: Option<String>,
     port: Option<u16>,
 ) -> Result<WebRemoteConfig, String> {
-    let mut params = json!({});
+    // Decide relay-only on the instance's switches BEFORE turning relay mode on
+    // below, which would make a config with neither way in look relay-only. An
+    // instance that can't answer gets the listener, as before.
+    let keep_relay_only = match send_control_request(ControlRequest {
+        command: "web_remote_status".into(),
+        params: json!({}),
+    })
+    .await
+    {
+        Ok(resp) if resp.ok => resp.data.is_some_and(|s| {
+            super::keeps_relay_only(
+                s["relay_mode_enabled"].as_bool().unwrap_or(false),
+                s["lan_enabled"].as_bool().unwrap_or(true),
+                scope.is_some() || port.is_some(),
+            )
+        }),
+        _ => false,
+    };
+
+    let relay = send_control_request(ControlRequest {
+        command: "web_remote_set_relay".into(),
+        params: json!({ "enabled": true }),
+    })
+    .await?;
+    if !relay.ok {
+        return Err(relay
+            .error
+            .unwrap_or_else(|| "the running Codemux instance refused to enable relay mode".into()));
+    }
+
+    // `keep_relay_only`: this is `connect`, not `remote enable`, so a relay-only
+    // setup stays relay-only unless a scope/port flag asks for the listener.
+    let mut params = json!({ "keep_relay_only": keep_relay_only });
     if let Some(s) = scope {
         params["scope"] = json!(s);
     }
@@ -945,21 +1054,12 @@ async fn configure_via_control_socket(
             .unwrap_or_else(|| "the running Codemux instance refused to enable remote access".into()));
     }
 
-    let relay = send_control_request(ControlRequest {
-        command: "web_remote_set_relay".into(),
-        params: json!({ "enabled": true }),
-    })
-    .await?;
-    if !relay.ok {
-        return Err(relay
-            .error
-            .unwrap_or_else(|| "the running Codemux instance refused to enable relay mode".into()));
-    }
-
-    // The relay response carries the authoritative post-change status.
-    let status = relay.data.unwrap_or(json!({}));
+    // The enable response carries the authoritative post-change status.
+    let data = enable.data.unwrap_or(json!({}));
+    let status = &data["status"];
     Ok(WebRemoteConfig {
         enabled: status["enabled"].as_bool().unwrap_or(true),
+        lan_enabled: status["lan_enabled"].as_bool().unwrap_or(true),
         port: status["port"]
             .as_u64()
             .and_then(|p| u16::try_from(p).ok())
@@ -974,7 +1074,7 @@ async fn configure_via_control_socket(
 }
 
 /// `codemux connect status`.
-pub fn run_connect_status() -> Result<(), String> {
+pub async fn run_connect_status() -> Result<(), String> {
     let db = crate::database::init_database()?;
     let identity = match cli_login::auth_status(&db) {
         cli_login::AuthStatusReport::SignedIn { user, .. } => {
@@ -982,7 +1082,7 @@ pub fn run_connect_status() -> Result<(), String> {
         }
         _ => None,
     };
-    let cfg = super::load_config_from_db(&db);
+    let mut cfg = super::load_config_from_db(&db);
     let host = default_host();
     let host_ref = host.as_ref().map(|h| h as &dyn ServiceHost);
     let service_supported = unsupported_reason(host_ref).is_none();
@@ -991,23 +1091,49 @@ pub fn run_connect_status() -> Result<(), String> {
         _ => ServiceState::default(),
     };
 
+    // A running instance owns the config in memory and knows what is actually
+    // bound, so ask it. A failed query degrades to the persisted view.
+    let instance_running = crate::control::control_server_is_running();
+    let live = if instance_running {
+        match send_control_request(ControlRequest {
+            command: "web_remote_status".into(),
+            params: json!({}),
+        })
+        .await
+        {
+            Ok(resp) if resp.ok => resp.data.map(|data| {
+                if let Some(port) = data["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
+                    cfg.port = port;
+                }
+                if let Some(scope) = data["bind_scope"].as_str() {
+                    cfg.bind_scope = scope.to_string();
+                }
+                live_state_from_status(&data)
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     print!(
         "{}",
         format_connect_status(&ConnectStatus {
             identity,
-            enabled: cfg.enabled,
-            relay_mode_enabled: cfg.relay_mode_enabled,
+            enabled: live.as_ref().map_or(cfg.enabled, |l| l.enabled),
+            relay_mode_enabled: live
+                .as_ref()
+                .map_or(cfg.relay_mode_enabled, |l| l.relay_mode_enabled),
             scope: cfg.bind_scope.clone(),
             port: cfg.port,
             service,
             service_supported,
-            instance_running: crate::control::control_server_is_running(),
+            instance_running,
             // The registry keys on these two; both are local facts, readable
-            // whether or not anything is running. Live registration health is
-            // only knowable inside a running instance, so it is deliberately
-            // not claimed here.
+            // whether or not anything is running.
             device_name: super::registration::device_name(),
             device_id: super::registration::persisted_device_id(&db),
+            live,
         })
     );
     Ok(())
@@ -1594,6 +1720,65 @@ mod tests {
     }
 
     #[test]
+    fn connect_opens_the_listener_on_a_fresh_config() {
+        let mut cfg = WebRemoteConfig::default();
+        assert!(!cfg.lan_enabled);
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.lan_enabled, "first run: the listener comes on too");
+    }
+
+    #[test]
+    fn connect_keeps_a_relay_only_setup_relay_only() {
+        // The user switched "On my network" off. Re-running `connect` (or its
+        // service restarting) must not put the machine back on the LAN.
+        let relay_only = WebRemoteConfig {
+            enabled: true,
+            lan_enabled: false,
+            relay_mode_enabled: true,
+            ..WebRemoteConfig::default()
+        };
+        let mut cfg = relay_only.clone();
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.enabled && cfg.relay_mode_enabled);
+        assert!(!cfg.lan_enabled, "nothing listens on the network");
+
+        // An explicit LAN flag is a request for the listener.
+        let mut cfg = relay_only.clone();
+        apply_connect_request(&mut cfg, None, Some(5100)).unwrap();
+        assert!(cfg.lan_enabled && cfg.port == 5100);
+
+        // Relay-only set up, then remote access switched off: still the
+        // user's choice, so re-running connect keeps it off the network.
+        let mut cfg = WebRemoteConfig {
+            enabled: false,
+            ..relay_only.clone()
+        };
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.enabled && cfg.relay_mode_enabled);
+        assert!(!cfg.lan_enabled, "the kill switch off doesn't make it a first run");
+
+        // Neither way in (whatever the kill switch says) is not relay-only:
+        // connect adds the listener along with the relay, as on a fresh config.
+        let mut cfg = WebRemoteConfig {
+            enabled: true,
+            lan_enabled: false,
+            ..WebRemoteConfig::default()
+        };
+        apply_connect_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.relay_mode_enabled && cfg.lan_enabled);
+    }
+
+    #[test]
+    fn connect_report_says_relay_only_instead_of_a_port() {
+        let text = format_connect_report(&ConnectReport {
+            lan_enabled: false,
+            ..installed_report()
+        });
+        assert!(text.contains("relay only — nothing listens on your network"), "{text}");
+        assert!(!text.contains("port"), "{text}");
+    }
+
+    #[test]
     fn connect_rejects_an_unknown_scope_without_mutating_anything() {
         let mut cfg = WebRemoteConfig::default();
         let err = apply_connect_request(&mut cfg, Some("wan".to_string()), None).unwrap_err();
@@ -1653,6 +1838,7 @@ mod tests {
             identity: "user@example.com".to_string(),
             scope: super::super::BIND_SCOPE_ALL.to_string(),
             port: DEFAULT_PORT,
+            lan_enabled: true,
             service: ServiceReport::Installed(InstallReport {
                 unit_path: "/home/u/.config/systemd/user/codemux.service".to_string(),
                 linger: LingerOutcome::Enabled,
@@ -1726,6 +1912,7 @@ mod tests {
             instance_running: false,
             device_name: "vps-fra-1".to_string(),
             device_id: Some("dev-123".to_string()),
+            live: None,
         });
         assert!(text.contains("Signed in as user@example.com"));
         assert!(text.contains("Relay mode:   on"));
@@ -1749,12 +1936,57 @@ mod tests {
             instance_running: false,
             device_name: "fresh-box".to_string(),
             device_id: None,
+            live: None,
         });
         assert!(text.contains("Not signed in"));
         assert!(text.contains("Enabled:      no"));
         assert!(text.contains("Relay mode:   off"));
         assert!(text.contains("codemux.service: not installed"));
         assert!(!text.contains("Device id"), "no id before first registration:\n{text}");
+    }
+
+    #[test]
+    fn status_reports_a_dead_listener_and_why_registration_failed() {
+        // The #404 machine: config says enabled + relay on, but the listener
+        // never bound. Status must say so instead of just "Enabled: yes".
+        let live = live_state_from_status(&json!({
+            "enabled": true,
+            "relay_mode_enabled": true,
+            "running": false,
+            "bind_error": "No Tailscale address found",
+            "relay_running": true,
+            "device_registered": false,
+            "registration_error": "device registration returned 503 Service Unavailable",
+        }));
+        let text = format_connect_status(&ConnectStatus {
+            identity: Some("user@example.com".to_string()),
+            enabled: true,
+            relay_mode_enabled: true,
+            scope: super::super::BIND_SCOPE_TAILSCALE.to_string(),
+            port: 4377,
+            service: ServiceState::default(),
+            service_supported: true,
+            instance_running: true,
+            device_name: "box".to_string(),
+            device_id: None,
+            live: Some(live),
+        });
+        assert!(
+            text.contains("Listener:     not running — No Tailscale address found"),
+            "names the bind failure:\n{text}"
+        );
+        assert!(text.contains("Relay:        up"));
+        assert!(text.contains("Registered:   no — device registration returned 503"));
+    }
+
+    #[test]
+    fn live_state_from_an_older_instance_never_reads_healthier() {
+        // An instance predating these fields: nothing is claimed as running.
+        let live = live_state_from_status(&json!({ "enabled": true, "running": true }));
+        assert!(live.listening);
+        assert!(!live.relay_running);
+        assert!(!live.registered);
+        assert_eq!(live.bind_error, None);
     }
 
     #[test]

@@ -160,6 +160,7 @@ mod tests {
         let status = super::super::WebRemoteStatus {
             enabled: true,
             running: true,
+            lan_enabled: true,
             port: super::super::DEFAULT_PORT,
             require_approval: false,
             bind_scope: super::super::BIND_SCOPE_ALL.to_string(),
@@ -175,6 +176,9 @@ mod tests {
             iroh_node_id: None,
             device_registered: false,
             device_id: None,
+            bind_error: None,
+            relay_running: false,
+            registration_error: None,
         };
 
         let body = snapshot_json(&app_state, &status);

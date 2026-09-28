@@ -344,6 +344,7 @@ function SubagentRunRow({
 }
 
 function StepGlyph({ status }: { status: StepStatus }) {
+  if (status === "unconfirmed") return <span title="Hermes did not report a completion result" className="size-3 text-muted-foreground">?</span>;
   if (status === "running") {
     return (
       <LoaderCircle

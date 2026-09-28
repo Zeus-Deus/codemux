@@ -24,8 +24,8 @@ export function SidebarWorkspaceList() {
   }
 
   return (
-    <SidebarGroup className="p-0">
-      <SidebarGroupContent>
+    <SidebarGroup className="flex-1 p-0">
+      <SidebarGroupContent className="flex flex-1 flex-col">
         <SidebarInbox />
       </SidebarGroupContent>
     </SidebarGroup>

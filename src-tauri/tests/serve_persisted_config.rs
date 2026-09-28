@@ -111,6 +111,9 @@ fn serve_honours_persisted_config_and_never_clobbers_relay_mode() {
         let db = codemux_lib::database::init_database().expect("open isolated db");
         let cfg = web_remote::update_config_headless(&db, |cfg| {
             cfg.enabled = true;
+            // `codemux connect` on a fresh machine switches the listener on
+            // too (the row default is off, which would be relay-only).
+            cfg.lan_enabled = true;
             cfg.port = port;
             cfg.bind_scope = web_remote::BIND_SCOPE_LOOPBACK.to_string();
             cfg.relay_mode_enabled = true;

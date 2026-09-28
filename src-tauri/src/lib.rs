@@ -511,6 +511,10 @@ fn build_core_app<R: tauri::Runtime>(
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Warn)
+                // Remote access's lifecycle (listener bound/retried, relay
+                // node id + home relay) is what a "why can't I connect"
+                // report needs, and it is a handful of lines per boot.
+                .level_for("codemux_lib::web_remote", log::LevelFilter::Info)
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
@@ -549,7 +553,12 @@ fn build_core_app<R: tauri::Runtime>(
         // armed before GTK init. `mode` is `Copy`, so the setup closure below
         // still captures it too.
         .on_page_load(move |webview, payload| {
-            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                // A new document is replacing the main page, so the old
+                // page's output subscribers are dead weight from here on.
+                if mode == AppMode::Gui && webview.label() == "main" {
+                    webview_recovery::release_page_subscribers(webview.app_handle());
+                }
                 return;
             }
             webview_tuning::apply_to_webview(webview);
@@ -760,8 +769,9 @@ fn build_core_app<R: tauri::Runtime>(
             // flip it at runtime via the `set_smooth_scrolling` command.
             webview_tuning::refresh_all(&handle);
 
-            // A dead WebKit web process leaves the window blank while the
-            // backend and agents keep running. Reload the page instead.
+            // A dead or hung renderer leaves the window blank while the
+            // backend and agents keep running. Recover by reloading the page
+            // from the app process (see `webview_recovery.rs`).
             if let Some(window) = app.get_webview_window("main") {
                 webview_recovery::install(&window);
             }
@@ -1176,6 +1186,12 @@ fn build_core_app<R: tauri::Runtime>(
                         registry
                             .set_grok(std::sync::Arc::new(grok) as _)
                             .await;
+
+                        let hermes = std::sync::Arc::new(agent_provider::hermes::HermesProvider::new(
+                            std::sync::Arc::new(agent_provider::hermes::binding::AppBindingStore(registry_handle.clone())),
+                        ));
+                        registry_handle.manage(hermes.clone());
+                        registry.set_hermes(hermes).await;
 
                         // OpenCode provider — Step 12 Stage 8. Shares
                         // the singleton OpenCodeServerManager held in
@@ -2455,6 +2471,10 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_set_fast_mode,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
+            commands::hermes::hermes_profiles,
+            commands::hermes::hermes_binding,
+            commands::hermes::hermes_catalog,
+            commands::hermes::hermes_disconnect,
             commands::agent_chat_provider_health,
             commands::list_chat_slash_commands,
             commands::list_launch_gemini_models,
@@ -2698,11 +2718,15 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_request_update,
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
+            web_remote::web_remote_retry,
             // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
             webview_tuning::set_smooth_scrolling,
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            // "Reload interface" in the command palette: reloads only the
+            // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
+            webview_recovery::reload_interface,
             // Native window background, so a light palette doesn't launch
             // behind `tauri.conf.json`'s near-black default.
             set_window_background,

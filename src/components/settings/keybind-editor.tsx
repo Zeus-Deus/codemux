@@ -12,8 +12,10 @@ import {
   KEYBIND_REGISTRY,
   KEYBIND_CATEGORIES,
   CATEGORY_LABELS,
+  getNativeEntryForCombo,
   type KeybindCategory,
 } from "@/lib/keybind-registry";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { normalizeKeyCombo, isModifierOnly } from "@/lib/keybind-utils";
 import { useResolvedKeybinds, type ResolvedEntry } from "@/hooks/use-resolved-keybinds";
 import { setKeybindRecordingMode } from "@/hooks/use-keyboard-shortcuts";
@@ -29,15 +31,19 @@ const RECORDING_TIMEOUT_MS = 4000;
 /** Shortcuts that should warn when being unbound via conflict override */
 const CRITICAL_IDS = new Set(["commandPalette", "openSettings", "closeOverlay"]);
 
+interface PendingConflict {
+  combo: string;
+  targetId: string;
+  conflictIds: string[];
+  /** Owned by a native shortcut: can't be overridden, only cancelled. */
+  reserved?: boolean;
+}
+
 export function KeybindEditor() {
   const [search, setSearch] = useState("");
   const [recordingId, setRecordingId] = useState<string | null>(null);
   const [recordingTimedOut, setRecordingTimedOut] = useState(false);
-  const [pendingConflict, setPendingConflict] = useState<{
-    combo: string;
-    targetId: string;
-    conflictIds: string[];
-  } | null>(null);
+  const [pendingConflict, setPendingConflict] = useState<PendingConflict | null>(null);
 
   const { keybindMap, reverseMap } = useResolvedKeybinds();
   const overrides = useSyncedSettingsStore(selectKeyboardShortcuts);
@@ -93,6 +99,14 @@ export function KeybindEditor() {
       const combo = normalizeKeyCombo(e);
       if (!combo) return;
 
+      // The desktop app consumes native shortcuts before the page sees them,
+      // so an action bound to one would never fire.
+      const native = getNativeEntryForCombo(combo);
+      if (native) {
+        setPendingConflict({ combo, targetId: recordingId, conflictIds: [native.id], reserved: true });
+        return;
+      }
+
       // Check for conflicts
       const existing = reverseMap.get(combo);
       const conflictIds = existing?.filter((id) => id !== recordingId) ?? [];
@@ -113,7 +127,7 @@ export function KeybindEditor() {
   }, [recordingId, reverseMap, saveOverride]);
 
   const confirmConflict = useCallback(() => {
-    if (!pendingConflict) return;
+    if (!pendingConflict || pendingConflict.reserved) return;
     const next = { ...freshOverrides() };
     for (const id of pendingConflict.conflictIds) {
       next[id] = "";
@@ -129,12 +143,15 @@ export function KeybindEditor() {
     setRecordingId(null);
   }, []);
 
-  // Filter by search query
+  // Filter by search query. Native shortcuts belong to the desktop window, so
+  // a browser on another device doesn't list them.
   const lowerSearch = search.toLowerCase();
+  const remote = isRemoteClient();
   const filteredEntries = (category: KeybindCategory) =>
     KEYBIND_REGISTRY.filter(
       (e) =>
         e.category === category &&
+        !(remote && e.native) &&
         (lowerSearch === "" ||
           e.label.toLowerCase().includes(lowerSearch) ||
           e.defaultKeys.toLowerCase().includes(lowerSearch) ||
@@ -251,7 +268,7 @@ function KeybindRow({
   entry: ResolvedEntry;
   isRecording: boolean;
   recordingTimedOut: boolean;
-  pendingConflict: { combo: string; targetId: string; conflictIds: string[] } | null;
+  pendingConflict: PendingConflict | null;
   keybindMap: Map<string, ResolvedEntry>;
   onStartRecording: () => void;
   onReset: () => void;
@@ -287,8 +304,24 @@ function KeybindRow({
           </p>
         )}
 
+        {/* A native shortcut owns this combo: nothing to override. */}
+        {pendingConflict?.reserved && (() => {
+          const owner = keybindMap.get(pendingConflict.conflictIds[0]);
+          return (
+          <div className="mt-2 flex items-center gap-2 flex-wrap rounded-md border border-warning/30 bg-warning/10 px-2.5 py-2">
+            <span className="text-body-sm text-warning">
+              {owner?.activeKeys ?? pendingConflict.combo} is reserved for{" "}
+              <span className="font-medium">{owner?.label ?? pendingConflict.conflictIds[0]}</span>
+            </span>
+            <Button variant="ghost" size="xs" className="ml-auto" onClick={onCancelConflict}>
+              Cancel
+            </Button>
+          </div>
+          );
+        })()}
+
         {/* Conflict warning */}
-        {pendingConflict && (() => {
+        {pendingConflict && !pendingConflict.reserved && (() => {
           const affectsCritical = pendingConflict.conflictIds.some((id) => CRITICAL_IDS.has(id));
           return (
             <div className="space-y-1.5 mt-2 rounded-md border border-warning/30 bg-warning/10 px-2.5 py-2">
@@ -340,29 +373,38 @@ function KeybindRow({
           </button>
         )}
 
-        {/* Key combo badge */}
-        <button
-          ref={badgeRef}
-          onClick={isRecording ? undefined : onStartRecording}
-          className={cn(
-            "text-body-sm font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-[color,background-color,border-color] duration-150",
-            isRecording
-              ? "border-primary/40 bg-primary/10 text-primary-foreground motion-safe:animate-pulse cursor-default"
+        {/* Key combo badge. Native shortcuts are fixed, so theirs is inert. */}
+        {entry.native ? (
+          <span
+            title="Handled by the desktop app, so it works even when the interface is frozen. Can't be changed."
+            className="text-body-sm font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight text-foreground/85 border-border/60 bg-muted/40 cursor-default"
+          >
+            {activeKeys}
+          </span>
+        ) : (
+          <button
+            ref={badgeRef}
+            onClick={isRecording ? undefined : onStartRecording}
+            className={cn(
+              "text-body-sm font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-[color,background-color,border-color] duration-150",
+              isRecording
+                ? "border-primary/40 bg-primary/10 text-primary-foreground motion-safe:animate-pulse cursor-default"
+                : isUnbound
+                  ? "text-muted-foreground/50 border-dashed border-border bg-transparent hover:border-border hover:bg-muted/40 cursor-pointer"
+                  : entry.isCustom
+                    ? "text-foreground border-primary/30 bg-primary/5 hover:bg-primary/10 cursor-pointer"
+                    : "text-foreground/85 border-border/60 bg-muted/40 hover:bg-muted hover:border-border cursor-pointer",
+            )}
+          >
+            {isRecording
+              ? recordingTimedOut
+                ? "Not captured"
+                : "Press keys\u2026"
               : isUnbound
-                ? "text-muted-foreground/50 border-dashed border-border bg-transparent hover:border-border hover:bg-muted/40 cursor-pointer"
-                : entry.isCustom
-                  ? "text-foreground border-primary/30 bg-primary/5 hover:bg-primary/10 cursor-pointer"
-                  : "text-foreground/85 border-border/60 bg-muted/40 hover:bg-muted hover:border-border cursor-pointer",
-          )}
-        >
-          {isRecording
-            ? recordingTimedOut
-              ? "Not captured"
-              : "Press keys\u2026"
-            : isUnbound
-              ? "\u2014"
-              : activeKeys}
-        </button>
+                ? "\u2014"
+                : activeKeys}
+          </button>
+        )}
       </div>
     </div>
   );

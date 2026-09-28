@@ -20,6 +20,10 @@ import {
   removeUserMessageByNonce,
 } from "@/lib/agent-chat/reducer";
 import { replaceTranscriptItem } from "@/lib/agent-chat/subagents";
+import {
+  installComposerDraftBackup,
+  restoredComposerDraft,
+} from "@/lib/agent-chat/composer-draft-backup";
 import type {
   ChatThreadState,
   ChatViewItem,
@@ -198,13 +202,15 @@ export interface ChatThreadSlice extends ChatThreadState {
   lastPersistedEventId: number | null;
 }
 
-function emptySlice(): ChatThreadSlice {
+/** A fresh slice. Its composer starts with whatever the previous page left
+ *  unsent for this thread, so reloading the window keeps a typed message. */
+function emptySlice(threadId: string): ChatThreadSlice {
   return {
     ...createEmptyThreadState(),
     model: null,
     permissionMode: DEFAULT_THREAD_PERMISSION_MODE,
     sessionLaunchMode: null,
-    inputDraft: "",
+    inputDraft: restoredComposerDraft(threadId),
     activeTurnId: null,
     resumeCursor: null,
     effort: null,
@@ -401,7 +407,7 @@ function updateSlice(
   threadId: string,
   update: (slice: ChatThreadSlice) => ChatThreadSlice,
 ): Partial<AgentChatStore> {
-  const existing = state.threads[threadId] ?? emptySlice();
+  const existing = state.threads[threadId] ?? emptySlice(threadId);
   const next = update(existing);
   if (next === existing) return {};
   touchThread(threadId);
@@ -430,7 +436,7 @@ function replayIntoSlice(
   cursor: { cursor: number | null },
 ): ChatThreadSlice {
   const replayed = replayTimed(parseTimedReplayPayloads(rows), opts);
-  const base = existing ?? emptySlice();
+  const base = existing ?? emptySlice(threadId);
   const messages =
     base.messages.length > 0 && replayed.messages.length > 0
       ? adoptItemIds(base.messages, replayed.messages)
@@ -603,7 +609,7 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
     set((state) =>
       state.threads[threadId]
         ? {}
-        : { threads: { ...state.threads, [threadId]: emptySlice() } },
+        : { threads: { ...state.threads, [threadId]: emptySlice(threadId) } },
     ),
 
   applyEvent: (threadId, event) =>
@@ -1019,6 +1025,8 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
     ),
 
 }));
+
+installComposerDraftBackup(useAgentChatStore);
 
 export const selectThread =
   (threadId: string | null) =>

@@ -1,4 +1,5 @@
 pub mod async_questions;
+pub mod hermes;
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -350,6 +351,7 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    hermes::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_version (

@@ -1,3 +1,4 @@
+import { selectCapabilities } from "@/stores/provider-capabilities-store";
 import { Sparkles } from "lucide-react";
 
 import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
@@ -32,7 +33,7 @@ export function UtilityAgentSetting() {
   const customProvider = (settings[UTILITY_SETTING_KEYS.provider] ||
     auto?.provider ||
     "codex") as AgentChatProviderKind;
-  const providerCaps = capabilities[customProvider];
+  const providerCaps = selectCapabilities(capabilities, customProvider);
   const customModel =
     settings[UTILITY_SETTING_KEYS.model] ||
     auto?.model ||
@@ -114,7 +115,7 @@ export function UtilityAgentSetting() {
             provider={customProvider}
             model={customModel}
             onProviderModelChange={(provider, model) => {
-              const caps = capabilities[provider];
+              const caps = selectCapabilities(capabilities, provider);
               const picked = caps?.models.find((entry) => entry.id === model);
               setSetting(UTILITY_SETTING_KEYS.provider, provider);
               setSetting(UTILITY_SETTING_KEYS.model, model);

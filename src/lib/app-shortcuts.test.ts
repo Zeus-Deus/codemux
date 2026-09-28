@@ -45,4 +45,15 @@ describe("isAppShortcut", () => {
     updateAppShortcuts({ commandPalette: "F6" });
     expect(isAppShortcut(keyEvent({ key: "F6" }))).toBe(true);
   });
+
+  it("leaves native shortcuts out of the intercept list", () => {
+    // The desktop app consumes Ctrl+Alt+R before the page sees it; in a
+    // browser client the key is just a key, so a focused terminal keeps it.
+    updateAppShortcuts({});
+    expect(
+      isAppShortcut(keyEvent({ key: "r", ctrlKey: true, altKey: true })),
+    ).toBe(false);
+    // The reload guard itself is still intercepted.
+    expect(isAppShortcut(keyEvent({ key: "r", ctrlKey: true }))).toBe(true);
+  });
 });

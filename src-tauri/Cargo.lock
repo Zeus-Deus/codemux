@@ -1250,6 +1250,7 @@ dependencies = [
  "uuid",
  "web-push",
  "webkit2gtk",
+ "webview2-com",
  "which",
  "windows-sys 0.59.0",
  "zbus 5.17.0",

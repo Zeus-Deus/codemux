@@ -79,8 +79,21 @@ fn is_ordered_invoke(cmd: &str) -> bool {
 
 // ── Live connection registry ────────────────────────────────────────
 
+/// Which way in a live socket arrived through. Each transport can be turned
+/// off on its own (the LAN listener and the from-anywhere relay are separate
+/// cards in Settings), and doing so must sever only that transport's sockets —
+/// a phone connected over the relay keeps working while the LAN port rebinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The axum `/ws` listener on the LAN / tailnet / loopback.
+    Lan,
+    /// The iroh QUIC relay transport (app.codemux.org).
+    Relay,
+}
+
 struct ConnInfo {
     session_id: String,
+    transport: Transport,
     out: OutboundTx,
     /// Set `true` to force this socket closed (revocation / keepalive death).
     close: watch::Sender<bool>,
@@ -98,12 +111,19 @@ impl ConnectionRegistry {
     /// Register a live socket for a session. `pub(super)` so the iroh transport
     /// ([`super::iroh`]) registers its bi-streams in this same registry, giving
     /// revocation / `close_all` reach over iroh sessions too.
-    pub(super) fn register(&self, session_id: &str, out: OutboundTx, close: watch::Sender<bool>) -> u64 {
+    pub(super) fn register(
+        &self,
+        session_id: &str,
+        transport: Transport,
+        out: OutboundTx,
+        close: watch::Sender<bool>,
+    ) -> u64 {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         self.conns.lock().unwrap().insert(
             id,
             ConnInfo {
                 session_id: session_id.to_string(),
+                transport,
                 out,
                 close,
             },
@@ -160,6 +180,20 @@ impl ConnectionRegistry {
             let _ = c.close.send(true);
         }
         conns.len()
+    }
+
+    /// Force every socket that arrived over `transport` closed, leaving the
+    /// other transport's sockets alone. Used when one way in is turned off or
+    /// the LAN listener rebinds to a new port/scope.
+    pub fn close_transport(&self, transport: Transport) -> usize {
+        let conns = self.conns.lock().unwrap();
+        let mut closed = 0;
+        for c in conns.values().filter(|c| c.transport == transport) {
+            let _ = c.out.send(Message::Close(None));
+            let _ = c.close.send(true);
+            closed += 1;
+        }
+        closed
     }
 }
 
@@ -597,7 +631,7 @@ async fn handle_socket<R: Runtime>(
     let (close_tx, mut close_rx) = watch::channel(false);
     let conn_id = shared
         .connections
-        .register(&session_id, out_tx.clone(), close_tx.clone());
+        .register(&session_id, Transport::Lan, out_tx.clone(), close_tx.clone());
     super::emit_state_changed(&app);
 
     // Writer: the single owner of the sink; every producer feeds `out_tx`.
@@ -877,7 +911,7 @@ mod tests {
         let reg = ConnectionRegistry::default();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = watch::channel(false);
-        let id = reg.register("sess-1", out_tx, close_tx);
+        let id = reg.register("sess-1", Transport::Lan, out_tx, close_tx);
 
         assert_eq!(reg.active_count(), 1);
         assert!(reg.session_live("sess-1"));
@@ -901,8 +935,8 @@ mod tests {
         let (ctx_a, _cra) = watch::channel(false);
         let (tx_b, mut rx_b) = mpsc::unbounded_channel();
         let (ctx_b, crb) = watch::channel(false);
-        reg.register("A", tx_a, ctx_a);
-        reg.register("B", tx_b, ctx_b);
+        reg.register("A", Transport::Lan, tx_a, ctx_a);
+        reg.register("B", Transport::Relay, tx_b, ctx_b);
 
         assert_eq!(reg.close_session("A"), 1);
         assert!(matches!(rx_a.try_recv(), Ok(Message::Close(_))));
@@ -922,8 +956,8 @@ mod tests {
         let (ctx_a, cra) = watch::channel(false);
         let (tx_b, mut rx_b) = mpsc::unbounded_channel();
         let (ctx_b, crb) = watch::channel(false);
-        reg.register("A", tx_a, ctx_a);
-        reg.register("B", tx_b, ctx_b);
+        reg.register("A", Transport::Lan, tx_a, ctx_a);
+        reg.register("B", Transport::Relay, tx_b, ctx_b);
 
         assert_eq!(reg.close_all(), 2);
         // Both sockets get a Close frame and have their close signal tripped.
@@ -931,6 +965,28 @@ mod tests {
         assert!(matches!(rx_b.try_recv(), Ok(Message::Close(_))));
         assert!(*cra.borrow(), "A's close signal tripped");
         assert!(*crb.borrow(), "B's close signal tripped");
+    }
+
+    #[test]
+    fn close_transport_severs_only_that_transport() {
+        // Turning the LAN listener off (or rebinding it) must not kick a phone
+        // that is connected over the relay, and vice versa.
+        let reg = ConnectionRegistry::default();
+        let (tx_lan, mut rx_lan) = mpsc::unbounded_channel();
+        let (ctx_lan, cr_lan) = watch::channel(false);
+        let (tx_relay, mut rx_relay) = mpsc::unbounded_channel();
+        let (ctx_relay, cr_relay) = watch::channel(false);
+        reg.register("A", Transport::Lan, tx_lan, ctx_lan);
+        reg.register("B", Transport::Relay, tx_relay, ctx_relay);
+
+        assert_eq!(reg.close_transport(Transport::Lan), 1);
+        assert!(matches!(rx_lan.try_recv(), Ok(Message::Close(_))));
+        assert!(*cr_lan.borrow(), "the LAN socket is signalled closed");
+        assert!(rx_relay.try_recv().is_err(), "the relay socket gets no Close frame");
+        assert!(!*cr_relay.borrow(), "the relay socket stays open");
+
+        assert_eq!(reg.close_transport(Transport::Relay), 1);
+        assert!(matches!(rx_relay.try_recv(), Ok(Message::Close(_))));
     }
 
     // ── Session gate (backs the assets + proxy route auth) ──────────

@@ -760,7 +760,7 @@ describe("SidebarInbox — project filter", () => {
     await renderInbox();
 
     await pickFilter("vexis");
-    expect(screen.getByText(/Nothing active/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing running in/)).toBeInTheDocument();
     // The settled vexis row still shows under the divider.
     expect(screen.getByText("In vexis")).toBeInTheDocument();
   });

@@ -1,3 +1,5 @@
+import { parseKeyCombo } from "@/lib/keybind-utils";
+
 export type KeybindCategory =
   | "general"
   | "search"
@@ -23,6 +25,13 @@ export interface KeybindEntry {
    *   handler. Anywhere else — sidebar, chat, overview — the action fires.
    */
   when?: "always" | "terminal" | "non-terminal";
+  /**
+   * Handled by the desktop app itself (`src-tauri/src/webview_recovery.rs`),
+   * before the page ever sees the key, so it still works when the interface is
+   * frozen or blank. Listed for reference only: it can't be rebound, the
+   * frontend never dispatches it, and other actions can't take its combo.
+   */
+  native?: true;
 }
 
 export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
@@ -37,9 +46,11 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "zoomOut", label: "Decrease interface size", category: "general", defaultKeys: "Ctrl+-", description: "Make all interface text and chrome smaller" },
   { id: "zoomReset", label: "Reset interface size", category: "general", defaultKeys: "Ctrl+0" },
   { id: "closeOverlay", label: "Close overlay", category: "general", defaultKeys: "Escape", description: "Close settings, search, or command palette" },
-  { id: "blockReload", label: "Block reload", category: "general", defaultKeys: "Ctrl+R", description: "Prevents accidental app reload" },
-  { id: "blockHardReload", label: "Block hard reload", category: "general", defaultKeys: "Ctrl+Shift+R", description: "Prevents accidental app reload" },
-  { id: "blockF5Reload", label: "Block F5 reload", category: "general", defaultKeys: "F5", description: "Prevents accidental app reload" },
+  { id: "blockReload", label: "Block reload", category: "general", defaultKeys: "Ctrl+R", description: "Prevents accidental app reload. Reloads the interface once the window stops responding" },
+  { id: "blockHardReload", label: "Block hard reload", category: "general", defaultKeys: "Ctrl+Shift+R", description: "Prevents accidental app reload. Reloads the interface once the window stops responding" },
+  { id: "blockF5Reload", label: "Block F5 reload", category: "general", defaultKeys: "F5", description: "Prevents accidental app reload. Reloads the interface once the window stops responding" },
+  // Kept in sync with `RECOVERY_SHORTCUT` in src-tauri/src/webview_recovery.rs.
+  { id: "reloadInterface", label: "Reload interface", category: "general", defaultKeys: "Ctrl+Alt+R", description: "Recovers a blank or frozen window. Terminals and agents keep running. From a shell: codemux reload-ui", native: true },
 
   // ── Search ──
   { id: "fileSearch", label: "Find file by name", category: "search", defaultKeys: "Ctrl+Shift+P" },
@@ -94,6 +105,26 @@ const registryById = new Map(KEYBIND_REGISTRY.map((e) => [e.id, e]));
 
 export function getRegistryEntry(id: string): KeybindEntry | undefined {
   return registryById.get(id);
+}
+
+/**
+ * The native entry that owns `combo`, if any. Compares parsed combos so the
+ * modifier order doesn't matter: recorded combos come out as "Alt+Ctrl+R"
+ * while the registry spells the native one "Ctrl+Alt+R".
+ */
+export function getNativeEntryForCombo(combo: string): KeybindEntry | undefined {
+  if (!combo) return undefined;
+  const target = parseKeyCombo(combo);
+  return KEYBIND_REGISTRY.find((entry) => {
+    if (!entry.native) return false;
+    const parsed = parseKeyCombo(entry.defaultKeys);
+    return (
+      parsed.ctrl === target.ctrl &&
+      parsed.alt === target.alt &&
+      parsed.shift === target.shift &&
+      parsed.key.toLowerCase() === target.key.toLowerCase()
+    );
+  });
 }
 
 /** All categories in display order */

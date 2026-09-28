@@ -1341,7 +1341,7 @@ impl From<ApprovalDecision> for ApprovalResponse {
                 updated_input: None,
                 message: Some(message),
             },
-            ApprovalDecision::Cancel => Self {
+            ApprovalDecision::Cancel | ApprovalDecision::ProviderOption { .. } => Self {
                 decision: "cancel".to_string(),
                 updated_input: None,
                 message: None,

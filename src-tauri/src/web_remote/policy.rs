@@ -17,6 +17,10 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "set_preset_pinned"
             | "refresh_workspace_issue"
             | "agent_chat_provider_health"
+            | "hermes_profiles"
+            | "hermes_catalog"
+            | "hermes_binding"
+            | "hermes_disconnect"
             | "unarchive_workspace"
             | "import_worktree_workspace"
             | "link_workspace_issue"
@@ -261,6 +265,25 @@ pub(super) fn allowed(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hermes_remote_profile_workflow_is_explicitly_allowed() {
+        // Paired clients already run and configure agent chats. Hermes exposes
+        // profile identity/catalog/binding metadata and runtime disconnect only;
+        // authentication remains in the official Hermes runtime. The executable
+        // always comes from host settings, never from the caller's profile.
+        for cmd in [
+            "hermes_profiles",
+            "hermes_catalog",
+            "hermes_binding",
+            "hermes_disconnect",
+        ] {
+            assert!(allowed(cmd), "{cmd}");
+        }
+        for cmd in ["hermes_auth", "hermes_get_credentials", "hermes_future_command"] {
+            assert!(!allowed(cmd), "{cmd}");
+        }
+    }
+
     #[test]
     fn remote_invoke_allowlist_is_closed_by_default() {
         for cmd in [
