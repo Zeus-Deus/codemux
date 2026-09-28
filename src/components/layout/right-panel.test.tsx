@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -35,6 +35,13 @@ vi.mock("@/components/workflow/orchestration-panel", () => ({
 }));
 vi.mock("@/components/diff/DiffPane", () => ({
   DiffPane: () => <div data-testid="diff-pane-stub" />,
+}));
+// An add-on view mounts through the native broker; the deck only decides
+// which one to show and what to call it.
+vi.mock("@/components/addons/addon-view", () => ({
+  AddonView: (props: Record<string, unknown>) => (
+    <div data-testid="addon-view-stub" data-props={JSON.stringify(props)} />
+  ),
 }));
 // The browser pane's body is a WebSocket screencast onto a canvas — not
 // jsdom-testable. Stub it to a sentinel so the deck wiring (which session
@@ -89,6 +96,8 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 
 import { RightPanel } from "./right-panel";
 import { docPaneId } from "./right-panel/pane-registry";
+import { useAddonsStore } from "@/stores/addons-store";
+import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 
 function chatPane(threadId: string | null): PaneNodeSnapshot {
   return {
@@ -826,5 +835,121 @@ describe("RightPanel browser pane", () => {
     expect(useUIStore.getState().getRightPanelPanes("ws-2")).toContain(
       "browser",
     );
+  });
+});
+
+describe("RightPanel add-on panes", () => {
+  const pane = "addon:test.plugin:brief" as const;
+  // Titled like a core pane on purpose: attribution is what tells them apart.
+  const plugin = {
+    installationId: "installation",
+    manifest: {
+      id: "test.plugin",
+      name: "Fixture Brief",
+      contributes: {
+        commands: [],
+        panels: [{ id: "brief", title: "Changes", icon: "git-branch" }],
+        composerActions: [],
+        composerViews: [],
+      },
+    } as unknown as AddonManifest,
+    desiredEnabled: true,
+    status: "enabled-idle",
+  } as AddonInstallation;
+  beforeEach(() => {
+    useAddonsStore.setState({ installed: [plugin], paused: false });
+  });
+  afterEach(() => {
+    useAddonsStore.setState({ installed: [], paused: false });
+  });
+  const openAddonPane = () =>
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": [...DEFAULT_RIGHT_PANEL_PANES, pane] },
+      rightPanelTabs: { "ws-1": pane },
+    });
+
+  it("names the add-on on its tab and on its view, not only the panel title", () => {
+    openAddonPane();
+    renderDeck({ activeTab: pane });
+    const tab = screen
+      .getByTestId("addon-tab")
+      .querySelector("button[aria-pressed]")!;
+    expect(tab).toHaveAttribute("aria-label", "Changes — Fixture Brief");
+    expect(tab).toHaveAttribute("title", "Changes — Fixture Brief");
+    expect(tab).toHaveTextContent("Changes");
+    // The core Changes tab keeps its plain name.
+    expect(screen.getByRole("button", { name: /^Changes$/ })).toBeInTheDocument();
+    expect(
+      JSON.parse(screen.getByTestId("addon-view-stub").dataset.props!),
+    ).toMatchObject({
+      id: "test.plugin",
+      view: "brief",
+      workspaceId: "ws-1",
+      label: "Changes — Fixture Brief",
+    });
+  });
+
+  it("lists add-on panels in their own attributed section of the + menu", async () => {
+    const user = userEvent.setup();
+    renderDeck();
+    await user.click(screen.getByTestId("right-panel-add-pane"));
+    expect(await screen.findByText("ADD-ONS")).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("menuitem", { name: "Changes — Fixture Brief" }),
+    );
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe(pane);
+  });
+
+  it("adds no Add-ons section to the + menu without add-on panels", async () => {
+    useAddonsStore.setState({ installed: [] });
+    const user = userEvent.setup();
+    renderDeck();
+    await user.click(screen.getByTestId("right-panel-add-pane"));
+    await screen.findByRole("menuitem", { name: /Open file/ });
+    expect(screen.queryByText("ADD-ONS")).toBeNull();
+  });
+
+  it.each([
+    ["host_id", { host_id: "host-1" }],
+    ["remote_cwd", { remote_cwd: "/srv/p" }],
+    ["attach_only", { attach_only: true }],
+  ])(
+    "hides add-on panes in a %s workspace without forgetting them",
+    async (_, remote) => {
+      openAddonPane();
+      const user = userEvent.setup();
+      renderDeck({
+        workspace: makeWorkspace(remote as Partial<WorkspaceSnapshot>),
+        activeTab: pane,
+      });
+      expect(screen.queryByTestId("addon-tab")).toBeNull();
+      expect(screen.queryByTestId("addon-view-stub")).toBeNull();
+      expect(useUIStore.getState().rightPanelPanes["ws-1"]).toContain(pane);
+      await user.click(screen.getByTestId("right-panel-add-pane"));
+      await screen.findByRole("menuitem", { name: /Open file/ });
+      expect(screen.queryByText("ADD-ONS")).toBeNull();
+    },
+  );
+
+  it("hides add-on panes in a browser client", () => {
+    mocks.remote = true;
+    openAddonPane();
+    renderDeck({ activeTab: pane });
+    expect(screen.queryByTestId("addon-tab")).toBeNull();
+    expect(screen.queryByTestId("addon-view-stub")).toBeNull();
+  });
+
+  it("hides a paused add-on's pane and brings it back on resume", () => {
+    openAddonPane();
+    useAddonsStore.setState({ paused: true });
+    renderDeck({ activeTab: pane });
+    expect(screen.queryByTestId("addon-tab")).toBeNull();
+    // A core pane stands in while the add-on pane is unavailable.
+    expect(screen.getByTestId("file-tree-panel")).toBeInTheDocument();
+    act(() => {
+      useAddonsStore.setState({ paused: false });
+    });
+    expect(screen.getByTestId("addon-tab")).toBeInTheDocument();
+    expect(screen.getByTestId("addon-view-stub")).toBeInTheDocument();
   });
 });

@@ -1,0 +1,36 @@
+{
+  "format": "codemux.feature-plugin",
+  "manifestVersion": 1,
+  "id": "example.hello",
+  "name": "Hello",
+  "description": "An independent CodeMux plugin.",
+  "version": "1.0.0",
+  "api": "^1.0.0",
+  "entry": "plugin.js",
+  "platforms": [
+    "linux-x64",
+    "windows-x64"
+  ],
+  "author": {
+    "name": "Example",
+    "url": "https://example.com"
+  },
+  "repository": "https://github.com/example/hello",
+  "license": "MIT",
+  "permissions": [],
+  "http": [],
+  "credentials": [],
+  "contributes": {
+    "commands": [
+      {
+        "id": "hello",
+        "title": "Say hello",
+        "requiresWorkspace": false
+      }
+    ],
+    "panels": [],
+    "composerActions": [],
+    "composerViews": []
+  },
+  "settings": []
+}

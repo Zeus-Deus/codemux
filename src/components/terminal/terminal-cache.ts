@@ -55,7 +55,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import {
-  writeToPty,
   attachPtyOutput,
   detachPtyOutput,
   pausePtyOutput,
@@ -66,6 +65,7 @@ import {
   Channel,
   type ScrollbackPayload,
 } from "@/tauri/commands";
+import { writePtyInput } from "./pty-input";
 import {
   scanKittySequences,
   applyKittyStack,
@@ -228,10 +228,7 @@ function scanKittyProtocol(entry: CachedTerminal, data: Uint8Array) {
   const scan = scanKittySequences(decoded);
 
   if (scan.hasQuery) {
-    writeToPty(
-      entry.sessionId,
-      `\x1b[?${kittyFlags(entry.kittyStack)}u`,
-    ).catch(console.error);
+    writePtyInput(entry.sessionId, `\x1b[?${kittyFlags(entry.kittyStack)}u`);
   }
   entry.kittyStack = applyKittyStack(
     entry.kittyStack,
@@ -353,22 +350,9 @@ function createCachedTerminal(
 
   // ── User input handler ──
   // Stable: sessionId never changes for a given cache entry.
-  let pendingInput = "";
-  let inputQueued = false;
   const dataDisposable = terminal.onData((data) => {
     if (entry.disposed) return;
-    pendingInput += data;
-    if (!inputQueued) {
-      inputQueued = true;
-      queueMicrotask(() => {
-        const batch = pendingInput;
-        pendingInput = "";
-        inputQueued = false;
-        writeToPty(sessionId, batch).catch((err) => {
-          console.error(`Failed to write to PTY for ${sessionId}:`, err);
-        });
-      });
-    }
+    writePtyInput(sessionId, data);
   });
   entry.cleanups.push(() => dataDisposable.dispose());
 

@@ -1,0 +1,133 @@
+{
+  "commit": "a1141577e1efb8ef3f3c5cef3ab4509ae962e04b",
+  "platform": "linux",
+  "hardware": {
+    "osRelease": "6.8.0-1064-azure",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "logicalCpus": 4,
+    "memoryBytes": 16765411328
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "06-host-credential-settings-and-explicit-fallback",
+    "07-paired-remote-cannot-invoke-or-subscribe-to-plugins",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "08-bounded-list-rendering-and-frame-budget",
+    "09-native-update-review-and-matching-data-rollback",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "11-corrupt-plugin-registry-does-not-block-core-startup"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "312321e3e72985f637b02b0621526e7d6a24fd69",
+    "run": "35392514725",
+    "platform": "linux"
+  },
+  "installerSha256": "fcaa802640ca730f9af687ddd583433e05f97055fa469bf89663be7936d58d59",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "credentials": {
+    "maskedInput": true,
+    "noSecretInInventoryOrSettings": true,
+    "mode": "missing Secret Service, explicit session-only fallback",
+    "removalAndFileRedaction": true
+  },
+  "remoteBoundary": {
+    "transport": "paired loopback HTTP/WebSocket against stock desktop",
+    "approval": "explicit desktop command",
+    "coreRpc": true,
+    "addonRpcDenied": true,
+    "coreEvents": true,
+    "addonEventsDenied": true
+  },
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 949.7270820000012
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 974.5817419999985
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 1026.974457999997
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 991.8235429999986
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 1008.2087790000005
+    }
+  ],
+  "uiRendering": {
+    "workload": "500 visible-model paths, five real Git refreshes while typing",
+    "renderedRows": 14,
+    "frameSamples": 640,
+    "p95FrameGapMs": 16,
+    "maxFrameGapMs": 19,
+    "refreshMs": [
+      326.7626820000005,
+      296.81468500000483,
+      338.3849380000029,
+      336.94675899999856,
+      337.7967339999959
+    ],
+    "p95FrameGapBudgetMs": 100
+  },
+  "nativeUpdates": {
+    "sameAccess": true,
+    "activeHost": true,
+    "expandedAccessReview": true,
+    "cancellation": true,
+    "rollbackMatchingPrivateData": true,
+    "developerModeOff": true
+  },
+  "corePaneRestoration": {
+    "preserved": [
+      "Files",
+      "Changes",
+      "Review"
+    ],
+    "paused": true,
+    "removed": true,
+    "noEmptyAccessorySpace": true
+  },
+  "status": "passed"
+}

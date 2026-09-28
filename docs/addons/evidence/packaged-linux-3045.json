@@ -1,0 +1,67 @@
+{
+  "platform": "linux",
+  "os": "6.8.0-1064-azure",
+  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "logicalCpus": 4,
+  "hostSha256": "dd6310532390ff0f3b4312db2615be3c4fa933e955bd7330f1db050241b20d3f",
+  "bundles": [
+    {
+      "format": ".deb",
+      "packagedSha256": "dd6310532390ff0f3b4312db2615be3c4fa933e955bd7330f1db050241b20d3f",
+      "provenance": "exact-sha256",
+      "hostPath": "usr/lib/codemux/binaries/codemux-addon-host-linux-x64",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1007.0116740000001
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 4.0497770000001765
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 3.105837999999949
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1003.5204709999998
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 3.6716019999998935
+        }
+      ]
+    },
+    {
+      "format": ".AppImage",
+      "packagedSha256": "7e74ae728316e1403c33fd0690f20ba21483db2a6cdc290f506678d0adcf8c07",
+      "provenance": "elf-sections-and-dynamic-metadata",
+      "hostPath": "squashfs-root/usr/lib/codemux/binaries/codemux-addon-host-linux-x64",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1003.984684
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 4.069824000000153
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 3.232184000000416
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1003.9180489999999
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 3.816092000000026
+        }
+      ]
+    }
+  ],
+  "workflowHead": "3045f47ffc3f20e34951922b72e06904ce231c78",
+  "workflowRun": "https://github.com/Zeus-Deus/codemux/actions/runs/35376157749"
+}

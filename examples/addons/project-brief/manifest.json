@@ -1,0 +1,59 @@
+{
+  "format": "codemux.feature-plugin",
+  "manifestVersion": 1,
+  "api": "^1.0.0",
+  "version": "1.0.0",
+  "entry": "plugin.js",
+  "platforms": [
+    "linux-x64",
+    "windows-x64"
+  ],
+  "author": {
+    "name": "CodeMux",
+    "url": "https://codemux.org"
+  },
+  "repository": "https://github.com/Zeus-Deus/codemux",
+  "license": "MIT",
+  "http": [],
+  "credentials": [],
+  "id": "codemux.project-brief",
+  "name": "Project Brief",
+  "description": "Prepare project context for a chat draft.",
+  "permissions": [
+    "workspace.read",
+    "git.read",
+    "composer.append"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "open",
+        "title": "Open Project Brief",
+        "requiresWorkspace": true
+      }
+    ],
+    "panels": [
+      {
+        "id": "brief",
+        "title": "Project Brief",
+        "icon": "file-text"
+      }
+    ],
+    "composerActions": [
+      {
+        "id": "insert",
+        "title": "Add project brief",
+        "icon": "file-text"
+      }
+    ],
+    "composerViews": []
+  },
+  "settings": [
+    {
+      "id": "include-files",
+      "type": "boolean",
+      "label": "Include changed filenames",
+      "default": true
+    }
+  ]
+}

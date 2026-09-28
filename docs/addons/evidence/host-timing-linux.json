@@ -1,0 +1,42 @@
+{
+  "profile": "release",
+  "packaged": false,
+  "os": "linux 7.2.5-3-omarchy",
+  "cpu": "AMD Ryzen 5 7600 6-Core Processor",
+  "logicalCpus": 12,
+  "sha256": "7f8079496c2a1e669d16c7f257a2ad31689f03203c47e2fe4bcd9094165eff87",
+  "samplesPerWorkload": 20,
+  "deadlineMs": 2000,
+  "workloads": [
+    {
+      "workload": "while(true){}",
+      "minMs": 1002.5891979999979,
+      "p95Ms": 1007.2198379999991,
+      "maxMs": 1010.3881799999999
+    },
+    {
+      "workload": "function f(){f()} f()",
+      "minMs": 1.9228750000002037,
+      "p95Ms": 2.757315999999264,
+      "maxMs": 2.8019269999967946
+    },
+    {
+      "workload": "new ArrayBuffer(128*1024*1024)",
+      "minMs": 1.6830640000007406,
+      "p95Ms": 2.847866999996768,
+      "maxMs": 3.255298000000039
+    },
+    {
+      "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+      "minMs": 1002.2652180000005,
+      "p95Ms": 1003.2288259999987,
+      "maxMs": 1003.2643519999983
+    },
+    {
+      "workload": "throw Error('synthetic')",
+      "minMs": 1.6045930000036606,
+      "p95Ms": 2.2726150000016787,
+      "maxMs": 2.5721560000019963
+    }
+  ]
+}

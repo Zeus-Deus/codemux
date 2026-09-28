@@ -128,8 +128,12 @@ export function docPanePath(id: RightPanelTab): string | null {
   return id.startsWith(DOC_PREFIX) ? id.slice(DOC_PREFIX.length) : null;
 }
 
+export function isAddonPane(id: string): id is `addon:${string}:${string}` {
+  return /^addon:[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$/.test(id);
+}
+
 export function isCorePane(id: RightPanelTab): id is RightPanelCorePane {
-  return !id.startsWith(DOC_PREFIX);
+  return BY_ID.has(id as RightPanelCorePane);
 }
 
 /** Last path segment — the doc tab's label and breadcrumb leaf. */

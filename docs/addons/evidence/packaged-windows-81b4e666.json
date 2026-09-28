@@ -1,0 +1,37 @@
+{
+  "platform": "win32",
+  "os": "10.0.26100",
+  "cpu": "AMD EPYC 7763 64-Core Processor                ",
+  "logicalCpus": 4,
+  "hostSha256": "7a5cc2c020d80d2150a13f0bd0a4aeac94b1189337a276119363e099d0fc464e",
+  "bundles": [
+    {
+      "format": ".exe",
+      "packagedSha256": "7a5cc2c020d80d2150a13f0bd0a4aeac94b1189337a276119363e099d0fc464e",
+      "provenance": "exact-sha256",
+      "hostPath": "binaries\\codemux-addon-host-windows-x64.exe",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1018.5375000000022
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 13.21219999999812
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 11.929599999999482
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1011.4567999999999
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 11.7345000000023
+        }
+      ]
+    }
+  ]
+}

@@ -75,13 +75,17 @@ import type { RightPanelTab } from "@/stores/ui-store";
 
 import { TabDropIndicator } from "../tab-drop-indicator";
 import { PaneActionButton } from "./pane-actions";
-import { PANE_REGISTRY, type PaneMeta } from "./pane-registry";
+import { isAddonPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
 import { PanelHeader } from "@/components/ui/panel-header";
 
 export interface DeckTab {
   id: RightPanelTab;
   label: string;
+  /** Who contributed the pane, for panes that are not CodeMux's own (an
+   *  add-on's name). Named in the tooltip and the accessible name, so an
+   *  add-on titled "Changes" never passes for the core pane. */
+  attribution?: string;
   icon: LucideIcon;
   /** Small mono badge — a count today ("12", "3/4"). */
   badge?: ReactNode;
@@ -172,8 +176,11 @@ function DeckTabChip({
         type="button"
         onClick={onSelect}
         aria-pressed={active}
+        aria-label={
+          tab.attribution ? `${tab.label} — ${tab.attribution}` : undefined
+        }
         // The full name on hover, for labels the cap below truncates.
-        title={tab.label}
+        title={tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label}
         className={cn(
           "flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[9px] text-body-sm",
           // Room for the close affordance only where it is always shown.
@@ -387,6 +394,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 }: PaneTabStripProps) {
   const remoteClient = isRemoteClient();
   const reserve = inTitlebar ? topRightReserve(remoteClient, true) : 0;
+  const coreSurfaces = surfaces.filter((surface) => !isAddonPane(surface.id));
+  const addonSurfaces = surfaces.filter((surface) => isAddonPane(surface.id));
 
   const tabIds = tabs.map((tab) => tab.id);
   const { containerRef, dragTabId, dropIndicatorLeft, getPillProps } =
@@ -483,7 +492,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           {/* Same `surfaces` array the empty-panel picker renders as cards,
               including Terminal, which is a *workspace* pane and routes to
               the action the main tab strip's "+" uses. */}
-          {surfaces.map((surface) => (
+          {coreSurfaces.map((surface) => (
             <DropdownMenuItem
               key={surface.id}
               className="h-[30px] rounded-md px-[9px] text-body font-medium"
@@ -493,6 +502,30 @@ export const PaneTabStrip = memo(function PaneTabStrip({
               {surface.label}
             </DropdownMenuItem>
           ))}
+          {/* Add-on panels get their own section, each attributed to its
+              add-on, so none can pass for a core pane. Absent without any. */}
+          {addonSurfaces.length > 0 && (
+            <>
+              <DropdownMenuSeparator className="mx-1 my-[5px]" />
+              <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
+                ADD-ONS
+              </DropdownMenuLabel>
+              {addonSurfaces.map((surface) => (
+                <DropdownMenuItem
+                  key={surface.id}
+                  aria-label={`${surface.label} — ${surface.description}`}
+                  className="h-[30px] rounded-md px-[9px] text-body font-medium"
+                  onClick={surface.onOpen}
+                >
+                  <surface.icon className="size-[14px]" />
+                  <span className="min-w-0 truncate">{surface.label}</span>
+                  <span className="ml-auto min-w-0 truncate pl-2 text-label font-normal text-muted-foreground">
+                    {surface.description}
+                  </span>
+                </DropdownMenuItem>
+              ))}
+            </>
+          )}
           <DropdownMenuSeparator className="mx-1 my-[5px]" />
           <DropdownMenuItem
             className="h-[30px] rounded-md px-[9px] text-body font-medium"

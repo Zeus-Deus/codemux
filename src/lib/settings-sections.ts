@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import {
   Archive,
+  Puzzle,
   Palette,
   Code2,
   TerminalSquare,
@@ -23,6 +24,7 @@ import {
 } from "lucide-react";
 
 export type Section =
+  | "addons"
   | "usage"
   | "interface"
   | "account"
@@ -69,6 +71,7 @@ interface NavGroup {
  */
 export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
   const editorWorkflowItems: NavItem[] = [
+    { id: "addons", label: "Add-ons", icon: Puzzle },
     { id: "editor", label: "Editor", icon: Code2 },
     { id: "terminal", label: "Terminal", icon: TerminalSquare },
     { id: "presets", label: "Presets", icon: Zap },

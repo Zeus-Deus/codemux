@@ -1,0 +1,68 @@
+name: Add-on contracts and native host
+on:
+  pull_request:
+    paths:
+      - 'src-tauri/addon-host/**'
+      - 'src-tauri/addon-protocol/**'
+      - 'packages/plugin-*/**'
+      - 'scripts/addons/**'
+      - '.github/workflows/addon-platform.yml'
+  push:
+    branches: ['codex/addons-*', main]
+    paths:
+      - 'src-tauri/addon-host/**'
+      - 'src-tauri/addon-protocol/**'
+      - 'packages/plugin-*/**'
+      - 'scripts/addons/**'
+      - '.github/workflows/addon-platform.yml'
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Windows GNU compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+      - name: Select standalone GNU toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+      - name: Contracts
+        run: cargo test -j 2 --locked --manifest-path src-tauri/addon-protocol/Cargo.toml --target ${{ matrix.target }} -- --test-threads=2
+      - name: Native child failure and IPC tests
+        run: cargo test -j 2 --locked --manifest-path src-tauri/addon-host/Cargo.toml --target ${{ matrix.target }} -- --test-threads=2
+      - name: SDK and author CLI
+        shell: bash
+        run: |
+          npm ci --ignore-scripts --prefix packages/plugin-sdk
+          npm ci --ignore-scripts --prefix packages/plugin-cli
+          npm run build --prefix packages/plugin-sdk
+          cargo run -j 2 --locked --manifest-path src-tauri/addon-protocol/Cargo.toml --example schema > /tmp/manifest-schema.json
+          diff --strip-trailing-cr -u packages/plugin-sdk/schema/manifest.json /tmp/manifest-schema.json
+          diff --strip-trailing-cr -u packages/plugin-sdk/schema/manifest.json packages/plugin-cli/schema/manifest.json
+      - name: Native SDK Remote DOM integration
+        shell: bash
+        run: |
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          node scripts/addons/sdk-native.mjs "${{ github.workspace }}/src-tauri/addon-host/target/${{ matrix.target }}/debug/codemux-addon-host${suffix}"

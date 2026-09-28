@@ -1,0 +1,28 @@
+{
+  "commit": "4f54b31430f7ba1dd4ae44aa85a7a3c2806367cc",
+  "platform": "linux",
+  "checks": [
+    "01-settings",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-disable-enable",
+    "03-issue-configuration"
+  ],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "603a73527c98883937296904e66b20c4744a1abe",
+    "run": "35379118363",
+    "platform": "linux"
+  },
+  "installerSha256": "6bdfb6e2d5551e0790ea80edbe83becd2c7ee9b91756c39ade363197059e7d8a",
+  "status": "failed",
+  "error": "Error: Timed out: 1 untracked",
+  "captureError": "TimeoutError: The operation was aborted due to timeout",
+  "workflowRun": "35382610101",
+  "artifactId": "10562902030",
+  "note": "Partial native UI evidence only. The run stopped at the Git count assertion: repository info/exclude was not copied into the private metadata snapshot. Later steps did not run."
+}

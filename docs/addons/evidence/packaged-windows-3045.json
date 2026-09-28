@@ -1,0 +1,39 @@
+{
+  "platform": "win32",
+  "os": "10.0.26100",
+  "cpu": "AMD EPYC 9V74 80-Core Processor                ",
+  "logicalCpus": 4,
+  "hostSha256": "1e55035d1d55e06ac1ec06a8df1fd3b36e524de072401cd2391e08c983732c21",
+  "bundles": [
+    {
+      "format": ".exe",
+      "packagedSha256": "1e55035d1d55e06ac1ec06a8df1fd3b36e524de072401cd2391e08c983732c21",
+      "provenance": "exact-sha256",
+      "hostPath": "binaries\\codemux-addon-host-windows-x64.exe",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1014.7129999999997
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 12.016399999998612
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 10.23279999999977
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1010.6166999999987
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 11.13169999999991
+        }
+      ]
+    }
+  ],
+  "workflowHead": "3045f47ffc3f20e34951922b72e06904ce231c78",
+  "workflowRun": "https://github.com/Zeus-Deus/codemux/actions/runs/35376157749"
+}

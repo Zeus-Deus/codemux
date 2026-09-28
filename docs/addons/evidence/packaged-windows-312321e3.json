@@ -1,0 +1,37 @@
+{
+  "platform": "win32",
+  "os": "10.0.26100",
+  "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+  "logicalCpus": 4,
+  "hostSha256": "ed059c176ef77d8b859de5d9c076bf2f766b336f60d12dda9fa57ecf5b7760d2",
+  "bundles": [
+    {
+      "format": ".exe",
+      "packagedSha256": "ed059c176ef77d8b859de5d9c076bf2f766b336f60d12dda9fa57ecf5b7760d2",
+      "provenance": "exact-sha256",
+      "hostPath": "binaries\\codemux-addon-host-windows-x64.exe",
+      "faults": [
+        {
+          "workload": "while(true){}",
+          "elapsedMs": 1017.4812000000002
+        },
+        {
+          "workload": "function f(){f()} f()",
+          "elapsedMs": 13.421500000000378
+        },
+        {
+          "workload": "new ArrayBuffer(128*1024*1024)",
+          "elapsedMs": 11.864400000000387
+        },
+        {
+          "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+          "elapsedMs": 1012.6272000000008
+        },
+        {
+          "workload": "throw Error('fixture')",
+          "elapsedMs": 14.814099999999598
+        }
+      ]
+    }
+  ]
+}

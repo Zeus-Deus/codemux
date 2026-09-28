@@ -31,7 +31,6 @@ import {
 import { resolveTerminalFontFamily, resolveTypographySettings } from "@/lib/typography";
 import { applyTerminalTypography } from "@/lib/terminal-typography";
 import {
-  writeToPty,
   resizePty,
   detachPtyOutput,
   attachPtyOutput,
@@ -45,6 +44,7 @@ import {
   Channel,
   type ScrollbackPayload,
 } from "@/tauri/commands";
+import { writePtyInput } from "./pty-input";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
 import { createWritePump } from "./terminal-write-pump";
 import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
@@ -163,10 +163,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // Apps (Claude Code, nvim, etc.) send this to check if the terminal
     // supports enhanced key reporting before pushing Kitty mode.
     if (scan.hasQuery) {
-      writeToPty(
+      writePtyInput(
         sessionIdRef.current,
         `\x1b[?${kittyFlags(kittyStackRef.current)}u`,
-      ).catch(console.error);
+      );
     }
 
     // Apply push/pop/reset. DA query from a new shell resets stale state.
@@ -399,7 +399,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           const isBackspace = codepoint === BACKSPACE_CODEPOINT;
           if (!isBackspace || kittyLevelRef.current > 0) {
             if (ev.type === "keydown") {
-              writeToPty(sid, csiUSequence(codepoint, mod)).catch(console.error);
+              writePtyInput(sid, csiUSequence(codepoint, mod));
             }
             ev.preventDefault?.();
             return false;
@@ -415,7 +415,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       if (killCombo && matchesKeyCombo(ev, killCombo)) {
         if (ev.type === "keydown") {
-          writeToPty(sid, "\x17").catch(console.error);
+          writePtyInput(sid, "\x17");
         }
         ev.preventDefault?.();
         return false;
@@ -478,22 +478,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     });
 
     // ── User input handler ──
-    let pendingInput = "";
-    let inputQueued = false;
-    const dataDisposable = term.onData((data) => {
-      pendingInput += data;
-      if (!inputQueued) {
-        inputQueued = true;
-        queueMicrotask(() => {
-          const batch = pendingInput;
-          pendingInput = "";
-          inputQueued = false;
-          writeToPty(sid, batch).catch((err) => {
-            console.error(`Failed to write to PTY for ${sid}:`, err);
-          });
-        });
-      }
-    });
+    const dataDisposable = term.onData((data) => writePtyInput(sid, data));
     dataDisposableRef.current = dataDisposable;
 
     // ── Scrollback serialization helper ──
@@ -1117,7 +1102,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      {mobile && <div className="mobile-terminal-keys">{[["Esc", "\x1b"],["Tab", "\t"],["Ctrl C", "\x03"],["↑", "\x1b[A"],["↓", "\x1b[B"],["←", "\x1b[D"],["→", "\x1b[C"]].map(([label,key]) => <button key={label} onPointerDown={e => e.preventDefault()} onClick={() => { void writeToPty(sessionId, key).catch(console.error); }}>{label}</button>)}<button onClick={() => termRef.current?.focus()}>Keyboard</button><button aria-pressed={phoneControl} onClick={() => setPhoneControl(v => !v)}>{phoneControl ? "Follow desktop size" : "Fit to phone"}</button></div>}
+      {mobile && <div className="mobile-terminal-keys">{[["Esc", "\x1b"],["Tab", "\t"],["Ctrl C", "\x03"],["↑", "\x1b[A"],["↓", "\x1b[B"],["←", "\x1b[D"],["→", "\x1b[C"]].map(([label,key]) => <button key={label} onPointerDown={e => e.preventDefault()} onClick={() => writePtyInput(sessionId, key)}>{label}</button>)}<button onClick={() => termRef.current?.focus()}>Keyboard</button><button aria-pressed={phoneControl} onClick={() => setPhoneControl(v => !v)}>{phoneControl ? "Follow desktop size" : "Fit to phone"}</button></div>}
     <div className="min-h-0 min-w-0 flex-1 overflow-auto">
     <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background" style={mobile && !phoneControl ? { minWidth: `${(mirrorSize?.cols ?? 80) * 9 + 16}px`, minHeight: `${(mirrorSize?.rows ?? 24) * 18 + 12}px` } : undefined}>
       <div

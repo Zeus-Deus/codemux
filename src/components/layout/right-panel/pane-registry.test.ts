@@ -7,6 +7,7 @@ import {
   docPaneId,
   docPanePath,
   isCorePane,
+  isAddonPane,
   paneMeta,
   relativeToRoot,
 } from "./pane-registry";
@@ -73,5 +74,15 @@ describe("breadcrumb paths", () => {
   // column, so the crumb degrades to the basename instead.
   it("falls back to the basename for a file outside the workspace", () => {
     expect(relativeToRoot("/etc/hosts", "/p")).toBe("hosts");
+  });
+});
+
+describe("add-on pane IDs", () => {
+  it("does not classify add-ons, empty sentinels or unknown IDs as core", () => {
+    expect(isAddonPane("addon:codemux.project-brief:brief")).toBe(true);
+    expect(isCorePane("addon:codemux.project-brief:brief")).toBe(false);
+    expect(isCorePane("unknown" as never)).toBe(false);
+    expect(isAddonPane("addon:../escape:brief")).toBe(false);
+    expect(isAddonPane("addon:codemux.project-brief:brief:extra")).toBe(false);
   });
 });

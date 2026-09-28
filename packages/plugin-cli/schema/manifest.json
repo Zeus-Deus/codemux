@@ -1,0 +1,491 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Manifest",
+  "type": "object",
+  "required": [
+    "api",
+    "author",
+    "contributes",
+    "credentials",
+    "description",
+    "entry",
+    "format",
+    "http",
+    "id",
+    "license",
+    "manifestVersion",
+    "name",
+    "permissions",
+    "platforms",
+    "repository",
+    "settings",
+    "version"
+  ],
+  "properties": {
+    "api": {
+      "type": "string"
+    },
+    "author": {
+      "$ref": "#/definitions/Author"
+    },
+    "contributes": {
+      "$ref": "#/definitions/Contributions"
+    },
+    "credentials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Credential"
+      },
+      "maxItems": 20
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 240,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "entry": {
+      "type": "string",
+      "enum": [
+        "plugin.js"
+      ]
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "codemux.feature-plugin"
+      ]
+    },
+    "http": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/HttpGrant"
+      },
+      "maxItems": 20
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])\\.)[a-z][a-z0-9-]{1,39}\\.(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$)[a-z][a-z0-9-]{1,39}$"
+    },
+    "license": {
+      "type": "string",
+      "maxLength": 100,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "manifestVersion": {
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 1.0,
+      "minimum": 1.0
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 80,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Permission"
+      },
+      "uniqueItems": true
+    },
+    "platforms": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Platform"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^https://"
+    },
+    "settings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Setting"
+      },
+      "maxItems": 50
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\\+[0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*)?$"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Author": {
+      "type": "object",
+      "required": [
+        "name",
+        "url"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https://"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Command": {
+      "type": "object",
+      "required": [
+        "id",
+        "requiresWorkspace",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$"
+        },
+        "requiresWorkspace": {
+          "type": "boolean"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Contributions": {
+      "type": "object",
+      "required": [
+        "commands",
+        "composerActions",
+        "composerViews",
+        "panels"
+      ],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Command"
+          },
+          "maxItems": 20
+        },
+        "composerActions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/View"
+          },
+          "maxItems": 8
+        },
+        "composerViews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/View"
+          },
+          "maxItems": 4
+        },
+        "panels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/View"
+          },
+          "maxItems": 8
+        }
+      },
+      "additionalProperties": false
+    },
+    "Credential": {
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "origin",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        },
+        "origin": {
+          "type": "string",
+          "pattern": "^https://(?!.*\\.(?:[0-9]+|0x[0-9a-f]*)$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+        },
+        "type": {
+          "$ref": "#/definitions/CredentialType"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CredentialType": {
+      "type": "string",
+      "enum": [
+        "bearer"
+      ]
+    },
+    "HttpGrant": {
+      "type": "object",
+      "required": [
+        "credential",
+        "methods",
+        "origin"
+      ],
+      "properties": {
+        "credential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HttpMethod"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "origin": {
+          "type": "string",
+          "pattern": "^https://(?!.*\\.(?:[0-9]+|0x[0-9a-f]*)$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ]
+    },
+    "Permission": {
+      "type": "string",
+      "enum": [
+        "workspace.read",
+        "git.read",
+        "composer.append",
+        "external.open"
+      ]
+    },
+    "Platform": {
+      "type": "string",
+      "enum": [
+        "linux-x64",
+        "windows-x64"
+      ]
+    },
+    "Setting": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "default",
+            "id",
+            "label",
+            "type"
+          ],
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
+            },
+            "label": {
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "boolean"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "label",
+            "type"
+          ],
+          "properties": {
+            "default": {
+              "default": "",
+              "type": "string",
+              "maxLength": 4096
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
+            },
+            "label": {
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "string"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "default",
+            "id",
+            "label",
+            "max",
+            "min",
+            "type"
+          ],
+          "properties": {
+            "default": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
+            },
+            "label": {
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+            },
+            "max": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "min": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "integer"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "default",
+            "id",
+            "label",
+            "type",
+            "values"
+          ],
+          "properties": {
+            "default": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,39}$"
+            },
+            "label": {
+              "type": "string",
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "enum"
+              ]
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 4096,
+                "minLength": 1,
+                "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "View": {
+      "type": "object",
+      "required": [
+        "icon",
+        "id",
+        "title"
+      ],
+      "properties": {
+        "icon": {
+          "type": "string",
+          "enum": [
+            "file-text",
+            "git-branch",
+            "github",
+            "list",
+            "check",
+            "info",
+            "settings",
+            "book-open",
+            "link",
+            "refresh-cw",
+            "plus",
+            "circle-alert",
+            "folder",
+            "terminal",
+            "code",
+            "search"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

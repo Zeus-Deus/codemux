@@ -34,6 +34,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { addonMockHandlers } from "./addon-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
@@ -3540,6 +3541,9 @@ const handlers: Record<string, Handler> = {
   }),
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
+  // Empty by default: plugins never alter a clean core-only UI. Synthetic
+  // manager states are opt-in with `?addons=…` (see ./addon-mock).
+  ...addonMockHandlers(),
   get_package_format: () => "AppImage",
 
   // ── Settings ──
@@ -6629,6 +6633,14 @@ async function invoke(
 
   const viaPlugin = routePlugin(cmd, args);
   if (viaPlugin !== MISS) return viaPlugin;
+
+  // An add-on command resolving `null` would look like success to the
+  // manager UI. Reject the way the host rejects an unavailable operation.
+  if (cmd.startsWith("addon_"))
+    throw {
+      message: `${cmd} is unavailable in the browser preview`,
+      data: { code: "REMOTE_UNSUPPORTED" },
+    };
 
   return defaultResult(cmd);
 }

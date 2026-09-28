@@ -1,0 +1,53 @@
+{
+  "format": "codemux.feature-plugin",
+  "manifestVersion": 1,
+  "id": "example.fault-isolation",
+  "name": "Fault Isolation Fixture",
+  "description": "CI-only hostile callback used to verify native host isolation.",
+  "version": "1.0.0",
+  "api": "^1.0.0",
+  "entry": "plugin.js",
+  "platforms": ["linux-x64", "windows-x64"],
+  "author": {
+    "name": "CodeMux CI",
+    "url": "https://codemux.org"
+  },
+  "repository": "https://github.com/Zeus-Deus/codemux",
+  "license": "MIT",
+  "permissions": [],
+  "http": [],
+  "credentials": [],
+  "settings": [],
+  "contributes": {
+    "commands": [
+      {
+        "id": "block",
+        "title": "Run isolated blocking fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "throw",
+        "title": "Run isolated throwing fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "promises",
+        "title": "Run isolated promise fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "recurse",
+        "title": "Run isolated recursion fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "allocate",
+        "title": "Run isolated allocation fixture",
+        "requiresWorkspace": true
+      }
+    ],
+    "panels": [],
+    "composerActions": [],
+    "composerViews": []
+  }
+}

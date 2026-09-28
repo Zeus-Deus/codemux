@@ -1,0 +1,99 @@
+{
+  "commit": "4419e446a62f6ca6f320226b2775afe9e0e2458e",
+  "platform": "win32",
+  "hardware": {
+    "osRelease": "10.0.26100",
+    "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "logicalCpus": 4,
+    "memoryBytes": 17174360064
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "08-bounded-list-rendering-and-frame-budget",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "11-corrupt-plugin-registry-does-not-block-core-startup"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "da835efb4571b600465920b78ea946c980bc8f1a",
+    "run": "35386904258",
+    "platform": "win32"
+  },
+  "installerSha256": "5ee93418900dd3b7c0333e27676913afafd786d19fc65d64d348afe741d1a288",
+  "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 662.3261999999995
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 659.7552999999971
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 749.116399999999
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 715.0553
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 739.5305000000008
+    }
+  ],
+  "uiRendering": {
+    "workload": "500 visible-model paths, five real Git refreshes while typing",
+    "renderedRows": 14,
+    "frameSamples": 344,
+    "p95FrameGapMs": 15.700000000000728,
+    "maxFrameGapMs": 15.799999999999272,
+    "refreshMs": [
+      310.21259999999893,
+      313.2037000000055,
+      329.2927999999956,
+      315.71719999999914,
+      319.9893000000011
+    ],
+    "p95FrameGapBudgetMs": 100
+  },
+  "status": "passed"
+}

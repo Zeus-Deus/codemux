@@ -1,0 +1,248 @@
+{
+  "commit": "9b807e9bc16f5d1078d6074526b47699517540e5",
+  "platform": "win32",
+  "hardware": {
+    "osRelease": "10.0.26100",
+    "cpu": "AMD EPYC 7763 64-Core Processor                ",
+    "logicalCpus": 4,
+    "memoryBytes": 17174360064
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "05-project-brief-composer-action",
+    "06-issue-companion-native-https",
+    "06-issue-companion-composer-accessory-and-link",
+    "07-credential-success-clears-error",
+    "06-host-credential-settings-and-explicit-fallback",
+    "07-paired-remote-cannot-invoke-or-subscribe-to-plugins",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "08-virtual-list-native-accessibility",
+    "08-bounded-list-rendering-and-frame-budget",
+    "09-native-update-review-and-matching-data-rollback",
+    "09-project-brief-setting-and-private-preference",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "10-project-brief-reinstall-follows-data-choice",
+    "10-context-typing-preserved",
+    "10-context-project-switch-cancels",
+    "10-context-thread-close-cancels",
+    "10-context-composer-replacement-cancels",
+    "10-context-disable-cancels",
+    "10-delayed-public-sdk-context-races",
+    "10-remove-during-activation-leaves-no-host-or-draft",
+    "11-corrupt-plugin-registry-does-not-block-core-startup",
+    "11-registry-reset-restores-add-on-management"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native",
+    "Windows WebView2 test switch --disable-backgrounding-occluded-windows: the runner browser an add-on link opens cannot pause the covered app's rendering",
+    "CI-only delayed public-SDK package built with the packed author tools; normal native package import, SDK broker and plugin-rendered status panel"
+  ],
+  "installerBuild": {
+    "commit": "9b807e9bc16f5d1078d6074526b47699517540e5",
+    "run": "35916722628",
+    "platform": "win32"
+  },
+  "installerSha256": "fb45fb4f814da89d483efea7062f1f2cfa1ee9e68326e04f269f8fd60d99bbcc",
+  "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "composerActions": {
+    "projectBrief": {
+      "menuGroup": "Add-ons",
+      "includeFiles": true,
+      "appended": true
+    },
+    "issueAccessory": {
+      "menuGroup": "Add-ons",
+      "aboveFooter": true,
+      "appended": true,
+      "closed": true
+    },
+    "externalLink": {
+      "attributionToast": true,
+      "launch": "system handler; not observable on the runner",
+      "openFailureToast": false,
+      "foreground": {
+        "before": {
+          "window": true,
+          "processName": "codemux",
+          "title": "Codemux",
+          "ownApp": true
+        },
+        "after": {
+          "window": true,
+          "processName": "msedge",
+          "title": "",
+          "ownApp": false
+        }
+      }
+    }
+  },
+  "credentials": {
+    "maskedInput": true,
+    "noSecretInInventoryOrSettings": true,
+    "mode": "native Windows credential store",
+    "removalAndFileRedaction": true
+  },
+  "remoteBoundary": {
+    "transport": "paired loopback HTTP/WebSocket against stock desktop",
+    "approval": "explicit desktop command",
+    "coreRpc": true,
+    "addonRpcDenied": true,
+    "coreEvents": true,
+    "addonEventsDenied": true
+  },
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 752.6326999999947
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 773.6938000000009
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 1125.0247999999992
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 794.1506000000008
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 824.1682999999975
+    }
+  ],
+  "uiRendering": {
+    "workload": "500 visible-model paths, five real Git refreshes while typing",
+    "renderedRows": 14,
+    "frameSamples": 392,
+    "p95FrameGapMs": 15.700000000004366,
+    "maxFrameGapMs": 15.700000000004366,
+    "refreshMs": [
+      330.1137000000017,
+      344.77489999998943,
+      347.4285999999993,
+      604.7620000000024,
+      340.02219999999215
+    ],
+    "p95FrameGapBudgetMs": 100,
+    "page": {
+      "start": {
+        "focused": true,
+        "visibility": "visible",
+        "foreground": {
+          "window": true,
+          "processName": "msedge",
+          "title": "",
+          "ownApp": false
+        }
+      },
+      "end": {
+        "focused": true,
+        "visibility": "visible"
+      }
+    }
+  },
+  "virtualListAccessibility": {
+    "label": "Add-on list",
+    "setSize": 500,
+    "keyboardEndPosition": 500,
+    "boundedRows": true
+  },
+  "nativeUpdates": {
+    "sameAccess": true,
+    "activeHost": true,
+    "expandedAccessReview": true,
+    "cancellation": true,
+    "rollbackMatchingPrivateData": true,
+    "developerModeOff": true
+  },
+  "projectBriefPreferences": {
+    "includeFilesOffOmitsChangedPaths": true,
+    "privatePreferencePersisted": true,
+    "survivedRestart": {
+      "includeFiles": false,
+      "showPaths": false
+    },
+    "reinstall": {
+      "keptDataRestored": {
+        "includeFiles": false,
+        "showPaths": false
+      },
+      "removedDataNotOffered": {
+        "includeFiles": true,
+        "showPaths": true
+      }
+    }
+  },
+  "terminalFocusFallbacks": 1,
+  "corePaneRestoration": {
+    "preserved": [
+      "Files",
+      "Changes",
+      "Review"
+    ],
+    "paused": true,
+    "removed": true,
+    "noEmptyAccessorySpace": true
+  },
+  "contextRaces": {
+    "fixtureSha256": "d5bd5066a2fb2541e0d7363fc3463da3962b746d2f9b65bc4399eca547ac3734",
+    "delayMs": 4000,
+    "completed": [
+      "typing",
+      "workspace",
+      "thread",
+      "replacement",
+      "disable"
+    ],
+    "rejections": {
+      "workspace": "CONTEXT_STALE",
+      "thread": "CONTEXT_STALE",
+      "replacement": "CONTEXT_STALE"
+    }
+  },
+  "removalDuringActivation": {
+    "fixtureSha256": "134058dd99368fa93676488c4d6ed1a413164daab0897c75faf32d9324b49d5f",
+    "activationDelayMs": 700,
+    "removalCompletedMs": 742
+  },
+  "registryReset": {
+    "backupKept": true,
+    "freshRegistry": true
+  },
+  "status": "passed"
+}

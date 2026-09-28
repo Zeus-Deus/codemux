@@ -1,0 +1,95 @@
+{
+  "commit": "40593c6dca7524b851d4b3887e473ed10b0353f3",
+  "platform": "linux",
+  "hardware": {
+    "osRelease": "6.8.0-1064-azure",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "logicalCpus": 4,
+    "memoryBytes": 16765411328
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "11-corrupt-plugin-registry-does-not-block-core-startup"
+  ],
+  "failedChecks": [
+    {
+      "name": "06-issue-companion-native-https",
+      "error": "Error: Timed out: section[aria-label=\"Add-on view\"] select: POST /session/9a21a12b-9d9f-4003-8211-d564e2775730/element: {\"value\":{\"error\":\"no such element\",\"message\":\"\",\"stacktrace\":\"\"}}"
+    }
+  ],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "91bd6a2be47665e04b7c9d452072b83bc6ccd6fe",
+    "run": "35389012944",
+    "platform": "linux"
+  },
+  "installerSha256": "d17576c8d31ef6de506589c4524488dc5b7f8e00deddb76175a7d425dcdda9c4",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 979.9746540000051
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 986.9138780000067
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 1089.8586819999982
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 1104.6862760000004
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 1068.487857
+    }
+  ],
+  "status": "failed",
+  "error": "Error: One or more native acceptance gates failed; see failedChecks",
+  "failureInventory": {
+    "installed": [],
+    "paused": true,
+    "error": "Add-on registry is unavailable; plugins are paused",
+    "developmentPackage": null,
+    "warnings": [],
+    "developerMode": false
+  }
+}
