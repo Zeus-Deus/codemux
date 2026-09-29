@@ -7,12 +7,14 @@ const mockListPrsOverview = vi.fn();
 const mockListPrsOverviewStats = vi.fn();
 const mockListPullRequests = vi.fn().mockResolvedValue([]);
 const mockGithubRateLimit = vi.fn();
+const mockRefreshGithubReadCache = vi.fn();
 
 vi.mock("@/tauri/commands", () => ({
   listPrsOverview: (...a: unknown[]) => mockListPrsOverview(...a),
   listPrsOverviewStats: (...a: unknown[]) => mockListPrsOverviewStats(...a),
   listPullRequests: (...a: unknown[]) => mockListPullRequests(...a),
   githubRateLimit: (...a: unknown[]) => mockGithubRateLimit(...a),
+  refreshGithubReadCache: (...a: unknown[]) => mockRefreshGithubReadCache(...a),
 }));
 
 const mockWorkspaces: {
@@ -124,8 +126,10 @@ beforeEach(() => {
   _resetSnapshotWriteGuard();
   _resetRateLimitGate();
   mockGithubRateLimit.mockReset();
+  mockRefreshGithubReadCache.mockReset().mockResolvedValue(undefined);
   mockListPrsOverview.mockReset();
   mockListPrsOverviewStats.mockReset();
+  mockListPullRequests.mockReset().mockResolvedValue([]);
   setRoots(ROOT);
 });
 
@@ -567,12 +571,12 @@ describe("usePrOverview — cadence", () => {
     const { result } = renderHook(() => usePrOverview(true, "open", "page"), { wrapper });
     await waitFor(() => expect(result.current.rows).toHaveLength(1));
 
-    expect(intervalOf(client, prOverviewKey(ROOT))).toBe(30_000);
+    expect(intervalOf(client, prOverviewKey(ROOT))).toBe(60_000);
     // The expensive half is slower even on the page: it is a second call
     // per root, and a check rollup ticking over on a row nobody has
     // opened yet is not what the page is for.
     await waitFor(() =>
-      expect(intervalOf(client, prOverviewStatsKey(ROOT))).toBe(90_000),
+      expect(intervalOf(client, prOverviewStatsKey(ROOT))).toBe(120_000),
     );
   });
 
@@ -586,10 +590,45 @@ describe("usePrOverview — cadence", () => {
     const { result } = renderHook(() => usePrOverview(true), { wrapper });
     await waitFor(() => expect(result.current.rows).toHaveLength(1));
 
-    expect(intervalOf(client, prOverviewKey(ROOT))).toBe(120_000);
+    expect(intervalOf(client, prOverviewKey(ROOT))).toBe(300_000);
     await waitFor(() =>
-      expect(intervalOf(client, prOverviewStatsKey(ROOT))).toBe(240_000),
+      expect(intervalOf(client, prOverviewStatsKey(ROOT))).toBe(300_000),
     );
+  });
+});
+
+describe("usePrOverview — manual refresh", () => {
+  it("waits for GitHub cache invalidation before re-reading, and leaves other providers alone", async () => {
+    setRoots(ROOT, OTHER);
+    mockWorkspaces[1]!.provider_kind = "gitlab";
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 1 })] });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    const clearCache = deferred<void>();
+    mockRefreshGithubReadCache.mockReturnValue(clearCache.promise);
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+    const reads = mockListPrsOverview.mock.calls.length;
+
+    act(() => result.current.refresh());
+    expect(mockRefreshGithubReadCache.mock.calls).toEqual([[ROOT]]);
+    expect(mockListPrsOverview).toHaveBeenCalledTimes(reads);
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 9 })] });
+    await act(async () => { clearCache.resolve(undefined); });
+    await waitFor(() => expect(result.current.rows.map((row) => row.number)).toEqual([9, 9]));
+    expect(mockListPrsOverview).toHaveBeenCalledTimes(reads + 2);
+  });
+
+  it("still re-reads when one cache invalidation fails", async () => {
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 1 })] });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockRefreshGithubReadCache.mockRejectedValue("could not resolve host github.com");
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 9 })] });
+
+    act(() => result.current.refresh());
+    await waitFor(() => expect(result.current.rows[0]?.number).toBe(9));
+    expect(mockRefreshGithubReadCache).toHaveBeenCalledWith(ROOT);
   });
 });
 
@@ -597,6 +636,24 @@ describe("usePrOverview — cadence", () => {
 
 describe("usePrOverview — the budget gate", () => {
   const RESET_SEC = Math.floor(Date.now() / 1000) + 900;
+
+  it.each(["stats", "history"] as const)("pauses all roots when %s is refused first", async (read) => {
+    setRoots(ROOT, OTHER);
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 1 })] });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockListPullRequests.mockResolvedValue([]);
+    const refused = read === "stats" ? mockListPrsOverviewStats : mockListPullRequests;
+    refused.mockRejectedValue("GraphQL: API rate limit already exceeded for user ID 1.");
+    mockGithubRateLimit.mockResolvedValue({ graphql_remaining: 0, graphql_reset: RESET_SEC });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true, read === "history" ? "all" : "open"), { wrapper });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBe(RESET_SEC * 1000));
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    expect(result.current.rows).toHaveLength(2);
+    expect(client.getQueryCache().find({ queryKey: prOverviewKey(ROOT) })?.observers[0]?.options.enabled).toBe(false);
+    expect(client.getQueryCache().find({ queryKey: prOverviewKey(OTHER) })?.observers[0]?.options.enabled).toBe(false);
+  });
 
   it("stops polling when the account's budget is spent, and says until when", async () => {
     setRoots(ROOT, OTHER);
@@ -733,7 +790,7 @@ describe("usePrOverview — the budget gate", () => {
     expect(result.current.rows[0]?.number).toBe(1);
   });
 
-  it("lifts the gate when the user presses Retry, and recovers", async () => {
+  it("keeps the cooldown when the user presses Retry, then recovers when it lifts", async () => {
     mockListPrsOverview.mockRejectedValue(
       "GraphQL: API rate limit already exceeded for user ID 1.",
     );
@@ -748,13 +805,17 @@ describe("usePrOverview — the budget gate", () => {
     const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
 
-    // The budget refilled early, or the user simply disbelieves us.
-    // Retry is allowed to find out, for the price of one request.
+    // Refreshing one surface cannot reopen the account for every root.
     mockListPrsOverview.mockResolvedValue({
       viewer: "mock-dev",
       items: [item({ number: 9 })],
     });
+    const calls = mockListPrsOverview.mock.calls.length;
     act(() => result.current.refresh());
+    expect(result.current.rateLimitedUntil).toBeGreaterThan(0);
+    expect(mockListPrsOverview).toHaveBeenCalledTimes(calls);
+    expect(mockRefreshGithubReadCache).not.toHaveBeenCalled();
+    act(() => clearRateLimitPause());
 
     await waitFor(() => expect(result.current.rows).toHaveLength(1));
     expect(result.current.rows[0]?.number).toBe(9);
@@ -786,9 +847,8 @@ describe("usePrOverview — the gate can be raised more than once", () => {
     await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
     expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
 
-    // The pause lifting is what Retry does by hand, so this is the same
-    // path the timer takes when it fires.
-    act(() => result.current.refresh());
+    // The timer is allowed to lift the pause; a refresh is not.
+    act(() => clearRateLimitPause());
 
     await waitFor(() => expect(mockGithubRateLimit).toHaveBeenCalledTimes(2));
     expect(result.current.rateLimitedUntil).toBeGreaterThan(0);
@@ -798,8 +858,7 @@ describe("usePrOverview — the gate can be raised more than once", () => {
     // Two things at once, and the second is why the first is written
     // this way.
     //
-    // The timer path: Retry also invalidates the queries, while the
-    // timer only lifts the gate and leaves the re-fetch to the observers
+    // The timer path only lifts the gate and leaves the re-fetch to the observers
     // re-enabling. That is the path that actually runs in production —
     // nobody is watching at 03:00 to press the button.
     //

@@ -10,7 +10,7 @@
  * its entire recovery window making the wall it just hit taller.
  *
  * So the gate. The first refusal pauses every pull-request query, at
- * once and globally — one gate for the page, the sidebar badge and the
+ * once within this frontend — one gate for the page, sidebar badge and
  * toast watcher together, because they all draw from one budget and a
  * gate any of them could route around is not a gate. It then asks the
  * host when the budget refills and waits exactly that long.
@@ -28,7 +28,7 @@
  *   beats blank" rule the rest of the page is built on.
  * - **It lifts by itself.** A timer fires at the reset, the queries
  *   re-enable, and the page refreshes without the user having done
- *   anything. Retry is offered, not required.
+ *   anything. The backend also holds a cooldown across every client.
  */
 
 import { useEffect, useSyncExternalStore } from "react";
@@ -46,9 +46,8 @@ import { githubRateLimit } from "@/tauri/commands";
 export const MIN_PAUSE_MS = 60_000;
 
 /**
- * Never pause for longer than this. GitHub's window is an hour, so an
- * hour is the longest honest answer; anything beyond it is a misread
- * reply, and the cost of testing that reading is one request.
+ * Bound a reset inferred from the quota endpoint to one hourly window.
+ * An explicit backend cooldown is authoritative and is not shortened.
  */
 export const MAX_PAUSE_MS = 60 * 60_000;
 
@@ -83,10 +82,40 @@ export function isRateLimitError(error: unknown): boolean {
   return /\b(rate limit|ratelimit)\b/i.test(String(error ?? ""));
 }
 
+export function prQueryRetry(count: number, error: unknown): boolean {
+  return !isRateLimitError(error) && count < 1;
+}
+
+export function newestRefusalAt(
+  queries: readonly { error: unknown; errorUpdatedAt: number }[],
+): number {
+  return queries.reduce(
+    (newest, query) =>
+      isRateLimitError(query.error) ? Math.max(newest, query.errorUpdatedAt) : newest,
+    0,
+  );
+}
+
+/** Every read, including conversation queries, can be the first to see a refusal. */
+export function usePrRefusal(
+  path: string,
+  providerKind: string | null | undefined,
+  queries: readonly { error: unknown; errorUpdatedAt: number }[],
+): void {
+  const refusedAt = newestRefusalAt(queries);
+  const refusal = queries.find((query) =>
+    query.errorUpdatedAt === refusedAt && isRateLimitError(query.error),
+  )?.error;
+  const message = refusal instanceof Error ? refusal.message : String(refusal ?? "");
+  useEffect(() => {
+    if (refusedAt > 0 && budgetApplies(providerKind)) void noteRateLimited(path, refusedAt, message);
+  }, [path, providerKind, refusedAt, message]);
+}
+
 /**
  * Whether this repository draws on the budget the gate is holding.
  *
- * The gate is GitHub's hourly GraphQL budget. A GitLab root is metered
+ * The gate is GitHub's API budget. A GitLab root is metered
  * by an entirely different host and must keep polling while GitHub is
  * refusing — one over-budget GitHub account silently freezing the badge,
  * the toasts and the page for a GitLab repository would be a new bug
@@ -119,6 +148,8 @@ export function pauseUntil(resetEpochSec: number, now: number): number {
 // spending while the page waits.
 
 let pausedUntil = 0;
+let backendDeadlineVersion = 0;
+let backendDeadlineUntil = 0;
 /**
  * When the newest refusal this gate has acted on landed, epoch ms.
  *
@@ -155,12 +186,13 @@ export function getPausedUntil(): number {
   return pausedUntil;
 }
 
-/** Lift the gate — what Retry means, and what the timer does.
+/** Lift the gate when its timer expires.
  *
  *  Leaves `lastRefusalAt` alone: the refusals still on screen were
  *  answered for by the pause this is ending, and forgetting that is how
  *  the gate would go straight back up on one of them. */
 export function clearRateLimitPause(): void {
+  backendDeadlineUntil = 0;
   publish(0);
 }
 
@@ -174,6 +206,8 @@ export function clearRateLimitPause(): void {
  *  this file is written to avoid. */
 export function _resetRateLimitGate(): void {
   lastRefusalAt = 0;
+  backendDeadlineVersion = 0;
+  backendDeadlineUntil = 0;
   publish(0);
 }
 
@@ -193,16 +227,39 @@ export function _resetRateLimitGate(): void {
  * but only the first one pays for the lookup, and a refusal no newer
  * than the last one acted on is not acted on again.
  */
-export async function noteRateLimited(path: string, refusedAt = Date.now()): Promise<void> {
+export async function noteRateLimited(
+  path: string,
+  refusedAt = Date.now(),
+  error?: unknown,
+): Promise<void> {
   if (refusedAt <= lastRefusalAt) return;
   lastRefusalAt = refusedAt;
+  // Our backend names the actual cooldown, including a reserved primary
+  // budget or exhausted REST bucket. Remaining GraphQL points do not mean
+  // these pauses are secondary limits. No additional lookup is needed.
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const deadline = /^GitHub API rate limit: requests to \S+ paused until (\d+)$/.exec(message);
+  const resetMs = deadline ? Number(deadline[1]) * 1000 : 0;
+  if (resetMs > 0 && Number.isSafeInteger(resetMs)) {
+    backendDeadlineVersion += 1;
+    backendDeadlineUntil = Math.max(
+      backendDeadlineUntil,
+      resetMs > Date.now() ? resetMs : Date.now() + MIN_PAUSE_MS,
+    );
+    publish(backendDeadlineUntil);
+    return;
+  }
   if (pausedUntil > refusedAt) return;
   // Pause on the default *first*. Everything below this line is a
   // request, and until the gate is up the polls it is meant to stop are
   // still firing.
   publish(refusedAt + DEFAULT_PAUSE_MS);
+  const versionAtLookup = backendDeadlineVersion;
   try {
     const limit = await githubRateLimit(path);
+    // A backend deadline received while this lookup was in flight takes
+    // precedence over the inference below.
+    if (versionAtLookup !== backendDeadlineVersion) return;
     // `now` again, not the one captured above: the lookup is a shell-out
     // with a ten-second budget of its own, and the floor below is only a
     // floor if it is measured from when it is applied.

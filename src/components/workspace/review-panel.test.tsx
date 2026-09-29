@@ -24,6 +24,7 @@ const mockCheckGithubRepo = vi.fn().mockResolvedValue(true);
 const mockGetBranchPullRequest = vi.fn().mockResolvedValue(null);
 const mockRefreshWorkspacePr = vi.fn().mockResolvedValue(undefined);
 const mockGetPullRequestChecks = vi.fn().mockResolvedValue([]);
+const mockGithubRateLimit = vi.fn();
 const mockGetPrReviewComments = vi.fn().mockResolvedValue([]);
 const mockGetPrInlineComments = vi.fn().mockResolvedValue([]);
 const mockListBranches = vi.fn().mockResolvedValue([]);
@@ -42,6 +43,7 @@ vi.mock("@/tauri/commands", () => ({
   getBranchPullRequest: (...args: unknown[]) => mockGetBranchPullRequest(...args),
   refreshWorkspacePr: (...args: unknown[]) => mockRefreshWorkspacePr(...args),
   getPullRequestChecks: (...args: unknown[]) => mockGetPullRequestChecks(...args),
+  githubRateLimit: (...args: unknown[]) => mockGithubRateLimit(...args),
   getPrReviewComments: (...args: unknown[]) => mockGetPrReviewComments(...args),
   getPrInlineComments: (...args: unknown[]) => mockGetPrInlineComments(...args),
   listBranches: (...args: unknown[]) => mockListBranches(...args),
@@ -60,6 +62,7 @@ vi.mock("./review/review-threads", () => ({ ReviewThreads: () => <div data-testi
 vi.mock("./review/incoming-prs-view", () => ({ IncomingPrsView: () => <div data-testid="incoming-prs-view" /> }));
 
 import { ReviewPanel } from "./review-panel";
+import { _resetRateLimitGate } from "@/lib/pr-rate-limit";
 import type { WorkspaceSnapshot, PullRequestInfo } from "@/tauri/types";
 // Access the cache helpers exported at module level for cache TTL tests
 import {
@@ -74,12 +77,12 @@ function flushPromises() {
   return act(() => new Promise((r) => setTimeout(r, 0)));
 }
 
-// Each test gets a fresh QueryClient so cached data + retries don't
-// leak between cases. Retries off so query errors surface immediately.
+// Each test gets a fresh QueryClient. Queries with an explicit retry policy
+// exercise it without waiting for the production retry delay.
 function renderPanel(node: ReactNode) {
   const client = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, staleTime: Infinity, refetchInterval: false },
+      queries: { retry: false, retryDelay: 0, staleTime: Infinity, refetchInterval: false },
     },
   });
   return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
@@ -147,6 +150,8 @@ beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
   _resetCaches();
+  _resetRateLimitGate();
+  mockGithubRateLimit.mockReset();
   mockCheckProviderAuth.mockResolvedValue({
     kind: "github",
     supported: true,
@@ -170,14 +175,62 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanup();
   vi.useRealTimers();
 });
 
-// The refresh button was removed in the visual-match PR — auto-poll
-// (2.5s for PR detail + checks, 30s for comments) handles freshness
-// now. The discovery / fetch behaviors these tests covered are still
-// exercised indirectly through the React Query hooks that fire on
-// mount and on workspace switch.
+describe("review polling", () => {
+  async function advance(ms: number) {
+    await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  }
+
+  it("slows both live reads after the pending checks finish", async () => {
+    vi.useFakeTimers();
+    mockGetBranchPullRequest.mockResolvedValue(mockPr);
+    mockGetPullRequestChecks.mockResolvedValue([{
+      name: "build", status: "in_progress", conclusion: null,
+    }]);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42 })} />);
+    await advance(10);
+    expect(mockGetPullRequestChecks).toHaveBeenCalledTimes(1);
+    await advance(29_000);
+    expect(mockGetPullRequestChecks).toHaveBeenCalledTimes(1);
+    mockGetPullRequestChecks.mockResolvedValue([{
+      name: "build", status: "completed", conclusion: "success",
+    }]);
+    await advance(1_100);
+    expect(mockGetPullRequestChecks).toHaveBeenCalledTimes(2);
+    const details = mockGetBranchPullRequest.mock.calls.length;
+    await advance(119_000);
+    expect(mockGetPullRequestChecks).toHaveBeenCalledTimes(2);
+    expect(mockGetBranchPullRequest).toHaveBeenCalledTimes(details);
+    await advance(1_100);
+    expect(mockGetPullRequestChecks).toHaveBeenCalledTimes(3);
+    expect(mockGetBranchPullRequest).toHaveBeenCalledTimes(details + 1);
+  });
+
+  it("a conversation refusal stops detail and checks without retrying the refusal", async () => {
+    vi.useFakeTimers();
+    mockGetBranchPullRequest.mockResolvedValue(mockPr);
+    mockGetPrReviewComments.mockRejectedValue("API rate limit exceeded");
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0, graphql_reset: Math.floor(Date.now() / 1000) + 3600,
+    });
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42 })} />);
+    await advance(10);
+    expect(mockGetPrReviewComments).toHaveBeenCalledTimes(1);
+    // Auth initialization enables the queries at the end of the first act;
+    // drain React Query's scheduled error notification before asserting the gate.
+    await advance(1);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    const checks = mockGetPullRequestChecks.mock.calls.length;
+    const details = mockGetBranchPullRequest.mock.calls.length;
+    await advance(5 * 60_000);
+    expect(mockGetPrReviewComments).toHaveBeenCalledTimes(1);
+    expect(mockGetPullRequestChecks).toHaveBeenCalledTimes(checks);
+    expect(mockGetBranchPullRequest).toHaveBeenCalledTimes(details);
+  });
+});
 
 describe("auto-fetch on mount", () => {
   it("calls getBranchPullRequest when PR exists on mount", async () => {

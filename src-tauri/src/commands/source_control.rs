@@ -298,7 +298,12 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
         };
     }
 
-    match provider.auth_status() {
+    let auth = if detected.kind == git_provider::ProviderKind::GitHub {
+        crate::github::check_gh_status_for_path(repo_path)
+    } else {
+        provider.auth_status()
+    };
+    match auth {
         GhStatus::NotInstalled => ProviderAuthStatus {
             kind,
             supported: true,

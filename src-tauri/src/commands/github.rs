@@ -232,6 +232,21 @@ pub async fn list_prs_overview(path: String) -> Result<crate::github::PrsOvervie
         .map_err(|e| format!("list_prs_overview task join failed: {e}"))?
 }
 
+/// Explicit refresh clears successful responses without lifting a host pause.
+#[tauri::command]
+pub async fn refresh_github_read_cache(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let provider = provider_for(&path, Operation::ListRead)?;
+        if provider.kind() == git_provider::ProviderKind::GitHub {
+            crate::github_budget::invalidate_read_cache(Path::new(&path))?;
+            crate::github::invalidate_github_reads();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("refresh_github_read_cache task join failed: {e}"))?
+}
+
 /// The slow half of the same rows: CI rollup and line counts by number.
 ///
 /// Gated on `ChecksStatus` rather than `ListRead`: a host that can list
@@ -692,12 +707,16 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
         // manual refresh must keep working on a host detection can't name
         // but the CLI can resolve.
         let detected = git_provider::detect_provider(Path::new(&cwd_for_pr));
-        let lookup = git_provider::provider_for_detection_or_default(&detected)
-            .workspace_pull_requests(Path::new(&cwd_for_pr));
-        (detected, lookup)
+        let provider = git_provider::provider_for_detection_or_default(&detected);
+        if provider.kind() == git_provider::ProviderKind::GitHub {
+            crate::github_budget::invalidate_read_cache(Path::new(&cwd_for_pr))?;
+            crate::github::invalidate_github_reads();
+        }
+        let lookup = provider.workspace_pull_requests(Path::new(&cwd_for_pr));
+        Ok::<_, String>((detected, lookup))
     })
     .await
-    .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))?;
+    .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
     state.update_workspace_provider_kind(
         &workspace_id,
         git_provider::provider_kind_field(&detected),

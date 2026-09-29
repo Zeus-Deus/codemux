@@ -4885,6 +4885,8 @@ const handlers: Record<string, Handler> = {
     core_reset: Math.floor(Date.now() / 1000) + 42 * 60,
   }),
 
+  refresh_github_read_cache: () => undefined,
+
   /**
    * The slow half, deliberately slow.
    *

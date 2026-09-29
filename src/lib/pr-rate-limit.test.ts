@@ -75,6 +75,47 @@ describe("pauseUntil", () => {
 });
 
 describe("noteRateLimited", () => {
+  it.each(["github.com", "git.enterprise.example"])(
+    "honors the backend's exact cooldown for %s without inferring a secondary block",
+    async (host) => {
+      const now = Date.now();
+      const reset = Math.floor(now / 1000) + 3700;
+      // A reserved primary budget can still have hundreds of points;
+      // an exhausted REST bucket can have a full GraphQL budget.
+      mockGithubRateLimit.mockResolvedValue({ graphql_remaining: 500, graphql_reset: reset });
+      await noteRateLimited(ROOT, now, `GitHub API rate limit: requests to ${host} paused until ${reset}`);
+      expect(getPausedUntil()).toBe(reset * 1000);
+      expect(mockGithubRateLimit).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not shorten a backend cooldown when an earlier budget lookup settles", async () => {
+    let release!: (value: unknown) => void;
+    mockGithubRateLimit.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    const now = Date.now();
+    const reset = Math.floor(now / 1000) + 900;
+    const pending = noteRateLimited(ROOT, now, "API rate limit exceeded");
+    await noteRateLimited(ROOT, now + 1, `GitHub API rate limit: requests to github.com paused until ${reset}`);
+    release({ graphql_remaining: 500, graphql_reset: reset });
+    await pending;
+    expect(getPausedUntil()).toBe(reset * 1000);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces a provisional five-minute pause with a shorter authoritative backend deadline", async () => {
+    let release!: (value: unknown) => void;
+    mockGithubRateLimit.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    const now = Date.now();
+    const reset = Math.floor(now / 1000) + 120;
+    const pending = noteRateLimited(ROOT, now, "API rate limit exceeded");
+    expect(getPausedUntil()).toBe(now + DEFAULT_PAUSE_MS);
+    await noteRateLimited(ROOT, now + 1, `GitHub API rate limit: requests to github.com paused until ${reset}`);
+    expect(getPausedUntil()).toBe(reset * 1000);
+    release({ graphql_remaining: 0, graphql_reset: Math.floor(now / 1000) + 3600 });
+    await pending;
+    expect(getPausedUntil()).toBe(reset * 1000);
+  });
+
   it("raises the gate before it asks how long for", async () => {
     // The asking is itself a request. A gate that stayed open until the
     // answer arrived would leave a window for exactly the polls it

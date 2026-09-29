@@ -214,6 +214,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "list_project_files"
             | "list_project_folders"
             | "list_prs_overview"
+            | "refresh_github_read_cache"
             | "list_prs_overview_stats"
             | "list_pull_requests"
             | "list_skills"
