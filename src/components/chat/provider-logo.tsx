@@ -22,13 +22,6 @@ const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   opencode: opencodeIcon,
 };
 
-// Hermes's mark is a full-bleed tile (a drawing on white), not a
-// transparent glyph, so it gets proportional rounding like Hermes
-// Desktop's own icon instead of hard square corners.
-const PROVIDER_ICON_CLASS: Partial<Record<AgentChatProviderKind, string>> = {
-  hermes: "rounded-[20%]",
-};
-
 const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
@@ -51,12 +44,7 @@ export function ProviderLogo({ provider, className }: Props) {
       data-provider={provider}
       // Same marks, same problem: `codex` is a white-only silhouette, so it
       // has to flip with the scheme or the provider chip renders empty.
-      className={cn(
-        "shrink-0 object-contain",
-        whiteMarkClass(provider),
-        PROVIDER_ICON_CLASS[provider],
-        className,
-      )}
+      className={cn("shrink-0 object-contain", whiteMarkClass(provider), className)}
     />
   );
 }
