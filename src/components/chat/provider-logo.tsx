@@ -10,6 +10,7 @@ import claudeIcon from "@/assets/preset-icons/claude.svg";
 import codexIcon from "@/assets/preset-icons/codex.svg";
 import cursorIcon from "@/assets/preset-icons/cursor-agent.svg";
 import grokIcon from "@/assets/preset-icons/grok.svg";
+import hermesIcon from "@/assets/preset-icons/hermes.png";
 import opencodeIcon from "@/assets/preset-icons/opencode.svg";
 
 const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
@@ -17,7 +18,7 @@ const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   codex: codexIcon,
   cursor: cursorIcon,
   grok: grokIcon,
-  hermes: new URL("../../assets/preset-icons/hermes.svg", import.meta.url).href,
+  hermes: hermesIcon,
   opencode: opencodeIcon,
 };
 

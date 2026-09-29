@@ -44,6 +44,14 @@ describe("ProviderLogo", () => {
     expect(img.getAttribute("alt")).toBe("Grok");
   });
 
+  it("renders the official Hermes mark, never inverted", () => {
+    const { container } = render(<ProviderLogo provider="hermes" />);
+    const img = container.querySelector("img") as HTMLImageElement;
+    expect(img.getAttribute("src")).toContain("hermes.png");
+    expect(img.getAttribute("alt")).toBe("Hermes");
+    expect(img.className).not.toContain("invert");
+  });
+
   it("forwards className for sizing", () => {
     const { container } = render(
       <ProviderLogo provider="claude" className="h-5 w-5" />,
