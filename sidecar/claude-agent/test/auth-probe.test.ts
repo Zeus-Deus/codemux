@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { classifyAuthOutput } from "../src/auth-probe";
+import { classifyAuthOutput, parseCliVersion } from "../src/auth-probe";
 
 describe("classifyAuthOutput", () => {
   test("JSON loggedIn:true is authenticated", () => {
@@ -89,5 +89,15 @@ describe("classifyAuthOutput", () => {
     // A string/null value is an unrecognized schema, not a "yes".
     expect(classifyAuthOutput(`{"loggedIn":"true"}`).status).toBe("unknown");
     expect(classifyAuthOutput(`{"loggedIn":null}`).status).toBe("unknown");
+  });
+});
+
+
+describe("parseCliVersion", () => {
+  test("supports version-first and name-first CLI output", () => {
+    expect(parseCliVersion("2.1.283 (Claude Code)\n")).toBe("2.1.283");
+    expect(parseCliVersion("Claude Code 2.1.114")).toBe("2.1.114");
+    expect(parseCliVersion("claude 2.2.0-beta.1")).toBe("2.2.0-beta.1");
+    expect(parseCliVersion("unexpected output")).toBe("unknown");
   });
 });

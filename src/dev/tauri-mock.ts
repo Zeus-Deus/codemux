@@ -4259,6 +4259,19 @@ const handlers: Record<string, Handler> = {
   // Provider runtime health probe. Healthy by default; QA can inject a
   // failure via `window.__codemuxChatMock.setProviderHealth(...)` to
   // exercise the chat surfaces' provider status banner.
+  // Opt-in fixture: ?providerUpdate=mise (or npm/manual/error), never real installers.
+  agent_chat_provider_update_check: (a) => ({
+    provider: a.provider, installed_version: "0.157.0", latest_version: "0.158.0",
+    available: !!new URLSearchParams(location.search).get("providerUpdate"),
+    manager: new URLSearchParams(location.search).get("providerUpdate") === "npm" ? "npm" : "Omarchy · mise",
+    can_update: new URLSearchParams(location.search).get("providerUpdate") !== "manual",
+    message: "Update this CLI with the package manager that installed it, then restart Codemux.",
+  }),
+  agent_chat_provider_update: async (a) => {
+    await new Promise(resolve => setTimeout(resolve, 1800));
+    if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
+    return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
+  },
   agent_chat_provider_health: (a) => {
     const provider = String(a.provider) as MockProviderKind;
     return (

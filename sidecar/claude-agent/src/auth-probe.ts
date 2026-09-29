@@ -92,10 +92,13 @@ export async function probeInstalled(
   if (trimmed === "") {
     return { installed: true, version: "unknown" };
   }
-  // Typical output: "claude 1.2.3" or "Claude Code 2.1.114".
-  const firstLine = trimmed.split("\n")[0] ?? trimmed;
-  const token = firstLine.split(/\s+/).pop() ?? firstLine;
-  return { installed: true, version: token };
+  return { installed: true, version: parseCliVersion(trimmed) };
+}
+
+/** Both "Claude Code 2.1.114" and "2.1.114 (Claude Code)" are used. */
+export function parseCliVersion(output: string): string {
+  const firstLine = output.trim().split("\n")[0] ?? "";
+  return firstLine.match(/\b\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\b/)?.[0] ?? "unknown";
 }
 
 /** Newer CLIs print `auth status` as a JSON object with a `loggedIn`

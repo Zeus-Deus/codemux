@@ -52,7 +52,44 @@ fn identity(path: &Path) -> Result<String, String> {
         use std::os::unix::fs::MetadataExt;
         Ok(format!("{}:{}", m.dev(), m.ino()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+        };
+
+        // Windows can tunnel a replaced directory's creation time. Use the
+        // volume and 128-bit file ID so replacement cannot inherit its identity.
+        let directory = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|_| {
+                "unsupported: filesystem cannot identify profile replacement".to_string()
+            })?;
+        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+        // SAFETY: the live directory handle and writable buffer are valid for
+        // this call. The buffer is read only after Windows reports success.
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle(),
+                FileIdInfo,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if success == 0 {
+            return Err("unsupported: filesystem cannot identify profile replacement".into());
+        }
+        let info = unsafe { info.assume_init() };
+        Ok(format!(
+            "{}:{:032x}",
+            info.VolumeSerialNumber,
+            u128::from_le_bytes(info.FileId.Identifier)
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         m.created()
             .map(|t| format!("{:?}", t))
@@ -147,8 +184,11 @@ mod tests {
         let binary = std::env::current_exe().unwrap();
         let p = resolve(&binary, root, "coder").unwrap();
         p.validate().unwrap();
+        std::fs::write(p.home.join("config.yaml"), "model: example").unwrap();
+        p.validate().unwrap();
         assert!(resolve(&binary, root, "../coder").is_err());
         std::fs::rename(&p.home, root.join("old")).unwrap();
+        assert_eq!(identity(&root.join("old")).unwrap(), p.identity);
         std::fs::create_dir(&p.home).unwrap();
         assert!(p.validate().unwrap_err().contains("replaced"));
         std::fs::create_dir(root.join("profiles/.deleted")).unwrap();
