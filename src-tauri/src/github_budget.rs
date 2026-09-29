@@ -175,6 +175,8 @@ fn context(path: &Path, args: &[&str]) -> Result<(String, Vec<String>), String> 
         .map(str::to_string)
         .or(repo_host)
         .or_else(|| env_host.filter(|h| !h.trim().is_empty()))
+        // OWNER/REPO selects the default host, not a host named OWNER.
+        .or_else(|| selected_repo.map(|_| "github.com".to_string()))
         .or_else(|| {
             repository
                 .as_ref()
@@ -1332,6 +1334,31 @@ mod tests {
         assert_eq!(retry_epoch("x-ratelimit-reset: 2000", 1000), Some(2000));
         assert_eq!(retry_epoch("Retry after 2 seconds", 1000), Some(1060));
         assert_eq!(retry_epoch("x-ratelimit-reset: 999", 1000), None);
+    }
+
+    #[test]
+    fn short_repository_selectors_use_the_default_host() {
+        let expected = std::env::var("GH_HOST")
+            .ok()
+            .filter(|host| !host.trim().is_empty())
+            .unwrap_or_else(|| "github.com".into())
+            .to_ascii_lowercase();
+        for selector in ["--repo", "-R"] {
+            let (host, pinned) = context(
+                Path::new("/nonexistent"),
+                &["pr", "list", selector, "owner/repo"],
+            )
+            .unwrap();
+            assert_eq!(host, expected);
+            assert_eq!(pinned[3], format!("{expected}/owner/repo"));
+        }
+        let (host, pinned) = context(
+            Path::new("/nonexistent"),
+            &["pr", "list", "--repo", "github.example/owner/repo"],
+        )
+        .unwrap();
+        assert_eq!(host, "github.example");
+        assert_eq!(pinned[3], "github.example/owner/repo");
     }
 
     #[test]
