@@ -10,6 +10,7 @@ import claudeIcon from "@/assets/preset-icons/claude.svg";
 import codexIcon from "@/assets/preset-icons/codex.svg";
 import cursorIcon from "@/assets/preset-icons/cursor-agent.svg";
 import grokIcon from "@/assets/preset-icons/grok.svg";
+import hermesIcon from "@/assets/preset-icons/hermes.png";
 import opencodeIcon from "@/assets/preset-icons/opencode.svg";
 
 const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
@@ -17,8 +18,15 @@ const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   codex: codexIcon,
   cursor: cursorIcon,
   grok: grokIcon,
-  hermes: new URL("../../assets/preset-icons/hermes.svg", import.meta.url).href,
+  hermes: hermesIcon,
   opencode: opencodeIcon,
+};
+
+// Hermes's mark is a full-bleed tile (a drawing on white), not a
+// transparent glyph, so it gets proportional rounding like Hermes
+// Desktop's own icon instead of hard square corners.
+const PROVIDER_ICON_CLASS: Partial<Record<AgentChatProviderKind, string>> = {
+  hermes: "rounded-[20%]",
 };
 
 const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
@@ -43,7 +51,12 @@ export function ProviderLogo({ provider, className }: Props) {
       data-provider={provider}
       // Same marks, same problem: `codex` is a white-only silhouette, so it
       // has to flip with the scheme or the provider chip renders empty.
-      className={cn("shrink-0 object-contain", whiteMarkClass(provider), className)}
+      className={cn(
+        "shrink-0 object-contain",
+        whiteMarkClass(provider),
+        PROVIDER_ICON_CLASS[provider],
+        className,
+      )}
     />
   );
 }

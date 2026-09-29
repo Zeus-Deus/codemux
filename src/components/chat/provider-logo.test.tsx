@@ -44,6 +44,15 @@ describe("ProviderLogo", () => {
     expect(img.getAttribute("alt")).toBe("Grok");
   });
 
+  it("renders Hermes's tile mark rounded and never inverted", () => {
+    const { container } = render(<ProviderLogo provider="hermes" />);
+    const img = container.querySelector("img") as HTMLImageElement;
+    expect(img.getAttribute("src")).toContain("hermes");
+    expect(img.getAttribute("alt")).toBe("Hermes");
+    expect(img.className).toContain("rounded-[20%]");
+    expect(img.className).not.toContain("invert");
+  });
+
   it("forwards className for sizing", () => {
     const { container } = render(
       <ProviderLogo provider="claude" className="h-5 w-5" />,
