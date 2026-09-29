@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { usePrPollingActive } from "@/hooks/use-pr-polling-active";
+import { budgetApplies, prQueryRetry, usePrRefusal, useRateLimitPause } from "@/lib/pr-rate-limit";
+import { PR_CONVERSATION_POLL_MS } from "@/lib/pr-polling";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -264,11 +267,16 @@ export function ReviewDetail(props: ReviewDetailProps) {
   // if you're reading Summary: a force-push has to be able to tell you
   // how many of your notes stopped matching without you going looking.
   // Keyed on the head sha, so a rewrite refetches by itself.
+  const pollingActive = usePrPollingActive();
+  const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
+  const canFetch = pollingActive && !paused;
   const needsDiff = activeTab === "code" || lineDrafts.length > 0;
   const diffQuery = useQuery({
     queryKey: ["pr", "review-diff", cwd, pr.number, pr.head_ref_oid],
     queryFn: () => getPrReviewDiff(cwd, pr.number),
-    enabled: needsDiff,
+    enabled: canFetch && needsDiff,
+    refetchOnWindowFocus: false,
+    retry: prQueryRetry,
     staleTime: 60_000,
   });
   const diffText = diffQuery.data ?? "";
@@ -312,7 +320,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   // ── The timeline ──
   //
-  // 30s, like the other conversation queries: history is not something
+  // Like the other conversation queries: history is not something
   // you sit and watch change. Fetched only while the tab is open — the
   // rail is the only thing that reads it, and a poll for a tab nobody is
   // looking at is a request per PR per half-minute for nothing.
@@ -320,14 +328,16 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const timelineQuery = useQuery({
     queryKey: ["pr", "timeline", cwd, pr.number] as const,
     queryFn: () => getPrTimeline(cwd, pr.number),
-    enabled: timelineEnabled,
-    staleTime: 30_000,
-    refetchInterval: timelineEnabled ? 30_000 : false,
+    enabled: canFetch && timelineEnabled,
+    refetchOnWindowFocus: false,
+    staleTime: PR_CONVERSATION_POLL_MS,
+    refetchInterval: PR_CONVERSATION_POLL_MS,
+    retry: prQueryRetry,
   });
 
   // ── Review threads ──
   //
-  // 30s, like the other conversation queries — a reply is not something
+  // Like the other conversation queries — a reply is not something
   // you sit and watch arrive. Gated on `list_read` rather than on the
   // two thread *write* operations, because reading who said what is
   // reading: a host that serves threads but declares neither write shows
@@ -336,10 +346,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const threadsQuery = useQuery({
     queryKey: ["pr", "review-threads", cwd, pr.number] as const,
     queryFn: () => getPrReviewThreads(cwd, pr.number),
-    enabled: operations.list_read,
-    staleTime: 30_000,
-    refetchInterval: operations.list_read ? 30_000 : false,
+    enabled: canFetch && operations.list_read,
+    refetchOnWindowFocus: false,
+    staleTime: PR_CONVERSATION_POLL_MS,
+    refetchInterval: PR_CONVERSATION_POLL_MS,
+    retry: prQueryRetry,
   });
+
+  usePrRefusal(cwd, provider.kind, [diffQuery, timelineQuery, threadsQuery]);
 
   // Stale and labelled beats blank: a failed refetch keeps the threads
   // that are on screen (react-query holds the last good data), and the

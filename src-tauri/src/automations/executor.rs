@@ -260,19 +260,24 @@ fn default_remote_branch(clone_dir: &Path) -> Option<String> {
 /// Best-effort: the URL of a PR for `branch`, via `gh pr list`. `None`
 /// when `gh` is absent, unauthenticated, or no PR exists.
 fn detect_pr_url(worktree: &Path, branch: &str) -> Option<String> {
-    let output = crate::execution::host_command("gh")
-        .arg("pr")
-        .arg("list")
-        .args(["--head", branch])
-        .args(["--json", "url"])
-        .args(["--jq", ".[0].url // empty"])
-        .current_dir(worktree)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let output = crate::github_budget::run(
+        worktree,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--limit",
+            "1",
+            "--json",
+            "url",
+            "--jq",
+            ".[0].url // empty",
+        ],
+        std::time::Duration::from_secs(10),
+    )
+    .ok()?;
+    let url = output.trim().to_string();
     if url.is_empty() {
         None
     } else {

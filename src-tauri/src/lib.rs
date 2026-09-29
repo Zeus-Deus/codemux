@@ -30,6 +30,7 @@ pub mod config;
 pub mod git;
 pub mod git_provider;
 pub mod github;
+pub mod github_budget;
 pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
@@ -1421,7 +1422,7 @@ fn build_core_app<R: tauri::Runtime>(
                     }
 
                     // Provider classification and linked-issue refresh stay
-                    // scoped to the active workspace. The dedicated 60s PR
+                    // scoped to the active workspace. The dedicated five-minute PR
                     // poller below is the sole owner of PR association; doing
                     // the same network lookup here every 5s created competing
                     // writers and twice the CLI load.
@@ -1467,7 +1468,7 @@ fn build_core_app<R: tauri::Runtime>(
                                         git_provider::provider_for_detection(&detected);
                                     let issue = if let Some(number) = issue_number {
                                         if provider.is_implemented() && provider.cli_available() {
-                                            Some(provider.get_issue_fresh(&path, number).map(|issue| {
+                                            Some(provider.get_issue(&path, number).map(|issue| {
                                                 github::LinkedIssue {
                                                     number: issue.number,
                                                     title: issue.title,
@@ -1824,7 +1825,7 @@ fn build_core_app<R: tauri::Runtime>(
                 }
             });
 
-            // Background PR polling for the sidebar PR-status icon. This 60s
+            // Background PR polling for the sidebar PR-status icon. This 5-minute
             // loop is the sole owner of branch-to-PR association and walks every
             // workspace, so active and inactive rows share one cadence and one
             // preserve/write/clear decision matrix.
@@ -1846,14 +1847,26 @@ fn build_core_app<R: tauri::Runtime>(
             // (~50ms) per workspace.
             let pr_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                const TICK_SECS: u64 = 60;
+                const TICK_SECS: u64 = 300;
+                let mut last_poll: Option<std::time::Instant> = None;
                 let mut last_status_authed: std::collections::HashMap<String, bool> =
                     std::collections::HashMap::new();
                 tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(3))).await;
 
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
-
+                    // Wake cheaply so restoring a hidden window can populate its
+                    // badges without waiting out the full polling interval.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let window_active = pr_handle.get_webview_window("main")
+                        .map(|window| window.is_visible().unwrap_or(false)
+                            && !window.is_minimized().unwrap_or(true))
+                        .unwrap_or(false);
+                    let remote_viewers = pr_handle.try_state::<web_remote::WebRemoteState>()
+                        .map(|state| state.active_connection_count() > 0).unwrap_or(false);
+                    if !window_active && !remote_viewers { continue; }
+                    if last_poll.is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(TICK_SECS)) {
+                        continue;
+                    }
                     let tick_started = std::time::Instant::now();
                     // Auth verdicts for this tick, keyed by provider
                     // instance. Populated lazily so a product no
@@ -1918,6 +1931,7 @@ fn build_core_app<R: tauri::Runtime>(
                             Some(authed) => *authed,
                             None => {
                                 let probe = provider.clone();
+                                let auth_path = path.clone();
                                 // Cheap (~50ms fork+exec), but still a
                                 // subprocess: off the async thread like every
                                 // other shell-out here. Each provider's auth
@@ -1928,7 +1942,11 @@ fn build_core_app<R: tauri::Runtime>(
                                         "background.pr-poll.queue-delay",
                                         queued_at.elapsed(),
                                     );
-                                    probe.auth_status()
+                                    if probe.kind() == git_provider::ProviderKind::GitHub {
+                                        github::check_gh_status_for_path(&auth_path)
+                                    } else {
+                                        probe.auth_status()
+                                    }
                                 })
                                 .await;
                                 let authed = matches!(
@@ -2026,6 +2044,7 @@ fn build_core_app<R: tauri::Runtime>(
                              skipped_unauthenticated={skipped_unauthenticated}"
                         );
                     }
+                    last_poll = Some(std::time::Instant::now());
                     let tick_elapsed = tick_started.elapsed();
                     diagnostics::record_perf_timing("background.pr-poll", tick_elapsed);
                     let tick_ms = tick_elapsed.as_millis();
@@ -2592,6 +2611,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::submit_pr_review_with_comments,
             commands::list_incoming_prs,
             commands::list_prs_overview,
+            commands::refresh_github_read_cache,
             commands::list_prs_overview_stats,
             commands::github_rate_limit,
             commands::merge_pull_request,

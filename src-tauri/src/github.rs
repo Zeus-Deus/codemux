@@ -516,7 +516,7 @@ pub(crate) fn map_github_timeline(rows: &[serde_json::Value]) -> Vec<PrTimelineE
 pub fn get_pr_timeline(repo_path: &Path, pr_number: u32) -> Result<Vec<PrTimelineEvent>, String> {
     let nwo = get_repo_nwo(repo_path)?;
     let endpoint = format!("repos/{nwo}/issues/{pr_number}/timeline");
-    let Some(json) = run_gh_optional(
+    let json = run_gh(
         repo_path,
         &[
             "api",
@@ -525,57 +525,124 @@ pub fn get_pr_timeline(repo_path: &Path, pr_number: u32) -> Result<Vec<PrTimelin
             "-H",
             "Accept: application/vnd.github+json",
         ],
-    ) else {
-        return Ok(Vec::new());
-    };
+    )?;
     if json.is_empty() {
         return Ok(Vec::new());
     }
     Ok(map_github_timeline(&parse_paginated_array(&json)))
 }
 
+#[derive(Clone)]
+struct LocalGhAuth {
+    status: GhStatus,
+    identity: Option<u64>,
+}
+
+static GH_LOCAL_AUTH: OnceLock<Mutex<HashMap<String, (Instant, u64, LocalGhAuth)>>> =
+    OnceLock::new();
+
+fn auth_fingerprint(host: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    host.hash(&mut hash);
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_CONFIG_DIR",
+    ] {
+        std::env::var_os(name).hash(&mut hash);
+    }
+    let config = std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::config_dir().map(|path| path.join("gh")));
+    if let Some(config) = config {
+        for file in ["hosts.yml", "config.yml"] {
+            if let Ok(metadata) = std::fs::metadata(config.join(file)) {
+                metadata.modified().ok().hash(&mut hash);
+                metadata.len().hash(&mut hash);
+            }
+        }
+    }
+    hash.finish()
+}
+
+fn local_gh_auth(host: &str) -> LocalGhAuth {
+    use std::hash::{Hash, Hasher};
+    let cache = GH_LOCAL_AUTH.get_or_init(Mutex::default);
+    let fingerprint = auth_fingerprint(host);
+    // Serialize local keyring reads too: a page fan-out should not open one
+    // secret-service round trip per repository. No token is retained or logged.
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((fetched_at, previous, auth)) = cache.get(host) {
+        if *previous == fingerprint && fetched_at.elapsed() < CLI_AVAILABILITY_TTL {
+            return auth.clone();
+        }
+    }
+    let mut token = crate::execution::host_command("gh");
+    token.args(["auth", "token", "--hostname", host]);
+    sanitize_gui_env_std_keep_dbus(&mut token);
+    let auth = match crate::git_provider::exec::run_timed(token, GH_AUTH_STATUS_TIMEOUT) {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => {
+            let mut identity = std::collections::hash_map::DefaultHasher::new();
+            output.stdout.trim().hash(&mut identity);
+            let mut user = crate::execution::host_command("gh");
+            user.args(["config", "get", "user", "--host", host]);
+            sanitize_gui_env_std_keep_dbus(&mut user);
+            let username = crate::git_provider::exec::run_timed(user, GH_AUTH_STATUS_TIMEOUT)
+                .ok()
+                .filter(|output| output.success)
+                .map(|output| output.stdout.trim().to_owned())
+                .unwrap_or_default();
+            LocalGhAuth {
+                status: GhStatus::Authenticated { username },
+                identity: Some(identity.finish()),
+            }
+        }
+        _ => LocalGhAuth {
+            status: GhStatus::NotAuthenticated,
+            identity: None,
+        },
+    };
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(host.to_owned(), (Instant::now(), fingerprint, auth.clone()));
+    auth
+}
+
+/// Credential identity is a process-local hash; it never contains the token.
+pub(crate) fn gh_credential_identity(host: &str) -> Option<u64> {
+    local_gh_auth(host).identity
+}
+
+/// `gh auth status` validates credentials remotely. Token availability and the
+/// configured login are local checks, so polling auth cannot spend API quota or
+/// turn a temporary API cooldown into a spurious logged-out state.
 pub fn check_gh_status() -> GhStatus {
+    let host = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".to_owned());
+    check_gh_status_for_host(&host)
+}
+
+pub(crate) fn check_gh_status_for_host(host: &str) -> GhStatus {
     if !gh_available() {
         return GhStatus::NotInstalled;
     }
+    local_gh_auth(host).status
+}
 
-    let mut cmd = crate::execution::host_command("gh");
-    cmd.args(["auth", "status"]);
-    // `gh` stores its token in the user's secret-service keyring on
-    // Linux desktops (gnome-keyring / kwallet / keepassxc-secret).
-    // Reading the token requires DBus session-bus access, so this
-    // call must use the keep-dbus variant — the default sanitiser
-    // overrides DBUS_SESSION_BUS_ADDRESS=/dev/null and would make
-    // every `gh auth status` look NotAuthenticated even after a
-    // successful `gh auth login`.
-    sanitize_gui_env_std_keep_dbus(&mut cmd);
-    let output = crate::git_provider::exec::run_timed(cmd, GH_AUTH_STATUS_TIMEOUT);
-
-    let Ok(output) = output else {
-        return GhStatus::NotAuthenticated;
-    };
-
-    if !output.success {
-        return GhStatus::NotAuthenticated;
+pub(crate) fn check_gh_status_for_path(repo_path: &Path) -> GhStatus {
+    match crate::github_budget::host_for_path(repo_path) {
+        Ok(host) => check_gh_status_for_host(&host),
+        Err(_) => GhStatus::NotAuthenticated,
     }
-
-    // "Logged in to github.com account USERNAME (...)" — modern gh
-    // (≥2.4x, incl. 2.97) prints auth status to stdout; older releases
-    // used stderr. Parsing only stderr made every modern install look
-    // like an anonymous viewer: rows still listed (the token was fine)
-    // but nothing could be attributed to "you", so the Pull Requests
-    // page filed the user's own PRs under Watching and the panel never
-    // showed the author's action bar. Check stdout first, then stderr.
-    let username = parse_auth_status_username(&output.stdout)
-        .or_else(|| parse_auth_status_username(&output.stderr))
-        .unwrap_or_default();
-
-    GhStatus::Authenticated { username }
 }
 
 /// Extract USERNAME from a `gh auth status` stream, wherever gh chose
 /// to print it. Only lines that describe a login are considered, so a
 /// hypothetical "account" in an error message can't produce a viewer.
+#[cfg(test)]
 fn parse_auth_status_username(stream: &str) -> Option<String> {
     stream
         .lines()
@@ -590,26 +657,7 @@ fn parse_auth_status_username(stream: &str) -> Option<String> {
 }
 
 fn run_gh(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = crate::execution::host_command("gh");
-    cmd.args(args).current_dir(repo_path);
-    // Keep DBus available so the secret-service keyring round-trip
-    // works — every gh subcommand pulls the auth token before
-    // hitting the API. See `check_gh_status` for the full rationale.
-    sanitize_gui_env_std_keep_dbus(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to run gh: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "gh {} failed: {}",
-            args.first().unwrap_or(&""),
-            stderr.trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    crate::github_budget::run(repo_path, args, Duration::from_secs(15))
 }
 
 fn run_gh_json(repo_path: &Path, args: &[&str]) -> Result<serde_json::Value, String> {
@@ -619,14 +667,7 @@ fn run_gh_json(repo_path: &Path, args: &[&str]) -> Result<serde_json::Value, Str
 
 /// Returns None on non-zero exit (e.g. "no PR for this branch") instead of Err.
 fn run_gh_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = crate::execution::host_command("gh");
-    cmd.args(args).current_dir(repo_path);
-    // Keep DBus available — see `check_gh_status` rationale.
-    sanitize_gui_env_std_keep_dbus(&mut cmd);
-    cmd.output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+    run_gh(repo_path, args).ok()
 }
 
 pub fn gh_available() -> bool {
@@ -730,6 +771,7 @@ pub const MAX_ISSUE_COMMENTS: usize = 20;
 /// surface as `Err`, never as a successful-but-empty `Ok` (which they treat as
 /// authoritative and act on by clearing). Being process-free, it is unit
 /// testable without a live `gh`.
+#[cfg(test)]
 fn gh_exit_result(
     command: &str,
     success: bool,
@@ -743,27 +785,7 @@ fn gh_exit_result(
 }
 
 fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut cmd = crate::execution::host_command("gh");
-    cmd.args(args).current_dir(repo_path);
-    // Keep DBus available — issue list/view both pull the auth
-    // token from the user's secret-service keyring on Linux. See
-    // `check_gh_status` rationale.
-    sanitize_gui_env_std_keep_dbus(&mut cmd);
-
-    let output = crate::git_provider::exec::run_timed(cmd, timeout).map_err(|e| match e {
-        crate::git_provider::exec::TimedFailure::Spawn(e) => format!("Failed to run gh: {e}"),
-        crate::git_provider::exec::TimedFailure::Wait(e) => format!("Failed to wait for gh: {e}"),
-        crate::git_provider::exec::TimedFailure::Timeout => {
-            format!("gh command timed out after {}s", timeout.as_secs())
-        }
-    })?;
-
-    gh_exit_result(
-        args.first().unwrap_or(&""),
-        output.success,
-        output.stdout,
-        &output.stderr,
-    )
+    crate::github_budget::run(repo_path, args, timeout)
 }
 
 pub fn list_github_issues(
@@ -773,9 +795,11 @@ pub fn list_github_issues(
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
-    match check_gh_status() {
+    match check_gh_status_for_path(repo_path) {
         GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
-        GhStatus::NotAuthenticated => return Err("gh CLI is not authenticated. Run: gh auth login".into()),
+        GhStatus::NotAuthenticated => {
+            return Err("gh CLI is not authenticated. Run: gh auth login".into())
+        }
         GhStatus::Authenticated { .. } => {}
     }
 
@@ -821,7 +845,7 @@ pub fn get_github_issue(repo_path: &Path, number: u64) -> Result<GitHubIssue, St
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
-    match check_gh_status() {
+    match check_gh_status_for_path(repo_path) {
         GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
         GhStatus::NotAuthenticated => {
             return Err("gh CLI is not authenticated. Run: gh auth login".into())
@@ -981,7 +1005,7 @@ pub fn get_pull_request(repo_path: &Path, number: u32) -> Result<PullRequestInfo
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
-    match check_gh_status() {
+    match check_gh_status_for_path(repo_path) {
         GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
         GhStatus::NotAuthenticated => {
             return Err("gh CLI is not authenticated. Run: gh auth login".into())
@@ -1065,7 +1089,7 @@ fn get_pr_diff_capped(
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
-    match check_gh_status() {
+    match check_gh_status_for_path(repo_path) {
         GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
         GhStatus::NotAuthenticated => {
             return Err("gh CLI is not authenticated. Run: gh auth login".into())
@@ -1346,6 +1370,31 @@ fn resolve_branch_pr(repo_path: &Path) -> Result<BranchPrLookup, String> {
     })
 }
 
+/// Drop derived caches after a successful remote mutation. The coordinator
+/// clears raw responses separately; neither action releases an account pause.
+pub(crate) fn invalidate_github_reads() {
+    crate::github_cache::invalidate_pr_cache(None);
+    crate::github_cache::invalidate_issue_cache(None);
+    if let Some(cache) = FALLBACK_PR_LIST_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+    if let Some(cache) = WORKTREE_PR_LIST_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+    if let Some(cache) = SIDE_BRANCH_PR_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+}
+
 /// How many HEAD reflog entries the side-branch fallback reads.
 ///
 /// The window is bounded by entry count rather than wall-clock age on
@@ -1362,7 +1411,7 @@ const REFLOG_CANDIDATE_LIMIT: usize = 5;
 /// out in the recent past, whose PRs are correspondingly recent.
 const FALLBACK_PR_LIST_LIMIT: &str = "50";
 
-/// How long one fallback result is reused. Sized to the 60s PR poller so
+/// How long one fallback result is reused. Shared by the background PR poller so
 /// the 5s active-workspace sweep can't multiply it.
 ///
 /// It gates **both** fallback caches, and between them the whole fallback
@@ -1868,7 +1917,7 @@ impl RemoteConfig {
 /// Cost per poll: one `for-each-ref`, plus — only when some owned branch has
 /// PR rows — one `git config` read and a repo-wide PR list memoized across
 /// workspaces. Nothing here is memoized per workspace, deliberately: the only
-/// callers are the 60s poller and a manual refresh, so a cache sized to the
+/// callers are the background poller and a manual refresh, so a cache sized to the
 /// poll interval would expire before the next poll could use it.
 ///
 /// Error contract matches [`get_workspace_pr`] exactly: `Err` means the
@@ -2071,7 +2120,7 @@ pub fn list_pull_requests(
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
-    match check_gh_status() {
+    match check_gh_status_for_path(repo_path) {
         GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
         GhStatus::NotAuthenticated => {
             return Err("gh CLI is not authenticated. Run: gh auth login".into())
@@ -2250,9 +2299,10 @@ pub fn rate_limit(repo_path: &Path) -> Result<GhRateLimit, String> {
 fn parse_rate_limit(output: &str) -> Result<GhRateLimit, String> {
     let v: serde_json::Value =
         serde_json::from_str(output).map_err(|e| format!("Failed to parse gh JSON: {e}"))?;
-    let resources = v.get("resources").filter(|r| r.is_object()).ok_or_else(|| {
-        "Expected a resources object from gh api rate_limit".to_string()
-    })?;
+    let resources = v
+        .get("resources")
+        .filter(|r| r.is_object())
+        .ok_or_else(|| "Expected a resources object from gh api rate_limit".to_string())?;
     // A bucket the host did not report reads as exhausted-with-no-reset,
     // which the caller turns into its minimum back-off. Guessing a
     // generous "plenty remaining" would keep it hammering a host that
@@ -2645,8 +2695,8 @@ pub fn get_pr_checks(repo_path: &Path, number: Option<u32>) -> Result<Vec<CheckI
     //
     // Also: `gh pr checks` exits non-zero when checks are pending
     // (exit 1) or any have failed (exit 8) but still writes valid
-    // JSON to stdout. Bypass `run_gh_optional` (which discards stdout
-    // on non-zero exit) and capture stdout regardless.
+    // JSON to stdout. The coordinator accepts those actual check results
+    // while propagating blank non-zero exits, including quota refusals.
     let number_str = number.map(|n| n.to_string());
     let mut args: Vec<&str> = vec!["pr", "checks"];
     if let Some(number) = &number_str {
@@ -2654,21 +2704,14 @@ pub fn get_pr_checks(repo_path: &Path, number: Option<u32>) -> Result<Vec<CheckI
     }
     args.extend_from_slice(&["--json", "name,state,bucket,link,startedAt,completedAt"]);
 
-    let output = crate::execution::host_command("gh")
-        .args(&args)
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to run gh: {e}"))?;
+    let json_str = run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?;
 
-    let json_str = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
-    if json_str.is_empty() {
-        return Ok(Vec::new());
-    }
+    let v: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse checks JSON: {e}"))?;
 
-    let v: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("Failed to parse checks JSON: {e}"))?;
-
-    let arr = v.as_array().ok_or("Expected JSON array from gh pr checks")?;
+    let arr = v
+        .as_array()
+        .ok_or("Expected JSON array from gh pr checks")?;
     Ok(arr
         .iter()
         .map(|c| CheckInfo {
@@ -2695,10 +2738,7 @@ pub fn get_pr_review_comments(
         args.push(number);
     }
     args.extend_from_slice(&["--json", "reviews"]);
-    let output = run_gh_optional(repo_path, &args);
-    let Some(json_str) = output else {
-        return Ok(Vec::new());
-    };
+    let json_str = run_gh(repo_path, &args)?;
     if json_str.is_empty() {
         return Ok(Vec::new());
     }
@@ -2740,11 +2780,7 @@ pub fn get_pr_inline_comments(
 ) -> Result<Vec<InlineReviewComment>, String> {
     let nwo = get_repo_nwo(repo_path)?;
     let endpoint = format!("repos/{}/pulls/{}/comments", nwo, pr_number);
-    let output = run_gh_optional(repo_path, &["api", &endpoint, "--paginate"]);
-
-    let Some(json_str) = output else {
-        return Ok(Vec::new());
-    };
+    let json_str = run_gh(repo_path, &["api", &endpoint, "--paginate"])?;
     if json_str.is_empty() {
         return Ok(Vec::new());
     }
@@ -3141,35 +3177,7 @@ impl PrDraftComment {
 /// carries an array of comment objects. `--input -` is the only way to
 /// post a real JSON document in one command.
 fn run_gh_stdin(repo_path: &Path, args: &[&str], stdin: &str) -> Result<String, String> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let mut cmd = crate::execution::host_command("gh");
-    cmd.args(args)
-        .current_dir(repo_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Keep DBus available — see `check_gh_status` rationale.
-    sanitize_gui_env_std_keep_dbus(&mut cmd);
-
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to run gh: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("gh stdin unavailable")?
-        .write_all(stdin.as_bytes())
-        .map_err(|e| format!("Failed to write to gh: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for gh: {e}"))?;
-
-    gh_exit_result(
-        args.first().unwrap_or(&""),
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        &String::from_utf8_lossy(&output.stderr),
-    )
+    crate::github_budget::run_stdin(repo_path, args, stdin, Duration::from_secs(15))
 }
 
 /// Post one inline comment immediately, outside any review.
@@ -5548,9 +5556,8 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
                     10, "MERGED", "workspace", "2026-01-01T00:00:00Z", None,
                 )),
             };
-            let result = get_workspace_prs_with(&repo, lookup, |_| {
-                Err("temporary list failure".into())
-            });
+            let result =
+                get_workspace_prs_with(&repo, lookup, |_| Err("temporary list failure".into()));
             // The merged current-branch PR must not replace a stored set
             // that may still contain open stack layers.
             assert!(matches!(

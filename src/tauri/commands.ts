@@ -769,6 +769,10 @@ export const listPrsOverview = (path: string) =>
 export const listPrsOverviewStats = (path: string) =>
   invoke<PrOverviewStats[]>("list_prs_overview_stats", { path });
 
+/** Explicit refresh forgets cached GitHub reads while retaining quota protection. */
+export const refreshGithubReadCache = (path: string) =>
+  invoke<void>("refresh_github_read_cache", { path });
+
 /** What is left of the GitHub budget, and when it refills.
  *
  *  Asked only after a call has come back refused for exceeding it —

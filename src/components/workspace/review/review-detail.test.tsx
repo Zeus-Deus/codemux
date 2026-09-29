@@ -18,6 +18,7 @@ const mockCheckoutDefaultBranch = vi.fn().mockResolvedValue("main");
 const mockGitPullChanges = vi.fn().mockResolvedValue(undefined);
 const mockGitStashPush = vi.fn().mockResolvedValue(undefined);
 const mockGetPrReviewThreads = vi.fn();
+const mockGithubRateLimit = vi.fn();
 const mockReplyToPrThread = vi.fn().mockResolvedValue(undefined);
 const mockSetPrThreadResolved = vi.fn().mockResolvedValue(undefined);
 
@@ -33,6 +34,7 @@ vi.mock("@/tauri/commands", () => ({
   gitPullChanges: (...a: unknown[]) => mockGitPullChanges(...a),
   gitStashPush: (...a: unknown[]) => mockGitStashPush(...a),
   getPrReviewThreads: (...a: unknown[]) => mockGetPrReviewThreads(...a),
+  githubRateLimit: (...a: unknown[]) => mockGithubRateLimit(...a),
   replyToPrThread: (...a: unknown[]) => mockReplyToPrThread(...a),
   setPrThreadResolved: (...a: unknown[]) => mockSetPrThreadResolved(...a),
 }));
@@ -67,6 +69,7 @@ import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
 import { _resetPrDrafts } from "./pr-drafts";
 import { resolveProvider } from "@/lib/source-control";
 import { ALL_OPERATIONS } from "@/lib/provider-auth";
+import { _resetRateLimitGate, getPausedUntil } from "@/lib/pr-rate-limit";
 
 /** GitLab's declaration: everything but the verdict it does not have. */
 const GITLAB_OPERATIONS = { ...ALL_OPERATIONS, request_changes: false };
@@ -210,6 +213,7 @@ function threadFixture() {
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
+  _resetRateLimitGate();
   // No threads by default: a test that is not about threads should not
   // have a second copy of the conversation on screen.
   mockGetPrReviewThreads.mockResolvedValue([]);
@@ -865,6 +869,17 @@ describe("without a workspace (the Pull Requests page)", () => {
 describe("review threads", () => {
   beforeEach(() => {
     mockGetPrReviewThreads.mockResolvedValue(threadFixture());
+  });
+
+  it("raises the shared cooldown when the nested conversation read is refused", async () => {
+    mockGetPrReviewThreads.mockRejectedValue("API rate limit exceeded");
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0, graphql_reset: Math.floor(Date.now() / 1000) + 900,
+    });
+    renderDetail();
+    await waitFor(() => expect(getPausedUntil()).toBeGreaterThan(Date.now()));
+    expect(mockGetPrReviewThreads).toHaveBeenCalledTimes(1);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
   });
 
   it("fetches threads and draws the writes the host declares", async () => {

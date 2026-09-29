@@ -83,7 +83,7 @@ impl SourceControlProvider for GitHubProvider {
         // Who is asking decides how the page groups, but not whether it
         // can list: a login that won't resolve costs the grouping, not
         // the rows, so it never fails the call.
-        let viewer = match self.auth_status() {
+        let viewer = match github::check_gh_status_for_path(repo_path) {
             GhStatus::Authenticated { username } if !username.is_empty() => Some(username),
             _ => None,
         };

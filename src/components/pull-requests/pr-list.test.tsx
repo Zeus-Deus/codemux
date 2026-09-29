@@ -522,10 +522,11 @@ describe("PrList — carried rows and the stale strip", () => {
     // And the rows are still there, exactly as in the ordinary case.
     expect(screen.getByTestId(`pr-row-${ROOT}-41`)).toBeInTheDocument();
 
-    // Retry stays offered: a user who thinks we are wrong is entitled to
-    // find out for the price of one request.
+    // A refresh cannot bypass the account cooldown from either control.
+    expect(screen.getByTestId("pr-stale-retry")).toBeDisabled();
+    expect(screen.getByTestId("pr-list-refresh")).toBeDisabled();
     await userEvent.click(screen.getByTestId("pr-stale-retry"));
-    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(onRefresh).not.toHaveBeenCalled();
   });
 
   it("raises the strip on a spent budget before every root has been refused", () => {

@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { useQuery, useQueryClient, type QueryStatus } from "@tanstack/react-query";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -50,6 +50,15 @@ import {
   SignedOutState,
   UnsupportedHostState,
 } from "./review/review-empty-states";
+
+import { usePrPollingActive } from "@/hooks/use-pr-polling-active";
+import { budgetApplies, prQueryRetry, usePrRefusal, useRateLimitPause } from "@/lib/pr-rate-limit";
+import {
+  checksAreSettled,
+  PR_PENDING_POLL_MS,
+  PR_SETTLED_POLL_MS,
+  PR_CONVERSATION_POLL_MS,
+} from "@/lib/pr-polling";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -254,14 +263,24 @@ export function ReviewPanel({ workspace }: Props) {
     };
   }, [cwd, provider]);
 
-  // ── React Query: PR data ──
-  //
-  // Each query is keyed by (workspaceId, pr_number) so switching
-  // workspaces auto-cancels in-flight calls for the previous workspace.
-  // Cadence: PR detail + checks at 2.5s so a check going green shows up
-  // without a manual refresh; reviews + inline comments at 30s, since
-  // they change far less often and carry larger payloads.
+  // Only the mounted review pane watches this PR. All PR surfaces share
+  // the visibility/idle clock and the account's refusal cooldown.
+  const pollingActive = usePrPollingActive();
+  const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
+  const checksKey = ["pr", "checks", workspace.workspace_id, prNumber] as const;
+  const watchingSince = useMemo(() => Date.now(), [cwd, prNumber]);
+  const pollMsFor = (state: { data?: CheckInfo[]; status: QueryStatus } | undefined) =>
+    checksAreSettled(
+      state?.data,
+      state?.status === "error",
+      { state: workspace.pr_state },
+      Date.now() - watchingSince,
+    )
+      ? PR_SETTLED_POLL_MS
+      : PR_PENDING_POLL_MS;
   const detailsEnabled =
+    pollingActive &&
+    !paused &&
     !initialLoading &&
     ghStatus?.status === "Authenticated" &&
     repoSupported === true &&
@@ -271,24 +290,30 @@ export function ReviewPanel({ workspace }: Props) {
     queryKey: ["pr", "detail", workspace.workspace_id, prNumber] as const,
     queryFn: () => getBranchPullRequest(cwd),
     enabled: detailsEnabled,
-    staleTime: 2_500,
-    refetchInterval: 2_500,
+    staleTime: PR_PENDING_POLL_MS,
+    refetchOnWindowFocus: false,
+    refetchInterval: () => pollMsFor(queryClient.getQueryState<CheckInfo[]>(checksKey)),
+    retry: prQueryRetry,
   });
 
   const checksQuery = useQuery({
-    queryKey: ["pr", "checks", workspace.workspace_id, prNumber] as const,
+    queryKey: checksKey,
     queryFn: () => getPullRequestChecks(cwd),
     enabled: detailsEnabled,
-    staleTime: 2_500,
-    refetchInterval: 2_500,
+    staleTime: PR_PENDING_POLL_MS,
+    refetchOnWindowFocus: false,
+    refetchInterval: (query) => pollMsFor(query.state),
+    retry: prQueryRetry,
   });
 
   const reviewsQuery = useQuery({
     queryKey: ["pr", "reviews", workspace.workspace_id, prNumber] as const,
     queryFn: () => getPrReviewComments(cwd),
     enabled: detailsEnabled,
-    staleTime: 30_000,
-    refetchInterval: 30_000,
+    staleTime: PR_CONVERSATION_POLL_MS,
+    refetchOnWindowFocus: false,
+    refetchInterval: PR_CONVERSATION_POLL_MS,
+    retry: prQueryRetry,
   });
 
   const inlineQuery = useQuery({
@@ -298,9 +323,13 @@ export function ReviewPanel({ workspace }: Props) {
       return getPrInlineComments(cwd, prNumber);
     },
     enabled: detailsEnabled && prNumber != null,
-    staleTime: 30_000,
-    refetchInterval: 30_000,
+    staleTime: PR_CONVERSATION_POLL_MS,
+    refetchOnWindowFocus: false,
+    refetchInterval: PR_CONVERSATION_POLL_MS,
+    retry: prQueryRetry,
   });
+
+  usePrRefusal(cwd, provider.kind, [prDetailQuery, checksQuery, reviewsQuery, inlineQuery]);
 
   // Is this branch on the remote at all? Decides which of the two
   // no-PR empty states applies.

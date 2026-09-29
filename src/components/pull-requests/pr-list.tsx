@@ -268,11 +268,12 @@ export function PrList({
           type="button"
           aria-label="Refresh pull requests"
           data-testid="pr-list-refresh"
+          disabled={rateLimitedUntil > 0}
           onClick={() => {
             applyPendingOrder();
             onRefresh();
           }}
-          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
+          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
         >
           <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
         </button>
@@ -450,8 +451,7 @@ export function PrList({
  * hourly API budget is spent, and the page has stopped asking until it
  * refills. That is not a broken repository and pressing Retry is not
  * what fixes it — waiting is — so the strip says which, and until when.
- * Retry stays offered anyway, because a user who thinks we are wrong
- * should be able to find out for the price of one request.
+ * Retry remains visible but disabled until the cooldown ends.
  *
  * A clock time rather than "in 15m", and the reason is specific to this
  * state: while the gate is up nothing is polling, so nothing re-renders,
@@ -498,8 +498,9 @@ function StaleStrip({
       <button
         type="button"
         data-testid="pr-stale-retry"
+        disabled={resumesAt != null}
         onClick={onRetry}
-        className={btnCard}
+        className={cn(btnCard, "disabled:pointer-events-none disabled:opacity-50")}
       >
         Retry
       </button>
