@@ -81,6 +81,7 @@ import type {
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
+import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
@@ -173,6 +174,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // instead of reusing the active sidebar workspace.
   const appHomeDir = useAppStore((s) => s.homeDir);
 
+  const providerUpdatesRemote = useAppStore((s) => draft.target.kind === "existing_workspace" &&
+    !!s.appState?.workspaces.find((w) => draft.target.kind === "existing_workspace" && w.workspace_id === draft.target.workspaceId)?.host_id);
   const existingWorkspaceCwd = useAppStore((s) => {
     if (draft.target.kind !== "existing_workspace") return null;
     const wsId = draft.target.workspaceId;
@@ -1183,6 +1186,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           send a first message into a session that will never start.
           Renders as a floating top overlay; needs `relative` above. */}
       <ProviderStatusNotice provider={draft.provider} />
+      <ProviderUpdateNotice provider={draft.provider} threadId={draft.threadId} remote={providerUpdatesRemote} />
       <div className="flex-1 min-h-0 overflow-hidden">
         {pending ? (
           <DraftPendingConversation pending={pending} composer={composerEl} />

@@ -144,6 +144,7 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
+import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import {
   formatProviderError,
   grokModelChangeRequiresRestart,
@@ -494,6 +495,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // "home"` check since the Home singleton was retired in Stage B of
   // the Home rework.
   const homeDir = useHomeDir();
+  const providerUpdatesRemote = useAppStore((s) => !!s.appState?.workspaces.find(
+    (w) => w.workspace_id === (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
+  )?.host_id);
   const workspaceProjectRoot = useAppStore((s) => {
     if (!s.appState) return null;
     const ws = s.appState.workspaces.find(
@@ -3965,6 +3969,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           used to fail silently into a perpetual "Working…" spinner.
           Renders as a floating top overlay; needs `relative` above. */}
       <ProviderStatusNotice provider={provider} />
+      <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (

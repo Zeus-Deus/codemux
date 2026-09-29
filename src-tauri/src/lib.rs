@@ -2476,6 +2476,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::hermes::hermes_catalog,
             commands::hermes::hermes_disconnect,
             commands::agent_chat_provider_health,
+            commands::provider_updates::agent_chat_provider_update_check,
+            commands::provider_updates::agent_chat_provider_update,
             commands::list_chat_slash_commands,
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
