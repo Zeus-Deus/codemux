@@ -54,7 +54,7 @@ export function ProviderUpdateNotice({ provider, threadId, remote = false }: { p
             <p className="text-body-sm font-medium">{slot.updated ? `${label} updated` : `${label} update available`}</p>
             <p className="mt-0.5 text-caption text-muted-foreground">{slot.updated ? report.installed_version : `${report.installed_version} → ${report.latest_version}`}</p>
           </div>
-          <button type="button" aria-label={`Dismiss ${label} update`} disabled={slot.updating} onClick={() => dismiss(target)} className="rounded p-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"><X className="size-3.5" /></button>
+          <button type="button" aria-label={`Dismiss ${label} update`} disabled={slot.updating} onClick={() => dismiss(target)} className="rounded-sm p-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"><X className="size-3.5" /></button>
         </div>
         <p className="mt-3 text-caption leading-relaxed text-muted-foreground">
           {slot.updated ? "Restart Codemux when you're ready to use the new version. Your running chats have not been restarted."
@@ -65,7 +65,7 @@ export function ProviderUpdateNotice({ provider, threadId, remote = false }: { p
         {slot.error && <p role="alert" className="mt-2 max-h-28 overflow-auto break-words text-caption text-destructive">{slot.error}</p>}
         {!slot.updated && <div className="mt-3 flex items-center justify-between gap-2">
           <span className="text-caption text-muted-foreground">{report.manager}</span>
-          {report.can_update ? <button type="button" disabled={slot.updating} onClick={() => void update(target)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-caption font-medium text-primary-foreground transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60">
+          {report.can_update ? <button type="button" disabled={slot.updating} onClick={() => void update(target)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-caption font-medium text-primary-foreground transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60">
             {slot.updating ? <LoaderCircle className="size-3 animate-spin" /> : <Download className="size-3" />}
             {slot.updating ? "Updating…" : slot.error ? "Try again" : "Update"}
           </button> : <a href={report.manager === "Omarchy system package" ? "https://omarchy.org/" : docs[provider]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-caption text-primary">Update guide<ArrowUpRight className="size-3" /></a>}
