@@ -1,6 +1,7 @@
 import type {
   CodeHighlighterPlugin,
   HighlightResult,
+  ThemeInput,
 } from "@streamdown/code";
 import {
   CheckIcon,
@@ -186,8 +187,49 @@ type HighlightedEntry = {
   cacheKey: string;
   code: string;
   language: string;
+  highlighter: CodeHighlighterPlugin;
+  themes: [ThemeInput, ThemeInput];
   result: HighlightResult;
 };
+
+// The plugin caches tokens, but reading them only in an effect still commits
+// raw spans first on every virtualized remount. Retain completed results for
+// the first render without starting highlighting (or registering callbacks)
+// during render. No token arrays are copied; plugin lifetimes remain weak.
+const MAX_REMOUNT_HIGHLIGHTS = 64;
+const MAX_REMOUNT_KEY_CHARS = 256 * 1024;
+type RemountHighlights = {
+  themes: [ThemeInput, ThemeInput];
+  entries: Map<string, HighlightedEntry>;
+  keyChars: number;
+};
+const remountHighlights = new WeakMap<CodeHighlighterPlugin, RemountHighlights>();
+
+function sameThemes(a: [ThemeInput, ThemeInput], b: [ThemeInput, ThemeInput]) {
+  return a[0] === b[0] && a[1] === b[1];
+}
+
+function rememberHighlight(entry: HighlightedEntry) {
+  if (!sameThemes(entry.themes, entry.highlighter.getThemes())) return;
+  if (entry.cacheKey.length > MAX_REMOUNT_KEY_CHARS) return;
+  let cache = remountHighlights.get(entry.highlighter);
+  if (!cache || !sameThemes(cache.themes, entry.themes)) {
+    cache = { themes: entry.themes, entries: new Map(), keyChars: 0 };
+    remountHighlights.set(entry.highlighter, cache);
+  }
+  if (cache.entries.delete(entry.cacheKey)) cache.keyChars -= entry.cacheKey.length;
+  cache.entries.set(entry.cacheKey, entry);
+  cache.keyChars += entry.cacheKey.length;
+  while (
+    cache.entries.size > MAX_REMOUNT_HIGHLIGHTS
+    || cache.keyChars > MAX_REMOUNT_KEY_CHARS
+  ) {
+    const oldest = cache.entries.keys().next().value;
+    if (oldest === undefined) break;
+    cache.entries.delete(oldest);
+    cache.keyChars -= oldest.length;
+  }
+}
 
 /**
  * Highlighted tokens for one fence, stale-while-revalidating.
@@ -211,18 +253,39 @@ function useHighlightedCode(
   highlighter: CodeHighlighterPlugin,
 ): HighlightResult {
   const cacheKey = `${language}\u0000${code}`;
-  const [highlighted, setHighlighted] = useState<HighlightedEntry | null>(null);
+  const [lightTheme, darkTheme] = highlighter.getThemes();
+  const cache = remountHighlights.get(highlighter);
+  const cached = cache && sameThemes(cache.themes, [lightTheme, darkTheme])
+    ? cache.entries.get(cacheKey)
+    : undefined;
+  const [highlighted, setHighlighted] = useState<HighlightedEntry | null>(
+    () => cached ?? null,
+  );
 
   useEffect(() => {
+    if (cached) {
+      setHighlighted((previous) => previous === cached ? previous : cached);
+      return;
+    }
     let active = true;
     const accept = (result: HighlightResult) => {
-      if (active) setHighlighted({ cacheKey, code, language, result });
+      if (!active) return;
+      const entry: HighlightedEntry = {
+        cacheKey,
+        code,
+        language,
+        highlighter,
+        themes: [lightTheme, darkTheme],
+        result,
+      };
+      rememberHighlight(entry);
+      setHighlighted(entry);
     };
     const result = highlighter.highlight(
       {
         code,
         language: language as BundledLanguage,
-        themes: highlighter.getThemes(),
+        themes: [lightTheme, darkTheme],
       },
       accept,
     );
@@ -230,18 +293,21 @@ function useHighlightedCode(
     return () => {
       active = false;
     };
-  }, [cacheKey, code, highlighter, language]);
+  }, [cached, cacheKey, code, highlighter, language, lightTheme, darkTheme]);
 
   return useMemo(() => {
-    if (highlighted?.cacheKey === cacheKey) return highlighted.result;
-    if (highlighted?.language === language && code.startsWith(highlighted.code)) {
+    if (cached) return cached.result;
+    const compatible = highlighted?.highlighter === highlighter
+      && sameThemes(highlighted.themes, [lightTheme, darkTheme]);
+    if (compatible && highlighted.cacheKey === cacheKey) return highlighted.result;
+    if (compatible && highlighted.language === language && code.startsWith(highlighted.code)) {
       return withPlainTail(
         highlighted.result,
         code.slice(highlighted.code.length),
       );
     }
     return rawHighlightResult(code);
-  }, [cacheKey, code, highlighted, language]);
+  }, [cached, cacheKey, code, highlighted, language, highlighter, lightTheme, darkTheme]);
 }
 
 type TokenStyle = CSSProperties & Record<`--${string}`, string | number>;
