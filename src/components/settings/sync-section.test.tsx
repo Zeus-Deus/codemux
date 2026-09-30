@@ -40,6 +40,7 @@ import {
   importSkillsFromFile,
   pickSaveFileDialog,
   pickOpenFileDialog,
+  skillsSyncStatus,
 } from "@/tauri/commands";
 import { useAuthStore } from "@/stores/auth-store";
 import { SyncSection } from "./sync-section";
@@ -91,6 +92,27 @@ describe("SyncSection — render fork", () => {
     expect(screen.getByText(/sign in to sync your skills/i)).toBeInTheDocument();
     // No password inputs anywhere in the signed-out state.
     expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+  });
+
+  it("shows only a neutral offline status for a network sync failure", async () => {
+    useAuthStore.setState({ syncAvailable: true, sessionStatus: "offline" });
+    vi.mocked(skillsSyncStatus).mockResolvedValueOnce({
+      state: "error",
+      lastError: "network: error sending request for url (https://example.com/api/skills)",
+      atMillis: Date.now(),
+    });
+    render(<SyncSection />);
+
+    const offline = await screen.findByRole("status");
+    expect(offline).toHaveTextContent(/offline.+cached settings/i);
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sync error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sync ready")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry|sync now/i })).not.toBeInTheDocument();
+    expect(offline).not.toHaveClass("border-warning/35", "bg-warning/5");
+    expect(screen.getByRole("button", { name: /export skills locally/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /import skills from backup/i })).toBeEnabled();
   });
 
   it.each([

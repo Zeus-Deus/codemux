@@ -30,15 +30,6 @@ export function SyncSection() {
   if (syncAvailable) {
     return (
       <div className="space-y-3">
-        {sessionStatus === "offline" && (
-          <p
-            role="status"
-            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-label text-muted-foreground"
-          >
-            Offline — using your cached settings. Changes will sync when the
-            connection returns.
-          </p>
-        )}
         {sessionStatus === "degraded" && (
           <p
             role="status"

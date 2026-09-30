@@ -22,6 +22,7 @@ import { AlertCircle, CheckCircle2, Loader2, RefreshCw } from "lucide-react";
 import { useSkillsSyncStatus } from "@/hooks/use-skills-sync-status";
 import { useTickEvery } from "@/hooks/use-tick-every";
 import { relativeTime } from "@/lib/relative-time";
+import { useAuthStore } from "@/stores/auth-store";
 
 export type SyncStateKind = "idle" | "syncing" | "error";
 
@@ -68,11 +69,29 @@ function stateLabel(state: SyncStateKind): string {
 
 export function SyncStatusDisplay() {
   const { status, syncNow, isSyncing } = useSkillsSyncStatus();
+  const sessionStatus = useAuthStore((s) => s.sessionStatus);
   // Re-render every 30s so "Last synced N minutes ago" advances
   // without re-fetching the underlying timestamp. 30s is enough
   // resolution for the buckets — the smallest one is "just now"
   // → "1 minute ago" at the 60s line.
   useTickEvery(30_000);
+
+  // The skills API tags request/transport failures with `network:`.
+  // Match that contract, not arbitrary words in an HTTP or filesystem error:
+  // actionable failures must remain visible even when auth is also offline.
+  const networkError = status?.state === "error" &&
+    status.lastError?.startsWith("network:");
+  const offline = networkError ||
+    (sessionStatus === "offline" && status?.state !== "error");
+
+  if (offline) {
+    return (
+      <p role="status" className="text-label text-muted-foreground">
+        Offline — using your cached settings. Changes will sync when the
+        connection returns.
+      </p>
+    );
+  }
 
   if (!status) {
     return <SyncStatusSkeleton />;
