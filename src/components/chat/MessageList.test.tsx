@@ -30,6 +30,10 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
+import {
+  resetTranscriptFadeCacheForTests,
+  setRendererMode,
+} from "./transcript-fade";
 import { MessageList } from "./MessageList";
 
 // The assistant-turn avatar renders the provider's branded mark via
@@ -175,6 +179,7 @@ vi.mock("@legendapp/list/react", async () => {
 
 afterEach(() => {
   cleanup();
+  resetTranscriptFadeCacheForTests();
   resetListDouble();
   lastListProps.current = null;
   scrollToEndSpy.mockClear();
@@ -2261,6 +2266,30 @@ describe("MessageList jump-to-latest pill", () => {
 });
 
 describe("MessageList viewport edge fade", () => {
+  it("aligns a last-row message jump at the top, clear of the composer fade", () => {
+    const message: ChatViewItem = { kind: "user_message", id: "jump-target", seq: 0, text: "Find this prompt" };
+    render(<MessageList messages={[message]} messageJumpRequest={{ itemId: message.id, nonce: 1 }} {...noopHandlers} />);
+    expect(scrollToIndexSpy).toHaveBeenCalledWith({ index: 0, animated: true, viewPosition: 0, viewOffset: 28 });
+  });
+  it("dissolves text above the measured composer and floating title band", () => {
+    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
+    const style = lastListProps.current?.style as Record<string, string>;
+    for (const key of ["maskImage", "WebkitMaskImage"] as const) {
+      expect(style[key]).toContain("transparent 0, #000 26px");
+      expect(style[key]).toContain("#000 calc(100% - var(--composer-overlay-height, 0px) - 28px)");
+      expect(style[key]).toContain("transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)");
+    }
+    const header = lastListProps.current?.ListHeaderComponent;
+    expect(header.props.className).toContain("pt-[26px]");
+  });
+  it("reserves titlebar space outside the scroller when the renderer disables masks", () => {
+    setRendererMode("compatibility");
+    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
+    expect(lastListProps.current?.style).toBeUndefined();
+    expect(document.querySelector('[data-transcript-edge-fade="off"]')).not.toBeNull();
+    expect(lastListProps.current?.ListHeaderComponent.props.className).toContain("pt-[26px]");
+  });
+
   // A mask composites the element's whole rendering, and a scroll container
   // renders its own scrollbar — so a single full-width fade dissolved the
   // scrollbar's end stop along with the content, and a fully-scrolled

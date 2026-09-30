@@ -82,7 +82,7 @@ interface Props {
   /** Active worktree root for resolving relative source references. */
   cwd?: string | null;
   /** Forwarded to `MessageList`: transitions of "reader has left the live
-   *  edge", which dims the composer overlay. Must be stable. */
+   *  edge", which updates the overlay's reading-back state. Must be stable. */
   onReadingBackChange?: (readingBack: boolean) => void;
 }
 
