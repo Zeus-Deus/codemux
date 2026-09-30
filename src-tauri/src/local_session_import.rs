@@ -661,10 +661,66 @@ pub async fn agent_chat_import_local_sessions<R: tauri::Runtime>(
 mod tests {
     use super::*;
     use serde_json::json;
+    fn synthetic_cwd(project: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\synthetic\{project}")
+        } else {
+            format!("/synthetic/{project}")
+        }
+    }
+    #[test]
+    fn local_import_cwd_requires_platform_absolute_paths_for_both_providers() {
+        for provider in ["claude", "codex"] {
+            let rows_for = |cwd: &str| {
+                if provider == "claude" {
+                    vec![
+                        json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","cwd":cwd,"timestamp":"2026-09-29T10:00:00Z","message":{"role":"user","content":"Human prompt"}}),
+                    ]
+                } else {
+                    vec![
+                        json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":cwd,"source":"cli"}}),
+                        json!({"type":"event_msg","payload":{"type":"user_message","message":"Human prompt"}}),
+                    ]
+                }
+            };
+            let mut absolute_cwds = vec![synthetic_cwd("project")];
+            if cfg!(windows) {
+                absolute_cwds.push(r"\\synthetic-host\share\project".into());
+            }
+            for cwd in absolute_cwds {
+                assert!(std::path::Path::new(&cwd).is_absolute());
+                let session = parse_rows(provider, &rows_for(&cwd))
+                    .unwrap_or_else(|| panic!("{provider} must accept absolute cwd {cwd:?}"));
+                assert_eq!(session.cwd, cwd, "cwd must be preserved verbatim");
+                assert_eq!(
+                    session.messages,
+                    vec![("user".into(), "Human prompt".into())]
+                );
+            }
+            let mut non_absolute_cwds = vec![
+                "",
+                ".",
+                "..",
+                "synthetic/project",
+                r"C:synthetic\project",
+                "C:",
+            ];
+            if cfg!(windows) {
+                non_absolute_cwds.extend(["/synthetic/project", r"\synthetic\project"]);
+            }
+            for cwd in non_absolute_cwds {
+                assert!(!std::path::Path::new(cwd).is_absolute());
+                assert!(
+                    parse_rows(provider, &rows_for(cwd)).is_none(),
+                    "{provider} must reject non-absolute cwd {cwd:?}"
+                );
+            }
+        }
+    }
     fn claude_fixture(id: &str, timestamp: &str) -> String {
         format!(
             "{}\n",
-            json!({"type":"user","sessionId":id,"cwd":"/synthetic/project","timestamp":timestamp,"message":{"role":"user","content":"Human prompt"}})
+            json!({"type":"user","sessionId":id,"cwd":synthetic_cwd("project"),"timestamp":timestamp,"message":{"role":"user","content":"Human prompt"}})
         )
     }
     #[test]
@@ -805,7 +861,7 @@ mod tests {
             .unwrap_err()
             .starts_with("imported_snapshot_read_only"));
         let input = serde_json::from_value(
-            json!({"thread_id":thread,"cwd":"/synthetic/project","additional_directories":[]}),
+            json!({"thread_id":thread,"cwd":synthetic_cwd("project"),"additional_directories":[]}),
         )
         .unwrap();
         let result = crate::commands::agent_chat::agent_chat_start_session(
@@ -820,7 +876,7 @@ mod tests {
             .unwrap_err()
             .starts_with("imported_snapshot_read_only"));
         let db = crate::database::DatabaseStore::new_in_memory();
-        db.upsert_agent_chat_session(thread, "ws", Some("/synthetic/project"), "claude")
+        db.upsert_agent_chat_session(thread, "ws", Some(&synthetic_cwd("project")), "claude")
             .unwrap();
         let record = serde_json::to_value(db.get_agent_chat_session(thread).unwrap()).unwrap();
         assert!(
@@ -873,7 +929,7 @@ mod tests {
     }
     #[test]
     fn local_import_mixed_sidechains_never_own_main_session_identity() {
-        let child = json!({"type":"user","isSidechain":true,"sessionId":"33333333-3333-4333-8333-333333333333","cwd":"/child","timestamp":"2026-09-29T20:00:00Z","message":{"role":"user","content":"CHILD SECRET"}});
+        let child = json!({"type":"user","isSidechain":true,"sessionId":"33333333-3333-4333-8333-333333333333","cwd":synthetic_cwd("child"),"timestamp":"2026-09-29T20:00:00Z","message":{"role":"user","content":"CHILD SECRET"}});
         let main: Value = serde_json::from_str(&claude_fixture(
             "11111111-1111-4111-8111-111111111111",
             "2026-09-29T10:00:00Z",
@@ -892,13 +948,13 @@ mod tests {
         let db = crate::database::DatabaseStore::new_in_memory();
         let state = crate::state::AppStateStore::default();
         state.clear_workspaces();
-        let workspace =
-            state.create_empty_workspace_at_path(std::path::PathBuf::from("/synthetic/project"));
+        let workspace = state
+            .create_empty_workspace_at_path(std::path::PathBuf::from(synthetic_cwd("project")));
         state
             .create_or_reuse_agent_chat_pane(
                 &workspace.0,
                 Some(crate::agent_provider::ProviderKind::Claude),
-                Some("/synthetic/project".into()),
+                Some(synthetic_cwd("project")),
                 None,
                 Some("existing-live-thread".into()),
             )
@@ -952,7 +1008,7 @@ mod tests {
     }
     #[test]
     fn local_import_codex_excludes_injected_context_and_analysis_channels() {
-        let meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":"/synthetic/project","source":"cli"}});
+        let meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":synthetic_cwd("project"),"source":"cli"}});
         let context = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>SECRET</environment_context>"}]}});
         let analysis = json!({"type":"response_item","payload":{"type":"message","role":"assistant","channel":"analysis","content":[{"type":"output_text","text":"SECRET reasoning"}]}});
         let visible =
@@ -965,7 +1021,7 @@ mod tests {
     }
     #[test]
     fn local_import_codex_mirrors_are_turn_scoped_and_preserve_repeated_prompts() {
-        let meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":"/synthetic/project","source":"cli"}});
+        let meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":synthetic_cwd("project"),"source":"cli"}});
         let event = |role: &str, text: &str| json!({"type":"event_msg","payload":{"type":if role == "user" {"user_message"} else {"agent_message"},"message":text}});
         let canonical = |role: &str, text: &str| json!({"type":"response_item","payload":{"type":"message","role":role,"content":[{"type":if role == "user" {"input_text"} else {"output_text"},"text":text}]}});
         for canonical_first in [false, true] {
@@ -1043,7 +1099,7 @@ mod tests {
     }
     #[test]
     fn local_import_codex_rejects_parent_thread_even_with_cli_source() {
-        let mut meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":"/synthetic/project","source":"cli"}});
+        let mut meta = json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":synthetic_cwd("project"),"source":"cli"}});
         let prompt =
             json!({"type":"event_msg","payload":{"type":"user_message","message":"Child prompt"}});
         for parent in [Value::Null, json!("")] {
@@ -1064,7 +1120,7 @@ mod tests {
     #[test]
     fn local_import_codex_deduplicates_event_mirrors() {
         let rows = vec![
-            json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":"/synthetic/project","source":"cli"}}),
+            json!({"type":"session_meta","timestamp":"2026-09-29T10:00:00Z","payload":{"id":"22222222-2222-4222-8222-222222222222","cwd":synthetic_cwd("project"),"source":"cli"}}),
             json!({"type":"event_msg","payload":{"type":"user_message","message":"Explain widgets"}}),
             json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Explain widgets"}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Visible answer"}]}}),
@@ -1092,7 +1148,7 @@ mod tests {
     #[test]
     fn local_import_claude_visible_text_only() {
         let rows = vec![
-            json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","cwd":"/synthetic/project","timestamp":"2026-09-29T10:00:00Z","message":{"role":"user","content":"Explain widgets"}}),
+            json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","cwd":synthetic_cwd("project"),"timestamp":"2026-09-29T10:00:00Z","message":{"role":"user","content":"Explain widgets"}}),
             json!({"type":"assistant","timestamp":"2026-09-29T10:01:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"SECRET"},{"type":"text","text":"Widgets are useful"},{"type":"tool_use","input":{"token":"SECRET"}}]}}),
             json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"SECRET"}]}}),
         ];
@@ -1104,6 +1160,6 @@ mod tests {
                 ("assistant".into(), "Widgets are useful".into())
             ]
         );
-        assert_eq!(session.cwd, "/synthetic/project");
+        assert_eq!(session.cwd, synthetic_cwd("project"));
     }
 }
