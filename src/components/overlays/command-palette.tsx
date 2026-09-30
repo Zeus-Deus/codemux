@@ -2,7 +2,7 @@ import { useAddonsStore } from "@/stores/addons-store";
 import { addonEnabled } from "@/lib/addons/types";
 import { executeAddon } from "@/lib/addons/platform";
 import { Puzzle } from "lucide-react";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
 import {
   ArrowLeft,
@@ -329,7 +329,9 @@ export function CommandPalette({ open, onOpenChange }: Props) {
       onOpenChange={onOpenChange}
       title="Command palette"
       description="Search workspaces, conversations, projects, and commands."
-      className="top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px]"
+      // Mobile's generic dialog rule centers at mid-screen; this top-anchored
+      // palette must instead leave room for its reserved results and keyboard.
+      className="top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!"
     >
       {/* Radix unmounts dialog content while closed, so the body's stores,
           clock, and avatar loads cost nothing until the palette opens. */}
@@ -348,7 +350,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const query = useMemo(() => parsePaletteQuery(rawQuery), [rawQuery]);
   // Shares its key with the sidebar badge's fetch, so `pr ` is answered
   // from rows that are already loaded rather than a fresh round trip.
-  const { rows: prOverviewRows } = usePrOverview(true);
+  const { rows: prOverviewRows } = usePrOverview(query.mode === "prs");
   const listRef = useRef<HTMLDivElement>(null);
   // A seeded `theme` query is a deep link from Settings ▸ Appearance, not
   // an ordinary palette search. Remember that distinction after the store's
@@ -356,8 +358,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // ahead of otherwise valid workspace/project/conversation matches.
   const openedForThemesRef = useRef(rawQuery === "theme");
   const searchRequestRef = useRef(0);
-  const [conversationRows, setConversationRows] = useState<AgentChatSearchResult[]>([]);
-  const [conversationSearching, setConversationSearching] = useState(false);
+  // Results and completion belong to the same request and publish together.
+  // Keying the snapshot also hides old hits during the new query's render,
+  // before its effect has had a chance to cancel the previous request.
+  const [conversationResult, setConversationResult] = useState<{
+    key: { needle: string; workspaceIdsKey: string; eligible: boolean };
+    rows: AgentChatSearchResult[];
+  } | null>(null);
 
   // Narrow subscriptions, not the whole snapshot. The palette mounts on the
   // switch path (it is one of the ways to switch), and `appState` itself
@@ -381,6 +388,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
   const updateSyncedSettings = useSyncedSettingsStore((s) => s.updateSettings);
 
+  const inboxLoaded = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
   const loadInbox = useSidebarInboxStore((s) => s.load);
@@ -613,36 +621,46 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     [workspaces],
   );
 
-  // Conversation text lives in SQLite FTS5, so unlike the in-memory groups
-  // it resolves asynchronously. A short debounce keeps fast palette typing
-  // from queuing stale DB reads; the generation guard makes the latest query
-  // authoritative even if an older invoke returns last.
+  const conversationSearchPending = conversationsEligible && workspaceIdsKey !== "";
+  // Identity belongs to this visit, not just its text: A → B → A must wait
+  // for a fresh A completion rather than reusing A's old hits/empty state.
+  const conversationKey = useMemo(
+    () => ({ needle: query.needle, workspaceIdsKey, eligible: conversationSearchPending }),
+    [query.needle, workspaceIdsKey, conversationSearchPending],
+  );
+  const conversationCurrent = conversationResult?.key === conversationKey;
+  const conversationRows = conversationSearchPending && conversationCurrent
+    ? conversationResult.rows : [];
+  const conversationSearching = conversationSearchPending && !conversationCurrent;
+
+  // SQLite FTS5 is debounced, but there is only one completion commit: no
+  // half-published rows/loading pair, and no stale result after close/re-query.
   useEffect(() => {
     const request = ++searchRequestRef.current;
-    const workspaceIds = workspaceIdsKey === "" ? [] : workspaceIdsKey.split("\n");
-    if (!conversationsEligible || workspaceIds.length === 0) {
-      setConversationRows([]);
-      setConversationSearching(false);
+    if (!conversationSearchPending) {
+      setConversationResult(null);
       return;
     }
-    setConversationRows([]);
-    setConversationSearching(true);
+    const workspaceIds = workspaceIdsKey.split("\n");
+    const publish = (rows: AgentChatSearchResult[]) => {
+      if (searchRequestRef.current === request) {
+        setConversationResult({ key: conversationKey, rows });
+      }
+    };
     const timer = window.setTimeout(() => {
       void agentChatSearch(query.needle, workspaceIds, 12)
-        .then((rows) => {
-          if (searchRequestRef.current === request) setConversationRows(rows);
-        })
+        .then(publish)
         .catch((error) => {
           if (searchRequestRef.current !== request) return;
           console.warn("[command-palette] conversation search failed", error);
-          setConversationRows([]);
-        })
-        .finally(() => {
-          if (searchRequestRef.current === request) setConversationSearching(false);
+          publish([]);
         });
     }, 140);
-    return () => window.clearTimeout(timer);
-  }, [conversationsEligible, query.needle, workspaceIdsKey]);
+    return () => {
+      window.clearTimeout(timer);
+      ++searchRequestRef.current;
+    };
+  }, [conversationSearchPending, conversationKey, query.needle, workspaceIdsKey]);
 
   // Themes are search-only. The resting palette answers "where was I?", and
   // six colour rows there would both bury that answer and put a live preview
@@ -666,14 +684,17 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     [themeStudioRows, query, themesEligible],
   );
 
-  const shownWorkspaces = matchedWorkspaces.slice(
+  // Publish the shelves only after their first read, rather than painting
+  // an incorrect active order and moving those rows under the user's cursor.
+  const inboxSearching = !inboxLoaded && query.mode === "all";
+  const shownWorkspaces = inboxLoaded ? matchedWorkspaces.slice(
     0,
     searching ? WORKSPACE_CAP_SEARCH : WORKSPACE_CAP_RESTING,
-  );
-  const shownProjects = matchedProjects.slice(
+  ) : [];
+  const shownProjects = inboxLoaded ? matchedProjects.slice(
     0,
     searching ? PROJECT_CAP_SEARCH : PROJECT_CAP_RESTING,
-  );
+  ) : [];
   const themeResultsFirst =
     openedForThemesRef.current &&
     rawQuery === "theme" &&
@@ -718,6 +739,19 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // `persist: false`, which keeps the boot shadow pointing at the real choice
   // so a crash mid-preview still reopens on the applied theme.
   const [selectedValue, setSelectedValue] = useState("");
+  const selectionIntentRef = useRef(false);
+  const inboxWasLoadedRef = useRef(inboxLoaded);
+  useLayoutEffect(() => {
+    const shelvesArrived = inboxLoaded && !inboxWasLoadedRef.current;
+    inboxWasLoadedRef.current = inboxLoaded;
+    if (shelvesArrived && !selectionIntentRef.current) {
+      // cmdk retains its automatic command selection when shelves appear.
+      // Move only that untouched default to the first now-visible result;
+      // never steal a choice made through keyboard navigation or hovering.
+      const first = listRef.current?.querySelector<HTMLElement>('[cmdk-item]:not([aria-disabled="true"])');
+      if (first?.dataset.value) setSelectedValue(first.dataset.value);
+    }
+  }, [inboxLoaded]);
   const previewTheme = useMemo(() => {
     const id = previewedThemeId(selectedValue);
     return id === null ? null : allThemes.find((theme) => theme.id === id) ?? null;
@@ -853,6 +887,15 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       // here; the state below is only where the value is parked.
       value={selectedValue}
       onValueChange={setSelectedValue}
+      onKeyDownCapture={(event) => {
+        if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) ||
+            (event.ctrlKey && ["n", "p", "j", "k"].includes(event.key))) {
+          selectionIntentRef.current = true;
+        }
+      }}
+      onPointerMoveCapture={(event) => {
+        if ((event.target as Element).closest("[cmdk-item]")) selectionIntentRef.current = true;
+      }}
       className="flex w-full flex-col overflow-hidden bg-popover text-popover-foreground"
     >
       {/* Header */}
@@ -871,7 +914,10 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         <CommandPrimitive.Input
           autoFocus
           value={rawQuery}
-          onValueChange={setRawQuery}
+          onValueChange={(value) => {
+            selectionIntentRef.current = false;
+            setRawQuery(value);
+          }}
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
@@ -884,12 +930,16 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       <div className="relative">
         <CommandPrimitive.List
           ref={listRef}
-          className="thin-scrollbar [scrollbar-gutter:stable] max-h-[352px] scroll-py-8 overflow-x-hidden overflow-y-auto py-1.5 pr-0.5 pl-1.5"
+          // Reserve the viewport rather than resizing the dialog/footer for
+          // every debounce, empty state, and asynchronously added section.
+          className="thin-scrollbar [scrollbar-gutter:stable] h-[352px] max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))] scroll-py-8 overflow-x-hidden overflow-y-auto py-1.5 pr-0.5 pl-1.5"
         >
           {totalShown === 0 && (
             <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
               <span className="text-body text-muted-foreground">
-                {conversationSearching ? (
+                {inboxSearching ? (
+                  "Loading workspaces…"
+                ) : conversationSearching ? (
                   <span className="inline-flex items-center gap-2">
                     <LoaderCircle className="size-3.5 animate-spin" />
                     Searching conversations…
