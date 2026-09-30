@@ -1,6 +1,8 @@
 import { Activity, createContext, useContext, useLayoutEffect, useMemo, useReducer, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
+export const TRANSCRIPT_CACHE_CAPACITY = 8;
+
 type ScrollPosition = { node: HTMLElement; top: number; left: number };
 type Entry = {
   key: string;
@@ -75,7 +77,7 @@ export function TranscriptCacheProvider({ children, activeKey, validKeys }: {
   const valid = new Set(validKeys);
   const leased = snapshot.filter((entry) => valid.has(entry.key) && entry.slot !== null);
   const inactive = snapshot.filter((entry) => valid.has(entry.key) && entry.slot === null);
-  const budget = Math.max(0, 4 - leased.length);
+  const budget = Math.max(0, TRANSCRIPT_CACHE_CAPACITY - leased.length);
   const retained = new Set([...leased, ...(budget ? inactive.slice(-budget) : [])]);
   // Children of victims were removed by React's mutation phase. Detach ONLY
   // their now-empty imperative hosts; no removeChild/innerHTML on React DOM.

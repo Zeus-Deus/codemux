@@ -39,6 +39,7 @@ import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
   MOCK_CHAT_THREAD_ID,
+  MOCK_SECOND_CHAT_THREAD_ID,
   MOCK_DIRTY_ARCHIVE_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
@@ -1480,7 +1481,7 @@ const ASSISTANT_BODIES = [
   "Done. The change keeps the DOM bounded regardless of conversation length, so session-open time and scroll cost stop scaling with history size.\n\nA second paragraph pads this message out so row heights vary — fixed-height assumptions are exactly what dynamic measurement has to absorb.\n\nAnd a third paragraph for good measure, because real assistant turns are rarely uniform.",
 ];
 
-let mockChatTranscriptCache: string[] | null = null;
+const mockChatTranscriptCache = new Map<string, string[]>();
 
 // ── Cursor reads + lazy tool results (mirrors commands/agent_chat.rs) ──
 
@@ -1508,11 +1509,11 @@ function mockThreadPayloads(threadId: string): string[] {
   if (
     fixture &&
     (threadId.startsWith(STRESS_THREAD_PREFIX) ||
-      threadId === MOCK_CHAT_THREAD_ID)
+      threadId === MOCK_CHAT_THREAD_ID || threadId === MOCK_SECOND_CHAT_THREAD_ID)
   ) {
     return stressChatTranscript(threadId, fixture);
   }
-  if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();
+  if (threadId === MOCK_CHAT_THREAD_ID || threadId === MOCK_SECOND_CHAT_THREAD_ID) return mockChatTranscript(threadId);
   return mockWorkflowTranscript(threadId) ?? [];
 }
 
@@ -1631,9 +1632,10 @@ function mockTruncateOnCharBoundary(text: string, maxBytes: number): string {
 /** Generate the persisted-payload list `agent_chat_list_messages`
  *  returns for the seeded thread: the same JSON envelopes the real
  *  backend stores, replayed by the frontend through the pure reducer. */
-function mockChatTranscript(): string[] {
-  if (mockChatTranscriptCache) return mockChatTranscriptCache;
-  const T = MOCK_CHAT_THREAD_ID;
+function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
+  const cached = mockChatTranscriptCache.get(threadId);
+  if (cached) return cached;
+  const T = threadId;
   const out: string[] = [];
   const push = (envelope: unknown) => out.push(JSON.stringify(envelope));
   for (let i = 0; i < MOCK_CHAT_TURNS; i++) {
@@ -1856,7 +1858,7 @@ function mockChatTranscript(): string[] {
     }
   }
 
-  mockChatTranscriptCache = out;
+  mockChatTranscriptCache.set(threadId, out);
   return out;
 }
 
@@ -6025,6 +6027,19 @@ const handlers: Record<string, Handler> = {
     appState = { ...appState, workspaces: [...appState.workspaces, ws] };
     setTimeout(() => emitAppState(), 0);
     return ws.workspace_id;
+  },
+  activate_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    const tab = ws?.tabs.find((candidate) => candidate.tab_id === a.tabId);
+    if (!ws || !tab) return undefined;
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((candidate) => candidate.workspace_id === ws.workspace_id
+        ? { ...candidate, active_tab_id: tab.tab_id, active_surface_id: tab.surface_id ?? candidate.active_surface_id }
+        : candidate),
+    };
+    emitAppState();
+    return undefined;
   },
   /**
    * A real extra terminal tab, so an agent handoff is visible in dev.

@@ -132,6 +132,7 @@ function terminalSurface(label: string, cwd: string): PaneRefs {
  *  this id so the virtualized MessageList can be exercised in a plain
  *  browser (issue #77). */
 export const MOCK_CHAT_THREAD_ID = "thread-mock-chat";
+export const MOCK_SECOND_CHAT_THREAD_ID = "thread-mock-chat-second";
 
 /** Inline data-URL PNG (200×120, teal field + magenta band + border)
  *  used to seed a user turn's attached image in the dev mock. A
@@ -351,9 +352,8 @@ const wsCodemuxMain = makeWorkspace({
   status: "working", // amber pulsing dot on the primary row
 });
 
-/** Agent-chat workspace: a single `agent_chat` pane bound to
- *  `MOCK_CHAT_THREAD_ID`. The mock hydrates a long transcript for it
- *  so list virtualization is observable in the browser. */
+/** Two independent chat tabs exercise warm transcript reuse on tab switches.
+ * Each surface is a lone chat; split-pane caching remains out of scope. */
 const wsCodemuxChat: WorkspaceSnapshot = (() => {
   const ws = makeWorkspace({
     workspace_id: "ws-codemux-chat",
@@ -378,16 +378,17 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     git_changed_files: 1,
   });
   const { pane, surface, tab } = chatSurface("Agent Chat", codemuxRoot);
+  const second = chatSurface("Second Chat", codemuxRoot, MOCK_SECOND_CHAT_THREAD_ID);
   // Chat sessions publish into pane_statuses just like terminal agents
   // (backend `set_pane_status_by_thread`); seed a green "review" dot so
   // the dev mock demonstrates a finished chat agent in the sidebar.
   paneStatuses[pane.pane_id] = "review";
   return {
     ...ws,
-    tabs: [tab],
+    tabs: [tab, second.tab],
     active_tab_id: tab.tab_id,
     active_surface_id: surface.surface_id,
-    surfaces: [surface],
+    surfaces: [surface, second.surface],
   };
 })();
 

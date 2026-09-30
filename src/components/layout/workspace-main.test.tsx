@@ -206,19 +206,21 @@ it("reuses transcript DOM across sole-chat workspaces but remounts the composer"
   expect(view.getByTestId("composer")).not.toBe(composer);
 });
 
-it("does not remount the live pane/composer when eligibility changes to a multi-tab route", () => {
+it("does not remount the live pane/composer or transcript when adding a second tab", () => {
   state.enableAgentChat = state.cacheProbe = true;
   const a = cacheWorkspace("a");
   state.workspace = a;
   const view = render(<WorkspaceMain />);
   const composer = view.getByTestId("composer");
+  const row = view.getByText("a");
   state.workspace = { ...a, tabs: [...a.tabs, { ...a.tabs[0], tab_id: "extra" }] };
   view.rerender(<WorkspaceMain />);
   expect(view.getByTestId("composer")).toBe(composer);
-  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(0);
+  expect(view.getByText("a")).toBe(row);
+  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(1);
 });
 
-it.each(["terminal", "browser", "editor", "diff", "split", "draft", "none"])("clears cached transcripts and uses the prior %s route", async (route) => {
+it.each(["terminal", "browser", "editor", "diff", "split", "draft", "none"])("uses the prior %s route without leasing an incompatible transcript", async (route) => {
   state.enableAgentChat = state.cacheProbe = true;
   const a = cacheWorkspace("a");
   const b = cacheWorkspace("b");
@@ -235,8 +237,13 @@ it.each(["terminal", "browser", "editor", "diff", "split", "draft", "none"])("cl
   if (route === "draft") await view.findByTestId("draft-surface");
   if (route === "editor") await view.findByTestId("editor-pane");
   if (route === "diff") await view.findByTestId("diff-pane");
-  expect(row.isConnected).toBe(false);
-  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(0);
+  const providerUnmounted = route === "draft" || route === "none";
+  expect(row.isConnected).toBe(!providerUnmounted);
+  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(providerUnmounted ? 0 : 2);
+  if (!providerUnmounted) {
+    expect(row.closest('[data-transcript-cache-parking]')).not.toBeNull();
+    expect(view.container.querySelector('[data-transcript-cache-slot]')).toBeNull();
+  }
 });
 it.each(["delete", "thread", "provider", "cwd", "conversion"])("promptly evicts hidden %s invalidation without remounting the active transcript", (change) => {
   state.enableAgentChat = state.cacheProbe = true;

@@ -11,16 +11,14 @@ export interface TranscriptBinding {
 
 export const TranscriptBindingContext = createContext<TranscriptBinding | null>(null);
 
-/** Deliberately conservative: terminal-kind tabs host chat surfaces too.
- * Extra tabs/surfaces, splits, drafts and unbound startup chats are not cached. */
-export function transcriptCacheBinding(workspace: WorkspaceSnapshot | null): TranscriptBinding | null {
-  if (!workspace || workspace.tabs.length !== 1 || workspace.surfaces.length !== 1) return null;
-  const tab = workspace.tabs[0];
-  const surface = workspace.surfaces[0];
+/** Terminal-kind tabs host chat surfaces too. Splits remain uncached: portal
+ * ancestry bypasses the pane capture events that activate split panes. */
+function bindingForTab(workspace: WorkspaceSnapshot, tab: WorkspaceSnapshot["tabs"][number]): TranscriptBinding | null {
+  if (tab.kind !== "terminal") return null;
+  const surface = workspace.surfaces.find((candidate) => candidate.surface_id === tab.surface_id);
+  if (!surface) return null;
   const pane = surface.root;
-  if (tab.kind !== "terminal" || tab.tab_id !== workspace.active_tab_id ||
-      tab.surface_id !== surface.surface_id || surface.surface_id !== workspace.active_surface_id ||
-      pane.kind !== "agent_chat" || pane.pane_id !== surface.active_pane_id || !pane.thread_id) return null;
+  if (pane.kind !== "agent_chat" || pane.pane_id !== surface.active_pane_id || !pane.thread_id) return null;
   const provider = pane.provider ?? "claude";
   const cwd = pane.cwd ?? workspace.cwd;
   return {
@@ -31,4 +29,19 @@ export function transcriptCacheBinding(workspace: WorkspaceSnapshot | null): Tra
     provider,
     cwd,
   };
+}
+
+export function transcriptCacheBinding(workspace: WorkspaceSnapshot | null): TranscriptBinding | null {
+  if (!workspace) return null;
+  const tab = workspace.tabs.find((candidate) => candidate.tab_id === workspace.active_tab_id);
+  if (!tab || tab.surface_id !== workspace.active_surface_id) return null;
+  return bindingForTab(workspace, tab);
+}
+
+/** Valid identities include parked tabs, independently of the selected route. */
+export function transcriptCacheBindings(workspace: WorkspaceSnapshot | null): TranscriptBinding[] {
+  return workspace ? workspace.tabs.flatMap((tab) => {
+    const binding = bindingForTab(workspace, tab);
+    return binding ? [binding] : [];
+  }) : [];
 }
