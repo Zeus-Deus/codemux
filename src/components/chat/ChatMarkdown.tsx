@@ -26,6 +26,7 @@ import { rehypeSelectionSafeText } from "@/lib/agent-chat/selection-safe-text";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
 import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
+import { useChatMarkdownPassive } from "./chat-markdown-passive";
 import {
   CHAT_MARKDOWN_COMPONENTS,
   ChatCodeRendererProvider,
@@ -209,6 +210,22 @@ const markdownComponents: Components = {
   [CHAT_FILE_LINK_TAG]: FileLinkElement,
 };
 
+function PassiveImage(props: ComponentProps<"img"> | (Record<string, unknown> & ExtraProps)) {
+  const { src, alt } = props;
+  const href = typeof src === "string" ? src : undefined;
+  const label = typeof alt === "string" && alt ? alt : href || "Image reference";
+  return <ChatMarkdownLink href={href}>{label}</ChatMarkdownLink>;
+}
+
+// Keep links explicit and images textual; skip both favicon decoration and
+// local-image/file upgrades so snapshot prose never consults current resources.
+const passiveMarkdownComponents: Components = {
+  ...CHAT_MARKDOWN_COMPONENTS,
+  a: ChatMarkdownLink,
+  img: PassiveImage,
+};
+const passiveRehypePlugins = [rehypeSelectionSafeText];
+
 const rehypePlugins = [
   rehypeRichExternalLinks,
   rehypeLocalImageLinks,
@@ -237,6 +254,7 @@ export function ChatMarkdown({
   workspaceCwd?: string | null;
   referencePaths?: readonly string[];
 }) {
+  const passive = useChatMarkdownPassive();
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
   const wrap = useSettingsStore(selectChatCodeWrap);
@@ -281,9 +299,9 @@ export function ChatMarkdown({
             <Streamdown
               parseIncompleteMarkdown
               remarkPlugins={remarkPlugins}
-              rehypePlugins={rehypePlugins}
+              rehypePlugins={passive ? passiveRehypePlugins : rehypePlugins}
               plugins={plugins}
-              components={markdownComponents}
+              components={passive ? passiveMarkdownComponents : markdownComponents}
               controls={controls}
               lineNumbers={false}
             >

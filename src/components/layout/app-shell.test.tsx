@@ -10,6 +10,7 @@ let appStateReady = true;
 let settingsLoaded = true;
 let syncedLoading = false;
 let showSettingsFlag = false;
+let showImportFlag = false;
 let showAutomationsFlag = false;
 let showDevicesFlag = false;
 let showNewProjectScreenFlag = false;
@@ -42,6 +43,9 @@ const updateSyncedSetting = vi.fn(
 // The real AppShell imports a lot. We mock the heavy children down to
 // sentinel text nodes so we can assert which branch of the shell
 // rendered.
+vi.mock("@/components/chat/LocalSessionImport", () => ({
+  LocalSessionImport: () => <div data-testid="import-overlay" />,
+}));
 vi.mock("./title-bar", () => ({
   TitleBar: () => <div data-testid="title-bar" />,
 }));
@@ -131,6 +135,7 @@ vi.mock("@/stores/ui-store", () => ({
     vi.fn((selector: (s: unknown) => unknown) =>
       selector({
         showSettings: showSettingsFlag,
+        showLocalSessionImport: showImportFlag,
         showAutomations: showAutomationsFlag,
         showDevices: showDevicesFlag,
         showNewProjectScreen: showNewProjectScreenFlag,
@@ -209,6 +214,7 @@ function resetMockState() {
   settingsLoaded = true;
   syncedLoading = false;
   showSettingsFlag = false;
+  showImportFlag = false;
   showAutomationsFlag = false;
   showDevicesFlag = false;
   showNewProjectScreenFlag = false;
@@ -226,6 +232,17 @@ function resetMockState() {
 describe("AppShell rendering gates", () => {
   beforeEach(resetMockState);
 
+  it("keeps the import overlay mounted across the first-workspace emission and Settings", async () => {
+    showImportFlag = true;
+    const view = render(<AppShell />);
+    const overlay = await view.findByTestId("import-overlay");
+    hasWorkspacesFlag = true;
+    view.rerender(<AppShell />);
+    expect(view.getByTestId("import-overlay")).toBe(overlay);
+    showSettingsFlag = true;
+    view.rerender(<AppShell />);
+    expect(view.getByTestId("import-overlay")).toBe(overlay);
+  });
   it("renders EmptyState when there are no workspaces and no active draft", () => {
     hasWorkspacesFlag = false;
     enableLazyFlag = false;

@@ -1,3 +1,4 @@
+import type { AgentChatSessionRecord, LocalChatSession } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 /**
  * Dev-only Tauri runtime shim.
@@ -139,6 +140,18 @@ console.log(
 // ── Mutable seed state ──────────────────────────────────────────────
 
 let appState: AppStateSnapshot = createSeedAppState();
+// Synthetic, browser-only histories: never reads native provider files.
+const sessionImportFixture = new URLSearchParams(window.location.search).get("fixture") === "session-import";
+if (sessionImportFixture) {
+  appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
+}
+const mockLocalSessions: LocalChatSession[] = [
+  { source_id: "claude:synthetic-parser", provider: "claude", title: "Fix the parser edge case", cwd: "/demo/parser", last_active_at: "2026-09-29T10:00:00Z", message_count: 2, already_imported: false },
+  { source_id: "codex:synthetic-tests", provider: "codex", title: "Review the parser tests", cwd: "/demo/parser", last_active_at: "2026-09-28T14:00:00Z", message_count: 2, already_imported: false },
+  { source_id: "codex:synthetic-docs", provider: "codex", title: "Document the setup steps", cwd: "/demo/docs", last_active_at: "2026-09-27T09:00:00Z", message_count: 2, already_imported: false },
+];
+const mockImportedRecords = new Map<string, AgentChatSessionRecord>();
+const mockImportedPayloads = new Map<string, string[]>();
 let stressDeltaTimer: number | null = null;
 let stressDeltaCount = 0;
 let providerRuntimeCommandCount = 0;
@@ -1501,6 +1514,8 @@ const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 
 /** The raw persisted payloads a thread would hold. */
 function mockThreadPayloads(threadId: string): string[] {
+  const imported = mockImportedPayloads.get(threadId);
+  if (imported) return imported;
   // Under a stress fixture the generated threads AND the seeded thread serve
   // the synthetic transcript — hydration cost is one of the things being
   // measured, and the curated 520-turn showcase is not that profile.
@@ -4172,6 +4187,37 @@ const handlers: Record<string, Handler> = {
     }
     return results.slice(0, limit);
   },
+  agent_chat_scan_local_sessions: () => ({ sessions: mockLocalSessions.map((s) => ({ ...s })), warnings: [] }),
+  agent_chat_import_local_sessions: (a) => {
+    const ids = Array.isArray(a.sourceIds) ? a.sourceIds as string[] : [];
+    const imported: { source_id: string; thread_id: string; workspace_id: string }[] = [];
+    let skipped = 0;
+    for (const sourceId of ids) {
+      const session = mockLocalSessions.find((s) => s.source_id === sourceId);
+      if (!session || session.already_imported) { skipped++; continue; }
+      const threadId = `mock-imported-${mockImportedRecords.size + 1}`;
+      let workspace = appState.workspaces.find((w) => w.cwd === session.cwd);
+      const built = buildRestoredWorkspace({ archive_id: threadId, workspace_id: `ws-${threadId}`, title: session.title, cwd: session.cwd, project_root: session.cwd, project_uid: null, workspace_kind: "main", worktree_path: null, git_branch: null, is_git: false, protected: true, archived_at: 0 });
+      const root = built.surfaces[0].root;
+      if (root.kind === "agent_chat") { root.thread_id = threadId; root.provider = session.provider; }
+      if (workspace) {
+        workspace = { ...workspace, surfaces: [...workspace.surfaces, ...built.surfaces], tabs: [...workspace.tabs, ...built.tabs] };
+        appState = { ...appState, workspaces: appState.workspaces.map((w) => w.workspace_id === workspace!.workspace_id ? workspace! : w) };
+      } else {
+        workspace = built;
+        appState = { ...appState, workspaces: [...appState.workspaces, built] };
+      }
+      mockImportedRecords.set(threadId, { thread_id: threadId, imported_from: sourceId, sdk_session_id: null, workspace_id: workspace.workspace_id, cwd: session.cwd, provider: session.provider, title: session.title, created_at: session.last_active_at, last_active_at: session.last_active_at, model: null, effort: null, context_window: null, permission_mode: null });
+      mockImportedPayloads.set(threadId, [
+        JSON.stringify({ type: "user_message", thread_id: threadId, client_nonce: `${threadId}-user`, text: `Please help with ${session.title.toLowerCase()}. This is a synthetic conversation.` }),
+        JSON.stringify({ type: "item_completed", thread_id: threadId, turn_id: `${threadId}-turn`, item: { kind: "assistant_text", id: `${threadId}-answer`, text: "Reviewed the synthetic example and captured the next steps. This is a read-only local copy." } }),
+      ]);
+      session.already_imported = true;
+      imported.push({ source_id: sourceId, thread_id: threadId, workspace_id: workspace.workspace_id });
+    }
+    emitAppState();
+    return { imported, skipped, warnings: [] };
+  },
   agent_chat_open_search_result: (a) => {
     const threadId = String(a.threadId ?? "");
     const location = findChatPaneLocation(threadId);
@@ -4198,6 +4244,7 @@ const handlers: Record<string, Handler> = {
   // any other thread has no persisted row yet.
   agent_chat_get_session: (a) => {
     const threadId = a.threadId as string;
+    if (mockImportedRecords.has(threadId)) return mockImportedRecords.get(threadId);
     if (threadId === MOCK_CHAT_THREAD_ID) {
       return {
         thread_id: MOCK_CHAT_THREAD_ID,

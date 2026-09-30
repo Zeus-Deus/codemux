@@ -27,6 +27,9 @@ import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { scheduleSequentialIdlePrefetch } from "@/lib/idle-prefetch";
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+
+const LocalSessionImport = lazy(() => import("@/components/chat/LocalSessionImport").then(m => ({ default: m.LocalSessionImport })));
 const MobileShell = lazy(() => import("@/components/mobile/mobile-shell").then(m => ({ default: m.MobileShell })));
 
 const loadSettingsView = () => import("@/components/settings/settings-view");
@@ -66,7 +69,18 @@ const BrowserPeekOverlay = lazy(() =>
   import("@/components/browser/BrowserPeekOverlay").then((module) => ({ default: module.BrowserPeekOverlay })),
 );
 
-export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
+export function AppShell(props: { onFirstPaint?: () => void } = {}) {
+  const showImport = useUIStore((s) => s.showLocalSessionImport);
+  const mobile = useMobileLayout();
+  // A stable sibling of all route gates: native import emits workspaces before
+  // its promise returns, so placing this under EmptyState would lose results.
+  return <>
+    {showImport && !mobile && !isRemoteClient() && <LazyBoundary label="recent chat import" presentation="overlay"><LocalSessionImport /></LazyBoundary>}
+    <AppShellContent {...props} />
+  </>;
+}
+
+function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const mobile = useMobileLayout();
   useMobileViewport();
   useNotificationLink();

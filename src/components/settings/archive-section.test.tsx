@@ -1,5 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   render,
@@ -57,6 +57,17 @@ vi.mock("@/stores/app-store", async (importOriginal) => {
 });
 
 import { ArchiveSection } from "./archive-section";
+import { useUIStore } from "@/stores/ui-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
+afterEach(cleanup);
+it("offers later import even after first-run dismissal", async () => {
+  useFeatureFlags.setState({ enableAgentChat: true });
+  useUIStore.setState({ showLocalSessionImport: false, localSessionImportOfferDismissed: true });
+  setArchived([]);
+  render(<ArchiveSection />);
+  await userEvent.click(screen.getByRole("button", { name: "Import recent chats" }));
+  expect(useUIStore.getState().showLocalSessionImport).toBe(true);
+});
 
 const DAY = 86_400;
 const now = Math.floor(Date.now() / 1000);

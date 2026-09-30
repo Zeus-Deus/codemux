@@ -1933,6 +1933,8 @@ export const agentChatStopSession = (
 // ── Session history (pane-header dropdown) ──
 
 export interface AgentChatSessionRecord {
+  /** Provenance of a read-only visible-text import; absent/null for live chats. */
+  imported_from?: string | null;
   thread_id: string;
   sdk_session_id: string | null;
   workspace_id: string;
@@ -2073,6 +2075,37 @@ export const agentChatSearch = (
     workspaceIds,
     limit,
   });
+
+export interface LocalChatSession {
+  source_id: string;
+  provider: "claude" | "codex";
+  title: string;
+  cwd: string;
+  last_active_at: string;
+  message_count: number;
+  already_imported: boolean;
+}
+
+export interface LocalChatScanResult {
+  sessions: LocalChatSession[];
+  warnings: string[];
+}
+
+export interface LocalChatImportResult {
+  imported: { source_id: string; thread_id: string; workspace_id: string }[];
+  skipped: number;
+  warnings: string[];
+}
+
+export const agentChatScanLocalSessions = async () => {
+  if (isRemoteClient()) throw new Error("Recent chat import is available on the local desktop only.");
+  return invoke<LocalChatScanResult>("agent_chat_scan_local_sessions");
+};
+
+export const agentChatImportLocalSessions = async (sourceIds: string[]) => {
+  if (isRemoteClient()) throw new Error("Recent chat import is available on the local desktop only.");
+  return invoke<LocalChatImportResult>("agent_chat_import_local_sessions", { sourceIds });
+};
 
 export const agentChatOpenSearchResult = (threadId: string) =>
   invoke<OpenAgentChatSearchResult>("agent_chat_open_search_result", {

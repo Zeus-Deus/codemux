@@ -1,5 +1,6 @@
 pub mod async_questions;
 pub mod hermes;
+pub(crate) mod local_sessions;
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,9 @@ pub struct RecentProject {
 pub struct AgentChatSessionRecord {
     pub thread_id: String,
     pub sdk_session_id: Option<String>,
+    /// Local imports are read-only snapshots, not provider-native resumes.
+    #[serde(default)]
+    pub imported_from: Option<String>,
     pub workspace_id: String,
     pub cwd: Option<String>,
     pub provider: String,
@@ -351,6 +355,7 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "
@@ -3772,6 +3777,7 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         let map_row = |row: &rusqlite::Row<'_>| {
             Ok(AgentChatSessionRecord {
+                imported_from: row.get(13)?,
                 thread_id: row.get(0)?,
                 sdk_session_id: row.get(1)?,
                 workspace_id: row.get(2)?,
@@ -3796,9 +3802,9 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
                  FROM agent_chat_sessions
-                 WHERE workspace_id = ?1 AND cwd = ?2 AND sdk_session_id IS NOT NULL
+                 WHERE workspace_id = ?1 AND cwd = ?2 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?3",
             ) {
                 Ok(s) => s,
@@ -3809,9 +3815,9 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
                  FROM agent_chat_sessions
-                 WHERE workspace_id = ?1 AND sdk_session_id IS NOT NULL
+                 WHERE workspace_id = ?1 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?2",
             ) {
                 Ok(s) => s,
@@ -4440,11 +4446,12 @@ impl DatabaseStore {
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
                 Ok(AgentChatSessionRecord {
+                    imported_from: row.get(13)?,
                     thread_id: row.get(0)?,
                     sdk_session_id: row.get(1)?,
                     workspace_id: row.get(2)?,

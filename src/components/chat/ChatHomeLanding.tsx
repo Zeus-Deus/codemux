@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { LocalSessionImportEntry } from "./LocalSessionImportEntry";
 
 interface Props {
   composer: ReactNode;
@@ -20,6 +21,7 @@ export function ChatHomeLanding({ composer }: Props) {
           chat-column.ts), so the landing card lines up with the
           mid-conversation composer at every pane width. */}
       <div className="w-full">{composer}</div>
+      <LocalSessionImportEntry firstRun />
     </div>
   );
 }

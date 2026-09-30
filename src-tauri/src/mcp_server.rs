@@ -1772,6 +1772,9 @@ pub fn plan_boot_mcp_reconciliation(
     let mut path_indexes = HashMap::<String, usize>::new();
 
     for workspace in &snapshot.workspaces {
+        if workspace.is_local_import_snapshot_only() {
+            continue;
+        }
         if let Some(index) = path_indexes.get(&workspace.cwd).copied() {
             targets[index].workspace_id = workspace.workspace_id.0.clone();
         } else {
@@ -1797,20 +1800,21 @@ pub fn plan_boot_mcp_reconciliation(
 /// Apply a planned batch. Keeping execution separate from planning lets boot
 /// run the active target synchronously and move the inactive vector to a
 /// blocking worker after first paint without inspecting a checkout twice.
-pub fn reconcile_mcp_config_targets(targets: &[McpConfigReconciliationTarget]) {
-    for target in targets {
-        upsert_mcp_config(&target.workspace_dir);
-    }
+pub fn reconcile_mcp_config_targets<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    targets: &[McpConfigReconciliationTarget],
+) -> usize {
+    reconcile_live_mcp_config_targets(app, targets)
 }
 
 fn reconciliation_target_is_live(
     snapshot: &crate::state::AppStateSnapshot,
     target: &McpConfigReconciliationTarget,
 ) -> bool {
-    snapshot
-        .workspaces
-        .iter()
-        .any(|workspace| Path::new(&workspace.cwd) == target.workspace_dir)
+    snapshot.workspaces.iter().any(|workspace| {
+        !workspace.is_local_import_snapshot_only()
+            && Path::new(&workspace.cwd) == target.workspace_dir
+    })
 }
 
 fn reconcile_live_mcp_config_targets<R: tauri::Runtime>(
@@ -2614,6 +2618,248 @@ mod tests {
         cleanup(&dir);
     }
 
+    async fn assert_import_restart_is_readonly(completed: bool) {
+        use tauri::Manager;
+        const CHILD: &str = "CODEMUX_TEST_IMPORT_MCP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let name = if completed {
+                "mcp_server::tests::local_import_mcp_completed_restart_is_readonly"
+            } else {
+                "mcp_server::tests::local_import_mcp_pending_restart_is_readonly"
+            };
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", dir.path())
+                .env("APPDATA", dir.path())
+                .env("CODEMUX_TEST_LAYOUT_PATH", dir.path().join("layout.json"))
+                .output()
+                .unwrap();
+            println!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "import restart child failed");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let store = crate::state::AppStateStore::default();
+        store.clear_workspaces();
+        let existing = b"{\"mcpServers\": {\"codemux\": {\"command\": \"user-owned\"}}, \"note\": \"preserve bytes\"}\n";
+        let mut projects = Vec::new();
+        let mut sessions = Vec::new();
+        let mut excludes = Vec::new();
+        for (index, name) in ["atlas", "beacon"].iter().enumerate() {
+            let project = root.path().join(name);
+            std::fs::create_dir(&project).unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&project)
+                .status()
+                .unwrap()
+                .success());
+            let exclude = project.join(".git/info/exclude");
+            std::fs::write(&exclude, b"# user-owned exclude\nkeep-me\n").unwrap();
+            excludes.push(std::fs::read(&exclude).unwrap());
+            if index == 0 {
+                std::fs::write(project.join(".mcp.json"), existing).unwrap();
+            }
+            sessions.push(crate::local_session_import::ParsedSession {
+                source_id: format!("{}1111111-1111-4111-8111-111111111111", index + 1),
+                provider: "claude".into(),
+                cwd: project.display().to_string(),
+                last_active_at: "2026-09-29T10:00:00Z".into(),
+                messages: vec![("user".into(), "Synthetic restart".into())],
+            });
+            projects.push(project);
+        }
+        store.import_local_sessions(&db, &sessions).unwrap();
+        let first = store.snapshot().workspaces[0].workspace_id.clone();
+        assert!(store.activate_workspace(&first.0)); // Selection is not setup intent.
+        let ids: Vec<_> = sessions.iter().map(|s| s.source_id.clone()).collect();
+        if completed {
+            store.persist_local_import_layout(&db, &ids).unwrap();
+        }
+        let restarted = crate::state::AppStateStore::default();
+        restarted.clear_workspaces();
+        if completed {
+            restarted.replace_snapshot(crate::state::load_persisted_state().unwrap());
+        }
+        let recovered = restarted.recover_local_import_layout(&db).unwrap();
+        assert_eq!(recovered.len(), if completed { 0 } else { 2 });
+        if !recovered.is_empty() {
+            restarted
+                .persist_local_import_layout(&db, &recovered)
+                .unwrap();
+        }
+        assert!(db.pending_local_imports().unwrap().is_empty());
+        assert!(restarted.activate_workspace(&restarted.snapshot().workspaces[0].workspace_id.0));
+        let app = tauri::test::mock_app();
+        app.manage(restarted);
+        app.manage(db);
+        assert!(is_auto_mcp_enabled(app.handle()));
+        let plan =
+            plan_boot_mcp_reconciliation(&app.state::<crate::state::AppStateStore>().snapshot());
+        if let Some(active) = &plan.active {
+            reconcile_mcp_config_targets(app.handle(), std::slice::from_ref(active));
+        }
+        let pending = PendingMcpConfigRepairs::default();
+        pending.replace(plan.inactive.clone());
+        let handle = app.handle().clone();
+        repair_inactive_mcp_configs_inner(&pending, move |targets| {
+            reconcile_live_mcp_config_targets(&handle, targets)
+        })
+        .await
+        .unwrap();
+        let preserved = std::fs::read(projects[0].join(".mcp.json")).unwrap() == existing;
+        let absent = !projects[1].join(".mcp.json").exists();
+        let exclude_unchanged: Vec<_> = projects
+            .iter()
+            .zip(&excludes)
+            .map(|(p, before)| std::fs::read(p.join(".git/info/exclude")).unwrap() == *before)
+            .collect();
+        println!("completed={completed}; existing_mcp_preserved={preserved}; new_mcp_absent={absent}; git_excludes_unchanged={exclude_unchanged:?}");
+        assert!(
+            preserved && absent && exclude_unchanged.iter().all(|v| *v),
+            "import-only restart mutated checkout files"
+        );
+        assert!(
+            plan.active.is_none() && plan.inactive.is_empty(),
+            "import-only targets must not be planned"
+        );
+        // Exercise both native close callers against the same source files.
+        // No provider/runtime is needed: the imported panes are also valid
+        // with provider=None, and the workspace provenance must still protect
+        // the checkout. This avoids instantiating any real provider driver.
+        let store = app.state::<crate::state::AppStateStore>();
+        let mut snapshot = store.snapshot();
+        let ids: Vec<_> = snapshot
+            .workspaces
+            .iter()
+            .map(|w| w.workspace_id.0.clone())
+            .collect();
+        for workspace in &mut snapshot.workspaces {
+            for surface in &mut workspace.surfaces {
+                if let crate::state::PaneNodeSnapshot::AgentChat { provider, .. } =
+                    &mut surface.root
+                {
+                    *provider = None;
+                }
+            }
+        }
+        store.replace_snapshot(snapshot);
+        app.manage(crate::terminal::PtyState {
+            sessions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+        let db = app.state::<crate::database::DatabaseStore>();
+        crate::commands::workspace::close_workspace_with_worktree_impl(
+            app.handle().clone(),
+            &store,
+            &db,
+            ids[0].clone(),
+            false,
+            None,
+            Some(false),
+        )
+        .await
+        .unwrap();
+        crate::commands::workspace::close_workspace(
+            app.handle().clone(),
+            app.state(),
+            app.state(),
+            ids[1].clone(),
+            Some(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(projects[0].join(".mcp.json")).unwrap(),
+            existing
+        );
+        assert!(!projects[1].join(".mcp.json").exists());
+        for (project, before) in projects.iter().zip(&excludes) {
+            assert_eq!(
+                std::fs::read(project.join(".git/info/exclude")).unwrap(),
+                *before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_import_mcp_completed_restart_is_readonly() {
+        assert_import_restart_is_readonly(true).await;
+    }
+
+    #[tokio::test]
+    async fn local_import_mcp_pending_restart_is_readonly() {
+        assert_import_restart_is_readonly(false).await;
+    }
+
+    #[test]
+    fn local_import_mcp_stale_plan_rejects_import_only_but_live_same_cwd_reconciles() {
+        use tauri::Manager;
+        for preexisting in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(project.path())
+                .status()
+                .unwrap()
+                .success());
+            let exclude = project.path().join(".git/info/exclude");
+            let old_exclude = std::fs::read(&exclude).unwrap();
+            let mcp = project.path().join(".mcp.json");
+            let old_mcp = b"{\"note\": \"user owns this\"}\n";
+            if preexisting {
+                std::fs::write(&mcp, old_mcp).unwrap();
+            }
+            let store = crate::state::AppStateStore::default();
+            store.clear_workspaces();
+            let live = store.create_empty_workspace_at_path(project.path().to_path_buf());
+            let stale = plan_boot_mcp_reconciliation(&store.snapshot())
+                .active
+                .unwrap();
+            store.close_workspace(&live.0).unwrap();
+            let db = crate::database::DatabaseStore::new_in_memory();
+            let session = crate::local_session_import::ParsedSession {
+                source_id: "11111111-1111-4111-8111-111111111111".into(),
+                provider: "claude".into(),
+                cwd: project.path().display().to_string(),
+                last_active_at: "2026-09-29T10:00:00Z".into(),
+                messages: vec![("user".into(), "Synthetic".into())],
+            };
+            store.import_local_sessions(&db, &[session]).unwrap();
+            let imported = store.snapshot().workspaces[0].workspace_id.clone();
+            let app = tauri::test::mock_app();
+            app.manage(store);
+            app.manage(db);
+            assert_eq!(
+                reconcile_mcp_config_targets(app.handle(), &[stale.clone()]),
+                0
+            );
+            if preexisting {
+                assert_eq!(std::fs::read(&mcp).unwrap(), old_mcp);
+            } else {
+                assert!(!mcp.exists());
+            }
+            assert_eq!(std::fs::read(&exclude).unwrap(), old_exclude);
+            let store = app.state::<crate::state::AppStateStore>();
+            let independent = store.create_empty_workspace_at_path(project.path().to_path_buf());
+            assert!(store.activate_workspace(&imported.0));
+            let plan = plan_boot_mcp_reconciliation(&store.snapshot());
+            assert_eq!(plan.active.as_ref().unwrap().workspace_id, independent.0);
+            assert!(plan.inactive.is_empty());
+            assert_eq!(reconcile_mcp_config_targets(app.handle(), &[stale]), 1);
+            assert!(read_mcp(project.path())["mcpServers"]["codemux"].is_object());
+            assert!(std::fs::read_to_string(&exclude)
+                .unwrap()
+                .contains(".mcp.json"));
+        }
+    }
+
     #[test]
     fn boot_plan_deduplicates_cwds_and_keeps_active_first() {
         let store = crate::state::AppStateStore::default();
@@ -2655,7 +2901,9 @@ mod tests {
 
         assert_eq!(
             repair_inactive_mcp_configs_inner(&pending, |targets| {
-                reconcile_mcp_config_targets(targets);
+                for target in targets {
+                    upsert_mcp_config(&target.workspace_dir);
+                }
                 targets.len()
             })
             .await
@@ -2667,7 +2915,9 @@ mod tests {
 
         assert_eq!(
             repair_inactive_mcp_configs_inner(&pending, |targets| {
-                reconcile_mcp_config_targets(targets);
+                for target in targets {
+                    upsert_mcp_config(&target.workspace_dir);
+                }
                 targets.len()
             })
             .await

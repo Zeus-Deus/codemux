@@ -160,6 +160,8 @@ type AttachSubmode =
 
 interface Props {
   draft: string;
+  /** Retain the focused textarea while provenance is unresolved, without edits. */
+  readOnly?: boolean;
   cwd: string | null;
   provider: AgentChatProviderKind;
   model: string | null;
@@ -407,6 +409,7 @@ export function composerWidthLadder(width: number | null): ComposerWidthLadder {
 
 export function Composer({
   draft,
+  readOnly = false,
   cwd,
   provider,
   model,
@@ -2855,7 +2858,7 @@ export function Composer({
           onDragOver={handleDragOver}
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
+          onDrop={readOnly ? undefined : handleDrop}
           className={cn(
             // Stacks above the strip, whose 18px seam tucks under the pill.
             "relative z-[1] flex flex-col",
@@ -3385,11 +3388,12 @@ export function Composer({
               <textarea
                 ref={textareaRef}
                 value={draft}
-                onChange={handleTextareaChange}
+                readOnly={readOnly}
+                onChange={readOnly ? undefined : handleTextareaChange}
                 onSelect={handleSelect}
                 onScroll={handleTextareaScroll}
-                onKeyDown={handleKeyDown}
-                onPaste={handlePasteImage}
+                onKeyDown={readOnly ? undefined : handleKeyDown}
+                onPaste={readOnly ? undefined : handlePasteImage}
                 onCompositionStart={() => {
                   composingRef.current = true;
                 }}

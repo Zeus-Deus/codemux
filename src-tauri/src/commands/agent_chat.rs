@@ -445,6 +445,7 @@ struct PaneAlreadyBoundError<'a> {
 /// Render a refused pane claim as the error string the command returns.
 fn pane_claim_error(conflict: &PaneClaimConflict, requested: ProviderKind) -> String {
     match conflict {
+        PaneClaimConflict::ReadOnly(error) => error.clone(),
         PaneClaimConflict::PaneNotFound { pane_id } => format!("pane_not_found: {pane_id}"),
         PaneClaimConflict::PaneAlreadyBound {
             pane_id,
@@ -739,6 +740,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
     mut input: StartSessionInput,
     expected_thread: Option<String>,
 ) -> Result<ThreadId, String> {
+    crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
+    if let Some(state) = app.try_state::<AppStateStore>() {
+        if let Some(thread) = state.agent_chat_thread_id(&pane_id) {
+            crate::local_session_import::require_live_session(&app, &thread)?;
+        }
+    }
     if provider == ProviderKind::Hermes {
         let state: State<'_, AppStateStore> = app.state();
         let workspace = state.workspace_id_for_pane(&pane_id);
@@ -903,11 +910,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
     let claim = {
         let state: State<'_, AppStateStore> = app.state();
         state
-            .claim_agent_chat_pane(
+            .claim_agent_chat_pane_checked(
                 &pane_id,
                 provider,
                 &requested_thread_id,
                 expected_thread.as_deref(),
+                |thread| crate::local_session_import::require_live_session(&app, thread),
             )
             .map_err(|conflict| pane_claim_error(&conflict, provider))?
     };
@@ -2029,6 +2037,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     thread_id: &ThreadId,
     require_original: bool,
 ) -> Result<(), String> {
+    crate::local_session_import::require_live_session(app,&thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider_kind).await?;
     // Fast path: a live session already exists, so no need to serialize
@@ -2389,6 +2398,7 @@ pub async fn send_turn_with_origin<R: Runtime>(
     mut input: SendTurnCommandInput,
     origin: TurnOrigin,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
+    crate::local_session_import::require_live_session(&app,&input.thread_id.0)?;
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
     }
@@ -8499,6 +8509,7 @@ mod tests {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             last_active_at: None,
             last_visited_at: None,
         }

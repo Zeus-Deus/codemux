@@ -62,21 +62,19 @@ pub struct TabSnapshot {
 struct PersistDebouncer {
     pending: Arc<AtomicBool>,
     last_snapshot: Arc<Mutex<Option<PendingPersist>>>,
+    write_lock: Arc<Mutex<()>>,
 }
 
-/// What the debouncer will write when its quiet period elapses: a snapshot the
-/// emit path already had to build, or — for delta emits, which build none — a
-/// closure that clones the store at flush time. The lazy form means a burst of
-/// deltas costs one deep clone per 500 ms window instead of one per delta.
+/// Resolve current state only under the writer gate. An emitted snapshot can
+/// predate a synchronous import save even if it is queued after that save.
+/// Keeping only lazy work prevents a delayed emit from overwriting newer panes.
 enum PendingPersist {
-    Ready(Box<AppStateSnapshot>),
     Lazy(Box<dyn Fn() -> AppStateSnapshot + Send>),
 }
 
 impl PendingPersist {
     fn resolve(self) -> AppStateSnapshot {
         match self {
-            PendingPersist::Ready(snapshot) => *snapshot,
             PendingPersist::Lazy(build) => build(),
         }
     }
@@ -87,13 +85,8 @@ impl PersistDebouncer {
         Self {
             pending: Arc::new(AtomicBool::new(false)),
             last_snapshot: Arc::new(Mutex::new(None)),
+            write_lock: Arc::new(Mutex::new(())),
         }
-    }
-
-    /// Queue a persist. If a write is already scheduled, just update the
-    /// buffered snapshot — the background thread will pick up the latest value.
-    fn schedule(&self, snapshot: AppStateSnapshot) {
-        self.schedule_pending(PendingPersist::Ready(Box::new(snapshot)));
     }
 
     fn schedule_pending(&self, pending: PendingPersist) {
@@ -109,11 +102,13 @@ impl PersistDebouncer {
 
         let pending = Arc::clone(&self.pending);
         let last_snapshot = Arc::clone(&self.last_snapshot);
+        let write_lock = Arc::clone(&self.write_lock);
 
         std::thread::spawn(move || {
             // Wait for the quiet period before writing.
             std::thread::sleep(Duration::from_millis(500));
 
+            let _write_guard = write_lock.lock().unwrap();
             // Take the snapshot and clear the flag while still holding the
             // mutex. This ensures no second worker can slip through the
             // pending.swap guard between the flag clear and the file write.
@@ -151,6 +146,9 @@ fn persist_debouncer() -> &'static PersistDebouncer {
 /// Synchronously persist the current app state. Called on app close to
 /// ensure the debounced write completes before the process exits.
 pub fn flush_persisted_state(store: &AppStateStore) {
+    let debouncer = persist_debouncer();
+    let _write_guard = debouncer.write_lock.lock().unwrap();
+    debouncer.last_snapshot.lock().unwrap().take();
     let snapshot = store.snapshot();
     if let Err(e) = save_persisted_state(&snapshot) {
         eprintln!("[codemux::state] Failed to persist layout state on close: {e}");
@@ -645,6 +643,12 @@ pub struct WorkspaceSnapshot {
     /// deserialize as `false`.
     #[serde(default)]
     pub attach_only: bool,
+    /// Persisted import-shell provenance, independent of mutable host metadata
+    /// and pane bindings. Only import/recovery sets true; opening an ordinary
+    /// live workspace sets false, even at a shared CWD. Tab selection never
+    /// clears it. None denotes a layout written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_snapshot_only: Option<bool>,
     /// Ms epoch of the last time an agent in this workspace genuinely did
     /// something — stamped when any of its panes transitions to a
     /// non-idle status (working / waiting on permission / finished
@@ -676,6 +680,17 @@ pub struct WorkspaceSnapshot {
     /// old persisted state deserializes as `None`.
     #[serde(default)]
     pub last_visited_at: Option<i64>,
+}
+
+impl WorkspaceSnapshot {
+    /// Legacy import shells were the only attach-only workspaces without a
+    /// host id or remote cwd. Remote attach-in-place shells retain remote_cwd
+    /// even on host reassignment. New layouts use explicit provenance so host
+    /// or pane metadata changes cannot silently grant checkout write intent.
+    pub fn is_local_import_snapshot_only(&self) -> bool {
+        self.imported_snapshot_only
+            .unwrap_or(self.attach_only && self.host_id.is_none() && self.remote_cwd.is_none())
+    }
 }
 
 /// A workspace the user archived: the workspace itself is closed (no
@@ -1215,7 +1230,14 @@ impl AppStateStore {
         })
     }
 
-    pub fn replace_snapshot(&self, snapshot: AppStateSnapshot) {
+    pub fn replace_snapshot(&self, mut snapshot: AppStateSnapshot) {
+        // Seal legacy provenance at restore, before mutable host/pane metadata
+        // can change. Ordinary and remote shells stay independently live.
+        for workspace in &mut snapshot.workspaces {
+            if workspace.imported_snapshot_only.is_none() {
+                workspace.imported_snapshot_only = Some(workspace.is_local_import_snapshot_only());
+            }
+        }
         *self.inner.lock().unwrap() = snapshot;
     }
 
@@ -1586,6 +1608,178 @@ impl AppStateStore {
         })
     }
 
+    /// Stage all pane mutations against a private clone; publish only after the
+    /// SQLite transaction commits. Holding this lock serializes workspace claims
+    /// with all other app mutations; failed inserts leave both stores unchanged.
+    pub(crate) fn import_local_sessions(
+        &self,
+        db: &crate::database::DatabaseStore,
+        sessions: &[crate::local_session_import::ParsedSession],
+    ) -> Result<crate::local_session_import::ImportResponse, String> {
+        let mut current = self.inner.lock().unwrap();
+        let mut candidate = current.clone();
+        let selection = candidate.active_workspace_id.clone();
+        let response = db.write_local_imports(sessions, |session| {
+            let workspace = candidate
+                .workspaces
+                .iter()
+                .find(|w| w.cwd == session.cwd && w.host_id.is_none())
+                .map(|w| w.workspace_id.clone())
+                .unwrap_or_else(|| {
+                    let id = Self::create_empty_workspace_at_path_locked(
+                        &mut candidate,
+                        PathBuf::from(&session.cwd),
+                    );
+                    if let Some(w) = candidate
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.workspace_id == id)
+                    {
+                        w.is_git = false;
+                        w.attach_only = true;
+                        w.imported_snapshot_only = Some(true);
+                    }
+                    id
+                });
+            Self::add_import_snapshot_pane(
+                &mut candidate,
+                &workspace.0,
+                &session.provider,
+                &session.cwd,
+                &session.thread_id(),
+                &session.title(),
+            )?;
+            Ok(workspace.0)
+        })?;
+        Self::restore_import_selection(&current, &mut candidate);
+        candidate.active_workspace_id = selection;
+        *current = candidate;
+        Ok(response)
+    }
+    pub(crate) fn persist_local_import_layout(
+        &self,
+        db: &crate::database::DatabaseStore,
+        ids: &[String],
+    ) -> Result<(), String> {
+        let debouncer = persist_debouncer();
+        let _write_guard = debouncer.write_lock.lock().unwrap();
+        debouncer.last_snapshot.lock().unwrap().take();
+        save_persisted_state(&self.snapshot())?;
+        db.complete_local_import_layout(ids)
+    }
+    pub(crate) fn recover_local_import_layout(
+        &self,
+        db: &crate::database::DatabaseStore,
+    ) -> Result<Vec<String>, String> {
+        let mut current = self.inner.lock().unwrap();
+        let mut candidate = current.clone();
+        let selection = candidate.active_workspace_id.clone();
+        let pending = db.pending_local_imports()?;
+        let mut ids = Vec::new();
+        for (source, thread, provider, workspace, cwd) in pending {
+            let Some(record) = db.get_agent_chat_session(&thread) else {
+                ids.push(source);
+                continue;
+            };
+            if !candidate
+                .workspaces
+                .iter()
+                .any(|w| w.workspace_id.0 == workspace)
+            {
+                let id = Self::create_empty_workspace_at_path_locked(
+                    &mut candidate,
+                    PathBuf::from(&cwd),
+                );
+                let w = candidate
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace_id == id)
+                    .unwrap();
+                w.workspace_id = WorkspaceId(workspace.clone());
+                w.is_git = false;
+                w.attach_only = true;
+                w.imported_snapshot_only = Some(true);
+            }
+            Self::add_import_snapshot_pane(
+                &mut candidate,
+                &workspace,
+                &provider,
+                &cwd,
+                &thread,
+                record.title.as_deref().unwrap_or("Imported conversation"),
+            )?;
+            ids.push(source);
+        }
+        Self::restore_import_selection(&current, &mut candidate);
+        candidate.active_workspace_id = selection;
+        restore_session_ids(&candidate);
+        *current = candidate;
+        Ok(ids)
+    }
+    fn restore_import_selection(before: &AppStateSnapshot, after: &mut AppStateSnapshot) {
+        for old in &before.workspaces {
+            if let Some(w) = after
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id == old.workspace_id)
+            {
+                w.active_tab_id = old.active_tab_id.clone();
+                w.active_surface_id = old.active_surface_id.clone();
+                for surface in &old.surfaces {
+                    if let Some(s) = w
+                        .surfaces
+                        .iter_mut()
+                        .find(|s| s.surface_id == surface.surface_id)
+                    {
+                        s.active_pane_id = surface.active_pane_id.clone();
+                    }
+                }
+            }
+        }
+    }
+    fn add_import_snapshot_pane(
+        snapshot: &mut AppStateSnapshot,
+        workspace: &str,
+        provider: &str,
+        cwd: &str,
+        thread: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        let provider = match provider {
+            "claude" => crate::agent_provider::ProviderKind::Claude,
+            "codex" => crate::agent_provider::ProviderKind::Codex,
+            _ => return Err("unsupported_import_provider".into()),
+        };
+        let (pane, created) = Self::create_chat_pane_locked(
+            snapshot,
+            workspace,
+            Some(provider),
+            Some(cwd.into()),
+            Some(crate::presets::LaunchMode::NewTab),
+            Some(thread.into()),
+        )?;
+        if created {
+            let w = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id.0 == workspace)
+                .unwrap();
+            if let Some(surface) = w.surfaces.iter_mut().find(|s| s.active_pane_id == pane) {
+                surface.title = title.into();
+                if let PaneNodeSnapshot::AgentChat { title: t, .. } = &mut surface.root {
+                    *t = title.into();
+                }
+                if let Some(tab) = w
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.surface_id.as_ref() == Some(&surface.surface_id))
+                {
+                    tab.title = title.into();
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn create_workspace(&self) -> WorkspaceId {
         self.create_workspace_at_path(current_project_root())
     }
@@ -1686,6 +1880,7 @@ impl AppStateStore {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
         });
@@ -1775,6 +1970,7 @@ impl AppStateStore {
             host_id: Some(host_id),
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             // Adoption is not activity. This workspace has a history — it
             // just happened on another device — so stamping `now` would tell
             // the idle sweep a month-old checkout is brand new, and the boot
@@ -1849,6 +2045,7 @@ impl AppStateStore {
             host_id: Some(host_id),
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             // Same as [`create_synced_workspace_shell`]: an adopted root
             // carries history from the device that made it, so it is left
             // unknown for the backfill to date rather than faked as `now`.
@@ -1969,6 +2166,7 @@ impl AppStateStore {
             host_id: Some(host_id),
             remote_cwd: Some(remote_cwd),
             attach_only: true,
+            imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
         });
@@ -2130,6 +2328,7 @@ impl AppStateStore {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
         });
@@ -2610,7 +2809,33 @@ impl AppStateStore {
         thread_id: &str,
         expected_thread: Option<&str>,
     ) -> Result<AgentChatPaneClaim, PaneClaimConflict> {
+        self.claim_agent_chat_pane_checked(
+            pane_id,
+            provider,
+            thread_id,
+            expected_thread,
+            |_| Ok(()),
+        )
+    }
+
+    /// Validate both threads while holding the same lock as the binding CAS.
+    /// Callers checking database provenance use the state -> database lock order,
+    /// also used by import_local_sessions; never a provider-dependent lookup.
+    pub(crate) fn claim_agent_chat_pane_checked(
+        &self,
+        pane_id: &str,
+        provider: crate::agent_provider::ProviderKind,
+        thread_id: &str,
+        expected_thread: Option<&str>,
+        check_live: impl Fn(&str) -> Result<(), String>,
+    ) -> Result<AgentChatPaneClaim, PaneClaimConflict> {
         let mut snapshot = self.inner.lock().unwrap();
+        let validate = |thread: &str| {
+            crate::local_session_import::require_live_thread(thread)
+                .and_then(|()| check_live(thread))
+                .map_err(PaneClaimConflict::ReadOnly)
+        };
+        validate(thread_id)?;
         let binding = snapshot
             .workspaces
             .iter_mut()
@@ -2623,6 +2848,7 @@ impl AppStateStore {
         };
 
         if let Some(current) = current_thread.as_deref() {
+            validate(current)?;
             let accepted = current == thread_id || expected_thread == Some(current);
             if !accepted {
                 return Err(PaneClaimConflict::PaneAlreadyBound {
@@ -5531,7 +5757,18 @@ pub fn emit_app_state<R: tauri::Runtime>(app: &AppHandle<R>) {
     }
     // Persist asynchronously with debounce — rapid consecutive calls (e.g.
     // swap + multiple resize events) collapse into a single disk write.
-    persist_debouncer().schedule(snapshot);
+    #[cfg(test)]
+    EMIT_PERSIST_TEST_HOOK.with(|hook| {
+        if let Some(pause) = hook.borrow_mut().take() {
+            pause();
+        }
+    });
+    schedule_persist_current(app);
+}
+
+#[cfg(test)]
+thread_local! {
+    static EMIT_PERSIST_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
 /// Coalesce many emits into one. The first call schedules a worker
@@ -5800,6 +6037,8 @@ pub struct AgentChatPaneClaim {
 /// Why a [`AppStateStore::claim_agent_chat_pane`] was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneClaimConflict {
+    /// Read-only provenance or reserved namespace; the pane stays untouched.
+    ReadOnly(String),
     /// No `AgentChat` pane with this id exists (closed, or never created).
     PaneNotFound { pane_id: String },
     /// Another thread already owns the pane. Carries the binding in force
@@ -6006,6 +6245,7 @@ fn default_app_state() -> AppStateSnapshot {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
             last_visited_at: Some(current_time_ms_signed()),
         }],
@@ -6269,6 +6509,12 @@ fn normalize_sizes(mut sizes: Vec<f32>) -> Vec<f32> {
 }
 
 fn persisted_layout_path() -> Option<PathBuf> {
+    // Windows config_dir uses a Known Folder API, not APPDATA overrides.
+    // Subprocess-only fixtures must never fall back to the user's layout.
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("CODEMUX_TEST_LAYOUT_PATH") {
+        return Some(PathBuf::from(path));
+    }
     let base = dirs::config_dir()?;
     Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
 }
@@ -6342,20 +6588,93 @@ fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
 }
 
 fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
-    let Some(path) = persisted_layout_path() else {
-        return Ok(());
-    };
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create config dir: {error}"))?;
-    }
+    use std::io::Write;
+    let path = persisted_layout_path().ok_or("No config directory for layout persistence")?;
+    let parent = path
+        .parent()
+        .ok_or("No parent directory for layout persistence")?;
+    fs::create_dir_all(parent).map_err(|error| format!("Failed to create config dir: {error}"))?;
 
     let snapshot = persistable_snapshot(snapshot);
-
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
-    fs::write(path, json).map_err(|error| format!("Failed to write layout state: {error}"))
+    // Same-directory temporary file keeps replacement atomic. A short write or
+    // failed file sync leaves the previous layout untouched and the journal pending.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Failed to create layout temporary file: {error}"))?;
+    temporary
+        .write_all(json.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("Failed to write/sync layout state: {error}"))?;
+    #[cfg(not(windows))]
+    temporary
+        .persist(&path)
+        .map_err(|error| format!("Failed to replace layout state: {error}"))?;
+    // Commit the directory entry before SQLite may mark the layout complete.
+    // After a rename, a sync failure still leaves a whole valid layout, but the
+    // caller must keep the recovery journal pending because durability is unknown.
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Failed to sync layout directory: {error}"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_NORMAL, MOVEFILE_REPLACE_EXISTING,
+            MOVEFILE_WRITE_THROUGH,
+        };
+        // File bytes were synced through the writable temporary handle above.
+        // Windows does not support the Unix read-only-directory flush contract.
+        // MoveFileExW WRITE_THROUGH does not return until the move is on disk:
+        // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
+        // Same-directory replacement, without COPY_ALLOWED, never degrades to
+        // a cross-volume copy/delete. Durability depends on the filesystem and
+        // storage honoring this API, not a claimed universal power-cut guarantee.
+        let source = fs::canonicalize(temporary.path())
+            .map_err(|error| format!("Failed to resolve layout temporary path: {error}"))?;
+        let destination = fs::canonicalize(parent)
+            .map_err(|error| format!("Failed to resolve layout directory: {error}"))?
+            .join(path.file_name().ok_or("No layout file name")?);
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // Match tempfile::persist's Windows attribute contract: a named temp
+        // starts with FILE_ATTRIBUTE_TEMPORARY, unsuitable for durable layout.
+        // This does not change its inherited ACL or the Unix permission mode.
+        // SAFETY: source is an owned, NUL-terminated UTF-16 path.
+        if unsafe { SetFileAttributesW(source.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
+            return Err(format!(
+                "Failed to normalize layout file attributes: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| format!("Failed to sync layout file attributes: {error}"))?;
+        // into_temp_path closes the file before rename and keeps failure cleanup.
+        let _temporary_path = temporary.into_temp_path();
+        // SAFETY: both buffers are owned, NUL-terminated UTF-16 paths and stay
+        // alive for the call. Flags request immediate same-volume replacement.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "Failed to replace/sync layout state: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn find_workspace_id_for_session(
@@ -9370,6 +9689,345 @@ mod tests {
 
     /// The compare-and-set that keeps a second client from stealing a pane
     /// whose session is still spawning, plus the rollback path.
+    #[test]
+    fn local_import_workspace_classification_survives_host_metadata_changes() {
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let session = crate::local_session_import::ParsedSession {
+            source_id: "11111111-1111-4111-8111-111111111111".into(),
+            provider: "claude".into(),
+            cwd: "/synthetic/project".into(),
+            last_active_at: "2026-09-29T10:00:00Z".into(),
+            messages: vec![("user".into(), "Synthetic".into())],
+        };
+        store.import_local_sessions(&db, &[session]).unwrap();
+        let id = store.snapshot().workspaces[0].workspace_id.clone();
+        assert!(store.snapshot().workspaces[0].is_local_import_snapshot_only());
+        store.set_workspace_host_id(&id.0, Some(17)).unwrap();
+        let saved: AppStateSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&store.snapshot()).unwrap()).unwrap();
+        assert!(
+            saved.workspaces[0].is_local_import_snapshot_only(),
+            "host metadata is not live-workspace intent"
+        );
+        let mut legacy = store.snapshot();
+        legacy.workspaces[0].host_id = None;
+        legacy.workspaces[0].imported_snapshot_only = None;
+        assert!(legacy.workspaces[0].is_local_import_snapshot_only());
+        let mut remote = legacy.workspaces[0].clone();
+        remote.remote_cwd = Some("/remote/project".into());
+        assert!(
+            !remote.is_local_import_snapshot_only(),
+            "legacy remote attachment is not imported history"
+        );
+        store.replace_snapshot(legacy);
+        store.set_workspace_host_id(&id.0, Some(17)).unwrap();
+        assert!(
+            store.snapshot().workspaces[0].is_local_import_snapshot_only(),
+            "restoring a legacy import must seal its classification"
+        );
+    }
+
+    #[test]
+    fn local_import_windows_layout_writer_has_no_readonly_directory_flush() {
+        // Static API-contract regression, runnable on Linux. This is not a
+        // Windows runtime test: FlushFileBuffers requires GENERIC_WRITE and
+        // opening a directory for write is not a supported substitute.
+        let source = include_str!("state_impl.rs");
+        let writer = source
+            .split("fn save_persisted_state(")
+            .nth(1)
+            .unwrap()
+            .split("fn find_workspace_id_for_session(")
+            .next()
+            .unwrap();
+        let windows = writer.split("#[cfg(windows)]").nth(1).unwrap();
+        assert!(
+            !windows.contains(".open(parent)"),
+            "Windows cannot acknowledge durability by flushing a read-only directory"
+        );
+        assert!(windows.contains("MoveFileExW("));
+        assert!(windows.contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH"));
+        assert!(windows.contains("last_os_error()"));
+        assert!(windows.contains("SetFileAttributesW("), "persisted layouts must not retain tempfile's FILE_ATTRIBUTE_TEMPORARY consistency contract");
+    }
+
+    #[cfg(windows)]
+    fn windows_layout_fixture_child(test: &str) -> bool {
+        if std::env::var_os("CODEMUX_TEST_LAYOUT_PATH").is_some() {
+            return false;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("CODEMUX_TEST_LAYOUT_PATH", root.path().join("layout.json"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Windows layout child: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_import_windows_layout_replacement_completes_journal_and_ordinary_saves() {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
+        if windows_layout_fixture_child("state::state_impl::tests::local_import_windows_layout_replacement_completes_journal_and_ordinary_saves") { return; }
+        let path = persisted_layout_path().unwrap();
+        for existing in [false, true] {
+            let _ = fs::remove_file(&path);
+            let store = AppStateStore::default();
+            store.clear_workspaces();
+            if existing {
+                save_persisted_state(&store.snapshot()).unwrap();
+            }
+            let db = crate::database::DatabaseStore::new_in_memory();
+            let session = crate::local_session_import::ParsedSession {
+                source_id: "11111111-1111-4111-8111-111111111111".into(),
+                provider: "claude".into(),
+                cwd: path.parent().unwrap().display().to_string(),
+                last_active_at: "2026-09-29T10:00:00Z".into(),
+                messages: vec![("user".into(), "Synthetic".into())],
+            };
+            store
+                .import_local_sessions(&db, &[session.clone()])
+                .unwrap();
+            assert_eq!(db.pending_local_imports().unwrap().len(), 1);
+            store
+                .persist_local_import_layout(&db, &[session.source_id])
+                .unwrap();
+            assert!(db.pending_local_imports().unwrap().is_empty());
+            assert_eq!(load_persisted_state().unwrap().workspaces.len(), 1);
+            assert_eq!(
+                fs::metadata(&path).unwrap().file_attributes() & FILE_ATTRIBUTE_TEMPORARY,
+                0
+            );
+            store.create_empty_workspace_at_path(path.parent().unwrap().join("ordinary-close"));
+            flush_persisted_state(&store);
+            assert_eq!(load_persisted_state().unwrap().workspaces.len(), 2);
+            let app = tauri::test::mock_app();
+            app.manage(store);
+            app.state::<AppStateStore>()
+                .create_empty_workspace_at_path(path.parent().unwrap().join("ordinary-deferred"));
+            schedule_persist_current(app.handle());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if load_persisted_state().is_some_and(|s| s.workspaces.len() == 3) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "deferred Windows save did not replace valid layout"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_import_windows_failed_replacement_preserves_layout_and_pending_journal() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        if windows_layout_fixture_child("state::state_impl::tests::local_import_windows_failed_replacement_preserves_layout_and_pending_journal") { return; }
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        save_persisted_state(&store.snapshot()).unwrap();
+        let path = persisted_layout_path().unwrap();
+        let old = fs::read(&path).unwrap();
+        // Real sharing violation: hold the destination without FILE_SHARE_DELETE.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let session = crate::local_session_import::ParsedSession {
+            source_id: "11111111-1111-4111-8111-111111111111".into(),
+            provider: "claude".into(),
+            cwd: path.parent().unwrap().display().to_string(),
+            last_active_at: "2026-09-29T10:00:00Z".into(),
+            messages: vec![("user".into(), "Synthetic".into())],
+        };
+        store
+            .import_local_sessions(&db, &[session.clone()])
+            .unwrap();
+        assert!(store
+            .persist_local_import_layout(&db, &[session.source_id.clone()])
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), old);
+        assert!(serde_json::from_slice::<AppStateSnapshot>(&old).is_ok());
+        assert_eq!(db.pending_local_imports().unwrap().len(), 1);
+        drop(locked);
+        store
+            .persist_local_import_layout(&db, &[session.source_id])
+            .unwrap();
+        assert!(db.pending_local_imports().unwrap().is_empty());
+        assert_eq!(load_persisted_state().unwrap().workspaces.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_import_paused_preimport_emit_cannot_overwrite_durable_import() {
+        const CHILD: &str = "CODEMUX_TEST_STALE_EMIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "state::state_impl::tests::local_import_paused_preimport_emit_cannot_overwrite_durable_import", "--nocapture"])
+                .env(CHILD, "1").env("XDG_CONFIG_HOME", dir.path()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "stale emit child: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let app = tauri::test::mock_app();
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        app.manage(store);
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let handle = app.handle().clone();
+        let emitter = std::thread::spawn(move || {
+            EMIT_PERSIST_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    captured_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }))
+            });
+            emit_app_state(&handle);
+        });
+        captured_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let session = crate::local_session_import::ParsedSession {
+            source_id: "11111111-1111-4111-8111-111111111111".into(),
+            provider: "claude".into(),
+            cwd: "/synthetic/project".into(),
+            last_active_at: "2026-09-29T10:00:00Z".into(),
+            messages: vec![("user".into(), "Synthetic prompt".into())],
+        };
+        let store = app.state::<AppStateStore>();
+        store
+            .import_local_sessions(&db, &[session.clone()])
+            .unwrap();
+        store
+            .persist_local_import_layout(&db, &[session.source_id.clone()])
+            .unwrap();
+        assert!(db.pending_local_imports().unwrap().is_empty());
+        assert_eq!(load_persisted_state().unwrap().workspaces.len(), 1);
+        let debouncer = persist_debouncer();
+        // Own the writer gate before allowing the old emit to schedule. Resolve
+        // its exact queued payload through the same flush path, without timers.
+        let _write_guard = debouncer.write_lock.lock().unwrap();
+        resume_tx.send(()).unwrap();
+        emitter.join().unwrap();
+        let pending = debouncer.last_snapshot.lock().unwrap().take().unwrap();
+        save_persisted_state(&pending.resolve()).unwrap();
+        let saved = load_persisted_state().unwrap();
+        assert_eq!(
+            saved.workspaces.len(),
+            1,
+            "late preimport emit must not erase imported workspace"
+        );
+        assert!(find_agent_chat_pane_id(
+            &saved.workspaces[0].surfaces[0].root,
+            &session.thread_id()
+        )
+        .is_some());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn local_import_interrupted_layout_write_preserves_old_bytes_and_pending_journal() {
+        const CHILD: &str = "CODEMUX_TEST_INTERRUPTED_LAYOUT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "state::state_impl::tests::local_import_interrupted_layout_write_preserves_old_bytes_and_pending_journal", "--nocapture"])
+                .env(CHILD, "1").env("XDG_CONFIG_HOME", dir.path()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "interrupted writer child: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        save_persisted_state(&store.snapshot()).unwrap();
+        let path = persisted_layout_path().unwrap();
+        let old = fs::read(&path).unwrap();
+        let session = crate::local_session_import::ParsedSession {
+            source_id: "11111111-1111-4111-8111-111111111111".into(),
+            provider: "claude".into(),
+            cwd: "/synthetic/project".into(),
+            last_active_at: "2026-09-29T10:00:00Z".into(),
+            messages: vec![("user".into(), "Synthetic prompt".into())],
+        };
+        store
+            .import_local_sessions(&db, &[session.clone()])
+            .unwrap();
+        // Real OS short write: a regular file write is interrupted at 64 bytes.
+        // Confined to this subprocess, never the test runner or shared cache.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+        }
+        assert!(store
+            .persist_local_import_layout(&db, &[session.source_id.clone()])
+            .is_err());
+        assert_eq!(
+            db.pending_local_imports().unwrap().len(),
+            1,
+            "journal must stay pending"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            old,
+            "failed writer must preserve exact old valid layout bytes"
+        );
+        let _: AppStateSnapshot = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    }
+    #[test]
+    fn local_import_atomic_claim_rejects_malformed_reserved_binding() {
+        use crate::agent_provider::ProviderKind;
+        let store = AppStateStore::default();
+        let workspace = store.snapshot().active_workspace_id;
+        let pane = store
+            .create_agent_chat_pane(
+                &workspace.0,
+                None,
+                None,
+                None,
+                Some("local-import-synthetic".into()),
+            )
+            .unwrap();
+        let before = serde_json::to_value(store.snapshot()).unwrap();
+        let result = store.claim_agent_chat_pane(
+            &pane.0,
+            ProviderKind::Codex,
+            "fresh-thread",
+            Some("local-import-synthetic"),
+        );
+        assert!(
+            result.is_err(),
+            "malformed imported pane must not be claimed"
+        );
+        assert_eq!(serde_json::to_value(store.snapshot()).unwrap(), before);
+    }
     #[test]
     fn claim_agent_chat_pane_rejects_a_competing_thread() {
         use crate::agent_provider::ProviderKind;

@@ -1,3 +1,4 @@
+import { LocalSessionImportEntry } from "@/components/chat/LocalSessionImportEntry";
 import { FolderOpen, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { WindowChrome } from "@/components/layout/window-chrome";
@@ -37,6 +38,8 @@ export function EmptyState() {
             Open a local folder with your code
           </div>
         </button>
+
+        <div className="mt-6 max-w-[400px]"><LocalSessionImportEntry firstRun /></div>
 
         {/* New project link */}
         <div className="mt-6 flex flex-col items-center gap-2">

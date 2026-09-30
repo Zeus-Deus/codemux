@@ -13,6 +13,7 @@ import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store
 import { TranscriptCacheMount } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
 import { MessageList } from "./MessageList";
+import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
@@ -60,6 +61,10 @@ interface Props {
   /** The session's chat provider. Forwarded to MessageList to brand the
    *  assistant-turn avatar with the provider's official mark. */
   provider?: AgentChatProviderKind | null;
+  /** Explicit pane permission for portal intent capture; unknown provenance is denied. */
+  runtimeIntentAllowed?: boolean;
+  /** Text-only snapshots must not automatically load linked resources. */
+  passive?: boolean;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -112,6 +117,8 @@ export const ChatTranscript = memo(function ChatTranscript({
   messageJumpRequest,
   sessionStartedAt,
   provider,
+  runtimeIntentAllowed = false,
+  passive = false,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -144,6 +151,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   );
 
   const list = (
+    <ChatMarkdownPassiveContext.Provider value={passive}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -174,11 +182,12 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+    </ChatMarkdownPassiveContext.Provider>
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The
   // sole pane is already active; reproduce only AgentChatPane's runtime-intent
   // capture here. The uncached path still bubbles through the normal pane.
-  const observeIntent = () => { if (provider) useProviderRuntimeIntent.getState().observe(provider); };
+  const observeIntent = () => { if (runtimeIntentAllowed && provider) useProviderRuntimeIntent.getState().observe(provider); };
   return (
     <div ref={rootRef} className="flex-1 min-h-0 w-full">
       {cacheKey ? <TranscriptCacheMount cacheKey={cacheKey}>

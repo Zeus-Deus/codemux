@@ -28,6 +28,16 @@ it("keeps provider runtime intent on cached transcript interactions despite port
   expect(intent.observe).toHaveBeenCalledTimes(3);
   expect(intent.observe).toHaveBeenLastCalledWith("claude");
 });
+it("does not record runtime intent from a readonly cached transcript", () => {
+  intent.observe.mockClear();
+  const view = render(<Harness id="a" runtimeIntentAllowed={false} />);
+  const row = view.getByText("a");
+  expect(row.closest('[data-transcript-cache-host]')).not.toBeNull();
+  fireEvent.pointerDown(row);
+  fireEvent.keyDown(row, { key: "Enter" });
+  fireEvent.focus(row);
+  expect(intent.observe).not.toHaveBeenCalled();
+});
 it("falls back for a transient local thread mismatch without caching its DOM", () => {
   const view = render(<Harness id="a" mismatch />);
   const row = view.getByText("a");
@@ -42,10 +52,10 @@ it("supports an unbound standalone transcript", () => {
 });
 const binding = (id: string): TranscriptBinding => ({ key: id, workspaceId: id, threadKey: `thread-${id}`, cwd: "/project", provider: "claude" });
 const props = (id: string) => ({ messages: [{ kind: "assistant_message", id, seq: 1, text: id, streaming: false, turn_id: "t" }] as ChatViewItem[], streaming: false, workspaceId: id, threadKey: `thread-${id}`, cwd: "/project", provider: "claude" as const, onRespondToRequest: vi.fn(), onAcceptPlan: vi.fn(), onRejectPlan: vi.fn() });
-function Harness({ id, callback = vi.fn(), mismatch = false }: { id: string; callback?: (id: string) => void; mismatch?: boolean }) {
+function Harness({ id, callback = vi.fn(), mismatch = false, runtimeIntentAllowed = true }: { id: string; callback?: (id: string) => void; mismatch?: boolean; runtimeIntentAllowed?: boolean }) {
   return <TranscriptCacheProvider activeKey={id} validKeys={["a", "b"]}>
     <TranscriptBindingContext.Provider value={binding(id)}>
-      <ChatTranscript key={id} {...props(id)} threadKey={mismatch ? "other" : `thread-${id}`} onAcceptPlan={callback} />
+      <ChatTranscript key={id} {...props(id)} runtimeIntentAllowed={runtimeIntentAllowed} threadKey={mismatch ? "other" : `thread-${id}`} onAcceptPlan={callback} />
     </TranscriptBindingContext.Provider>
   </TranscriptCacheProvider>;
 }
