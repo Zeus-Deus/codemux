@@ -1,5 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -26,6 +26,11 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { skillsSyncNow, skillsSyncStatus } from "@/tauri/commands";
 import { SyncStatusDisplay, SyncStateIcon } from "./sync-status-display";
+import { useAuthStore } from "@/stores/auth-store";
+
+beforeEach(() => {
+  useAuthStore.setState({ sessionStatus: "verified" });
+});
 
 afterEach(() => {
   cleanup();
@@ -108,6 +113,72 @@ describe("SyncStatusDisplay", () => {
     expect(await screen.findByText("Sync error")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent(/Network unreachable/);
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it.each(["verified", "offline"] as const)(
+    "renders network failures neutrally while the auth session is %s",
+    async (sessionStatus) => {
+      useAuthStore.setState({ sessionStatus });
+      vi.mocked(skillsSyncStatus).mockResolvedValue({
+        state: "error",
+        lastError: "network: error sending request for url (https://example.com/api/skills)",
+        atMillis: Date.now(),
+      });
+      render(<SyncStatusDisplay />);
+
+      expect(await screen.findByRole("status")).toHaveTextContent(/offline.+cached settings/i);
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("Sync error")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    },
+  );
+
+  it("shows offline status while the initial skills status is pending", () => {
+    useAuthStore.setState({ sessionStatus: "offline" });
+    vi.mocked(skillsSyncStatus).mockReturnValue(new Promise(() => {}));
+    render(<SyncStatusDisplay />);
+    expect(screen.getByRole("status")).toHaveTextContent(/offline.+cached settings/i);
+  });
+
+  it.each([
+    "list_skills: HTTP 401 Unauthorized",
+    "list_skills: HTTP 500 Internal Server Error",
+    "parse list_skills: invalid JSON",
+    "write tmp mapping: permission denied",
+    "list_skills: HTTP 403: network policy forbids access",
+    "unknown sync failure",
+  ])("keeps actionable errors visible even offline: %s", async (lastError) => {
+    useAuthStore.setState({ sessionStatus: "offline" });
+    vi.mocked(skillsSyncStatus).mockResolvedValue({
+      state: "error",
+      lastError,
+      atMillis: Date.now(),
+    });
+    render(<SyncStatusDisplay />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(lastError);
+    expect(screen.getByText("Sync error")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("recovers from offline after an auth update and successful sync event", async () => {
+    useAuthStore.setState({ sessionStatus: "offline" });
+    vi.mocked(skillsSyncStatus).mockResolvedValue({
+      state: "error",
+      lastError: "network: connection refused",
+      atMillis: Date.now(),
+    });
+    render(<SyncStatusDisplay />);
+    await screen.findByRole("status");
+    act(() => {
+      useAuthStore.setState({ sessionStatus: "verified" });
+      capturedEventCallback!({ state: "idle", lastSyncAtMillis: Date.now() });
+    });
+    expect(await screen.findByText("Sync ready")).toBeInTheDocument();
+    expect(screen.getByText(/Last synced just now/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sync now" })).toBeEnabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("Sync now button calls skillsSyncNow and disables until post-cycle event arrives", async () => {
