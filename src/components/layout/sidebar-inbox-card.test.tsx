@@ -170,6 +170,58 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe("SidebarInboxCard — repeated project title", () => {
+  it.each([null, "working"] as const)(
+    "places the project avatar beside the repeated title (%s)",
+    (status) => {
+      const { card } = renderCard({
+        status,
+        workspace: makeWorkspace({ title: "myapp" }),
+      });
+      const title = within(card).getByText("myapp");
+      const avatar = within(card).getByText("M");
+      expect(title.parentElement).toContainElement(avatar);
+      expect(within(card).getAllByText("myapp")).toHaveLength(1);
+      if (status === "working") {
+        expect(within(card).getByRole("status")).toHaveTextContent("Working");
+      }
+    },
+  );
+});
+
+describe("SidebarInboxCard — git line labels", () => {
+  it.each([
+    [1, 0, "1 line added, 0 removed", "+1"],
+    [0, 1, "0 lines added, 1 removed", "−1"],
+  ] as const)("labels one-sided changes (%i added, %i removed)", (added, removed, label, text) => {
+    const { card } = renderCard({
+      workspace: makeWorkspace({ git_additions: added, git_deletions: removed }),
+    });
+    const stats = within(card).getByRole("img", { name: label });
+    expect(stats).toHaveAttribute("title", label);
+    expect(stats).toHaveTextContent(text);
+  });
+
+  it("does not expose line counts when git stats are hidden", () => {
+    const { card } = renderCard({
+      showGitStats: false,
+      workspace: makeWorkspace({ git_additions: 11, git_deletions: 3 }),
+    });
+    expect(within(card).queryByRole("img", { name: /lines added/ })).toBeNull();
+  });
+
+  it("explains additions and deletions without changing their compact text", () => {
+    const { card } = renderCard({
+      workspace: makeWorkspace({ git_additions: 11, git_deletions: 3 }),
+    });
+    const stats = within(card).getByRole("img", {
+      name: "11 lines added, 3 removed",
+    });
+    expect(stats).toHaveAttribute("title", "11 lines added, 3 removed");
+    expect(stats).toHaveTextContent("+11 −3");
+  });
+});
+
 describe("SidebarInboxCard — snooze affordance", () => {
   it("offers Snooze under the same guardrail as Settle", () => {
     for (const status of ["working", "permission"] as ActivePaneStatus[]) {

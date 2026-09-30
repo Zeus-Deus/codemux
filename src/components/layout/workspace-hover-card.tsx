@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "lucide-react";
 import {
   HoverCard,
@@ -96,6 +96,7 @@ export function WorkspaceHoverCard({
   children,
 }: Props) {
   const groupActive = useHoverCardGroupActive();
+  const suppressUntilPointerLeave = useRef(false);
   // `instant` is captured when the card opens, not read live, and it governs
   // BOTH ends of the card's motion (see `data-instant` in
   // `@/components/ui/hover-card`). A card that DID wait its delay animates in
@@ -109,6 +110,7 @@ export function WorkspaceHoverCard({
   });
 
   const handleOpenChange = useCallback((next: boolean) => {
+    if (next && suppressUntilPointerLeave.current) return;
     // Read the store directly rather than closing over `groupActive`: this
     // fires from Radix's own timer, and the answer must be the phase as it
     // stands right now, before this card joins it below. Read OUTSIDE the
@@ -136,7 +138,20 @@ export function WorkspaceHoverCard({
       openDelay={groupActive ? 0 : OPEN_DELAY_MS}
       closeDelay={CLOSE_DELAY_MS}
     >
-      <HoverCardTrigger asChild>{children}</HoverCardTrigger>
+      <HoverCardTrigger
+        asChild
+        onPointerDownCapture={() => {
+          // Selection must not leave a preview covering the newly opened chat.
+          // Capture also catches nested row actions that stop propagation.
+          suppressUntilPointerLeave.current = true;
+          setCardState((prev) => ({ ...prev, open: false }));
+        }}
+        onPointerLeave={() => {
+          suppressUntilPointerLeave.current = false;
+        }}
+      >
+        {children}
+      </HoverCardTrigger>
       <HoverCardContent
         side="right"
         align="start"

@@ -299,8 +299,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       : workspace.title;
   /** A workspace named after its project prints the same word twice — once
    *  in the eyebrow, once as the title. The avatar already carries project
-   *  identity, so the eyebrow's label stands down and the card reads as one
-   *  name on one line. */
+   *  identity, so the avatar and title share the header when they repeat.
+   *  Distinct work titles retain the project eyebrow. */
   const titleRepeatsProject =
     displayTitle.trim().toLowerCase() === repo.name.trim().toLowerCase();
 
@@ -363,6 +363,67 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const eyebrowGlyphClass = cn(
     "flex shrink-0 items-center border-none bg-transparent p-0",
     "text-muted-foreground/75 transition-colors duration-150 hover:text-foreground",
+  );
+
+  const projectAvatar = (
+    <ProjectAvatar
+      name={repo.name}
+      color={appearance.customColor}
+      imageUrl={appearance.imageUrl}
+      cacheBust={appearance.imageVersion}
+      size="sm"
+      shape="square"
+      className={cn(
+        "shrink-0 font-bold transition-[opacity,filter] duration-150",
+        visuallyReceded &&
+          "opacity-40 grayscale group-hover/card:opacity-100 group-hover/card:grayscale-0 group-focus-within/card:opacity-100 group-focus-within/card:grayscale-0",
+      )}
+    />
+  );
+
+  const titleLine = (
+    <div className="flex min-w-0 items-center gap-1.5">
+      {titleRepeatsProject && projectAvatar}
+      {/* No visible unread dot: the eyebrow status and full-brightness
+          card already say "look here", so unread is carried by the
+          bolder title alone. Screen readers still get it spelled out. */}
+      {unread && <span className="sr-only">Unread: </span>}
+      <span
+        className={cn(
+          "truncate text-body leading-[1.35] transition-colors duration-150",
+          visuallyReceded
+            ? "text-muted-foreground/55 group-hover/card:text-foreground group-focus-within/card:text-foreground"
+            : "text-foreground",
+          // The extra weight is what makes an unread card readable
+          // as unread at a glance down a scrolling list. Read cards
+          // sit at 500 with the project label, so neither line wins
+          // a weight contest with the other.
+          unread ? "font-semibold" : "font-medium",
+        )}
+      >
+        {displayTitle}
+      </span>
+      {workspace.linked_issue && (
+        // The chip owns its own colours — a solid state dot and the
+        // `#N` beside it — and takes no class from here, so its
+        // recede is a wrapper opacity rather than a colour swap.
+        // Without it the chip would be the brightest thing on a dim
+        // card, louder than that card's own title.
+        <span
+          className={cn(
+            "flex shrink-0 transition-opacity duration-150",
+            visuallyReceded &&
+              "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
+          )}
+        >
+          <IssueDetailPopover
+            providerKind={workspace.provider_kind}
+            workspaceId={workspace.workspace_id}
+            issue={workspace.linked_issue}
+          />
+        </span>
+      )}
+    </div>
   );
 
   const stateCluster = (
@@ -551,19 +612,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
             >
               {/* Eyebrow: repo identity + agent state / Settle swap */}
               <div className="flex min-h-5 items-center gap-1.5">
-                <ProjectAvatar
-                  name={repo.name}
-                  color={appearance.customColor}
-                  imageUrl={appearance.imageUrl}
-                  cacheBust={appearance.imageVersion}
-                  size="sm"
-                  shape="square"
-                  className={cn(
-                    "shrink-0 font-bold transition-[opacity,filter] duration-150",
-                    visuallyReceded &&
-                      "opacity-40 grayscale group-hover/card:opacity-100 group-hover/card:grayscale-0 group-focus-within/card:opacity-100 group-focus-within/card:grayscale-0",
-                  )}
-                />
+                {titleRepeatsProject ? titleLine : projectAvatar}
                 {!titleRepeatsProject && (
                   <span
                     className={cn(
@@ -755,48 +804,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 )}
               </div>
 
-              {/* Title line: work title + linked-issue chip */}
-              <div className="mt-0.5 flex min-w-0 items-center gap-1.5">
-                {/* No visible unread dot: the eyebrow status and full-brightness
-                    card already say "look here", so unread is carried by the
-                    bolder title alone. Screen readers still get it spelled out. */}
-                {unread && <span className="sr-only">Unread: </span>}
-                <span
-                  className={cn(
-                    "truncate text-body leading-[1.35] transition-colors duration-150",
-                    visuallyReceded
-                      ? "text-muted-foreground/55 group-hover/card:text-foreground group-focus-within/card:text-foreground"
-                      : "text-foreground",
-                    // The extra weight is what makes an unread card readable
-                    // as unread at a glance down a scrolling list. Read cards
-                    // sit at 500 with the project label, so neither line wins
-                    // a weight contest with the other.
-                    unread ? "font-semibold" : "font-medium",
-                  )}
-                >
-                  {displayTitle}
-                </span>
-                {workspace.linked_issue && (
-                  // The chip owns its own colours — a solid state dot and the
-                  // `#N` beside it — and takes no class from here, so its
-                  // recede is a wrapper opacity rather than a colour swap.
-                  // Without it the chip would be the brightest thing on a dim
-                  // card, louder than that card's own title.
-                  <span
-                    className={cn(
-                      "flex shrink-0 transition-opacity duration-150",
-                      visuallyReceded &&
-                        "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
-                    )}
-                  >
-                    <IssueDetailPopover
-                      providerKind={workspace.provider_kind}
-                      workspaceId={workspace.workspace_id}
-                      issue={workspace.linked_issue}
-                    />
-                  </span>
-                )}
-              </div>
+              {!titleRepeatsProject && (
+                <div className="mt-0.5">{titleLine}</div>
+              )}
 
               {/* Blocker line — needs-you cards only */}
               {isNeeds && (
@@ -842,7 +852,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   </span>
                 )}
                 {hasStats && (
-                  <span className="shrink-0 tabular-nums">
+                  <span
+                    role="img"
+                    title={`${workspace.git_additions} ${workspace.git_additions === 1 ? "line" : "lines"} added, ${workspace.git_deletions} removed`}
+                    aria-label={`${workspace.git_additions} ${workspace.git_additions === 1 ? "line" : "lines"} added, ${workspace.git_deletions} removed`}
+                    className="shrink-0 tabular-nums"
+                  >
                     {workspace.git_additions > 0 && (
                       <span
                         className={cn(

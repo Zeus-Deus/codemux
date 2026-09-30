@@ -576,6 +576,70 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(screen.getByText("alpha")).toBeInTheDocument();
   });
 
+  it("suppresses a pending hover after pointer-down until the pointer leaves", () => {
+    const { alpha } = renderRows({ strict: true });
+    pointerEnter(alpha);
+    advance(50);
+    fireEvent.pointerDown(alpha, { pointerType: "mouse" });
+    fireEvent.focus(alpha);
+    fireEvent.click(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    pointerLeave(alpha);
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+  });
+
+  it("dismisses an already-open card on pointer-down", () => {
+    const { alpha } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+
+    fireEvent.pointerDown(alpha, { pointerType: "mouse" });
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+  });
+
+  it("suppresses a clicked row even during the instant group phase", () => {
+    const { alpha, beta } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    pointerLeave(alpha);
+    pointerEnter(beta);
+    fireEvent.pointerDown(beta, { pointerType: "mouse" });
+    advance(1000);
+    expect(screen.queryByText("beta")).not.toBeInTheDocument();
+
+    pointerLeave(beta);
+    pointerEnter(beta);
+    advance(OPEN_DELAY_MS);
+    expect(screen.getByText("beta")).toBeInTheDocument();
+  });
+
+  it("captures pointer-down on nested actions that stop propagation", () => {
+    render(
+      <WorkspaceHoverCard
+        workspace={makeWorkspace()}
+        repo={{ name: "myapp", path: "/home/u/projects/myapp" }}
+        status={null}
+      >
+        <div data-testid="nested-row">
+          <button onPointerDown={(e) => e.stopPropagation()}>Action</button>
+        </div>
+      </WorkspaceHoverCard>,
+    );
+    const row = screen.getByTestId("nested-row");
+    pointerEnter(row);
+    advance(50);
+    fireEvent.pointerDown(screen.getByText("Action"));
+    advance(1000);
+    expect(card()).toBeNull();
+  });
+
   it("opens the NEXT row's card with no delay at all once a card is already up", () => {
     const { alpha, beta } = renderRows();
     pointerEnter(alpha);
