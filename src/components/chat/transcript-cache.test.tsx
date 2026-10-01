@@ -1,7 +1,7 @@
 import { StrictMode, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { TranscriptCacheProvider, TranscriptCacheMount } from "./transcript-cache";
+import { TRANSCRIPT_CACHE_CAPACITY, TranscriptCacheProvider, TranscriptCacheMount } from "./transcript-cache";
 
 afterEach(cleanup);
 
@@ -198,16 +198,25 @@ it("retains only transcript DOM across pane remounts and measures in the active 
   expect(effects).toEqual(new Set(["a"]));
 });
 
-it("bounds ownership to four transcripts and evicts the least recently used inactive host", () => {
-  const view = render(<Harness active="a" />);
+it("bounds ownership to eight transcripts and evicts the least recently used inactive host", () => {
+  const validKeys = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+  const view = render(<Harness active="a" validKeys={validKeys} />);
   const a = view.getByTestId("a");
-  for (const active of ["b", "c", "d", "a", "e"]) view.rerender(<Harness active={active} />);
-  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(4);
+  view.rerender(<Harness active="b" validKeys={validKeys} />);
+  const victim = view.getByTestId("b").closest('[data-transcript-cache-host]')!;
+  for (const active of ["c", "d", "e", "f", "g", "h", "a"])
+    view.rerender(<Harness active={active} validKeys={validKeys} />);
+  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(8);
+  view.rerender(<Harness active="i" validKeys={validKeys} />);
+  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(8);
+  expect(TRANSCRIPT_CACHE_CAPACITY).toBe(8);
   expect(view.queryByTestId("b")).toBeNull();
+  expect(victim.childNodes).toHaveLength(0);
+  expect(victim.isConnected).toBe(false);
   expect(view.getByTestId("a")).toBe(a);
-  const e = view.getByTestId("e");
-  expect(e.closest('[data-transcript-cache-slot]')).not.toBeNull();
-  view.rerender(<Harness active="a" />);
+  const i = view.getByTestId("i");
+  expect(i.closest('[data-transcript-cache-slot]')).not.toBeNull();
+  view.rerender(<Harness active="a" validKeys={validKeys} />);
   expect(view.getByTestId("a")).toBe(a);
   expect(effects).toEqual(new Set(["a"]));
 });
