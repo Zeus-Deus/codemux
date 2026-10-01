@@ -3082,7 +3082,7 @@ export function Composer({
               "grid",
               expanded
                 ? "grid-rows-[1fr]"
-                : "grid-rows-[0fr] opacity-0 transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
+                : "grid-rows-[0fr] opacity-0 transition-[grid-template-rows,opacity] duration-250 ease-out motion-reduce:transition-none",
             )}
           >
             <div className={cn("min-h-0", !expanded && "overflow-hidden")}>
