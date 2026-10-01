@@ -805,8 +805,10 @@ body.pane-resizing iframe {
   border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
   border-radius: 12px;
   background: color-mix(in srgb, var(--muted) 78%, var(--background));
-  contain-intrinsic-size: auto 120px;
-  content-visibility: auto;
+  /* LegendList already virtualizes these cards. A second deferred-layout
+     boundary can substitute a 120px placeholder for the real code height,
+     adding another source of row-size corrections while scrolling. Native
+     WebKit trials settled sooner without it. Keep mounted cards measurable. */
 }
 
 .chat-markdown [data-chat-code-header] {
