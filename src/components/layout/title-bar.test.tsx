@@ -253,6 +253,9 @@ function stubIslandRects(getByTestId: (id: string) => HTMLElement): void {
     ({ left: 300, right: 470, width: 170, height: 32 }) as DOMRect;
   getByTestId("titlebar-action-island").getBoundingClientRect = () =>
     ({ left: 990, right: 1150, width: 160, height: 32 }) as DOMRect;
+  // Past the transcript's right edge: the corner sits clear of the column.
+  getByTestId("titlebar-corner-plate").getBoundingClientRect = () =>
+    ({ left: 1300, right: 1434, width: 134, height: 36 }) as DOMRect;
 }
 
 function renderBar() {
@@ -420,26 +423,46 @@ describe("TitleBar chrome gating", () => {
     expect(utilities).not.toHaveClass("ml-1");
   });
 
-  it("keeps overlap washes dormant in the normal frameless state", () => {
+  it("keeps every plate dormant in the normal frameless state", () => {
     state.enableAgentChat = true;
     const { getByTestId } = renderBar();
 
     expect(getByTestId("floating-titlebar")).not.toHaveAttribute(
       "data-chat-overlap",
     );
+    for (const id of [
+      "titlebar-workspace-island",
+      "titlebar-action-island",
+      "titlebar-corner-plate",
+    ]) {
+      expect(getByTestId(id)).not.toHaveAttribute("data-raised");
+    }
     expect(getByTestId("titlebar-workspace-island")).toHaveClass(
-      "titlebar-overlap-wash",
-      "titlebar-overlap-wash-start",
-      "h-8",
+      "titlebar-island",
     );
     expect(getByTestId("titlebar-action-island")).toHaveClass(
-      "titlebar-overlap-wash",
-      "titlebar-overlap-wash-end",
-      "h-8",
+      "titlebar-island",
     );
+    expect(getByTestId("titlebar-corner-plate")).toHaveClass("titlebar-plate");
   });
 
-  it("raises only the intersecting islands once transcript content is underneath", async () => {
+  it("draws one corner plate behind the panel controls and window buttons", () => {
+    state.enableAgentChat = true;
+    const { getByTestId, rerender } = renderBar();
+    // Panel closed: the 28px toggle 104px in, plus 4px of breath.
+    expect(getByTestId("titlebar-corner-plate").style.width).toBe("134px");
+
+    state.rightPanelTab = "files";
+    rerender(
+      <TooltipProvider delayDuration={0}>
+        <TitleBar sidebarOpen onToggleSidebar={() => {}} />
+      </TooltipProvider>,
+    );
+    // Panel open: the expand button joins the cluster.
+    expect(getByTestId("titlebar-corner-plate").style.width).toBe("164px");
+  });
+
+  it("raises only the intersecting groups once transcript content is underneath", async () => {
     state.enableAgentChat = true;
     const transcript = makeTranscriptNode();
     const source = Symbol("overlap-test");
@@ -448,6 +471,11 @@ describe("TitleBar chrome gating", () => {
     stubIslandRects(getByTestId);
 
     fireEvent(window, new Event("resize"));
+    // Overlapping the column alone is not enough: nothing is underneath yet.
+    expect(getByTestId("titlebar-workspace-island")).not.toHaveAttribute(
+      "data-raised",
+    );
+
     act(() => publishTitlebarContentUnder("ws-1", source, true));
     await waitFor(() =>
       expect(getByTestId("floating-titlebar")).toHaveAttribute(
@@ -455,8 +483,24 @@ describe("TitleBar chrome gating", () => {
         "true",
       ),
     );
+    expect(getByTestId("titlebar-workspace-island")).toHaveAttribute(
+      "data-raised",
+      "true",
+    );
+    expect(getByTestId("titlebar-action-island")).toHaveAttribute(
+      "data-raised",
+      "true",
+    );
+    expect(getByTestId("titlebar-corner-plate")).not.toHaveAttribute(
+      "data-raised",
+    );
 
     act(() => clearTitlebarContentUnder("ws-1", source));
+    await waitFor(() =>
+      expect(getByTestId("titlebar-action-island")).not.toHaveAttribute(
+        "data-raised",
+      ),
+    );
     transcript.remove();
   });
 
