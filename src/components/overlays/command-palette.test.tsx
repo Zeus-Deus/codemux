@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { Profiler } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
@@ -21,6 +22,8 @@ const mocks = vi.hoisted(() => ({
     appState: null as unknown,
   },
   backend: {
+    dbGetUiState: vi.fn(),
+    prOverview: vi.fn(() => ({ rows: [] })),
     agentChatSearch: vi.fn(),
     openConversationSearchResult: vi.fn(),
     reloadInterface: vi.fn(),
@@ -52,10 +55,7 @@ vi.mock("@/stores/app-store", async (importOriginal) => ({
 
 vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
 
-vi.mock("@/stores/sidebar-inbox-store", () => ({
-  useSidebarInboxStore: (selector: (state: unknown) => unknown) =>
-    selector({ settled: [], snoozed: [], load: async () => {}, setFilter: () => {} }),
-}));
+// Use the real inbox subscriptions to cover its asynchronous first read.
 
 vi.mock("@/stores/sidebar-density-store", () => ({
   formatElapsed: () => "1m",
@@ -67,6 +67,7 @@ vi.mock("@/components/layout/use-project-appearance", () => ({
   useProjectAppearance: () => ({ customColor: null, imageUrl: null, imageVersion: 0 }),
 }));
 
+vi.mock("@/lib/pr-overview-query", () => ({ usePrOverview: mocks.backend.prOverview }));
 vi.mock("@/lib/use-coarse-clock", () => ({ useCoarseClock: () => 0 }));
 vi.mock("@/hooks/use-resolved-keybinds", () => ({
   useResolvedKeybinds: () => ({
@@ -78,6 +79,7 @@ vi.mock("@/lib/perf/instrumented-activate", () => ({
   activateWorkspaceInteraction: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/tauri/commands", () => ({
+  dbGetUiState: mocks.backend.dbGetUiState,
   dbSetSetting: vi.fn().mockResolvedValue(undefined),
   agentChatSearch: mocks.backend.agentChatSearch,
   createBrowserPane: vi.fn(),
@@ -95,6 +97,7 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 vi.mock("@/lib/addons/platform", () => ({ executeAddon: vi.fn() }));
 
 import { CommandPalette } from "./command-palette";
+import { useSidebarInboxStore, __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
 import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
@@ -135,6 +138,9 @@ beforeEach(() => {
   useSettingsStore.setState({ settings: { "appearance.theme_source": "manual" }, loaded: true });
   useOmarchyStore.setState({ theme: null, loaded: true });
   vi.clearAllMocks();
+  __resetSidebarInboxStoreForTests();
+  useSidebarInboxStore.setState({ loaded: true });
+  mocks.backend.dbGetUiState.mockResolvedValue(null);
   mocks.synced.settings.appearance.theme = "default";
   mocks.synced.settings.appearance.custom_themes = [];
   mocks.app.appState = null;
@@ -356,7 +362,192 @@ describe("command palette — theme picker", () => {
   });
 });
 
+describe("command palette — stable async sections", () => {
+  it("enables pull-request fetching only in pull-request mode", () => {
+    renderPalette();
+    expect(mocks.backend.prOverview).toHaveBeenLastCalledWith(false);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "pr " } });
+    expect(mocks.backend.prOverview).toHaveBeenLastCalledWith(true);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: ">settings" } });
+    expect(mocks.backend.prOverview).toHaveBeenLastCalledWith(false);
+  });
+
+  it("keeps commands usable until the inbox can publish workspace ordering once", async () => {
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: {},
+      workspaces: [
+        { workspace_id: "ws-1", title: "Parked branch", cwd: "/repo", surfaces: [], active_surface_id: "" },
+        { workspace_id: "ws-2", title: "Active branch", cwd: "/repo", surfaces: [], active_surface_id: "" },
+      ],
+    };
+    renderPalette();
+    expect(screen.getByText("Settings")).toBeInTheDocument();
+    expect(screen.queryByText("Workspaces")).not.toBeInTheDocument();
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:new-agent"));
+    await act(async () => resolveInbox(JSON.stringify({ settled: [{ id: "ws-1", at: 1 }] })));
+    const workspaceOptions = screen.getAllByRole("option").filter((el) => el.dataset.value?.startsWith("ws:"));
+    expect(workspaceOptions.map((el) => el.dataset.value)).toEqual(["ws:ws-2", "ws:ws-1"]);
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "ws:ws-2"));
+  });
+
+  it.each(["keyboard", "pointer"])("preserves a deliberate %s selection when inbox shelves arrive", async (inputKind) => {
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = { active_workspace_id: "ws-1", pane_statuses: {}, workspaces: [
+      { workspace_id: "ws-1", title: "Branch", cwd: "/repo", surfaces: [], active_surface_id: "" },
+    ] };
+    const user = userEvent.setup();
+    renderPalette();
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:new-agent"));
+    if (inputKind === "keyboard") await user.keyboard("{ArrowDown}");
+    else await user.hover(screen.getByText("Settings"));
+    const selected = document.querySelector('[cmdk-item][aria-selected="true"]')?.getAttribute("data-value");
+    expect(selected).not.toBe("cmd:new-agent");
+    await act(async () => resolveInbox(null));
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
+  });
+
+  it("does not announce no matches for a path until inbox ordering is ready", async () => {
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = { active_workspace_id: "ws-1", pane_statuses: {}, workspaces: [
+      { workspace_id: "ws-1", title: "Branch", cwd: "/repo", surfaces: [], active_surface_id: "" },
+    ] };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("/repo");
+    renderPalette();
+    expect(screen.queryByText(/No matches for/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading workspaces…")).toBeInTheDocument();
+    await act(async () => resolveInbox(null));
+    expect(document.querySelector('[cmdk-item][data-value="ws:ws-1"]')).toBeInTheDocument();
+    expect(screen.queryByText("Loading workspaces…")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "/absent" } });
+    expect(screen.getByText(/No matches for/)).toBeInTheDocument();
+  });
+});
+
 describe("command palette — conversation search", () => {
+  const branchState = () => ({ active_workspace_id: "ws-1", pane_statuses: {}, workspaces: [
+    { workspace_id: "ws-1", title: "Branch one", cwd: "/repo", surfaces: [], active_surface_id: "" },
+    { workspace_id: "ws-2", title: "Branch two", cwd: "/repo", surfaces: [], active_surface_id: "" },
+  ] });
+  const hit = (title: string) => ({
+    message_id: 42, thread_id: "thread-42", workspace_id: "ws-1", cwd: "/repo", provider: "claude",
+    session_title: title, role: "assistant", turn_id: "turn-7", snippet: title, created_at: "2026-08-10 10:00:00",
+  });
+
+  it("does not move a keyboard-selected static row when conversations arrive", async () => {
+    mocks.app.appState = branchState();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("branch");
+    let resolveSearch!: (rows: ReturnType<typeof hit>[]) => void;
+    mocks.backend.agentChatSearch.mockImplementation(() => new Promise((resolve) => { resolveSearch = resolve; }));
+    const user = userEvent.setup();
+    renderPalette();
+    await waitFor(() => expect(mocks.backend.agentChatSearch).toHaveBeenCalled());
+    await user.keyboard("{ArrowDown}");
+    const selected = document.querySelector('[cmdk-item][aria-selected="true"]')?.getAttribute("data-value");
+    expect(selected).toBe("ws:ws-2");
+    await act(async () => resolveSearch([hit("Branch history")]));
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
+  });
+
+  it("ignores an out-of-order response and never renders old hits with new query text", async () => {
+    mocks.app.appState = branchState();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("first");
+    const resolvers: Array<(rows: ReturnType<typeof hit>[]) => void> = [];
+    mocks.backend.agentChatSearch.mockImplementation(() => new Promise((resolve) => resolvers.push(resolve)));
+    const paints: Array<{ query: string; text: string }> = [];
+    render(withClient(<Profiler id="search" onRender={() => {
+      paints.push({ query: (document.querySelector("[cmdk-input]") as HTMLInputElement)?.value,
+        text: document.querySelector("[cmdk-list]")?.textContent ?? "" });
+    }}><CommandPalette open onOpenChange={vi.fn()} /></Profiler>));
+    await waitFor(() => expect(resolvers).toHaveLength(1));
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "second" } });
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+    await act(async () => resolvers[1]([hit("Second result")]));
+    await act(async () => resolvers[0]([hit("First result")]));
+    expect(screen.getByText("Second result")).toBeInTheDocument();
+    expect(screen.queryByText("First result")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "third" } });
+    expect(paints.some((paint) => paint.query === "third" && paint.text.includes("Second result"))).toBe(false);
+  });
+
+  it.each([true, false])("starts a fresh search when returning to a completed query (previous hits: %s)", async (hadHits) => {
+    mocks.app.appState = branchState();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("first");
+    const resolvers: Array<(rows: ReturnType<typeof hit>[]) => void> = [];
+    mocks.backend.agentChatSearch.mockImplementation(() => new Promise((resolve) => resolvers.push(resolve)));
+    renderPalette();
+    const input = screen.getByRole("combobox");
+    await waitFor(() => expect(resolvers).toHaveLength(1));
+    await act(async () => resolvers[0](hadHits ? [hit("Old first result")] : []));
+    fireEvent.change(input, { target: { value: "second" } });
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+    fireEvent.change(input, { target: { value: "first" } });
+    expect(screen.queryByText("Old first result")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No matches for/)).not.toBeInTheDocument();
+    expect(screen.getByText("Searching conversations…")).toBeInTheDocument();
+    await waitFor(() => expect(resolvers).toHaveLength(3));
+    await act(async () => resolvers[1]([hit("Late second result")]));
+    expect(screen.getByText("Searching conversations…")).toBeInTheDocument();
+    expect(screen.queryByText("Late second result")).not.toBeInTheDocument();
+    await act(async () => resolvers[2]([hit("Fresh first result")]));
+    expect(screen.getByText("Fresh first result")).toBeInTheDocument();
+  });
+
+  it("settles a failed search without blocking static commands or the next search", async () => {
+    mocks.app.appState = branchState();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("needle");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.backend.agentChatSearch.mockRejectedValueOnce(new Error("Search unavailable"));
+    try {
+      renderPalette();
+      await screen.findByText(/No matches for/);
+      expect(screen.queryByText("Searching conversations…")).not.toBeInTheDocument();
+      fireEvent.change(screen.getByRole("combobox"), { target: { value: ">settings" } });
+      expect(screen.getByText("Settings")).toBeInTheDocument();
+      mocks.backend.agentChatSearch.mockResolvedValueOnce([hit("Recovered result")]);
+      fireEvent.change(screen.getByRole("combobox"), { target: { value: "recover" } });
+      expect(await screen.findByText("Recovered result")).toBeInTheDocument();
+    } finally { warning.mockRestore(); }
+  });
+
+  it("anchors the reserved viewport above the mobile keyboard instead of at mid-screen", () => {
+    renderPalette();
+    const dialog = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')!;
+    expect(dialog).toHaveClass("in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]!");
+    expect(dialog).toHaveClass("in-[[data-mobile]]:p-0!");
+    expect(document.querySelector("[cmdk-list]")).toHaveClass("max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))]");
+  });
+
+  it("reserves the result viewport even for a single match", async () => {
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">reload interface");
+    renderPalette();
+    expect(document.querySelector("[cmdk-list]")).toHaveClass("h-[352px]");
+  });
+
+  it("never paints no-matches before an eligible first search has finished", async () => {
+    mocks.app.appState = { active_workspace_id: "ws-1", pane_statuses: {}, workspaces: [
+      { workspace_id: "ws-1", title: "Branch", cwd: "/repo", surfaces: [], active_surface_id: "" },
+    ] };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("needle");
+    mocks.backend.agentChatSearch.mockImplementation(() => new Promise(() => {}));
+    const paints: string[] = [];
+    render(withClient(<Profiler id="search" onRender={() => {
+      paints.push(document.querySelector("[cmdk-list]")?.textContent ?? "");
+    }}><CommandPalette open onOpenChange={vi.fn()} /></Profiler>));
+    expect(paints.length).toBeGreaterThan(0);
+    expect(paints.some((text) => text.includes("No matches"))).toBe(false);
+    expect(screen.getByText("Searching conversations…")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: ">reload interface" } });
+    expect(screen.queryByText("Searching conversations…")).not.toBeInTheDocument();
+  });
+
   it("searches open workspaces and opens a durable transcript hit", async () => {
     const hit = {
       message_id: 42,
