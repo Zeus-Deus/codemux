@@ -6,13 +6,16 @@
 //! API-equivalent estimate, not a claim about what a plan covered or what the
 //! provider billed.
 //!
-//! Matching is by **model-id substring**, deliberately: every provider
-//! spells its ids differently and they gain suffixes over time
-//! (`claude-opus-4-5-20251101`, `gpt-5.2-codex`, the OpenCode catalogue's
-//! `anthropic/claude-sonnet-4-5`). A substring table degrades to "unknown
-//! model" rather than to a wrong price, and an unknown model contributes
-//! tokens but no cost — the UI shows the tokens and simply omits them from
-//! the money column.
+//! Only verified model ids and their dated snapshots are matched. Provider
+//! prefixes and Claude context suffixes are normalized first. Future versions
+//! and internal routing labels remain unpriced rather than inheriting a
+//! different model's price. Their tokens still appear in the dashboard.
+//!
+//! These are current standard, global, short-context token rates. Histories
+//! do not consistently preserve per-request context size, service tier,
+//! geography, or historical price schedules. This fallback cannot reproduce
+//! those billing modifiers or server-side tool fees. See the usage audit in
+//! `docs/research/usage-tracker-audit.md` for the provider/source boundaries.
 //!
 //! OpenCode is the exception: its durable message records can carry a cost
 //! calculated from the upstream model catalogue, so the history importer
@@ -46,17 +49,17 @@ pub struct ModelRates {
 }
 
 impl ModelRates {
-    /// Anthropic's cache multipliers are uniform across the model line:
-    /// a 5-minute cache write costs 1.25x base input, a 1-hour write 2x,
-    /// and a cache read 0.1x. Expressing them as a constructor keeps the
-    /// table below honest — a future price change touches one number per
-    /// model, not five. Re-verified against the published rate card on
-    /// 2026-08-08: every listed model is a clean multiple of its input.
+    /// Anthropic's standard cache reads cost 0.1x input. Newer models
+    /// override that rate; write multipliers remain 1.25x and 2x.
     const fn anthropic(input: f64, output: f64) -> Self {
+        Self::anthropic_with_cache_read(input, output, input * 0.1)
+    }
+
+    const fn anthropic_with_cache_read(input: f64, output: f64, cache_read: f64) -> Self {
         Self {
             input,
             output,
-            cache_read: input * 0.1,
+            cache_read,
             cache_write: input * 1.25,
             cache_write_1h: input * 2.0,
         }
@@ -66,10 +69,7 @@ impl ModelRates {
     /// directly rather than derived, and no separate charge for writing
     /// to the cache is published for this model.
     ///
-    /// `cache_write: 0.0` is a statement about the published rate card,
-    /// not a guess: outside the GPT-5.6 generation OpenAI does not list a
-    /// cache-write price at all, and inventing one would put a number in
-    /// the money column that no document supports.
+    /// Models without a published separate cache-write charge use zero.
     const fn openai(input: f64, output: f64, cache_read: f64) -> Self {
         Self {
             input,
@@ -80,14 +80,13 @@ impl ModelRates {
         }
     }
 
-    /// GPT-5.6-generation pricing, which *does* publish a cache-write
-    /// rate: 1.25x uncached input, with cached input at 0.1x. OpenAI
-    /// publishes no longer-TTL tier, so both write rates are the same.
-    const fn openai_5_6(input: f64, output: f64) -> Self {
+    /// GPT-5.6 and GPT-6 publish a 1.25x cache-write rate. The cache-read
+    /// rate is explicit: GPT-6.1 Sol reads at 0.05x instead of 0.1x.
+    const fn openai_with_cache_write(input: f64, output: f64, cache_read: f64) -> Self {
         Self {
             input,
             output,
-            cache_read: input * 0.1,
+            cache_read,
             cache_write: input * 1.25,
             cache_write_1h: input * 1.25,
         }
@@ -132,57 +131,88 @@ impl ModelRates {
     }
 }
 
-/// The whole price list, most-specific pattern first.
+/// Verified standard/global token rates, rechecked 2026-10-01.
 ///
-/// Order matters: `lookup` returns the first match, so a narrower id
-/// fragment (`opus-4-1`) has to precede the family catch-all (`opus`).
-/// Keeping every rate in this one array is intentional — a price change is
-/// a one-line diff here and nowhere else.
-/// Sources, both re-read and re-verified **2026-08-08**:
+/// Sources:
+/// - <https://platform.claude.com/docs/en/about-claude/pricing>
+/// - <https://developers.openai.com/api/docs/pricing>
 ///
-/// - Anthropic: <https://platform.claude.com/docs/en/docs/about-claude/pricing>
-///   (the canonical target of the old `docs.anthropic.com` URL).
-/// - OpenAI: <https://developers.openai.com/api/docs/pricing> (the
-///   canonical 301 target of `platform.openai.com/docs/pricing`) plus the
-///   per-model pages under `developers.openai.com/api/docs/models/<id>`.
-///   `openai.com/api/pricing` is bot-gated and returns 403.
+/// Keep generations explicit. A new version can change both base and cache
+/// prices; family catch-alls silently misprice it. A price correction also
+/// requires an IMPORT_VERSION bump so unchanged histories are re-priced.
 const RATES: &[(&str, ModelRates)] = &[
-    // ── Anthropic (Claude) ──
-    ("opus-4-1", ModelRates::anthropic(15.0, 75.0)),
-    ("opus-4-0", ModelRates::anthropic(15.0, 75.0)),
-    ("opus", ModelRates::anthropic(5.0, 25.0)),
-    // Sonnet 5 launched on an introductory rate and reverts to the
-    // family price on **2026-09-01**. Dated deliberately: after that
-    // date this line should be deleted so `sonnet` catches it again.
-    ("sonnet-5", ModelRates::anthropic(2.0, 10.0)),
-    ("sonnet", ModelRates::anthropic(3.0, 15.0)),
-    // Haiku 3.5 is cheaper than the current family price; it is retired
-    // on first-party but still served on Bedrock/Vertex, and old ledger
-    // rows referencing it must not be re-priced upward.
-    ("haiku-3-5", ModelRates::anthropic(0.80, 4.0)),
-    ("haiku", ModelRates::anthropic(1.0, 5.0)),
-    ("fable", ModelRates::anthropic(10.0, 50.0)),
-    ("mythos", ModelRates::anthropic(10.0, 50.0)),
-    // ── OpenAI (Codex / GPT) ──
-    //
-    // ORDERING IS LOad-BEARING and the reason this block is long. The
-    // lookup is first-match-wins over substrings, so every generation
-    // that is *not* $1.25/$10 has to appear before the `gpt-5` catch-all
-    // — otherwise `gpt-5.6-sol` (the model the Codex CLI actually runs)
-    // is billed at a quarter of its real input rate. Tier suffixes
-    // (`-pro`, `-mini`, `-nano`) precede their own family for the same
-    // reason, and every `gpt-5.x-codex` id precedes the generic `codex`
-    // entry because those ids contain both fragments.
-    //
-    // GPT-5.6 is three separately-priced models, not three effort
-    // levels: sol (flagship), terra (balanced), luna (high-volume).
-    // Bare `gpt-5.6` is an alias that routes to sol.
-    ("gpt-5.6-sol", ModelRates::openai_5_6(5.00, 30.00)),
-    ("gpt-5.6-terra", ModelRates::openai_5_6(2.00, 12.00)),
-    ("gpt-5.6-luna", ModelRates::openai_5_6(0.20, 1.20)),
-    ("gpt-5.6", ModelRates::openai_5_6(5.00, 30.00)),
-    // The `-pro` tiers publish no cached-input rate, so a cache read is
-    // priced at the full input rate rather than at an invented discount.
+    // Anthropic. Opus 5.5 and Fable/Mythos 5.1 have lower cache-read ratios.
+    (
+        "claude-opus-5-5",
+        ModelRates::anthropic_with_cache_read(4.0, 20.0, 0.20),
+    ),
+    ("claude-opus-5", ModelRates::anthropic(5.0, 25.0)),
+    ("claude-opus-4-8", ModelRates::anthropic(5.0, 25.0)),
+    ("claude-opus-4-7", ModelRates::anthropic(5.0, 25.0)),
+    ("claude-opus-4-6", ModelRates::anthropic(5.0, 25.0)),
+    ("claude-opus-4-5", ModelRates::anthropic(5.0, 25.0)),
+    ("claude-opus-4-1", ModelRates::anthropic(15.0, 75.0)),
+    ("claude-opus-4-0", ModelRates::anthropic(15.0, 75.0)),
+    ("claude-opus-4", ModelRates::anthropic(15.0, 75.0)),
+    // Sonnet 5 still lists $2/$10; the old September expiry was incorrect.
+    ("claude-sonnet-5-5", ModelRates::anthropic(2.0, 10.0)),
+    ("claude-sonnet-5", ModelRates::anthropic(2.0, 10.0)),
+    ("claude-sonnet-4-6", ModelRates::anthropic(3.0, 15.0)),
+    ("claude-sonnet-4-5", ModelRates::anthropic(3.0, 15.0)),
+    ("claude-sonnet-4-0", ModelRates::anthropic(3.0, 15.0)),
+    ("claude-sonnet-4", ModelRates::anthropic(3.0, 15.0)),
+    ("claude-haiku-4-5", ModelRates::anthropic(1.0, 5.0)),
+    ("claude-haiku-3-5", ModelRates::anthropic(0.80, 4.0)),
+    (
+        "claude-fable-5-1",
+        ModelRates::anthropic_with_cache_read(10.0, 50.0, 0.25),
+    ),
+    ("claude-fable-5", ModelRates::anthropic(10.0, 50.0)),
+    (
+        "claude-mythos-5-1",
+        ModelRates::anthropic_with_cache_read(10.0, 50.0, 0.25),
+    ),
+    ("claude-mythos-5", ModelRates::anthropic(10.0, 50.0)),
+    // OpenAI. Cache writes have no separate TTL tier.
+    (
+        "gpt-6.1-sol",
+        ModelRates::openai_with_cache_write(2.00, 10.00, 0.10),
+    ),
+    (
+        "gpt-6-astra",
+        ModelRates::openai_with_cache_write(10.00, 50.00, 1.00),
+    ),
+    (
+        "gpt-6-sol",
+        ModelRates::openai_with_cache_write(2.00, 10.00, 0.20),
+    ),
+    (
+        "gpt-6-luna",
+        ModelRates::openai_with_cache_write(0.10, 0.50, 0.01),
+    ),
+    // Current Sol promotion is published through at least 2026-11-21.
+    (
+        "gpt-5.6-sol",
+        ModelRates::openai_with_cache_write(4.00, 20.00, 0.40),
+    ),
+    (
+        "gpt-5.6-terra",
+        ModelRates::openai_with_cache_write(2.00, 12.00, 0.20),
+    ),
+    (
+        "gpt-5.6-luna",
+        ModelRates::openai_with_cache_write(0.20, 1.20, 0.02),
+    ),
+    (
+        "gpt-5.6",
+        ModelRates::openai_with_cache_write(4.00, 20.00, 0.40),
+    ),
+    (
+        "gpt-5.6-cyber",
+        ModelRates::openai_with_cache_write(12.50, 75.00, 1.25),
+    ),
+    ("gpt-5.5-cyber", ModelRates::openai(12.50, 75.00, 1.25)),
+    // Pro models publish no cache discount: use full input for cache reads.
     ("gpt-5.5-pro", ModelRates::openai(30.00, 180.00, 30.00)),
     ("gpt-5.5", ModelRates::openai(5.00, 30.00, 0.50)),
     ("gpt-5.4-mini", ModelRates::openai(0.75, 4.50, 0.075)),
@@ -191,35 +221,82 @@ const RATES: &[(&str, ModelRates)] = &[
     ("gpt-5.4", ModelRates::openai(2.50, 15.00, 0.25)),
     ("gpt-5.3-codex", ModelRates::openai(1.75, 14.00, 0.175)),
     ("gpt-5.2-pro", ModelRates::openai(21.00, 168.00, 21.00)),
+    ("gpt-5.2-codex", ModelRates::openai(1.75, 14.00, 0.175)),
     ("gpt-5.2", ModelRates::openai(1.75, 14.00, 0.175)),
+    ("gpt-5.1-codex-max", ModelRates::openai(1.25, 10.00, 0.125)),
+    ("gpt-5.1-codex-mini", ModelRates::openai(0.25, 2.00, 0.025)),
+    ("gpt-5.1-codex", ModelRates::openai(1.25, 10.00, 0.125)),
     ("gpt-5.1", ModelRates::openai(1.25, 10.00, 0.125)),
     ("gpt-5-pro", ModelRates::openai(15.00, 120.00, 15.00)),
     ("gpt-5-nano", ModelRates::openai(0.05, 0.40, 0.005)),
     ("gpt-5-mini", ModelRates::openai(0.25, 2.00, 0.025)),
     ("gpt-5-codex", ModelRates::openai(1.25, 10.00, 0.125)),
     ("gpt-5", ModelRates::openai(1.25, 10.00, 0.125)),
-    ("codex-mini", ModelRates::openai(1.50, 6.00, 0.375)),
-    ("codex", ModelRates::openai(1.25, 10.00, 0.125)),
+    ("codex-mini-latest", ModelRates::openai(1.50, 6.00, 0.375)),
+    ("gpt-4.1-nano", ModelRates::openai(0.10, 0.40, 0.025)),
     ("gpt-4.1-mini", ModelRates::openai(0.40, 1.60, 0.10)),
     ("gpt-4.1", ModelRates::openai(2.00, 8.00, 0.50)),
+    ("gpt-4o-2024-05-13", ModelRates::openai(5.00, 15.00, 5.00)),
     ("gpt-4o-mini", ModelRates::openai(0.15, 0.60, 0.075)),
     ("gpt-4o", ModelRates::openai(2.50, 10.00, 1.25)),
     ("o4-mini", ModelRates::openai(1.10, 4.40, 0.275)),
+    ("o3-pro", ModelRates::openai(20.00, 80.00, 20.00)),
+    ("o3-mini", ModelRates::openai(1.10, 4.40, 0.55)),
     ("o3", ModelRates::openai(2.00, 8.00, 0.50)),
+    ("o1-pro", ModelRates::openai(150.00, 600.00, 150.00)),
+    ("o1", ModelRates::openai(15.00, 60.00, 7.50)),
 ];
 
-/// Look up list prices for `model_id`, or `None` when the id matches
-/// nothing in the table.
-///
-/// `None` is a first-class answer, not a failure: the ledger still records
-/// the token split for an unrecognized model, and the dashboard renders it
-/// with an empty cost cell rather than inventing a number.
+/// Look up a verified model or dated snapshot. Unknown ids stay unpriced.
 pub fn lookup(model_id: &str) -> Option<ModelRates> {
-    let needle = model_id.to_ascii_lowercase();
+    let normalized = model_id.to_ascii_lowercase();
+    let model = normalized.rsplit('/').next()?;
+    let model = model.strip_prefix("anthropic.").unwrap_or(model);
+    let model = match model.split_once('[') {
+        Some((id, "1m]" | "200k]")) => id,
+        Some(_) => return None,
+        None => model,
+    };
     RATES
         .iter()
-        .find(|(pattern, _)| needle.contains(pattern))
+        .find(|(known, _)| {
+            model == *known
+                || model
+                    .strip_prefix(known)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .is_some_and(is_snapshot_suffix)
+        })
         .map(|(_, rates)| *rates)
+}
+
+fn is_snapshot_suffix(suffix: &str) -> bool {
+    // Claude snapshots: YYYYMMDD (optionally Bedrock's -vN:M revision).
+    // OpenAI snapshots: YYYY-MM-DD. No arbitrary tier/version suffixes.
+    let date = match suffix.split_once("-v") {
+        Some((date, revision)) => {
+            let Some((version, variant)) = revision.split_once(':') else {
+                return false;
+            };
+            if version.is_empty()
+                || variant.is_empty()
+                || !version.bytes().all(|b| b.is_ascii_digit())
+                || !variant.bytes().all(|b| b.is_ascii_digit())
+            {
+                return false;
+            }
+            date
+        }
+        None => suffix,
+    };
+    (date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
+        || (date.len() == 10
+            && date.bytes().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            }))
 }
 
 /// Convenience wrapper: price a token split for a possibly-unknown model.
@@ -256,9 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn matches_claude_families_by_substring() {
-        // Dated snapshots, bare aliases, and provider-prefixed catalogue
-        // ids all have to land on the same family.
+    fn matches_verified_claude_models() {
+        // Dated snapshots and provider-prefixed catalogue ids preserve rates.
         for id in [
             "claude-opus-4-5-20251101",
             "claude-opus-4-6",
@@ -282,75 +358,95 @@ mod tests {
     }
 
     #[test]
-    fn more_specific_patterns_win() {
-        // `gpt-5-mini` must not be swallowed by the `gpt-5` family entry,
-        // and `opus-4-1` must not be swallowed by `opus`.
+    fn cheaper_tiers_and_legacy_models_keep_their_own_rates() {
         approx(lookup("gpt-5-mini").unwrap().input, 0.25);
         approx(lookup("gpt-5.2-codex").unwrap().input, 1.75);
         approx(lookup("claude-opus-4-1-20250805").unwrap().input, 15.0);
     }
 
-    /// The regression this table was rewritten for. The Codex CLI runs
-    /// `gpt-5.6-sol`, which is $5/$30 — the generic `gpt-5` entry prices
-    /// it at $1.25/$10, understating real spend fourfold. Ordering is the
-    /// only thing that prevents it, so assert on the ordering directly.
     #[test]
-    fn gpt_5_6_variants_are_not_swallowed_by_the_gpt_5_family() {
-        let sol = lookup("gpt-5.6-sol").expect("sol is priced");
-        approx(sol.input, 5.0);
-        approx(sol.output, 30.0);
-        approx(sol.cache_read, 0.5);
-        let terra = lookup("gpt-5.6-terra").unwrap();
-        approx(terra.input, 2.0);
-        approx(terra.output, 12.0);
-        let luna = lookup("gpt-5.6-luna").unwrap();
-        approx(luna.input, 0.20);
-        approx(luna.output, 1.20);
-        // The bare alias routes to sol.
-        approx(lookup("gpt-5.6").unwrap().input, 5.0);
-        // And the generic entry is still there for the ids that really
-        // are $1.25/$10.
-        approx(lookup("gpt-5").unwrap().input, 1.25);
-        approx(lookup("gpt-5-codex").unwrap().input, 1.25);
-        approx(lookup("gpt-5.1").unwrap().input, 1.25);
-
-        // Ordering is load-bearing: every non-$1.25 OpenAI pattern must
-        // appear before the `gpt-5` catch-all, or it never matches.
-        let index = |needle: &str| {
-            RATES
-                .iter()
-                .position(|(pattern, _)| *pattern == needle)
-                .unwrap_or_else(|| panic!("{needle} missing from the table"))
-        };
-        let catch_all = index("gpt-5");
-        for specific in [
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.6",
-            "gpt-5.5-pro",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.3-codex",
-            "gpt-5.2",
-            "gpt-5-pro",
-            "gpt-5-mini",
-            "gpt-5-nano",
+    fn current_openai_models_have_distinct_cache_rates() {
+        for (id, input, output, cache_read) in [
+            ("gpt-6.1-sol", 2.0, 10.0, 0.10),
+            ("gpt-6-sol", 2.0, 10.0, 0.20),
+            ("gpt-6-astra", 10.0, 50.0, 1.0),
+            ("gpt-6-luna", 0.10, 0.50, 0.01),
+            ("gpt-5.6-sol", 4.0, 20.0, 0.40),
+            ("gpt-5.6-terra", 2.0, 12.0, 0.20),
+            ("gpt-5.6-luna", 0.20, 1.20, 0.02),
+            ("gpt-5.6-cyber", 12.50, 75.0, 1.25),
         ] {
-            assert!(
-                index(specific) < catch_all,
-                "{specific} must precede the gpt-5 catch-all"
-            );
+            let rates = lookup(id).unwrap();
+            approx(rates.input, input);
+            approx(rates.output, output);
+            approx(rates.cache_read, cache_read);
+            approx(rates.cache_write, input * 1.25);
+            approx(rates.cache_write_1h, rates.cache_write);
         }
-        // `gpt-5.x-codex` ids contain BOTH fragments, so they must also
-        // beat the generic `codex` entry.
-        assert!(index("gpt-5.3-codex") < index("codex"));
-        assert!(index("codex-mini") < index("codex"));
+        assert_eq!(lookup("gpt-5.6"), lookup("gpt-5.6-sol"));
     }
 
     #[test]
-    fn sonnet_5_holds_its_introductory_rate() {
-        // Sonnet 5 is $2/$10 until 2026-09-01; the rest of the family is
+    fn newer_claude_models_override_family_cache_discount() {
+        for (id, input, output, read) in [
+            ("claude-opus-5-5", 4.0, 20.0, 0.20),
+            ("claude-sonnet-5-5", 2.0, 10.0, 0.20),
+            ("claude-fable-5-1", 10.0, 50.0, 0.25),
+            ("claude-mythos-5-1", 10.0, 50.0, 0.25),
+        ] {
+            let rates = lookup(id).unwrap();
+            approx(rates.input, input);
+            approx(rates.output, output);
+            approx(rates.cache_read, read);
+            approx(
+                rates.cost_usd_with_1h(0, 0, 1_000_000, 1_000_000, 500_000),
+                read + input * 1.625,
+            );
+        }
+        approx(lookup("claude-fable-5").unwrap().cache_read, 1.0);
+    }
+
+    #[test]
+    fn provider_prefixes_and_snapshots_preserve_model_identity() {
+        for id in [
+            "anthropic/claude-opus-5-5[1m]",
+            "anthropic.claude-opus-5-5-20260915-v1:0",
+            "claude-opus-5-5-20260915",
+        ] {
+            assert_eq!(lookup(id), lookup("claude-opus-5-5"));
+        }
+        assert_eq!(
+            lookup("openai/gpt-6.1-sol-2026-09-29"),
+            lookup("gpt-6.1-sol")
+        );
+        approx(lookup("gpt-4o-2024-05-13").unwrap().input, 5.0);
+        approx(lookup("gpt-4o-2024-08-06").unwrap().input, 2.5);
+        approx(lookup("gpt-5.1-codex-mini").unwrap().input, 0.25);
+    }
+
+    #[test]
+    fn future_versions_and_internal_labels_do_not_inherit_prices() {
+        for id in [
+            "gpt-5.7",
+            "gpt-6.2-sol",
+            "gpt-6-sol-pro",
+            "gpt-5.6-unknown",
+            "claude-opus-9-0",
+            "claude-sonnet-5-6",
+            "claude-fable-5-2",
+            "codex-auto-review",
+            "codex",
+            "some-provider/not-gpt-5",
+            "gpt-6-sol[unknown]",
+            "claude-opus-5-5-20260915-vunknown",
+        ] {
+            assert!(lookup(id).is_none(), "{id} must remain unpriced");
+        }
+    }
+
+    #[test]
+    fn sonnet_5_keeps_its_current_published_rate() {
+        // Sonnet 5 remains $2/$10 on 2026-10-01; Sonnet 4 is
         // $3/$15 and must not be dragged down with it.
         approx(lookup("claude-sonnet-5").unwrap().input, 2.0);
         approx(lookup("claude-sonnet-5").unwrap().output, 10.0);
@@ -383,9 +479,9 @@ mod tests {
     #[test]
     fn openai_models_have_no_separate_one_hour_tier() {
         let sol = lookup("gpt-5.6-sol").unwrap();
-        approx(sol.cache_write, 6.25);
-        approx(sol.cache_write_1h, 6.25);
-        // No cache-write rate is published outside the 5.6 generation.
+        approx(sol.cache_write, 5.0);
+        approx(sol.cache_write_1h, 5.0);
+        // Earlier generations have no separate published cache-write rate.
         approx(lookup("gpt-5").unwrap().cache_write, 0.0);
     }
 
