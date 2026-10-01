@@ -272,6 +272,9 @@ pub fn regenerate_mcp_config(
         .iter()
         .find(|w| w.workspace_id.0 == workspace_id)
         .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+    if ws.is_local_import_snapshot_only() {
+        return Err("Imported snapshot workspace does not own MCP configuration; open a live workspace first".into());
+    }
     crate::mcp_server::upsert_mcp_config(Path::new(&ws.cwd));
     Ok(())
 }
@@ -1152,6 +1155,9 @@ fn workspace_owns_mcp_config_dir(
     workspace: &crate::state::WorkspaceSnapshot,
     config_dir: &Path,
 ) -> bool {
+    if workspace.is_local_import_snapshot_only() {
+        return false;
+    }
     paths_equal(Path::new(&workspace.cwd), config_dir)
         || workspace
             .worktree_path
@@ -1246,7 +1252,8 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         }
         (
             ws.and_then(|w| w.worktree_path.clone()),
-            ws.map(workspace_mcp_config_dir),
+            ws.filter(|w| !w.is_local_import_snapshot_only())
+                .map(workspace_mcp_config_dir),
             ws.and_then(|w| w.git_branch.clone()),
             ws.map(|w| w.title.clone()).unwrap_or_default(),
             ws.and_then(|w| w.host_id),
@@ -2211,7 +2218,8 @@ pub async fn close_workspace<R: tauri::Runtime>(
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id);
         (
-            ws.map(|w| (w.cwd.clone(), w.title.clone())),
+            ws.filter(|w| !w.is_local_import_snapshot_only())
+                .map(|w| (w.cwd.clone(), w.title.clone())),
             ws.and_then(|w| w.host_id),
         )
     };
@@ -3343,6 +3351,40 @@ mod phase_1_6_close_tests {
     use super::*;
     use crate::state::{AppStateStore, SplitDirection, WorkspacePresetLayout};
     use tempfile::TempDir;
+
+    #[test]
+    fn local_import_mcp_regeneration_and_close_do_not_own_source_checkout() {
+        let checkout = TempDir::new().unwrap();
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let session = crate::local_session_import::ParsedSession {
+            source_id: "11111111-1111-4111-8111-111111111111".into(),
+            provider: "claude".into(),
+            cwd: checkout.path().display().to_string(),
+            last_active_at: "2026-09-29T10:00:00Z".into(),
+            messages: vec![("user".into(), "Synthetic".into())],
+        };
+        store.import_local_sessions(&db, &[session]).unwrap();
+        let snapshot = store.snapshot();
+        let workspace = &snapshot.workspaces[0];
+        let app = tauri::test::mock_app();
+        app.manage(store);
+        let result = regenerate_mcp_config(
+            app.state::<AppStateStore>(),
+            workspace.workspace_id.0.clone(),
+        );
+        assert!(
+            !checkout.path().join(".mcp.json").exists(),
+            "snapshot regeneration wrote to its source"
+        );
+        assert!(result.is_err());
+        // Both native close paths use this extraction before their state mutation.
+        assert!(
+            !workspace_owns_mcp_config_dir(workspace, checkout.path()),
+            "snapshot close acquired MCP ownership"
+        );
+    }
 
     #[test]
     fn close_workspace_removes_workspace_from_state() {

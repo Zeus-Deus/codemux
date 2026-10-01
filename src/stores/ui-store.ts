@@ -165,6 +165,11 @@ interface UIStore {
    * Transient; never persisted.
    */
   themeStudio: ThemeStudioRequest | null;
+  /** Local import overlay; transient, never persisted. */
+  showLocalSessionImport: boolean;
+  localSessionImportOfferDismissed: boolean;
+  dismissLocalSessionImportOffer: () => void;
+  setShowLocalSessionImport: (show: boolean) => void;
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
   onboardingProjectDir: string | null;
@@ -316,6 +321,10 @@ export const useUIStore = create<UIStore>()(
       showCommandPalette: false,
       commandPaletteQuery: null,
       themeStudio: null,
+      showLocalSessionImport: false,
+      localSessionImportOfferDismissed: false,
+      dismissLocalSessionImportOffer: () => set({ localSessionImportOfferDismissed: true }),
+      setShowLocalSessionImport: (show) => set({ showLocalSessionImport: show }),
       showCloneDialog: false,
       showNewProjectScreen: false,
       onboardingProjectDir: null,

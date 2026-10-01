@@ -1,3 +1,4 @@
+import { LocalSessionImportEntry } from "@/components/chat/LocalSessionImportEntry";
 import { useMemo, useRef, useState } from "react";
 
 import { AlertTriangle, Archive, ArchiveRestore, Trash2 } from "lucide-react";
@@ -336,7 +337,9 @@ export function ArchiveSection() {
 
   if (archived.length === 0) {
     return (
-      <div className="flex flex-col items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center">
+      <div className="space-y-8">
+        <LocalSessionImportEntry />
+        <div className="flex flex-col items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center">
         <Archive className="size-5 text-muted-foreground/50" />
         <p className="text-body text-muted-foreground">
           No archived workspaces
@@ -345,12 +348,14 @@ export function ArchiveSection() {
           Archive a workspace from the sidebar to park it here without
           touching its files.
         </p>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="space-y-8">
+      <LocalSessionImportEntry />
       {groups.map((group, idx) => (
         <section key={group.path} className={cn(idx === 0 && "mt-0")}>
           <Eyebrow className="mb-3" title={group.path}>

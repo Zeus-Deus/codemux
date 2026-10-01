@@ -566,6 +566,18 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 "workspaces": workspaces,
             }))
         }
+        "agent_chat_scan_local_sessions" => {
+            crate::local_session_import::agent_chat_scan_local_sessions(app.clone()).await
+                .and_then(|r|serde_json::to_value(r).map_err(|e|e.to_string()))
+        }
+        "agent_chat_import_local_sessions" => {
+            match request.params.get("source_ids").cloned().ok_or("source_ids_required".to_string())
+                .and_then(|v|serde_json::from_value::<Vec<String>>(v).map_err(|e|e.to_string())) {
+                Ok(ids)=>crate::local_session_import::agent_chat_import_local_sessions(app.clone(),ids).await
+                    .and_then(|r|serde_json::to_value(r).map_err(|e|e.to_string())),
+                Err(error)=>Err(error),
+            }
+        }
         "get_app_state" => {
             let state: State<'_, AppStateStore> = app.state();
             serde_json::to_value(state.snapshot()).map_err(|error| error.to_string())
@@ -2131,6 +2143,7 @@ mod tests {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            imported_snapshot_only: Some(false),
             last_active_at: None,
             last_visited_at: None,
         }

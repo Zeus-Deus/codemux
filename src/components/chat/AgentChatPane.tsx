@@ -152,6 +152,7 @@ import {
 } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
+import { Button } from "@/components/ui/button";
 import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
   queuedMessages,
@@ -248,16 +249,29 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const observeProviderRuntimeIntent = useProviderRuntimeIntent(
     (state) => state.observe,
   );
+  const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  const [sessionMetadata, setSessionMetadata] = useState<{
+    threadId: string;
+    imported: boolean;
+    error: string | null;
+  } | null>(null);
+  const [metadataRetry, setMetadataRetry] = useState(0);
+  // Only a locally initiated startup may retain its composer during verification.
+  const startupThreadRef = useRef<string | null>(null);
+  // Thread-keyed and fail-closed: cached models are not proof of provenance.
+  // Include the incoming pane binding so a switch cannot expose the old composer.
+  const metadataReady = !threadId || (sessionMetadata?.threadId === threadId && !sessionMetadata.error);
+  const importedCopy = !!threadId && sessionMetadata?.threadId === threadId && sessionMetadata.imported;
+  const conversationWritable = metadataReady && !importedCopy && (!pane.thread_id || pane.thread_id === threadId);
   // Intent on this pane is also intent to know the provider's catalog: warm
   // it here so the effort / permission / model controls are populated by the
   // time the user reaches for them, instead of only after a picker opens.
   // Persisted catalogs paint first; this is the background refresh behind
   // them, and it shares the picker's singleflight so nothing runs twice.
   useEffect(() => {
-    if (!providerRuntimeIntent) return;
+    if (!conversationWritable || !providerRuntimeIntent) return;
     void refreshProviderCapabilitiesForIntent(provider);
-  }, [providerRuntimeIntent, provider]);
-  const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  }, [conversationWritable, providerRuntimeIntent, provider]);
   // A fresh pane intentionally waits for explicit user intent before it
   // starts a provider session. Keep text typed during that async startup
   // locally, then move it into the authoritative thread slice as soon as the
@@ -438,6 +452,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // remount during that grace period could steal focus later.
   const promotionFocusConsumedRef = useRef(false);
   const focusComposerAfterPromotion =
+    conversationWritable &&
     promotedDraftThreadId !== null &&
     threadId === promotedDraftThreadId &&
     !promotionFocusConsumedRef.current;
@@ -635,7 +650,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const storedDraft = useAgentChatStore((s) =>
     threadId ? (s.threads[threadId]?.inputDraft ?? "") : "",
   );
-  const draft = threadId ? storedDraft : pendingSessionDraft;
+  // The backend can publish our binding before start_session acknowledges it.
+  // Keep the local draft until that acknowledgement transfers it to the slice.
+  const draft = threadId && !(startupThreadRef.current === threadId && pendingSessionDraft)
+    ? storedDraft : pendingSessionDraft;
   const timeline = useAgentChatStore(
     useShallow((s) => {
       const t = threadId ? s.threads[threadId] : undefined;
@@ -696,13 +714,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // at most once per pane mount and only for a not-yet-started thread.
   const primedMcpRef = useRef(false);
   useEffect(() => {
-    if (primedMcpRef.current) return;
+    if (!conversationWritable || primedMcpRef.current) return;
     if (messages.length > 0) return;
     primedMcpRef.current = true;
     void primeChatMcp().catch(() => {
       /* best-effort */
     });
-  }, [messages.length]);
+  }, [conversationWritable, messages.length]);
 
   // Subagent drill-in view state (locked decision 3): the pane swaps its
   // transcript body for a read-only sub-transcript and its sub-header for
@@ -1011,7 +1029,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // picker-triggered silent restart resumes the SDK session instead
   // of starting fresh.
   //
-  // Race safety: gated on `model === null`, and we re-check the live
+  // Provenance is fetched even for a warm, already-configured slice.
+  // Race safety: we re-check the live
   // slice after the async fetch so a selection the user made while the
   // fetch was in flight is never clobbered. `seedAttemptedRef` (keyed
   // by thread id, released on teardown like the hydrate effect) keeps
@@ -1021,7 +1040,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const seedAttemptedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!threadId) return;
-    if (model !== null) return;
     if (seedAttemptedRef.current === threadId) return;
     seedAttemptedRef.current = threadId;
     const seedThreadId = threadId;
@@ -1029,14 +1047,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     let cancelled = false;
     void (async () => {
       let record: AgentChatSessionRecord | null = null;
+      let metadataError: string | null = null;
       try {
         record = await agentChatGetSession(seedThreadId);
       } catch (err) {
-        // Soft-fail: fall through to the provider default so the
-        // pickers still render. Log so it's debuggable.
-        console.warn("[agent-chat] get-session on mount failed:", err);
+        // Keep the saved config fallback, but fail closed on send until
+        // provenance can be checked. The user can retry in the pane.
+        metadataError = String(err instanceof Error ? err.message : err);
       }
       if (cancelled) return;
+      setSessionMetadata({ threadId: seedThreadId, imported: record?.imported_from != null, error: metadataError });
+      // Imported copies have no native resume cursor or writable configuration.
+      if (record?.imported_from != null) return;
       // Never overwrite a value the user picked while the fetch was in
       // flight — the picker handlers write straight to the slice. The
       // guard is PER FIELD (not a single `model`-only bail): a user can
@@ -1103,7 +1125,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
   }, [
     threadId,
-    model,
+    metadataRetry,
     provider,
     setStoreModel,
     setStoreEffort,
@@ -1317,6 +1339,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // user can retry by re-opening the workspace.
   const recoveryAttempted = useRef(false);
   useEffect(() => {
+    if (!conversationWritable) return;
     /**
      * Finish a half-completed materialise: the draft got a workspace and a
      * pane but never a session, so adopt its orphan thread id (which already
@@ -1456,6 +1479,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     startAttempted.current = true;
     setStarting(true);
     const localThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+    startupThreadRef.current = localThreadId;
     // For a brand-new thread with no slice yet, use this provider's
     // native default. OpenCode deliberately launches with a null
     // permission mode; feeding it Claude's bypass token would persist
@@ -1478,6 +1502,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // stale failure banner (no-op when nothing is bannered).
         void useProviderHealth.getState().noteProviderSuccess(provider);
         ensureThread(id);
+        startupThreadRef.current = id;
         commitPendingSessionDraft(id);
         setThreadId(id);
         setStoreModel(id, defaultModel);
@@ -1508,6 +1533,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       })
       .finally(() => setStarting(false));
   }, [
+    conversationWritable,
     threadId,
     promotedDraftThreadId,
     recoveryDraft,
@@ -1537,7 +1563,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // sees the pre-set snapshot when two Enter presses fire in one
     // tick). Refs mutate synchronously; the second call sees
     // `sendInFlightRef.current === true` and bails.
-    if (sendInFlightRef.current) return;
+    if (!conversationWritable || sendInFlightRef.current) return;
     if (!threadId) return;
     // `textOverride` is the one-click "Continue run" path (issue #154):
     // it sends fixed text through this same machinery so the optimistic
@@ -1856,6 +1882,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     })();
     },
     [
+    conversationWritable,
     threadId,
     draft,
     provider,
@@ -3162,10 +3189,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Fast choice is no longer valid for the resolved model, heal it back to
   // Standard instead of keeping a hidden premium-tier override alive.
   useEffect(() => {
-    if (fastMode && activeModel && !activeModel.supports_fast_mode) {
+    if (conversationWritable && fastMode && activeModel && !activeModel.supports_fast_mode) {
       handleFastModeChange(false);
     }
-  }, [fastMode, activeModel, handleFastModeChange]);
+  }, [conversationWritable, fastMode, activeModel, handleFastModeChange]);
 
   // Grok's installed CLI owns this catalogue and the store refreshes it while
   // Codemux is running. Reconcile removals as well as additions: a retired
@@ -3174,6 +3201,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const grokReconcileAttemptsRef = useRef(new Set<string>());
   useEffect(() => {
     if (
+      !conversationWritable ||
       provider !== "grok" ||
       grokConfigurationBusy ||
       restartInFlightRef.current ||
@@ -3254,6 +3282,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         });
     }
   }, [
+    conversationWritable,
     provider,
     grokConfigurationBusy,
     threadId,
@@ -3635,8 +3664,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   useEffect(() => {
     // Resume's phrase depends on whether the provider has its own `/goal`;
     // otherwise the command list only loads when the slash popup opens.
-    if (hasGoal) void loadProviderCommands(provider, cwd);
-  }, [hasGoal, provider, cwd, loadProviderCommands]);
+    if (conversationWritable && hasGoal) void loadProviderCommands(provider, cwd);
+  }, [conversationWritable, hasGoal, provider, cwd, loadProviderCommands]);
   const [messageJumpRequest, setMessageJumpRequest] = useState<{
     itemId: string;
     turnId?: string | null;
@@ -3844,9 +3873,36 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     else root.removeAttribute("data-reading-back");
   }, []);
 
-  const composerEl = (
+  const retainStartupComposer = startupThreadRef.current !== null &&
+    (!threadId || startupThreadRef.current === threadId) &&
+    (!pane.thread_id || pane.thread_id === startupThreadRef.current) && !importedCopy;
+  const conversationCheckNotice = (
+    <div className="pointer-events-auto mx-auto max-w-3xl px-4 py-4 text-body text-muted-foreground" role="status">
+      {importedCopy ? (
+        <>
+          <p>Imported conversation · Read-only copy</p>
+          <p className="mt-1 text-label">
+            Visible user and assistant text only. To use this as context,
+            attach it with @session in a new chat.
+          </p>
+        </>
+      ) : sessionMetadata?.threadId === threadId && sessionMetadata.error ? (
+        <>
+          <p>Could not check conversation: {sessionMetadata.error}</p>
+          <Button variant="ghost" size="sm" onClick={() => {
+            seedAttemptedRef.current = null;
+            setMetadataRetry((n) => n + 1);
+          }}>
+            Retry conversation check
+          </Button>
+        </>
+      ) : <p>Checking conversation…</p>}
+    </div>
+  );
+  const composerEl = !conversationWritable && !retainStartupComposer ? conversationCheckNotice : (
     <Composer
       draft={draft}
+      readOnly={!conversationWritable}
       cwd={cwd}
       // An empty pane reads as a new chat: "Describe what you want the
       // agent to do…" until the first turn lands (design D10 copy).
@@ -3865,7 +3921,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
       belowComposerSlot={mobile ? null : belowComposerSlot}
-      stripSlot={stripEl}
+      stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
@@ -3895,9 +3951,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       contextUsage={contextUsage}
       contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
       contextUsageProviderLabel={contextUsageProviderLabel}
-      sessionReady={sessionReady}
+      sessionReady={conversationWritable && sessionReady}
       sessionAwaitingIntent={sessionAwaitingIntent}
-      configurationReady={!grokConfigurationBusy}
+      configurationReady={conversationWritable && !grokConfigurationBusy}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
       stagedAttachments={stagedAttachments}
@@ -3914,18 +3970,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         removeStagedAttachment(threadId, id);
       }}
       onToggleExpandPr={handleToggleExpandPr}
-      onAttachFile={handleAttachFile}
-      onAttachFolder={handleAttachFolder}
-      onAttachIssue={handleAttachIssue}
-      onAttachPr={handleAttachPr}
-      onAttachSession={handleAttachSession}
-      onAttachImage={handleAttachImage}
+      onAttachFile={conversationWritable ? handleAttachFile : undefined}
+      onAttachFolder={conversationWritable ? handleAttachFolder : undefined}
+      onAttachIssue={conversationWritable ? handleAttachIssue : undefined}
+      onAttachPr={conversationWritable ? handleAttachPr : undefined}
+      onAttachSession={conversationWritable ? handleAttachSession : undefined}
+      onAttachImage={conversationWritable ? handleAttachImage : undefined}
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={workspaceProviderKind}
       providerCliInstalled={providerCliInstalled}
       providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => {
+        if (!conversationWritable) return;
         if (threadId) {
           setInputDraft(threadId, next);
           return;
@@ -3961,15 +4018,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onDragEnter={handlePaneDragEnter}
       onDragLeave={handlePaneDragLeave}
       onDropCapture={resetPaneDrag}
-      onFocusCapture={() => observeProviderRuntimeIntent(provider)}
-      onKeyDownCapture={() => observeProviderRuntimeIntent(provider)}
-      onPointerDownCapture={() => observeProviderRuntimeIntent(provider)}
+      onFocusCapture={() => { if (conversationWritable) observeProviderRuntimeIntent(provider); }}
+      onKeyDownCapture={() => { if (conversationWritable) observeProviderRuntimeIntent(provider); }}
+      onPointerDownCapture={() => { if (conversationWritable) observeProviderRuntimeIntent(provider); }}
     >
       {/* Provider runtime health (probe-backed, TTL-cached): a dead CLI
           used to fail silently into a perpetual "Working…" spinner.
           Renders as a floating top overlay; needs `relative` above. */}
-      <ProviderStatusNotice provider={provider} />
-      <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />
+      {conversationWritable && <ProviderStatusNotice provider={provider} />}
+      {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
@@ -4008,14 +4065,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               messageJumpRequest={messageJumpRequest}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
-              onRespondToRequest={handleRespond}
-              onAcceptPlan={handleAcceptPlan}
-              onRejectPlan={handleRejectPlan}
-              onCancelQueued={handleCancelQueued}
-              onSendQueuedNow={handleSendQueuedNow}
-              onSteerQueued={capabilities?.supports_steering ? handleSteerQueued : undefined}
+              runtimeIntentAllowed={conversationWritable}
+              passive={!conversationWritable}
+              onRespondToRequest={conversationWritable ? handleRespond : () => Promise.resolve()}
+              onAcceptPlan={conversationWritable ? handleAcceptPlan : () => {}}
+              onRejectPlan={conversationWritable ? handleRejectPlan : () => {}}
+              onCancelQueued={conversationWritable ? handleCancelQueued : () => {}}
+              onSendQueuedNow={conversationWritable ? handleSendQueuedNow : () => {}}
+              onSteerQueued={conversationWritable && capabilities?.supports_steering ? handleSteerQueued : undefined}
               turnCheckpointByNonce={turnCheckpointByNonce}
-              onRevertTurn={handleRequestTurnRevert}
+              onRevertTurn={conversationWritable ? handleRequestTurnRevert : undefined}
               revertingTurnIndex={revertingTurnIndex}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
@@ -4045,8 +4104,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 : "pointer-events-none absolute inset-x-0 bottom-0 z-10 pt-3.5"
             }
           >
-            {pendingInputPanelEl}
-            {threadId && (
+            {conversationWritable && pendingInputPanelEl}
+            {conversationWritable && threadId && (
               <AsyncQuestionPanel
                 threadId={threadId}
                 working={streaming}
@@ -4058,7 +4117,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 )}
               />
             )}
-            {debugBannerEl && (
+            {conversationWritable && debugBannerEl && (
               // Docked in a `pointer-events-none` region, so the banner's
               // own buttons have to opt back in.
               <div className="pointer-events-auto">{debugBannerEl}</div>

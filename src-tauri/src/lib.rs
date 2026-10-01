@@ -20,6 +20,7 @@ pub mod automations;
 pub mod automations_sync;
 pub mod branch_name;
 pub mod json_rpc_child;
+pub mod local_session_import;
 pub mod mcp_server;
 pub mod agent_browser;
 pub mod browser_viewport;
@@ -685,6 +686,13 @@ fn build_core_app<R: tauri::Runtime>(
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.clear_workspaces();
             }
+            {
+                let state: tauri::State<'_, state::AppStateStore> = handle.state();
+                let db: tauri::State<'_, database::DatabaseStore> = handle.state();
+                if let Err(error) = state.recover_local_import_layout(&db).and_then(|ids| {
+                    if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
+                }) {log::warn!("Local import layout recovery remains pending: {error}");}
+            }
             // Headless (`codemux serve`) deliberately keeps the CWD workspace
             // `default_app_state()` creates. The clear above exists purely to
             // show the GUI's splash screen, and there is no splash screen to
@@ -702,7 +710,7 @@ fn build_core_app<R: tauri::Runtime>(
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 let plan = mcp_server::plan_boot_mcp_reconciliation(&state.snapshot());
                 if let Some(active) = plan.active {
-                    mcp_server::reconcile_mcp_config_targets(std::slice::from_ref(&active));
+                    mcp_server::reconcile_mcp_config_targets(&handle, std::slice::from_ref(&active));
                 }
                 let pending: tauri::State<'_, mcp_server::PendingMcpConfigRepairs> =
                     handle.state();
@@ -2466,6 +2474,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::set_agent_chat_enabled,
             commands::quit_app,
             commands::get_home_dir,
+            local_session_import::agent_chat_scan_local_sessions,
+            local_session_import::agent_chat_import_local_sessions,
             commands::agent_chat_create_pane,
             commands::agent_chat_close_pane,
             commands::dev_agent_chat_spawn_test_pane,

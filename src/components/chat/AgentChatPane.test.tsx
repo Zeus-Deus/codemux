@@ -3,6 +3,8 @@ import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
+let useRealTranscript = false;
+let useRealComposer = false;
 // Overridable per-test: thread -> messages map so the new race-fix
 // tests can observe which slice AgentChatPane subscribes to.
 let currentThreadsMap: Record<string, unknown[]> = {};
@@ -89,14 +91,32 @@ const appendUserMessageMock = vi.fn();
  *  imperatively folded into the slice (e.g. Stop's local settle). */
 const applyEventMock = vi.fn();
 
+// Only virtual layout is replaced: provenance tests use real cached transcripts,
+// message rows, markdown, and (where requested) the real Composer.
+vi.mock("@legendapp/list/react", async () => {
+  const React = await import("react");
+  return { LegendList: React.forwardRef(function List(props: Record<string, any>, ref) {
+    const node = React.useRef<HTMLDivElement>(null);
+    React.useImperativeHandle(ref, () => ({
+      getScrollableNode: () => node.current,
+      getState: () => ({ scroll: 0, scrollLength: 500, isAtEnd: true, listen: () => () => {} }),
+      scrollToEnd: () => Promise.resolve(), scrollToIndex: () => Promise.resolve(), scrollToOffset: () => Promise.resolve(),
+    }));
+    return <div ref={node}>{props.ListHeaderComponent}{props.data.map((item: unknown, index: number) =>
+      <React.Fragment key={props.keyExtractor(item, index)}>{props.renderItem({ item, index })}</React.Fragment>
+    )}{props.ListFooterComponent}</div>;
+  }) };
+});
+
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
     <div data-testid="home-landing">{composer}</div>
   ),
 }));
 
-vi.mock("./ChatTranscript", () => ({
-  ChatTranscript: ({
+vi.mock("./ChatTranscript", async (importOriginal) => {
+  const { ChatTranscript: RealTranscript } = await importOriginal<typeof import("./ChatTranscript")>();
+  const StubTranscript = ({
     messages,
     streaming,
     sessionStartedAt,
@@ -160,8 +180,9 @@ vi.mock("./ChatTranscript", () => ({
         onClick={() => onSendQueuedNow?.("q-1")}
       />
     </div>
-  ),
-}));
+  );
+  return { ChatTranscript: (props: React.ComponentProps<typeof RealTranscript>) => useRealTranscript ? <RealTranscript {...props} /> : <StubTranscript {...props} /> };
+});
 
 vi.mock("./DebugCleanupBanner", () => ({
   DebugCleanupBanner: ({
@@ -212,8 +233,9 @@ vi.mock("./DebugExitDialog", () => ({
   },
 }));
 
-vi.mock("./Composer", () => ({
-  Composer: ({
+vi.mock("./Composer", async (importOriginal) => {
+  const { Composer: RealComposer } = await importOriginal<typeof import("./Composer")>();
+  const StubComposer = ({
     zone1Override,
     belowComposerSlot,
     stripSlot,
@@ -249,13 +271,13 @@ vi.mock("./Composer", () => ({
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
     onProviderModelChange: (
-      provider: "claude" | "codex" | "cursor" | "grok" | "opencode",
+      provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes",
       model: string,
     ) => void;
     onContextWindowChange: (contextWindow: string) => void;
-    onFastModeChange: (fastMode: boolean) => void;
+    onFastModeChange?: (fastMode: boolean) => void;
     onPermissionModeChange: (mode: string) => void;
-    provider: "claude" | "codex" | "cursor" | "grok" | "opencode";
+    provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes";
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;
@@ -335,7 +357,7 @@ vi.mock("./Composer", () => ({
       />
       <button
         data-testid="fast-mode-change"
-        onClick={() => onFastModeChange(true)}
+        onClick={() => onFastModeChange?.(true)}
       />
       {/* Permission-mode picker selection. Per-turn providers have to
           push the choice onto the LIVE session; per-session ones
@@ -345,8 +367,9 @@ vi.mock("./Composer", () => ({
         onClick={() => onPermissionModeChange("ask")}
       />
     </div>
-  ),
-}));
+  );
+  return { Composer: (props: React.ComponentProps<typeof RealComposer>) => useRealComposer ? <RealComposer {...props} /> : <StubComposer {...props} /> };
+});
 
 // Thread Scope row — the sole empty-state scope surface (below the
 // composer). Stubbed because its three popovers own their own store
@@ -418,6 +441,10 @@ vi.mock("@/stores/ui-store", () => ({
     },
   ),
 }));
+
+vi.mock("@/hooks/use-chat-code-plugin", () => ({ useChatCodePlugin: () => undefined }));
+
+vi.mock("@/hooks/use-mcp-runtime", () => ({ useMcpRuntime: () => ({ runtimes: {} }) }));
 
 vi.mock("@/hooks/use-agent-chat-events", () => ({
   useAgentChatEvents: () => {},
@@ -504,6 +531,9 @@ vi.mock("@/tauri/commands", () => ({
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   // MCP warmup fired on the empty-state mount; no-op in tests.
   primeChatMcp: vi.fn().mockResolvedValue(undefined),
+  listMcpServers: vi.fn().mockResolvedValue([]),
+  startSkillsWatcher: vi.fn().mockResolvedValue(undefined),
+  listChatSlashCommands: vi.fn().mockResolvedValue([]),
   // Host-scoped source-control preflight behind the composer's hosting
   // attach rows. Default to a fully usable checkout; the gating tests
   // override per-case.
@@ -711,6 +741,9 @@ vi.mock("@/stores/agent-chat-store", () => {
 });
 
 import { AgentChatPane } from "./AgentChatPane";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { TranscriptCacheProvider } from "./transcript-cache";
+import { TranscriptBindingContext } from "./transcript-cache-binding";
 import {
   agentChatGetSession,
   agentChatInterruptTurn,
@@ -749,17 +782,270 @@ const pane = {
 // Most component tests exercise behavior after a chat pane has been chosen.
 // Keep that explicit while individual startup tests can reset the gate.
 beforeEach(() => {
+  vi.mocked(agentChatGetSession).mockReset().mockResolvedValue(null);
   useProviderRuntimeIntent.getState().reset();
   useProviderRuntimeIntent.getState().observe("claude");
 });
 
+afterEach(cleanup);
 afterEach(() => {
   // Vitest globals are off, so Testing Library never auto-unmounts. Without
   // this every test left its pane mounted — live subscriptions, listeners
   // and all — and the file's heap climbed ~40MB per test until the worker
   // ran out of memory in CI.
   cleanup();
+  useRealTranscript = false;
+  useRealComposer = false;
   useProviderRuntimeIntent.getState().reset();
+});
+
+function cachedPane(threadId = "thread-x", includeFresh = false) {
+  const binding = { key: threadId, workspaceId: "ws-home", threadKey: threadId, provider: "claude" as const, cwd: "/home/user" };
+  return <TooltipProvider><TranscriptCacheProvider activeKey={threadId} validKeys={[threadId]}>
+    <TranscriptBindingContext.Provider value={binding}>
+      <AgentChatPane pane={{ ...pane, thread_id: threadId }} />
+    </TranscriptBindingContext.Provider>
+    {includeFresh && <AgentChatPane pane={{ ...pane, pane_id: "fresh-pane", thread_id: null }} />}
+  </TranscriptCacheProvider></TooltipProvider>;
+}
+
+function interactWithCachedTranscript(container: HTMLElement) {
+  const target = container.querySelector('[data-transcript-cache-host] > div')!;
+  expect(target).not.toBeNull();
+  fireEvent.pointerDown(target);
+  fireEvent.keyDown(target, { key: "ArrowDown" });
+  fireEvent.focus(target);
+}
+
+describe("AgentChatPane real cached provenance", () => {
+  beforeEach(() => {
+    useRealTranscript = true;
+    currentMessages = [{ kind: "assistant_message", id: "copy", seq: 1, text: "Imported answer", streaming: false, turn_id: "t" }];
+    currentThreadsMap = { "other-thread": currentMessages };
+    currentSliceOverrides = { "thread-x": { model: "already-seeded" }, "other-thread": { model: "already-seeded" } };
+    currentDraftsById = {};
+    useProviderRuntimeIntent.getState().reset();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatSendTurn).mockClear();
+  });
+  it("keeps imported and metadata-pending assistant prose passive even when provider intent was already observed", async () => {
+    const prose = "[External](https://private.example.test/page)\n\n![Remote](https://private.example.test/secret.png)\n\n![Local](/project/private.png)\n\n[Local reference](/project/private.png)";
+    currentMessages = [
+      { kind: "user_message", id: "user", seq: 1, text: prose, turn_id: "t" },
+      { kind: "assistant_message", id: "assistant", seq: 2, text: prose, streaming: false, turn_id: "t" },
+    ];
+    useProviderRuntimeIntent.getState().observe("claude");
+    const observeIntent = vi.spyOn(useProviderRuntimeIntent.getState(), "observe");
+    let metadata!: (record: AgentChatSessionRecord | null) => void;
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((r) => { metadata = r; }));
+    const view = render(cachedPane());
+    const assertPassive = () => {
+      expect(view.container.querySelector('[data-message-id="user"]')?.textContent).toContain("![Remote]");
+      const markdown = view.container.querySelector(".chat-markdown")!;
+      expect(markdown).not.toBeNull();
+      expect(markdown.querySelectorAll("img")).toHaveLength(0);
+      expect(markdown.textContent).toContain("Remote");
+      expect(markdown.textContent).toContain("Local");
+      expect(view.queryByTestId("composer")).toBeNull();
+    };
+    await waitFor(() => expect(view.container.querySelector('[data-message-id="user"]')).not.toBeNull());
+    assertPassive();
+    interactWithCachedTranscript(view.container);
+    expect(observeIntent).not.toHaveBeenCalled();
+    await act(async () => metadata({ imported_from: "claude:fixture" } as AgentChatSessionRecord));
+    assertPassive();
+    interactWithCachedTranscript(view.container);
+    expect(observeIntent).not.toHaveBeenCalled();
+    observeIntent.mockRestore();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
+  it("keeps the normal live cached transcript intent capture", async () => {
+    const view = render(cachedPane());
+    await waitFor(() => expect(view.getByTestId("composer")).toBeInTheDocument());
+    interactWithCachedTranscript(view.container);
+    expect(useProviderRuntimeIntent.getState().providers.claude).toBe(true);
+  });
+  it("never launches an unbound pane from pending, failed or imported cache interactions", async () => {
+    let reject!: (error: Error) => void;
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+    const view = render(cachedPane("thread-x", true));
+    interactWithCachedTranscript(view.container);
+    expect(useProviderRuntimeIntent.getState().providers.claude).not.toBe(true);
+    await act(async () => reject(new Error("metadata offline")));
+    interactWithCachedTranscript(view.container);
+    expect(useProviderRuntimeIntent.getState().providers.claude).not.toBe(true);
+    vi.mocked(agentChatGetSession).mockResolvedValueOnce({ imported_from: "claude:fixture" } as AgentChatSessionRecord);
+    fireEvent.click(view.getByRole("button", { name: "Retry conversation check" }));
+    await waitFor(() => expect(view.getByText("Imported conversation · Read-only copy")).toBeInTheDocument());
+    interactWithCachedTranscript(view.container);
+    expect(useProviderRuntimeIntent.getState().providers.claude).not.toBe(true);
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
+  it("does not unlock an imported warm slice when stale live metadata completes after a switch", async () => {
+    let resolveOld!: (record: AgentChatSessionRecord | null) => void;
+    let resolveCurrent!: (record: AgentChatSessionRecord | null) => void;
+    useProviderRuntimeIntent.getState().observe("claude");
+    vi.mocked(agentChatGetSession)
+      .mockImplementationOnce(() => new Promise((r) => { resolveOld = r; }))
+      .mockImplementationOnce(() => new Promise((r) => { resolveCurrent = r; }));
+    const view = render(cachedPane());
+    view.rerender(cachedPane("other-thread"));
+    await act(async () => resolveCurrent({ imported_from: "claude:fixture" } as AgentChatSessionRecord));
+    await act(async () => resolveOld(null));
+    interactWithCachedTranscript(view.container);
+    expect(view.queryByTestId("composer")).toBeNull();
+    expect(view.getByText("Imported conversation · Read-only copy")).toBeInTheDocument();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentChatPane real startup composer", () => {
+  beforeEach(() => {
+    useRealComposer = true;
+    currentMessages = [];
+    currentThreadsMap = {};
+    currentSliceOverrides = {};
+    currentDraftsById = {};
+    useProviderRuntimeIntent.getState().reset();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatSendTurn).mockClear();
+    setInputDraftMock.mockImplementation((id: string, inputDraft: string) => {
+      currentThreadsMap[id] ??= [];
+      currentSliceOverrides[id] = { ...currentSliceOverrides[id], inputDraft };
+    });
+  });
+  afterEach(() => { setInputDraftMock.mockReset(); });
+  it("never mounts a writable real composer for unknown imported history even with upstream intent", async () => {
+    useProviderRuntimeIntent.getState().observe("claude");
+    let metadata!: (record: AgentChatSessionRecord | null) => void;
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((r) => { metadata = r; }));
+    const view = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+    expect(view.queryByRole("textbox")).toBeNull();
+    await act(async () => metadata({ imported_from: "claude:fixture" } as AgentChatSessionRecord));
+    expect(view.queryByRole("textbox")).toBeNull();
+    expect(view.getByText("Imported conversation · Read-only copy")).toBeInTheDocument();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+  });
+  it("keeps the focused startup composer readonly on metadata failure and re-enables it after retry", async () => {
+    let reject!: (error: Error) => void;
+    vi.mocked(agentChatStartSession).mockResolvedValueOnce("retry-thread");
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((_r, r) => { reject = r; }));
+    const view = render(<TooltipProvider><AgentChatPane pane={{ ...pane, thread_id: null }} /></TooltipProvider>);
+    const textarea = view.getByRole("textbox") as HTMLTextAreaElement;
+    act(() => textarea.focus());
+    fireEvent.change(textarea, { target: { value: "keep my draft" } });
+    textarea.setSelectionRange(2, 5);
+    await waitFor(() => expect(agentChatGetSession).toHaveBeenCalledWith("retry-thread"));
+    await act(async () => reject(new Error("metadata offline")));
+    expect(view.getByRole("textbox")).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 5]);
+    expect(textarea).toHaveAttribute("readonly");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    vi.mocked(agentChatGetSession).mockResolvedValueOnce(null);
+    fireEvent.click(view.getByRole("button", { name: "Retry conversation check" }));
+    await waitFor(() => expect(textarea).not.toHaveAttribute("readonly"));
+    expect(view.getByRole("textbox")).toBe(textarea);
+    expect(textarea.value).toBe("keep my draft");
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 5]);
+  });
+  it("preserves focus and draft when the backend publishes its binding before startup completes", async () => {
+    let start!: (id: string) => void;
+    let metadata!: (record: AgentChatSessionRecord | null) => void;
+    vi.mocked(agentChatStartSession).mockImplementationOnce(() => new Promise((r) => { start = r; }));
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((r) => { metadata = r; }));
+    const tree = (threadId: string | null) => <TooltipProvider><AgentChatPane pane={{ ...pane, thread_id: threadId }} /></TooltipProvider>;
+    const view = render(tree(null));
+    const textarea = view.getByRole("textbox") as HTMLTextAreaElement;
+    act(() => textarea.focus());
+    fireEvent.change(textarea, { target: { value: "unfinished draft" } });
+    textarea.setSelectionRange(3, 7);
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledOnce());
+    const requestedId = vi.mocked(agentChatStartSession).mock.calls[0][2].thread_id;
+    view.rerender(tree(requestedId));
+    expect(view.getByRole("textbox")).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.value).toBe("unfinished draft");
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([3, 7]);
+    expect(textarea).toHaveAttribute("readonly");
+    await act(async () => start(requestedId));
+    await act(async () => metadata(null));
+    expect(view.getByRole("textbox")).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([3, 7]);
+  });
+  it("retains the real textarea, focused draft and caret across deferred startup and metadata", async () => {
+    let start!: (id: string) => void;
+    let metadata!: (record: AgentChatSessionRecord | null) => void;
+    vi.mocked(agentChatStartSession).mockImplementationOnce(() => new Promise((r) => { start = r; }));
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((r) => { metadata = r; }));
+    const view = render(<TooltipProvider><AgentChatPane pane={{ ...pane, thread_id: null }} /></TooltipProvider>);
+    const textarea = view.getByRole("textbox") as HTMLTextAreaElement;
+    act(() => textarea.focus());
+    fireEvent.change(textarea, { target: { value: "draft in progress" } });
+    textarea.setSelectionRange(6, 11);
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledOnce());
+    expect(document.activeElement).toBe(textarea);
+    await act(async () => start("thread-started"));
+    expect(view.getByRole("textbox")).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.value).toBe("draft in progress");
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([6, 11]);
+    expect(textarea).toHaveAttribute("readonly");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    await act(async () => metadata(null));
+    expect(view.getByRole("textbox")).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([6, 11]);
+    expect(textarea).not.toHaveAttribute("readonly");
+  });
+});
+
+describe("AgentChatPane imported provenance", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "assistant_text", id: "copy", text: "Imported answer" }];
+    currentThreadsMap = {};
+    currentSliceOverrides = { "thread-x": { model: "already-seeded" } };
+    currentDraftsById = {};
+    vi.mocked(agentChatGetSession).mockReset();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatSendTurn).mockClear();
+    useProviderRuntimeIntent.getState().reset();
+  });
+  afterEach(() => { vi.mocked(agentChatGetSession).mockReset().mockResolvedValue(null); });
+  it("blocks interaction while metadata loads, then shows a read-only imported copy even with a seeded model", async () => {
+    let resolve!: (record: AgentChatSessionRecord) => void;
+    vi.mocked(agentChatGetSession).mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+    const view = render(<AgentChatPane pane={pane} />);
+    expect(view.queryByTestId("composer")).toBeNull();
+    expect(view.getByText("Checking conversation…")).toBeInTheDocument();
+    fireEvent.pointerDown(view.container.firstElementChild!);
+    expect(useProviderRuntimeIntent.getState().providers.claude).not.toBe(true);
+    await act(async () => resolve({ imported_from: "claude:fixture" } as AgentChatSessionRecord));
+    expect(view.getByText("Imported conversation · Read-only copy")).toBeInTheDocument();
+    expect(view.queryByTestId("composer")).toBeNull();
+    fireEvent.pointerDown(view.container.firstElementChild!);
+    expect(useProviderRuntimeIntent.getState().providers.claude).not.toBe(true);
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
+  it("rechecks provenance when the thread changes, and fails closed with a retry", async () => {
+    vi.mocked(agentChatGetSession).mockResolvedValueOnce(null).mockRejectedValueOnce(new Error("Metadata unavailable")).mockResolvedValueOnce({ imported_from: "codex:fixture" } as AgentChatSessionRecord);
+    const view = render(<AgentChatPane pane={pane} />);
+    await waitFor(() => expect(view.getByTestId("composer")).toBeInTheDocument());
+    view.rerender(<AgentChatPane pane={{ ...pane, thread_id: "another-thread" }} />);
+    expect(view.queryByTestId("composer")).toBeNull();
+    await waitFor(() => expect(view.getByText(/Metadata unavailable/)).toBeInTheDocument());
+    expect(view.queryByTestId("composer")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Retry conversation check" }));
+    await waitFor(() => expect(view.getByText("Imported conversation · Read-only copy")).toBeInTheDocument());
+  });
 });
 
 describe("AgentChatPane provider runtime intent", () => {
@@ -771,6 +1057,7 @@ describe("AgentChatPane provider runtime intent", () => {
     vi.mocked(agentChatStartSession).mockResolvedValue("thread-started");
 
     const { container } = render(<AgentChatPane pane={paneWithoutThread} />);
+    await act(async () => {});
     await act(async () => Promise.resolve());
     expect(agentChatStartSession).not.toHaveBeenCalled();
 
@@ -786,6 +1073,7 @@ describe("AgentChatPane provider runtime intent", () => {
     );
 
     const { container } = render(<AgentChatPane pane={paneWithoutThread} />);
+    await act(async () => {});
     await act(async () => Promise.resolve());
     const composer = container.querySelector('[data-testid="composer"]')!;
     // Nothing is starting yet: the composer is told so, and must not read
@@ -810,6 +1098,7 @@ describe("AgentChatPane provider runtime intent", () => {
     // What `launchAgentChatPane` records before the pane is created.
     useProviderRuntimeIntent.getState().observe("claude");
     render(<AgentChatPane pane={paneWithoutThread} />);
+    await act(async () => {});
     await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
   });
 
@@ -826,6 +1115,7 @@ describe("AgentChatPane provider runtime intent", () => {
     );
 
     const { container } = render(<AgentChatPane pane={paneWithoutThread} />);
+    await act(async () => {});
     fireEvent.pointerDown(container.firstElementChild!);
     await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
 
@@ -855,9 +1145,10 @@ describe("AgentChatPane empty-state branch", () => {
     clearDraftMock.mockClear();
   });
 
-  it("renders ChatHomeLanding when messages.length === 0", () => {
+  it("renders ChatHomeLanding when messages.length === 0", async () => {
     currentMessages = [];
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).not.toBeNull();
@@ -866,9 +1157,10 @@ describe("AgentChatPane empty-state branch", () => {
     ).toBeNull();
   });
 
-  it("renders ChatTranscript + Composer when messages.length >= 1", () => {
+  it("renders ChatTranscript + Composer when messages.length >= 1", async () => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     expect(
       container.querySelector('[data-testid="transcript"]'),
     ).not.toBeNull();
@@ -884,6 +1176,7 @@ describe("AgentChatPane empty-state branch", () => {
     currentMessages = [];
     currentSliceOverrides = { "thread-x": { inputDraft: "hello" } };
     const view = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
 
     fireEvent.click(
       view.container.querySelector('[data-testid="composer-submit"]')!,
@@ -936,6 +1229,7 @@ describe("AgentChatPane source-control preflight", () => {
       username: null,
     });
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       const composer = container.querySelector('[data-testid="composer"]');
       expect(composer?.getAttribute("data-provider-cli-installed")).toBe(
@@ -949,6 +1243,7 @@ describe("AgentChatPane source-control preflight", () => {
 
   it("passes a usable CLI through as authenticated", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       const composer = container.querySelector('[data-testid="composer"]');
       expect(composer?.getAttribute("data-provider-cli-installed")).toBe(
@@ -982,6 +1277,7 @@ describe("AgentChatPane Continue-run chip (issue #154)", () => {
       "thread-x": { inputDraft: "half-typed next message" },
     };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const { agentChatSendTurn } = await import("@/tauri/commands");
     fireEvent.click(
       container.querySelector('[data-testid="composer-continue"]')!,
@@ -1019,6 +1315,7 @@ describe("AgentChatPane usage-limit row", () => {
 
   it("is the only resume affordance and routes its buttons to the backend", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     // The Continue chip stands down while the usage row is up.
     expect(
       container.querySelector('[data-testid="composer"]')!.getAttribute("data-interrupted"),
@@ -1080,6 +1377,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
 
   it("anchors the exact bubble it appended, and reports it to the transcript", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     expect(anchorNonce(container)).toBe("");
 
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
@@ -1103,6 +1401,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     const { agentChatSendTurn } = await import("@/tauri/commands");
     vi.mocked(agentChatSendTurn).mockResolvedValue({turn_id:"", queued_id:"profile-queue"});
     const { container } = render(<AgentChatPane pane={{...pane,provider:"hermes"}} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(agentChatSendTurn).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(container.querySelector('[data-testid="transcript"]')).toHaveAttribute("data-streaming", "false"));
@@ -1110,6 +1409,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
 
   it("gives the one-click Continue run the same contract", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="composer-continue"]')!,
     );
@@ -1133,6 +1433,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       .mockResolvedValue({ turn_id: "turn-1", queued_id: null } as never);
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(anchorNonce(container)).toBe(""));
 
@@ -1155,6 +1456,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       },
     ];
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="send-queued-now"]')!,
     );
@@ -1191,6 +1493,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     );
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="send-queued-now"]')!,
     );
@@ -1202,6 +1505,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       "thread-x": { inputDraft: "draft already in progress" },
     };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="cancel-queued"]')!);
 
     const { agentChatCancelQueuedTurn } = await import("@/tauri/commands");
@@ -1222,6 +1526,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     const { agentChatCancelQueuedTurn } = await import("@/tauri/commands");
     vi.mocked(agentChatCancelQueuedTurn).mockResolvedValueOnce(false);
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="cancel-queued"]')!);
 
     await waitFor(() => {
@@ -1244,6 +1549,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       "thread-x": { inputDraft: "hello there", streaming: true },
     };
     const { container, rerender } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(anchorNonce(container)).toBe("1"));
 
@@ -1263,6 +1569,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     vi.mocked(agentChatSendTurn).mockRejectedValue(new Error("boom") as never);
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => {
       expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
@@ -1301,8 +1608,9 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
     vi.mocked(agentChatListMessages).mockResolvedValue([]);
   });
 
-  it("swaps the transcript for the breadcrumb + read-only drill-in on enter, and Esc returns", () => {
+  it("swaps the transcript for the breadcrumb + read-only drill-in on enter, and Esc returns", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
 
     // Orchestrator mode: the (mocked) transcript is shown, no breadcrumb.
     expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull();
@@ -1322,8 +1630,9 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
     expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull();
   });
 
-  it("keeps the parent-bound composer mounted while entered", () => {
+  it("keeps the parent-bound composer mounted while entered", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
     const region = () => container.querySelector('[data-testid="composer"]')!.parentElement!;
     expect(region()).toHaveClass("absolute");
@@ -1337,8 +1646,9 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
     expect(region()).toHaveClass("absolute");
   });
 
-  it("hides the composer's running-subagents strip while drilled into a subagent, and shows it again on Esc", () => {
+  it("hides the composer's running-subagents strip while drilled into a subagent, and shows it again on Esc", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     // Orchestrator mode: one live subagent — the strip is up, handed to
     // the composer through its strip slot.
     const runningRow =
@@ -1406,6 +1716,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
   it("reads from the start of the thread when the slice has no cursor", async () => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
         "thread-x",
@@ -1420,6 +1731,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
     vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
         runLive: false,
@@ -1451,6 +1763,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
     vi.mocked(agentChatTurnActive).mockResolvedValue(true);
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
         runLive: true,
@@ -1468,6 +1781,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
       new Error("command unavailable"),
     );
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
         runLive: false,
@@ -1482,6 +1796,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     vi.mocked(agentChatThreadHeadId).mockResolvedValue(12);
     vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(applyPayloadsTailMock).toHaveBeenCalledWith("thread-x", rows, {
         runLive: false,
@@ -1504,6 +1819,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     vi.mocked(agentChatThreadHeadId).mockResolvedValue(12);
     vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
         "thread-x",
@@ -1528,6 +1844,7 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
         afterId === null ? rows : [],
     );
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
         runLive: false,
@@ -1595,6 +1912,7 @@ describe("AgentChatPane session-start marker wiring (D2)", () => {
       makeSessionRecord({ thread_id: "thread-x", created_at: createdAt }),
     ]);
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(vi.mocked(agentChatListSessions)).toHaveBeenCalledWith(
         "ws-home",
@@ -1617,6 +1935,7 @@ describe("AgentChatPane session-start marker wiring (D2)", () => {
       }),
     ]);
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(vi.mocked(agentChatListSessions)).toHaveBeenCalled();
     });
@@ -1631,6 +1950,7 @@ describe("AgentChatPane session-start marker wiring (D2)", () => {
       makeSessionRecord({ thread_id: "thread-x", created_at: "not-a-date" }),
     ]);
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await waitFor(() => {
       expect(vi.mocked(agentChatListSessions)).toHaveBeenCalled();
     });
@@ -1657,7 +1977,7 @@ describe("AgentChatPane Stage C race fix", () => {
     vi.mocked(agentChatStartSession).mockClear();
   });
 
-  it("adopts a promoted draft's thread_id when pane.thread_id is null, and does NOT start a fresh session", () => {
+  it("adopts a promoted draft's thread_id when pane.thread_id is null, and does NOT start a fresh session", async () => {
     // Simulate the race window: pane created but start_session's
     // state emit hasn't landed yet, so `pane.thread_id` is still
     // null. A promoted draft claims this workspace and carries the
@@ -1678,6 +1998,7 @@ describe("AgentChatPane Stage C race fix", () => {
     };
 
     const { container } = render(<AgentChatPane pane={paneNoThread} />);
+    await act(async () => {});
 
     // Transcript renders the seeded slice (one message), not the
     // empty default.
@@ -1690,7 +2011,7 @@ describe("AgentChatPane Stage C race fix", () => {
     expect(agentChatStartSession).not.toHaveBeenCalled();
   });
 
-  it("requests focus for the composer mounted from a promoted draft", () => {
+  it("requests focus for the composer mounted from a promoted draft", async () => {
     currentDraftsById = {
       "draft-1": {
         draftId: "draft-1",
@@ -1703,6 +2024,7 @@ describe("AgentChatPane Stage C race fix", () => {
     };
 
     const { container } = render(<AgentChatPane pane={paneNoThread} />);
+    await act(async () => {});
 
     expect(container.querySelector('[data-testid="composer"]')).toHaveAttribute(
       "data-focus-on-mount",
@@ -1710,17 +2032,19 @@ describe("AgentChatPane Stage C race fix", () => {
     );
   });
 
-  it("starts a fresh session when pane.thread_id is null AND no promoted draft claims this workspace", () => {
+  it("starts a fresh session when pane.thread_id is null AND no promoted draft claims this workspace", async () => {
     // No drafts → the pane is a true blank slate, so the existing
     // mint-and-start branch should still fire.
     currentDraftsById = {};
     render(<AgentChatPane pane={paneNoThread} />);
+    await act(async () => {});
     expect(agentChatStartSession).toHaveBeenCalledTimes(1);
   });
 
-  it("does not start a fresh session when pane.thread_id is already populated", () => {
+  it("does not start a fresh session when pane.thread_id is already populated", async () => {
     const paneWithThread = { ...paneNoThread, thread_id: "thread-x" };
     render(<AgentChatPane pane={paneWithThread} />);
+    await act(async () => {});
     expect(agentChatStartSession).not.toHaveBeenCalled();
   });
 
@@ -1754,6 +2078,7 @@ describe("AgentChatPane Stage C race fix", () => {
         pane={{ ...paneNoThread, thread_id: "draft-thread-42" }}
       />,
     );
+    await act(async () => {});
 
     await waitFor(() =>
       expect(agentChatStartSession).toHaveBeenCalledTimes(1),
@@ -1798,6 +2123,7 @@ describe("AgentChatPane Stage C race fix", () => {
     );
 
     const { container } = render(<AgentChatPane pane={paneNoThread} />);
+    await act(async () => {});
 
     // The claim was attempted exactly once and never retried.
     await waitFor(() =>
@@ -1817,13 +2143,14 @@ describe("AgentChatPane Stage C race fix", () => {
     errorToast.mockRestore();
   });
 
-  it("syncs local threadId state when pane.thread_id transitions from null to set after mount", () => {
+  it("syncs local threadId state when pane.thread_id transitions from null to set after mount", async () => {
     // Mount with thread_id null and no promoted draft → fresh session
     // branch fires.
     currentDraftsById = {};
     const { rerender, container } = render(
       <AgentChatPane pane={paneNoThread} />,
     );
+    await act(async () => {});
     expect(agentChatStartSession).toHaveBeenCalledTimes(1);
 
     // Rerender with thread_id populated (simulating the delayed
@@ -1903,9 +2230,10 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     };
   }
 
-  it("renders NO interactive scope row on an empty thread — only the read-only Context Row", () => {
+  it("renders NO interactive scope row on an empty thread — only the read-only Context Row", async () => {
     const projectPane = seedProjectWorkspace({ git_branch: "feat/login" });
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     expect(
       container.querySelector('[data-testid="thread-scope-row-stub"]'),
     ).toBeNull();
@@ -1922,17 +2250,19 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     ).not.toBeNull();
   });
 
-  it("keeps the SAME strip once the conversation has messages (scope never appears to change on first send)", () => {
+  it("keeps the SAME strip once the conversation has messages (scope never appears to change on first send)", async () => {
     const projectPane = seedProjectWorkspace({ git_branch: "feat/login" });
     const empty = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     const beforeSend = strip(empty.container)!.innerHTML;
     cleanup();
     currentMessages = [{ kind: "user_message", id: "m1" }];
     const withMessages = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     expect(strip(withMessages.container)!.innerHTML).toBe(beforeSend);
   });
 
-  it("a worktree-backed workspace's extra chat tab gets the same read-only strip (the reported bug)", () => {
+  it("a worktree-backed workspace's extra chat tab gets the same read-only strip (the reported bug)", async () => {
     // `project_root` is the PARENT repo, `cwd` the linked worktree —
     // the exact shape that used to re-offer "New worktree" per tab.
     const wtPane = seedProjectWorkspace({
@@ -1940,6 +2270,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       git_branch: "fix-login",
     });
     const { container } = render(<AgentChatPane pane={wtPane} />);
+    await act(async () => {});
     expect(
       container.querySelector('[data-testid="thread-scope-row-stub"]'),
     ).toBeNull();
@@ -1947,10 +2278,11 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     expect(scoped.getByText("fix-login")).toBeInTheDocument();
   });
 
-  it("home-rooted pane shows Home with no branch and no project picker", () => {
+  it("home-rooted pane shows Home with no branch and no project picker", async () => {
     Object.assign(mockAppState, HOME_APP_STATE);
     workspaceIdForPaneOverride = "ws-home";
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const scoped = within(container);
     expect(scoped.getByText("Home")).toBeInTheDocument();
     expect(scoped.queryByText("·")).not.toBeInTheDocument();
@@ -1981,6 +2313,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       queued_id: null,
     } as never);
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="composer-submit"]')!,
     );
@@ -2016,6 +2349,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       queued_id: null,
     } as never);
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="composer-submit"]')!,
     );
@@ -2056,6 +2390,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       queued_id: null,
     } as never);
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     const submit = container.querySelector('[data-testid="composer-submit"]')!;
     fireEvent.click(submit);
     fireEvent.click(submit);
@@ -2079,6 +2414,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       queued_id: null,
     } as never);
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="composer-submit"]')!,
     );
@@ -2109,6 +2445,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     } as never);
     const homePane = { ...pane, pane_id: "pane-home", thread_id: "thread-x" };
     const { container } = render(<AgentChatPane pane={homePane} />);
+    await act(async () => {});
     fireEvent.click(
       container.querySelector('[data-testid="composer-submit"]')!,
     );
@@ -2118,30 +2455,33 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
   });
 
-  it("renders no strip at all when appState is null (early-boot fallback)", () => {
+  it("renders no strip at all when appState is null (early-boot fallback)", async () => {
     mockAppState.appState = null;
     workspaceIdForPaneOverride = null;
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
     expect(strip(container)).toBeNull();
   });
 
-  it("labels the strip from project_root, not cwd, when they differ", () => {
+  it("labels the strip from project_root, not cwd, when they differ", async () => {
     const featPane = seedProjectWorkspace({ cwd: "/projects/foo-feat-x" });
     const { container } = render(<AgentChatPane pane={featPane} />);
+    await act(async () => {});
     expect(strip(container)!.querySelector("span[title]")!.getAttribute("title")).toBe(
       "/projects/foo",
     );
   });
 
-  it("falls back to active_workspace_id's project_root when workspaceIdForPane is null", () => {
+  it("falls back to active_workspace_id's project_root when workspaceIdForPane is null", async () => {
     const projectPane = seedProjectWorkspace();
     workspaceIdForPaneOverride = null;
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    await act(async () => {});
     expect(within(container).getByText("foo")).toBeInTheDocument();
   });
 
-  it("project_root null on the workspace falls back to cwd", () => {
+  it("project_root null on the workspace falls back to cwd", async () => {
     mockAppState.appState = {
       active_workspace_id: "ws-adhoc",
       workspaces: [
@@ -2161,6 +2501,7 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
       cwd: "/tmp/adhoc",
     };
     const { container } = render(<AgentChatPane pane={adhocPane} />);
+    await act(async () => {});
     expect(within(container).getByText("adhoc")).toBeInTheDocument();
   });
 });
@@ -2229,6 +2570,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     // provider default.
     const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     await waitFor(() => expect(setModelMock).toHaveBeenCalled());
     expect(agentChatGetSession).toHaveBeenCalledWith("thread-x");
     const [threadId, model] = setModelMock.mock.calls[0];
@@ -2246,6 +2588,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     );
     const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     await waitFor(() => expect(setModelMock).toHaveBeenCalled());
     const [, model] = setModelMock.mock.calls[0];
     expect(model).toBe("claude-sonnet-4-6");
@@ -2262,6 +2605,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     );
     const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     await waitFor(() =>
       expect(setEffortMock).toHaveBeenCalledWith("thread-x", "high"),
     );
@@ -2283,6 +2627,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
       provider: "codex" as const,
     };
     render(<AgentChatPane pane={codexPane} />);
+    await act(async () => {});
     await waitFor(() =>
       expect(setPermissionModeMock).toHaveBeenCalledWith(
         "thread-x",
@@ -2303,6 +2648,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     );
     const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     // The model still seeds (the user didn't touch it).
     await waitFor(() =>
       expect(setModelMock).toHaveBeenCalledWith(
@@ -2323,6 +2669,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     );
     const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     await waitFor(() => expect(setResumeCursorMock).toHaveBeenCalled());
     expect(setResumeCursorMock).toHaveBeenCalledWith("thread-x", {
       resume: "sdk-abc",
@@ -2335,11 +2682,12 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     );
     const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     await waitFor(() => expect(setResumeCursorMock).toHaveBeenCalled());
     expect(setResumeCursorMock).toHaveBeenCalledWith("thread-x", null);
   });
 
-  it("does not fetch the session row when there is no thread_id yet", () => {
+  it("does not fetch the session row when there is no thread_id yet", async () => {
     // The "new pane" mount path takes a different branch — it starts
     // a session and the .then() handler seeds the model. The seed
     // effect must not fire its fetch pre-thread, otherwise we'd read
@@ -2365,6 +2713,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
       provider: "codex" as const,
     };
     render(<AgentChatPane pane={codexPane} />);
+    await act(async () => {});
     await waitFor(() => expect(setModelMock).toHaveBeenCalled());
     const [, model] = setModelMock.mock.calls[0];
     expect(model).toBe("gpt-5.4");
@@ -2390,6 +2739,7 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
   it("persists the model on a picker change (fire-and-forget)", async () => {
     const existingPane = { ...pane, thread_id: "thread-x" };
     const { container } = render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     const btn = container.querySelector(
       '[data-testid="model-change"]',
     ) as HTMLButtonElement;
@@ -2406,6 +2756,7 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
   it("persists the context window on a picker change", async () => {
     const existingPane = { ...pane, thread_id: "thread-x" };
     const { container } = render(<AgentChatPane pane={existingPane} />);
+    await act(async () => {});
     const btn = container.querySelector(
       '[data-testid="context-window-change"]',
     ) as HTMLButtonElement;
@@ -2455,6 +2806,7 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
       thread_id: "thread-x",
     };
     const { container } = render(<AgentChatPane pane={codexPane} />);
+    await act(async () => {});
     vi.mocked(agentChatSetFastMode).mockClear();
     vi.mocked(agentChatStopSession).mockClear();
     vi.mocked(agentChatStartSession).mockClear();
@@ -2583,6 +2935,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     };
 
     render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
 
     await waitFor(() =>
       expect(setEffortMock).toHaveBeenCalledWith("thread-x", "high"),
@@ -2614,6 +2967,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
 
     const view = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
     await waitFor(() =>
       expect(setEffortMock).toHaveBeenLastCalledWith(
         "thread-x",
@@ -2647,6 +3001,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     seedGrokCapabilities([grokModel("grok-future")]);
 
     render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
 
     await waitFor(() =>
       expect(agentChatSetModel).toHaveBeenCalledWith(
@@ -2688,6 +3043,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
 
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
     fireEvent.click(getByTestId("grok-model-change"));
 
     await waitFor(() =>
@@ -2736,6 +3092,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
       .mockResolvedValueOnce(undefined);
 
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -2780,6 +3137,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     ]);
 
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
     expect(getByTestId("composer")).toHaveAttribute(
       "data-configuration-ready",
       "false",
@@ -2864,6 +3222,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
 
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
     fireEvent.click(getByTestId("grok-model-change"));
 
     await waitFor(() => {
@@ -2914,6 +3273,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
 
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
     await act(async () => {
       await Promise.resolve();
     });
@@ -2945,11 +3305,12 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
   });
 
-  it("does not expose Plan or Ask as client-controlled Grok modes", () => {
+  it("does not expose Plan or Ask as client-controlled Grok modes", async () => {
     currentSliceOverrides = {
       "thread-x": { model: "grok-4.6", permissionMode: "agent" },
     };
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
 
     fireEvent.click(getByTestId("mode-activate-plan"));
     fireEvent.click(getByTestId("mode-activate-ask"));
@@ -2966,6 +3327,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
       "thread-x": { model: "grok-4.6", permissionMode: "agent" },
     };
     const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {});
 
     fireEvent.click(getByTestId("accept-plan"));
     await waitFor(() =>
@@ -3016,6 +3378,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
       const { getByTestId } = render(
         <AgentChatPane pane={{ ...pane, provider }} />,
       );
+    await act(async () => {});
 
       fireEvent.click(getByTestId("composer-stop"));
 
@@ -3049,6 +3412,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
         }),
     );
     const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
 
     fireEvent.click(getByTestId("composer-stop"));
     await act(async () => {
@@ -3098,6 +3462,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
     vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(false);
 
     const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(getByTestId("composer-stop"));
 
     await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
@@ -3123,6 +3488,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
       .mockRejectedValue(new Error("rpc error: interrupt RPC failed"));
 
     const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(getByTestId("composer-stop"));
 
     await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
@@ -3142,6 +3508,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
     vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(true);
 
     const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(getByTestId("composer-stop"));
 
     await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
@@ -3183,6 +3550,7 @@ describe("AgentChatPane provider handoff", () => {
 
   it("atomically switches a restored pane to the selected provider and model", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
 
     fireEvent.click(
       container.querySelector('[data-testid="provider-model-change"]')!,
@@ -3224,6 +3592,7 @@ describe("AgentChatPane provider handoff", () => {
       .mockRejectedValueOnce(new Error("codex unavailable"))
       .mockResolvedValueOnce("thread-x");
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
 
     fireEvent.click(
       container.querySelector('[data-testid="provider-model-change"]')!,
@@ -3288,6 +3657,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     };
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3328,6 +3698,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     };
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3345,6 +3716,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
 
   it("activating Debug pill flips slice.mode without an SDK setPermissionMode call", async () => {
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const activateBtn = container.querySelector(
       '[data-testid="mode-activate-debug"]',
     ) as HTMLButtonElement;
@@ -3372,6 +3744,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     );
     currentSliceOverrides = { "thread-x": { permissionMode: "acceptEdits" } };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const activateBtn = container.querySelector(
       '[data-testid="mode-activate-plan"]',
     ) as HTMLButtonElement;
@@ -3402,6 +3775,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     };
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const acceptBtn = container.querySelector(
       '[data-testid="accept-plan"]',
     ) as HTMLButtonElement;
@@ -3492,6 +3866,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
       "thread-x": { permissionMode: "agent", sessionLaunchMode: "agent" },
     };
     const { container } = render(<AgentChatPane pane={cursorPane} />);
+    await act(async () => {});
     (
       container.querySelector(
         '[data-testid="permission-mode-change"]',
@@ -3529,6 +3904,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={cursorPane} />);
+    await act(async () => {});
     (
       container.querySelector('[data-testid="accept-plan"]') as HTMLButtonElement
     ).click();
@@ -3562,6 +3938,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={cursorPane} />);
+    await act(async () => {});
     (
       container.querySelector('[data-testid="accept-plan"]') as HTMLButtonElement
     ).click();
@@ -3592,6 +3969,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={cursorPane} />);
+    await act(async () => {});
     (
       container.querySelector('[data-testid="accept-plan"]') as HTMLButtonElement
     ).click();
@@ -3631,6 +4009,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
 
   it("grep-on-mount fires with the workspace project root and CODEMUX_DEBUG pattern", async () => {
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await Promise.resolve();
     expect(grepCountPattern).toHaveBeenCalledWith(
       "/home/user",
@@ -3641,6 +4020,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
   it("grep-on-mount with hits flips hasDebugActivity true and marks resolved", async () => {
     vi.mocked(grepCountPattern).mockResolvedValue(3);
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await Promise.resolve();
     await Promise.resolve();
     expect(setHasDebugActivityMock).toHaveBeenCalledWith("thread-x", true);
@@ -3653,6 +4033,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
   it("grep-on-mount failure soft-fails: hasDebugActivity stays false, resolved still flips", async () => {
     vi.mocked(grepCountPattern).mockRejectedValue(new Error("rg missing"));
     render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     await Promise.resolve();
     await Promise.resolve();
     expect(setHasDebugActivityMock).toHaveBeenCalledWith("thread-x", false);
@@ -3671,6 +4052,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3691,6 +4073,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3714,6 +4097,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3737,6 +4121,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
       },
     };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3767,6 +4152,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
       },
     };
     const { container, rerender } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     expect(
       container.querySelector('[data-testid="debug-cleanup-banner"]'),
     ).not.toBeNull();
@@ -3836,6 +4222,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
         }),
     );
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const banner = container.querySelector(
       '[data-testid="debug-cleanup-banner"]',
     ) as HTMLButtonElement;
@@ -3866,6 +4253,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
     });
 
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     const removeBtn = container.querySelector(
       '[data-testid="mode-remove"]',
     ) as HTMLButtonElement;
@@ -3895,6 +4283,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
         }),
     );
     const { unmount } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     // Effect ran and called setDebugActivityResolved(threadId, false)
     // synchronously to mark "in flight". Clear the spy so we only
     // observe writes that happen AFTER unmount.
@@ -3923,6 +4312,7 @@ describe("GUI delivery commands", () => {
   it.each(["queue", "steer", "interrupt"])("sends /%s as delivery metadata, not provider prompt text", async (delivery) => {
     currentSliceOverrides = { "thread-x": { inputDraft: `/${delivery} Use SQLite` } };
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(agentChatSendTurn).toHaveBeenCalledOnce());
     expect(vi.mocked(agentChatSendTurn).mock.calls[0][1]).toMatchObject({ delivery, text: "Use SQLite", display_text: "Use SQLite" });
@@ -3931,6 +4321,7 @@ describe("GUI delivery commands", () => {
     currentSliceOverrides = { "thread-x": { inputDraft: "/steer Use SQLite" } };
     vi.mocked(agentChatSendTurn).mockRejectedValueOnce(new Error("Delivery rejected"));
     const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "/steer Use SQLite"));
   });
