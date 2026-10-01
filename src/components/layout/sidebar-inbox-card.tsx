@@ -38,6 +38,7 @@ import { useProjectAppearance } from "./use-project-appearance";
 import { isRowActivationKey } from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
+import { CardProgressSweep } from "./sidebar-creating-card";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import { providerForWorkspace, providerRef } from "@/lib/source-control";
 import {
@@ -107,6 +108,13 @@ interface Props {
   leaving: boolean;
   /** True briefly after an un-settle so the returning card eases back in. */
   justUnsettled: boolean;
+  /** Set briefly when the workspace has just appeared. `"grow"` opens a row
+   *  for it; `"handoff"` only fades it in, because it is replacing the
+   *  "creating" stand-in that already holds its slot. */
+  arrival?: "grow" | "handoff" | null;
+  /** A just-created workspace whose agent has not reported yet. Fills the
+   *  otherwise empty readout so the card never looks idle mid-launch. */
+  starting?: boolean;
   /** 1-9 digit rendered as a keycap in the card eyebrow while the jump modifier
    *  is held, or null when no hint should show. */
   jumpHint?: number | null;
@@ -163,6 +171,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   now,
   leaving,
   justUnsettled,
+  arrival = null,
+  starting = false,
   jumpHint,
   onSettle,
   onSnooze,
@@ -426,6 +436,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     </div>
   );
 
+  const showStarting = starting && status === null;
   const stateCluster = (
     <span
       className={cn(
@@ -498,6 +509,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         "Monitoring"
       ) : isDone ? (
         "Done · review"
+      ) : showStarting ? (
+        <span role="status" className="shimmer font-semibold">
+          Starting
+        </span>
       ) : (
         idleTime
       )}
@@ -558,6 +573,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           "[content-visibility:auto] [contain-intrinsic-size:auto_88px]",
           leaving ? "max-h-0 opacity-0" : "max-h-40 opacity-100",
           justUnsettled && "rise-in",
+          arrival === "grow" && "card-in",
+          arrival === "handoff" && "rise-in",
         )}
       >
         {/* Hover details live on the inner card, not on the animation wrapper
@@ -610,6 +627,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   "border-transparent bg-accent-ember/[0.08] ring-1 ring-accent-ember/55",
               )}
             >
+              {/* Carries the stand-in's progress hairline through the
+                  hand-off until the agent reports in. */}
+              {showStarting && <CardProgressSweep />}
               {/* Eyebrow: repo identity + agent state / Settle swap */}
               <div className="flex min-h-5 items-center gap-1.5">
                 {titleRepeatsProject ? titleLine : projectAvatar}

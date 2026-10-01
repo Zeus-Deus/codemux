@@ -1095,8 +1095,10 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // agent…"; project / existing_workspace drafts keep the existing
   // isDraft-derived default ("Describe what you want the agent to
   // do…") by passing `undefined`.
+  // Once the first prompt is sent the docked composer already speaks for
+  // the live thread, so it takes the live pane's copy (no override).
   const placeholderOverride =
-    draft.target.kind === "home" ? "Message the agent…" : undefined;
+    draft.target.kind === "home" && !pending ? "Message the agent…" : undefined;
 
   const composerEl = (
     <Composer
@@ -1120,8 +1122,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       // Drafts do not need a backend session to be considered ready —
       // Enter-to-send is always available as long as text is present.
       sessionReady={true}
-      // No live session yet — drives the draft-variant placeholder copy.
-      isDraft={true}
+      // No live session yet — drives the draft-variant placeholder copy and
+      // keeps the prompt card open. Once the first prompt is sent, the
+      // docked composer behaves like the live pane's: it folds to the pill,
+      // so the hand-off to AgentChatPane (which mounts it collapsed too)
+      // shows no resize at all.
+      isDraft={!pending}
       focusOnMount={focusComposerAfterSubmit}
       placeholderOverride={placeholderOverride}
       showProviderPicker={true}
@@ -1259,9 +1265,10 @@ function DraftPendingConversation({
           </div>
         </div>
       </div>
-      {/* The composer owns its own column rails (see chat-column.ts), so
-          this wrapper only adds the gap below it. */}
-      <div className="pb-4">{composer}</div>
+      {/* The composer owns its own column rails (see chat-column.ts) and
+          its bottom gap, and AgentChatPane docks it flush the same way —
+          so the pill sits at the same height before and after the hand-off. */}
+      {composer}
     </div>
   );
 }

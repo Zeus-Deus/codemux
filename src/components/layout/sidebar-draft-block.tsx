@@ -66,7 +66,7 @@ export function buildSidebarDraftCatalog(
   return { homeDir, nameByProjectPath, projectByWorkspaceId };
 }
 
-function projectForDraft(
+export function projectForDraft(
   draft: ChatDraft,
   catalog: SidebarDraftCatalog,
 ): DraftProjectIdentity {

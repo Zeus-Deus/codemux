@@ -81,7 +81,7 @@ describe("Composer pill collapse", () => {
     expect(wrapper()).not.toHaveAttribute("data-expanded");
     expect(wrapper().className).toContain("rounded-[22px]");
     expect(body()).toHaveAttribute("data-collapsed");
-    expect(body().className).toContain("h-0");
+    expect(body().className).toContain("grid-rows-[0fr]");
     expect(getByTestId("composer-gap")).toHaveTextContent(
       "Reply or steer the agent…",
     );
@@ -153,6 +153,45 @@ describe("Composer pill collapse", () => {
       vi.advanceTimersByTime(400);
     });
     expect(result.wrapper()).not.toHaveAttribute("data-expanded");
+  });
+
+  it("folds back to the pill after a send even though the caret stays", () => {
+    vi.useFakeTimers();
+    const onSubmit = vi.fn();
+    const result = renderComposer({ draft: "ship it", onSubmit });
+    act(() => result.textarea().focus());
+    fireEvent.keyDown(result.textarea(), { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledOnce();
+    result.rerender(ui({ draft: "", onSubmit }));
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    // Still focused — typing keeps landing — but the card is a pill.
+    expect(document.activeElement).toBe(result.textarea());
+    expect(result.wrapper()).not.toHaveAttribute("data-expanded");
+    // The fold animates; the unfold must stay instant.
+    expect(result.body().className).toContain("transition-");
+
+    // Typing the next message re-expands it.
+    result.rerender(ui({ draft: "a", onSubmit }));
+    expect(result.wrapper()).toHaveAttribute("data-expanded");
+    expect(result.body().className).not.toContain("transition-");
+    result.rerender(ui({ draft: "", onSubmit }));
+    expect(result.wrapper()).not.toHaveAttribute("data-expanded");
+
+    // So does reaching for the card.
+    fireEvent.pointerDown(result.wrapper(), { button: 0 });
+    expect(result.wrapper()).toHaveAttribute("data-expanded");
+  });
+
+  it("focus carried across a send by focusOnMount rests as a pill", () => {
+    const result = renderComposer({ focusOnMount: true });
+    expect(document.activeElement).toBe(result.textarea());
+    expect(result.wrapper()).not.toHaveAttribute("data-expanded");
+    // Tabbing away and back is a real focus, which opens it.
+    act(() => result.textarea().blur());
+    act(() => result.textarea().focus());
+    expect(result.wrapper()).toHaveAttribute("data-expanded");
   });
 
   it("clicking the gap focuses the textarea, which expands the card", () => {
