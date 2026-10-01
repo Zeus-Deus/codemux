@@ -3794,12 +3794,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
   }, [paneDragDepth, resetPaneDrag]);
 
-  // The composer region floats over the transcript so the thread reads
-  // through it while dimmed. Two jobs here, both driven off its measured
-  // height: publish it as `--composer-overlay-height` (the transcript's
-  // footer reserves exactly that much, so the tail can still be scrolled
-  // clear of the overlay), and re-pin a reader who was at the live edge when
-  // the region changed height (the pill expanding, a question card opening).
+  // The composer region floats over the transcript. Its measured height
+  // publishes `--composer-overlay-height` for the footer reserve and fade,
+  // so the tail can still be scrolled clear of the overlay. Re-pin a reader
+  // who was at the live edge when the region changed height (the pill
+  // expanding, a question card opening).
   // Content above no longer slides as the region grows — it is out of flow —
   // so the old scrollTop-by-delta correction would now double-count.
   const paneRootRef = useRef<HTMLDivElement | null>(null);
@@ -3862,10 +3861,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }, [hasTranscript]);
 
   // Reading-back state is stamped straight onto the pane root instead of
-  // held in React state: it flips on scroll, and the composer subtree is
-  // expensive to re-render. The fade is then pure CSS descending from this
-  // attribute (see `.composer-overlay-card` in `globals.css`), so scrolling
-  // costs zero renders in a subtree that re-renders on every keystroke.
+  // held in React state: it flips on scroll, so keep this presentation signal
+  // independent of the expensive composer subtree. Docked controls remain
+  // opaque; the transcript viewport owns the edge fade.
   const handleReadingBackChange = useCallback((readingBack: boolean) => {
     const root = paneRootRef.current;
     if (!root) return;
@@ -4085,10 +4083,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           {/* Composer region (design D10): groups the whole composer
               column — AskUserQuestion panel, debug banner, the strip and
               the composer pill. Floats over the bottom of the scrolling
-              transcript rather than sitting below it, so scrolling back
-              draws the thread through the dimmed composer instead of
-              through flat pane background. The transcript reserves the
-              region's measured height in its footer, so nothing is
+              transcript rather than sitting below it. The viewport fades
+              the thread before it reaches these opaque controls. It reserves
+              the region's measured height in its footer, so nothing is
               permanently hidden underneath. Observed to publish that
               height and to pin the live edge while it changes.
               `pointer-events-none` keeps the empty column gutters

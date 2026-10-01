@@ -120,6 +120,7 @@ describe("MessageTrail", () => {
     expect(scrollToIndex).toHaveBeenCalledWith({
       index: 2,
       animated: false,
+      viewPosition: 0,
       viewOffset: 10,
     });
   });

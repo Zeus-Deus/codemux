@@ -68,6 +68,7 @@ export function useMobileHistory({
         await listRef.current.scrollToIndex({
           index: entry.slotIndex,
           animated: false,
+          viewPosition: 0,
           viewOffset: 10,
         });
       },

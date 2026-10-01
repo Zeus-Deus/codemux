@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+
+const stylesheet = readFileSync("src/globals.css", "utf8");
 
 import {
   COMPOSER_OVERLAY_CARD,
@@ -43,6 +46,15 @@ describe("isReadingBack", () => {
 });
 
 describe("COMPOSER_OVERLAY_CARD", () => {
+  it("clears the full floating title band outside the scroller in either renderer", () => {
+    const bandRule = stylesheet.match(/\[data-under-titlebar="true"\] \[data-transcript-edge-fade\]\s*\{([^}]+)\}/)?.[1];
+    expect(bandRule).toContain("padding-top: 40px");
+  });
+  it("keeps docked controls opaque while reading history, including without a mask", () => {
+    const cardRule = stylesheet.match(/\.composer-overlay-card\s*\{([^}]+)\}/)?.[1];
+    expect(cardRule).toContain("background-color: var(--background)");
+    expect(stylesheet).not.toMatch(/\[data-reading-back\][^{]*\.composer-overlay-card/);
+  });
   // The dim/restore rules are hand-written CSS in `globals.css` keyed off
   // this class under `[data-reading-back]`. Utilities cannot express it:
   // Tailwind wraps group selectors in `:where()`, which contributes no
@@ -53,7 +65,7 @@ describe("COMPOSER_OVERLAY_CARD", () => {
 
   // The region is `pointer-events-none` so the empty column gutters stay
   // transparent to clicks and selection on the transcript rows behind it.
-  it("re-enables pointer events, keeping a dimmed composer clickable", () => {
+  it("re-enables pointer events on the opaque docked controls", () => {
     expect(COMPOSER_OVERLAY_CARD).toContain("pointer-events-auto");
   });
 });

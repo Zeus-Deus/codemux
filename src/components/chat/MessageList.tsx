@@ -182,7 +182,7 @@ interface Props {
   /** Active worktree root used to resolve relative source references. */
   cwd?: string | null;
   /** Fires on transitions of "the reader has scrolled back off the live
-   *  edge", which is what dims the composer overlay below (see
+   *  edge", which updates the overlay's geometry/state (see
    *  `READING_BACK_THRESHOLD_PX`). Boolean transitions only, never per
    *  scroll frame. Must be referentially stable — this list is memoized. */
   onReadingBackChange?: (readingBack: boolean) => void;
@@ -1018,11 +1018,10 @@ export const MessageList = memo(function MessageList({
     };
   }, [workspaceId]);
 
-  // "Reading back": the reader has left the live edge, so the composer
-  // overlay dims and lets the transcript read through it. Deliberately NOT
-  // `isNearEnd` (half a viewport), which is tuned for the jump pill and
-  // would hold the composer solid through the first screen of scrolling.
-  // A raw distance-from-bottom read is also immune to the anchored-send
+  // "Reading back": publish when the reader leaves the live edge, independent
+  // of the compositor's mask and the always-opaque docked controls.
+  // Deliberately NOT `isNearEnd` (half a viewport), which is tuned for the
+  // jump pill. A raw distance-from-bottom read is also immune to the anchored-send
   // end space, which inflates `scrollHeight` without the reader moving.
   useEffect(() => {
     if (!onReadingBackChange) return;
@@ -1039,7 +1038,7 @@ export const MessageList = memo(function MessageList({
     viewport.addEventListener("scroll", sync, { passive: true });
     // The distance also changes when the content or the box resizes, with no
     // scroll event: a streaming reply growing below a parked reader has to
-    // dim the composer the same way scrolling up does.
+    // report leaving the live edge the same way scrolling up does.
     const observer = new ResizeObserver(sync);
     observer.observe(viewport);
     return () => {
@@ -1080,6 +1079,7 @@ export const MessageList = memo(function MessageList({
       ?.scrollToIndex({
         index: subagentTargetIndex,
         animated: false,
+        viewPosition: 0,
         viewOffset: 16,
       })
       .then(() => {
@@ -1123,6 +1123,7 @@ export const MessageList = memo(function MessageList({
       ?.scrollToIndex({
         index: conversationSearchTargetIndex,
         animated: !prefersReducedMotion(),
+        viewPosition: 0,
         viewOffset: 28,
       })
       .then(() => {
@@ -1179,6 +1180,7 @@ export const MessageList = memo(function MessageList({
       ?.scrollToIndex({
         index: messageJumpTargetIndex,
         animated: !prefersReducedMotion(),
+        viewPosition: 0,
         viewOffset: 28,
       })
       .then(() => {
@@ -1309,6 +1311,7 @@ export const MessageList = memo(function MessageList({
     <ChatFileLinkContext.Provider value={fileLinkContext}>
       <div
         className="group/transcript-list relative size-full min-h-0 overflow-hidden"
+        data-transcript-edge-fade={fadeEnabled ? "on" : "off"}
         data-provider={provider ?? undefined}
       >
       {!mobile && <MessageTrail slots={slots} listRef={listRef} />}
@@ -1479,7 +1482,7 @@ function slotClientNonce(slot: TranscriptSlot): string | null {
  *  sized to stop short of the bar; layer 2 is an opaque strip over the bar's
  *  own column (layers composite additively, so the strip wins there). */
 const WS_FADE_MASK_IMAGE =
-  "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%), linear-gradient(#000, #000)";
+  "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - var(--composer-overlay-height, 0px) - 28px), transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)), linear-gradient(#000, #000)";
 const WS_FADE_MASK_SIZE =
   "calc(100% - var(--transcript-sbw, 0px)) 100%, var(--transcript-sbw, 0px) 100%";
 const WS_FADE_MASK_POSITION = "left top, right top";

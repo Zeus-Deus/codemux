@@ -1,27 +1,11 @@
 /**
- * Composer overlay presentation.
+ * Cards in the floating composer region remain opaque while reading history.
+ * The transcript's viewport mask dissolves text before the docked controls;
+ * the shared card backdrop protects them when masks are disabled too.
  *
- * The composer region floats over the bottom of the transcript (see
- * `AgentChatPane`). Two consequences every card docked in that region has to
- * opt into:
- *
- *  1. The region itself is `pointer-events-none` so the empty column gutters
- *     beside the cards stay transparent — a click or a text-selection drag
- *     in that dead space belongs to the transcript row behind it. Each
- *     visible card re-enables pointer events on its own box.
- *
- *  2. While the reader is scrolled back off the live edge, the whole cluster
- *     dims so the thread reads through it. The trigger is a
- *     `data-reading-back` attribute stamped on the pane root by the
- *     transcript's scroll listener, so this is pure CSS — flipping it costs
- *     no React render in a subtree that re-renders on every keystroke. The
- *     rules themselves live in `globals.css` under `.composer-overlay-card`.
- *
- * Dimming the card *including its background* is the point: unlike a
- * translucent-fill-plus-blur treatment, it puts the transcript's own text
- * behind the composer at full legibility. Hover or focus anywhere in the
- * card brings it straight back, and pointer events are never disabled — the
- * dimmed composer stays fully clickable and typable.
+ * The region itself is pointer-events-none, so empty column gutters still
+ * belong to the transcript. Each visible card re-enables pointer events on
+ * its own box. Reading-back geometry remains independent of presentation.
  */
 export const COMPOSER_OVERLAY_CARD =
   "pointer-events-auto composer-overlay-card";

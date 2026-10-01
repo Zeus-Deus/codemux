@@ -154,6 +154,7 @@ describe("mobile conversation history", () => {
     expect(jump).toHaveBeenCalledWith({
       index: 0,
       animated: false,
+      viewPosition: 0,
       viewOffset: 10,
     });
     hook.unmount();

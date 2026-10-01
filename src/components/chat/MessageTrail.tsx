@@ -233,6 +233,7 @@ const TrailRail = memo(function TrailRail({
       void listRef.current?.scrollToIndex({
         index: slotIndex,
         animated: false,
+        viewPosition: 0,
         viewOffset: SCROLL_MARGIN_PX,
       });
     },
