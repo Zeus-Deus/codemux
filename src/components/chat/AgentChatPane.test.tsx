@@ -359,6 +359,10 @@ vi.mock("./Composer", async (importOriginal) => {
         data-testid="fast-mode-change"
         onClick={() => onFastModeChange?.(true)}
       />
+      <button
+        data-testid="standard-mode-change"
+        onClick={() => onFastModeChange?.(false)}
+      />
       {/* Permission-mode picker selection. Per-turn providers have to
           push the choice onto the LIVE session; per-session ones
           restart. Both branches are asserted below. */}
@@ -2733,7 +2737,7 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
   });
   afterEach(() => {
     cleanup();
-    useProviderCapabilities.setState({ codex: null, codexError: null });
+    useProviderCapabilities.setState({ codex: null, codexError: null, cursor: null, cursorError: null });
   });
 
   it("persists the model on a picker change (fire-and-forget)", async () => {
@@ -2768,65 +2772,77 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
     );
   });
 
-  it("applies Codex Fast mode live without stopping or restarting the session", async () => {
+  function renderFastModePane(provider: "codex" | "cursor", fastMode = false) {
     useProviderCapabilities.setState({
-      codex: {
-        models: [
-          {
-            id: "gpt-5.4",
-            label: "GPT-5.4",
-            description: null,
-            effort_levels: ["medium", "high"],
-            default_effort: "medium",
-            effort_descriptions: {},
-            prompt_injected_effort_levels: [],
-            context_window_options: [],
-            supports_adaptive_thinking: false,
-            supports_thinking_toggle: false,
-            supports_fast_mode: true,
-            supports_images: true,
-            sub_provider: null,
-            is_free: false,
-          },
-        ],
+      [provider]: {
+        models: [{ ...grokModel("fast-model"), supports_fast_mode: true }],
         effort_granularity: "per_turn",
         effort_label_map: {},
         permission_modes: [],
         default_permission_mode: "danger-full-access",
         permission_granularity: "per_session",
       },
-      codexError: null,
     });
     currentSliceOverrides = {
-      "thread-x": { model: "gpt-5.4", fastMode: false },
+      "thread-x": { model: "fast-model", fastMode },
     };
-    const codexPane = {
-      ...pane,
-      provider: "codex" as const,
-      thread_id: "thread-x",
-    };
-    const { container } = render(<AgentChatPane pane={codexPane} />);
-    await act(async () => {});
-    vi.mocked(agentChatSetFastMode).mockClear();
-    vi.mocked(agentChatStopSession).mockClear();
-    vi.mocked(agentChatStartSession).mockClear();
+    return render(<AgentChatPane pane={{ ...pane, provider }} />);
+  }
 
-    const button = container.querySelector(
-      '[data-testid="fast-mode-change"]',
-    ) as HTMLButtonElement;
-    button.click();
+  it.each(["codex", "cursor"] as const)(
+    "applies %s Fast mode only after acceptance without restarting the session",
+    async (provider) => {
+      let accept!: () => void;
+      vi.mocked(agentChatSetFastMode).mockReset().mockImplementationOnce(
+        () => new Promise<void>((resolve) => { accept = resolve; }),
+      );
+      const { container } = renderFastModePane(provider);
+      await act(async () => {});
+      setFastModeMock.mockClear();
+      vi.mocked(agentChatStopSession).mockClear();
+      vi.mocked(agentChatStartSession).mockClear();
+      const button = container.querySelector('[data-testid="fast-mode-change"]')!;
+      fireEvent.click(button);
+      fireEvent.click(button);
 
-    await waitFor(() =>
-      expect(agentChatSetFastMode).toHaveBeenCalledWith(
-        "codex",
-        "thread-x",
-        true,
-      ),
-    );
-    expect(setFastModeMock).toHaveBeenCalledWith("thread-x", true);
-    expect(agentChatStopSession).not.toHaveBeenCalled();
-    expect(agentChatStartSession).not.toHaveBeenCalled();
-  });
+      expect(agentChatSetFastMode).toHaveBeenCalledExactlyOnceWith(provider, "thread-x", true);
+      expect(setFastModeMock).not.toHaveBeenCalled();
+      await act(async () => accept());
+      expect(setFastModeMock).toHaveBeenCalledExactlyOnceWith("thread-x", true);
+      expect(agentChatStopSession).not.toHaveBeenCalled();
+      expect(agentChatStartSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "keeps the accepted Fast mode (%s) after rejection and permits retry",
+    async (initialFastMode) => {
+      vi.mocked(agentChatSetFastMode).mockReset()
+        .mockRejectedValueOnce("tier unavailable")
+        .mockResolvedValue(undefined);
+      const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "fast-error");
+      try {
+        const { container } = renderFastModePane("codex", initialFastMode);
+        await act(async () => {});
+        setFastModeMock.mockClear();
+        const button = container.querySelector(
+          initialFastMode ? '[data-testid="standard-mode-change"]' : '[data-testid="fast-mode-change"]',
+        )!;
+        fireEvent.click(button);
+        await waitFor(() => expect(errorToast).toHaveBeenCalledWith(
+          "Failed to set service tier: tier unavailable", expect.objectContaining({ duration: 8000 }),
+        ));
+        expect(setFastModeMock).not.toHaveBeenCalled();
+
+        fireEvent.click(button);
+        await waitFor(() => expect(setFastModeMock).toHaveBeenCalledExactlyOnceWith(
+          "thread-x", !initialFastMode,
+        ));
+      } finally {
+        errorToast.mockRestore();
+      }
+    },
+  );
 });
 
 const grokPane = { ...pane, provider: "grok" as const };

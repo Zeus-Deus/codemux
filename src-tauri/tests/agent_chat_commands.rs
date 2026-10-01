@@ -999,6 +999,125 @@ async fn full_bridge_pipeline_streams_provider_events_per_thread() {
     assert!(b.iter().all(|p| p.thread_id.0 == "pipe-b"));
 }
 
+// Fast tier changes must persist only after acceptance, except that a missing
+// live session defers application to the next auto-resume.
+#[tokio::test]
+async fn fast_mode_persists_accepted_changes_and_missing_sessions_only() {
+    use codemux_lib::agent_provider::ProviderError;
+    use codemux_lib::commands::agent_chat::agent_chat_set_fast_mode;
+    use codemux_lib::database::AgentChatSessionConfig;
+
+    for kind in [ProviderKind::Codex, ProviderKind::Cursor] {
+        for initial_fast in [false, true] {
+            for outcome in ["accepted", "rejected", "missing"] {
+                let app = mock_app_with_chat_state();
+                app.manage(test_observability(true));
+                let provider = Arc::new(MockAgentProvider::new(kind));
+                let registry = ProviderRegistry::new();
+                match kind {
+                    ProviderKind::Codex => registry.set_codex(provider.clone()).await,
+                    ProviderKind::Cursor => registry.set_cursor(provider.clone()).await,
+                    _ => unreachable!(),
+                }
+                app.manage(registry);
+                let handle = app.handle().clone();
+                let thread = ThreadId("fast-tier-test".into());
+                let db: State<'_, DatabaseStore> = handle.state();
+                db.upsert_agent_chat_session(&thread.0, "ws", None, "codex")
+                    .unwrap();
+                db.update_agent_chat_session_config(
+                    &thread.0,
+                    &AgentChatSessionConfig {
+                        fast_mode: Some(initial_fast),
+                        ..AgentChatSessionConfig::default()
+                    },
+                )
+                .unwrap();
+                match outcome {
+                    "rejected" => provider.fail_next_fast_mode(ProviderError::RpcError {
+                        message: "tier unavailable".into(),
+                    }),
+                    "missing" => provider.fail_next_fast_mode(ProviderError::SessionNotFound {
+                        thread_id: thread.clone(),
+                    }),
+                    _ => {}
+                }
+
+                let result =
+                    agent_chat_set_fast_mode(handle.clone(), kind, thread.clone(), !initial_fast)
+                        .await;
+                assert_eq!(
+                    result.is_err(),
+                    outcome == "rejected",
+                    "{kind:?}: {outcome}"
+                );
+                assert_eq!(
+                    db.get_agent_chat_session(&thread.0).unwrap().fast_mode,
+                    if outcome == "rejected" {
+                        initial_fast
+                    } else {
+                        !initial_fast
+                    },
+                    "{kind:?}: {outcome}",
+                );
+                assert_eq!(
+                    provider.calls.snapshot(),
+                    vec![MockCall::SetFastMode(thread, !initial_fast),]
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_mode_can_clear_stale_choices_for_an_unsupported_provider() {
+    use codemux_lib::agent_provider::opencode::{
+        OpenCodeAgentProvider, OpenCodeProviderConfig, OpenCodeServerManager,
+    };
+    use codemux_lib::commands::agent_chat::agent_chat_set_fast_mode;
+    use codemux_lib::database::AgentChatSessionConfig;
+
+    let app = mock_app_with_chat_state();
+    app.manage(test_observability(true));
+    let registry = ProviderRegistry::new();
+    registry
+        .set_opencode(Arc::new(OpenCodeAgentProvider::new(
+            Arc::new(OpenCodeServerManager::new()),
+            OpenCodeProviderConfig::default(),
+        )))
+        .await;
+    app.manage(registry);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    let thread = ThreadId("stale-fast-tier".into());
+    db.upsert_agent_chat_session(&thread.0, "ws", None, "opencode")
+        .unwrap();
+    db.update_agent_chat_session_config(
+        &thread.0,
+        &AgentChatSessionConfig {
+            fast_mode: Some(true),
+            ..AgentChatSessionConfig::default()
+        },
+    )
+    .unwrap();
+
+    agent_chat_set_fast_mode(
+        handle.clone(),
+        ProviderKind::OpenCode,
+        thread.clone(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(!db.get_agent_chat_session(&thread.0).unwrap().fast_mode);
+    assert!(
+        agent_chat_set_fast_mode(handle.clone(), ProviderKind::OpenCode, thread.clone(), true)
+            .await
+            .is_err()
+    );
+    assert!(!db.get_agent_chat_session(&thread.0).unwrap().fast_mode);
+}
+
 // ── Backend auto-resume after a restart ──
 //
 // The bug: after the app is closed and reopened, the provider's live
@@ -1146,6 +1265,7 @@ mod auto_resume {
                 &thread.0,
                 &AgentChatSessionConfig {
                     model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                    fast_mode: Some(true),
                     ..AgentChatSessionConfig::default()
                 },
             )
@@ -1174,6 +1294,7 @@ mod auto_resume {
         let captured = read_capture(&capture);
         assert_eq!(captured.len(), 1, "exactly one start-session was sent");
         let params = &captured[0]["params"];
+        assert_eq!(params["fastMode"], false, "disabled Claude Fast must not be restored");
         assert_eq!(
             params["threadId"].as_str(),
             Some(thread.0.as_str()),
