@@ -7,7 +7,7 @@
 //
 //   - SyncEngine::sync_now() walks the syncable paths AND pushes
 //     diffs (skills_smoke pushes one record directly).
-//   - The mapping table at `<home>/.codemux/sync/skills-mapping.json`
+//   - The mapping table at `<home>/.codemux/sync/skills-mapping-<account>.json`
 //     gets created and updated correctly across multiple cycles.
 //   - Pull writes to the canonical `<home>/.codemux/skills/<name>/SKILL.md`
 //     destination on a "fresh" device (simulated via a tempdir
@@ -38,6 +38,11 @@ use codemux_lib::skills_sync::export::{
     export_all_synced_skills, import_exported_skills,
 };
 use codemux_lib::skills_sync::SyncEngine;
+use codemux_lib::skills_sync::mapping::account_mapping_path;
+
+/// Mapping files are per account; each run uses throwaway homes, so a
+/// fixed id is enough to keep cycles on one mapping.
+const SMOKE_ACCOUNT: &str = "smoke-account";
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_API_URL: &str = "https://api.codemux.org";
@@ -123,7 +128,7 @@ async fn main() {
     fs::write(&skill_path, "# Stage 5 smoke\n\nfirst version\n").unwrap();
 
     let r1 = engine
-        .sync_now(&bearer, user_paths.clone())
+        .sync_now(&bearer, SMOKE_ACCOUNT, user_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("sync_now cycle 1: {e}")));
     if r1.pushed_count != 1 {
@@ -135,7 +140,7 @@ async fn main() {
     ));
 
     // Mapping should now have the new entry.
-    let mapping_path = home.path().join(".codemux/sync/skills-mapping.json");
+    let mapping_path = account_mapping_path(home.path(), SMOKE_ACCOUNT);
     let mapping_json = fs::read_to_string(&mapping_path)
         .unwrap_or_else(|e| fail(format!("read mapping: {e}")));
     if !mapping_json.contains("stage5-smoke") {
@@ -151,7 +156,7 @@ async fn main() {
     )
     .unwrap();
     let r2 = engine
-        .sync_now(&bearer, user_paths.clone())
+        .sync_now(&bearer, SMOKE_ACCOUNT, user_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("sync_now cycle 2: {e}")));
     if r2.pushed_count != 1 {
@@ -171,7 +176,7 @@ async fn main() {
     // ── Cycle 3: idempotent sync_now is a no-op ─────────────
     step("cycle 3: sync_now with no local changes → no-op");
     let r3 = engine
-        .sync_now(&bearer, user_paths.clone())
+        .sync_now(&bearer, SMOKE_ACCOUNT, user_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("sync_now cycle 3: {e}")));
     if r3.pushed_count != 0 {
@@ -186,7 +191,7 @@ async fn main() {
     let fresh_paths: Vec<PathBuf> = vec![fresh_home.path().join(".codemux/skills")];
 
     let r4 = fresh_engine
-        .sync_now(&bearer, fresh_paths.clone())
+        .sync_now(&bearer, SMOKE_ACCOUNT, fresh_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("fresh sync_now: {e}")));
     if r4.pulled_count != 1 {
