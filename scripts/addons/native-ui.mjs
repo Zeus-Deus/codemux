@@ -29,6 +29,12 @@ assert.equal(
   "Refuses persistent/self-hosted runners",
 );
 assert.ok(process.env.RUNNER_TEMP);
+const ciGithubToken = process.env.CODEMUX_NATIVE_UI_GITHUB_TOKEN;
+assert.ok(ciGithubToken?.trim(), "Requires the read-only workflow GitHub token");
+// Only the harness seeds this credential. Neither the desktop nor its child
+// processes should receive the workflow token in their environment.
+delete process.env.CODEMUX_NATIVE_UI_GITHUB_TOKEN;
+const redact = (value) => value.replaceAll(ciGithubToken, "[REDACTED CI TOKEN]");
 const root = await mkdtemp(join(process.env.RUNNER_TEMP, "codemux-native-ui-"));
 const evidenceDir = resolve("addon-native-ui-evidence");
 await mkdir(evidenceDir, { recursive: true });
@@ -465,6 +471,19 @@ async function windowsForeground() {
 }
 let terminalProbe = 0;
 let credentialProbe;
+let ciGithubCredentialInstalled = false;
+async function clearCiGithubCredential() {
+  if (!ciGithubCredentialInstalled) return;
+  assert.deepEqual(
+    await native("addon_credential_clear", {
+      id: "codemux.issue-companion",
+      credentialId: "github-token",
+    }),
+    [],
+    "The session-only CI credential must be cleared without warnings",
+  );
+  ciGithubCredentialInstalled = false;
+}
 async function choosePackage(path) {
   await script(
     `const original = window.fetch;
@@ -1048,7 +1067,7 @@ async function shortcut(key) {
   });
 }
 async function capture(name) {
-  await writeFile(join(evidenceDir, `${name}.txt`), await text());
+  await writeFile(join(evidenceDir, `${name}.txt`), redact(await text()));
   if (process.platform === "linux") {
     // WebKitWebDriver's snapshot hangs after the terminal canvas appears on
     // the Ubuntu runner. Capture the actual disposable X display instead.
@@ -1844,6 +1863,18 @@ try {
     assert.equal(settings.owner, "octocat");
     assert.equal(settings.repository, "Hello-World");
   });
+  // Keep the real DNS/TLS and credential-injection path, without sharing the
+  // unauthenticated quota of other jobs on the runner's public IP address.
+  await native("addon_credential_set", {
+    id: "codemux.issue-companion",
+    credentialId: "github-token",
+    value: ciGithubToken,
+    sessionOnly: true,
+  });
+  ciGithubCredentialInstalled = true;
+  evidence.seams.push(
+    "Read-only workflow GitHub token seeded through native session-only credential storage; the production HTTPS broker injects it, never the plugin",
+  );
   const project = join(root, "synthetic-project");
   await mkdir(project);
   await run("git", ["init", "--initial-branch=main", project]);
@@ -2004,9 +2035,9 @@ try {
     "06-issue-companion-native-https",
     async () => {
       await openCommand("Open Issue Companion");
-      // Public, read-only HTTPS through the production DNS/TLS broker. No token,
-      // intercepted fetch, or fixture-only origin exception. A rate limit fails
-      // this gate visibly instead of treating an error state as a successful fetch.
+      // Public, read-only HTTPS through the production DNS/TLS broker with its
+      // host-owned credential. No intercepted fetch or origin exception. A rate
+      // limit fails this gate rather than counting an error state as a fetch.
       await element(`${issuesView} select`);
       await clickText("Add to draft", within(issuesView));
       await until("issue appended to actual draft", () =>
@@ -2017,7 +2048,7 @@ try {
     },
     true,
   );
-  // Before the synthetic credential exists: this reaches public GitHub too.
+  // The same session-only CI credential also covers the accessory's fetch.
   await step(
     "06-issue-companion-composer-accessory-and-link",
     async () => {
@@ -2062,7 +2093,7 @@ try {
             accessories: 1,
           },
         );
-        // Unauthenticated public GitHub, as in the panel step: a rate limit or
+        // Authenticated public GitHub, as in the panel step: a rate limit or
         // any other failed load is this gate's recorded failure.
         const loaded = await until("accessory issues loaded", () =>
           script(
@@ -2180,6 +2211,11 @@ try {
     },
     true,
   );
+  await clearCiGithubCredential();
+  evidence.githubAuthentication = {
+    mode: "session-only workflow token",
+    clearedBeforeSyntheticCredentialChecks: true,
+  };
   await step(
     "06-host-credential-settings-and-explicit-fallback",
     checkCredentialSettings,
@@ -2807,6 +2843,10 @@ try {
     });
   throw error;
 } finally {
+  if (session)
+    await clearCiGithubCredential().catch((error) => {
+      evidence.githubCredentialCleanupError = redact(String(error));
+    });
   if (process.platform === "win32" && desktop) {
     await run("powershell.exe", [
       "-NoProfile",
@@ -2852,8 +2892,22 @@ try {
   account.close();
   await writeFile(
     join(evidenceDir, "result.json"),
-    JSON.stringify(evidence, null, 2) + "\n",
+    redact(JSON.stringify(evidence, null, 2)) + "\n",
   );
+  // Driver diagnostics may be written outside capture(). Redact text artifacts
+  // before upload, then verify that no artifact contains the workflow token.
+  for (const path of await files(evidenceDir)) {
+    const bytes = await readFile(path);
+    if (/\.(txt|log|json)$/.test(path)) {
+      const original = bytes.toString("utf8");
+      const redacted = redact(original);
+      if (redacted !== original) await writeFile(path, redacted);
+    }
+    assert.ok(
+      !(await readFile(path)).includes(Buffer.from(ciGithubToken)),
+      "CI token leaked into native UI evidence",
+    );
+  }
   // Job VM disposal removes the synthetic profile; do not recursively delete
   // system app-data directories or terminate unrelated processes here.
 }

@@ -42,6 +42,7 @@ on:
       ]
 permissions:
   contents: read
+  issues: read
 concurrency:
   group: addon-packaged-${{ github.ref }}
   # Preserve installer evidence and populated caches from an in-flight build.
@@ -245,9 +246,13 @@ jobs:
         run: ./scripts/addons/install-webdriver.ps1
       - name: Native desktop UI acceptance (Linux)
         if: runner.os == 'Linux'
+        env:
+          CODEMUX_NATIVE_UI_GITHUB_TOKEN: ${{ github.token }}
         run: dbus-run-session -- xvfb-run -a node scripts/addons/native-ui.mjs
       - name: Native desktop UI acceptance (Windows)
         if: runner.os == 'Windows'
+        env:
+          CODEMUX_NATIVE_UI_GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/addons/native-ui.mjs
       - uses: actions/upload-artifact@v4
         if: always()
