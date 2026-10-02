@@ -177,6 +177,8 @@ import {
   setWorkspacePinned,
 } from "@/tauri/commands";
 import { getJumpTarget } from "./sidebar-inbox-jump";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
 
 let wsCounter = 0;
 import type { WorkspacePrRef } from "@/lib/workspace-prs";
@@ -3335,5 +3337,116 @@ describe("SidebarInbox — running-process indicator", () => {
       `${META_CLUSTER_MIN_WIDTH}px`,
       `${META_CLUSTER_MIN_WIDTH}px`,
     ]);
+  });
+});
+
+describe("SidebarInbox — new workspace arrival", () => {
+  afterEach(() => {
+    useChatDraftStore.setState({
+      draftsById: {},
+      activeDraftId: null,
+      activeHomeDraftId: null,
+      projectDraftIdByPath: {},
+    });
+  });
+
+  /** What DraftChatSurface does on a first send, minus the backend. */
+  function sendFirstPrompt(text: string) {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/home/u/projects/myapp");
+    act(() => {
+      useAgentChatStore.getState().ensureThread(draft.threadId);
+      useAgentChatStore.getState().appendUserMessage(draft.threadId, text);
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+    });
+    return draft;
+  }
+
+  it("holds a creating card for a first send, then hands off to the real card", async () => {
+    workspaces = [makeWorkspace({ title: "Existing" })];
+    const { container, rerender } = await flushRender();
+    const existing = () =>
+      container.querySelector('[data-inbox-card="ws-1"]') as HTMLElement;
+    // First paint is the baseline — nothing already open animates in.
+    expect(existing().closest(".card-in, .rise-in")).toBeNull();
+
+    const draft = sendFirstPrompt("Add a dark mode toggle\nwith tests");
+    await rerenderInbox(rerender);
+
+    const creating = container.querySelector("[data-creating-card]") as HTMLElement;
+    expect(creating).not.toBeNull();
+    expect(creating.className).toContain("card-in");
+    expect(creating).toHaveTextContent("Add a dark mode toggle");
+    expect(creating).not.toHaveTextContent("with tests");
+    expect(creating).toHaveTextContent("Creating");
+    expect(creating).toHaveTextContent("Setting up workspace…");
+    // It holds the slot the new card lands in: above the existing cards.
+    expect(creating.compareDocumentPosition(existing())).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+    // The workspace lands before the draft has named it (pane not created).
+    workspaces = [
+      ...workspaces,
+      makeWorkspace({ title: "add-dark-mode-toggle", surfaces: surfaceWithPane("p-new") }),
+    ];
+    await rerenderInbox(rerender);
+
+    expect(container.querySelector("[data-creating-card]")).toBeNull();
+    const card = container.querySelector('[data-inbox-card="ws-2"]') as HTMLElement;
+    expect(cardOrder(container)).toEqual(["ws-2", "ws-1"]);
+    // A cross-fade over the stand-in's slot, not a second row opening.
+    expect(card.closest(".rise-in")).not.toBeNull();
+    expect(card.closest(".card-in")).toBeNull();
+    expect(card).toHaveTextContent("Starting");
+    expect(existing()).not.toHaveTextContent("Starting");
+
+    // Once the agent reports, the card reads as an ordinary working card.
+    act(() => {
+      useChatDraftStore.getState().markMaterialized(draft.draftId, {
+        workspaceId: "ws-2",
+        paneId: "p-new",
+        threadId: draft.threadId,
+      });
+    });
+    paneStatuses = { "p-new": "working" };
+    await rerenderInbox(rerender);
+    expect(card).toHaveTextContent("Working");
+    expect(card).not.toHaveTextContent("Starting");
+  });
+
+  it("grows a row open for a workspace that appears with no send in flight", async () => {
+    workspaces = [makeWorkspace({ title: "Existing" })];
+    const { container, rerender } = await flushRender();
+    workspaces = [...workspaces, makeWorkspace({ title: "From the CLI" })];
+    await rerenderInbox(rerender);
+
+    const card = container.querySelector('[data-inbox-card="ws-2"]') as HTMLElement;
+    expect(card.closest(".card-in")).not.toBeNull();
+    expect(card).not.toHaveTextContent("Starting");
+    expect(container.querySelector("[data-creating-card]")).toBeNull();
+  });
+
+  it("gives an existing-workspace send no stand-in — nothing is being created", async () => {
+    workspaces = [makeWorkspace({ title: "Existing" })];
+    const { container, rerender } = await flushRender();
+    const base = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/home/u/projects/myapp");
+    act(() => {
+      useChatDraftStore.setState((st) => ({
+        draftsById: {
+          ...st.draftsById,
+          [base.draftId]: {
+            ...base,
+            target: { kind: "existing_workspace", workspaceId: "ws-1" },
+          },
+        },
+      }));
+      useChatDraftStore.getState().markPromoting(base.draftId);
+    });
+    await rerenderInbox(rerender);
+    expect(container.querySelector("[data-creating-card]")).toBeNull();
   });
 });

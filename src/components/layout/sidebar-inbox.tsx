@@ -70,7 +70,13 @@ import {
 } from "@/components/github/pr-status-icon";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { parseKeyCombo } from "@/lib/keybind-utils";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useChatDraftStore, type ChatDraft } from "@/stores/chat-draft-store";
+import { useShallow } from "zustand/react/shallow";
+import { SidebarCreatingCard } from "./sidebar-creating-card";
+import {
+  promotionStartedAt,
+  selectNewWorkspaceDraftsInFlight,
+} from "./new-workspace-sends";
 import {
   setJumpTargets,
   DEFAULT_JUMP_MODIFIER,
@@ -89,6 +95,7 @@ import {
 } from "@/lib/workspace-prs";
 import {
   buildSidebarDraftCatalog,
+  projectForDraft,
   SidebarDraftBlock,
   useFrozenActiveDraftRow,
   useVisibleSidebarDraftCount,
@@ -105,6 +112,11 @@ const SETTLE_ANIM_MS = 200;
 /** How long the rise-in ease on a just-settled / just-un-settled row is kept
  *  before the marker clears. */
 const ROW_IN_MS = 400;
+
+/** How long a newly appeared card keeps its arrival class — the longest
+ *  arrival keyframe (`card-in`, 340ms) plus margin. Cleared afterwards so a
+ *  later remount (filter switch, un-settle) never replays it. */
+const ARRIVE_MS = 600;
 
 /** Settled-tail paging: show a short head on first paint, then reveal a larger
  *  page at a time so the settled section can never dominate the sidebar. */
@@ -1078,6 +1090,97 @@ export function SidebarInbox() {
     [],
   );
 
+  // ── New-workspace arrival ──
+  // A first prompt from a new chat retires its sidebar draft row at once, but
+  // the workspace it creates reaches the snapshot seconds later. Until it
+  // does, a "creating" stand-in holds the slot the card will land in; when it
+  // lands, the real card fades in over that slot and reads "Starting" until
+  // its agent reports. Any other new workspace grows its row open instead of
+  // popping in. Nothing animates on first paint: `knownIds` is the baseline.
+  const inFlightDrafts = useChatDraftStore(
+    useShallow(selectNewWorkspaceDraftsInFlight),
+  );
+  const [knownIds, setKnownIds] = useState<ReadonlySet<string> | null>(null);
+  const [arrivedAt, setArrivedAt] = useState<ReadonlyMap<string, number>>(
+    () => new Map(),
+  );
+  const [arrivingIds, setArrivingIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+
+  useEffect(() => {
+    if (!appStateLoaded) return;
+    if (knownIds === null) {
+      setKnownIds(new Set(allWorkspaces.map((w) => w.workspace_id)));
+      return;
+    }
+    const added = allWorkspaces
+      .map((w) => w.workspace_id)
+      .filter((id) => !knownIds.has(id));
+    if (added.length === 0) return;
+    const at = Date.now();
+    setKnownIds(new Set([...knownIds, ...added]));
+    setArrivedAt((cur) => {
+      const next = new Map(cur);
+      for (const id of added) next.set(id, at);
+      return next;
+    });
+    setArrivingIds((cur) => new Set([...cur, ...added]));
+    timeoutsRef.current.push(
+      window.setTimeout(() => {
+        setArrivingIds((cur) => {
+          const next = new Set(cur);
+          for (const id of added) next.delete(id);
+          return next;
+        });
+      }, ARRIVE_MS),
+    );
+  }, [appStateLoaded, allWorkspaces, knownIds]);
+
+  /** Mounted this render and not yet recorded — i.e. arriving right now. */
+  const isNewcomer = (id: string) => knownIds !== null && !knownIds.has(id);
+
+  // Pair each in-flight send with the workspace it is creating. The draft
+  // names it only once the pane exists (`materializedTo`), but the workspace
+  // itself lands in the snapshot a beat earlier, so until then the first
+  // workspace to arrive since the send began is the one it made. Unpaired
+  // sends still in flight render a stand-in.
+  const startingDraftByWorkspace = new Map<string, ChatDraft>();
+  const creatingDrafts: ChatDraft[] = [];
+  for (const draft of inFlightDrafts) {
+    let workspaceId =
+      draft.materializedTo?.workspaceId ??
+      draft.promotedTo?.workspaceId ??
+      null;
+    if (workspaceId === null) {
+      const startedAt = promotionStartedAt(draft.draftId);
+      workspaceId =
+        allWorkspaces.find((w) => {
+          const id = w.workspace_id;
+          if (startingDraftByWorkspace.has(id)) return false;
+          if (isNewcomer(id)) return true;
+          const at = arrivedAt.get(id);
+          return startedAt !== undefined && at !== undefined && at >= startedAt;
+        })?.workspace_id ?? null;
+    }
+    if (
+      workspaceId !== null &&
+      allWorkspaces.some((w) => w.workspace_id === workspaceId)
+    ) {
+      startingDraftByWorkspace.set(workspaceId, draft);
+    } else if (draft.promoting) {
+      creatingDrafts.push(draft);
+    }
+  }
+  const visibleCreating = creatingDrafts
+    .map((draft) => ({ draft, project: projectForDraft(draft, sidebarDraftCatalog) }))
+    .filter(({ project }) => filter === null || project.path === filter);
+
+  const arrivalOf = (id: string): "grow" | "handoff" | null => {
+    if (!arrivingIds.has(id) && !isNewcomer(id)) return null;
+    return startingDraftByWorkspace.has(id) ? "handoff" : "grow";
+  };
+
   /** Keep the just-settled / just-un-settled rise-in marker for one beat. */
   const markRowIn = (
     setter: (updater: (cur: string | null) => string | null) => void,
@@ -1305,6 +1408,7 @@ export function SidebarInbox() {
   // pinned hairline has a second side to separate.
   const hasContentBelowPinned =
     topTier.length > 0 ||
+    visibleCreating.length > 0 ||
     filteredPending.length > 0 ||
     wrappingUpTier.length > 0 ||
     snoozedRows.length > 0 ||
@@ -1869,6 +1973,8 @@ export function SidebarInbox() {
         now={now}
         leaving={leavingId === id}
         justUnsettled={justUnsettledId === id}
+        arrival={arrivalOf(id)}
+        starting={startingDraftByWorkspace.has(id)}
         jumpHint={
           jumpHintsVisible && visualIndex < MAX_JUMP_HINTS
             ? visualIndex + 1
@@ -2041,6 +2147,7 @@ export function SidebarInbox() {
 
         {visibleDraftCount === 0 &&
           orderedActiveCards.length === 0 &&
+          visibleCreating.length === 0 &&
           filteredPending.length === 0 && (
             <SidebarEmptyState filterName={filterName ?? null} />
           )}
@@ -2059,6 +2166,17 @@ export function SidebarInbox() {
             className="mx-1 my-1.5 h-px bg-border/60"
           />
         )}
+
+        {/* Newest-first, so a workspace being created lands at the top of
+            the active cards — the stand-in holds exactly that slot. */}
+        {visibleCreating.map(({ draft, project }) => (
+          <SidebarCreatingCard
+            key={draft.draftId}
+            draft={draft}
+            projectName={project.name}
+            projectPath={project.path}
+          />
+        ))}
 
         {topTier.map((ws, index) => renderCard(ws, pinnedCards.length + index))}
 

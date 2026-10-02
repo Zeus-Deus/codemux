@@ -499,14 +499,25 @@ export function Composer({
   // Kept hidden so the visible affordance stays the popup row.
   const imageInputRef = useRef<HTMLInputElement | null>(null);
 
+  /** Focus is inside the card but should not hold it open — set by a send
+   *  (or focus carried across one), cleared the moment the user focuses,
+   *  presses, or leaves the card. See `expanded`. */
+  const [restingFocus, setRestingFocus] = useState(false);
+
   // The first send moves the composer between distinct layout branches
   // (empty-state -> transcript, and draft -> live pane), which replaces the
   // textarea DOM node. Restore the caret on the replacement without allowing
   // the browser to scroll the newly bottom-docked composer out of position.
   // This is deliberately opt-in: a normal pane mount must not steal focus.
+  //
+  // Every caller sets this only to carry focus across a send, so the carried
+  // focus is a resting one: the caret is live for the next message, but the
+  // card stays a pill until the user actually reaches for it. Focus first,
+  // then rest: the focus event itself clears `restingFocus`.
   useEffect(() => {
     if (!focusOnMount) return;
     textareaRef.current?.focus({ preventScroll: true });
+    setRestingFocus(true);
   }, [focusOnMount]);
 
   // Auto-grow textarea from the resting min up to ~10 rows.
@@ -2564,13 +2575,24 @@ export function Composer({
   const ladder = composerWidthLadder(pillWidth);
 
   const [focusWithin, setFocusWithin] = useState(false);
-  const handleWrapperFocus = useCallback(() => setFocusWithin(true), []);
+  const handleWrapperFocus = useCallback(() => {
+    setFocusWithin(true);
+    setRestingFocus(false);
+  }, []);
   const handleWrapperBlur = useCallback(
     (e: React.FocusEvent<HTMLDivElement>) => {
       const next = e.relatedTarget as Node | null;
       if (next && e.currentTarget.contains(next)) return;
       setFocusWithin(false);
+      setRestingFocus(false);
     },
+    [],
+  );
+  // A press anywhere on the card is the user reaching for it. The textarea
+  // usually still holds focus after a send, so no focus event would fire to
+  // clear the resting state on its own.
+  const handleWrapperPointerDown = useCallback(
+    () => setRestingFocus(false),
     [],
   );
 
@@ -2586,6 +2608,11 @@ export function Composer({
   );
   const submit = useCallback(() => {
     if (remoteDisconnected) return;
+    // Enter keeps the caret in the textarea, so focus alone would hold the
+    // card open under the message that was just sent until the user clicked
+    // elsewhere. Rest it instead: once the hold lapses the card folds back to
+    // the pill while typing still lands (and re-expands it).
+    setRestingFocus(true);
     setSendHold(true);
     if (sendHoldTimerRef.current !== null) {
       window.clearTimeout(sendHoldTimerRef.current);
@@ -2619,7 +2646,7 @@ export function Composer({
     isDraft ||
     ladder.collapseDisabled ||
     draft.length > 0 ||
-    focusWithin ||
+    (focusWithin && !restingFocus) ||
     stagedAttachments.length > 0 ||
     mode !== "default" ||
     slashOpen ||
@@ -2855,6 +2882,7 @@ export function Composer({
           data-dragging={isDragging || undefined}
           onFocus={handleWrapperFocus}
           onBlur={handleWrapperBlur}
+          onPointerDownCapture={handleWrapperPointerDown}
           onDragOver={handleDragOver}
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
@@ -3041,412 +3069,424 @@ export function Composer({
           {/* Everything above the controls row collapses with the pill.
               The textarea stays mounted — and focusable — inside a
               zero-height box, so Tab or a click on the gap expands the
-              card in place without swapping DOM nodes. */}
+              card in place without swapping DOM nodes.
+              The fold animates (a 1fr → 0fr grid row, so no height has to
+              be measured); the unfold is instant, because the transition
+              class only exists in the collapsed state. Expansion therefore
+              still commits in one frame, and a popup anchored to the card
+              never measures a half-open box. */}
           <div
             data-testid="composer-body"
             data-collapsed={!expanded || undefined}
-            className={cn(!expanded && "h-0 overflow-hidden")}
+            className={cn(
+              "grid",
+              expanded
+                ? "grid-rows-[1fr]"
+                : "grid-rows-[0fr] opacity-0 transition-[grid-template-rows,opacity] duration-250 ease-out motion-reduce:transition-none",
+            )}
           >
-            {errorMessage && (
-              <div
-                role="alert"
-                className="px-3 pt-2 text-label text-destructive/90 leading-tight"
-              >
-                <span>Send failed: {errorMessage}. </span>
-                <span className="text-muted-foreground/80">
-                  Press Enter to retry.
-                </span>
-              </div>
-            )}
-            {/* Step 8 Stage 3 refactor — strip above textarea hosts
-                the active mode pill + image attachment chips. File /
-                folder chips render INSIDE the textarea via the mirror
-                overlay below; images can't live inline as text so they
-                stay here. The mode pill moved out of the footer when
-                the `+ Mode` dropdown was retired in favour of the
-                unified `+` popup. */}
-            {(mode !== "default" ||
-              pendingCommand !== null ||
-              stagedAttachments.some(
-                (a) =>
-                  a.kind === "image" ||
-                  a.kind === "pr" ||
-                  a.kind === "session",
-              ) ||
-              (interrupted && !streaming && !sending && !!onContinueRun)) && (
-              <div
-                data-testid="composer-attachment-strip"
-                className="flex flex-wrap gap-1.5 px-3 pt-2"
-              >
-                {/* A leading `/name` the runtime will execute. The
-                    inline token in the mirror below can only carry
-                    colour — it shares character metrics with the
-                    textarea, so no icon or padding can go in there.
-                    This chip is where the invocation gets said out
-                    loud: icon, the literal command, and the registry's
-                    own one-liner. */}
-                {pendingCommand && (
-                  <span
-                    data-testid="composer-command-chip"
-                    data-command-kind={pendingCommand.kind}
-                    role="status"
-                    className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-accent-ember/15 px-2.5 py-1 text-label text-accent-ember"
-                  >
-                    {/* Same icon the popup row carried, so the chip is
-                        recognisably the thing the user just picked. */}
-                    {pendingCommand.kind === "skill" ? (
-                      <BookOpen className="size-3 shrink-0" aria-hidden />
-                    ) : (
-                      <SquareSlash className="size-3 shrink-0" aria-hidden />
-                    )}
-                    <span className="shrink-0 font-medium">
-                      Runs {pendingCommand.token}
+            <div className={cn("min-h-0", !expanded && "overflow-hidden")}>
+              {errorMessage && (
+                <div
+                  role="alert"
+                  className="px-3 pt-2 text-label text-destructive/90 leading-tight"
+                >
+                  <span>Send failed: {errorMessage}. </span>
+                  <span className="text-muted-foreground/80">
+                    Press Enter to retry.
+                  </span>
+                </div>
+              )}
+              {/* Step 8 Stage 3 refactor — strip above textarea hosts
+                  the active mode pill + image attachment chips. File /
+                  folder chips render INSIDE the textarea via the mirror
+                  overlay below; images can't live inline as text so they
+                  stay here. The mode pill moved out of the footer when
+                  the `+ Mode` dropdown was retired in favour of the
+                  unified `+` popup. */}
+              {(mode !== "default" ||
+                pendingCommand !== null ||
+                stagedAttachments.some(
+                  (a) =>
+                    a.kind === "image" ||
+                    a.kind === "pr" ||
+                    a.kind === "session",
+                ) ||
+                (interrupted && !streaming && !sending && !!onContinueRun)) && (
+                <div
+                  data-testid="composer-attachment-strip"
+                  className="flex flex-wrap gap-1.5 px-3 pt-2"
+                >
+                  {/* A leading `/name` the runtime will execute. The
+                      inline token in the mirror below can only carry
+                      colour — it shares character metrics with the
+                      textarea, so no icon or padding can go in there.
+                      This chip is where the invocation gets said out
+                      loud: icon, the literal command, and the registry's
+                      own one-liner. */}
+                  {pendingCommand && (
+                    <span
+                      data-testid="composer-command-chip"
+                      data-command-kind={pendingCommand.kind}
+                      role="status"
+                      className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-accent-ember/15 px-2.5 py-1 text-label text-accent-ember"
+                    >
+                      {/* Same icon the popup row carried, so the chip is
+                          recognisably the thing the user just picked. */}
+                      {pendingCommand.kind === "skill" ? (
+                        <BookOpen className="size-3 shrink-0" aria-hidden />
+                      ) : (
+                        <SquareSlash className="size-3 shrink-0" aria-hidden />
+                      )}
+                      <span className="shrink-0 font-medium">
+                        Runs {pendingCommand.token}
+                      </span>
+                      {/* The argument placeholder only shows while the
+                          command is still bare, so a filled-in command
+                          doesn't keep nagging with a hint it satisfied. */}
+                      {!pendingCommand.args && pendingCommand.argumentHint && (
+                        <span className="shrink-0 opacity-60">
+                          {pendingCommand.argumentHint}
+                        </span>
+                      )}
+                      {pendingCommand.description && (
+                        <span className="truncate opacity-70">
+                          · {pendingCommand.description}
+                        </span>
+                      )}
                     </span>
-                    {/* The argument placeholder only shows while the
-                        command is still bare, so a filled-in command
-                        doesn't keep nagging with a hint it satisfied. */}
-                    {!pendingCommand.args && pendingCommand.argumentHint && (
-                      <span className="shrink-0 opacity-60">
-                        {pendingCommand.argumentHint}
-                      </span>
-                    )}
-                    {pendingCommand.description && (
-                      <span className="truncate opacity-70">
-                        · {pendingCommand.description}
-                      </span>
-                    )}
-                  </span>
-                )}
-                {/* Dead-run recovery (issue #154): a one-click chip that
-                    resumes the interrupted run. Amber-tinted, mirroring
-                    ModePill's shape. */}
-                {interrupted && !streaming && !sending && onContinueRun && (
-                  <button
-                    type="button"
-                    data-testid="composer-continue-run-chip"
-                    onClick={onContinueRun}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-label text-warning hover:bg-warning/25"
-                  >
-                    <RotateCw className="size-3" aria-hidden />
-                    <span>Continue run</span>
-                  </button>
-                )}
-                {mode !== "default" && (
-                  <ModePill
-                    mode={mode as ActivePillMode}
-                    onRemove={onModeRemove}
-                  />
-                )}
-                {stagedAttachments
-                  .filter(
-                    (a) =>
-                      a.kind === "image" ||
-                      a.kind === "pr" ||
-                      a.kind === "session",
-                  )
-                  .map((attachment) => (
-                    <AttachmentChip
-                      key={attachment.id}
-                      attachment={attachment}
-                      onRemove={(id) => {
-                        if (
-                          attachment.kind === "session" &&
-                          attachment.metadata.mentionToken
-                        ) {
-                          onDraftChange(
-                            removeSessionMentionToken(
-                              draft,
-                              attachment.metadata.mentionToken,
-                            ),
-                          );
-                        }
-                        onRemoveAttachment?.(id);
-                      }}
-                      onToggleExpand={
-                        attachment.kind === "pr" && onToggleExpandPr
-                          ? (id) => onToggleExpandPr(id)
-                          : undefined
-                      }
+                  )}
+                  {/* Dead-run recovery (issue #154): a one-click chip that
+                      resumes the interrupted run. Amber-tinted, mirroring
+                      ModePill's shape. */}
+                  {interrupted && !streaming && !sending && onContinueRun && (
+                    <button
+                      type="button"
+                      data-testid="composer-continue-run-chip"
+                      onClick={onContinueRun}
+                      className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-label text-warning hover:bg-warning/25"
+                    >
+                      <RotateCw className="size-3" aria-hidden />
+                      <span>Continue run</span>
+                    </button>
+                  )}
+                  {mode !== "default" && (
+                    <ModePill
+                      mode={mode as ActivePillMode}
+                      onRemove={onModeRemove}
                     />
-                  ))}
+                  )}
+                  {stagedAttachments
+                    .filter(
+                      (a) =>
+                        a.kind === "image" ||
+                        a.kind === "pr" ||
+                        a.kind === "session",
+                    )
+                    .map((attachment) => (
+                      <AttachmentChip
+                        key={attachment.id}
+                        attachment={attachment}
+                        onRemove={(id) => {
+                          if (
+                            attachment.kind === "session" &&
+                            attachment.metadata.mentionToken
+                          ) {
+                            onDraftChange(
+                              removeSessionMentionToken(
+                                draft,
+                                attachment.metadata.mentionToken,
+                              ),
+                            );
+                          }
+                          onRemoveAttachment?.(id);
+                        }}
+                        onToggleExpand={
+                          attachment.kind === "pr" && onToggleExpandPr
+                            ? (id) => onToggleExpandPr(id)
+                            : undefined
+                        }
+                      />
+                    ))}
+                </div>
+              )}
+              {/* Step 8 Stage 6 — soft 5MB warning. Non-blocking by
+                  design: the user can still send, but a request that big
+                  hits Anthropic's 32MB request cap fast and slows
+                  response time noticeably. We show actual bytes so the
+                  user can decide whether to compress before sending. */}
+              {showImageSizeWarning && (
+                <div
+                  data-testid="composer-image-size-warning"
+                  className="px-3 pt-1 text-caption text-warning"
+                >
+                  Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
+                  — consider reducing for faster requests
+                </div>
+              )}
+              {/* Step 8 Stage 7 — soft warning at the SOFT_LIMIT line so
+                  the user can self-trim before the hard cap blocks the
+                  next add. The hard-cap copy renders separately below. */}
+              {showCountSoftWarning && (
+                <div
+                  data-testid="composer-attachment-count-warning"
+                  className="px-3 pt-1 text-caption text-warning"
+                >
+                  {stagedCount} attachments — consider trimming for cleaner prompts
+                </div>
+              )}
+              {showCountHardWarning && (
+                <div
+                  data-testid="composer-attachment-count-hardcap"
+                  className="px-3 pt-1 text-caption text-destructive"
+                >
+                  {stagedCount} attachments — limit reached. Remove some to add
+                  more.
+                </div>
+              )}
+              <div className="relative">
+                {/*
+                  Mirror overlay: renders the same text as the textarea but
+                  with `/skill-name` tokens wrapped in a colored span. The
+                  textarea on top has transparent text + a visible caret, so
+                  the user sees the highlighted mirror through the
+                  transparent layer. Critical that the two layers share
+                  identical padding/font/line-height so cursor and mirror
+                  stay glued together at every position.
+                */}
+                <div
+                  ref={mirrorRef}
+                  aria-hidden
+                  data-testid="composer-highlight-mirror"
+                  className={cn(
+                    "pointer-events-none absolute inset-0",
+                    COMPOSER_TEXT_LAYOUT,
+                    "whitespace-pre-wrap break-words text-foreground",
+                    // `overflow-y-auto` (rather than `overflow-hidden`) is
+                    // required so we can imperatively assign `scrollTop` —
+                    // setting `scrollTop` on a clipped element is a no-op in
+                    // some browsers. The mirror's own scrollbar is hidden
+                    // (next two utilities) so only the textarea's scrollbar
+                    // is ever visible to the user.
+                    "overflow-y-auto",
+                    "no-scrollbar",
+                  )}
+                >
+                  {highlightSegments.map((seg, i) => {
+                    if (seg.kind === "command") {
+                      // Fill and colour only. The mirror's glyph advances
+                      // have to match the textarea's exactly, so padding,
+                      // icons and even a heavier font-weight are off
+                      // limits — any of them drifts the caret off the
+                      // painted text.
+                      return (
+                        <span
+                          key={i}
+                          data-testid={`composer-command-token-${seg.name}`}
+                          data-command-kind={seg.commandKind}
+                          className="rounded-sm bg-accent-ember/15 text-accent-ember"
+                        >
+                          {seg.text}
+                        </span>
+                      );
+                    }
+                    if (seg.kind === "skill") {
+                      // A skill named mid-prompt is still an invocation,
+                      // just not the leading one — same fill as the
+                      // command token so both read as "this runs", with
+                      // the chip above naming only the leading one.
+                      return (
+                        <span
+                          key={i}
+                          data-testid={`composer-skill-token-${seg.name}`}
+                          className="rounded-sm bg-accent-ember/15 text-accent-ember"
+                        >
+                          {seg.text}
+                        </span>
+                      );
+                    }
+                    if (seg.kind === "attachment") {
+                      // Inline chip rendering. Background fills the text
+                      // bounding box only — no padding tricks — so the
+                      // mirror's character widths stay glued to the
+                      // textarea's caret positions. Loading state dims
+                      // the chip; an unresolvable read renders red.
+                      return (
+                        <span
+                          key={i}
+                          data-testid={`composer-attachment-token-${seg.basename}`}
+                          data-loading={seg.isLoading || undefined}
+                          data-error={seg.hasError || undefined}
+                          data-tint={seg.hasError ? "destructive" : "neutral"}
+                          className={cn(
+                            "rounded-sm bg-surface-3 text-foreground",
+                            seg.isLoading && "opacity-60",
+                            seg.hasError &&
+                              "bg-destructive/15 text-destructive",
+                          )}
+                        >
+                          {seg.text}
+                        </span>
+                      );
+                    }
+                    if (seg.kind === "session-attachment") {
+                      return (
+                        <span
+                          key={i}
+                          data-testid={`composer-session-token-${seg.ref}`}
+                          data-provider={seg.provider}
+                          data-loading={seg.isLoading || undefined}
+                          data-error={seg.hasError || undefined}
+                          className={cn(
+                            "rounded-sm bg-primary/10 text-primary",
+                            seg.isLoading && "opacity-60",
+                            seg.hasError &&
+                              "bg-destructive/15 text-destructive",
+                          )}
+                        >
+                          {seg.text}
+                        </span>
+                      );
+                    }
+                    if (seg.kind === "issue-attachment") {
+                      // Stage 4 — state-coloured pill. Open issues use the
+                      // warning token (amber) to match the chip strip
+                      // directly above; closed issues use a muted neutral
+                      // so the eye isn't drawn to them. Error / loading
+                      // states override the same way file tokens do.
+                      return (
+                        <span
+                          key={i}
+                          data-testid={`composer-issue-token-${seg.ref}`}
+                          data-state={seg.state}
+                          data-loading={seg.isLoading || undefined}
+                          data-error={seg.hasError || undefined}
+                          className={cn(
+                            "rounded-sm",
+                            seg.state === "open"
+                              ? "bg-warning/15 text-warning"
+                              : "bg-surface-3 text-muted-foreground",
+                            seg.isLoading && "opacity-60",
+                            seg.hasError &&
+                              "bg-destructive/15 text-destructive",
+                          )}
+                        >
+                          {seg.text}
+                        </span>
+                      );
+                    }
+                    if (seg.kind === "pr-attachment") {
+                      // Stage 5 — PR pill. Four state branches, matching
+                      // the chip strip's colours so the inline token and
+                      // the staged chip read as the same thing.
+                      //   open    → primary blue   (active, mergeable)
+                      //   merged  → purple/chart-4 (canonical "merged" hue)
+                      //   closed  → muted          (unmerged, dropped)
+                      //   draft   → muted          (in-progress)
+                      const stateClass =
+                        seg.state === "open"
+                          ? "bg-primary/15 text-primary"
+                          : seg.state === "merged"
+                            ? "bg-chart-4/15 text-chart-4"
+                            : "bg-surface-3 text-muted-foreground";
+                      return (
+                        <span
+                          key={i}
+                          data-testid={`composer-pr-token-${seg.ref}`}
+                          data-state={seg.state}
+                          data-loading={seg.isLoading || undefined}
+                          data-error={seg.hasError || undefined}
+                          className={cn(
+                            "rounded-sm",
+                            stateClass,
+                            seg.isLoading && "opacity-60",
+                            seg.hasError &&
+                              "bg-destructive/15 text-destructive",
+                          )}
+                        >
+                          {seg.text}
+                        </span>
+                      );
+                    }
+                    return <Fragment key={i}>{seg.text}</Fragment>;
+                  })}
+                  {/* Trailing newline doesn't render unless followed by a
+                      glyph — pad with a zero-width space so the mirror's
+                      height matches the textarea's after a fresh Enter. */}
+                  {draft.endsWith("\n") || draft === "" ? "​" : null}
+                  {argumentGhost !== null && (
+                    <span
+                      aria-hidden
+                      data-testid="composer-argument-ghost"
+                      className={COMPOSER_PLACEHOLDER_COLOR}
+                    >
+                      {argumentGhost}
+                    </span>
+                  )}
+                </div>
+                <textarea
+                  ref={textareaRef}
+                  value={draft}
+                  readOnly={readOnly}
+                  onChange={readOnly ? undefined : handleTextareaChange}
+                  onSelect={handleSelect}
+                  onScroll={handleTextareaScroll}
+                  onKeyDown={readOnly ? undefined : handleKeyDown}
+                  onPaste={readOnly ? undefined : handlePasteImage}
+                  onCompositionStart={() => {
+                    composingRef.current = true;
+                  }}
+                  onCompositionEnd={(e) => {
+                    composingRef.current = false;
+                    // After composition ends, run detection on the now-final
+                    // value so popup state catches up with what was typed.
+                    const el = e.currentTarget;
+                    const cursor = el.selectionStart ?? el.value.length;
+                    const slashHit = findSlashContextAtCursor(el.value, cursor);
+                    const mentionHit = findMentionAtCursor(el.value, cursor);
+                    if (slashHit) {
+                      setSlashAnchor(slashHit);
+                      if (mentionAnchor) closeMention();
+                    } else if (mentionHit) {
+                      setMentionAnchor(mentionHit);
+                      if (slashAnchor) closeSlash();
+                    } else {
+                      closeSlash();
+                      closeMention();
+                    }
+                  }}
+                  placeholder={placeholderText}
+                  rows={1}
+                  className={cn(
+                    // `block` is load-bearing: a `<textarea>` defaults to
+                    // `inline-block`, so it sits on a line box and its
+                    // vertical position is resolved via baseline alignment.
+                    // The mirror behind it is an absolutely-positioned block
+                    // pinned to the container top. Baseline-aligned inline
+                    // boxes are computed differently across rendering engines
+                    // (notably WebKitGTK, which powers the desktop build) than
+                    // Chromium, which drifts the caret/selection off the
+                    // painted text. Forcing `block` pins the textarea to the
+                    // container top on every engine so the two layers stay
+                    // glued, and drops the phantom line-box descent that
+                    // otherwise made this box a few px too tall.
+                    "relative block w-full resize-none bg-transparent",
+                    COMPOSER_TEXT_LAYOUT,
+                    // Transparent text — the colored mirror behind shows
+                    // through. Caret stays visible via `caret-foreground`.
+                    "text-transparent caret-foreground",
+                    "placeholder:text-muted-foreground/60",
+                    "outline-none",
+                  )}
+                  // min-height (rather than a floor in the auto-grow effect)
+                  // so the imperative `style.height` can never shrink the box
+                  // below the resting size.
+                  style={{
+                    minHeight: `${textareaMinPx}px`,
+                    maxHeight: `${MAX_ROWS_APPROX_PX}px`,
+                  }}
+                />
               </div>
-            )}
-            {/* Step 8 Stage 6 — soft 5MB warning. Non-blocking by
-                design: the user can still send, but a request that big
-                hits Anthropic's 32MB request cap fast and slows
-                response time noticeably. We show actual bytes so the
-                user can decide whether to compress before sending. */}
-            {showImageSizeWarning && (
-              <div
-                data-testid="composer-image-size-warning"
-                className="px-3 pt-1 text-caption text-warning"
-              >
-                Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
-                — consider reducing for faster requests
-              </div>
-            )}
-            {/* Step 8 Stage 7 — soft warning at the SOFT_LIMIT line so
-                the user can self-trim before the hard cap blocks the
-                next add. The hard-cap copy renders separately below. */}
-            {showCountSoftWarning && (
-              <div
-                data-testid="composer-attachment-count-warning"
-                className="px-3 pt-1 text-caption text-warning"
-              >
-                {stagedCount} attachments — consider trimming for cleaner prompts
-              </div>
-            )}
-            {showCountHardWarning && (
-              <div
-                data-testid="composer-attachment-count-hardcap"
-                className="px-3 pt-1 text-caption text-destructive"
-              >
-                {stagedCount} attachments — limit reached. Remove some to add
-                more.
-              </div>
-            )}
-            <div className="relative">
-              {/*
-                Mirror overlay: renders the same text as the textarea but
-                with `/skill-name` tokens wrapped in a colored span. The
-                textarea on top has transparent text + a visible caret, so
-                the user sees the highlighted mirror through the
-                transparent layer. Critical that the two layers share
-                identical padding/font/line-height so cursor and mirror
-                stay glued together at every position.
-              */}
-              <div
-                ref={mirrorRef}
-                aria-hidden
-                data-testid="composer-highlight-mirror"
-                className={cn(
-                  "pointer-events-none absolute inset-0",
-                  COMPOSER_TEXT_LAYOUT,
-                  "whitespace-pre-wrap break-words text-foreground",
-                  // `overflow-y-auto` (rather than `overflow-hidden`) is
-                  // required so we can imperatively assign `scrollTop` —
-                  // setting `scrollTop` on a clipped element is a no-op in
-                  // some browsers. The mirror's own scrollbar is hidden
-                  // (next two utilities) so only the textarea's scrollbar
-                  // is ever visible to the user.
-                  "overflow-y-auto",
-                  "no-scrollbar",
-                )}
-              >
-                {highlightSegments.map((seg, i) => {
-                  if (seg.kind === "command") {
-                    // Fill and colour only. The mirror's glyph advances
-                    // have to match the textarea's exactly, so padding,
-                    // icons and even a heavier font-weight are off
-                    // limits — any of them drifts the caret off the
-                    // painted text.
-                    return (
-                      <span
-                        key={i}
-                        data-testid={`composer-command-token-${seg.name}`}
-                        data-command-kind={seg.commandKind}
-                        className="rounded-sm bg-accent-ember/15 text-accent-ember"
-                      >
-                        {seg.text}
-                      </span>
-                    );
-                  }
-                  if (seg.kind === "skill") {
-                    // A skill named mid-prompt is still an invocation,
-                    // just not the leading one — same fill as the
-                    // command token so both read as "this runs", with
-                    // the chip above naming only the leading one.
-                    return (
-                      <span
-                        key={i}
-                        data-testid={`composer-skill-token-${seg.name}`}
-                        className="rounded-sm bg-accent-ember/15 text-accent-ember"
-                      >
-                        {seg.text}
-                      </span>
-                    );
-                  }
-                  if (seg.kind === "attachment") {
-                    // Inline chip rendering. Background fills the text
-                    // bounding box only — no padding tricks — so the
-                    // mirror's character widths stay glued to the
-                    // textarea's caret positions. Loading state dims
-                    // the chip; an unresolvable read renders red.
-                    return (
-                      <span
-                        key={i}
-                        data-testid={`composer-attachment-token-${seg.basename}`}
-                        data-loading={seg.isLoading || undefined}
-                        data-error={seg.hasError || undefined}
-                        data-tint={seg.hasError ? "destructive" : "neutral"}
-                        className={cn(
-                          "rounded-sm bg-surface-3 text-foreground",
-                          seg.isLoading && "opacity-60",
-                          seg.hasError &&
-                            "bg-destructive/15 text-destructive",
-                        )}
-                      >
-                        {seg.text}
-                      </span>
-                    );
-                  }
-                  if (seg.kind === "session-attachment") {
-                    return (
-                      <span
-                        key={i}
-                        data-testid={`composer-session-token-${seg.ref}`}
-                        data-provider={seg.provider}
-                        data-loading={seg.isLoading || undefined}
-                        data-error={seg.hasError || undefined}
-                        className={cn(
-                          "rounded-sm bg-primary/10 text-primary",
-                          seg.isLoading && "opacity-60",
-                          seg.hasError &&
-                            "bg-destructive/15 text-destructive",
-                        )}
-                      >
-                        {seg.text}
-                      </span>
-                    );
-                  }
-                  if (seg.kind === "issue-attachment") {
-                    // Stage 4 — state-coloured pill. Open issues use the
-                    // warning token (amber) to match the chip strip
-                    // directly above; closed issues use a muted neutral
-                    // so the eye isn't drawn to them. Error / loading
-                    // states override the same way file tokens do.
-                    return (
-                      <span
-                        key={i}
-                        data-testid={`composer-issue-token-${seg.ref}`}
-                        data-state={seg.state}
-                        data-loading={seg.isLoading || undefined}
-                        data-error={seg.hasError || undefined}
-                        className={cn(
-                          "rounded-sm",
-                          seg.state === "open"
-                            ? "bg-warning/15 text-warning"
-                            : "bg-surface-3 text-muted-foreground",
-                          seg.isLoading && "opacity-60",
-                          seg.hasError &&
-                            "bg-destructive/15 text-destructive",
-                        )}
-                      >
-                        {seg.text}
-                      </span>
-                    );
-                  }
-                  if (seg.kind === "pr-attachment") {
-                    // Stage 5 — PR pill. Four state branches, matching
-                    // the chip strip's colours so the inline token and
-                    // the staged chip read as the same thing.
-                    //   open    → primary blue   (active, mergeable)
-                    //   merged  → purple/chart-4 (canonical "merged" hue)
-                    //   closed  → muted          (unmerged, dropped)
-                    //   draft   → muted          (in-progress)
-                    const stateClass =
-                      seg.state === "open"
-                        ? "bg-primary/15 text-primary"
-                        : seg.state === "merged"
-                          ? "bg-chart-4/15 text-chart-4"
-                          : "bg-surface-3 text-muted-foreground";
-                    return (
-                      <span
-                        key={i}
-                        data-testid={`composer-pr-token-${seg.ref}`}
-                        data-state={seg.state}
-                        data-loading={seg.isLoading || undefined}
-                        data-error={seg.hasError || undefined}
-                        className={cn(
-                          "rounded-sm",
-                          stateClass,
-                          seg.isLoading && "opacity-60",
-                          seg.hasError &&
-                            "bg-destructive/15 text-destructive",
-                        )}
-                      >
-                        {seg.text}
-                      </span>
-                    );
-                  }
-                  return <Fragment key={i}>{seg.text}</Fragment>;
-                })}
-                {/* Trailing newline doesn't render unless followed by a
-                    glyph — pad with a zero-width space so the mirror's
-                    height matches the textarea's after a fresh Enter. */}
-                {draft.endsWith("\n") || draft === "" ? "​" : null}
-                {argumentGhost !== null && (
-                  <span
-                    aria-hidden
-                    data-testid="composer-argument-ghost"
-                    className={COMPOSER_PLACEHOLDER_COLOR}
-                  >
-                    {argumentGhost}
-                  </span>
-                )}
-              </div>
-              <textarea
-                ref={textareaRef}
-                value={draft}
-                readOnly={readOnly}
-                onChange={readOnly ? undefined : handleTextareaChange}
-                onSelect={handleSelect}
-                onScroll={handleTextareaScroll}
-                onKeyDown={readOnly ? undefined : handleKeyDown}
-                onPaste={readOnly ? undefined : handlePasteImage}
-                onCompositionStart={() => {
-                  composingRef.current = true;
-                }}
-                onCompositionEnd={(e) => {
-                  composingRef.current = false;
-                  // After composition ends, run detection on the now-final
-                  // value so popup state catches up with what was typed.
-                  const el = e.currentTarget;
-                  const cursor = el.selectionStart ?? el.value.length;
-                  const slashHit = findSlashContextAtCursor(el.value, cursor);
-                  const mentionHit = findMentionAtCursor(el.value, cursor);
-                  if (slashHit) {
-                    setSlashAnchor(slashHit);
-                    if (mentionAnchor) closeMention();
-                  } else if (mentionHit) {
-                    setMentionAnchor(mentionHit);
-                    if (slashAnchor) closeSlash();
-                  } else {
-                    closeSlash();
-                    closeMention();
-                  }
-                }}
-                placeholder={placeholderText}
-                rows={1}
-                className={cn(
-                  // `block` is load-bearing: a `<textarea>` defaults to
-                  // `inline-block`, so it sits on a line box and its
-                  // vertical position is resolved via baseline alignment.
-                  // The mirror behind it is an absolutely-positioned block
-                  // pinned to the container top. Baseline-aligned inline
-                  // boxes are computed differently across rendering engines
-                  // (notably WebKitGTK, which powers the desktop build) than
-                  // Chromium, which drifts the caret/selection off the
-                  // painted text. Forcing `block` pins the textarea to the
-                  // container top on every engine so the two layers stay
-                  // glued, and drops the phantom line-box descent that
-                  // otherwise made this box a few px too tall.
-                  "relative block w-full resize-none bg-transparent",
-                  COMPOSER_TEXT_LAYOUT,
-                  // Transparent text — the colored mirror behind shows
-                  // through. Caret stays visible via `caret-foreground`.
-                  "text-transparent caret-foreground",
-                  "placeholder:text-muted-foreground/60",
-                  "outline-none",
-                )}
-                // min-height (rather than a floor in the auto-grow effect)
-                // so the imperative `style.height` can never shrink the box
-                // below the resting size.
-                style={{
-                  minHeight: `${textareaMinPx}px`,
-                  maxHeight: `${MAX_ROWS_APPROX_PX}px`,
-                }}
-              />
             </div>
           </div>
           {dropTarget ? (

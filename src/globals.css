@@ -1057,6 +1057,35 @@ body.pane-resizing iframe {
   animation: cm-row-in 0.13s ease;
 }
 
+/* A workspace card arriving in the sidebar inbox — the "creating" stand-in
+ * for a just-sent first prompt, or a workspace that appeared from anywhere
+ * else. It opens its own row (max-height) so the cards below slide down
+ * instead of jumping, while the card itself settles in from just above.
+ * 7rem clears a full card (~90px) without a long dead tail on the ease. */
+@keyframes cm-card-in {
+  from {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+  60% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    max-height: 7rem;
+    transform: none;
+  }
+}
+.card-in {
+  animation: cm-card-in 0.34s cubic-bezier(0.2, 0, 0, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .card-in {
+    animation: none;
+  }
+}
+
 /* Live-status text shimmer for the agent-chat streaming marker
  * ("Working…", "Running <tool>…") and the reasoning block header while
  * thinking (design D9 / D5). A soft light band sweeps across the glyphs
