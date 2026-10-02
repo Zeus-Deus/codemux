@@ -1167,14 +1167,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
       composer,
     );
   const pending = async (id) => {
-    // The composer menu waits for broker registration and supplies its exact
-    // target, unlike a global command invoked during a pane's first mount.
-    await chooseComposerAction(
-      "example.context-races",
-      id,
-      `CI delayed ${id}`,
-      "Context Race Fixture",
-    );
+    await openCommand(`CI delayed ${id}`);
     try {
       await hasText(`CI pending ${id}`);
     } catch (error) {

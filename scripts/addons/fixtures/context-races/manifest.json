@@ -68,33 +68,7 @@
         "icon": "list"
       }
     ],
-    "composerActions": [
-      {
-        "id": "typing",
-        "title": "CI delayed typing",
-        "icon": "list"
-      },
-      {
-        "id": "workspace",
-        "title": "CI delayed workspace",
-        "icon": "list"
-      },
-      {
-        "id": "thread",
-        "title": "CI delayed thread",
-        "icon": "list"
-      },
-      {
-        "id": "replacement",
-        "title": "CI delayed replacement",
-        "icon": "list"
-      },
-      {
-        "id": "disable",
-        "title": "CI delayed disable",
-        "icon": "list"
-      }
-    ],
+    "composerActions": [],
     "composerViews": []
   }
 }

@@ -5,9 +5,9 @@ import {
   PluginError,
   Stack,
   Text,
-  useEffect,
   useReducer,
 } from "@codemux/plugin-sdk";
+import { useLayoutEffect } from "preact/hooks";
 
 // CI-only: the harness releases each append after changing its context, so
 // slow native UI operations cannot lose a race against a fixed timer. The
@@ -24,7 +24,9 @@ function record(line: string) {
 }
 function Status() {
   const [, rerender] = useReducer((n: number) => n + 1, 0);
-  useEffect(() => {
+  // Subscribe in the commit that renders the snapshot; an action can run
+  // before a deferred effect subscribes when the panel has just remounted.
+  useLayoutEffect(() => {
     const update = () => rerender(undefined);
     listeners.add(update);
     return () => {
@@ -70,7 +72,6 @@ export default definePlugin({
         }
       };
       ctx.commands.register(id, handler);
-      ctx.composerActions.register(id, handler);
     }
   },
 });
