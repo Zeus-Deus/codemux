@@ -24,16 +24,17 @@ function record(line: string) {
 function Status() {
   const [, rerender] = useReducer((n: number) => n + 1, 0);
   useEffect(() => {
-    listeners.add(rerender);
+    const update = () => rerender(undefined);
+    listeners.add(update);
     return () => {
-      listeners.delete(rerender);
+      listeners.delete(update);
     };
   }, []);
   return (
     <Stack spacing="sm">
       <Heading>Context race status</Heading>
       <Text color="muted">CI status ready</Text>
-      <Button onClick={() => {
+      <Button onPress={() => {
         for (const [id, release] of pending) {
           pending.delete(id);
           release();
