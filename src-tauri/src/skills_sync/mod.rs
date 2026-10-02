@@ -45,6 +45,7 @@ pub mod export;
 pub mod mapping;
 pub mod path_detection;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -53,7 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use api_client::{SkillUpload, SkillWire};
-use mapping::{default_mapping_path, load_mapping, save_mapping, MappingEntry, SkillMapping};
+use mapping::{account_mapping_path, load_mapping, save_mapping, MappingEntry, SkillMapping};
 use path_detection::{destination_path_after_pull, detect_skill_path};
 
 /// Sync result reported back to the frontend after a `sync_now`.
@@ -105,7 +106,6 @@ pub struct SyncEngine {
 
 struct EngineInner {
     state: SyncStateSnapshot,
-    mapping_path: PathBuf,
     home: PathBuf,
     /// Canonical destination root (`~/.codemux/skills/`) used to
     /// short-circuit lookups during pull.
@@ -124,7 +124,6 @@ impl SyncEngine {
         Self {
             inner: Mutex::new(EngineInner {
                 state: SyncStateSnapshot::default(),
-                mapping_path: default_mapping_path(home),
                 home: home.to_path_buf(),
                 skills_root: home.join(".codemux/skills"),
             }),
@@ -151,6 +150,7 @@ impl SyncEngine {
     pub async fn sync_now(
         &self,
         token: &str,
+        account_id: &str,
         enumerate_paths: Vec<PathBuf>,
     ) -> Result<SyncResult, String> {
         let started_millis = now_millis();
@@ -165,7 +165,7 @@ impl SyncEngine {
             };
         }
 
-        let result = self.run_cycle(token, enumerate_paths).await;
+        let result = self.run_cycle(token, account_id, enumerate_paths).await;
 
         // Update final state.
         {
@@ -190,16 +190,18 @@ impl SyncEngine {
     async fn run_cycle(
         &self,
         token: &str,
+        account_id: &str,
         enumerate_paths: Vec<PathBuf>,
     ) -> Result<SyncResult, String> {
-        let (mapping_path, home, skills_root) = {
+        let (home, skills_root) = {
             let guard = self
                 .inner
                 .lock()
                 .map_err(|e| format!("engine lock poisoned: {e}"))?;
-            (guard.mapping_path.clone(), guard.home.clone(), guard.skills_root.clone())
+            (guard.home.clone(), guard.skills_root.clone())
         };
 
+        let mapping_path = account_mapping_path(&home, account_id);
         let mut mapping = load_mapping(&mapping_path);
         let mut result = SyncResult::default();
 
@@ -219,11 +221,14 @@ impl SyncEngine {
             mapping.plaintext_migrated = true;
         }
 
+        let local_files = collect_local_skill_files(&enumerate_paths);
+        let mut local = LocalSkills::new(&local_files, &mapping, &home);
+
         // ── PULL ──────────────────────────────────────────────
         let remote = api_client::list_skills(token).await?;
 
         for wire in &remote {
-            match self.apply_remote_skill(wire, &mut mapping, &home, &skills_root) {
+            match self.apply_remote_skill(wire, &mut mapping, &mut local, &home, &skills_root) {
                 Ok(applied) => {
                     if applied {
                         result.pulled_count += 1;
@@ -247,7 +252,6 @@ impl SyncEngine {
         // ── PUSH ──────────────────────────────────────────────
         // Walk every syncable directory; for each SKILL.md decide
         // whether it needs an update.
-        let local_files = collect_local_skill_files(&enumerate_paths);
         for local in &local_files {
             match self.push_one(local, &mut mapping, token, &home).await {
                 Ok(PushOutcome::Pushed) => result.pushed_count += 1,
@@ -275,6 +279,7 @@ impl SyncEngine {
         &self,
         wire: &SkillWire,
         mapping: &mut SkillMapping,
+        local: &mut LocalSkills,
         home: &Path,
         skills_root: &Path,
     ) -> Result<bool, String> {
@@ -303,6 +308,40 @@ impl SyncEngine {
         // Names + contents arrive as plaintext from the server.
         let name_plain = wire.name.clone();
         let content_plain = wire.content.clone();
+
+        // A row this mapping has never seen (first sync for the
+        // account, or a lost mapping) may still be a skill that lives
+        // on this device. Link it to that file rather than writing a
+        // second copy that the push pass would then upload as yet
+        // another row.
+        if existing.is_none() {
+            let key = SkillKey::from_wire(wire);
+            let pull_dest = destination_path_after_pull(&name_plain, home);
+            if let Some(local_path) = local.claim(&key, &pull_dest) {
+                // Identical content is already in sync; otherwise the
+                // push pass uploads the local file over this row.
+                let in_sync = fs::read_to_string(&local_path).is_ok_and(|c| c == content_plain);
+                let last_synced_at_millis = if in_sync {
+                    file_mtime_millis(&local_path).unwrap_or(0)
+                } else {
+                    0
+                };
+                mapping.upsert(MappingEntry {
+                    local_path,
+                    remote_id: wire.remote_id.clone(),
+                    name: name_plain,
+                    provider: wire.provider.clone(),
+                    scope: wire.scope.clone(),
+                    last_synced_at_millis,
+                    server_updated_at_millis: server_updated_millis,
+                });
+                return Ok(false);
+            }
+            // Another row already owns this device's copy: a duplicate.
+            if local.keys.contains(&key) || mapping.find_by_path(&pull_dest).is_some() {
+                return Ok(false);
+            }
+        }
 
         // Decide the destination path. New entries always land at
         // the canonical `~/.codemux/skills/<name>/SKILL.md`.
@@ -476,6 +515,70 @@ enum PushOutcome {
     Conflict,
 }
 
+/// Identity of a skill across the sync boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SkillKey {
+    name: String,
+    provider: String,
+    scope: String,
+}
+
+impl SkillKey {
+    fn from_wire(wire: &SkillWire) -> Self {
+        Self {
+            name: wire.name.clone(),
+            provider: wire.provider.clone(),
+            scope: wire.scope.clone(),
+        }
+    }
+}
+
+/// Syncable skills on this device, used to link unmapped server rows
+/// to existing files instead of duplicating them.
+#[derive(Default)]
+struct LocalSkills {
+    /// Files no mapping entry points at yet, in scan order.
+    unclaimed: Vec<(PathBuf, SkillKey)>,
+    /// Every syncable skill present on this device.
+    keys: HashSet<SkillKey>,
+}
+
+impl LocalSkills {
+    fn new(files: &[PathBuf], mapping: &SkillMapping, home: &Path) -> Self {
+        let mut local = Self::default();
+        for path in files {
+            let (Some(info), Some(name)) = (detect_skill_path(path, home), skill_name_from_path(path))
+            else {
+                continue;
+            };
+            if !info.is_syncable {
+                continue;
+            }
+            let key = SkillKey {
+                name,
+                provider: info.provider,
+                scope: info.scope,
+            };
+            local.keys.insert(key.clone());
+            if mapping.find_by_path(path).is_none() {
+                local.unclaimed.push((path.clone(), key));
+            }
+        }
+        local
+    }
+
+    /// Take the unclaimed file for `key`, else an unclaimed file at the
+    /// row's pull destination (a copy pulled before the mapping was lost).
+    fn claim(&mut self, key: &SkillKey, pull_dest: &Path) -> Option<PathBuf> {
+        let index = self
+            .unclaimed
+            .iter()
+            .position(|(_, k)| k == key)
+            .or_else(|| self.unclaimed.iter().position(|(path, _)| path == pull_dest))?;
+        Some(self.unclaimed.remove(index).0)
+    }
+}
+
 // ────────────────────────────────────────────────────────────────
 // Helpers.
 
@@ -646,6 +749,7 @@ mod tests {
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
+                &mut LocalSkills::default(),
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -695,6 +799,7 @@ mod tests {
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
+                &mut LocalSkills::default(),
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -737,6 +842,7 @@ mod tests {
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
+                &mut LocalSkills::default(),
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -760,6 +866,7 @@ mod tests {
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
+                &mut LocalSkills::default(),
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -769,6 +876,82 @@ mod tests {
     }
 
     // ── snapshot / state transitions ───────────────────────────
+
+    fn write_local_skill(home: &Path, root: &str, name: &str, content: &str) -> PathBuf {
+        let path = home.join(root).join(name).join("SKILL.md");
+        write_skill_to_disk(&path, content).unwrap();
+        path
+    }
+
+    fn pull(engine: &SyncEngine, home: &Path, local_files: &[PathBuf], wires: &[SkillWire]) -> SkillMapping {
+        let mut mapping = SkillMapping::default();
+        let mut local = LocalSkills::new(local_files, &mapping, home);
+        for wire in wires {
+            engine
+                .apply_remote_skill(wire, &mut mapping, &mut local, home, &home.join(".codemux/skills"))
+                .unwrap();
+        }
+        mapping
+    }
+
+    #[test]
+    fn unmapped_rows_link_to_the_local_skill_instead_of_duplicating_it() {
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let same = write_local_skill(home.path(), ".claude/skills", "same", "body");
+        let edited = write_local_skill(home.path(), ".claude/skills", "edited", "local edit");
+        let mapping = pull(&engine, home.path(), &[same.clone(), edited.clone()], &[
+            plain_wire("same", "body", "claude", "user", "1", "2026-04-29T20:00:00Z"),
+            plain_wire("edited", "older", "claude", "user", "2", "2026-04-29T20:00:00Z"),
+            // Duplicate rows of a skill this device already owns.
+            plain_wire("same", "body", "claude", "user", "3", "2026-04-29T20:00:00Z"),
+            plain_wire("edited", "older", "claude", "user", "4", "2026-04-29T20:00:00Z"),
+        ]);
+
+        let linked: Vec<_> = mapping.skills.iter().map(|e| (e.remote_id.as_str(), e.local_path.clone())).collect();
+        assert_eq!(linked, vec![("1", same.clone()), ("2", edited.clone())]);
+        // Matching content is in sync; a differing file is pushed over the row.
+        assert_eq!(mapping.skills[0].last_synced_at_millis, file_mtime_millis(&same).unwrap());
+        assert_eq!(mapping.skills[1].last_synced_at_millis, 0);
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "local edit");
+        assert!(!home.path().join(".codemux/skills").exists());
+    }
+
+    #[test]
+    fn duplicate_rows_share_one_pulled_copy() {
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let mapping = pull(&engine, home.path(), &[], &[
+            plain_wire("remote", "first", "claude", "user", "1", "2026-04-29T20:00:00Z"),
+            plain_wire("remote", "second", "claude", "user", "2", "2026-04-29T20:00:00Z"),
+        ]);
+        let dest = destination_path_after_pull("remote", home.path());
+        assert_eq!(mapping.skills.len(), 1);
+        assert_eq!(mapping.skills[0].local_path, dest);
+        assert_eq!(fs::read_to_string(dest).unwrap(), "first");
+    }
+
+    #[test]
+    fn a_previously_pulled_copy_is_relinked_not_overwritten() {
+        let home = TempDir::new().unwrap();
+        let engine = SyncEngine::with_home(home.path());
+        let copy = write_local_skill(home.path(), ".codemux/skills", "remote", "kept edit");
+        let mapping = pull(&engine, home.path(), &[copy.clone()], &[
+            plain_wire("remote", "server", "claude", "user", "1", "2026-04-29T20:00:00Z"),
+        ]);
+        assert_eq!(mapping.skills[0].local_path, copy);
+        assert_eq!(fs::read_to_string(copy).unwrap(), "kept edit");
+    }
+
+    #[test]
+    fn each_account_has_its_own_mapping_file() {
+        let home = Path::new("/home/u");
+        assert_ne!(account_mapping_path(home, "dev"), account_mapping_path(home, "main"));
+        assert_eq!(
+            account_mapping_path(home, "../a/b"),
+            home.join(".codemux/sync/skills-mapping-ab.json"),
+        );
+    }
 
     #[test]
     fn fresh_engine_reports_idle_with_no_last_sync() {

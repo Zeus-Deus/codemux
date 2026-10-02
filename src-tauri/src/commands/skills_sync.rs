@@ -40,6 +40,12 @@ pub async fn skills_sync_now<R: tauri::Runtime>(
         Some((t, _expires)) => t,
         None => return Ok(SyncResult::default()),
     };
+    // The local↔remote mapping is per account; without a known
+    // account there is nowhere safe to record it.
+    let account_id = match load_cached_user(&db) {
+        Some(user) => user.id,
+        None => return Ok(SyncResult::default()),
+    };
 
     // Emit "we just transitioned to Syncing" so the frontend's
     // status display can spin its icon without waiting for the
@@ -78,7 +84,7 @@ pub async fn skills_sync_now<R: tauri::Runtime>(
         .map(|(p, _)| p)
         .collect();
 
-    let result = engine.sync_now(&token, paths).await;
+    let result = engine.sync_now(&token, &account_id, paths).await;
 
     // Always emit the post-cycle snapshot — Idle on success,
     // Error on failure. Both transitions are interesting to the
