@@ -1088,11 +1088,12 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   );
   const bytes = await readFile(path);
   evidence.seams.push(
-    "CI-only delayed public-SDK package built with the packed author tools; normal native package import, SDK broker and plugin-rendered status panel",
+    "CI-only public-SDK package with explicitly released appends built with the packed author tools; normal native package import, SDK broker and plugin-rendered status panel",
   );
   evidence.contextRaces = {
     fixtureSha256: createHash("sha256").update(bytes).digest("hex"),
-    delayMs: 4000,
+    completion: "Status-panel release after the context mutation",
+    disableDelayMs: 4000,
     completed: [],
     rejections: {},
   };
@@ -1169,9 +1170,12 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     await openCommand(`CI delayed ${id}`);
     await hasText(`CI pending ${id}`);
   };
-  // The context change itself must reject the late append, well before the
-  // 10 s interaction expires; an expiry would not prove cancellation.
+  // Release only after the native mutation, so a slow driver cannot let an
+  // append finish before the context changes. Expiry still fails this check:
+  // only context cancellation (CONTEXT_STALE / NO_COMPOSER) is accepted.
+  const release = () => clickText("Release pending appends");
   const cancelled = async (id, codes) => {
+    await release();
     const pattern = new RegExp(`CI cancelled ${id}: ([A-Z_]+)`);
     const code = await until(
       `CI cancelled ${id}`,
@@ -1199,6 +1203,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   await step("10-context-typing-preserved", async () => {
     await pending("typing");
     await typeComposer(" User race input.");
+    await release();
     await hasText("CI appended typing");
     assert.ok(
       (await drafts()).some(

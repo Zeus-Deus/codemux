@@ -1,4 +1,5 @@
 import {
+  Button,
   definePlugin,
   Heading,
   PluginError,
@@ -8,12 +9,13 @@ import {
   useReducer,
 } from "@codemux/plugin-sdk";
 
-// CI-only: each command waits past a context change and then tries to append
-// to the draft it was started from. Outcomes are shown in a panel rather than
-// notifications so the three-per-minute notification limit cannot hide them.
+// CI-only: the harness releases each append after changing its context, so
+// slow native UI operations cannot lose a race against a fixed timer. The
+// disable case keeps a timer because disabling stops the fixture itself.
 const cases = ["typing", "workspace", "thread", "replacement", "disable"];
 const outcomes: string[] = [];
 const listeners = new Set<() => void>();
+const pending = new Map<string, () => void>();
 function record(line: string) {
   outcomes.push(line);
   if (outcomes.length > 12) outcomes.shift();
@@ -31,6 +33,12 @@ function Status() {
     <Stack spacing="sm">
       <Heading>Context race status</Heading>
       <Text color="muted">CI status ready</Text>
+      <Button onClick={() => {
+        for (const [id, release] of pending) {
+          pending.delete(id);
+          release();
+        }
+      }}>Release pending appends</Button>
       {outcomes.map((line) => (
         <Text>{`CI ${line}`}</Text>
       ))}
@@ -45,8 +53,11 @@ export default definePlugin({
     );
     for (const id of cases)
       ctx.commands.register(id, async (context) => {
+        const ready = id === "disable"
+          ? new Promise<void>((resolve) => setTimeout(resolve, 4000))
+          : new Promise<void>((resolve) => pending.set(id, resolve));
         record(`pending ${id}`);
-        await new Promise((resolve) => setTimeout(resolve, 4000));
+        await ready;
         try {
           await ctx.composer.appendText(context, ` CI delayed ${id}.`);
           record(`appended ${id}`);
