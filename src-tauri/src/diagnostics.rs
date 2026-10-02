@@ -59,7 +59,7 @@ pub fn record_perf_timing(name: &'static str, elapsed: Duration) {
     // Saturating increment: a full ring drops its oldest entry for each new
     // one, so its length pins at the capacity. `Relaxed` is enough — the
     // count is a standalone statistic, ordered against nothing.
-    let _ = PERF_SAMPLE_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+    let _ = PERF_SAMPLE_COUNT.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
         (count < PERF_RING_CAPACITY).then_some(count + 1)
     });
 
