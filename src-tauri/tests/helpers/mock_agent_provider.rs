@@ -28,6 +28,7 @@ pub enum MockCall {
     InterruptTurn(ThreadId, Option<TurnId>),
     RespondToRequest(ThreadId, RequestId),
     SetModel(ThreadId, String),
+    SetFastMode(ThreadId, bool),
     SetPermissionMode(ThreadId, String),
     RollbackConversation(ThreadId, u32),
     StopSession(ThreadId),
@@ -68,6 +69,7 @@ pub struct MockAgentProvider {
     /// `start_session` inserts, `stop_session` removes.
     live: Arc<Mutex<HashSet<ThreadId>>>,
     rollback_error: Arc<Mutex<Option<String>>>,
+    fast_mode_error: Mutex<Option<ProviderError>>,
     send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Every `StartSessionInput` received, in order, so tests can assert
     /// on what the command layer actually handed the provider (workspace
@@ -85,6 +87,7 @@ impl MockAgentProvider {
             event_tx,
             live: Arc::new(Mutex::new(HashSet::new())),
             rollback_error: Arc::new(Mutex::new(None)),
+            fast_mode_error: Mutex::new(None),
             send_gate: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
@@ -98,6 +101,11 @@ impl MockAgentProvider {
 
     pub fn fail_next_rollback(&self, message: impl Into<String>) {
         *self.rollback_error.lock().unwrap() = Some(message.into());
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_fast_mode(&self, error: ProviderError) {
+        *self.fast_mode_error.lock().unwrap() = Some(error);
     }
 
     /// Keep one dispatch in flight while a test drives concurrent commands.
@@ -215,6 +223,14 @@ impl AgentProvider for MockAgentProvider {
     async fn set_model(&self, thread_id: ThreadId, model: String) -> Result<(), ProviderError> {
         self.calls.push(MockCall::SetModel(thread_id, model));
         Ok(())
+    }
+
+    async fn set_fast_mode(&self, thread_id: ThreadId, fast_mode: bool) -> Result<(), ProviderError> {
+        self.calls.push(MockCall::SetFastMode(thread_id, fast_mode));
+        match self.fast_mode_error.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn set_permission_mode(

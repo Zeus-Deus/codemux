@@ -3163,18 +3163,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ],
   );
 
+  const fastModeChangesInFlightRef = useRef(new Set<string>());
   const handleFastModeChange = useCallback(
     (next: boolean) => {
       if (!threadId || (next && !activeModel?.supports_fast_mode)) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
+      if (fastModeChangesInFlightRef.current.has(threadId)) return;
       const current = useAgentChatStore.getState().threads[threadId];
       if (!current || current.fastMode === next) return;
-      setStoreFastMode(threadId, next);
+      fastModeChangesInFlightRef.current.add(threadId);
       // Codex carries the service tier on `turn/start`; Cursor exposes a live
       // ACP Fast config option. Neither requires replacing the conversation.
-      agentChatSetFastMode(provider, threadId, next).catch((err) => {
-        toast.error(`Failed to set service tier: ${err}`);
-      });
+      agentChatSetFastMode(provider, threadId, next)
+        // Reflect the tier only after the provider accepts it. Keep requests
+        // for this thread sequential so an older result cannot win a race.
+        .then(() => setStoreFastMode(threadId, next))
+        .catch((err) => {
+          toast.error(`Failed to set service tier: ${err}`);
+        })
+        .finally(() => fastModeChangesInFlightRef.current.delete(threadId));
     },
     [
       threadId,

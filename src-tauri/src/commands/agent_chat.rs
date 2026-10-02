@@ -3825,9 +3825,9 @@ pub async fn agent_chat_set_model<R: Runtime>(
 }
 
 /// Change the provider's service-speed tier without replacing its live
-/// conversation. The choice is persisted first so an app restart or dead
-/// provider process resumes with the same tier; a missing live session is
-/// therefore already healed for the next auto-resume.
+/// conversation. Persist only accepted changes so a rejected tier does not
+/// become the next startup's setting. A missing live session is still saved
+/// so the next auto-resume applies the user's choice.
 #[tauri::command]
 pub async fn agent_chat_set_fast_mode<R: Runtime>(
     app: AppHandle<R>,
@@ -3839,6 +3839,14 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    // Serialize tier changes with cold-session resume so it cannot adopt
+    // the old persisted tier between applying and saving this choice.
+    let lock = resume_lock_for(&thread_id.0);
+    let _guard = lock.lock().await;
+    match impl_.set_fast_mode(thread_id.clone(), fast_mode).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
+        Err(err) => return Err(provider_err(err)),
+    }
     {
         let db: State<'_, DatabaseStore> = app.state();
         let config = AgentChatSessionConfig {
@@ -3849,11 +3857,7 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
             eprintln!("[codemux::agent_chat] failed to persist Fast mode config: {error}");
         }
     }
-    match impl_.set_fast_mode(thread_id, fast_mode).await {
-        Ok(()) => Ok(()),
-        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
-        Err(err) => Err(provider_err(err)),
-    }
+    Ok(())
 }
 
 /// Change a session's permission mode (accept-edits, bypass, plan,

@@ -160,11 +160,16 @@ pub trait AgentProvider: Send + Sync {
     /// Swap the session's service-speed tier at runtime. Providers that
     /// advertise Fast mode should override this and apply the choice to the
     /// existing provider session rather than forcing a stop/resume cycle.
+    /// Standard is a no-op for providers without Fast support, allowing stale
+    /// persisted Fast choices to be cleared when capabilities change.
     async fn set_fast_mode(
         &self,
         _thread_id: ThreadId,
-        _fast_mode: bool,
+        fast_mode: bool,
     ) -> Result<(), ProviderError> {
+        if !fast_mode {
+            return Ok(());
+        }
         Err(ProviderError::ValidationError {
             message: "provider does not support mid-session Fast mode changes".into(),
         })
