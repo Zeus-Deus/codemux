@@ -9,14 +9,14 @@
 //! reference multi-provider client populates its provider-command
 //! menu from the SDK init result rather than a static table.
 //!
-//! Results are cached per working directory for the app's lifetime —
+//! Results are cached per working directory for one minute —
 //! commands are cwd-sensitive because project-scoped custom commands
 //! resolve relative to it. The composer's slash popup triggers the
-//! harvest lazily on first open, so the CLI spawn cost is paid at
-//! most once per project per run.
+//! harvest lazily on open, so the CLI spawn cost is paid once per
+//! project per cache interval unless explicitly refreshed.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -58,11 +58,11 @@ struct ListCommandsResponse {
 }
 
 /// Process-wide cache of harvested command lists, keyed by cwd.
-/// Mirrors `ClaudeCapabilityCache` — populated on first call per cwd
-/// and reused for the rest of the app's lifetime.
+/// Populated lazily per cwd, expiring after one minute or bypassed by
+/// an explicit refresh so newly added project commands become visible.
 #[derive(Default)]
 pub struct ClaudeSlashCommandCache {
-    inner: Mutex<HashMap<String, Vec<ProviderSlashCommand>>>,
+    inner: Mutex<HashMap<String, (Instant, Vec<ProviderSlashCommand>)>>,
 }
 
 impl ClaudeSlashCommandCache {
@@ -74,19 +74,28 @@ impl ClaudeSlashCommandCache {
     /// live harvest, cache it, and return. Failures are NOT cached so
     /// a transient error (CLI not installed yet, spawn timeout)
     /// retries on the next popup open.
-    pub async fn get_or_harvest(
+    pub async fn get_or_harvest(&self, cwd: &str) -> Result<Vec<ProviderSlashCommand>, String> {
+        self.get_or_harvest_with_refresh(cwd, false).await
+    }
+
+    pub async fn get_or_harvest_with_refresh(
         &self,
         cwd: &str,
+        force: bool,
     ) -> Result<Vec<ProviderSlashCommand>, String> {
-        {
+        if !force {
             let guard = self.inner.lock().await;
-            if let Some(cached) = guard.get(cwd) {
-                return Ok(cached.clone());
+            if let Some((at, cached)) = guard.get(cwd) {
+                if at.elapsed() < Duration::from_secs(60) {
+                    return Ok(cached.clone());
+                }
             }
         }
         let commands = harvest_via_sidecar(cwd).await?;
-        let mut guard = self.inner.lock().await;
-        guard.insert(cwd.to_string(), commands.clone());
+        self.inner
+            .lock()
+            .await
+            .insert(cwd.to_string(), (Instant::now(), commands.clone()));
         Ok(commands)
     }
 }

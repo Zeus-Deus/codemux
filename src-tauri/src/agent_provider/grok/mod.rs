@@ -306,6 +306,18 @@ impl AgentProvider for GrokAgentProvider {
         !session.is_dead() && session.state.lock().await.active_turn.is_some()
     }
 
+    async fn session_slash_commands(
+        &self,
+        thread_id: ThreadId,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<super::claude::slash_commands::ProviderSlashCommand>, ProviderError> {
+        let session = self.sessions.read().await.get(&thread_id).cloned();
+        match session {
+            Some(session) if !session.is_dead() => session.slash_commands(cwd).await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
     fn event_stream(&self) -> ProviderEventStream {
         let receiver = self.event_tx.subscribe();
         let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {

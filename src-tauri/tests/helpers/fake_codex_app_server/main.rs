@@ -165,6 +165,9 @@ fn main() {
     let capture_turn = std::env::var("FAKE_CODEX_CAPTURE_TURN").ok();
     let async_mode = std::env::var("FAKE_CODEX_ASYNC_MODE").ok();
     let trace = std::env::var("FAKE_CODEX_TRACE").ok();
+    let mut hooks: Vec<Value> = std::env::var("FAKE_CODEX_HOOKS").ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
     let history_file = std::env::var("FAKE_CODEX_HISTORY").ok();
     let mut async_turns: Vec<Value> = history_file
         .as_ref()
@@ -220,6 +223,24 @@ fn main() {
             writeln!(file, "{}", json!({"method":method,"params":msg.params})).unwrap();
         }
         match method {
+            "hooks/list" => {
+                if let Some(id) = id {
+                    write_line(&json!({"id": id, "result": {"data": [{
+                        "cwd": msg.params["cwds"][0], "hooks": hooks, "warnings": [], "errors": []
+                    }]}}));
+                }
+            }
+            "config/batchWrite" => {
+                for edit in msg.params["edits"].as_array().into_iter().flatten() {
+                    for (key, state) in edit["value"].as_object().into_iter().flatten() {
+                        if let Some(hook) = hooks.iter_mut().find(|hook| hook["key"] == *key) {
+                            if state["trusted_hash"] == hook["currentHash"] { hook["trustStatus"] = json!("trusted"); }
+                            if let Some(enabled) = state["enabled"].as_bool() { hook["enabled"] = json!(enabled); }
+                        }
+                    }
+                }
+                if let Some(id) = id { write_line(&json!({"id": id, "result": {}})); }
+            }
             "initialize" => {
                 if let Some(id) = id {
                     write_line(&json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}));
@@ -296,6 +317,17 @@ fn main() {
                         "id": id,
                         "result": {"thread": {"id": thread_id}},
                     }));
+                }
+                fire_script_entries_for(method, &script, &pending_server_requests);
+            }
+            "thread/compact/start" | "review/start" => {
+                if let Some(id) = id {
+                    let result = if method == "review/start" {
+                        json!({"turn": {"id": "native-turn"}})
+                    } else {
+                        json!({})
+                    };
+                    write_line(&json!({"jsonrpc":"2.0", "id": id, "result": result}));
                 }
                 fire_script_entries_for(method, &script, &pending_server_requests);
             }

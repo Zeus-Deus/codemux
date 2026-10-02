@@ -223,15 +223,24 @@ describe("Composer · command execution affordance", () => {
     expect(chip).toHaveTextContent("Runs /goal");
   });
 
-  it("still lets a uniquely-named skill claim its bare name over a provider command", async () => {
+  it("keeps the native command on a skill name collision", async () => {
     listSkillsMock.mockResolvedValue([makeSkill({ id: "a", name: "goal" })]);
 
     const { findByTestId } = renderComposer({ draft: "/goal ship the release" });
 
     expect(await findByTestId("composer-command-chip")).toHaveAttribute(
       "data-command-kind",
-      "skill",
+      "provider",
     );
+  });
+
+  it("waits for initial native discovery before allowing a command to send", async () => {
+    let finish!: (commands: { name: string }[]) => void;
+    listChatSlashCommandsMock.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const view = renderComposer({ draft: "/goal ship the release" });
+    await waitFor(() => expect(view.getByRole("button", { name: "Send" })).toBeDisabled());
+    finish([{ name: "goal" }]);
+    await waitFor(() => expect(view.getByRole("button", { name: "Send" })).toBeEnabled());
   });
 
   it("picks up a session-fed catalogue that was empty on the first read", async () => {

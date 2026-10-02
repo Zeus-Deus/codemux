@@ -13,6 +13,8 @@ import {
 
 import type { ChatMode } from "@/stores/agent-chat-store";
 import type { ProviderSlashCommand } from "@/tauri/commands";
+import type { AgentChatProviderKind } from "@/tauri/types";
+import { sessionProviderLabel } from "./session-mentions";
 import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
 
 import { type GoalSubcommandWord } from "./goal";
@@ -53,6 +55,12 @@ export interface SlashCommandItem {
   command: string;
   /** Lucide icon. Optional; some skills may not have an icon. */
   icon?: LucideIcon;
+  /** Definition source and item type, independent of the active model. */
+  identity?: {
+    provider: AgentChatProviderKind | "codemux";
+    kind: "skill" | "command";
+    label: string;
+  };
   /** Tailwind classes applied to the icon, overriding the popup's
    *  default `text-muted-foreground`. Used to tint state-bearing
    *  icons (e.g. green for open issues, muted for closed). Optional;
@@ -100,6 +108,8 @@ export interface SlashCommandItem {
 export interface SlashAnchor {
   /** Index of the trigger character (`/` or `@`) in the value. */
   start: number;
+  /** Dollar syntax opens the skills-only picker. Slash is the default. */
+  trigger?: "$";
   /** Substring between the trigger and the cursor. Empty when the
    *  user has just typed the trigger. */
   query: string;
@@ -128,7 +138,7 @@ export type MentionAnchor = SlashAnchor;
 export function findTriggerAtCursor(
   value: string,
   cursor: number,
-  trigger: "/" | "@",
+  trigger: "/" | "@" | "$",
 ): SlashAnchor | null {
   if (cursor < 0 || cursor > value.length) return null;
   for (let i = cursor - 1; i >= 0; i--) {
@@ -319,7 +329,9 @@ export function findSlashContextAtCursor(
   value: string,
   cursor: number,
 ): SlashAnchor | null {
-  return findSlashAtCursor(value, cursor) ?? findSlashArgAtCursor(value, cursor);
+  const skill = findTriggerAtCursor(value, cursor, "$");
+  return findSlashAtCursor(value, cursor) ?? findSlashArgAtCursor(value, cursor)
+    ?? (skill ? { ...skill, trigger: "$" } : null);
 }
 
 /**
@@ -434,6 +446,7 @@ export function filterSlashItems(
   for (const item of items) {
     if (
       item.command.toLowerCase().startsWith(`/${q}`) ||
+      item.command.toLowerCase().startsWith(`$${q}`) ||
       item.label.toLowerCase().includes(q)
     ) {
       bucketFor(item.group).names.push(item);
@@ -446,7 +459,12 @@ export function filterSlashItems(
       bucketFor(item.group).descriptions.push(item);
     }
   }
-  return [...groups.values()].flatMap((b) => [...b.names, ...b.descriptions]);
+  // An exact command wins over unrelated skill prose, including across
+  // groups. Keep groups contiguous so keyboard and visual order agree.
+  const exactRank = (item: SlashCommandItem) => item.command.toLowerCase() === `/${q}` ? 2 : item.command.toLowerCase() === `$${q}` ? 1 : 0;
+  const groupRank = (bucket: { names: SlashCommandItem[] }) => Math.max(0, ...bucket.names.map(exactRank));
+  return [...groups.values()].sort((a, b) => groupRank(b) - groupRank(a))
+    .flatMap((bucket) => [...bucket.names].sort((a, b) => exactRank(b) - exactRank(a)).concat(bucket.descriptions));
 }
 
 /**
@@ -612,6 +630,7 @@ export function buildModelCommand({
 }
 
 interface BuildProviderCommandsArgs {
+  provider?: AgentChatProviderKind;
   /** Provider-native commands discovered live from the provider (e.g.
    *  Claude Code's `/compact`, `/init`, `/review`, custom
    *  `.claude/commands` entries). Never hardcoded. */
@@ -635,6 +654,7 @@ interface BuildProviderCommandsArgs {
 export function buildProviderCommands({
   commands,
   reservedNames,
+  provider,
 }: BuildProviderCommandsArgs): SlashCommandItem[] {
   return commands
     .filter((c) => !reservedNames.has(c.name.toLowerCase()))
@@ -651,6 +671,7 @@ export function buildProviderCommands({
           ? c.argumentHint
           : undefined,
       icon: SquareSlash,
+      identity: provider ? { provider, kind: "command" as const, label: `${sessionProviderLabel(provider)} command` } : undefined,
       group: "COMMANDS",
       onSelect: () => {},
     }));

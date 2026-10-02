@@ -186,6 +186,18 @@ describe("buildSubcommandItems", () => {
 });
 
 describe("filterSlashItems", () => {
+  it("selects a slash control before a colliding dollar skill alias", () => {
+    const rows = [{ id: "skill", label: "hooks", command: "$hooks", group: "SKILLS", onSelect: () => {} },
+      { id: "hooks", label: "Hooks", command: "/hooks", group: "CHAT", onSelect: () => {} }];
+    expect(filterSlashItems(rows, "hooks").map((item) => item.id)).toEqual(["hooks", "skill"]);
+  });
+  it("ranks an exact command ahead of skills matching its description across groups", () => {
+    const rows = [{ id: "skill", label: "hook-development", command: "/hook-development", description: "Manage hooks", group: "SKILLS", onSelect: () => {} },
+      { id: "hooks", label: "Hooks", command: "/hooks", description: "Manage lifecycle hooks", group: "CHAT", onSelect: () => {} }];
+    const filtered = filterSlashItems(rows, "hooks");
+    expect(filtered.map((item) => item.id)).toEqual(["hooks", "skill"]);
+    expect(groupSlashItems(filtered).flatMap((group) => group.items)).toEqual(filtered);
+  });
   const items: SlashCommandItem[] = [
     {
       id: "mode:plan",
@@ -640,5 +652,15 @@ describe("slashArgumentPlaceholder", () => {
 
   it("shows nothing unless the caret is at the end", () => {
     expect(ghost("/goal ", NO_GOAL, false)).toBeNull();
+  });
+});
+
+
+describe("dollar skill completion", () => {
+  it("opens a skill-only anchor at a dollar token and preserves slash anchors", () => {
+    expect(findSlashContextAtCursor("use $deploy", 11)).toEqual({ start: 4, query: "deploy", trigger: "$" });
+    expect(findSlashContextAtCursor("$", 1)).toEqual({ start: 0, query: "", trigger: "$" });
+    expect(findSlashContextAtCursor("cost$deploy", 11)).toBeNull();
+    expect(findSlashContextAtCursor("$deploy now", 11)).toBeNull();
   });
 });

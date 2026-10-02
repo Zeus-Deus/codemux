@@ -226,6 +226,26 @@ pub trait AgentProvider: Send + Sync {
         })
     }
 
+    /// Commands published by one live session (providers with profile-scoped
+    /// vocabularies must never merge catalogues by cwd alone).
+    async fn session_slash_commands(
+        &self,
+        _thread_id: ThreadId,
+        _cwd: &std::path::Path,
+    ) -> Result<Vec<super::claude::slash_commands::ProviderSlashCommand>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    /// Native lifecycle-hook controls. Adapters opt in explicitly.
+    async fn manage_hooks(
+        &self,
+        _cwd: &std::path::Path,
+        _thread_id: Option<ThreadId>,
+        _update: Option<super::codex::hooks::HookUpdate>,
+    ) -> Result<super::codex::hooks::HooksList, String> {
+        Err("This provider does not expose lifecycle-hook controls in chat.".into())
+    }
+
     /// Subscribe to the canonical runtime event stream.
     ///
     /// Each call typically returns a fresh subscription; implementations are

@@ -696,6 +696,12 @@ impl CodexSession {
                 .and_then(|turns| turns.iter().rev().find(|t| t["status"] == "inProgress"))
                 .and_then(|turn| turn["id"].as_str());
             if let Some(active) = active {
+                if super::slash_commands::request(&input.text, &root)
+                    .map_err(|message| ProviderError::ValidationError { message })?
+                    .is_some()
+                {
+                    return Err(ProviderError::ValidationError { message: "Native commands cannot steer a running turn. Choose Queue or Interrupt and send.".into() });
+                }
                 let params = super::protocol::TurnSteerParams {
                     thread_id: root.clone(),
                     expected_turn_id: active.to_owned(),
@@ -739,12 +745,24 @@ impl CodexSession {
                     message: "Resolve the pending approval before sending a follow-up.".into(),
                 });
             }
+            let native = super::slash_commands::request(&input.text, &root)
+                .map_err(|message| ProviderError::ValidationError { message })?
+                .is_some();
             let checkpoint = input.turn_checkpoint.as_ref();
             if let Some(checkpoint) = checkpoint {
                 checkpoint.prepare().await;
             }
-            let sent = self
-                .do_send_with_id(
+            let sent = if native {
+                self.do_send(
+                    input.text.clone(),
+                    input.images.clone(),
+                    input.skill_invocations.clone(),
+                    input.model_override.clone(),
+                    input.effort_override.clone(),
+                )
+                .await
+            } else {
+                self.do_send_with_id(
                     input.text.clone(),
                     input.images.clone(),
                     input.skill_invocations.clone(),
@@ -752,7 +770,9 @@ impl CodexSession {
                     input.effort_override.clone(),
                     input.client_nonce.clone(),
                 )
-                .await;
+                .await
+                .map_err(plain_send_error)
+            };
             return match sent {
                 Ok(turn_id) => {
                     if let Some(checkpoint) = checkpoint {
@@ -768,7 +788,7 @@ impl CodexSession {
                     if let Some(checkpoint) = checkpoint {
                         checkpoint.abort().await;
                     }
-                    Err(plain_send_error(error))
+                    Err(error)
                 }
             };
         }
@@ -996,6 +1016,60 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
+        let thread_id = self.state.lock().await.codex_thread_id.clone();
+        let native = super::slash_commands::request(&text, &thread_id)
+            .map_err(|message| ProviderError::ValidationError { message })?;
+        if let Some((method, params)) = native {
+            if !images.is_empty() || !skill_invocations.is_empty() {
+                return Err(ProviderError::ValidationError {
+                    message: "Codex commands cannot include images or skills. Send them in a separate message.".into(),
+                });
+            }
+            // Reserve the queue before the RPC. Notifications may arrive before
+            // its response, and own the final lifecycle/real turn identifier.
+            let pending = TurnId(format!("native-{}", uuid::Uuid::new_v4()));
+            self.state.lock().await.active_turn = Some(pending.clone());
+            let response = match self.child.request(method, params).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let mut state = self.state.lock().await;
+                    if state.active_turn.as_ref() == Some(&pending) {
+                        state.active_turn = None;
+                    }
+                    return Err(ProviderError::RpcError {
+                        message: format!("{method} failed: {error}"),
+                    });
+                }
+            };
+            // Compaction returns {} and reports its turn exclusively through
+            // notifications. Review returns a regular turn envelope.
+            if method == "review/start" {
+                if let Some(id) = response
+                    .pointer("/turn/id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let mut state = self.state.lock().await;
+                    if state.active_turn.as_ref() == Some(&pending) {
+                        state.active_turn = Some(TurnId(id.into()));
+                    }
+                    return Ok(TurnId(id.into()));
+                }
+                let mut state = self.state.lock().await;
+                if state.active_turn.as_ref() == Some(&pending) {
+                    state.active_turn = None;
+                }
+                return Err(ProviderError::RpcError {
+                    message: "Codex returned a malformed review/start response.".into(),
+                });
+            }
+            return Ok(self
+                .state
+                .lock()
+                .await
+                .active_turn
+                .clone()
+                .unwrap_or(pending));
+        }
         self.do_send_with_id(
             text,
             images,

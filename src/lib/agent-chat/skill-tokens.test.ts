@@ -434,3 +434,21 @@ describe("skillsForProvider", () => {
     expect(skillsForProvider([claudeOnly], "grok")).toEqual([]);
   });
 });
+
+
+describe("native dollar skill syntax", () => {
+  it("resolves dollar and slash aliases to the same exact skill and deduplicates", () => {
+    const skill = makeSkill("deploy");
+    expect(resolveSkillSelection("$deploy /deploy ship", [skill])).toEqual({ skillIds: ["id-deploy"], text: "ship" });
+    expect(parseSkillTokens("$deploy ship", [skill])[0]?.token).toBe("$deploy");
+    expect(parseSkillTokens("cost$deploy", [skill])).toEqual([]);
+  });
+});
+
+
+it("keeps a native slash command when a same-named skill exists", () => {
+  const skill = makeSkill("review");
+  const commands = [{ name: "review" }];
+  expect(resolveSkillSelection("/review branch main", [skill], commands)).toEqual({ skillIds: [], text: "/review branch main" });
+  expect(resolveSkillSelection("$review check security", [skill], commands)).toEqual({ skillIds: [skill.id], text: "check security" });
+});

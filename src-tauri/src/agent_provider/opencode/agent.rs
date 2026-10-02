@@ -232,6 +232,7 @@ impl AgentProvider for OpenCodeAgentProvider {
             resume_session_id,
             self.event_tx.clone(),
             carried_usage,
+            Some(input.cwd.clone()),
         )
         .await?;
         let provider_session_id = session.provider_session_id.clone();

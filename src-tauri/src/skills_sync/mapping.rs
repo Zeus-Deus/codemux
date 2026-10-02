@@ -127,14 +127,19 @@ impl SkillMapping {
 // ────────────────────────────────────────────────────────────────
 // Disk I/O.
 
-/// Default mapping file location.
-/// `~/.codemux/sync/skills-mapping.json` — separate from the
+/// Mapping file for one account:
+/// `~/.codemux/sync/skills-mapping-<account>.json` — separate from the
 /// skills payload directory so a "rm -rf ~/.codemux/skills" wipe
-/// doesn't take the mapping with it (the user might want to
-/// re-pull on a fresh skills/ dir without re-creating every
-/// skill).
-pub fn default_mapping_path(home: &Path) -> PathBuf {
-    home.join(".codemux/sync/skills-mapping.json")
+/// doesn't take the mapping with it. Remote ids belong to an account,
+/// so each account gets its own file: a shared file let the dev and
+/// release builds (signed into different accounts) drop each other's
+/// entries on every sync, and each re-created its skills as new rows.
+pub fn account_mapping_path(home: &Path, account_id: &str) -> PathBuf {
+    let account: String = account_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    home.join(format!(".codemux/sync/skills-mapping-{account}.json"))
 }
 
 /// Read the mapping file. Missing file → fresh empty mapping.
@@ -190,7 +195,9 @@ pub fn save_mapping(path: &Path, mapping: &SkillMapping) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(mapping)
         .map_err(|e| format!("serialize mapping: {e}"))?;
 
-    let tmp = path.with_extension("tmp");
+    // Per-process tmp name: two Codemux processes saving at once must
+    // not interleave their bytes into one file.
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&tmp, &json).map_err(|e| format!("write tmp mapping: {e}"))?;
     fs::rename(&tmp, path).map_err(|e| format!("rename mapping: {e}"))?;
     Ok(())
@@ -396,9 +403,8 @@ mod tests {
         m.upsert(entry("1", "x", &PathBuf::from("/p")));
         save_mapping(&p, &m).unwrap();
 
-        let tmp = p.with_extension("tmp");
-        assert!(!tmp.exists(), "tmp should be consumed by rename");
-        assert!(p.exists());
+        let files: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(files, vec![std::ffi::OsString::from("m.json")], "tmp should be consumed by rename");
     }
 
     #[test]

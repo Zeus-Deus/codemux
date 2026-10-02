@@ -1718,6 +1718,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const skillSelection = resolveSkillSelection(
         rawText,
         skillsForProvider(skillsRegistry, provider),
+        selectProviderCommands(provider, cwd, threadId)(useProviderCommandsStore.getState()).commands,
       );
       // Snapshot staged attachments AT submit time so the block we
       // inject reflects exactly what the user has staged. Reading from
@@ -1761,6 +1762,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         effort,
         null,
         attachmentBlock,
+        selectProviderCommands(provider, cwd, threadId)(useProviderCommandsStore.getState()).commands,
       );
       // Optimistic append carries a client nonce so a `turn_queued`
       // event can reconcile THIS exact bubble (grey it out) instead of
@@ -3664,15 +3666,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     threadId ? (s.threads[threadId]?.goal ?? null) : null,
   );
   const providerCommands = useProviderCommandsStore(
-    useMemo(() => selectProviderCommands(provider, cwd), [provider, cwd]),
+    useMemo(() => selectProviderCommands(provider, cwd, threadId), [provider, cwd, threadId]),
   ).commands;
   const loadProviderCommands = useProviderCommandsStore((s) => s.loadCommands);
   const hasGoal = storedGoal !== null;
   useEffect(() => {
     // Resume's phrase depends on whether the provider has its own `/goal`;
     // otherwise the command list only loads when the slash popup opens.
-    if (conversationWritable && hasGoal) void loadProviderCommands(provider, cwd);
-  }, [conversationWritable, hasGoal, provider, cwd, loadProviderCommands]);
+    if (conversationWritable && hasGoal) void loadProviderCommands(provider, cwd, false, threadId);
+  }, [conversationWritable, hasGoal, provider, cwd, threadId, loadProviderCommands]);
   const [messageJumpRequest, setMessageJumpRequest] = useState<{
     itemId: string;
     turnId?: string | null;

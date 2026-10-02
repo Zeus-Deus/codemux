@@ -70,7 +70,10 @@ impl SkillInventoryService {
 
         let mut inventory = filesystem_inventory(canonical_cwd.as_deref(), include_plugins);
 
-        if let Some(cwd) = canonical_cwd.as_deref() {
+        // Home needs native catalogues too: built-in and plugin skills may
+        // have no portable filesystem entry in the scanned user roots.
+        let catalogue_cwd = canonical_cwd.clone().or_else(dirs::home_dir);
+        if let Some(cwd) = catalogue_cwd.as_deref() {
             let codex = harvest_codex_catalog(cwd);
             let opencode = async {
                 match opencode_manager {
@@ -397,34 +400,37 @@ async fn harvest_codex_catalog(cwd: &Path) -> Result<(Vec<Skill>, Vec<String>), 
     .await
     .map_err(|error| format!("codex_skills_spawn_failed: {error}"))?;
     let child = Arc::new(child);
-    let init = serde_json::to_value(InitializeParams {
-        client_info: ClientInfo {
-            name: "codemux-skill-inventory".into(),
-            title: "Codemux".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-        },
-        capabilities: Capabilities {
-            experimental_api: true,
-        },
-    })
-    .map_err(|error| format!("codex_skills_initialize_serialize: {error}"))?;
-    child
-        .request("initialize", init)
-        .await
-        .map_err(|error| format!("codex_skills_initialize_failed: {error}"))?;
-    child
-        .notify("initialized", json!({}))
-        .await
-        .map_err(|error| format!("codex_skills_initialized_failed: {error}"))?;
-    let response = child
-        .request(
-            "skills/list",
-            json!({ "cwds": [cwd.to_string_lossy()], "forceReload": false }),
-        )
-        .await
-        .map_err(|error| format!("codex_skills_list_failed: {error}"))?;
+    let result = async {
+        let init = serde_json::to_value(InitializeParams {
+            client_info: ClientInfo {
+                name: "codemux-skill-inventory".into(),
+                title: "Codemux".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            capabilities: Capabilities {
+                experimental_api: true,
+            },
+        })
+        .map_err(|error| format!("codex_skills_initialize_serialize: {error}"))?;
+        child
+            .request("initialize", init)
+            .await
+            .map_err(|error| format!("codex_skills_initialize_failed: {error}"))?;
+        child
+            .notify("initialized", json!({}))
+            .await
+            .map_err(|error| format!("codex_skills_initialized_failed: {error}"))?;
+        let response = child
+            .request(
+                "skills/list",
+                json!({ "cwds": [cwd.to_string_lossy()], "forceReload": false }),
+            )
+            .await
+            .map_err(|error| format!("codex_skills_list_failed: {error}"))?;
+        Ok(parse_codex_catalog(response))
+    }.await;
     let _ = child.shutdown().await;
-    Ok(parse_codex_catalog(response))
+    result
 }
 
 fn parse_codex_catalog(value: Value) -> (Vec<Skill>, Vec<String>) {

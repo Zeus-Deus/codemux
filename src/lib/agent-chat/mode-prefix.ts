@@ -14,6 +14,8 @@
  * idempotency guarantees in `applyClaudePromptEffortPrefix`).
  */
 
+import { buildCommandRegistry, parseLeadingCommand } from "./command-tokens";
+
 import type { ChatMode } from "@/stores/agent-chat-store";
 
 import {
@@ -116,7 +118,15 @@ export function applyAllPrefixes(
   effort: string | null | undefined,
   stagedSkillBody?: string | null,
   attachmentBlock?: string | null,
+  providerCommands: readonly { name: string }[] = [],
 ): string {
+  // A leading slash belongs to the provider command parser. Prefixing a
+  // wrapper would silently turn /compact or a custom command into prose.
+  // Skills have already been removed by exact-id resolution at this point.
+  if (parseLeadingCommand(text, buildCommandRegistry([], providerCommands)) && !stagedSkillBody) {
+    const context = attachmentBlock?.trim();
+    return context ? `${text.trim()}\n\n${context}` : text.trim();
+  }
   const base = effort === "ultrathink" ? stripClaudeUltrathinkPrefix(text) : text;
   const withAttachments = applyAttachmentPrefix(base, attachmentBlock);
   const withSkill = applySkillPrefix(withAttachments, stagedSkillBody);
