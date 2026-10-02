@@ -40,6 +40,7 @@ describe("chat-draft-store", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       expect(draft.target).toEqual({ kind: "home" });
       expect(draft.provider).toBe("claude");
+      expect(draft.checkoutMode).toBe("worktree");
       expect(draft.permissionMode).toBe("bypassPermissions");
       // Default model is seeded so capability-dependent pickers
       // (Effort, ContextWindow) render on first paint. In the test
@@ -152,6 +153,7 @@ describe("chat-draft-store", () => {
       const project = useChatDraftStore.getState().getOrCreateProjectDraft("/x");
       expect(home.draftId).not.toBe(project.draftId);
       expect(project.target).toEqual({ kind: "project", projectPath: "/x" });
+      expect(project.checkoutMode).toBe("worktree");
     });
 
     it("preserves an invested project draft and remaps the project slot", () => {

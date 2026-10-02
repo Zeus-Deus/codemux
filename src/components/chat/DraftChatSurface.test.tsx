@@ -607,7 +607,7 @@ describe("DraftChatSurface", () => {
       expect(stub.dataset.projectPath).toBe("/projects/foo");
       // checkoutMode / baseBranch default from `makeDraft` — the row
       // reads them straight off the draft, no local component state.
-      expect(stub.dataset.checkoutMode).toBe("current");
+      expect(stub.dataset.checkoutMode).toBe("worktree");
       expect(stub.dataset.baseBranch).toBe("");
     });
 
@@ -1114,16 +1114,16 @@ describe("DraftChatSurface", () => {
       });
     });
 
-    it("onChangeCheckoutMode('worktree') flips the draft's checkoutMode", () => {
+    it("onChangeCheckoutMode('current') overrides the default worktree mode", () => {
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastThreadScopeRowProps.current!.checkoutMode).toBe("current");
-      lastThreadScopeRowProps.current!.onChangeCheckoutMode("worktree");
+      expect(lastThreadScopeRowProps.current!.checkoutMode).toBe("worktree");
+      lastThreadScopeRowProps.current!.onChangeCheckoutMode("current");
       const next = useChatDraftStore.getState().draftsById[draft.draftId];
-      expect(next.checkoutMode).toBe("worktree");
+      expect(next.checkoutMode).toBe("current");
     });
 
     it("onChangeWorktreeName / onChangeBaseBranch persist onto the draft", () => {
@@ -1210,7 +1210,7 @@ describe("DraftChatSurface", () => {
   });
 
   describe("Thread Scope redesign — deferred worktree creation on submit", () => {
-    it("checkoutMode 'worktree' passes the resolved project path through to materializeAndSend", async () => {
+    it("a new project chat defaults to creating a worktree on submit", async () => {
       vi.mocked(materializeAndSend).mockResolvedValueOnce({
         success: true,
         workspaceId: "ws-worktree",
@@ -1221,9 +1221,6 @@ describe("DraftChatSurface", () => {
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
-      useChatDraftStore
-        .getState()
-        .updateDraftConfig(draft.draftId, { checkoutMode: "worktree" });
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { container } = renderSurface();
       const ta = container.querySelector("textarea") as HTMLTextAreaElement;
@@ -1237,7 +1234,7 @@ describe("DraftChatSurface", () => {
       expect(call[8]).toBe("/projects/foo");
     });
 
-    it("checkoutMode 'current' (the default) passes null as the worktree project path", async () => {
+    it("explicitly selecting the current checkout skips worktree creation on submit", async () => {
       vi.mocked(materializeAndSend).mockResolvedValueOnce({
         success: true,
         workspaceId: "ws-project",
@@ -1248,6 +1245,9 @@ describe("DraftChatSurface", () => {
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
+      useChatDraftStore
+        .getState()
+        .updateDraftConfig(draft.draftId, { checkoutMode: "current" });
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { container } = renderSurface();
       const ta = container.querySelector("textarea") as HTMLTextAreaElement;
