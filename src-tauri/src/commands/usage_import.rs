@@ -34,7 +34,8 @@ use crate::database::{DatabaseStore, ProviderUsageCacheRow};
 /// | 1 | initial import (implicit — installs predating this constant) |
 /// | 2 | per-turn Codex, Claude cache TTLs, corrected model prices |
 /// | 3 | provider history authoritative where available; growing rows upsert; OpenCode imported |
-pub const IMPORT_VERSION: i64 = 3;
+/// | 4 | October 2026 prices; verified model ids; preserve identical Codex requests when totals grow |
+pub const IMPORT_VERSION: i64 = 4;
 
 /// Settings key holding the [`IMPORT_VERSION`] the current rows were
 /// produced by.
@@ -335,10 +336,10 @@ pub fn parse_codex_rollout(lines: impl Iterator<Item = String>) -> Vec<ImportedR
     let mut model: Option<String> = None;
     let mut rows: Vec<ImportedRow> = Vec::new();
     let mut turn_index: usize = 0;
-    // Consecutive-duplicate guard: an identical `last_token_usage` in
-    // two adjacent events is a re-send, not a second turn whose token
-    // counts coincided to the token.
-    let mut previous_delta: Option<ImportedUsage> = None;
+    // A repeated last-request count is only a re-send when the cumulative
+    // total also repeats. Two real requests can have identical token counts.
+    // Older logs without totals retain the last-request-only duplicate guard.
+    let mut previous_observation: Option<(ImportedUsage, Option<ImportedUsage>)> = None;
 
     // Fallback state, used only when the file has no `last_token_usage`.
     let mut best = ImportedUsage::default();
@@ -407,10 +408,12 @@ pub fn parse_codex_rollout(lines: impl Iterator<Item = String>) -> Vec<ImportedR
 
                 if let Some(delta) = info.get("last_token_usage").map(split_from_codex_usage) {
                     saw_delta = true;
-                    if delta.is_empty() || previous_delta == Some(delta) {
+                    let total = info.get("total_token_usage").map(split_from_codex_usage);
+                    let observation = (delta, total);
+                    if delta.is_empty() || previous_observation == Some(observation) {
                         continue;
                     }
-                    previous_delta = Some(delta);
+                    previous_observation = Some(observation);
                     let Some(session) = session_id.as_deref() else {
                         // A `token_count` before the session meta has no
                         // id to key on. Dropping it (rather than keying
@@ -1255,8 +1258,7 @@ mod tests {
         );
     }
 
-    /// An identical `last_token_usage` in two adjacent events is a
-    /// re-send, not a second turn that coincided to the token.
+    /// Logs without cumulative counters retain last-request deduplication.
     #[test]
     fn codex_suppresses_consecutive_duplicate_deltas() {
         let repeated = r#"
@@ -1417,6 +1419,20 @@ mod tests {
         assert_eq!(rows[0].reported_cost_usd, Some(0.75));
     }
 
+    #[test]
+    fn codex_identical_requests_count_when_cumulative_usage_grows() {
+        let raw = r#"{"type":"session_meta","payload":{"id":"s"}}
+{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+{"timestamp":"2026-10-01T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10},"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}
+{"timestamp":"2026-10-01T12:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10},"total_token_usage":{"input_tokens":200,"output_tokens":20}}}}
+{"timestamp":"2026-10-01T12:01:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10},"total_token_usage":{"input_tokens":200,"output_tokens":20}}}}"#;
+        let rows = parse_codex_rollout(lines(raw));
+        assert_eq!(rows.len(), 2, "two requests, followed by one duplicate event");
+        assert_eq!(rows.iter().map(|row| row.usage.input).sum::<i64>(), 200);
+        assert_eq!(rows.iter().map(|row| row.usage.output).sum::<i64>(), 20);
+        assert_ne!(rows[0].import_key, rows[1].import_key);
+    }
+
     // ── importer versioning ──
 
     fn seeded_db() -> DatabaseStore {
@@ -1460,6 +1476,55 @@ mod tests {
             db.usage_import_state("/logs/a.jsonl").unwrap().is_none(),
             "file state goes too, or the rebuild scan skips everything"
         );
+    }
+
+    #[test]
+    fn october_price_update_rebuilds_old_costs_and_preserves_reported_costs() {
+        let db = seeded_db();
+        db.set_setting(IMPORT_VERSION_KEY, "3").unwrap();
+        assert!(purge_if_importer_changed(&db).unwrap());
+        assert!(db.usage_import_state("/logs/a.jsonl").unwrap().is_none());
+
+        let mut rows = parse_claude_transcript(lines(
+            r#"{"type":"assistant","sessionId":"s","timestamp":"2026-10-01T12:00:00Z","message":{"id":"m","model":"claude-opus-5-5","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1000000}}}"#,
+        ));
+        rows.extend(parse_codex_rollout(lines(
+            r#"{"type":"session_meta","payload":{"id":"c"}}
+{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+{"timestamp":"2026-10-01T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000000,"cached_input_tokens":1000000,"output_tokens":0}}}}"#,
+        )));
+        rows.push(
+            parse_opencode_message(
+                &serde_json::json!({
+                    "id": "o", "role": "assistant", "modelID": "gpt-6.1-sol",
+                    "providerID": "openai", "tokens": {"input": 1000000}, "cost": 7.25
+                }),
+                "o",
+                "o",
+                1_800_000_000_000,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut report = UsageImportReport::default();
+        materialize_rows(&db, rows, &mut report, &mut HashSet::new()).unwrap();
+        assert_eq!(report.rows_updated, 3);
+        let rows = db.usage_rows_since(0).unwrap();
+        let claude = rows
+            .iter()
+            .find(|row| row.provider == "claude")
+            .unwrap();
+        assert_eq!(claude.cost_usd, Some(0.20));
+        assert_eq!(claude.cost_source.as_deref(), Some("table"));
+        let codex = rows.iter().find(|row| row.provider == "codex").unwrap();
+        assert_eq!(codex.cost_usd, Some(0.10));
+        assert_eq!(codex.cost_source.as_deref(), Some("table"));
+        let opencode = rows
+            .iter()
+            .find(|row| row.provider == "opencode")
+            .unwrap();
+        assert_eq!(opencode.cost_usd, Some(7.25));
+        assert_eq!(opencode.cost_source.as_deref(), Some("provider"));
     }
 
     /// The purge must not repeat once the version is recorded, or every
