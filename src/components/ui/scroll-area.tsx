@@ -5,6 +5,30 @@ import { ScrollArea as ScrollAreaPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 
+// Radix's viewport renders an inline <style>, and React 19 reassigns its
+// innerHTML on every viewport render. WebKitGTK re-parses even an identical
+// stylesheet and recalculates style for the whole page (~100 ms per render
+// with a long chat open), so skip writes that would not change anything.
+const innerHTML =
+  typeof HTMLStyleElement === "undefined"
+    ? undefined
+    : Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML")
+if (
+  innerHTML?.get &&
+  innerHTML.set &&
+  !Object.prototype.hasOwnProperty.call(HTMLStyleElement.prototype, "innerHTML")
+) {
+  const { get, set } = innerHTML
+  Object.defineProperty(HTMLStyleElement.prototype, "innerHTML", {
+    configurable: true,
+    enumerable: innerHTML.enumerable,
+    get,
+    set(this: HTMLStyleElement, value: string) {
+      if (get.call(this) !== String(value)) set.call(this, value)
+    },
+  })
+}
+
 function ScrollArea({
   className,
   children,
