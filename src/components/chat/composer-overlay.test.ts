@@ -46,9 +46,13 @@ describe("isReadingBack", () => {
 });
 
 describe("COMPOSER_OVERLAY_CARD", () => {
-  it("clears the full floating title band outside the scroller in either renderer", () => {
+  it("runs the transcript under the floating title band, edge to edge", () => {
+    // The band's control groups lift onto their own plates instead; jump and
+    // send targets add the band height (see transcript-top-inset.ts).
     const bandRule = stylesheet.match(/\[data-under-titlebar="true"\] \[data-transcript-edge-fade\]\s*\{([^}]+)\}/)?.[1];
-    expect(bandRule).toContain("padding-top: 40px");
+    expect(bandRule).not.toContain("padding-top");
+    // Sharp to the window edge: no top fade behind the band.
+    expect(bandRule).toContain("--transcript-top-fade: 0px");
   });
   it("keeps docked controls opaque while reading history, including without a mask", () => {
     const cardRule = stylesheet.match(/\.composer-overlay-card\s*\{([^}]+)\}/)?.[1];

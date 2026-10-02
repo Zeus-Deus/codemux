@@ -65,6 +65,7 @@ import {
 } from "./transcript-derivations";
 import { CHAT_COLUMN } from "./chat-column";
 import { isReadingBack } from "./composer-overlay";
+import { useTranscriptTopInset } from "./transcript-top-inset";
 import {
   subscribeTranscriptFade,
   transcriptFadeEnabled,
@@ -320,6 +321,14 @@ export const MessageList = memo(function MessageList({
     !tailIsWorkingActivity;
 
   const listRef = useRef<LegendListRef | null>(null);
+  // Chrome floating over the viewport's top edge (the titlebar band for a
+  // lone chat). Rows the reader asked to see are parked below it. Mirrored
+  // into a ref so the scroll callbacks read the live value without being
+  // re-created when a split toggles it.
+  const topInset = useTranscriptTopInset();
+  const sendAnchorOffset = SEND_ANCHOR_OFFSET + topInset;
+  const topInsetRef = useRef(topInset);
+  topInsetRef.current = topInset;
   const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
 
   // -------------------------------------------------------------------------
@@ -705,7 +714,7 @@ export const MessageList = memo(function MessageList({
               index: anchorIndexRef.current ?? targetIndex,
               animated,
               viewPosition: 0,
-              viewOffset: SEND_ANCHOR_OFFSET,
+              viewOffset: SEND_ANCHOR_OFFSET + topInsetRef.current,
             });
 
           const animated = !prefersReducedMotion();
@@ -751,7 +760,11 @@ export const MessageList = memo(function MessageList({
              *  bounds the wait, and it lands on the target authoritatively. */
             const onScrollEnd = () => {
               if (finished) return;
-              if (!landedOnAnchorTarget(listRef.current, anchorIndexRef.current ?? targetIndex)) {
+              if (!landedOnAnchorTarget(
+                  listRef.current,
+                  anchorIndexRef.current ?? targetIndex,
+                  SEND_ANCHOR_OFFSET + topInsetRef.current,
+                )) {
                 // Not our glide (or not there yet) — keep listening.
                 viewport?.addEventListener("scrollend", onScrollEnd, {
                   once: true,
@@ -895,11 +908,17 @@ export const MessageList = memo(function MessageList({
     if (anchorIndex === null) return undefined;
     return {
       anchorIndex,
-      anchorOffset: SEND_ANCHOR_OFFSET,
+      anchorOffset: sendAnchorOffset,
       onReady: handleAnchorReady,
       onSizeChanged: handleAnchorSizeChanged,
     };
-  }, [anchorClientNonce, handleAnchorReady, handleAnchorSizeChanged, slots]);
+  }, [
+    anchorClientNonce,
+    handleAnchorReady,
+    handleAnchorSizeChanged,
+    sendAnchorOffset,
+    slots,
+  ]);
 
   // The advance decision. Re-assigned every render so the scheduler always
   // runs the latest closure (the accepted mutable-ref pattern used for the
@@ -923,7 +942,11 @@ export const MessageList = memo(function MessageList({
       const anchorIndex = anchorIndexRef.current;
       // Not measured yet — `onReady` owns the first positioning.
       if (anchorIndex === null) return;
-      const metrics = getAnchoredTurnMetrics({ state, anchorIndex });
+      const metrics = getAnchoredTurnMetrics({
+        state,
+        anchorIndex,
+        anchorOffset: sendAnchorOffset,
+      });
       if (!metrics || metrics.scrollDeltaToRevealEnd <= 1) return;
       void list.scrollToOffset({
         offset: state.scroll + metrics.scrollDeltaToRevealEnd,
@@ -941,7 +964,7 @@ export const MessageList = memo(function MessageList({
       return;
     }
     // Without this the reserved blank space would be a scroll target.
-    if (!realContentOverflowsViewport(state)) return;
+    if (!realContentOverflowsViewport(state, sendAnchorOffset)) return;
     void list.scrollToEnd({ animated: false });
   };
 
@@ -1080,7 +1103,7 @@ export const MessageList = memo(function MessageList({
         index: subagentTargetIndex,
         animated: false,
         viewPosition: 0,
-        viewOffset: 16,
+        viewOffset: 16 + topInsetRef.current,
       })
       .then(() => {
         if (cancelled) return;
@@ -1124,7 +1147,7 @@ export const MessageList = memo(function MessageList({
         index: conversationSearchTargetIndex,
         animated: !prefersReducedMotion(),
         viewPosition: 0,
-        viewOffset: 28,
+        viewOffset: 28 + topInsetRef.current,
       })
       .then(() => {
         if (cancelled) return;
@@ -1181,7 +1204,7 @@ export const MessageList = memo(function MessageList({
         index: messageJumpTargetIndex,
         animated: !prefersReducedMotion(),
         viewPosition: 0,
-        viewOffset: 28,
+        viewOffset: 28 + topInsetRef.current,
       })
       .then(() => {
         if (cancelled) return;
@@ -1266,11 +1289,13 @@ export const MessageList = memo(function MessageList({
   // when this prop changes, so it must not be rebuilt on unrelated renders.
   const listHeader = useMemo(
     () => (
-      <div className={cn(CHAT_COLUMN, "pt-[26px]")}>
+      // The top of the thread starts clear of any chrome floating over the
+      // viewport; scrolling then carries it underneath.
+      <div className={CHAT_COLUMN} style={{ paddingTop: 26 + topInset }}>
         <SessionStartMarker startedAt={sessionStartedAt} />
       </div>
     ),
-    [sessionStartedAt],
+    [sessionStartedAt, topInset],
   );
 
   // The composer region is an overlay pinned to the bottom of the pane, so
@@ -1314,7 +1339,9 @@ export const MessageList = memo(function MessageList({
         data-transcript-edge-fade={fadeEnabled ? "on" : "off"}
         data-provider={provider ?? undefined}
       >
-      {!mobile && <MessageTrail slots={slots} listRef={listRef} />}
+      {!mobile && (
+        <MessageTrail slots={slots} listRef={listRef} topInset={topInset} />
+      )}
       <LegendList<TranscriptSlot>
         ref={listRef}
         data={slots}
@@ -1420,10 +1447,11 @@ const SEND_ANCHOR_SETTLE_TOLERANCE_PX = 4;
 function landedOnAnchorTarget(
   list: LegendListRef | null,
   anchorIndex: number,
+  anchorOffset: number,
 ): boolean {
   if (!list) return true;
   const state = list.getState();
-  const target = getSendAnchorTargetOffset(state, anchorIndex);
+  const target = getSendAnchorTargetOffset(state, anchorIndex, anchorOffset);
   if (target === null) return true;
   const node = list.getScrollableNode();
   const maxScroll =
@@ -1482,7 +1510,7 @@ function slotClientNonce(slot: TranscriptSlot): string | null {
  *  sized to stop short of the bar; layer 2 is an opaque strip over the bar's
  *  own column (layers composite additively, so the strip wins there). */
 const WS_FADE_MASK_IMAGE =
-  "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - var(--composer-overlay-height, 0px) - 28px), transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)), linear-gradient(#000, #000)";
+  "linear-gradient(to bottom, transparent 0, #000 var(--transcript-top-fade, 26px), #000 calc(100% - var(--composer-overlay-height, 0px) - 28px), transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)), linear-gradient(#000, #000)";
 const WS_FADE_MASK_SIZE =
   "calc(100% - var(--transcript-sbw, 0px)) 100%, var(--transcript-sbw, 0px) 100%";
 const WS_FADE_MASK_POSITION = "left top, right top";

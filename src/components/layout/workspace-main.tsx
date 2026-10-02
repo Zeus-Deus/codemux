@@ -16,6 +16,8 @@ import { TabBar } from "./tab-bar";
 import { PresetBar } from "./preset-bar";
 import { PaneContainer } from "./pane-container";
 import { WorkspaceTranscriptCache } from "@/components/chat/workspace-transcript-cache";
+import { TranscriptTopInsetContext } from "@/components/chat/transcript-top-inset";
+import { TITLEBAR_BAND_HEIGHT } from "@/lib/titlebar-geometry";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { cn } from "@/lib/utils";
@@ -331,6 +333,7 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
     (surface) => surface.surface_id === activeTab?.surface_id,
   );
   const isSoleRootChat = activeSurface?.root.kind === "agent_chat";
+  const underTitlebar = enableAgentChat && !mobile && isSoleRootChat;
 
   return (
     <div
@@ -362,14 +365,17 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
           // A lone chat runs its transcript under the floating titlebar;
           // fixed rows at the pane's top (the subagent breadcrumb) read
           // this to start below the band instead.
-          data-under-titlebar={
-            enableAgentChat && !mobile && isSoleRootChat ? "true" : undefined
-          }
+          data-under-titlebar={underTitlebar ? "true" : undefined}
           className={cn(
             "flex-1 min-h-0 overflow-hidden",
             enableAgentChat && !mobile && !isSoleRootChat && "pt-10",
           )}
         >
+          {/* Must wrap the cache: retained transcripts are portalled from
+              its provider, so that is where they read context from. */}
+          <TranscriptTopInsetContext.Provider
+            value={underTitlebar ? TITLEBAR_BAND_HEIGHT : 0}
+          >
           <WorkspaceTranscriptCache workspace={activeWorkspace} enabled={enableAgentChat}>
           {activeTab?.kind === "diff" ? (
             <LazyBoundary label="diff" className="h-full">
@@ -386,6 +392,7 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
             <PaneContainer workspace={activeWorkspace} />
           )}
           </WorkspaceTranscriptCache>
+          </TranscriptTopInsetContext.Provider>
         </div>
       </div>
 

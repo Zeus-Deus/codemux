@@ -402,82 +402,55 @@
   transition: opacity 0.1s ease;
 }
 
-/* The GUI titlebar remains fully transparent by default. When runtime
- * geometry says its controls physically intersect the centered chat column
- * AND that transcript has scrolled underneath, each control run lights a
- * soft wash of the window background behind itself.
+/* The GUI titlebar is frameless by default and the transcript scrolls under
+ * it edge to edge, the same way it scrolls under the docked composer. When
+ * runtime geometry says a control group physically sits over the centred
+ * chat column AND transcript text has scrolled underneath, that group (and
+ * only that group) lifts onto a plate in the composer's surface language:
+ * the same muted tint, hairline border and deep low shadow, as a stadium.
+ * Between the groups the text keeps running clear to the top edge.
  *
- * A wash, not a plate: there is no rectangle, no border and no shadow, so
- * nothing reads as a floating card sitting on the conversation — the light
- * just fades out until the transcript is untouched. Crucially each island
- * lights only its own neighbourhood, so between the two runs the transcript
- * still runs clean to the very top edge; there is no full-width layer
- * anywhere in this treatment.
- *
- * The fade is a mask on a flat fill rather than a gradient background: a
- * mask reaches alpha 0 exactly at the box edge, so the box can never clip
- * the fade into a visible straight line, and the solid area stays pinned
- * under the controls regardless of the island's width. */
-.titlebar-overlap-wash {
-  /* Positioning context + own stacking context, so the z-index: -1 wash
-     below tucks under this island's controls without falling behind the
-     app background painted by an ancestor. */
+ * Islands draw the plate as a ::before so it never takes part in layout;
+ * the corner cluster draws it on a dedicated `.titlebar-plate` layer
+ * because its controls are positioned separately (see title-bar.tsx). */
+.titlebar-island {
+  /* Positioning context + own stacking context, so the z-index: -1 plate
+     tucks under this island's controls without falling behind the app
+     background painted by an ancestor. */
   position: relative;
   isolation: isolate;
 }
 
-.titlebar-overlap-wash::before {
+.titlebar-island::before,
+.titlebar-plate {
+  pointer-events: none;
+  border-radius: 9999px;
+  border: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+  background-color: color-mix(in oklab, var(--muted) 40%, var(--background));
+  box-shadow: 0 12px 28px -18px oklch(0 0 0 / 0.4);
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+/* Islands are 32px tall; the plate breathes 2px above and below and 4px at
+   each end, matching the corner plate. */
+.titlebar-island::before {
   content: "";
   position: absolute;
   z-index: -1;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 120ms ease-out;
-  /* Both islands are 32px tall inset 4px from the top of the 40px band, so
-     -4px pins the wash to the physical top of the window. It stays solid
-     down to the bottom of the 40px band and feathers out over the next 28px. */
-  top: -4px;
-  height: 68px;
-  background: var(--background);
-  -webkit-mask-composite: source-in;
-  mask-composite: intersect;
+  inset: -2px -4px;
 }
 
-/* Tab run. The left edge stops at the sidebar (-6px is the band's inset
-   from it), mirroring how the action run stops at the open panel: nothing
-   paints over the sidebar or its floating toggle, and a solid edge flush
-   against the sidebar shows no seam. Only the right side feathers, over a
-   40px spill, so the whole island sits on solid background. */
-.titlebar-overlap-wash-start::before {
-  left: -6px;
-  right: -40px;
-  -webkit-mask-image:
-    linear-gradient(to left, transparent, #000 40px),
-    linear-gradient(to bottom, #000 40px, transparent);
-  mask-image:
-    linear-gradient(to left, transparent, #000 40px),
-    linear-gradient(to bottom, #000 40px, transparent);
-}
-
-/* Action run. Extended out to the window's right edge (`--wash-right-extend`
-   is set inline from the title bar and equals the band's own right inset),
-   so the panel toggle and the native window buttons sit in the same light as
-   the actions themselves instead of being stranded on bare transcript. That
-   side meets the window (or the open panel's own background), so only the
-   left side feathers. */
-.titlebar-overlap-wash-end::before {
-  left: -40px;
-  right: calc(-1 * var(--wash-right-extend, 28px));
-  -webkit-mask-image:
-    linear-gradient(to right, transparent, #000 40px),
-    linear-gradient(to bottom, #000 40px, transparent);
-  mask-image:
-    linear-gradient(to right, transparent, #000 40px),
-    linear-gradient(to bottom, #000 40px, transparent);
-}
-
-[data-chat-overlap="true"] .titlebar-overlap-wash::before {
+.titlebar-island[data-raised="true"]::before,
+.titlebar-plate[data-raised="true"] {
   opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .titlebar-island::before,
+  .titlebar-plate {
+    transition-duration: 0ms;
+  }
 }
 
 /* Terminal lifecycle overlay (starting / migrating / failed). Opacity is
@@ -1286,12 +1259,11 @@ body.pane-resizing iframe {
   }
 }
 
-/* Keep the floating title band's 40px OUTSIDE the scrolling viewport in
- * either renderer. Enlarging only the mask would hide sends/history jumps
- * at their established top offsets. Scroll-content padding would disappear
- * on scroll. Split/mobile/legacy panes already have in-flow chrome. */
+/* A lone chat runs its transcript under the floating titlebar, edge to edge.
+ * Its control groups lift onto their own plates, so the text between them
+ * stays sharp to the window edge instead of half-fading behind the band. */
 [data-under-titlebar="true"] [data-transcript-edge-fade] {
-  padding-top: 40px;
+  --transcript-top-fade: 0px;
 }
 
 /* Docked controls stay opaque even when the edge mask is disabled. Mask the

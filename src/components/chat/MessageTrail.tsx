@@ -54,24 +54,29 @@ const CARD_EST_H = 96;
 export const MessageTrail = memo(function MessageTrail({
   slots,
   listRef,
+  topInset = 0,
 }: {
   slots: TranscriptSlot[];
   listRef: React.RefObject<LegendListRef | null>;
+  /** Chrome floating over the viewport's top edge; jumps land below it. */
+  topInset?: number;
 }) {
   const entries = useMemo(() => buildTrailEntries(slots), [slots]);
 
   if (entries.length < TRAIL_MIN_TURNS) return null;
   return (
-    <TrailRail entries={entries} listRef={listRef} />
+    <TrailRail entries={entries} listRef={listRef} topInset={topInset} />
   );
 });
 
 const TrailRail = memo(function TrailRail({
   entries,
   listRef,
+  topInset,
 }: {
   entries: TrailEntry[];
   listRef: React.RefObject<LegendListRef | null>;
+  topInset: number;
 }) {
   const railRef = useRef<HTMLElement | null>(null);
   const tickRefs = useRef(new Map<number, HTMLSpanElement>());
@@ -234,10 +239,10 @@ const TrailRail = memo(function TrailRail({
         index: slotIndex,
         animated: false,
         viewPosition: 0,
-        viewOffset: SCROLL_MARGIN_PX,
+        viewOffset: SCROLL_MARGIN_PX + topInset,
       });
     },
-    [listRef],
+    [listRef, topInset],
   );
 
   const hoveredEntry = hovered ? entries[hovered.entryIndex] : null;

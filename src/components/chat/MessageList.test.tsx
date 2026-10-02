@@ -35,6 +35,7 @@ import {
   setRendererMode,
 } from "./transcript-fade";
 import { MessageList } from "./MessageList";
+import { TranscriptTopInsetContext } from "./transcript-top-inset";
 
 // The assistant-turn avatar renders the provider's branded mark via
 // ProviderLogo, which imports the SVG assets at module load. vitest's
@@ -2275,19 +2276,32 @@ describe("MessageList viewport edge fade", () => {
     render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
     const style = lastListProps.current?.style as Record<string, string>;
     for (const key of ["maskImage", "WebkitMaskImage"] as const) {
-      expect(style[key]).toContain("transparent 0, #000 26px");
+      expect(style[key]).toContain("transparent 0, #000 var(--transcript-top-fade, 26px)");
       expect(style[key]).toContain("#000 calc(100% - var(--composer-overlay-height, 0px) - 28px)");
       expect(style[key]).toContain("transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)");
     }
     const header = lastListProps.current?.ListHeaderComponent;
-    expect(header.props.className).toContain("pt-[26px]");
+    expect(header.props.style).toEqual({ paddingTop: 26 });
   });
   it("reserves titlebar space outside the scroller when the renderer disables masks", () => {
     setRendererMode("compatibility");
     render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
     expect(lastListProps.current?.style).toBeUndefined();
     expect(document.querySelector('[data-transcript-edge-fade="off"]')).not.toBeNull();
-    expect(lastListProps.current?.ListHeaderComponent.props.className).toContain("pt-[26px]");
+    expect(lastListProps.current?.ListHeaderComponent.props.style).toEqual({ paddingTop: 26 });
+  });
+  it("parks the thread top and jump targets below chrome floating over the viewport", () => {
+    // A lone chat runs under the 40px titlebar band. The viewport is not
+    // inset, so the text scrolls underneath; only rows the reader asked to
+    // see are offset clear of it.
+    const message: ChatViewItem = { kind: "user_message", id: "jump-target", seq: 0, text: "Find this prompt" };
+    render(
+      <TranscriptTopInsetContext.Provider value={40}>
+        <MessageList messages={[message]} messageJumpRequest={{ itemId: message.id, nonce: 1 }} {...noopHandlers} />
+      </TranscriptTopInsetContext.Provider>,
+    );
+    expect(scrollToIndexSpy).toHaveBeenCalledWith({ index: 0, animated: true, viewPosition: 0, viewOffset: 68 });
+    expect(lastListProps.current?.ListHeaderComponent.props.style).toEqual({ paddingTop: 66 });
   });
 
   // A mask composites the element's whole rendering, and a scroll container
