@@ -351,6 +351,8 @@ interface Props {
   threadId?: string | null;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
+  /** First-send only: leave the agent running and open a fresh draft. */
+  onBackgroundSubmit?: () => void;
   onStop: () => void;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
@@ -471,6 +473,7 @@ export function Composer({
   threadId = null,
   onDraftChange,
   onSubmit,
+  onBackgroundSubmit,
   onStop,
   onProviderModelChange,
   onModelChange,
@@ -2668,7 +2671,7 @@ export function Composer({
     },
     [],
   );
-  const submit = useCallback(() => {
+  const submit = useCallback((background = false) => {
     if (remoteDisconnected) return;
     const action = allSlashItems.find((item) => item.id.startsWith("composer:") && item.command.toLowerCase() === draft.trim().toLowerCase());
     if (action) {
@@ -2692,8 +2695,9 @@ export function Composer({
       sendHoldTimerRef.current = null;
       setSendHold(false);
     }, SEND_HOLD_MS);
-    onSubmit();
-  }, [onSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems]);
+    if (background && onBackgroundSubmit) onBackgroundSubmit();
+    else onSubmit();
+  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems]);
 
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's
@@ -2754,6 +2758,7 @@ export function Composer({
   });
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (composingRef.current || e.nativeEvent.isComposing) return;
     // Shift+Tab cycles modes regardless of popup state. preventDefault
     // is critical — the browser would otherwise move focus out of the
     // textarea via native tab navigation.
@@ -2837,7 +2842,7 @@ export function Composer({
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (canSubmit) submit();
+      if (canSubmit) submit(e.ctrlKey);
     }
   };
 
@@ -3589,7 +3594,8 @@ export function Composer({
             onEffortChange={onEffortChange}
             onContextWindowChange={onContextWindowChange}
             onFastModeChange={onFastModeChange}
-            onSubmit={submit}
+            onSubmit={() => submit()}
+            onBackgroundSubmit={onBackgroundSubmit ? () => submit(true) : undefined}
             onStop={onStop}
             controlsDisabled={!sessionReady}
             configurationDisabled={!configurationEnabled}
@@ -3614,6 +3620,10 @@ export function Composer({
               ) : showQueueHint ? (
                 <span className="truncate text-label leading-none text-muted-foreground/70">
                   {steeringUnavailable ? "Steer unavailable" : `Enter to ${delivery.delivery}`}
+                </span>
+              ) : onBackgroundSubmit ? (
+                <span className="truncate text-label leading-none text-muted-foreground/70">
+                  Ctrl+Enter to send in background
                 </span>
               ) : null
             }

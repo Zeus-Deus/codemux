@@ -145,6 +145,44 @@ describe("materializeAndSend", () => {
   });
 
   describe("happy path", () => {
+    it.each(["home", "project", "existing_workspace", "worktree"] as const)(
+      "starts a %s draft in the background without selecting workspace or pane",
+      async (kind) => {
+        const actions = makeActions();
+        const draft = makeDraft({
+          target: kind === "home" ? { kind: "home" }
+            : kind === "existing_workspace" ? { kind, workspaceId: "ws-existing" }
+            : { kind: "project", projectPath: "/projects/foo" },
+          checkoutMode: kind === "worktree" ? "worktree" : "current",
+          worktreeName: "background-task",
+        });
+        if (kind === "worktree") {
+          vi.mocked(createWorktreeWorkspaceResult).mockResolvedValueOnce({
+            workspaceId: "ws-worktree", cwd: "/worktrees/background-task", adopted: false,
+          });
+        }
+        const result = await materializeAndSend(draft, "hello", "/home/user", actions,
+          null, null, [], [], kind === "worktree" ? "/projects/foo" : null,
+          undefined, { background: true });
+        expect(result.success).toBe(true);
+        expect(agentChatSendTurn).toHaveBeenCalled();
+        expect(actions.markPromoted).toHaveBeenCalled();
+        expect(activateWorkspace).not.toHaveBeenCalled();
+        expect(agentChatCreatePane).toHaveBeenCalledWith(
+          expect.any(String), "claude", expect.any(String), null, draft.threadId, false,
+        );
+        if (kind === "home" || kind === "project") {
+          expect(createEmptyWorkspace).toHaveBeenCalledWith(expect.any(String),
+            expect.objectContaining({ select: false }));
+        } else if (kind === "worktree") {
+          expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
+            "/projects/foo", "background-task", true, "empty", null,
+            null, null, null, null, { provider: "claude", thread_id: draft.threadId }, false,
+          );
+        }
+      },
+    );
+
     it("creates a fresh workspace at $HOME with a message-derived title for a home draft", async () => {
       const actions = makeActions();
       const draft = makeDraft();

@@ -66,6 +66,7 @@ interface Props {
   onContextWindowChange: (value: string) => void;
   onFastModeChange?: (fastMode: boolean) => void;
   onSubmit: () => void;
+  onBackgroundSubmit?: () => void;
   onStop: () => void;
   controlsDisabled: boolean;
   /** Disables provider/model/runtime configuration without disabling the
@@ -138,6 +139,7 @@ export function ComposerFooter({
   onContextWindowChange,
   onFastModeChange = () => {},
   onSubmit,
+  onBackgroundSubmit,
   onStop,
   controlsDisabled,
   configurationDisabled = controlsDisabled,
@@ -340,7 +342,10 @@ export function ComposerFooter({
         ) : (
           <button
             type="button"
-            onClick={onSubmit}
+            onClick={(e) => {
+              if (e.ctrlKey && onBackgroundSubmit) onBackgroundSubmit();
+              else onSubmit();
+            }}
             disabled={!canSubmit || streaming}
             className={cn(
               ROUND_CONTROL,
@@ -349,7 +354,7 @@ export function ComposerFooter({
               "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
             )}
             aria-label="Send"
-            title="Send"
+            title={onBackgroundSubmit ? "Send (Ctrl+Enter or Ctrl-click to send in background)" : "Send"}
           >
             <ArrowUp className="size-4" />
           </button>

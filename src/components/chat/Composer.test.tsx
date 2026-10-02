@@ -84,6 +84,31 @@ function renderComposer(props: Partial<ComposerProps> = {}) {
 }
 
 describe("Composer", () => {
+  it("uses Ctrl+Enter for background send only when the surface supports it", () => {
+    const onSubmit = vi.fn();
+    const onBackgroundSubmit = vi.fn();
+    const { container, rerender } = renderComposer({ draft: "hello", onSubmit, onBackgroundSubmit });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true, shiftKey: true });
+    expect(onBackgroundSubmit).not.toHaveBeenCalled();
+    fireEvent.compositionStart(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    expect(onBackgroundSubmit).not.toHaveBeenCalled();
+    fireEvent.compositionEnd(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    expect(onBackgroundSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledOnce();
+    fireEvent.keyDown(textarea, { key: "Enter", altKey: true });
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(onBackgroundSubmit).toHaveBeenCalledOnce();
+
+    rerender(<TooltipProvider><Composer {...baseProps()} draft="reply" onSubmit={onSubmit} /></TooltipProvider>);
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter", ctrlKey: true });
+    expect(onSubmit).toHaveBeenCalledTimes(3);
+  });
+
   it("keeps Enter-to-queue enabled while native configuration is frozen", () => {
     const onSubmit = vi.fn();
     const onModeActivate = vi.fn();

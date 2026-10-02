@@ -6179,16 +6179,18 @@ const handlers: Record<string, Handler> = {
             // create path below does: a pane that already lives in another
             // tab would otherwise resolve to something the caller cannot
             // see. Mirrors the backend's create-or-reuse.
-            surface.active_pane_id = node.pane_id;
-            ws.active_surface_id = surface.surface_id;
-            const tab = ws.tabs.find(
-              (candidate) => candidate.surface_id === surface.surface_id,
-            );
-            if (tab) ws.active_tab_id = tab.tab_id;
-            appState = {
-              ...appState,
-              active_workspace_id: ws.workspace_id,
-            };
+            if (a.select !== false) {
+              surface.active_pane_id = node.pane_id;
+              ws.active_surface_id = surface.surface_id;
+              const tab = ws.tabs.find(
+                (candidate) => candidate.surface_id === surface.surface_id,
+              );
+              if (tab) ws.active_tab_id = tab.tab_id;
+              appState = {
+                ...appState,
+                active_workspace_id: ws.workspace_id,
+              };
+            }
             emitAppState();
             return node.pane_id;
           }
