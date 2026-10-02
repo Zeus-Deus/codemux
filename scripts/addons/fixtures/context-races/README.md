@@ -1,7 +1,7 @@
 # Context race acceptance fixture
 
 CI-only package using the public CodeMux SDK and CLI. Each command waits for
-the harness to click “Release pending appends” in the fixture's status panel,
+the harness to run “CI release pending appends” from the command palette,
 then tries to append to the draft it was started from. The harness types,
 switches projects, or closes or replaces the chat pane before releasing the
 append. This establishes the ordering without racing a timer against native

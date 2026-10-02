@@ -1092,7 +1092,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   );
   evidence.contextRaces = {
     fixtureSha256: createHash("sha256").update(bytes).digest("hex"),
-    completion: "Status-panel release after the context mutation",
+    completion: "Release command after the context mutation",
     disableDelayMs: 4000,
     completed: [],
     rejections: {},
@@ -1172,8 +1172,9 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
   };
   // Release only after the native mutation, so a slow driver cannot let an
   // append finish before the context changes. Expiry still fails this check:
-  // only context cancellation (CONTEXT_STALE / NO_COMPOSER) is accepted.
-  const release = () => clickText("Release pending appends");
+  // only context cancellation (CONTEXT_STALE / NO_COMPOSER) is accepted. The
+  // release command has a fresh context, independent of a remounting panel.
+  const release = () => openCommand("CI release pending appends");
   const cancelled = async (id, codes) => {
     await release();
     const pattern = new RegExp(`CI cancelled ${id}: ([A-Z_]+)`);

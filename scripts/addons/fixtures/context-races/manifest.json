@@ -26,6 +26,11 @@
         "requiresWorkspace": true
       },
       {
+        "id": "release",
+        "title": "CI release pending appends",
+        "requiresWorkspace": true
+      },
+      {
         "id": "typing",
         "title": "CI delayed typing",
         "requiresWorkspace": true

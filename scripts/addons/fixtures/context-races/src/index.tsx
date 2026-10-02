@@ -1,5 +1,4 @@
 import {
-  Button,
   definePlugin,
   Heading,
   PluginError,
@@ -34,12 +33,6 @@ function Status() {
     <Stack spacing="sm">
       <Heading>Context race status</Heading>
       <Text color="muted">CI status ready</Text>
-      <Button onPress={() => {
-        for (const [id, release] of pending) {
-          pending.delete(id);
-          release();
-        }
-      }}>Release pending appends</Button>
       {outcomes.map((line) => (
         <Text>{`CI ${line}`}</Text>
       ))}
@@ -52,6 +45,12 @@ export default definePlugin({
     ctx.commands.register("status", (context) =>
       ctx.panels.open("status", context).catch(() => {}),
     );
+    ctx.commands.register("release", () => {
+      for (const [id, release] of pending) {
+        pending.delete(id);
+        release();
+      }
+    });
     for (const id of cases)
       ctx.commands.register(id, async (context) => {
         const ready = id === "disable"
