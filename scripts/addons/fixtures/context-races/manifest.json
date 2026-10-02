@@ -7,14 +7,19 @@
   "version": "1.0.0",
   "api": "^1.0.0",
   "entry": "plugin.js",
-  "platforms": ["linux-x64", "windows-x64"],
+  "platforms": [
+    "linux-x64",
+    "windows-x64"
+  ],
   "author": {
     "name": "CodeMux CI",
     "url": "https://codemux.org"
   },
   "repository": "https://github.com/Zeus-Deus/codemux",
   "license": "MIT",
-  "permissions": ["composer.append"],
+  "permissions": [
+    "composer.append"
+  ],
   "http": [],
   "credentials": [],
   "settings": [],
@@ -63,7 +68,33 @@
         "icon": "list"
       }
     ],
-    "composerActions": [],
+    "composerActions": [
+      {
+        "id": "typing",
+        "title": "CI delayed typing",
+        "icon": "list"
+      },
+      {
+        "id": "workspace",
+        "title": "CI delayed workspace",
+        "icon": "list"
+      },
+      {
+        "id": "thread",
+        "title": "CI delayed thread",
+        "icon": "list"
+      },
+      {
+        "id": "replacement",
+        "title": "CI delayed replacement",
+        "icon": "list"
+      },
+      {
+        "id": "disable",
+        "title": "CI delayed disable",
+        "icon": "list"
+      }
+    ],
     "composerViews": []
   }
 }

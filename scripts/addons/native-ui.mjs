@@ -1167,8 +1167,22 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
       composer,
     );
   const pending = async (id) => {
-    await openCommand(`CI delayed ${id}`);
-    await hasText(`CI pending ${id}`);
+    // The composer menu waits for broker registration and supplies its exact
+    // target, unlike a global command invoked during a pane's first mount.
+    await chooseComposerAction(
+      "example.context-races",
+      id,
+      `CI delayed ${id}`,
+      "Context Race Fixture",
+    );
+    try {
+      await hasText(`CI pending ${id}`);
+    } catch (error) {
+      evidence.contextRaces.diagnostics = await native("addon_diagnostics", {
+        id: "example.context-races",
+      });
+      throw error;
+    }
   };
   // Release only after the native mutation, so a slow driver cannot let an
   // append finish before the context changes. Expiry still fails this check:

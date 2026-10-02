@@ -1,6 +1,7 @@
 import {
   definePlugin,
   Heading,
+  type Handler,
   PluginError,
   Stack,
   Text,
@@ -16,6 +17,7 @@ const outcomes: string[] = [];
 const listeners = new Set<() => void>();
 const pending = new Map<string, () => void>();
 function record(line: string) {
+  console.info(`CI ${line}`);
   outcomes.push(line);
   if (outcomes.length > 12) outcomes.shift();
   for (const listener of listeners) listener();
@@ -51,8 +53,8 @@ export default definePlugin({
         release();
       }
     });
-    for (const id of cases)
-      ctx.commands.register(id, async (context) => {
+    for (const id of cases) {
+      const handler: Handler = async (context) => {
         const ready = id === "disable"
           ? new Promise<void>((resolve) => setTimeout(resolve, 4000))
           : new Promise<void>((resolve) => pending.set(id, resolve));
@@ -66,6 +68,9 @@ export default definePlugin({
             `cancelled ${id}: ${error instanceof PluginError ? error.code : "unknown"}`,
           );
         }
-      });
+      };
+      ctx.commands.register(id, handler);
+      ctx.composerActions.register(id, handler);
+    }
   },
 });
