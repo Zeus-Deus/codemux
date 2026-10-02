@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -666,6 +666,8 @@ describe("Composer", () => {
       expect(listChatSlashCommandsMock).toHaveBeenLastCalledWith(
         "grok",
         "/home/user",
+        true,
+        null,
       );
     });
 
@@ -754,53 +756,52 @@ describe("Composer", () => {
       expect(onModeActivate).not.toHaveBeenCalled();
     });
 
-    it("Arrow keys move the highlight without leaving the textarea", () => {
-      const { container, getByTestId } = renderComposer({ mode: "default" });
+    it("Arrow keys follow visible rows and stop at both ends without leaving the textarea", () => {
+      const { container } = renderComposer({ mode: "default" });
       const textarea = getTextarea(container);
       type(textarea, "/");
-      // First visible item is highlighted by default.
-      expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
-      fireEvent.keyDown(textarea, { key: "ArrowDown" });
-      expect(getByTestId("slash-item-mode:ask")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
-      fireEvent.keyDown(textarea, { key: "ArrowDown" });
-      expect(getByTestId("slash-item-mode:debug")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
-      // The WORKFLOWS group's single `/workflow` row follows MODES.
-      fireEvent.keyDown(textarea, { key: "ArrowDown" });
-      expect(getByTestId("slash-item-workflow")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
-      // The SETTINGS group's single `/model` row follows WORKFLOWS.
-      fireEvent.keyDown(textarea, { key: "ArrowDown" });
-      expect(getByTestId("slash-item-composer:model")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
-      fireEvent.keyDown(textarea, { key: "ArrowDown" });
-      for (const command of ["queue", "steer", "interrupt"]) {
-        expect(getByTestId(`slash-item-delivery:${command}`)).toHaveAttribute("data-selected", "true");
+      const rows = Array.from(container.querySelectorAll('[data-testid^="slash-item-"]'));
+      expect(rows[0]).toHaveAttribute("data-testid", "slash-item-mode:plan");
+      for (const row of rows) {
+        expect(row, row.getAttribute("data-testid") ?? "row").toHaveAttribute("data-selected", "true");
         fireEvent.keyDown(textarea, { key: "ArrowDown" });
       }
-      // Wraps around to the top.
-      expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
-      fireEvent.keyDown(textarea, { key: "ArrowUp" });
-      // Wraps from top to bottom, landing on the last delivery command.
-      expect(getByTestId("slash-item-delivery:interrupt")).toHaveAttribute(
-        "data-selected",
-        "true",
-      );
+      for (let i = 0; i < 20; i++) fireEvent.keyDown(textarea, { key: "ArrowDown", repeat: true });
+      expect(rows[rows.length - 1]).toHaveAttribute("data-selected", "true");
+      for (let i = 0; i < rows.length + 20; i++) fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      expect(rows[0]).toHaveAttribute("data-selected", "true");
+      expect(document.activeElement === textarea || !document.activeElement?.closest('[data-testid="slash-command-popup"]')).toBe(true);
+    });
+
+    it("stops a held arrow at key release instead of replaying queued repeats", () => {
+      const { container } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      type(textarea, "/");
+      const rows = Array.from(container.querySelectorAll('[data-testid^="slash-item-"]'));
+      const callbacks: FrameRequestCallback[] = [];
+      const frame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      });
+      const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+      try {
+        fireEvent.keyDown(textarea, { key: "ArrowDown" });
+        for (let i = 0; i < 40; i++) fireEvent.keyDown(textarea, { key: "ArrowDown", repeat: true });
+        expect(rows[1]).toHaveAttribute("data-selected", "true");
+        expect(callbacks).toHaveLength(1);
+        act(() => callbacks[0](performance.now()));
+        expect(rows[2]).toHaveAttribute("data-selected", "true");
+        fireEvent.keyDown(textarea, { key: "ArrowDown", repeat: true });
+        fireEvent.keyUp(textarea, { key: "ArrowDown" });
+        expect(cancel).toHaveBeenCalled();
+        act(() => callbacks[1](performance.now()));
+        fireEvent.keyDown(textarea, { key: "ArrowDown", repeat: true });
+        expect(rows[2]).toHaveAttribute("data-selected", "true");
+        expect(callbacks).toHaveLength(2);
+      } finally {
+        frame.mockRestore();
+        cancel.mockRestore();
+      }
     });
 
     it("hides the active mode from the popup items", () => {
@@ -857,7 +858,7 @@ describe("Composer", () => {
       expect(queryByTestId("slash-item-mode:plan")).toBeNull();
     });
 
-    it("Enter falls through to submit when popup is empty (no items to pick)", () => {
+    it("Enter falls through to submit when popup is empty (no items to pick)", async () => {
       const onSubmit = vi.fn();
       const onModeActivate = vi.fn();
       const { container } = renderComposer({
@@ -871,6 +872,8 @@ describe("Composer", () => {
       // popup visible. Pressing Enter should *send* the message —
       // there's no item to activate.
       type(textarea, "/zzz");
+      await waitFor(() => expect(listChatSlashCommandsMock).toHaveBeenCalled());
+      await waitFor(() => expect(useProviderCommandsStore.getState().entries["claude\n/home/user"]?.loading).toBe(false));
       fireEvent.keyDown(textarea, { key: "Enter" });
       expect(onModeActivate).not.toHaveBeenCalled();
       expect(onSubmit).toHaveBeenCalled();

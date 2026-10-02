@@ -301,7 +301,7 @@ describe("DraftChatSurface", () => {
       await vi.waitFor(() => expect(queryByTestId("slash-item-skill:user-skill")).not.toBeNull());
       expect(queryByTestId("slash-item-skill:project-skill")).toBeNull();
       expect(listSkills).toHaveBeenCalledWith("/home/user", true, false);
-      expect(listChatSlashCommands).toHaveBeenCalledWith(provider, "/home/user");
+      expect(listChatSlashCommands).toHaveBeenCalledWith(provider, "/home/user", false);
 
       act(() => store.updateDraftTarget(draft.draftId, { kind: "project", projectPath: "/projects/foo" }));
       await vi.waitFor(() => expect(queryByTestId("slash-item-skill:project-skill")).not.toBeNull());

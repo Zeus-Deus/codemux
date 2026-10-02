@@ -1,12 +1,16 @@
 import { BookOpen } from "lucide-react";
 
 import type { Skill } from "@/tauri/commands";
+import type { AgentChatProviderKind } from "@/tauri/types";
+import { sessionProviderLabel } from "./session-mentions";
 
 import { skillTokenFor } from "./skill-tokens";
 import type { SlashCommandItem } from "./slash-commands";
 
 interface BuildSkillCommandsArgs {
   skills: Skill[];
+  providerCommands?: readonly { name: string }[];
+  activeProvider?: AgentChatProviderKind;
   /** Called when the user activates an exact skill definition. */
   onInvoke: (skill: Skill) => void;
 }
@@ -23,6 +27,8 @@ interface BuildSkillCommandsArgs {
  */
 export function buildSkillCommands({
   skills,
+  providerCommands = [],
+  activeProvider,
   onInvoke,
 }: BuildSkillCommandsArgs): SlashCommandItem[] {
   const idCounts = new Map<string, number>();
@@ -36,11 +42,23 @@ export function buildSkillCommands({
     // Search the skill's own prose, not the `provider · scope` suffix,
     // or `/codex` would match every Codex skill.
     searchDescription: skill.description ?? "",
-    command: skillTokenFor(skill, skills),
+    command: providerCommands.some((command) => command.name.toLowerCase() === skillTokenFor(skill, skills).slice(1).toLowerCase())
+      ? skillTokenFor(skill, skills).replace(/^\//, "$") : skillTokenFor(skill, skills),
     icon: BookOpen,
+    identity: { provider: skill.provider, kind: "skill", label: skillIdentityLabel(skill, activeProvider) },
     group: "SKILLS",
     onSelect: () => onInvoke(skill),
   }));
+}
+
+function skillIdentityLabel(skill: Skill, activeProvider?: AgentChatProviderKind): string {
+  const scope = skill.scope === "plugin" && skill.pluginSlug ? `plugin/${skill.pluginSlug}` : skill.scope;
+  const source = `${sessionProviderLabel(skill.provider)} skill · ${scope}`;
+  if (!activeProvider) return source;
+  const availability = skill.projections?.find((projection) => projection.targetProvider === activeProvider)?.availability;
+  if (availability === "native") return `${source} · Native in ${sessionProviderLabel(activeProvider)}`;
+  if (availability === "explicit-portable" || (!skill.projections && skill.provider !== activeProvider)) return `${source} · Portable in ${sessionProviderLabel(activeProvider)}`;
+  return source;
 }
 
 /**

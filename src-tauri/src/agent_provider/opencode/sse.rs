@@ -129,6 +129,7 @@ impl SseRouter {
 /// mutable watched-session + permission-routing state.
 #[derive(Debug, Clone)]
 pub struct SsePeer {
+    pub directory: Option<std::path::PathBuf>,
     pub session_id: String,
     pub event_ctx: Arc<Mutex<EventContext>>,
     pub router: Arc<Mutex<SseRouter>>,
@@ -163,7 +164,13 @@ async fn run_sse_listener(
     peer: SsePeer,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 ) {
-    let url = format!("{}/event", base_url.trim_end_matches('/'));
+    let mut url = format!("{}/event", base_url.trim_end_matches('/'));
+    if let Some(directory) = peer.directory.as_ref() {
+        url.push_str(&format!(
+            "?directory={}",
+            urlencoding::encode(&directory.to_string_lossy())
+        ));
+    }
     let client = match reqwest::Client::builder()
         // No request timeout — SSE is long-polled by design and
         // OpenCode's idle keep-alive may go minutes between bytes.
@@ -539,12 +546,13 @@ fn warn(peer: &SsePeer, message: String) -> ProviderRuntimeEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::KnownEvent;
+    use super::*;
     use crate::agent_provider::types::{ProviderSessionId, ThreadId, TurnId};
 
     fn peer(session_id: &str) -> SsePeer {
         SsePeer {
+            directory: None,
             session_id: session_id.to_string(),
             event_ctx: Arc::new(Mutex::new(EventContext {
                 thread_id: ThreadId("t1".into()),

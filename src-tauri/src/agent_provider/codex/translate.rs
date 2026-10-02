@@ -1387,7 +1387,8 @@ fn translate_item_started(
         // their content streams in via the matching delta event. Skip
         // emitting a duplicate event so the UI doesn't show an empty
         // placeholder.
-        "agentMessage" | "reasoning" | "plan" | "userMessage" | "hookPrompt" => vec![],
+        "agentMessage" | "reasoning" | "plan" | "userMessage" | "hookPrompt"
+        | "enteredReviewMode" | "exitedReviewMode" => vec![],
         // Other variants (webSearch, imageGeneration, etc.) — surface as
         // a warning so we know the SDK shipped something new.
         other => vec![ProviderRuntimeEvent::RuntimeWarning {
@@ -1424,10 +1425,15 @@ fn translate_item_completed(
             thread_id: thread_id.clone(),
             active: false,
         }],
-        "agentMessage" => {
+        "enteredReviewMode" => vec![],
+        "agentMessage" | "exitedReviewMode" => {
             let text = env
                 .item
-                .get("text")
+                .get(if item_type == "exitedReviewMode" {
+                    "review"
+                } else {
+                    "text"
+                })
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -1566,6 +1572,25 @@ pub fn translate_server_request(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_review_final_output_is_rendered_as_assistant_text() {
+        let events = translate_notification(
+            &ThreadId("parent".into()),
+            NotificationMessage::from_raw(
+                "item/completed",
+                json!({
+                    "threadId": "native", "turnId": "review-turn",
+                    "item": {"type": "exitedReviewMode", "id": "review", "review": "Found a regression."}
+                }),
+            ),
+        );
+        assert!(
+            matches!(events.as_slice(), [ProviderRuntimeEvent::ItemCompleted {
+            item: CompletedItem::AssistantText { text }, ..
+        }] if text == "Found a regression.")
+        );
+    }
 
     #[test]
     fn context_compaction_lifecycle() {

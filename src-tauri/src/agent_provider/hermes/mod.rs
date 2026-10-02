@@ -174,6 +174,7 @@ struct Runtime {
     /// Shared foreground gate also protects new/load and model changes.
     operation: Mutex<()>,
     routes: Mutex<HashMap<String, std::sync::Weak<Chat>>>,
+    commands: Mutex<HashMap<String, Vec<super::claude::slash_commands::ProviderSlashCommand>>>,
     queue: Mutex<Queue>,
     barrier: mpsc::UnboundedSender<oneshot::Sender<()>>,
 }
@@ -356,6 +357,7 @@ impl Inner {
             profile,
             operation: Mutex::new(()),
             routes: Mutex::new(HashMap::new()),
+            commands: Mutex::new(HashMap::new()),
             queue: Mutex::new(Queue::default()),
             barrier,
         });
@@ -425,6 +427,17 @@ impl Inner {
         let Some(sid) = text(&n.params, "sessionId") else {
             return;
         };
+        // Command catalogues are session metadata, including while idle and
+        // during session/new before the chat route has been registered.
+        if let Some(commands) = super::acp::slash_commands::available_commands_from_value(&n.params)
+        {
+            runtime
+                .commands
+                .lock()
+                .await
+                .insert(sid.to_string(), commands);
+            return;
+        }
         let chat = runtime
             .routes
             .lock()
@@ -433,7 +446,7 @@ impl Inner {
             .and_then(std::sync::Weak::upgrade);
         let Some(chat) = chat else {
             return;
-        }; // Catalog and native load replay are intentionally not imported.
+        }; // Native load replay is intentionally not imported.
         let Some(update) = n.params.get("update") else {
             return;
         };
@@ -1439,6 +1452,32 @@ impl AgentProvider for HermesProvider {
         });
         Ok(())
     }
+    async fn session_slash_commands(
+        &self,
+        thread_id: ThreadId,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<super::claude::slash_commands::ProviderSlashCommand>, ProviderError> {
+        let chat = self.chat(&thread_id).await?;
+        let binding = chat.binding.lock().await;
+        if cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()) != binding.cwd {
+            return Err(invalid(
+                "Command discovery must use this Hermes conversation's working directory.",
+            ));
+        }
+        let Some(id) = binding.acp_session_id.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let commands = chat
+            .runtime
+            .commands
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(commands)
+    }
+
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         let chats: Vec<_> = self.inner.chats.lock().await.values().cloned().collect();
         let mut out = vec![];

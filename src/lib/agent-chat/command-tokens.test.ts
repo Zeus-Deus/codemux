@@ -36,12 +36,13 @@ describe("buildCommandRegistry", () => {
     expect(registry.get("omarchy")?.kind).toBe("skill");
   });
 
-  it("lets a skill win a name collision, matching the popup's precedence", () => {
+  it("keeps provider slash commands and dollar skills independently addressable", () => {
     const registry = buildCommandRegistry(
       [makeSkill("review")],
       [{ name: "review", description: "Review a pull request" }],
     );
-    expect(registry.get("review")?.kind).toBe("skill");
+    expect(parseLeadingCommand("/review", registry)?.kind).toBe("provider");
+    expect(parseLeadingCommand("$review", registry)?.kind).toBe("skill");
   });
 
   it("registers a collided skill under its provider-qualified token", () => {
@@ -52,7 +53,7 @@ describe("buildCommandRegistry", () => {
     const registry = buildCommandRegistry(skills, []);
     // Both definitions survive under distinct addresses; neither is
     // reachable as the bare `/review`, exactly as the popup inserts them.
-    expect(registry.size).toBe(2);
+    expect(registry.size).toBe(4);
     expect(registry.has("review")).toBe(false);
   });
 });

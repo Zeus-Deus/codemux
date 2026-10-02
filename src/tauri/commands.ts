@@ -2625,17 +2625,56 @@ export interface ProviderSlashCommand {
   argumentHint: string;
 }
 
-/** List the provider-native slash commands for a thread anchored at
- *  `cwd`. Claude harvests via the Agent SDK's `supportedCommands()`
- *  and Grok uses its ACP initialize/live command snapshot (both cached per
- *  cwd backend-side). Providers without discovery resolve to an empty list. */
+export interface NativeHook {
+  key: string;
+  currentHash: string;
+  enabled: boolean;
+  isManaged: boolean;
+  trustStatus: "managed" | "trusted" | "untrusted" | "modified";
+  eventName: string;
+  handlerType: string;
+  source: string;
+  sourcePath: string;
+  command?: string;
+  server?: string;
+  tool?: string;
+  matcher?: string | null;
+  statusMessage?: string | null;
+  timeoutSec: number;
+  additionalContextLimit?: number | null;
+  async?: boolean;
+}
+
+export interface NativeHooksList {
+  cwd: string;
+  hooks: NativeHook[];
+  warnings: string[];
+  errors: { path: string; message: string }[];
+}
+
+export type NativeHookUpdate =
+  | { action: "trust"; key: string; hash: string }
+  | { action: "setEnabled"; key: string; hash: string; enabled: boolean };
+
+export const agentChatHooks = (
+  provider: AgentChatProviderKind,
+  cwd: string | null,
+  threadId: string | null,
+  update: NativeHookUpdate | null = null,
+) => invoke<NativeHooksList>("agent_chat_hooks", { provider, cwd, threadId, update });
+
+/** Discover executable commands for the current provider, directory and session. */
 export const listChatSlashCommands = (
   provider: AgentChatProviderKind,
-  cwd: string,
+  cwd: string | null,
+  force = false,
+  threadId: string | null = null,
 ) =>
   invoke<ProviderSlashCommand[]>("list_chat_slash_commands", {
     provider,
     cwd,
+    force,
+    threadId,
   });
 
 /** Start the file watcher. Returns the count of paths actually being

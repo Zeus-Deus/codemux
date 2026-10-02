@@ -2508,6 +2508,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::provider_updates::agent_chat_provider_update_check,
             commands::provider_updates::agent_chat_provider_update,
             commands::list_chat_slash_commands,
+            commands::agent_chat_hooks,
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,

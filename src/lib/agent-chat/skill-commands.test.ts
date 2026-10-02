@@ -29,6 +29,21 @@ function makeSkill(overrides: Partial<Skill> = {}): Skill {
 }
 
 describe("buildSkillCommands", () => {
+  it("identifies the skill's definition source separately from the active provider", () => {
+    const [item] = buildSkillCommands({
+      skills: [makeSkill({ provider: "claude", projections: [{ targetProvider: "codex", availability: "explicit-portable", compatibility: "compatible", reasons: [], invocation: "codex-skill-item" }] })],
+      activeProvider: "codex", onInvoke: () => {},
+    });
+    expect(item.identity).toEqual({ provider: "claude", kind: "skill", label: "Claude skill · user · Portable in Codex" });
+  });
+
+  it("distinguishes native provider skills and their scope from provider commands", () => {
+    const [item] = buildSkillCommands({
+      skills: [makeSkill({ provider: "codex", scope: "system", projections: [{ targetProvider: "codex", availability: "native", compatibility: "compatible", reasons: [], invocation: "codex-skill-item" }] })],
+      activeProvider: "codex", onInvoke: () => {},
+    });
+    expect(item.identity).toEqual({ provider: "codex", kind: "skill", label: "Codex skill · system · Native in Codex" });
+  });
   it("maps each skill to a SlashCommandItem with expected shape", () => {
     const onInvoke = vi.fn();
     const items = buildSkillCommands({
@@ -140,4 +155,10 @@ describe("formatScopeIndicator", () => {
       formatScopeIndicator(makeSkill({ provider: "claude", scope: "plugin", pluginSlug: null })),
     ).toBe("claude · plugin");
   });
+});
+
+
+it("keeps a same-named provider command available by inserting a dollar skill token", () => {
+  const items = buildSkillCommands({ skills: [makeSkill({ name: "review" })], providerCommands: [{ name: "review" }], onInvoke: vi.fn() });
+  expect(items[0].command).toBe("$review");
 });

@@ -1,3 +1,4 @@
+import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import {
   activateWorkspace,
@@ -379,6 +380,7 @@ export async function materializeAndSend(
         draft.effort,
         typeof skillBodies === "string" ? skillBodies : null,
         attachmentBlock,
+        selectProviderCommands(draft.provider, cwd, draft.threadId)(useProviderCommandsStore.getState()).commands,
       ),
       display_text: text,
       skill_ids: exactSkillSelection?.skillIds ?? [],
@@ -590,6 +592,8 @@ export async function materializeWithPreset(
             normalizeChatModeForProvider(draft.provider, draft.mode),
             draft.effort,
             typeof skillBodies === "string" ? skillBodies : null,
+            null,
+            selectProviderCommands(draft.provider, cwd, draft.threadId)(useProviderCommandsStore.getState()).commands,
           ),
           display_text: prompt,
           skill_ids: exactSkills?.skillIds ?? [],

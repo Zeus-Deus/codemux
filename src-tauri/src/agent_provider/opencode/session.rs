@@ -87,6 +87,7 @@ pub struct OpenCodeSession {
     outbound: Mutex<()>,
     queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
     queue_worker: Mutex<Option<JoinHandle<()>>>,
+    native_requests: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl OpenCodeSession {
@@ -105,6 +106,7 @@ impl OpenCodeSession {
         // used this same OpenCode session id, when there is one. `None`
         // starts fresh. See `OpenCodeAgentProvider::usage_states`.
         carried_usage: Option<Arc<Mutex<OpenCodeUsageState>>>,
+        directory: Option<std::path::PathBuf>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
             if err == "opencode_not_installed" {
@@ -120,7 +122,20 @@ impl OpenCodeSession {
             }
         })?;
 
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(directory) = directory.as_ref() {
+            headers.insert(
+                "x-opencode-directory",
+                reqwest::header::HeaderValue::from_str(&urlencoding::encode(
+                    &directory.to_string_lossy(),
+                ))
+                .map_err(|error| ProviderError::ValidationError {
+                    message: error.to_string(),
+                })?,
+            );
+        }
         let http = reqwest::Client::builder()
+            .default_headers(headers)
             .build()
             .map_err(|err| ProviderError::ProcessError {
                 message: "failed to build HTTP client".into(),
@@ -229,6 +244,7 @@ impl OpenCodeSession {
         };
         let queue_events = event_tx.subscribe();
         let peer = SsePeer {
+            directory: directory.clone(),
             session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
             router: router.clone(),
@@ -284,6 +300,7 @@ impl OpenCodeSession {
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
             queue_worker: Mutex::new(None),
+            native_requests: Mutex::new(Vec::new()),
         });
         session.start_queue_worker(queue_events).await;
         Ok(session)
@@ -577,8 +594,53 @@ impl OpenCodeSession {
             Some(v) => Some(v),
             None => self.current_variant.lock().await.clone(),
         };
-        let body = build_prompt_async_request(text, model.as_deref(), variant.as_deref(), &images)
-            .map_err(|err| ProviderError::ValidationError { message: err })?;
+        let native = crate::agent_provider::slash_commands::leading_command(&text);
+        if native.is_some() && steer {
+            return Err(ProviderError::ValidationError {
+                message: "Native commands cannot steer a running turn. Choose Queue or Interrupt and send.".into(),
+            });
+        }
+        let prompt =
+            build_prompt_async_request(text.clone(), model.as_deref(), variant.as_deref(), &images)
+                .map_err(|err| ProviderError::ValidationError { message: err })?;
+        let (endpoint, body) = match native {
+            Some(("compact", arguments)) => {
+                if !arguments.is_empty() || !images.is_empty() {
+                    return Err(ProviderError::ValidationError {
+                        message: "OpenCode /compact accepts no arguments or images.".into(),
+                    });
+                }
+                let model =
+                    prompt
+                        .model
+                        .as_ref()
+                        .ok_or_else(|| ProviderError::ValidationError {
+                            message: "Select a model before compacting this OpenCode conversation."
+                                .into(),
+                        })?;
+                (
+                    "summarize",
+                    serde_json::json!({ "providerID": model.provider_id, "modelID": model.model_id }),
+                )
+            }
+            Some((name, arguments)) => {
+                // /command expands native templates and accepts image file parts.
+                // Sending /name through prompt_async would only send literal prose.
+                let files: Vec<_> = prompt
+                    .parts
+                    .iter()
+                    .filter(|part| matches!(part, super::protocol::PartInput::File { .. }))
+                    .collect();
+                let mut body = serde_json::json!({
+                    "command": name, "arguments": arguments, "parts": files,
+                });
+                // Optional Zod fields accept omission, not JSON null.
+                if let Some(model) = model.as_ref() { body["model"] = serde_json::json!(model); }
+                if let Some(variant) = prompt.variant.as_ref() { body["variant"] = serde_json::json!(variant); }
+                ("command", body)
+            }
+            None => ("prompt_async", serde_json::to_value(&prompt).unwrap()),
+        };
         let turn_id = {
             let mut ctx = self.event_ctx.lock().await;
             if !steer {
@@ -598,17 +660,79 @@ impl OpenCodeSession {
                 });
         }
         let url = format!(
-            "{}/session/{}/prompt_async",
+            "{}/session/{}/{}",
             self.server_handle.base_url.trim_end_matches('/'),
-            urlencoding::encode(&self.provider_session_id.0)
+            urlencoding::encode(&self.provider_session_id.0),
+            endpoint
         );
-        let response = self
+        let request = self
             .http
             .post(&url)
             .basic_auth("opencode", Some(&self.server_handle.server_password))
-            .json(&body)
-            .send()
-            .await;
+            .json(&body);
+        if endpoint != "prompt_async" {
+            // Native endpoints respond only after generation completes. Keep
+            // the composer/queue responsive while SSE streams the actual turn.
+            let context = self.event_ctx.clone();
+            let events = self.event_tx.clone();
+            let thread_id = self.thread_id.clone();
+            let expected_turn = turn_id.clone();
+            let dead = self.dead.clone();
+            let handle = tokio::spawn(async move {
+                let result = request
+                    .timeout(std::time::Duration::from_secs(600))
+                    .send()
+                    .await;
+                let failure = match result {
+                    Ok(response) if response.status().is_success() => response
+                        .bytes()
+                        .await
+                        .err()
+                        .map(|error| format!("{endpoint}_response_failed: {error}")),
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        Some(format!(
+                            "{endpoint}_http_status_{}: {body}",
+                            status.as_u16()
+                        ))
+                    }
+                    Err(error) => Some(format!("{endpoint}_send_failed: {error}")),
+                };
+                // Successful generations settle on session.idle in the SSE
+                // stream, after their final output. HTTP can arrive first;
+                // settling here would route late output/idle to a queued turn.
+                let Some(message) = failure else { return };
+                let mut live = context.lock().await;
+                // SSE may already have settled this turn and dispatched the
+                // next. A late HTTP result must never clear that newer turn.
+                if !dead.load(Ordering::Relaxed)
+                    && live.turn_active
+                    && live.turn_id == expected_turn
+                {
+                    live.turn_active = false;
+                    let status = crate::agent_provider::TurnStatus::Error {
+                        subtype: "native_command_failed".into(),
+                        message,
+                    };
+                    let _ = events.send(ProviderRuntimeEvent::TurnCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: expected_turn,
+                        status,
+                        usage: None,
+                    });
+                    let _ = events.send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id,
+                        status: SessionStatus::Ready,
+                    });
+                }
+            });
+            let mut requests = self.native_requests.lock().await;
+            requests.retain(|request| !request.is_finished());
+            requests.push(handle);
+            return Ok(turn_id);
+        }
+        let response = request.send().await;
         let response = match response {
             Ok(r) => r,
             Err(err) => {
@@ -624,7 +748,7 @@ impl OpenCodeSession {
                         });
                 }
                 return Err(ProviderError::RpcError {
-                    message: format!("prompt_async_send_failed: {err}"),
+                    message: format!("{endpoint}_send_failed: {err}"),
                 });
             }
         };
@@ -641,10 +765,7 @@ impl OpenCodeSession {
             }
             let body = response.text().await.unwrap_or_default();
             return Err(ProviderError::RpcError {
-                message: format!(
-                    "prompt_async_http_status_{}: {body}",
-                    status.as_u16()
-                ),
+                message: format!("{endpoint}_http_status_{}: {body}", status.as_u16()),
             });
         }
         // SSE may already have completed the turn before this HTTP response.
@@ -775,6 +896,9 @@ impl OpenCodeSession {
     /// OpenCode-side session, and emits the closed state.
     pub async fn shutdown(&self) {
         self.dead.store(true, Ordering::Relaxed);
+        for request in self.native_requests.lock().await.drain(..) {
+            request.abort();
+        }
         if let Some(worker) = self.queue_worker.lock().await.take() {
             worker.abort();
         }
@@ -793,10 +917,20 @@ impl OpenCodeSession {
             .basic_auth("opencode", Some(&self.server_handle.server_password))
             .send()
             .await;
-        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: self.thread_id.clone(),
-            status: SessionStatus::Closed,
-        });
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: self.thread_id.clone(),
+                status: SessionStatus::Closed,
+            });
+    }
+}
+
+impl Drop for OpenCodeSession {
+    fn drop(&mut self) {
+        for request in self.native_requests.get_mut().drain(..) {
+            request.abort();
+        }
     }
 }
 
@@ -1175,6 +1309,7 @@ mod tests {
             None,
             tx,
             None,
+            None,
         )
         .await;
 
@@ -1214,6 +1349,7 @@ mod tests {
             None,
             None,
             tx,
+            None,
             None,
         )
         .await
@@ -1285,6 +1421,7 @@ mod tests {
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
             queue_worker: Mutex::new(None),
+            native_requests: Mutex::new(Vec::new()),
         });
         session.start_queue_worker(tx.subscribe()).await;
         (session, tx, rx)
@@ -1571,6 +1708,7 @@ mod tests {
             Some("ses_keep".into()),
             tx,
             None,
+            None,
         )
         .await;
 
@@ -1765,5 +1903,127 @@ mod tests {
         assert!(lookup_context_window(&cat, "openai/nope").is_none());
         assert!(lookup_context_window(&cat, "openai/mystery").is_none());
         assert!(lookup_context_window(&cat, "no-slash").is_none());
+    }
+    async fn await_native_http(session: &OpenCodeSession) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session.native_requests.lock().await.iter().any(|request| !request.is_finished()) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("native HTTP must return");
+    }
+
+    async fn await_native_completion(
+        rx: &mut broadcast::Receiver<ProviderRuntimeEvent>,
+    ) -> crate::agent_provider::TurnStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let ProviderRuntimeEvent::TurnCompleted { status, .. } = rx.recv().await.unwrap()
+                {
+                    return status;
+                }
+            }
+        })
+        .await
+        .expect("native command must settle")
+    }
+
+    #[tokio::test]
+    async fn native_command_routes_arguments_and_images_to_command_endpoint() {
+        let mut server = Server::new_async().await;
+        let command = server.mock("POST", "/session/sess_1/command")
+            .match_header("authorization", mockito::Matcher::Any)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "command": "test", "arguments": "first\nsecond", "model": "openai/gpt-5", "variant": "high",
+                "parts": [{ "type": "file", "mime": "image/png", "url": "data:image/png;base64,AQID" }]
+            })))
+            .with_status(200).with_body("{}").create_async().await;
+        let (session, _, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session
+            .send_turn(
+                "/test first\nsecond".into(),
+                vec![ImageInput {
+                    data: vec![1, 2, 3],
+                    media_type: "image/png".into(),
+                }],
+                None,
+                Some("high".into()),
+            )
+            .await
+            .unwrap();
+        await_native_http(&session).await;
+        assert!(session.turn_active().await, "HTTP success must wait for final SSE output and idle");
+        while let Ok(event) = rx.try_recv() { assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })); }
+        command.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_compact_uses_selected_model_and_rejects_extra_content() {
+        let mut server = Server::new_async().await;
+        let compact = server
+            .mock("POST", "/session/sess_1/summarize")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"providerID": "openai", "modelID": "gpt-5"}),
+            ))
+            .with_status(200)
+            .with_body("true")
+            .create_async()
+            .await;
+        let (session, _, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        assert!(session
+            .send_turn("/compact more".into(), vec![], None, None)
+            .await
+            .is_err());
+        assert!(!session.turn_active().await);
+        session
+            .send_turn("/compact".into(), vec![], None, None)
+            .await
+            .unwrap();
+        await_native_http(&session).await;
+        assert!(session.turn_active().await);
+        while let Ok(event) = rx.try_recv() { assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })); }
+        compact.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_command_failure_does_not_leave_session_running() {
+        let mut server = Server::new_async().await;
+        let command = server
+            .mock("POST", "/session/sess_1/command")
+            .with_status(400)
+            .with_body("Unknown command")
+            .create_async()
+            .await;
+        let (session, _, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session
+            .send_turn("/unknown".into(), vec![], None, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(await_native_completion(&mut rx).await, crate::agent_provider::TurnStatus::Error { message, .. } if message.contains("Unknown command"))
+        );
+        assert!(!session.turn_active().await);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Ready,
+                ..
+            })
+        ));
+        command.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_command_omits_unselected_model_and_effort() {
+        let mut server = Server::new_async().await;
+        let command = server.mock("POST", "/session/sess_1/command")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "command": "init", "arguments": "", "parts": [],
+            })))
+            .with_status(200).with_body("{}").create_async().await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        *session.current_model.lock().await = None;
+        session.send_turn("/init".into(), vec![], None, None).await.unwrap();
+        await_native_http(&session).await;
+        command.assert_async().await;
     }
 }

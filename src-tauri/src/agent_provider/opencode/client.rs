@@ -136,6 +136,30 @@ impl OpenCodeClient {
         Ok(flatten_provider_list(raw))
     }
 
+    /// Project-scoped native commands, including custom and MCP commands.
+    pub async fn list_commands(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<Vec<super::protocol::OpenCodeCommand>, String> {
+        let url = format!(
+            "{}/command?directory={}",
+            self.config.base_url,
+            urlencoding::encode(&directory.to_string_lossy())
+        );
+        let response = self
+            .attach_auth(self.http.get(&url))
+            .send()
+            .await
+            .map_err(format_request_error)?;
+        if !response.status().is_success() {
+            return Err(format!("http_status_{}", response.status().as_u16()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("parse_error: {error}"))
+    }
+
     /// Return OpenCode's authoritative skill catalog for one working directory.
     pub async fn list_skills(
         &self,
@@ -1117,5 +1141,24 @@ mod tests {
                 || formatted.starts_with("request_error"),
             "unexpected classification: {formatted}"
         );
+    }
+    #[tokio::test]
+    async fn native_command_catalog_is_project_scoped() {
+        let mut server = mockito::Server::new_async().await;
+        let catalog = server.mock("GET", "/command?directory=%2Frepo%2Fwith%20space")
+            .match_header("authorization", mockito::Matcher::Any)
+            .with_status(200).with_header("content-type", "application/json")
+            .with_body(r#"[{"name":"test","description":"Run tests","hints":["<filter>"],"source":"command"}]"#)
+            .create_async().await;
+        let mut config = OpenCodeClientConfig::new(server.url());
+        config.server_password = Some("pw".into());
+        let commands = OpenCodeClient::new(config)
+            .unwrap()
+            .list_commands(std::path::Path::new("/repo/with space"))
+            .await
+            .unwrap();
+        catalog.assert_async().await;
+        assert_eq!(commands[0].name, "test");
+        assert_eq!(commands[0].hints, vec!["<filter>"]);
     }
 }

@@ -20,11 +20,13 @@ vi.mock("@/tauri/commands", async (importActual) => {
     listSkills: vi.fn(),
     startSkillsWatcher: vi.fn().mockResolvedValue(0),
     listChatSlashCommands: vi.fn(),
+    agentChatHooks: vi.fn().mockResolvedValue({ cwd: "/home/user", hooks: [], warnings: [], errors: [] }),
   };
 });
 
 import { Composer } from "./Composer";
-import { listChatSlashCommands, listSkills, startSkillsWatcher } from "@/tauri/commands";
+import { agentChatHooks, listChatSlashCommands, listSkills, startSkillsWatcher } from "@/tauri/commands";
+import { useUIStore } from "@/stores/ui-store";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useSkillsStore } from "@/stores/skills-store";
 
@@ -141,6 +143,79 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
   });
 
   afterEach(() => cleanup());
+
+  it("opens Codex native hooks from Home without sending a prompt, ahead of skill prose", async () => {
+    listSkillsMock.mockResolvedValue([makeSkill({ provider: "codex", name: "hook-development", description: "Develop hooks" })]);
+    const onSubmit = vi.fn();
+    const { container, getByTestId, findByRole } = renderComposer({ provider: "codex", cwd: null, onSubmit });
+    fireEvent.change(getTextarea(container), { target: { value: "/hooks", selectionStart: 6 } });
+    fireEvent.click(getByTestId("slash-item-composer:hooks"));
+    expect(await findByRole("dialog")).toHaveTextContent("Codex hooks");
+    expect(agentChatHooks).toHaveBeenCalledWith("codex", null, null);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("offers the shared help and skills controls across all providers", async () => {
+    listSkillsMock.mockResolvedValue([]);
+    for (const provider of ["codex", "claude", "opencode", "cursor", "grok", "hermes"] as const) {
+      const view = renderComposer({ provider });
+      fireEvent.change(getTextarea(view.container), { target: { value: "/", selectionStart: 1 } });
+      expect(view.getByTestId("slash-item-composer:help")).toBeVisible();
+      fireEvent.click(view.getByTestId("slash-item-composer:skills"));
+      expect(useUIStore.getState().settingsSection).toBe("skills");
+      view.unmount();
+    }
+  });
+
+  it("selects a colliding skill's dollar alias from slash completion", async () => {
+    listSkillsMock.mockResolvedValue([makeSkill({ id: "review-skill", name: "review" })]);
+    listChatSlashCommandsMock.mockResolvedValue([{ name: "review", description: "Native review", argumentHint: "" }]);
+    const onDraftChange = vi.fn();
+    const view = renderComposer({ onDraftChange });
+    fireEvent.change(getTextarea(view.container), { target: { value: "/review", selectionStart: 7 } });
+    const skillRow = await view.findByTestId("slash-item-skill:review-skill");
+    await waitFor(() => expect(skillRow).toHaveTextContent("$review"));
+    fireEvent.click(skillRow);
+    expect(onDraftChange).toHaveBeenLastCalledWith("$review ");
+  });
+
+  it("help prepares a discovered native command without sending it", async () => {
+    listSkillsMock.mockResolvedValue([]);
+    listChatSlashCommandsMock.mockResolvedValue([{ name: "custom-native", description: "Runtime command", argumentHint: "<target>" }]);
+    const onDraftChange = vi.fn();
+    const onSubmit = vi.fn();
+    const view = renderComposer({ onDraftChange, onSubmit });
+    fireEvent.change(getTextarea(view.container), { target: { value: "/help", selectionStart: 5 } });
+    fireEvent.click(view.getByTestId("slash-item-composer:help"));
+    const command = await view.findByRole("button", { name: /custom-native/ });
+    fireEvent.click(command);
+    expect(onDraftChange).toHaveBeenLastCalledWith("/custom-native ");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("offers only skills for dollar syntax and inserts the dollar token", async () => {
+    listSkillsMock.mockResolvedValue([makeSkill({ id: "demo", name: "demo" })]);
+    listChatSlashCommandsMock.mockResolvedValue([{ name: "compact", description: "Compact", argumentHint: "" }]);
+    const onDraftChange = vi.fn();
+    const { container, getByTestId, queryByTestId } = renderComposer({ onDraftChange });
+    const el = getTextarea(container);
+    fireEvent.change(el, { target: { value: "$", selectionStart: 1 } });
+    await waitFor(() => expect(queryByTestId("slash-item-skill:demo")).not.toBeNull());
+    expect(queryByTestId("slash-item-mode:plan")).toBeNull();
+    expect(queryByTestId("slash-item-provider-command:compact")).toBeNull();
+    fireEvent.click(getByTestId("slash-item-skill:demo"));
+    expect(onDraftChange).toHaveBeenLastCalledWith("$demo ");
+  });
+
+  it("refreshes both commands and skills from the slash menu", async () => {
+    listSkillsMock.mockResolvedValue([]);
+    const { container, getByTestId } = renderComposer();
+    fireEvent.change(getTextarea(container), { target: { value: "/", selectionStart: 1 } });
+    await waitFor(() => expect(getByTestId("slash-item-composer:refresh")).not.toHaveAttribute("data-disabled", "true"));
+    fireEvent.click(getByTestId("slash-item-composer:refresh"));
+    await waitFor(() => expect(listChatSlashCommandsMock).toHaveBeenLastCalledWith("claude", "/home/user/project", true));
+    expect(listSkillsMock).toHaveBeenLastCalledWith("/home/user/project", true, true);
+  });
 
   it("opens the popup, loads skills lazily, and shows them under SKILLS", async () => {
     listSkillsMock.mockResolvedValue([

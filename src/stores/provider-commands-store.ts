@@ -13,10 +13,10 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * time the composer's slash popup opens for a provider + cwd pair.
  *
  * Sibling of `skills-store` — same lazy-load-on-popup-open shape, but
- * keyed per `(provider, cwd)` because project-scoped custom commands
- * are cwd-sensitive and each provider reports its own vocabulary.
+ * keyed per provider/directory and, for ACP providers, conversation.
+ * Home resolves to the user's home directory on the backend.
  *
- * Static provider catalogues stay cached for the app's lifetime. An ACP
+ * Provider catalogues expire after one minute. An ACP
  * runtime can replace its backend snapshot at any point in a session, so the
  * composer force-refreshes this inexpensive IPC read whenever its popup
  * reopens. A stale cache clears on `invalidate()` (used by tests) or an app
@@ -25,18 +25,21 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 interface ProviderCommandsEntry {
   commands: ProviderSlashCommand[];
   loaded: boolean;
+  loadedAt?: number;
   loading: boolean;
   error: string | null;
 }
 
 interface ProviderCommandsState {
-  /** Keyed by `${provider}\n${cwd}`. */
+  /** Provider + directory + optional ACP conversation. */
   entries: Record<string, ProviderCommandsEntry>;
+  generation: number;
 
   loadCommands: (
     provider: AgentChatProviderKind,
     cwd: string | null,
     force?: boolean,
+    threadId?: string | null,
   ) => Promise<void>;
   /** Drop every cached entry. Next `loadCommands` refetches. */
   invalidate: () => void;
@@ -61,27 +64,28 @@ const EMPTY_ENTRY: ProviderCommandsEntry = {
 export function catalogueFollowsSession(
   provider: AgentChatProviderKind,
 ): boolean {
-  return provider === "grok" || provider === "cursor";
+  return provider === "grok" || provider === "cursor" || provider === "hermes";
 }
 
 export const commandsKey = (
   provider: AgentChatProviderKind,
-  cwd: string,
-): string => `${provider}\n${cwd}`;
+  cwd: string | null,
+  threadId: string | null = null,
+): string => `${provider}\n${cwd ?? "<home>"}${catalogueFollowsSession(provider) ? `\n${threadId ?? ""}` : ""}`;
 
 export const useProviderCommandsStore = create<ProviderCommandsState>()(
   (set, get) => ({
     entries: {},
+    generation: 0,
 
-    loadCommands: async (provider, cwd, force = false) => {
-      // No cwd (Home draft with no project anchored) → nothing to
-      // probe against; project commands are cwd-relative.
-      if (!cwd) return;
-      const key = commandsKey(provider, cwd);
+    loadCommands: async (provider, cwd, force = false, threadId = null) => {
+      // Home uses the backend's home directory, just like skill discovery.
+      const key = commandsKey(provider, cwd, threadId);
       const entry = get().entries[key] ?? EMPTY_ENTRY;
 
       if (entry.loading) return;
-      if (entry.loaded && !force) return;
+      if (entry.loaded && !entry.error && !force && Date.now() - (entry.loadedAt ?? 0) < 60_000) return;
+      const generation = get().generation;
 
       set((s) => ({
         entries: {
@@ -90,19 +94,24 @@ export const useProviderCommandsStore = create<ProviderCommandsState>()(
         },
       }));
       try {
-        const commands = await listChatSlashCommands(provider, cwd);
+        const commands = await (catalogueFollowsSession(provider)
+          ? listChatSlashCommands(provider, cwd, force, threadId)
+          : listChatSlashCommands(provider, cwd, force));
+        if (get().generation !== generation) return;
         set((s) => ({
           entries: {
             ...s.entries,
             [key]: {
               commands,
               loaded: true,
+              loadedAt: Date.now(),
               loading: false,
               error: null,
             },
           },
         }));
       } catch (err) {
+        if (get().generation !== generation) return;
         set((s) => ({
           entries: {
             ...s.entries,
@@ -117,7 +126,7 @@ export const useProviderCommandsStore = create<ProviderCommandsState>()(
     },
 
     invalidate: () => {
-      set({ entries: {} });
+      set((s) => ({ entries: {}, generation: s.generation + 1 }));
     },
   }),
 );
@@ -125,8 +134,7 @@ export const useProviderCommandsStore = create<ProviderCommandsState>()(
 /** Selector factory: the entry for a provider + cwd pair, or the
  *  stable empty entry when nothing has been fetched yet. */
 export const selectProviderCommands =
-  (provider: AgentChatProviderKind, cwd: string | null) =>
+  (provider: AgentChatProviderKind, cwd: string | null, threadId: string | null = null) =>
   (s: ProviderCommandsState): ProviderCommandsEntry => {
-    if (!cwd) return EMPTY_ENTRY;
-    return s.entries[commandsKey(provider, cwd)] ?? EMPTY_ENTRY;
+    return s.entries[commandsKey(provider, cwd, threadId)] ?? EMPTY_ENTRY;
   };

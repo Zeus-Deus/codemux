@@ -6,7 +6,7 @@ import type { Skill, SkillProvider } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 export interface SkillTokenMatch {
-  /** Inclusive start offset in the source text, points at the `/`. */
+  /** Inclusive start offset, pointing at `/` or `$`. */
   start: number;
   /** Exclusive end offset (one past the last char of the name). */
   end: number;
@@ -18,12 +18,12 @@ export interface SkillTokenMatch {
   skill: Skill;
 }
 
-// Slash must sit at start-of-text or be preceded by whitespace, mirroring
+// The trigger must sit at start-of-text or be preceded by whitespace, mirroring
 // the rule in `findSlashAtCursor`. The name is `[A-Za-z0-9_-]+` and must
 // end at a non-name character (or end-of-text). Lookbehind + lookahead
 // keep matches non-greedy and boundary-respecting.
 const SKILL_TOKEN_RE =
-  /(?<=^|\s)\/([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){0,3})(?=[^A-Za-z0-9_:-]|$)/g;
+  /(?<=^|\s)[/$]([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){0,3})(?=[^A-Za-z0-9_:-]|$)/g;
 
 /** Match chat adapters to the projection the backend invokes for them. */
 function projectionProviderForChat(
@@ -110,6 +110,7 @@ export function skillTokenFor(skill: Skill, skills: Skill[]): string {
 export function parseSkillTokens(
   text: string,
   skills: Skill[],
+  providerCommands: readonly { name: string }[] = [],
 ): SkillTokenMatch[] {
   if (!text || skills.length === 0) return [];
 
@@ -132,6 +133,10 @@ export function parseSkillTokens(
     if (!skill) continue;
     const start = m.index;
     const end = start + m[0].length;
+    // Native commands own the leading slash; dollar syntax always picks
+    // the exact skill even when its name matches a provider command.
+    if (m[0].startsWith("/") && text.slice(0, start).trim() === "" &&
+        providerCommands.some((command) => command.name.toLowerCase() === name.toLowerCase())) continue;
     matches.push({ start, end, token: m[0], name, skill });
   }
   return matches;
@@ -187,8 +192,9 @@ export function rebaseSkillSelection(
 export function resolveSkillSelection(
   text: string,
   skills: Skill[],
+  providerCommands: readonly { name: string }[] = [],
 ): ResolvedSkillSelection {
-  const matches = parseSkillTokens(text, skills);
+  const matches = parseSkillTokens(text, skills, providerCommands);
   if (matches.length === 0) return { skillIds: [], text };
   const ids: string[] = [];
   const seen = new Set<string>();

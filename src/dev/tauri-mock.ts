@@ -3435,7 +3435,23 @@ const MOCK_MARKETPLACE_VARIANTS: Record<string, unknown[]> = {
   ],
 };
 
+const mockHooks = [{
+  key: "project:/demo/.codex/hooks.json:Stop:0", currentHash: "demo-hook-version", eventName: "stop",
+  handlerType: "command", command: "npm run check", source: "project", sourcePath: "/demo/.codex/hooks.json",
+  enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
+}];
+
 const handlers: Record<string, Handler> = {
+  agent_chat_hooks: (a) => {
+    const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
+    if (update) {
+      const hook = mockHooks.find((hook) => hook.key === update.key);
+      if (!hook || update.hash !== hook.currentHash) throw new Error("This hook changed. Refresh and review it.");
+      if (update.action === "trust") hook.trustStatus = "trusted";
+      if (update.action === "setEnabled") hook.enabled = update.enabled ?? false;
+    }
+    return { cwd: a.cwd ?? "/demo", hooks: mockHooks.map((hook) => ({ ...hook })), warnings: [], errors: [] };
+  },
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
   bootstrap_session: () => ({
@@ -3735,7 +3751,7 @@ const handlers: Record<string, Handler> = {
             ? GROK_CAPABILITIES
             : EMPTY_CAPABILITIES), supports_steering: a.provider === "codex" || a.provider === "opencode" }),
   // Provider commands mirror only surfaces our adapters can execute.
-  // OpenCode native commands stay hidden; its skills remain available.
+  // Codex actions route to app-server; OpenCode commands use its command API.
   list_chat_slash_commands: (a) =>
     a.provider === "claude"
       ? [
@@ -3793,6 +3809,17 @@ const handlers: Record<string, Handler> = {
             argumentHint: "<goal text>",
           },
         ]
+      : a.provider === "codex"
+        ? [
+            { name: "compact", description: "Summarize conversation history to free up context", argumentHint: "" },
+            { name: "review", description: "Review changes, a branch, a commit, or custom instructions", argumentHint: "[uncommitted | branch <name> | commit <sha> | instructions]" },
+          ]
+      : a.provider === "opencode"
+        ? [
+            { name: "compact", description: "Summarize conversation history to free up context", argumentHint: "" },
+            { name: "init", description: "Initialize project instructions", argumentHint: "" },
+            { name: "test", description: "Run the project test suite", argumentHint: "[test filter]" },
+          ]
       : a.provider === "cursor"
           ? [
               // This adapter's catalogue carries a name and description

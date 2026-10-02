@@ -173,6 +173,12 @@ async fn live_session_update_populates_the_shared_command_cache() {
     .await
     .expect("session never published its command catalogue");
 
+    assert_eq!(provider.session_slash_commands(ThreadId(thread_id.into()), &cwd).await.unwrap(), published);
+    assert!(provider.session_slash_commands(ThreadId(thread_id.into()), std::path::Path::new("/wrong-directory")).await.is_err());
+    // A catalogue owned by another conversation must not be returned just
+    // because it has the same cwd.
+    assert!(provider.session_slash_commands(ThreadId("missing-conversation".into()), &cwd).await.unwrap().is_empty());
+
     assert_eq!(
         published
             .iter()

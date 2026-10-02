@@ -53,11 +53,10 @@ export interface CommandRegistryEntry {
 // first thing in a draft (`/home/zeus/notes.md`) can never read as a
 // command.
 const LEADING_COMMAND_RE =
-  /^\s*\/([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){0,3})(?=[^A-Za-z0-9_:/-]|$)/;
+  /^\s*([/$])([A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)(?=[^A-Za-z0-9_.:/-]|$)/;
 
-/** Fold a skill list + the provider's discovered commands into one
- *  lookup keyed by lowercased name. Skills win a collision, matching
- *  the popup's `reservedNames` precedence. */
+/** Fold skills and native commands into one lookup. Native names own
+ *  the leading slash; every skill also has an explicit dollar address. */
 export function buildCommandRegistry(
   skills: readonly Skill[],
   providerCommands: readonly {
@@ -79,11 +78,9 @@ export function buildCommandRegistry(
     // Address the skill the same way the popup inserts it, so a
     // collision-qualified token (`/provider:scope:name`) still resolves.
     const token = skillTokenFor(skill, skills as Skill[]).slice(1);
-    registry.set(token.toLowerCase(), {
-      name: token,
-      kind: "skill",
-      description: skill.description ?? undefined,
-    });
+    const entry: CommandRegistryEntry = { name: token, kind: "skill", description: skill.description ?? undefined };
+    registry.set(`$${token.toLowerCase()}`, entry);
+    if (!registry.has(token.toLowerCase())) registry.set(token.toLowerCase(), entry);
   }
   return registry;
 }
@@ -98,16 +95,16 @@ export function parseLeadingCommand(
 ): DraftCommandMatch | null {
   const match = LEADING_COMMAND_RE.exec(text);
   if (!match) return null;
-  const name = match[1];
+  const name = match[2];
   if (!name) return null;
-  const entry = registry.get(name.toLowerCase());
-  if (!entry) return null;
+  const entry = registry.get(match[1] === "$" ? `$${name.toLowerCase()}` : name.toLowerCase());
+  if (!entry || (match[1] === "$" && entry.kind !== "skill")) return null;
   const end = match[0].length;
   const start = end - name.length - 1;
   return {
     start,
     end,
-    token: `/${name}`,
+    token: `${match[1]}${name}`,
     name,
     kind: entry.kind,
     description: entry.description?.trim() ?? "",

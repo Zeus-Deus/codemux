@@ -24,6 +24,7 @@ pub mod opencode;
 pub mod pricing;
 pub mod provider;
 pub mod types;
+pub mod slash_commands;
 
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};

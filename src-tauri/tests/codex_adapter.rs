@@ -133,6 +133,44 @@ fn start_input(thread_id: &str) -> StartSessionInput {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_hooks_use_catalogue_and_exact_config_updates_without_inference() {
+    use codemux_lib::agent_provider::codex::hooks::HookUpdate;
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let fixture = write_script(json!([{
+        "key": "path:/tmp/.codex/hooks.json:Stop:0", "currentHash": "reviewed",
+        "isManaged": false, "trustStatus": "untrusted", "enabled": false,
+        "eventName": "stop", "handlerType": "command", "command": "npm run check"
+    }]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_HOOKS", fixture.path.to_str().unwrap()),
+        ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+    let catalogue = provider.manage_hooks(&cwd, None, None).await.unwrap();
+    assert_eq!(catalogue.hooks[0]["command"], "npm run check");
+    let probe_calls = std::fs::read_to_string(trace.path()).unwrap();
+    assert!(!probe_calls.contains("thread/start"));
+    assert!(!probe_calls.contains("turn/start"));
+    start_session_resilient(&provider, start_input("hooks-live")).await.unwrap();
+    let thread = Some(ThreadId("hooks-live".into()));
+    let key = catalogue.hooks[0]["key"].as_str().unwrap().to_string();
+    assert!(provider.manage_hooks(&cwd, thread.clone(), Some(HookUpdate::Trust { key: key.clone(), hash: "stale".into() })).await.is_err());
+    assert!(!std::fs::read_to_string(trace.path()).unwrap().contains("config/batchWrite"));
+    let trusted = provider.manage_hooks(&cwd, thread.clone(), Some(HookUpdate::Trust { key: key.clone(), hash: "reviewed".into() })).await.unwrap();
+    assert_eq!(trusted.hooks[0]["trustStatus"], "trusted");
+    let enabled = provider.manage_hooks(&cwd, thread, Some(HookUpdate::SetEnabled { key: key.clone(), hash: "reviewed".into(), enabled: true })).await.unwrap();
+    assert_eq!(enabled.hooks[0]["enabled"], true);
+    let calls: Vec<Value> = std::fs::read_to_string(trace.path()).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let writes: Vec<_> = calls.iter().filter(|call| call["method"] == "config/batchWrite").collect();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0]["params"]["edits"][0]["value"], json!({key.clone(): {"trusted_hash": "reviewed"}}));
+    assert_eq!(writes[1]["params"]["edits"][0]["value"], json!({key: {"enabled": true}}));
+    assert!(calls.iter().all(|call| call["method"] != "turn/start"));
+    provider.stop_session(ThreadId("hooks-live".into())).await.unwrap();
+}
+
 #[derive(Debug, Default)]
 struct RecordingTurnCheckpoint(Mutex<Vec<&'static str>>);
 
@@ -429,6 +467,80 @@ async fn send_turn_emits_structured_skill_item_on_the_wire() {
         })
     }));
     provider.stop_session(ThreadId("t-skill".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_commands_use_rpc_and_release_the_active_turn() {
+    for (text, method, expected) in [
+        (
+            "/compact",
+            "thread/compact/start",
+            json!({"threadId":"c-1"}),
+        ),
+        (
+            "/review commit abc123",
+            "review/start",
+            json!({
+                "threadId":"c-1", "delivery":"inline", "target":{"type":"commit","sha":"abc123"}
+            }),
+        ),
+    ] {
+        let trace = tempfile::NamedTempFile::new().unwrap();
+        let script = write_script(json!([
+            {"after":method,"delay_ms":5,"emit":"notification","method":"turn/started",
+             "params":{"threadId":"c-1","turnId":"native-turn"}},
+            {"after":method,"delay_ms":20,"emit":"notification","method":"turn/completed",
+             "params":{"threadId":"c-1","turnId":"native-turn","status":"succeeded"}}
+        ]));
+        let wrapper = wrapper_with_env(&[
+            ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+            ("FAKE_CODEX_SCRIPT", script.path.to_str().unwrap()),
+        ]);
+        let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+        let mut stream = provider.event_stream();
+        start_session_resilient(&provider, start_input("native-chat"))
+            .await
+            .unwrap();
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: ThreadId("native-chat".into()),
+                text: text.into(),
+                images: vec![],
+                skill_invocations: vec![],
+                display_text: None,
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+                turn_checkpoint: None,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = stream.next().await {
+                if let ProviderRuntimeEvent::TurnCompleted { status, .. } = event {
+                    assert!(matches!(status, TurnStatus::Success));
+                    return;
+                }
+            }
+            panic!("native command never completed");
+        })
+        .await
+        .unwrap();
+        assert!(!provider.turn_active(&ThreadId("native-chat".into())).await);
+        let calls: Vec<Value> = std::fs::read_to_string(trace.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let native = calls.iter().find(|call| call["method"] == method).unwrap();
+        assert_eq!(native["params"], expected);
+        assert!(!calls.iter().any(|call| call["method"] == "turn/start"));
+        provider
+            .stop_session(ThreadId("native-chat".into()))
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

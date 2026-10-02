@@ -1,8 +1,10 @@
 import { Command as CommandPrimitive } from "cmdk";
-import { useEffect, useRef, type SyntheticEvent } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, type SyntheticEvent } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
+import { CommandSourceIcon } from "./CommandSourceIcon";
+import { usePopupHighlight, type PopupHighlightStore } from "./popup-highlight-store";
 import {
   groupSlashItems,
   type SlashCommandItem,
@@ -62,7 +64,7 @@ const stopRowSelection = (event: SyntheticEvent) => event.stopPropagation();
  * `highlightedId` prop. The parent intercepts ArrowUp/ArrowDown/Enter
  * on the textarea and updates `highlightedId` accordingly. cmdk
  * renders the highlighted state via its `value` prop and forwards
- * mouse-hover changes back through `onValueChange`.
+ * mouse-hover changes back through the popup pointer handler.
  *
  * Positioning: rendered as `absolute bottom-full` inside the same
  * `relative` wrapper as the textarea so the popup floats just above
@@ -77,33 +79,114 @@ export function SlashCommandPopup({
   footerNote = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement | null>(null);
-  // Raised only for the span of a pointermove being dispatched through
-  // the popup. cmdk selects a row from its own `onPointerMove` and
-  // calls `onValueChange` synchronously from there, so a highlight
-  // change seen while this is up is hover-driven. The capture handler
-  // below raises it before cmdk's row handler runs; the bubble handler
-  // lowers it once the event is done, leaving cmdk's own list-churn
-  // re-selection unmarked.
-  const pointerMoveActiveRef = useRef(false);
+  const pointerHighlightRef = useRef<string | null>(null);
+  const pointerPositionRef = useRef<{ x: number; y: number } | null>(null);
+  const selectRef = useRef(onSelect);
+  selectRef.current = onSelect;
+  const selectItem = useCallback((item: SlashCommandItem) => selectRef.current(item), []);
 
-  // cmdk's built-in scrollIntoView only fires when cmdk itself handles
-  // the keyboard event. Because the textarea keeps focus and the parent
-  // drives highlight via the controlled `value` prop, cmdk never sees
-  // ArrowUp/Down — so we replicate the scroll-into-view ourselves
-  // whenever the highlighted item changes.
-  useEffect(() => {
+  // Hover must not pull a manually scrolled menu back toward its selection.
+  // Keyboard navigation scrolls only this viewport, never the chat or window.
+  useLayoutEffect(() => {
     if (!open || !highlightedId) return;
+    if (pointerHighlightRef.current === highlightedId) {
+      pointerHighlightRef.current = null;
+      return;
+    }
+    pointerHighlightRef.current = null;
     const list = listRef.current;
-    if (!list) return;
-    const target = list.querySelector<HTMLElement>(
+    const viewport = list?.closest<HTMLElement>("[data-slot=scroll-area-viewport]");
+    const target = list?.querySelector<HTMLElement>(
       `[data-testid="slash-item-${CSS.escape(highlightedId)}"]`,
     );
-    target?.scrollIntoView({ block: "nearest" });
+    if (!viewport || !target) return;
+    const bounds = viewport.getBoundingClientRect();
+    const row = target.getBoundingClientRect();
+    if (row.top < bounds.top) viewport.scrollTop += row.top - bounds.top;
+    else if (row.bottom > bounds.bottom) viewport.scrollTop += row.bottom - bounds.bottom;
   }, [highlightedId, open]);
 
-  if (!open) return null;
+  // Keep the scroll area out of highlight moves: cmdk's store updates only the
+  // two affected rows, so held arrow keys stay cheap in WebKitGTK.
+  const list = useMemo(
+    () => (
+      <>
+        {/*
+          Stage 4 polish — wrap the cmdk list in shadcn `ScrollArea`
+          so the popup gets a visible (Radix-styled) scrollbar when
+          content overflows the 320 px cap. Previously the list had
+          `overflow-y-auto no-scrollbar`, which scrolled silently and
+          gave users no affordance that more rows existed below the
+          fold (notably: the new "MCP Servers…" attach row was
+          frequently below the fold). The ScrollArea owns the
+          scrolling ancestor; the cmdk List is a plain listbox inside
+          it. Keyboard navigation adjusts only this viewport’s scroll position.
+        */}
+        {/*
+          `type="always"` keeps the scrollbar permanently visible
+          whenever content overflows the 320 px cap (Radix's default
+          is `"hover"`, which fades the scrollbar out — invisible to
+          users who haven't moved the cursor over the right edge yet).
+          The wider scrollbar (`w-2`) gets explicit sizing via the
+          `[&_…scrollbar]` selectors below so it's a solid affordance
+          rather than a 1 px line.
+        */}
+        <ScrollArea
+          type="always"
+          className={cn(
+            "max-h-80 w-full",
+            // Viewport: cap height + force the inner div cmdk renders
+            // to sit on a single block (cmdk's <Command> spreads
+            // multi-children inside CommandList; the viewport's
+            // default flex layout otherwise stretches a single child).
+            "[&>[data-slot=scroll-area-viewport]]:max-h-80",
+            "[&>[data-slot=scroll-area-viewport]]:overscroll-contain",
+            // Radix's viewport wraps children in a `display: table;
+            // min-width: 100%` div (inline styles). A table box is
+            // shrink-to-fit, so any row wider than the popup — a long
+            // chat title plus its provider/timestamp adornment —
+            // stretches the table past 100% and gets clipped by the
+            // wrapper's `overflow-hidden` instead of truncating.
+            // Forcing the wrapper back to a plain full-width block
+            // gives `truncate` a definite width to work against.
+            // `!` is required: these override inline styles.
+            "[&>[data-slot=scroll-area-viewport]>div]:!block",
+            "[&>[data-slot=scroll-area-viewport]>div]:!w-full",
+            "[&>[data-slot=scroll-area-viewport]>div]:!min-w-0",
+            // Scrollbar: solid track + visible thumb in the popover's
+            // contrast tier so it reads against the dark popup bg.
+            "[&_[data-slot=scroll-area-scrollbar]]:w-2",
+            "[&_[data-slot=scroll-area-thumb]]:bg-foreground/30",
+            "[&_[data-slot=scroll-area-thumb]]:hover:bg-foreground/50",
+          )}
+        >
+          <CommandPrimitive.List
+            ref={listRef}
+            className="outline-none"
+          >
+          <CommandRows items={items} onSelect={selectItem} />
+          {footerNote && (
+            <div
+              data-testid="slash-popup-footer"
+              data-tone={footerNote.tone}
+              className={cn(
+                "px-3 py-2 text-label border-t border-border/40",
+                footerNote.tone === "error"
+                  ? "text-destructive"
+                  : "text-muted-foreground/80",
+              )}
+            >
+              {footerNote.message}
+            </div>
+          )}
+          </CommandPrimitive.List>
+        </ScrollArea>
+      </>
+    ),
+    [items, footerNote, selectItem],
+  );
 
-  const groups = groupSlashItems(items);
+  if (!open) return null;
 
   return (
     <div
@@ -113,11 +196,22 @@ export function SlashCommandPopup({
         "rounded-lg border border-border/60 bg-popover shadow-md",
         "overflow-hidden",
       )}
-      onPointerMoveCapture={() => {
-        pointerMoveActiveRef.current = true;
+      onPointerLeave={() => {
+        pointerPositionRef.current = null;
       }}
-      onPointerMove={() => {
-        pointerMoveActiveRef.current = false;
+      onPointerMove={(event) => {
+        if (event.buttons !== 0) return;
+        const previous = pointerPositionRef.current;
+        const position = { x: event.clientX, y: event.clientY };
+        pointerPositionRef.current = position;
+        // Scrolling can place another row under a stationary cursor.
+        // Only actual pointer movement should change the highlight.
+        if (previous?.x === position.x && previous.y === position.y) return;
+        const row = (event.target as HTMLElement).closest<HTMLElement>("[cmdk-item]");
+        const id = row?.getAttribute("data-value");
+        if (!id || row?.getAttribute("aria-disabled") === "true") return;
+        pointerHighlightRef.current = id;
+        onHighlightChange(id, "pointer");
       }}
       // Pointer events live on the popup itself; the textarea keeps
       // focus, so cmdk never gets keyboard input — the parent drives
@@ -148,70 +242,37 @@ export function SlashCommandPopup({
         // Manual filtering — parent decides what's visible.
         shouldFilter={false}
         value={highlightedId ?? ""}
+        disablePointerSelection
         onValueChange={(id) => {
-          if (id) {
-            onHighlightChange(
-              id,
-              pointerMoveActiveRef.current ? "pointer" : "list",
-            );
-          }
+          if (id) onHighlightChange(id, "list");
         }}
         className="text-popover-foreground"
       >
-        {/*
-          Stage 4 polish — wrap the cmdk list in shadcn `ScrollArea`
-          so the popup gets a visible (Radix-styled) scrollbar when
-          content overflows the 320 px cap. Previously the list had
-          `overflow-y-auto no-scrollbar`, which scrolled silently and
-          gave users no affordance that more rows existed below the
-          fold (notably: the new "MCP Servers…" attach row was
-          frequently below the fold). The ScrollArea owns the
-          scrolling ancestor; the cmdk List is a plain listbox inside
-          it. `scrollIntoView` from the keyboard-nav effect walks up
-          to the ScrollArea viewport unchanged.
-        */}
-        {/*
-          `type="always"` keeps the scrollbar permanently visible
-          whenever content overflows the 320 px cap (Radix's default
-          is `"hover"`, which fades the scrollbar out — invisible to
-          users who haven't moved the cursor over the right edge yet).
-          The wider scrollbar (`w-2`) gets explicit sizing via the
-          `[&_…scrollbar]` selectors below so it's a solid affordance
-          rather than a 1 px line.
-        */}
-        <ScrollArea
-          type="always"
-          className={cn(
-            "max-h-80 w-full",
-            // Viewport: cap height + force the inner div cmdk renders
-            // to sit on a single block (cmdk's <Command> spreads
-            // multi-children inside CommandList; the viewport's
-            // default flex layout otherwise stretches a single child).
-            "[&>[data-slot=scroll-area-viewport]]:max-h-80",
-            // Radix's viewport wraps children in a `display: table;
-            // min-width: 100%` div (inline styles). A table box is
-            // shrink-to-fit, so any row wider than the popup — a long
-            // chat title plus its provider/timestamp adornment —
-            // stretches the table past 100% and gets clipped by the
-            // wrapper's `overflow-hidden` instead of truncating.
-            // Forcing the wrapper back to a plain full-width block
-            // gives `truncate` a definite width to work against.
-            // `!` is required: these override inline styles.
-            "[&>[data-slot=scroll-area-viewport]>div]:!block",
-            "[&>[data-slot=scroll-area-viewport]>div]:!w-full",
-            "[&>[data-slot=scroll-area-viewport]>div]:!min-w-0",
-            // Scrollbar: solid track + visible thumb in the popover's
-            // contrast tier so it reads against the dark popup bg.
-            "[&_[data-slot=scroll-area-scrollbar]]:w-2",
-            "[&_[data-slot=scroll-area-thumb]]:bg-foreground/30",
-            "[&_[data-slot=scroll-area-thumb]]:hover:bg-foreground/50",
-          )}
-        >
-          <CommandPrimitive.List
-            ref={listRef}
-            className="outline-none"
-          >
-          {items.length === 0 ? (
+        {list}
+        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="border-t border-border/40 px-3 py-2 text-label text-muted-foreground">
+          {items.find((item) => item.id === highlightedId)?.identity?.label}
+        </div>}
+      </CommandPrimitive>
+    </div>
+  );
+}
+
+/** Reads the highlight from a store so arrow keys re-render only this popup. */
+export function StoreSlashCommandPopup({
+  highlight,
+  ...props
+}: Omit<Props, "highlightedId"> & { highlight: PopupHighlightStore }) {
+  return <SlashCommandPopup {...props} highlightedId={usePopupHighlight(highlight)} />;
+}
+
+// Keep the catalogue mounted during arrow navigation. cmdk updates the two
+// selected rows through its store; recreating every row on each repeat makes
+// long skill inventories lag behind the user's key release.
+const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "items" | "onSelect">) {
+  const groups = groupSlashItems(items);
+  return (
+    <>
+      {items.length === 0 ? (
             <div className="px-3 py-4 text-center text-label text-muted-foreground">
               No commands match
             </div>
@@ -261,9 +322,10 @@ export function SlashCommandPopup({
                         disabled && "opacity-50 cursor-not-allowed",
                       )}
                     >
-                      {Icon && (
+                      {item.identity ? <CommandSourceIcon identity={item.identity} /> : Icon && (
                         <span
                           className={cn(
+                            "flex w-3.5 shrink-0 items-center",
                             item.stacked &&
                               "flex size-7 shrink-0 items-center justify-center rounded-md border border-border/40 bg-muted/35",
                           )}
@@ -292,7 +354,7 @@ export function SlashCommandPopup({
                         </span>
                       ) : (
                         <>
-                      <span className="text-foreground">{item.label}</span>
+                      <span className="max-w-[40%] shrink-0 truncate text-foreground" title={item.label}>{item.label}</span>
                       {item.argumentHint &&
                         // The description already falls back to
                         // `/<name> <hint>`; don't repeat it.
@@ -303,7 +365,7 @@ export function SlashCommandPopup({
                           </span>
                         )}
                       {item.description && (
-                        <span className="truncate text-label text-muted-foreground">
+                        <span className="min-w-0 flex-1 truncate text-label text-muted-foreground">
                           {item.description}
                         </span>
                       )}
@@ -332,7 +394,7 @@ export function SlashCommandPopup({
                           {item.rightAdornment}
                         </span>
                       ) : (
-                        <span className="ml-auto font-mono text-label text-muted-foreground/70">
+                        <span className="ml-auto max-w-[30%] shrink-0 truncate font-mono text-label text-muted-foreground/70" title={item.command}>
                           {item.command}
                         </span>
                       )}
@@ -342,23 +404,6 @@ export function SlashCommandPopup({
               </CommandPrimitive.Group>
             ))
           )}
-          {footerNote && (
-            <div
-              data-testid="slash-popup-footer"
-              data-tone={footerNote.tone}
-              className={cn(
-                "px-3 py-2 text-label border-t border-border/40",
-                footerNote.tone === "error"
-                  ? "text-destructive"
-                  : "text-muted-foreground/80",
-              )}
-            >
-              {footerNote.message}
-            </div>
-          )}
-          </CommandPrimitive.List>
-        </ScrollArea>
-      </CommandPrimitive>
-    </div>
+    </>
   );
-}
+});

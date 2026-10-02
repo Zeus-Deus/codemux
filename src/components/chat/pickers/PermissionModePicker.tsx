@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Lock } from "lucide-react";
 
 import {
@@ -36,6 +36,7 @@ interface Props {
   value: string | null;
   onChange: (mode: string) => void;
   disabled?: boolean;
+  openSignal?: number;
   /** Render a leading hairline pipe. Lives inside the picker (not the
    *  footer) so the pipe disappears together with the control when the
    *  capability gate hides it — no orphaned separators. */
@@ -54,10 +55,18 @@ export function PermissionModePicker({
   value,
   onChange,
   disabled,
+  openSignal,
   withSeparator,
   iconOnly = false,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const lastSignal = useRef(openSignal);
+  useEffect(() => {
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      if (!disabled && modes?.length) setOpen(true);
+    }
+  }, [openSignal, disabled, modes]);
 
   // Hide when capabilities aren't available or the provider has
   // declared no permission modes.

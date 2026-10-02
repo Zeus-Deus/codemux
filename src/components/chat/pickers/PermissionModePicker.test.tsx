@@ -115,6 +115,20 @@ describe("PermissionModePicker — render", () => {
 });
 
 describe("PermissionModePicker — interaction", () => {
+  it("opens on a new composer command signal without changing permissions", async () => {
+    const onChange = vi.fn();
+    const view = (signal: number) => (
+      <TooltipProvider>
+        <PermissionModePicker modes={CODEX_MODES} value={null} onChange={onChange} openSignal={signal} />
+      </TooltipProvider>
+    );
+    const { rerender } = render(view(0));
+    expect(screen.queryByRole("option")).toBeNull();
+    rerender(view(1));
+    expect((await screen.findAllByRole("option")).length).toBe(CODEX_MODES.length);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   it("clicking a row calls onChange with the mode's value", async () => {
     const user = userEvent.setup();
     const { trigger, onChange } = renderPicker({ modes: CLAUDE_MODES });

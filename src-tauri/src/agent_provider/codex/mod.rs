@@ -25,6 +25,8 @@
 pub mod auth;
 pub mod capabilities;
 pub mod protocol;
+pub mod slash_commands;
+pub mod hooks;
 pub(crate) mod session;
 pub mod translate;
 
@@ -35,7 +37,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_core::Stream;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderCapabilities, ProviderError,
@@ -87,6 +89,7 @@ pub struct CodexAgentProvider {
     config: CodexProviderConfig,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<CodexSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    hooks_operation: Mutex<()>,
 }
 
 impl CodexAgentProvider {
@@ -98,6 +101,7 @@ impl CodexAgentProvider {
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            hooks_operation: Mutex::new(()),
         }
     }
 
@@ -496,6 +500,45 @@ impl AgentProvider for CodexAgentProvider {
             });
         }
         Ok(out)
+    }
+
+    async fn manage_hooks(
+        &self,
+        cwd: &std::path::Path,
+        thread_id: Option<ThreadId>,
+        update: Option<hooks::HookUpdate>,
+    ) -> Result<hooks::HooksList, String> {
+        let _operation = self.hooks_operation.lock().await;
+        let cwd = cwd.canonicalize().map_err(|error| format!("Cannot open hooks for this directory: {error}"))?;
+        if let Some(thread_id) = thread_id {
+            let session = self.sessions.read().await.get(&thread_id).cloned();
+            if let Some(session) = session.filter(|session| !session.is_dead()) {
+                if session.cwd.canonicalize().map_err(|error| error.to_string())? != cwd {
+                    return Err("Hook discovery must use this conversation's directory.".into());
+                }
+                return hooks::manage(&session.child, &cwd, update).await;
+            }
+        }
+        // Home/new drafts have no session. Probe without creating a thread
+        // or starting inference, using the same executable and Codex home.
+        let mut env = HashMap::new();
+        if let Some(home) = self.config.codex_home.as_ref() {
+            env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
+        }
+        let child = crate::json_rpc_child::JsonRpcChild::spawn(crate::json_rpc_child::SpawnConfig {
+            program: self.config.codex_binary.clone(), args: vec!["app-server".into()],
+            env, cwd: Some(cwd.clone()), default_timeout: std::time::Duration::from_secs(15),
+        }).await.map_err(|error| format!("Cannot start Codex hook discovery: {error}"))?;
+        let result = async {
+            child.request("initialize", serde_json::json!({
+                "clientInfo": self.config.client_info,
+                "capabilities": {"experimentalApi": true},
+            })).await.map_err(|error| error.to_string())?;
+            child.notify("initialized", serde_json::json!({})).await.map_err(|error| error.to_string())?;
+            hooks::manage(&child, &cwd, update).await
+        }.await;
+        let _ = child.shutdown().await;
+        result
     }
 
     fn event_stream(&self) -> ProviderEventStream {

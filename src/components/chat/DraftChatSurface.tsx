@@ -1,3 +1,4 @@
+import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
   useCallback,
@@ -409,7 +410,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       selectActiveSkills(useSkillsStore.getState(), cwdForSession),
       currentDraft.provider,
     );
-    const skillSelection = resolveSkillSelection(text, sourceSkills);
+    const skillSelection = resolveSkillSelection(text, sourceSkills, selectProviderCommands(currentDraft.provider, cwdForSession, currentDraft.threadId)(useProviderCommandsStore.getState()).commands);
     // Step 8 Stage 2 — snapshot staged attachments at submit time
     // (live store read avoids stale closure if a chip resolved
     // between the last render and Enter). Stage 2.1: filter to

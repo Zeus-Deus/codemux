@@ -6,6 +6,7 @@ import { Bug, ListTodo } from "lucide-react";
 
 import type { SlashCommandItem } from "@/lib/agent-chat/slash-commands";
 import { SlashCommandPopup } from "./SlashCommandPopup";
+import { buildProviderCommands } from "@/lib/agent-chat/slash-commands";
 
 afterEach(() => cleanup());
 
@@ -41,6 +42,83 @@ function makeItems(): SlashCommandItem[] {
 }
 
 describe("SlashCommandPopup", () => {
+  it("shows the definition provider and skill type, even when used in another provider", () => {
+    const item: SlashCommandItem = { id: "skill:review", label: "review", command: "$review", group: "SKILLS", onSelect: vi.fn(), identity: { provider: "claude", kind: "skill", label: "Claude skill · project · Portable in Codex" } };
+    render(<SlashCommandPopup items={[item]} highlightedId={item.id} onHighlightChange={vi.fn()} onSelect={vi.fn()} open />);
+    const source = screen.getByRole("img", { name: item.identity!.label });
+    expect(source.querySelector('[data-provider="claude"]')).not.toBeNull();
+    expect(source.querySelector('[data-provider="codex"]')).toBeNull();
+    expect(source).toHaveAttribute("data-command-kind", "skill");
+    expect(source.children).toHaveLength(1);
+    expect(screen.getByTestId("slash-item-source")).toHaveTextContent("Portable in Codex");
+  });
+
+  it.each(["codex", "claude", "opencode", "cursor", "grok", "hermes"] as const)("identifies %s native commands with one provider mark and a textual command label", (provider) => {
+    const items = buildProviderCommands({ provider, commands: [{ name: "native-action", description: "Provider action", argumentHint: "" }], reservedNames: new Set() });
+    render(<SlashCommandPopup items={items} highlightedId={items[0].id} onHighlightChange={vi.fn()} onSelect={vi.fn()} open />);
+    const source = screen.getByRole("img", { name: items[0].identity!.label });
+    expect(source.querySelector(`[data-provider="${provider}"]`)).not.toBeNull();
+    expect(source).toHaveAttribute("data-command-kind", "command");
+    expect(source.children).toHaveLength(1);
+  });
+  it("does not rebuild a large skill catalogue for each highlight change", () => {
+    const icon = vi.fn(() => <svg aria-hidden />);
+    const items = Array.from({ length: 250 }, (_, index): SlashCommandItem => ({
+      id: `skill:${index}`, label: `Skill ${index}`, command: `/skill-${index}`,
+      group: "SKILLS", icon: icon as unknown as SlashCommandItem["icon"], onSelect: vi.fn(),
+    }));
+    const props = { items, onHighlightChange: vi.fn(), onSelect: vi.fn(), open: true };
+    const { rerender } = render(<SlashCommandPopup {...props} highlightedId={items[0].id} />);
+    expect(icon).toHaveBeenCalledTimes(250);
+    icon.mockClear();
+    for (let index = 1; index <= 10; index++) {
+      rerender(<SlashCommandPopup {...props} onSelect={vi.fn()} highlightedId={items[index].id} />);
+      expect(screen.getByTestId(`slash-item-${items[index].id}`)).toHaveAttribute("data-selected", "true");
+    }
+    expect(icon).not.toHaveBeenCalled();
+  });
+
+  it("keeps keyboard scrolling inside the menu viewport", () => {
+    const props = { items: makeItems(), onHighlightChange: vi.fn(), onSelect: vi.fn(), open: true };
+    const { container, rerender } = render(<SlashCommandPopup {...props} highlightedId="mode:plan" />);
+    const viewport = container.querySelector<HTMLElement>("[data-slot=scroll-area-viewport]")!;
+    const row = screen.getByTestId("slash-item-mode:debug");
+    vi.spyOn(viewport, "getBoundingClientRect").mockReturnValue({ top: 100, bottom: 200 } as DOMRect);
+    const geometry = vi.spyOn(row, "getBoundingClientRect").mockReturnValue({ top: 190, bottom: 220 } as DOMRect);
+    const ancestorScroll = vi.spyOn(row, "scrollIntoView");
+    rerender(<SlashCommandPopup {...props} highlightedId="mode:debug" />);
+    expect(viewport.scrollTop).toBe(20);
+    expect(ancestorScroll).not.toHaveBeenCalled();
+    vi.spyOn(screen.getByTestId("slash-item-mode:plan"), "getBoundingClientRect").mockReturnValue({ top: 90, bottom: 120 } as DOMRect);
+    geometry.mockReturnValue({ top: 110, bottom: 140 } as DOMRect);
+    rerender(<SlashCommandPopup {...props} highlightedId="mode:plan" />);
+    expect(viewport.scrollTop).toBe(10);
+    rerender(<SlashCommandPopup {...props} highlightedId="mode:debug" />);
+    expect(viewport.scrollTop).toBe(10);
+  });
+
+  it("does not scroll on hover or highlight rows moving beneath a stationary pointer", () => {
+    const onHighlightChange = vi.fn();
+    const props = { items: makeItems(), onHighlightChange, onSelect: vi.fn(), open: true };
+    const { container, rerender } = render(<SlashCommandPopup {...props} highlightedId="mode:plan" />);
+    const viewport = container.querySelector<HTMLElement>("[data-slot=scroll-area-viewport]")!;
+    viewport.scrollTop = 80;
+    vi.spyOn(viewport, "getBoundingClientRect").mockReturnValue({ top: 100, bottom: 200 } as DOMRect);
+    const row = screen.getByTestId("slash-item-mode:debug");
+    vi.spyOn(row, "getBoundingClientRect").mockReturnValue({ top: 190, bottom: 220 } as DOMRect);
+    fireEvent.pointerMove(row, { clientX: 100, clientY: 190 });
+    expect(onHighlightChange).toHaveBeenLastCalledWith("mode:debug", "pointer");
+    rerender(<SlashCommandPopup {...props} highlightedId="mode:debug" />);
+    expect(viewport.scrollTop).toBe(80);
+    onHighlightChange.mockClear();
+    fireEvent.wheel(viewport, { deltaY: 100 });
+    fireEvent.pointerMove(screen.getByTestId("slash-item-skill:codemux-ui"), { clientX: 100, clientY: 190 });
+    expect(onHighlightChange).not.toHaveBeenCalled();
+    expect(viewport.scrollTop).toBe(80);
+    fireEvent.pointerMove(screen.getByTestId("slash-item-skill:codemux-ui"), { clientX: 101, clientY: 190 });
+    expect(onHighlightChange).toHaveBeenLastCalledWith("skill:codemux-ui", "pointer");
+  });
+
   it("renders nothing when open=false", () => {
     const { container } = render(
       <SlashCommandPopup

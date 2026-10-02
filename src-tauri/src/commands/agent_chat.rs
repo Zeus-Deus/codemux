@@ -4059,6 +4059,23 @@ pub async fn agent_chat_provider_health(
     crate::agent_provider::health::check_provider_health(provider).await
 }
 
+#[tauri::command]
+pub async fn agent_chat_hooks(
+    provider: ProviderKind,
+    cwd: Option<String>,
+    thread_id: Option<ThreadId>,
+    update: Option<crate::agent_provider::codex::hooks::HookUpdate>,
+    registry: tauri::State<'_, ProviderRegistry>,
+    observability: tauri::State<'_, ObservabilityStore>,
+) -> Result<crate::agent_provider::codex::hooks::HooksList, String> {
+    feature_flag_on(&observability)?;
+    let directory = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) => std::path::PathBuf::from(cwd),
+        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?,
+    };
+    lookup_provider(&registry, provider).await?.manage_hooks(&directory, thread_id, update).await
+}
+
 /// List the provider-native slash commands available to a chat thread
 /// anchored at `cwd`. Claude discovers them through the Agent SDK. ACP
 /// providers publish a full catalogue over `available_commands_update`,
@@ -4066,14 +4083,14 @@ pub async fn agent_chat_provider_health(
 /// answers with one at initialize, so it can be probed before any session
 /// exists. Only expose commands the current adapter can execute.
 ///
-/// Selecting one of these in the UI inserts the literal `/name ` text
-/// into the draft; the text is forwarded verbatim to the provider,
-/// which interprets the leading slash itself. Codemux never executes
-/// provider commands locally.
+/// Selecting a command inserts `/name ` into the draft. Codex actions
+/// map to app-server RPCs, OpenCode uses its command/summarize endpoints,
+/// and Claude/ACP providers interpret the leading slash themselves.
+/// Hermes catalogues belong to individual sessions, including profiles.
 #[tauri::command]
 pub async fn list_chat_slash_commands(
     provider: ProviderKind,
-    cwd: String,
+    cwd: Option<String>,
     slash_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache>,
@@ -4082,9 +4099,23 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
     >,
+    opencode_manager: tauri::State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    force: Option<bool>,
+    thread_id: Option<ThreadId>,
+    registry: tauri::State<'_, ProviderRegistry>,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
+    let cwd = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) => cwd,
+        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?.to_string_lossy().into_owned(),
+    };
+    if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+        if let Some(thread_id) = thread_id {
+            return lookup_provider(&registry, provider).await?
+                .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err);
+        }
+    }
     match provider {
-        ProviderKind::Claude => slash_cache.get_or_harvest(&cwd).await,
+        ProviderKind::Claude => slash_cache.get_or_harvest_with_refresh(&cwd, force.unwrap_or(false)).await,
         ProviderKind::Grok => {
             let binary_path = which::which("grok").map_err(|_| {
                 crate::agent_provider::grok::capabilities::HarvestError::NotInstalled {
@@ -4111,19 +4142,33 @@ pub async fn list_chat_slash_commands(
                 std::path::Path::new(&cwd),
             )
             .await),
-        // OpenCode lists commands through GET /command, but its prompt_async
-        // endpoint treats slash text literally. Native execution needs the
-        // separate command endpoint and project-scoped session lifecycle.
-        // Keep skills available through Codemux's existing skill inventory.
-        ProviderKind::OpenCode => Ok(Vec::new()),
-        // Codex has nothing to enumerate: upstream deleted custom prompts
-        // outright and skills took their place, and the slash commands its
-        // TUI still offers are interpreted by that TUI and never reach the
-        // model, so they mean nothing sent over the app-server protocol
-        // Codemux drives.
-        ProviderKind::Codex => Ok(Vec::new()),
-        // Hermes owns its native skills; there is no slash catalogue to serve.
-        ProviderKind::Hermes => Ok(Vec::new()),
+        ProviderKind::OpenCode => {
+            let handle = opencode_manager.ensure_running().await?;
+            let mut config = crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
+            config.server_password = Some(handle.server_password);
+            let client = crate::agent_provider::opencode::OpenCodeClient::new(config)?;
+            let mut commands = vec![crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                name: "compact".into(),
+                description: "Summarize conversation history to free up context".into(),
+                argument_hint: String::new(),
+            }];
+            for command in client.list_commands(std::path::Path::new(&cwd)).await? {
+                if command.name != "compact" && command.source.as_deref() != Some("skill") {
+                    commands.push(crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                        name: command.name,
+                        description: command.description.unwrap_or_default(),
+                        argument_hint: command.hints.join(" "),
+                    });
+                }
+            }
+            Ok(commands)
+        }
+        ProviderKind::Codex => Ok(crate::agent_provider::codex::slash_commands::commands()),
+        ProviderKind::Hermes => match thread_id {
+            Some(thread_id) => lookup_provider(&registry, provider).await?
+                .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err),
+            None => Ok(Vec::new()),
+        },
     }
 }
 

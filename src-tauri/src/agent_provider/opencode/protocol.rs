@@ -44,6 +44,18 @@ pub struct ModelRef {
     pub model_id: String,
 }
 
+/// Native command inventory returned by GET /command.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenCodeCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub hints: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
 /// One element of the `parts` array on a prompt body.
 ///
 /// Codemux today only emits text parts (the chat composer is plain

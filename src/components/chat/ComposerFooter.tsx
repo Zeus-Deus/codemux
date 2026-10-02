@@ -78,6 +78,7 @@ interface Props {
   attachOpen?: boolean;
   /** Imperative model-picker open request from `/model`. */
   modelPickerOpenSignal?: number;
+  permissionPickerOpenSignal?: number;
   /** Latest context-window occupancy for the thread. `null` renders no
    *  meter. */
   contextUsage?: ContextUsageSnapshot | null;
@@ -143,6 +144,7 @@ export function ComposerFooter({
   onAttachClick,
   attachOpen = false,
   modelPickerOpenSignal,
+  permissionPickerOpenSignal,
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
   contextUsageProviderLabel = null,
@@ -303,6 +305,7 @@ export function ComposerFooter({
             {/* Stays visible while a mode pill is active (discoverability)
                 but disabled, so it can't fight the pill's setting. */}
             <PermissionModePicker
+              openSignal={permissionPickerOpenSignal}
               modes={permissionModes}
               value={permissionMode}
               onChange={onPermissionModeChange}

@@ -1,3 +1,4 @@
+import { usePopupArrowNavigation } from "./use-popup-arrow-navigation";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { useAddonComposerAdapter } from "@/lib/addons/use-addon-composer-adapter";
@@ -47,7 +48,7 @@ import {
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
 import { isChatModeSupported } from "@/lib/agent-chat/mode-compatibility";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
-import { skillsForProvider, skillTokenFor } from "@/lib/agent-chat/skill-tokens";
+import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   buildModelCommand,
@@ -108,12 +109,16 @@ import type {
 } from "@/tauri/types";
 
 import { AttachmentChip } from "./AttachmentChip";
+import { HooksManager } from "./HooksManager";
+import { ProviderCommandsDialog } from "./ProviderCommandsDialog";
+import { useUIStore } from "@/stores/ui-store";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
-import { SlashCommandPopup } from "./SlashCommandPopup";
+import { StoreSlashCommandPopup } from "./SlashCommandPopup";
+import { usePopupHighlightSelector, usePopupHighlightStore } from "./popup-highlight-store";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 
@@ -576,7 +581,8 @@ export function Composer({
         : { value, atEnd },
     );
   }, []);
-  const [slashHighlighted, setSlashHighlighted] = useState<string | null>(null);
+  const slashHighlight = usePopupHighlightStore();
+  const slashHasHighlight = usePopupHighlightSelector(slashHighlight, (id) => id !== null);
   // IME composition guard — slash detection must not fire mid-composition,
   // otherwise dead-key sequences for non-Latin keyboards trigger the
   // popup unexpectedly.
@@ -590,8 +596,11 @@ export function Composer({
   // backend. Only one of slash/mention can be open at a time —
   // `handleTextareaChange` enforces mutual exclusion.
   const [mentionAnchor, setMentionAnchor] = useState<MentionAnchor | null>(null);
-  const [mentionHighlighted, setMentionHighlighted] = useState<string | null>(
-    null,
+  const mentionHighlight = usePopupHighlightStore();
+  // Landing on a chat row is the one move the auto-highlight effect
+  // may need to correct; other moves leave the composer unrendered.
+  const mentionChatHighlight = usePopupHighlightSelector(mentionHighlight, (id) =>
+    id?.startsWith("session:") ? id : null,
   );
   /** True once the user has moved the mention highlight themselves
    *  with the arrow keys. Until then the highlight is ours to re-pick
@@ -697,6 +706,9 @@ export function Composer({
   // and pops the footer's model picker via an incrementing signal
   // (state-only activation, same handling as mode picks).
   const [modelPickerOpenSignal, setModelPickerOpenSignal] = useState(0);
+  const [permissionPickerOpenSignal, setPermissionPickerOpenSignal] = useState(0);
+  const [hooksOpen, setHooksOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const modelCommand = useMemo(
     () => ({
       ...buildModelCommand({
@@ -737,36 +749,23 @@ export function Composer({
   const skillsLoading = useSkillsStore((s) => s.loading);
   const skillsLoaded = useSkillsStore((s) => s.loaded);
   const skillsError = useSkillsStore((s) => s.error);
+  const skillAdapterError = useSkillsStore((s) => s.adapterErrors.find((error) => error.provider === provider)?.message);
 
   // The popup-side `onInvoke` handler is a no-op signal: the actual
   // textarea mutation happens inside `handleSlashSelect` based on the
   // item's id prefix. Modes still need their `onSelect` activator.
-  const skillItems = useMemo(
-    () => buildSkillCommands({ skills: skills.filter((skill) => !["queue", "steer", "interrupt"].includes(skill.name.toLowerCase())), onInvoke: () => {} }),
-    [skills],
-  );
-
-  // ─── Provider slash commands (Claude Code built-ins + custom) ────
-  // Discovered live from the provider (SDK `supportedCommands()` via
-  // the sidecar's transient probe, cached backend-side per cwd) —
-  // never hardcoded. Lazy-loaded on first popup open, same shape as
-  // skills. Picking one inserts the literal `/name ` text into the
-  // draft; the provider interprets the leading slash at send time.
+  // Provider catalogues come from SDK/server discovery or the adapter's
+  // executable RPC actions. Load lazily for this project and session;
+  // selecting a row inserts `/name ` for dispatch through that adapter.
   const providerCommandsEntry = useProviderCommandsStore(
-    useMemo(() => selectProviderCommands(provider, cwd), [provider, cwd]),
+    useMemo(() => selectProviderCommands(provider, cwd, threadId), [provider, cwd, threadId]),
   );
   const loadProviderCommands = useProviderCommandsStore(
     (s) => s.loadCommands,
   );
 
-  // Names already claimed by Codemux-local rows. A provider command
-  // with a colliding name is dropped — the local behaviour (mode
-  // pill, workflow, skill expansion) wins.
-  //
-  // What a skill reserves is the token the popup inserts for it, not
-  // its bare name. Two same-named skills are addressed by a qualified
-  // token, so the bare name goes unclaimed; reserving it anyway would
-  // hide a provider's own command behind a spelling nothing offers.
+  // Local actions own their names. Skills use dollar syntax on a native
+  // command collision so both choices stay available in the picker.
   const reservedCommandNames = useMemo(() => {
     const names = new Set<string>([
       "plan",
@@ -774,22 +773,35 @@ export function Composer({
       "debug",
       "default",
       "model",
+      "refresh",
+      "mcp",
+      "permissions",
+      "help", "skills", "settings", "usage",
       "workflow",
       "queue", "steer", "interrupt",
     ]);
-    for (const skill of skills) {
-      names.add(skillTokenFor(skill, skills).slice(1).toLowerCase());
-    }
+    if (provider === "codex") names.add("hooks");
     return names;
-  }, [skills]);
+  }, [provider]);
+
+  const skillItems = useMemo(
+    () => buildSkillCommands({
+      providerCommands: [...providerCommandsEntry.commands, ...[...reservedCommandNames].map((name) => ({ name }))],
+      skills,
+      activeProvider: provider,
+      onInvoke: () => {},
+    }),
+    [skills, providerCommandsEntry.commands, reservedCommandNames, provider],
+  );
 
   const providerCommandItems = useMemo(
     () =>
       buildProviderCommands({
+        provider,
         commands: providerCommandsEntry.commands,
         reservedNames: reservedCommandNames,
       }),
-    [providerCommandsEntry.commands, reservedCommandNames],
+    [providerCommandsEntry.commands, reservedCommandNames, provider],
   );
 
   // ─── Executable-command recognition ──────────────────────────────
@@ -799,13 +811,18 @@ export function Composer({
   // excluded the same way the popup excludes them — the text the user
   // is left holding for those is prose, not a command.
   const commandRegistry = useMemo(
-    () =>
-      buildCommandRegistry(
+    () => {
+      const registry = buildCommandRegistry(
         skills,
         providerCommandsEntry.commands.filter(
           (command) => !reservedCommandNames.has(command.name.toLowerCase()),
         ),
-      ),
+      );
+      // Local controls open immediately; they must never promise a model
+      // invocation through the "runs on send" chip. Keep dollar skill aliases.
+      for (const name of reservedCommandNames) registry.delete(name);
+      return registry;
+    },
     [skills, providerCommandsEntry.commands, reservedCommandNames],
   );
 
@@ -841,7 +858,7 @@ export function Composer({
   );
 
   const allSlashItems = useMemo(
-    () => [
+    () => slashAnchor?.trigger === "$" ? skillItems.map((item) => ({ ...item, command: item.command.replace(/^\//, "$") })) : [
       ...modeCommands,
       workflowCommand,
       modelCommand,
@@ -852,9 +869,46 @@ export function Composer({
         disabled: option.value === "steer" && streaming && !supportsSteering,
         group: "MESSAGE DELIVERY", onSelect: () => {},
       })) : []),
-      ...(slashLeadsMessage ? providerCommandItems : []),
+      ...(slashLeadsMessage || helpOpen ? providerCommandItems : []),
+      {
+        id: "composer:help", label: "Commands and skills", command: "/help", icon: SquareSlash,
+        description: "Browse available commands and controls for this provider", group: "CHAT",
+        onSelect: () => setHelpOpen(true),
+      },
+      ...[{ name: "skills", label: "Manage skills", section: "skills", description: "View installed skills and enable or disable definitions" },
+        { name: "settings", label: "Agent settings", section: "agent", description: "Open Codemux agent settings" },
+        { name: "usage", label: "Usage", section: "usage", description: "View provider usage and limits" }].map((action): SlashCommandItem => ({
+          id: `composer:${action.name}`, label: action.label, command: `/${action.name}`, icon: Settings,
+          description: action.description, group: "CHAT", onSelect: () => useUIStore.getState().setShowSettings(true, action.section),
+        })),
+      ...(provider === "codex" ? [{
+        id: "composer:hooks", label: "Hooks", command: "/hooks", icon: Settings,
+        description: "View and manage lifecycle hooks", group: "CHAT",
+        onSelect: () => setHooksOpen(true),
+      }] : []),
+      {
+        id: "composer:permissions", label: "Permissions", command: "/permissions", icon: Settings,
+        description: "Choose this provider's access mode", group: "CHAT",
+        disabled: !configurationEnabled || mode !== "default" || !permissionModes?.length,
+        onSelect: () => setPermissionPickerOpenSignal((signal) => signal + 1),
+      },
+      {
+        id: "composer:refresh", label: "Refresh commands and skills", command: "/refresh", icon: RotateCw,
+        description: "Reload the current provider and project inventory", group: "CHAT",
+        disabled: skillsLoading || providerCommandsEntry.loading,
+        onSelect: () => { void loadSkills(cwd ?? null, true); void loadProviderCommands(provider, cwd ?? null, true, threadId); },
+      },
+      {
+        id: "composer:mcp", label: "MCP servers", command: "/mcp", icon: Server,
+        description: "View and manage connected tools", group: "CHAT",
+        onSelect: () => { setAttachOpen(true); setAttachSubmode("mcp"); setAttachQuery(""); },
+      },
     ],
     [
+      slashAnchor?.trigger,
+      helpOpen,
+      permissionModes, configurationEnabled, mode,
+      skillsLoading, providerCommandsEntry.loading, loadSkills, loadProviderCommands, cwd, provider, threadId,
       modeCommands,
       workflowCommand,
       modelCommand,
@@ -874,8 +928,8 @@ export function Composer({
   const slashPopupFooter = useMemo(() => {
     // The subcommand list is static; load state belongs to the full list.
     if (slashAnchor?.command) return null;
-    if (skillsError) {
-      return { tone: "error" as const, message: `Skills: ${skillsError}` };
+    if (skillsError || skillAdapterError) {
+      return { tone: "error" as const, message: `Skills: ${skillsError ?? skillAdapterError}` };
     }
     // Command loading/error only surfaces when the COMMANDS group is
     // actually offered (leading `/`) — mirrors the allSlashItems gate
@@ -900,6 +954,7 @@ export function Composer({
   }, [
     slashAnchor?.command,
     skillsError,
+    skillAdapterError,
     skillsLoading,
     skillsLoaded,
     slashLeadsMessage,
@@ -953,10 +1008,10 @@ export function Composer({
   // initialises the highlight when the popup first opens.
   useEffect(() => {
     if (!slashAnchor) return;
-    const visible = filteredItems.map((i) => i.id);
-    if (slashHighlighted && visible.includes(slashHighlighted)) return;
-    setSlashHighlighted(visible[0] ?? null);
-  }, [slashAnchor, filteredItems, slashHighlighted]);
+    const current = slashHighlight.get();
+    if (current && filteredItems.some((i) => i.id === current)) return;
+    slashHighlight.set(filteredItems[0]?.id ?? null);
+  }, [slashAnchor, filteredItems, slashHasHighlight, slashHighlight]);
 
   // Popup visibility is driven by *anchor presence only*, not by
   // filter results. An empty filter shows the "No commands match"
@@ -973,16 +1028,16 @@ export function Composer({
   // opened — a paste, a restored draft, or a cursor moved past the
   // token all land there. Discovery has to run in those paths too, or
   // the command silently reads as prose right up until send.
-  const draftLeadsWithSlash = useMemo(() => /^\s*\//.test(draft), [draft]);
+  const draftLeadsWithSlash = useMemo(() => /^\s*[/$]/.test(draft), [draft]);
   const commandsWanted = slashOpen || draftLeadsWithSlash;
 
   // First-open lazy load. The store guards against double-fetch via its
   // loaded + in-flight loading flags, so re-firing this effect on every
   // open is harmless and keeps the popup snappy after the initial scan.
   useEffect(() => {
-    if (!commandsWanted) return;
+    if (!commandsWanted && !helpOpen) return;
     void loadSkills(cwd ?? null);
-  }, [commandsWanted, cwd, loadSkills, skillsGeneration]);
+  }, [commandsWanted, helpOpen, cwd, loadSkills, skillsGeneration]);
 
   // Do not restart the watcher when its events invalidate discovery. The
   // load effect above retries even while the popup stays open.
@@ -994,7 +1049,7 @@ export function Composer({
   }, [slashOpen, cwd, includePluginSkills]);
 
   useEffect(() => {
-    if (!commandsWanted) return;
+    if (!commandsWanted && !helpOpen) return;
     // Provider command discovery rides the same trigger. A session-fed
     // catalogue is re-read every time the user enters command context,
     // because the first read can predate the session that publishes it.
@@ -1004,8 +1059,14 @@ export function Composer({
       provider,
       cwd ?? null,
       catalogueFollowsSession(provider),
+      threadId,
     );
-  }, [commandsWanted, slashOpen, cwd, loadProviderCommands, provider]);
+    // ACP catalogues can change while the picker remains open. These are
+    // inexpensive session reads, with no subprocess or inference startup.
+    if (!catalogueFollowsSession(provider) || (!slashOpen && !helpOpen)) return;
+    const timer = window.setInterval(() => void loadProviderCommands(provider, cwd ?? null, true, threadId), 2000);
+    return () => window.clearInterval(timer);
+  }, [commandsWanted, helpOpen, slashOpen, cwd, loadProviderCommands, provider, threadId]);
 
   // ─── Mention popup: debounced file fetch ─────────────────────────
   // Fires on every query change while the popup is open. The 100ms
@@ -1198,12 +1259,12 @@ export function Composer({
 
   const closeSlash = () => {
     setSlashAnchor(null);
-    setSlashHighlighted(null);
+    slashHighlight.set(null);
   };
 
   const closeMention = useCallback(() => {
     setMentionAnchor(null);
-    setMentionHighlighted(null);
+    mentionHighlight.set(null);
     mentionHighlightPinnedRef.current = false;
     setFileMatches(EMPTY_FILE_MATCHES);
     setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
@@ -1247,7 +1308,7 @@ export function Composer({
       if (attachOpen) closeAttachPopup();
       if (slashAnchor) {
         setSlashAnchor(null);
-        setSlashHighlighted(null);
+        slashHighlight.set(null);
       }
       if (mentionAnchor) closeMention();
     };
@@ -1312,7 +1373,7 @@ export function Composer({
     setAttachQuery("");
     if (slashAnchor) {
       setSlashAnchor(null);
-      setSlashHighlighted(null);
+      slashHighlight.set(null);
     }
     if (mentionAnchor) closeMention();
   }, [
@@ -2223,6 +2284,7 @@ export function Composer({
   const mentionAutoPicksChats = parsedMention.category === "session";
   useEffect(() => {
     if (!mentionOpen) return;
+    const mentionHighlighted = mentionHighlight.get();
     const ids = mentionItems.map((item) => item.id);
     const autoPick = mentionAutoPicksChats
       ? (ids[0] ?? null)
@@ -2238,8 +2300,8 @@ export function Composer({
         autoPick !== mentionHighlighted;
       if (!strandedOnChat) return;
     }
-    setMentionHighlighted(autoPick);
-  }, [mentionOpen, mentionItems, mentionHighlighted, mentionAutoPicksChats]);
+    mentionHighlight.set(autoPick);
+  }, [mentionOpen, mentionItems, mentionChatHighlight, mentionAutoPicksChats, mentionHighlight]);
 
   /** Replace the typed `@<query>` with the picked token + trailing
    *  space and keep the cursor right after the insertion. Shared
@@ -2375,8 +2437,8 @@ export function Composer({
         // mirror overlay highlights skill tokens; `/workflow` and
         // provider commands are handled by the provider runtime —
         // this composer only ever inserts the text.
-        const tokenName = item.command.replace(/^\//, "");
-        const insertion = `/${tokenName}${after.startsWith(" ") ? "" : " "}`;
+        const tokenName = item.command.replace(/^[/$]/, "");
+        const insertion = `${slashAnchor.trigger === "$" || item.command.startsWith("$") ? "$" : "/"}${tokenName}${after.startsWith(" ") ? "" : " "}`;
         const next = before + insertion + after;
         onDraftChange(next);
         // Cursor lands right after the inserted token (and the space we
@@ -2395,7 +2457,7 @@ export function Composer({
           : null;
         if (argHit) {
           setSlashAnchor(argHit);
-          setSlashHighlighted(null);
+          slashHighlight.set(null);
           item.onSelect();
           return;
         }
@@ -2407,7 +2469,7 @@ export function Composer({
         // refocusing the textarea here would immediately dismiss it
         // (Radix closes on focus-outside). Every other state-only pick
         // returns focus to the textarea so the user keeps typing.
-        if (item.id !== "composer:model") {
+        if (!item.id.startsWith("composer:")) {
           requestAnimationFrame(() => textareaRef.current?.focus());
         }
       }
@@ -2608,6 +2670,15 @@ export function Composer({
   );
   const submit = useCallback(() => {
     if (remoteDisconnected) return;
+    const action = allSlashItems.find((item) => item.id.startsWith("composer:") && item.command.toLowerCase() === draft.trim().toLowerCase());
+    if (action) {
+      if (action.disabled) return;
+      onDraftChange("");
+      setSlashAnchor(null);
+      slashHighlight.set(null);
+      action.onSelect();
+      return;
+    }
     // Enter keeps the caret in the textarea, so focus alone would hold the
     // card open under the message that was just sent until the user clicked
     // elsewhere. Rest it instead: once the hold lapses the card folds back to
@@ -2622,7 +2693,7 @@ export function Composer({
       setSendHold(false);
     }, SEND_HOLD_MS);
     onSubmit();
-  }, [onSubmit, remoteDisconnected]);
+  }, [onSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems]);
 
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's
@@ -2632,7 +2703,8 @@ export function Composer({
   const busy = streaming || sending;
   const delivery = parseMessageDelivery(draft);
   const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
-  const canSubmit = !remoteDisconnected && sessionReady && !sending && delivery.text.length > 0 && !steeringUnavailable;
+  const discoveringCommands = draftLeadsWithSlash && providerCommandsEntry.loading && !providerCommandsEntry.loaded;
+  const canSubmit = !remoteDisconnected && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
@@ -2669,6 +2741,17 @@ export function Composer({
     },
     [],
   );
+
+  const arrowNavigation = usePopupArrowNavigation(slashOpen || mentionOpen, (direction) => {
+    const items = slashOpen ? filteredItems : mentionItems;
+    const highlight = slashOpen ? slashHighlight : mentionHighlight;
+    if (!slashOpen) mentionHighlightPinnedRef.current = true;
+    highlight.set((current) => {
+      const index = current ? items.findIndex((item) => item.id === current) : -1;
+      const next = Math.max(0, Math.min(index + direction, items.length - 1));
+      return items[next]?.id ?? null;
+    });
+  });
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Shift+Tab cycles modes regardless of popup state. preventDefault
@@ -2707,25 +2790,15 @@ export function Composer({
       // path so the user can still send the message-with-slash-text
       // without first dismissing the popup.
       if (filteredItems.length > 0) {
-        if (e.key === "ArrowDown") {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
           e.preventDefault();
-          const ids = filteredItems.map((i) => i.id);
-          const idx = slashHighlighted ? ids.indexOf(slashHighlighted) : -1;
-          const next = ids[(idx + 1) % ids.length];
-          if (next) setSlashHighlighted(next);
-          return;
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault();
-          const ids = filteredItems.map((i) => i.id);
-          const idx = slashHighlighted ? ids.indexOf(slashHighlighted) : 0;
-          const next = ids[(idx - 1 + ids.length) % ids.length];
-          if (next) setSlashHighlighted(next);
+          e.stopPropagation();
+          arrowNavigation.navigate({ key: e.key, repeat: e.repeat, timeStamp: e.timeStamp });
           return;
         }
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
-          const item = filteredItems.find((i) => i.id === slashHighlighted);
+          const item = filteredItems.find((i) => i.id === slashHighlight.get());
           if (item) handleSlashSelect(item);
           return;
         }
@@ -2747,31 +2820,15 @@ export function Composer({
         return;
       }
       if (mentionItems.length > 0) {
-        if (e.key === "ArrowDown") {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
           e.preventDefault();
-          const ids = mentionItems.map((i) => i.id);
-          const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : -1;
-          const next = ids[(idx + 1) % ids.length];
-          if (next) {
-            mentionHighlightPinnedRef.current = true;
-            setMentionHighlighted(next);
-          }
-          return;
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault();
-          const ids = mentionItems.map((i) => i.id);
-          const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : 0;
-          const next = ids[(idx - 1 + ids.length) % ids.length];
-          if (next) {
-            mentionHighlightPinnedRef.current = true;
-            setMentionHighlighted(next);
-          }
+          e.stopPropagation();
+          arrowNavigation.navigate({ key: e.key, repeat: e.repeat, timeStamp: e.timeStamp });
           return;
         }
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
-          const item = mentionItems.find((i) => i.id === mentionHighlighted);
+          const item = mentionItems.find((i) => i.id === mentionHighlight.get());
           if (item) handleMentionPopupSelect(item);
           return;
         }
@@ -2807,13 +2864,13 @@ export function Composer({
       setMentionAnchor(mentionHit);
       if (slashAnchor) {
         setSlashAnchor(null);
-        setSlashHighlighted(null);
+        slashHighlight.set(null);
       }
       if (attachOpen) closeAttachPopup();
     } else {
       if (slashAnchor) {
         setSlashAnchor(null);
-        setSlashHighlighted(null);
+        slashHighlight.set(null);
       }
       if (mentionAnchor) closeMention();
     }
@@ -2941,17 +2998,19 @@ export function Composer({
               e.target.value = "";
             }}
           />
-          <SlashCommandPopup
+          <StoreSlashCommandPopup
             items={filteredItems}
-            highlightedId={slashHighlighted}
-            onHighlightChange={setSlashHighlighted}
+            highlight={slashHighlight}
+            onHighlightChange={(id, source) => {
+              if (source === "pointer") slashHighlight.set(id);
+            }}
             onSelect={handleSlashSelect}
             open={slashOpen}
             footerNote={slashPopupFooter}
           />
-          <SlashCommandPopup
+          <StoreSlashCommandPopup
             items={mentionItems}
-            highlightedId={mentionHighlighted}
+            highlight={mentionHighlight}
             // Hover is a deliberate move, so it pins exactly like
             // ArrowUp/ArrowDown — without that, the correction below
             // yanks the highlight straight back off the row the
@@ -2963,7 +3022,7 @@ export function Composer({
               if (source === "pointer") {
                 mentionHighlightPinnedRef.current = true;
               }
-              setMentionHighlighted(id);
+              mentionHighlight.set(id);
             }}
             onSelect={handleMentionPopupSelect}
             open={mentionOpen}
@@ -3432,6 +3491,7 @@ export function Composer({
                   onSelect={handleSelect}
                   onScroll={handleTextareaScroll}
                   onKeyDown={readOnly ? undefined : handleKeyDown}
+                  onBlur={arrowNavigation.cancel}
                   onPaste={readOnly ? undefined : handlePasteImage}
                   onCompositionStart={() => {
                     composingRef.current = true;
@@ -3536,6 +3596,7 @@ export function Composer({
             onAttachClick={handleAttachClick}
             attachOpen={attachOpen}
             modelPickerOpenSignal={modelPickerOpenSignal}
+            permissionPickerOpenSignal={permissionPickerOpenSignal}
             contextUsage={contextUsage}
             contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
             contextUsageProviderLabel={contextUsageProviderLabel}
@@ -3570,6 +3631,14 @@ export function Composer({
             spacing it needs below itself. */}
         {belowComposerSlot ?? null}
       </div>
+      {provider === "codex" && <HooksManager open={hooksOpen} onOpenChange={setHooksOpen} cwd={cwd ?? null} threadId={threadId ?? null} />}
+      <ProviderCommandsDialog open={helpOpen} onOpenChange={setHelpOpen} providerLabel={sessionProviderLabel(provider)} items={allSlashItems} loading={skillsLoading || providerCommandsEntry.loading} error={providerCommandsEntry.error ?? skillsError ?? skillAdapterError ?? null} onSelect={(item) => {
+        if (item.id.startsWith("skill:") || item.id.startsWith("provider-command:") || item.id.startsWith("delivery:") || item.id === "workflow") {
+          onDraftChange(`${item.command} ${draft}`);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+        item.onSelect();
+      }} />
     </div>
   );
 }

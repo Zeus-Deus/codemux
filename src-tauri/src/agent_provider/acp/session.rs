@@ -277,6 +277,7 @@ pub(crate) struct AcpSession {
     child: Arc<JsonRpcChild>,
     dialect: AcpDialect,
     slash_command_cache: Arc<AcpSlashCommandCache>,
+    commands: Mutex<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Ordering barriers into the two tasks that consume child messages.
@@ -292,6 +293,19 @@ pub(crate) struct AcpSession {
 }
 
 impl AcpSession {
+    async fn record_commands(&self, value: &Value) {
+        if let Some(commands) = super::slash_commands::available_commands_from_value(value) {
+            *self.commands.lock().await = commands;
+        }
+    }
+
+    pub async fn slash_commands(&self, cwd: &std::path::Path) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, ProviderError> {
+        if cwd != self.cwd {
+            return Err(ProviderError::ValidationError { message: "Command discovery must use this conversation's directory.".into() });
+        }
+        Ok(self.commands.lock().await.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_and_initialize(
         thread_id: ThreadId,
@@ -511,6 +525,8 @@ impl AcpSession {
             child,
             dialect,
             slash_command_cache,
+            commands: Mutex::new(super::slash_commands::available_commands_from_value(&setup)
+                .or_else(|| super::slash_commands::available_commands_from_value(&initialized)).unwrap_or_default()),
             event_tx,
             tasks: Mutex::new(Vec::new()),
             notification_barrier_tx,
@@ -1100,6 +1116,7 @@ impl AcpSession {
     /// for every extension update, then process the durable terminal marker.
     async fn handle_xai_session_update(&self, params: Value) {
         if is_available_commands_update(&params) {
+            self.record_commands(&params).await;
             self.slash_command_cache
                 .replace_from_value(self.dialect, &self.cwd, &params)
                 .await;
@@ -1981,6 +1998,7 @@ impl AcpSession {
         // snapshot is session-scoped rather than turn-scoped — so it has to be
         // taken before the active-turn check below drops replay frames.
         if is_available_commands_update(&params) {
+            self.record_commands(&params).await;
             self.slash_command_cache
                 .replace_from_value(self.dialect, &self.cwd, &params)
                 .await;

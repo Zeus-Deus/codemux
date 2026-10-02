@@ -300,3 +300,19 @@ describe("applyAllPrefixes — attachment block ordering (Step 8 Stage 2)", () =
     expect(withUndef).toBe(withNull);
   });
 });
+
+
+describe("provider commands keep their leading token", () => {
+  const commands = [{ name: "compact" }, { name: "plugin:review" }];
+  it("preserves registered commands across modes and prompt effort", () => {
+    expect(applyAllPrefixes("/compact", "ask", "ultrathink", null, null, commands)).toBe("/compact");
+    expect(applyAllPrefixes("/plugin:review target", "debug", "ultrathink", null, null, commands)).toBe("/plugin:review target");
+  });
+  it("keeps attachment context after the command arguments", () => {
+    expect(applyAllPrefixes("/plugin:review target", "ask", null, null, "file context", commands)).toBe("/plugin:review target\n\nfile context");
+  });
+  it("still wraps unknown commands and absolute paths", () => {
+    expect(applyAllPrefixes("/unknown", "ask", null, null, null, commands)).toContain(ASK_WRAPPER);
+    expect(applyAllPrefixes("/home/project", "ask", null, null, null, commands)).toContain(ASK_WRAPPER);
+  });
+});
