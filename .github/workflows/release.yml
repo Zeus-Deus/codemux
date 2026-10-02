@@ -8,6 +8,9 @@ on:
 jobs:
   release:
     name: release (${{ matrix.os }})
+    # Signing secrets live in the protected `release` environment: only v* tags,
+    # and each run waits for a maintainer to approve it.
+    environment: release
     strategy:
       # Never fail-fast — a Windows bundle failure should not cancel the
       # Linux release. Users depend on the Linux AppImage/deb even if the
