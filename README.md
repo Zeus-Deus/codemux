@@ -6,7 +6,7 @@
 
 **The Agentic Development Environment for Builders**
 
-![Codemux Screenshot](assets/codemux-home.png)
+![Codemux Screenshot](assets/codemux-home.jpg)
 
 </div>
 
