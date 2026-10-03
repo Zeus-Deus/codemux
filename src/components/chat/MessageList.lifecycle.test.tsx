@@ -4,7 +4,6 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import type { ChatViewItem } from "@/lib/agent-chat/types";
-import { getTitlebarContentUnder, getTitlebarTranscriptElements } from "@/lib/titlebar-content-under";
 import { MessageList } from "./MessageList";
 
 // Real MessageList, real rows, real LegendList. Only the missing browser
@@ -102,28 +101,6 @@ afterEach(() => {
   vi.unstubAllGlobals();
   delete (HTMLElement.prototype as { scrollTo?: unknown }).scrollTo;
   delete (HTMLElement.prototype as { scrollBy?: unknown }).scrollBy;
-});
-
-it("unregisters the retained viewport while hidden and reattaches live titlebar events", async () => {
-  const props = { workspaceId: "lifecycle-titlebar" };
-  const view = render(tree("visible", props));
-  await frames();
-  const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
-  for (let i = 0; i < 3; i++) {
-    expect(getTitlebarTranscriptElements()).toContain(viewport);
-    view.rerender(tree("hidden", props));
-    expect(getTitlebarTranscriptElements()).not.toContain(viewport);
-    expect(getTitlebarContentUnder(props.workspaceId)).toBe(false);
-    view.rerender(tree("visible", props));
-    await frames();
-    expect(getTitlebarTranscriptElements().filter((node) => node === viewport)).toHaveLength(1);
-    viewport.scrollTop = 0;
-    fireEvent.scroll(viewport);
-    expect(getTitlebarContentUnder(props.workspaceId)).toBe(false);
-  }
-  view.unmount();
-  expect(getTitlebarTranscriptElements()).not.toContain(viewport);
-  expect(getTitlebarContentUnder(props.workspaceId)).toBe(false);
 });
 
 it("uses the fresh pane's row callbacks and does not take focus on reveal", async () => {

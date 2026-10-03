@@ -2,7 +2,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { geometryFingerprint } from "@/lib/geometry-fingerprint";
 import {
-  act,
   cleanup,
   fireEvent,
   render,
@@ -231,32 +230,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
-import {
-  clearTitlebarContentUnder,
-  publishTitlebarContentUnder,
-  registerTitlebarTranscript,
-} from "@/lib/titlebar-content-under";
 import { TitleBar } from "./title-bar";
-
-/** A stand-in chat viewport wide enough to collide with both islands. */
-function makeTranscriptNode(): HTMLElement {
-  const transcript = document.createElement("div");
-  transcript.dataset.slot = "transcript-list";
-  transcript.getBoundingClientRect = () =>
-    ({ left: 288, right: 1260, width: 972, height: 800 }) as DOMRect;
-  document.body.appendChild(transcript);
-  return transcript;
-}
-
-function stubIslandRects(getByTestId: (id: string) => HTMLElement): void {
-  getByTestId("titlebar-workspace-island").getBoundingClientRect = () =>
-    ({ left: 300, right: 470, width: 170, height: 32 }) as DOMRect;
-  getByTestId("titlebar-action-island").getBoundingClientRect = () =>
-    ({ left: 990, right: 1150, width: 160, height: 32 }) as DOMRect;
-  // Past the transcript's right edge: the corner sits clear of the column.
-  getByTestId("titlebar-corner-plate").getBoundingClientRect = () =>
-    ({ left: 1300, right: 1434, width: 134, height: 36 }) as DOMRect;
-}
 
 function renderBar() {
   return render(
@@ -423,144 +397,19 @@ describe("TitleBar chrome gating", () => {
     expect(utilities).not.toHaveClass("ml-1");
   });
 
-  it("keeps every plate dormant in the normal frameless state", () => {
+  it("keeps the header frameless: no plates behind the control groups", () => {
+    // Transcript text dissolves before it reaches the band (see the
+    // `--transcript-top-clear` mask in globals.css), so the controls never
+    // need a background of their own.
     state.enableAgentChat = true;
-    const { getByTestId } = renderBar();
+    const { getByTestId, queryByTestId } = renderBar();
 
-    expect(getByTestId("floating-titlebar")).not.toHaveAttribute(
-      "data-chat-overlap",
-    );
-    for (const id of [
-      "titlebar-workspace-island",
-      "titlebar-action-island",
-      "titlebar-corner-plate",
-    ]) {
+    expect(queryByTestId("titlebar-corner-plate")).toBeNull();
+    for (const id of ["titlebar-workspace-island", "titlebar-action-island"]) {
       expect(getByTestId(id)).not.toHaveAttribute("data-raised");
+      expect(getByTestId(id).className).not.toMatch(/titlebar-(island|plate)/);
     }
-    expect(getByTestId("titlebar-workspace-island")).toHaveClass(
-      "titlebar-island",
-    );
-    expect(getByTestId("titlebar-action-island")).toHaveClass(
-      "titlebar-island",
-    );
-    expect(getByTestId("titlebar-corner-plate")).toHaveClass("titlebar-plate");
   });
-
-  it("draws one corner plate behind the panel controls and window buttons", () => {
-    state.enableAgentChat = true;
-    const { getByTestId, rerender } = renderBar();
-    // Panel closed: the 28px toggle 104px in, plus 4px of breath.
-    expect(getByTestId("titlebar-corner-plate").style.width).toBe("134px");
-
-    state.rightPanelTab = "files";
-    rerender(
-      <TooltipProvider delayDuration={0}>
-        <TitleBar sidebarOpen onToggleSidebar={() => {}} />
-      </TooltipProvider>,
-    );
-    // Panel open: the expand button joins the cluster.
-    expect(getByTestId("titlebar-corner-plate").style.width).toBe("164px");
-  });
-
-  it("raises only the intersecting groups once transcript content is underneath", async () => {
-    state.enableAgentChat = true;
-    const transcript = makeTranscriptNode();
-    const source = Symbol("overlap-test");
-
-    const { getByTestId } = renderBar();
-    stubIslandRects(getByTestId);
-
-    fireEvent(window, new Event("resize"));
-    // Overlapping the column alone is not enough: nothing is underneath yet.
-    expect(getByTestId("titlebar-workspace-island")).not.toHaveAttribute(
-      "data-raised",
-    );
-
-    act(() => publishTitlebarContentUnder("ws-1", source, true));
-    await waitFor(() =>
-      expect(getByTestId("floating-titlebar")).toHaveAttribute(
-        "data-chat-overlap",
-        "true",
-      ),
-    );
-    expect(getByTestId("titlebar-workspace-island")).toHaveAttribute(
-      "data-raised",
-      "true",
-    );
-    expect(getByTestId("titlebar-action-island")).toHaveAttribute(
-      "data-raised",
-      "true",
-    );
-    expect(getByTestId("titlebar-corner-plate")).not.toHaveAttribute(
-      "data-raised",
-    );
-
-    act(() => clearTitlebarContentUnder("ws-1", source));
-    await waitFor(() =>
-      expect(getByTestId("titlebar-action-island")).not.toHaveAttribute(
-        "data-raised",
-      ),
-    );
-    transcript.remove();
-  });
-
-  it("re-measures against the fresh transcript a tab or workspace switch mounts", async () => {
-    // Regression: the overlap effect snapshotted `querySelectorAll` once and
-    // depended only on `[enabled]`. `PaneContainer` renders only the active
-    // surface, so switching tabs unmounts `MessageList` and mounts a new one
-    // with a brand-new node — the titlebar kept observing the detached
-    // element and the raised treatment could never fire again after any
-    // navigation. Each viewport now registers itself, and the registry
-    // version re-keys the effect.
-    state.enableAgentChat = true;
-    const source = Symbol("overlap-remount");
-    const first = makeTranscriptNode();
-    const unregisterFirst = registerTitlebarTranscript(first);
-
-    const { getByTestId } = renderBar();
-    stubIslandRects(getByTestId);
-
-    fireEvent(window, new Event("resize"));
-    act(() => publishTitlebarContentUnder("ws-1", source, true));
-    await waitFor(() =>
-      expect(getByTestId("floating-titlebar")).toHaveAttribute(
-        "data-chat-overlap",
-        "true",
-      ),
-    );
-
-    // Switch away: the old viewport unmounts.
-    act(() => {
-      first.remove();
-      unregisterFirst();
-    });
-    await waitFor(() =>
-      expect(getByTestId("floating-titlebar")).not.toHaveAttribute(
-        "data-chat-overlap",
-      ),
-    );
-
-    // Switch back / to another chat tab: a different DOM node mounts. The
-    // titlebar must pick it up without a remount of its own.
-    const second = makeTranscriptNode();
-    let unregisterSecond = () => {};
-    act(() => {
-      unregisterSecond = registerTitlebarTranscript(second);
-    });
-    await waitFor(() =>
-      expect(getByTestId("floating-titlebar")).toHaveAttribute(
-        "data-chat-overlap",
-        "true",
-      ),
-    );
-
-    act(() => {
-      unregisterSecond();
-      clearTitlebarContentUnder("ws-1", source);
-    });
-    second.remove();
-  });
-
 
   it("renders the GUI draft chrome (draft pill + draft launcher) while a lazy-creation draft is active", () => {
     // Regression coverage: the draft used to fall back to the legacy

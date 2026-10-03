@@ -1,11 +1,4 @@
-import {
-  useState,
-  useEffect,
-  useCallback,
-  useLayoutEffect,
-  useRef,
-  useSyncExternalStore,
-} from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   PanelLeft,
   PanelRight,
@@ -34,10 +27,7 @@ import {
 import { groupEditors } from "@/lib/editor-groups";
 import { clampRightPanelWidth } from "@/lib/right-panel-width";
 import {
-  PANEL_CLUSTER_WIDTH,
-  PANEL_CONTROL_WIDTH,
   RIGHT_PANEL_RESIZER_REACH,
-  WINDOW_CONTROLS_RESERVE,
   panelClusterRight,
   topRightReserve,
 } from "@/lib/titlebar-geometry";
@@ -73,13 +63,6 @@ import { toast } from "@/lib/toast";
 import { applyPreset, openInEditor } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
-import {
-  getTitlebarContentUnder,
-  getTitlebarTranscriptElements,
-  getTitlebarTranscriptVersion,
-  subscribeTitlebarContentUnder,
-  subscribeTitlebarTranscripts,
-} from "@/lib/titlebar-content-under";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
@@ -526,14 +509,6 @@ interface TitleBarProps {
   onToggleSidebar: () => void;
 }
 
-/** `CHAT_COLUMN`'s `max-w-[49.5rem]`, in rem so it follows the interface size. */
-const CHAT_READING_COLUMN_MAX_WIDTH_REM = 49.5;
-
-function chatReadingColumnMaxWidthPx(): number {
-  const rootFontSize = Number.parseFloat(getComputedStyle(document.documentElement).fontSize);
-  return CHAT_READING_COLUMN_MAX_WIDTH_REM * (Number.isFinite(rootFontSize) ? rootFontSize : 16);
-}
-
 /**
  * Any measured sidebar width at or below this is the collapsed icon rail
  * (3.25rem = 52px — see `SIDEBAR_WIDTH_ICON` in `ui/sidebar.tsx`), never an
@@ -542,110 +517,6 @@ function chatReadingColumnMaxWidthPx(): number {
  * icon column.
  */
 const COLLAPSED_RAIL_MAX_WIDTH = 64;
-
-type TitlebarGroup = "workspace" | "action" | "corner";
-
-const TITLEBAR_GROUPS: readonly TitlebarGroup[] = ["workspace", "action", "corner"];
-
-type RaisedGroups = Readonly<Record<TitlebarGroup, boolean>>;
-
-const NOTHING_RAISED: RaisedGroups = {
-  workspace: false,
-  action: false,
-  corner: false,
-};
-
-/**
- * Measure the real transcript and control rectangles, per control group.
- * This keeps each group's raised plate tied to an actual horizontal
- * collision with the centred reading column instead of a viewport
- * breakpoint, and lights only the groups that collide: in a wide window
- * the corner cluster sits far outside the column and stays bare while the
- * tabs may not.
- *
- * `transcriptVersion` is the live-registry counter from
- * `titlebar-content-under.ts`. It MUST stay in the dependency list: the
- * measured node set is a snapshot, and `PaneContainer` renders only the
- * active surface, so every tab / workspace switch destroys the observed
- * transcript and mounts a new one. Without re-keying on the registry the
- * effect would keep observing a detached node and no group could ever be
- * raised again after the first navigation.
- */
-function useTitlebarChatOverlap(enabled: boolean, transcriptVersion: number) {
-  const workspaceIslandRef = useRef<HTMLDivElement | null>(null);
-  const actionIslandRef = useRef<HTMLDivElement | null>(null);
-  const cornerPlateRef = useRef<HTMLDivElement | null>(null);
-  const [overlaps, setOverlaps] = useState<RaisedGroups>(NOTHING_RAISED);
-
-  useLayoutEffect(() => {
-    if (!enabled) {
-      setOverlaps(NOTHING_RAISED);
-      return;
-    }
-
-    // Registered viewports are the live source of truth; the DOM query is
-    // kept as a superset so a transcript rendered by a path that never
-    // registers is still measured on the runs that do happen.
-    const transcripts = Array.from(
-      new Set<HTMLElement>([
-        ...getTitlebarTranscriptElements(),
-        ...document.querySelectorAll<HTMLElement>(
-          '[data-slot="transcript-list"]',
-        ),
-      ]),
-    );
-    const groups: Record<TitlebarGroup, HTMLDivElement | null> = {
-      workspace: workspaceIslandRef.current,
-      action: actionIslandRef.current,
-      corner: cornerPlateRef.current,
-    };
-
-    const update = () => {
-      const columns = transcripts.flatMap((transcript) => {
-        const rect = transcript.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return [];
-        const width = Math.min(chatReadingColumnMaxWidthPx(), rect.width);
-        const left = rect.left + (rect.width - width) / 2;
-        return [{ left, right: left + width }];
-      });
-      const hits = (element: HTMLDivElement | null) => {
-        if (!element) return false;
-        const rect = element.getBoundingClientRect();
-        if (rect.width <= 0) return false;
-        return columns.some(
-          (column) => rect.left < column.right && rect.right > column.left,
-        );
-      };
-      const next: RaisedGroups = {
-        workspace: hits(groups.workspace),
-        action: hits(groups.action),
-        corner: hits(groups.corner),
-      };
-      setOverlaps((current) =>
-        TITLEBAR_GROUPS.every((key) => current[key] === next[key])
-          ? current
-          : next,
-      );
-    };
-
-    update();
-    window.addEventListener("resize", update);
-    if (typeof ResizeObserver === "undefined") {
-      return () => window.removeEventListener("resize", update);
-    }
-    const observer = new ResizeObserver(update);
-    transcripts.forEach((transcript) => observer.observe(transcript));
-    Object.values(groups).forEach((element) => {
-      if (element) observer.observe(element);
-    });
-    return () => {
-      window.removeEventListener("resize", update);
-      observer.disconnect();
-    };
-  }, [enabled, transcriptVersion]);
-
-  return { actionIslandRef, cornerPlateRef, overlaps, workspaceIslandRef };
-}
 
 export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const activeWorkspaceId = useActiveWorkspaceId();
@@ -694,24 +565,6 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       ? rightPanelRowWidth
       : rightPanelWidth
     : rightPanelWidth;
-  const contentUnder = useSyncExternalStore(
-    subscribeTitlebarContentUnder,
-    () => getTitlebarContentUnder(activeWorkspaceId),
-    () => false,
-  );
-  const transcriptVersion = useSyncExternalStore(
-    subscribeTitlebarTranscripts,
-    getTitlebarTranscriptVersion,
-    () => 0,
-  );
-  const { actionIslandRef, cornerPlateRef, overlaps, workspaceIslandRef } =
-    useTitlebarChatOverlap(guiChrome, transcriptVersion);
-  // A group is raised only while transcript text is actually scrolled
-  // underneath it; at the top of a thread the band stays frameless.
-  const raised = (group: TitlebarGroup) =>
-    contentUnder && overlaps[group] ? "true" : undefined;
-  const anyRaised = TITLEBAR_GROUPS.some((group) => raised(group));
-
   // The band's right inset, measured from the window's right edge.
   //
   // Panel closed, the workspace branch has to stop before the fixed panel
@@ -731,17 +584,6 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       : remoteClient
         ? 6
         : 104;
-
-  // The corner plate sits behind everything pinned to the top-right: the
-  // panel controls and, on desktop, the native window buttons. Measured
-  // from the window's right edge; the plate reaches 4px past the controls
-  // on the left, matching the islands' own plates.
-  const cornerControlsWidth = guiChrome && activeWorkspaceId
-    ? panelClusterRight(remoteClient) +
-      (activeWorkspacePanelOpen ? PANEL_CLUSTER_WIDTH - 6 : PANEL_CONTROL_WIDTH)
-    : remoteClient
-      ? 0
-      : WINDOW_CONTROLS_RESERVE - 4;
 
   if (!guiChrome && !draftGuiChrome) {
     return (
@@ -786,7 +628,6 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   return (
     <div
       data-testid="floating-titlebar"
-      data-chat-overlap={anyRaised ? "true" : undefined}
       className="pointer-events-none absolute inset-x-0 top-0 z-30 h-10"
     >
       {/* The unoccupied top edge remains a native drag target. The floating
@@ -859,10 +700,8 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         }}
       >
         <div
-          ref={workspaceIslandRef}
           data-testid="titlebar-workspace-island"
-          data-raised={raised("workspace")}
-          className="titlebar-island pointer-events-auto flex h-8 min-w-0 max-w-[58%] items-center"
+          className="pointer-events-auto flex h-8 min-w-0 max-w-[58%] items-center"
           onPointerDown={(e) => e.stopPropagation()}
         >
           {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
@@ -882,10 +721,8 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         />
 
         <div
-          ref={actionIslandRef}
           data-testid="titlebar-action-island"
-          data-raised={raised("action")}
-          className="titlebar-island pointer-events-auto flex h-8 shrink-0 items-center gap-[2px]"
+          className="pointer-events-auto flex h-8 shrink-0 items-center gap-[2px]"
           onPointerDown={(e) => e.stopPropagation()}
         >
           {guiChrome ? (
@@ -926,22 +763,6 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           the native buttons — the one cluster in this band whose position
           never depends on the panel. Workspace-only: a draft renders no
           right panel, so there is nothing for it to control. */}
-      {/* Raised plate for the corner. One plate behind both the panel
-          controls and the native buttons, since they read as one cluster;
-          drawn as its own layer because the two are positioned separately.
-          Full-expand keeps it: the corner is still over the panel there,
-          which the overlap measurement already reports as clear. */}
-      {cornerControlsWidth > 0 && (
-        <div
-          ref={cornerPlateRef}
-          data-testid="titlebar-corner-plate"
-          data-raised={raised("corner")}
-          aria-hidden
-          className="titlebar-plate absolute top-0.5 right-0.5 h-9"
-          style={{ width: `${cornerControlsWidth + 2}px` }}
-        />
-      )}
-
       {guiChrome && activeWorkspaceId && (
         <RightPanelChromeCluster workspaceId={activeWorkspaceId} />
       )}
@@ -950,8 +771,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           outside the workspace action island. */}
       {!remoteClient && (
         // The buttons are 28px; centring them in the band's 32px row keeps
-        // them on the same axis as the panel controls beside them, which
-        // shows once the corner plate draws around both.
+        // them on the same axis as the panel controls beside them.
         <div className="pointer-events-auto absolute right-1 top-1 z-10 flex h-8 items-center">
           <div className="overflow-hidden rounded-md">
             <WindowControls />

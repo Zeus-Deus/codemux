@@ -402,57 +402,6 @@
   transition: opacity 0.1s ease;
 }
 
-/* The GUI titlebar is frameless by default and the transcript scrolls under
- * it edge to edge, the same way it scrolls under the docked composer. When
- * runtime geometry says a control group physically sits over the centred
- * chat column AND transcript text has scrolled underneath, that group (and
- * only that group) lifts onto a plate in the composer's surface language:
- * the same muted tint, hairline border and deep low shadow, as a stadium.
- * Between the groups the text keeps running clear to the top edge.
- *
- * Islands draw the plate as a ::before so it never takes part in layout;
- * the corner cluster draws it on a dedicated `.titlebar-plate` layer
- * because its controls are positioned separately (see title-bar.tsx). */
-.titlebar-island {
-  /* Positioning context + own stacking context, so the z-index: -1 plate
-     tucks under this island's controls without falling behind the app
-     background painted by an ancestor. */
-  position: relative;
-  isolation: isolate;
-}
-
-.titlebar-island::before,
-.titlebar-plate {
-  pointer-events: none;
-  border-radius: 9999px;
-  border: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
-  background-color: color-mix(in oklab, var(--muted) 40%, var(--background));
-  box-shadow: 0 12px 28px -18px oklch(0 0 0 / 0.4);
-  opacity: 0;
-  transition: opacity 120ms ease-out;
-}
-
-/* Islands are 32px tall; the plate breathes 2px above and below and 4px at
-   each end, matching the corner plate. */
-.titlebar-island::before {
-  content: "";
-  position: absolute;
-  z-index: -1;
-  inset: -2px -4px;
-}
-
-.titlebar-island[data-raised="true"]::before,
-.titlebar-plate[data-raised="true"] {
-  opacity: 1;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .titlebar-island::before,
-  .titlebar-plate {
-    transition-duration: 0ms;
-  }
-}
-
 /* Terminal lifecycle overlay (starting / migrating / failed). Opacity is
    driven imperatively from TerminalPane.tsx (DOM-mutation path, for perf):
    it fades to 0 on `ready` before display:none, so the card doesn't snap
@@ -1259,11 +1208,15 @@ body.pane-resizing iframe {
   }
 }
 
-/* A lone chat runs its transcript under the floating titlebar, edge to edge.
- * Its control groups lift onto their own plates, so the text between them
- * stays sharp to the window edge instead of half-fading behind the band. */
+/* A lone chat's transcript scrolls under the floating titlebar, but text
+ * dissolves before it reaches the controls: fully clear through the band's
+ * control row, then fading in below it. The controls stay frameless on the
+ * plain background instead of needing plates of their own. Keep the clear
+ * zone plus the fade within `TITLEBAR_BAND_HEIGHT + SEND_ANCHOR_OFFSET`, so
+ * a freshly sent prompt is parked fully visible. */
 [data-under-titlebar="true"] [data-transcript-edge-fade] {
-  --transcript-top-fade: 0px;
+  --transcript-top-clear: 32px;
+  --transcript-top-fade: 24px;
 }
 
 /* Docked controls stay opaque even when the edge mask is disabled. Mask the
