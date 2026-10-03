@@ -20,10 +20,6 @@ import {
   docEditorTabId,
   docPaneId,
 } from "@/components/layout/right-panel/pane-registry";
-import {
-  getTitlebarContentUnder,
-  getTitlebarTranscriptElements,
-} from "@/lib/titlebar-content-under";
 import { useAppStore } from "@/stores/app-store";
 import { useEditorStore } from "@/stores/editor-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -264,69 +260,6 @@ describe("MessageList retained scroll state", () => {
     await act(() => new Promise<void>((resolve) => window.setTimeout(resolve, 180)));
     view.rerender(tree("visible"));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Jump to latest" })).not.toBeNull());
-  });
-});
-
-describe("MessageList titlebar scroll edge", () => {
-  it("publishes only after the transcript scrolls beneath the overlay", () => {
-    const { unmount } = render(
-      <MessageList
-        messages={[readCall(0, "/a")]}
-        workspaceId="ws-scroll-edge"
-        {...noopHandlers}
-      />,
-    );
-    const viewport = document.querySelector<HTMLElement>(
-      '[data-slot="transcript-list"]',
-    );
-    expect(viewport).not.toBeNull();
-
-    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
-    viewport!.scrollTop = 12;
-    fireEvent.scroll(viewport!);
-    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(true);
-
-    viewport!.scrollTop = 0;
-    fireEvent.scroll(viewport!);
-    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
-
-    viewport!.scrollTop = 12;
-    fireEvent.scroll(viewport!);
-    unmount();
-    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
-  });
-
-  it("registers its live viewport so the titlebar never measures a detached node", () => {
-    // `PaneContainer` renders only the active surface, so a tab switch
-    // unmounts this list entirely. The titlebar keys its overlap
-    // measurement on this registry — if the node stayed registered after
-    // unmount (or was never registered) the raised treatment would latch
-    // onto a detached element and stop firing after any navigation.
-    const { unmount } = render(
-      <MessageList
-        messages={[readCall(0, "/a")]}
-        workspaceId="ws-registry"
-        {...noopHandlers}
-      />,
-    );
-    const viewport = document.querySelector<HTMLElement>(
-      '[data-slot="transcript-list"]',
-    );
-    expect(getTitlebarTranscriptElements()).toContain(viewport);
-
-    unmount();
-    expect(getTitlebarTranscriptElements()).not.toContain(viewport);
-  });
-
-  it("registers even without a workspace id, since the overlap check is geometric", () => {
-    const { unmount } = render(
-      <MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />,
-    );
-    const viewport = document.querySelector<HTMLElement>(
-      '[data-slot="transcript-list"]',
-    );
-    expect(getTitlebarTranscriptElements()).toContain(viewport);
-    unmount();
   });
 });
 
@@ -2276,7 +2209,11 @@ describe("MessageList viewport edge fade", () => {
     render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
     const style = lastListProps.current?.style as Record<string, string>;
     for (const key of ["maskImage", "WebkitMaskImage"] as const) {
-      expect(style[key]).toContain("transparent 0, #000 var(--transcript-top-fade, 26px)");
+      // An optional clear zone (set under the titlebar) before the fade, so
+      // text is gone before it reaches the titlebar's controls.
+      expect(style[key]).toContain(
+        "transparent 0, transparent var(--transcript-top-clear, 0px), #000 calc(var(--transcript-top-clear, 0px) + var(--transcript-top-fade, 26px))",
+      );
       expect(style[key]).toContain("#000 calc(100% - var(--composer-overlay-height, 0px) - 28px)");
       expect(style[key]).toContain("transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)");
     }
@@ -2289,6 +2226,24 @@ describe("MessageList viewport edge fade", () => {
     expect(lastListProps.current?.style).toBeUndefined();
     expect(document.querySelector('[data-transcript-edge-fade="off"]')).not.toBeNull();
     expect(lastListProps.current?.ListHeaderComponent.props.style).toEqual({ paddingTop: 26 });
+  });
+  it("dissolves text under the titlebar with a scrim when the renderer disables masks", () => {
+    setRendererMode("compatibility");
+    render(
+      <TranscriptTopInsetContext.Provider value={40}>
+        <MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />
+      </TranscriptTopInsetContext.Provider>,
+    );
+    expect(screen.getByTestId("transcript-titlebar-scrim")).toBeInTheDocument();
+  });
+  it("leaves the titlebar fade to the mask when the renderer supports it", () => {
+    render(
+      <TranscriptTopInsetContext.Provider value={40}>
+        <MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />
+      </TranscriptTopInsetContext.Provider>,
+    );
+    expect(screen.queryByTestId("transcript-titlebar-scrim")).toBeNull();
+    expect(lastListProps.current?.style).toBeDefined();
   });
   it("parks the thread top and jump targets below chrome floating over the viewport", () => {
     // A lone chat runs under the 40px titlebar band. The viewport is not

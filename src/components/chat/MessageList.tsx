@@ -34,11 +34,6 @@ import {
   usageLimitRecordText,
 } from "@/lib/agent-chat/usage-limit";
 import { cn } from "@/lib/utils";
-import {
-  clearTitlebarContentUnder,
-  publishTitlebarContentUnder,
-  registerTitlebarTranscript,
-} from "@/lib/titlebar-content-under";
 import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
@@ -329,7 +324,6 @@ export const MessageList = memo(function MessageList({
   const sendAnchorOffset = SEND_ANCHOR_OFFSET + topInset;
   const topInsetRef = useRef(topInset);
   topInsetRef.current = topInset;
-  const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
 
   // -------------------------------------------------------------------------
   // New-turn scroll contract (see send-scroll-state.ts for the state model)
@@ -983,20 +977,10 @@ export const MessageList = memo(function MessageList({
     void listRef.current?.scrollToEnd({ animated: !prefersReducedMotion() });
   }, [claimScroll]);
 
-  // Publish this viewport to the titlebar's live-element registry so its
-  // overlap measurement always runs against mounted nodes. `PaneContainer`
-  // renders only the active surface, so switching tabs or workspaces
-  // unmounts this list and mounts a fresh one — register/unregister is what
-  // tells the titlebar to re-measure. Not gated on `workspaceId`: the
-  // measurement is purely geometric, and a hidden/unsized transcript is
-  // filtered out there by its zero-area rect.
+  // Lets the owning pane find this viewport to pin its scroll position
+  // while the composer below changes height.
   useEffect(() => {
-    const viewport = listRef.current?.getScrollableNode();
-    if (!viewport) return;
-    // Lets the owning pane find this viewport to pin its scroll position
-    // while the composer below changes height.
-    viewport.setAttribute("data-transcript-viewport", "");
-    return registerTitlebarTranscript(viewport);
+    listRef.current?.getScrollableNode()?.setAttribute("data-transcript-viewport", "");
   }, []);
 
   // Publish the native scrollbar's width to CSS as `--transcript-sbw`, which
@@ -1021,25 +1005,6 @@ export const MessageList = memo(function MessageList({
     observer.observe(viewport);
     return () => observer.disconnect();
   }, [fadeEnabled]);
-
-  // Drive the overlay from the transcript's actual scroll position. This
-  // publishes only a boolean transition, not every scroll frame, and the
-  // external store safely aggregates multiple chat panes in one workspace.
-  useEffect(() => {
-    if (!workspaceId) return;
-    const viewport = listRef.current?.getScrollableNode();
-    if (!viewport) return;
-    const source = titlebarScrollSourceRef.current;
-    const sync = () =>
-      publishTitlebarContentUnder(workspaceId, source, viewport.scrollTop > 4);
-
-    sync();
-    viewport.addEventListener("scroll", sync, { passive: true });
-    return () => {
-      viewport.removeEventListener("scroll", sync);
-      clearTitlebarContentUnder(workspaceId, source);
-    };
-  }, [workspaceId]);
 
   // "Reading back": publish when the reader leaves the live edge, independent
   // of the compositor's mask and the always-opaque docked controls.
@@ -1339,6 +1304,17 @@ export const MessageList = memo(function MessageList({
         data-transcript-edge-fade={fadeEnabled ? "on" : "off"}
         data-provider={provider ?? undefined}
       >
+      {/* Without the edge mask (compatibility renderer), text under the
+          floating titlebar is dissolved by a background scrim instead, the
+          same clear-then-fade shape as the mask's top edge. Above the list,
+          below the trail (z-20). */}
+      {!fadeEnabled && topInset > 0 && (
+        <div
+          aria-hidden
+          data-testid="transcript-titlebar-scrim"
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 h-14 bg-gradient-to-b from-background from-[57%] to-transparent"
+        />
+      )}
       {!mobile && (
         <MessageTrail slots={slots} listRef={listRef} topInset={topInset} />
       )}
@@ -1510,7 +1486,7 @@ function slotClientNonce(slot: TranscriptSlot): string | null {
  *  sized to stop short of the bar; layer 2 is an opaque strip over the bar's
  *  own column (layers composite additively, so the strip wins there). */
 const WS_FADE_MASK_IMAGE =
-  "linear-gradient(to bottom, transparent 0, #000 var(--transcript-top-fade, 26px), #000 calc(100% - var(--composer-overlay-height, 0px) - 28px), transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)), linear-gradient(#000, #000)";
+  "linear-gradient(to bottom, transparent 0, transparent var(--transcript-top-clear, 0px), #000 calc(var(--transcript-top-clear, 0px) + var(--transcript-top-fade, 26px)), #000 calc(100% - var(--composer-overlay-height, 0px) - 28px), transparent calc(100% - var(--composer-overlay-height, 0px) - 4px)), linear-gradient(#000, #000)";
 const WS_FADE_MASK_SIZE =
   "calc(100% - var(--transcript-sbw, 0px)) 100%, var(--transcript-sbw, 0px) 100%";
 const WS_FADE_MASK_POSITION = "left top, right top";
