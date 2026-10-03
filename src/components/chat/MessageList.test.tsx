@@ -2234,7 +2234,13 @@ describe("MessageList viewport edge fade", () => {
         <MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />
       </TranscriptTopInsetContext.Provider>,
     );
-    expect(screen.getByTestId("transcript-titlebar-scrim")).toBeInTheDocument();
+    const scrim = screen.getByTestId("transcript-titlebar-scrim");
+    // Same shape as the mask's top edge, from the same variables, and off
+    // the scrollbar's column.
+    expect(scrim.style.right).toBe("var(--transcript-sbw, 0px)");
+    expect(scrim.style.height).toContain("var(--transcript-top-clear, 0px)");
+    expect(scrim.style.height).toContain("var(--transcript-top-fade, 26px)");
+    expect(scrim.style.backgroundImage).toContain("var(--transcript-top-clear, 0px)");
   });
   it("leaves the titlebar fade to the mask when the renderer supports it", () => {
     render(
@@ -2284,17 +2290,21 @@ describe("MessageList viewport edge fade", () => {
     }
   });
 
-  it("publishes the measured scrollbar width the mask reads", () => {
-    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
-    const viewport = document.querySelector<HTMLElement>(
-      '[data-slot="transcript-list"]',
-    )!;
-    // CSS cannot ask how wide a scrollbar is, so the mask depends on this
-    // variable existing. jsdom reports zero-size boxes, so the value is
-    // "0px" here — the assertion is that it is published at all, which is
-    // what keeps the mask from falling back to spanning the full width.
-    expect(viewport.style.getPropertyValue("--transcript-sbw")).toBe("0px");
-  });
+  it.each(["accelerated", "compatibility"] as const)(
+    "publishes the measured scrollbar width the mask and scrim read (%s renderer)",
+    (mode) => {
+      setRendererMode(mode);
+      render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
+      // On the wrapper, so both the viewport's mask and its sibling scrim
+      // inherit it.
+      const wrapper = document.querySelector<HTMLElement>("[data-transcript-edge-fade]")!;
+      // CSS cannot ask how wide a scrollbar is, so the mask depends on this
+      // variable existing. jsdom reports zero-size boxes, so the value is
+      // "0px" here — the assertion is that it is published at all, which is
+      // what keeps the mask from falling back to spanning the full width.
+      expect(wrapper.style.getPropertyValue("--transcript-sbw")).toBe("0px");
+    },
+  );
 });
 
 describe("MessageList — live marker when the live tail row is not on screen", () => {

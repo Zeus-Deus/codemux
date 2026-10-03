@@ -992,19 +992,21 @@ export const MessageList = memo(function MessageList({
   // mask falls back to spanning the full width exactly as it used to.
   // Observed rather than measured once: pane splits and zoom changes both
   // resize the viewport, and a stale width would misplace the seam.
+  // Published on the wrapper, not the viewport, so the titlebar scrim (the
+  // mask's fallback, a sibling of the viewport) keeps off the bar too.
   useEffect(() => {
-    if (!fadeEnabled) return;
     const viewport = listRef.current?.getScrollableNode();
-    if (!viewport) return;
+    const wrapper = viewport?.closest<HTMLElement>("[data-transcript-edge-fade]");
+    if (!viewport || !wrapper) return;
     const sync = () => {
       const bar = Math.max(0, (viewport.offsetWidth - viewport.clientWidth) / 2);
-      viewport.style.setProperty("--transcript-sbw", `${bar}px`);
+      wrapper.style.setProperty("--transcript-sbw", `${bar}px`);
     };
     sync();
     const observer = new ResizeObserver(sync);
     observer.observe(viewport);
     return () => observer.disconnect();
-  }, [fadeEnabled]);
+  }, []);
 
   // "Reading back": publish when the reader leaves the live edge, independent
   // of the compositor's mask and the always-opaque docked controls.
@@ -1312,7 +1314,8 @@ export const MessageList = memo(function MessageList({
         <div
           aria-hidden
           data-testid="transcript-titlebar-scrim"
-          className="pointer-events-none absolute inset-x-0 top-0 z-10 h-14 bg-gradient-to-b from-background from-[57%] to-transparent"
+          className="pointer-events-none absolute left-0 top-0 z-10"
+          style={TITLEBAR_SCRIM_STYLE}
         />
       )}
       {!mobile && (
@@ -1490,6 +1493,16 @@ const WS_FADE_MASK_IMAGE =
 const WS_FADE_MASK_SIZE =
   "calc(100% - var(--transcript-sbw, 0px)) 100%, var(--transcript-sbw, 0px) 100%";
 const WS_FADE_MASK_POSITION = "left top, right top";
+
+/** The compatibility-renderer stand-in for the mask's top edge: the same
+ *  clear zone and fade, read from the same variables (set under the
+ *  titlebar in globals.css), and kept off the scrollbar's column. */
+const TITLEBAR_SCRIM_STYLE: CSSProperties = {
+  right: "var(--transcript-sbw, 0px)",
+  height: "calc(var(--transcript-top-clear, 0px) + var(--transcript-top-fade, 26px))",
+  backgroundImage:
+    "linear-gradient(to bottom, var(--background) var(--transcript-top-clear, 0px), transparent 100%)",
+};
 
 const WS_FADE_STYLE: CSSProperties = {
   maskImage: WS_FADE_MASK_IMAGE,
