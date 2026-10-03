@@ -348,17 +348,18 @@ export interface InitialChatPane {
  *  backend supplies it) its resolved cwd. */
 export const createEmptyWorkspaceResult = (
   cwd: string,
-  opts?: { skipSetup?: boolean; initialChat?: InitialChatPane },
+  opts?: { skipSetup?: boolean; initialChat?: InitialChatPane; select?: boolean },
 ): Promise<WorkspaceCreateResult> =>
   invoke<unknown>(opts?.initialChat ? "materialize_chat_workspace" : "create_empty_workspace", {
     cwd,
     ...(opts?.initialChat ? { initialChat: opts.initialChat } : {}),
     skipSetup: opts?.skipSetup ?? null,
+    ...(opts?.select !== undefined ? { select: opts.select } : {}),
   }).then(normalizeWorkspaceCreate);
 
 export const createEmptyWorkspace = (
   cwd: string,
-  opts?: { skipSetup?: boolean; initialChat?: InitialChatPane },
+  opts?: { skipSetup?: boolean; initialChat?: InitialChatPane; select?: boolean },
 ): Promise<string> =>
   createEmptyWorkspaceResult(cwd, opts).then((r) => r.workspaceId);
 
@@ -561,8 +562,10 @@ export const createWorktreeWorkspaceResult = (
   prNumber?: number | null,
   modelSelection?: ModelSelection | null,
   initialChat?: InitialChatPane,
+  select?: boolean,
 ): Promise<WorkspaceCreateResult> =>
   invoke<unknown>("create_worktree_workspace", {
+    ...(select !== undefined ? { select } : {}),
     ...(initialChat ? { initialChat } : {}),
     repoPath,
     branch,
@@ -1652,6 +1655,7 @@ export const agentChatCreatePane = async (
   cwd: string | null = null,
   launchMode: LaunchMode | null = null,
   threadId: string | null = null,
+  select?: boolean,
 ) => {
   const id = await invoke<string>("agent_chat_create_pane", {
     workspaceId,
@@ -1659,8 +1663,9 @@ export const agentChatCreatePane = async (
     cwd,
     launchMode,
     threadId,
+    ...(select !== undefined ? { select } : {}),
   });
-  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, id);
+  if (isRemoteClient() && select !== false) await refreshRemoteWorkspaceView(workspaceId, undefined, id);
   return id;
 };
 

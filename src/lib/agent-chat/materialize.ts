@@ -191,6 +191,8 @@ export async function materializeAndSend(
    *  tracks the actual work instead of a bare spinner. Optional; a
    *  no-op by default. */
   onPhase: (phase: MaterializePhase) => void = () => {},
+  /** Create and send without selecting the workspace or its pane. */
+  options: { background?: boolean } = {},
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -240,6 +242,7 @@ export async function materializeAndSend(
         draft.baseBranch ?? "",
         text,
         initialChatForDraft(draft),
+        ...(options.background ? [false] as const : []),
       );
       workspaceId = created.workspaceId;
       // Prefer the cwd the create response carries (contract item 6);
@@ -257,7 +260,11 @@ export async function materializeAndSend(
     } else {
       switch (draft.target.kind) {
         case "home": {
-          const created = await createHomeRootedWorkspace(text, initialChatForDraft(draft));
+          const created = await createHomeRootedWorkspace(
+            text,
+            initialChatForDraft(draft),
+            options.background ? false : undefined,
+          );
           workspaceId = created;
           break;
         }
@@ -266,6 +273,7 @@ export async function materializeAndSend(
             draft.target.projectPath,
             text,
             initialChatForDraft(draft),
+            options.background ? false : undefined,
           );
           break;
         case "existing_workspace":
@@ -313,6 +321,7 @@ export async function materializeAndSend(
       effectiveCwd,
       null,
       draft.threadId,
+      ...(options.background ? [false] as const : []),
     );
   } catch (err) {
     const message = errorMessage(err);
@@ -402,7 +411,7 @@ export async function materializeAndSend(
   //    to the live pane. Failure here is non-fatal: the workspace
   //    exists, its state will reconcile on the next app-state emit.
   try {
-    await activateWorkspace(workspaceId);
+    if (!options.background) await activateWorkspace(workspaceId);
   } catch (err) {
     console.warn(
       "[materialize] activateWorkspace failed (non-fatal):",
@@ -731,6 +740,7 @@ function initialChatForDraft(draft: ChatDraft): InitialChatPane {
 async function createHomeRootedWorkspace(
   firstMessage: string,
   initialChat?: InitialChatPane,
+  select?: boolean,
 ): Promise<string> {
   const homeDir = useAppStore.getState().homeDir;
   if (!homeDir) {
@@ -739,6 +749,7 @@ async function createHomeRootedWorkspace(
   const workspaceId = await createEmptyWorkspace(homeDir, {
     skipSetup: true,
     ...(initialChat ? { initialChat } : {}),
+    ...(select !== undefined ? { select } : {}),
   });
   await applyFirstMessageTitle(workspaceId, firstMessage);
   return workspaceId;
@@ -753,8 +764,16 @@ async function createProjectWorkspace(
   projectPath: string,
   firstMessage: string,
   initialChat?: InitialChatPane,
+  select?: boolean,
 ): Promise<string> {
-  const workspaceId = await createEmptyWorkspace(projectPath, initialChat ? { initialChat } : undefined);
+  const opts = {
+    ...(initialChat ? { initialChat } : {}),
+    ...(select !== undefined ? { select } : {}),
+  };
+  const workspaceId = await createEmptyWorkspace(
+    projectPath,
+    initialChat || select !== undefined ? opts : undefined,
+  );
   autoNameWorkspace(workspaceId, projectPath, firstMessage);
   return workspaceId;
 }
@@ -913,6 +932,7 @@ export async function createDeferredWorktree(
   baseBranch: string,
   firstMessage: string,
   initialChat?: InitialChatPane,
+  select?: boolean,
 ): Promise<WorkspaceCreateResult> {
   let name = worktreeName.trim();
   if (!name) {
@@ -945,6 +965,7 @@ export async function createDeferredWorktree(
     null,
     null,
     initialChat,
+    ...(select !== undefined ? [select] : []),
   );
 }
 

@@ -1,30 +1,36 @@
 import {
   definePlugin,
   Heading,
+  type Handler,
   PluginError,
   Stack,
   Text,
-  useEffect,
   useReducer,
 } from "@codemux/plugin-sdk";
+import { useLayoutEffect } from "preact/hooks";
 
-// CI-only: each command waits past a context change and then tries to append
-// to the draft it was started from. Outcomes are shown in a panel rather than
-// notifications so the three-per-minute notification limit cannot hide them.
+// CI-only: the harness releases each append after changing its context, so
+// slow native UI operations cannot lose a race against a fixed timer. The
+// disable case keeps a timer because disabling stops the fixture itself.
 const cases = ["typing", "workspace", "thread", "replacement", "disable"];
 const outcomes: string[] = [];
 const listeners = new Set<() => void>();
+const pending = new Map<string, () => void>();
 function record(line: string) {
+  console.info(`CI ${line}`);
   outcomes.push(line);
   if (outcomes.length > 12) outcomes.shift();
   for (const listener of listeners) listener();
 }
 function Status() {
   const [, rerender] = useReducer((n: number) => n + 1, 0);
-  useEffect(() => {
-    listeners.add(rerender);
+  // Subscribe in the commit that renders the snapshot; an action can run
+  // before a deferred effect subscribes when the panel has just remounted.
+  useLayoutEffect(() => {
+    const update = () => rerender(undefined);
+    listeners.add(update);
     return () => {
-      listeners.delete(rerender);
+      listeners.delete(update);
     };
   }, []);
   return (
@@ -43,10 +49,19 @@ export default definePlugin({
     ctx.commands.register("status", (context) =>
       ctx.panels.open("status", context).catch(() => {}),
     );
-    for (const id of cases)
-      ctx.commands.register(id, async (context) => {
+    ctx.commands.register("release", () => {
+      for (const [id, release] of pending) {
+        pending.delete(id);
+        release();
+      }
+    });
+    for (const id of cases) {
+      const handler: Handler = async (context) => {
+        const ready = id === "disable"
+          ? new Promise<void>((resolve) => setTimeout(resolve, 4000))
+          : new Promise<void>((resolve) => pending.set(id, resolve));
         record(`pending ${id}`);
-        await new Promise((resolve) => setTimeout(resolve, 4000));
+        await ready;
         try {
           await ctx.composer.appendText(context, ` CI delayed ${id}.`);
           record(`appended ${id}`);
@@ -55,6 +70,8 @@ export default definePlugin({
             `cancelled ${id}: ${error instanceof PluginError ? error.code : "unknown"}`,
           );
         }
-      });
+      };
+      ctx.commands.register(id, handler);
+    }
   },
 });

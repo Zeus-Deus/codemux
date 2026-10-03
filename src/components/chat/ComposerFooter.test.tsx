@@ -76,6 +76,22 @@ function renderFooter(props: Partial<FooterProps> = {}) {
 }
 
 describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
+  it("sends in the background on Ctrl-click and normally on plain click", () => {
+    const onSubmit = vi.fn();
+    const onBackgroundSubmit = vi.fn();
+    renderFooter({ onSubmit, onBackgroundSubmit });
+    const send = screen.getByRole("button", { name: "Send" });
+    fireEvent.click(send, { ctrlKey: true });
+    expect(onBackgroundSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit).not.toHaveBeenCalled();
+    fireEvent.click(send);
+    expect(onSubmit).toHaveBeenCalledOnce();
+    fireEvent.click(send, { altKey: true });
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(onBackgroundSubmit).toHaveBeenCalledOnce();
+    expect(send.title).toContain("Ctrl-click");
+  });
+
   it("does NOT render the legacy '+ Mode' dropdown trigger", () => {
     // The Stage 3 refactor moved mode selection into the unified `+`
     // popup. This test is a regression guard so the dropdown can't

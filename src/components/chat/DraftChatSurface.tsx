@@ -112,13 +112,34 @@ const EMPTY_ATTACHMENTS: Attachment[] = [];
  */
 export function DraftChatSurface() {
   const draft = useChatDraftStore(selectActiveDraft);
+  const [focusDraftId, setFocusDraftId] = useState<string | null>(null);
+  useEffect(() => {
+    // The child composer consumes the request on mount. Do not carry it
+    // into later visits to the same draft after the user moves focus away.
+    if (focusDraftId === draft?.draftId) setFocusDraftId(null);
+  }, [draft?.draftId, focusDraftId]);
   if (!draft) return null;
   // Key on the draft id so a slot swap (home → project) remounts with a
   // fresh resolved-cwd effect instead of carrying stale state.
-  return <DraftChatSurfaceInner key={draft.draftId} draft={draft} />;
+  return (
+    <DraftChatSurfaceInner
+      key={draft.draftId}
+      draft={draft}
+      focusOnMount={focusDraftId === draft.draftId}
+      onBackgroundStarted={setFocusDraftId}
+    />
+  );
 }
 
-function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
+function DraftChatSurfaceInner({
+  draft,
+  focusOnMount,
+  onBackgroundStarted,
+}: {
+  draft: ChatDraft;
+  focusOnMount: boolean;
+  onBackgroundStarted: (draftId: string) => void;
+}) {
   const capabilities = useProviderCapabilities((s) =>
     selectCapabilities(s, draft.provider),
   );
@@ -340,7 +361,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     markPaneReady("agent-chat", { target: sessionWorkspaceId ?? undefined });
   }, [sessionWorkspaceId]);
 
-  const handleSubmit = useCallback(() => {
+  const handleSubmit = useCallback((background = false) => {
     if (sendInFlightRef.current) return;
     // Re-read fresh state so a same-tick keystroke then Enter sees the
     // just-written text.
@@ -401,7 +422,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     }
 
     sendInFlightRef.current = true;
-    setFocusComposerAfterSubmit(true);
+    if (!background) setFocusComposerAfterSubmit(true);
     const chat = useAgentChatStore.getState();
     // Resolve any `/skill-name` tokens in the draft text against the
     // skills registry. Same parser the live pane uses; bodies are
@@ -446,12 +467,42 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // work begins. The status line advances through the real phases via
     // `materializeAndSend`'s `onPhase` hook.
     const finalDraft = currentDraft;
-    setPending({
-      text,
-      images: imageDisplaySources,
-      phase: worktreeProjectPath ? "creating-worktree" : "creating-workspace",
-    });
+    if (background) {
+      // Claim before clearing: the home slot must not reuse or discard the
+      // sending draft while attachment preflight is still in flight.
+      state.markPromoting(finalDraft.draftId);
+    } else {
+      setPending({
+        text,
+        images: imageDisplaySources,
+        phase: worktreeProjectPath ? "creating-worktree" : "creating-workspace",
+      });
+    }
     updateDraftInput(finalDraft.draftId, "");
+    if (background) {
+      const nextDraft = state.getOrCreateHomeDraft({ lockedToHome: true });
+      onBackgroundStarted(nextDraft.draftId);
+      setActiveDraft(nextDraft.draftId);
+    }
+
+    const reportFailure = (message: string, description?: string) => {
+      setPending(null);
+      updateDraftInput(finalDraft.draftId, text);
+      if (
+        background &&
+        useChatDraftStore.getState().draftsById[finalDraft.draftId]?.promoting
+      ) {
+        state.markSendFailed(finalDraft.draftId, message);
+      }
+      toast.error(message, {
+        description,
+        action: background ? {
+          label: "Review draft",
+          onClick: () => setActiveDraft(finalDraft.draftId),
+        } : undefined,
+      });
+      sendInFlightRef.current = false;
+    };
 
     void (async () => {
       // A conversation in another tab can advance while this draft is open.
@@ -517,12 +568,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       if (unstaged.length > 0) {
         // A staged image never landed — block the send (the raw-bytes
         // fallback is gone) and restore the composer.
-        setPending(null);
-        updateDraftInput(finalDraft.draftId, text);
-        toast.error(
+        reportFailure(
           "An attached image failed to upload — remove it and try again.",
         );
-        sendInFlightRef.current = false;
         return;
       }
       const imageRefs = buildImageRefs(freshAttachments);
@@ -532,12 +580,10 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           attachment.kind === "session" && !attachment.resolvedContent?.trim(),
       );
       if (unavailableSession) {
-        setPending(null);
-        updateDraftInput(finalDraft.draftId, text);
-        toast.error("Conversation handoff could not be loaded", {
-          description: `Remove ${unavailableSession.metadata.label} or try again.`,
-        });
-        sendInFlightRef.current = false;
+        reportFailure(
+          "Conversation handoff could not be loaded",
+          `Remove ${unavailableSession.metadata.label} or try again.`,
+        );
         return;
       }
       const attachmentBlock = buildAttachmentBlock(activeFreshAttachments);
@@ -577,6 +623,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         imageDisplaySources,
         worktreeProjectPath,
         (phase) => setPending((p) => (p ? { ...p, phase } : p)),
+        { background },
       );
       if (result.success) {
         // The provider started a session and took the turn — retire any
@@ -587,7 +634,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         // Flip to the real pane. The pending view stays mounted until
         // this surface unmounts, and the live pane renders the same
         // optimistically-appended bubble — flicker-free.
-        setActiveDraft(null);
+        if (
+          !background &&
+          useChatDraftStore.getState().activeDraftId === finalDraft.draftId
+        ) {
+          setActiveDraft(null);
+        }
         // Clear the chips per-turn so the fresh AgentChatPane mount
         // doesn't render leftover chips from the draft surface.
         clearStagedAttachments(finalDraft.threadId);
@@ -600,9 +652,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         // bubble; drop the pending view and restore the composer text so
         // the user can retry. The error also surfaces via
         // `draft.lastSendError` on the composer.
-        setPending(null);
-        updateDraftInput(finalDraft.draftId, text);
-        toast.error(`Send failed: ${formatProviderError(result.error)}`);
+        reportFailure(`Send failed: ${formatProviderError(result.error)}`);
         // A materialize failure often means the provider runtime itself
         // is broken — re-probe (bypassing the TTL) so the status banner
         // explains why instead of leaving only a transient toast.
@@ -624,6 +674,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     clearStagedAttachments,
     updateStagedAttachment,
     updateDraftInput,
+    onBackgroundStarted,
   ]);
 
   // Step 8 Stage 2 — chip lifecycle for the `@` mention popup.
@@ -1129,7 +1180,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       // so the hand-off to AgentChatPane (which mounts it collapsed too)
       // shows no resize at all.
       isDraft={!pending}
-      focusOnMount={focusComposerAfterSubmit}
+      focusOnMount={focusOnMount || focusComposerAfterSubmit}
       placeholderOverride={placeholderOverride}
       showProviderPicker={true}
       showStopButton={false}
@@ -1165,7 +1216,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       providerCliInstalled={providerCliInstalled}
       providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
-      onSubmit={handleSubmit}
+      onSubmit={() => handleSubmit()}
+      onBackgroundSubmit={!pending && !draft.promoting ? () => handleSubmit(true) : undefined}
       onStop={handleStop}
       onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}

@@ -691,6 +691,91 @@ describe("DraftChatSurface", () => {
       return draft;
     }
 
+    it.each(["keyboard", "button"])("opens a focused empty draft immediately on background send by %s", async (gesture) => {
+      let finish!: (result: Awaited<ReturnType<typeof materializeAndSend>>) => void;
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+      const draft = seedProjectDraft();
+      const { container, getByRole } = renderSurface();
+      if (gesture === "keyboard") fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter", ctrlKey: true });
+      else fireEvent.click(getByRole("button", { name: "Send" }), { ctrlKey: true });
+
+      const store = useChatDraftStore.getState();
+      const nextId = store.activeDraftId!;
+      expect(nextId).not.toBe(draft.draftId);
+      expect(store.draftsById[nextId]).toMatchObject({ target: { kind: "home" }, lockedToHome: true, inputDraft: "" });
+      expect(store.draftsById[draft.draftId].promoting).toBe(true);
+      const nextTextarea = container.querySelector("textarea")!;
+      expect(document.activeElement).toBe(nextTextarea);
+      fireEvent.change(nextTextarea, { target: { value: "next task" } });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      expect(vi.mocked(materializeAndSend).mock.calls[0][10]).toEqual({ background: true });
+      await act(async () => finish({ success: true, workspaceId: "ws-project", paneId: "pane-new", threadId: draft.threadId }));
+      expect(useChatDraftStore.getState().activeDraftId).toBe(nextId);
+      expect(nextTextarea).toHaveValue("next task");
+      expect(document.activeElement).toBe(nextTextarea);
+    });
+
+    it("consumes background focus before a later visit to the same draft", () => {
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const draft = seedProjectDraft();
+      const { container } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter", ctrlKey: true });
+      const nextId = useChatDraftStore.getState().activeDraftId!;
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+
+      act(() => useChatDraftStore.getState().setActiveDraft(draft.draftId));
+      const outside = document.createElement("button");
+      document.body.appendChild(outside);
+      outside.focus();
+      act(() => useChatDraftStore.getState().setActiveDraft(nextId));
+
+      expect(container.querySelector("textarea")).toHaveValue("");
+      expect(document.activeElement).toBe(outside);
+      outside.remove();
+    });
+
+    it("keeps a failed background prompt recoverable without interrupting the next draft", async () => {
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({ success: false, error: "workspace lock" });
+      const draft = seedProjectDraft();
+      const { container } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter", ctrlKey: true });
+      const nextId = useChatDraftStore.getState().activeDraftId;
+      fireEvent.change(container.querySelector("textarea")!, { target: { value: "keep typing" } });
+      await vi.waitFor(() => expect(toast.error).toHaveBeenCalled());
+      expect(useChatDraftStore.getState().activeDraftId).toBe(nextId);
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({ inputDraft: "hello", promoting: false });
+      expect(container.querySelector("textarea")).toHaveValue("keep typing");
+      const calls = vi.mocked(toast.error).mock.calls;
+      const options = calls[calls.length - 1][1]!;
+      expect(options.action).toMatchObject({ label: "Review draft" });
+      act(() => (options.action as import("sonner").Action).onClick({} as never));
+      expect(useChatDraftStore.getState().activeDraftId).toBe(draft.draftId);
+      expect(container.querySelector("textarea")).toHaveValue("hello");
+    });
+
+    it("releases a background draft's in-flight state when attachment preflight fails", async () => {
+      const draft = seedProjectDraft();
+      const chat = useAgentChatStore.getState();
+      chat.ensureThread(draft.threadId);
+      chat.addStagedAttachment(draft.threadId, {
+        id: "failed-image", kind: "image", ref: "image.png", resolvedContent: "",
+        metadata: { label: "image.png", error: "Upload failed" },
+        resolvedImage: { mime: "image/png", bytes: new Uint8Array([1, 2, 3]) },
+      });
+      const { container } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter", ctrlKey: true });
+      const nextId = useChatDraftStore.getState().activeDraftId;
+      await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+        "An attached image failed to upload — remove it and try again.", expect.anything(),
+      ));
+      expect(materializeAndSend).not.toHaveBeenCalled();
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+        inputDraft: "hello", promoting: false, lastSendError: expect.any(String),
+      });
+      expect(useChatDraftStore.getState().activeDraftId).toBe(nextId);
+      expect(useAgentChatStore.getState().threads[draft.threadId].stagedAttachments).toHaveLength(1);
+    });
+
     it("calls materializeAndSend with the draft + trimmed text + project path cwd", async () => {
       vi.mocked(materializeAndSend).mockResolvedValueOnce({
         success: true,
