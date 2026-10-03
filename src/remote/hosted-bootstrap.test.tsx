@@ -7,8 +7,9 @@
  * context in: without them the screen silently degrades back to a bare
  * credential prompt the next time the card is refactored.
  */
-import { cleanup, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+import { useSyncExternalStore } from "react";
 import { HostedScreen } from "./hosted-bootstrap";
 import { HostedFlow, type HostedState } from "./hosted";
 
@@ -36,7 +37,29 @@ function state(over: Partial<HostedState> = {}): HostedState {
 describe("HostedScreen", () => {
   // This suite has no globals-driven auto-cleanup; unmount between renders so
   // `screen` queries only ever see the screen under test.
-  beforeEach(cleanup);
+  afterEach(cleanup);
+
+  it("lets a user cancel a stalled connection and choose a device again", () => {
+    const controller = new HostedFlow({
+      signIn: async () => [],
+      connect: async () => new Promise<void>(() => {}),
+    });
+    void controller.select({
+      id: "fixture-desktop", deviceId: "fixture-install", nodeId: "fixture-node",
+      name: "Test Desktop", platform: "linux", lastSeenAt: null,
+    });
+    function Screen() {
+      const current = useSyncExternalStore(
+        (notify) => controller.subscribe(notify), () => controller.getState(),
+      );
+      return <HostedScreen state={current} flow={controller} apiHost="api.example" />;
+    }
+    render(<Screen />);
+    fireEvent.click(screen.getByRole("button", { name: "Back to devices" }));
+    expect(screen.queryByText("Connecting")).not.toBeInTheDocument();
+    expect(screen.getByText("No devices yet")).toBeInTheDocument();
+    expect(controller.getState().phase).toBe("devices");
+  });
 
   it("names the product and says what the page is before asking for credentials", () => {
     render(

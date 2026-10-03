@@ -47,7 +47,7 @@ import {
 import { createIrohConnection } from "./iroh-connection";
 import { IrohWasmUnavailableError, loadIrohDialer } from "./iroh-wasm-loader";
 import { installShim } from "./shim";
-import type { ConnectionStatus } from "./transport";
+import type { ConnectionStatus, RemoteTransport } from "./transport";
 import { useRemoteConnectionStore } from "./remote-connection-store";
 
 const WASM_UNAVAILABLE_COPY =
@@ -93,11 +93,12 @@ export async function bootstrapHosted(): Promise<void> {
       await registry.signIn(email, authSecret);
       return registry.listDevices();
     },
-    connect(device, handlers) {
+    connect(device, handlers, signal) {
       return connectOverIroh({
         registry,
         device,
         handlers,
+        signal,
         onStatus: (s) => handleStatus(s, device.name),
         onUnauthorized: handleUnauthorized,
       });
@@ -183,6 +184,7 @@ interface ConnectArgs {
   handlers: HostedConnectHandlers;
   onStatus(status: ConnectionStatus): void;
   onUnauthorized(): void;
+  signal: AbortSignal;
 }
 
 /**
@@ -191,53 +193,119 @@ interface ConnectArgs {
  * classifies (unauthorized → back to sign-in; anything else → back to the
  * picker).
  */
-async function connectOverIroh(args: ConnectArgs): Promise<void> {
-  let dialer;
-  try {
-    dialer = await loadIrohDialer();
-  } catch (err) {
-    if (err instanceof IrohWasmUnavailableError) {
-      throw new Error(WASM_UNAVAILABLE_COPY);
-    }
-    throw err;
-  }
-
-  const conn = createIrohConnection({
-    registry: args.registry,
-    deviceId: args.device.id,
-    dialer,
-    onPending: args.handlers.onPending,
-    onMintError: (err: DeviceRegistryError) => {
-      // Transient mint failures (offline/network/server) → keep the picker's
-      // "offline, retrying" copy; auth failures route through onUnauthorized.
-      if (
-        err.kind === "offline" ||
-        err.kind === "network" ||
-        err.kind === "server" ||
-        err.kind === "rate_limited"
-      ) {
-        args.handlers.onOfflineRetry();
-      }
-    },
-  });
-
+export async function connectOverIroh(args: ConnectArgs): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const { transport } = installShim({
-      baseUrl: window.location.origin,
-      viewHost: args.device.id,
-      appVersion: null,
-      getToken: () => null,
-      onStatusChange: args.onStatus,
-      onUnauthorized: () => {
-        args.onUnauthorized();
-        reject({
-          reason: "unauthorized",
-          message: "Your account session expired. Sign in again.",
+    let transport: RemoteTransport | null = null;
+    let settled = false;
+    let stopped = false;
+    let waitingApproval = false;
+    let lastError: string | null = null;
+    // Bound the whole startup, including WASM loading, grant minting and dial.
+    // Live reconnects retain the transport's normal indefinite retry policy.
+    function timeout(): void {
+      finish(new Error(waitingApproval
+        ? `Approval on ${args.device.name} timed out. Approve this browser in Remote Access, then try again.`
+        : `Connection to ${args.device.name} timed out. Check that Codemux is running ` +
+          "with Remote Access enabled on that desktop, then try again." +
+          (lastError ? ` (${lastError})` : "")));
+    }
+    let timer = window.setTimeout(timeout, 30_000);
+    let approvalTimer: number | null = null;
+
+    function offlineRetry(): void {
+      if (settled) return;
+      if (waitingApproval) {
+        waitingApproval = false;
+        window.clearTimeout(timer);
+        timer = window.setTimeout(timeout, 30_000);
+      }
+      args.handlers.onOfflineRetry();
+    }
+
+    function finish(error?: unknown): void {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      if (approvalTimer !== null) window.clearTimeout(approvalTimer);
+      args.signal.removeEventListener("abort", cancel);
+      if (error !== undefined) {
+        stopped = true;
+        transport?.close();
+        reject(error);
+      } else {
+        resolve();
+      }
+    }
+
+    function cancel(): void {
+      finish(new DOMException("Connection cancelled", "AbortError"));
+    }
+    args.signal.addEventListener("abort", cancel, { once: true });
+    if (args.signal.aborted) {
+      cancel();
+      return;
+    }
+
+    void (async () => {
+      try {
+        const dialer = await loadIrohDialer();
+        // A late WASM load must not install a shim for an expired attempt.
+        if (settled) return;
+        const conn = createIrohConnection({
+          registry: args.registry,
+          deviceId: args.device.id,
+          dialer,
+          onPending: () => {
+            if (settled) return;
+            if (!waitingApproval) {
+              waitingApproval = true;
+              window.clearTimeout(timer);
+              // Keep the first approval deadline across offline/pending transitions.
+              if (approvalTimer === null) {
+                approvalTimer = window.setTimeout(timeout, 5 * 60_000);
+              }
+            }
+            args.handlers.onPending();
+          },
+          onMintError: (err: DeviceRegistryError) => {
+            if (!settled && (
+              err.kind === "offline" ||
+              err.kind === "network" ||
+              err.kind === "server" ||
+              err.kind === "rate_limited"
+            )) {
+              lastError = err.message;
+              offlineRetry();
+            }
+          },
+          onTransportError: (err) => {
+            if (settled) return;
+            lastError = err instanceof Error ? err.message : typeof err === "string" ? err : null;
+            offlineRetry();
+          },
         });
-      },
-      deps: { fetchImpl: conn.fetchImpl, wsFactory: conn.wsFactory },
-    });
-    transport.connect().then(resolve, reject);
+        ({ transport } = installShim({
+          baseUrl: window.location.origin,
+          viewHost: args.device.id,
+          appVersion: null,
+          getToken: () => null,
+          onStatusChange: (status) => { if (!stopped) args.onStatus(status); },
+          onUnauthorized: () => {
+            if (stopped) return;
+            args.onUnauthorized();
+            finish({
+              reason: "unauthorized",
+              message: "Your account session expired. Sign in again.",
+            });
+          },
+          deps: { fetchImpl: conn.fetchImpl, wsFactory: conn.wsFactory },
+        }));
+        await transport.connect();
+        finish();
+      } catch (err) {
+        finish(err instanceof IrohWasmUnavailableError ? new Error(WASM_UNAVAILABLE_COPY) : err);
+      }
+    })();
   });
 }
 
@@ -275,7 +343,7 @@ export function HostedScreen(props: {
         );
       break;
     case "connecting":
-      body = <ConnectingScreen state={state} />;
+      body = <ConnectingScreen state={state} flow={flow} />;
       break;
     case "connected":
     default:
@@ -548,7 +616,7 @@ function NoDevices(props: {
   );
 }
 
-function ConnectingScreen(props: { state: HostedState }): React.ReactElement {
+function ConnectingScreen(props: { state: HostedState; flow: HostedFlow }): React.ReactElement {
   const name = props.state.selected?.name ?? "your device";
   let title: string;
   let detail: string;
@@ -567,7 +635,14 @@ function ConnectingScreen(props: { state: HostedState }): React.ReactElement {
       detail = `Establishing a secure connection to ${name}…`;
       break;
   }
-  return <Spinner title={title} detail={detail} />;
+  return (
+    <div>
+      <Spinner title={title} detail={detail} />
+      <button type="button" style={switchLinkStyle} onClick={() => props.flow.backToDevices()}>
+        Back to devices
+      </button>
+    </div>
+  );
 }
 
 function Spinner(props: { title: string; detail: string }): React.ReactElement {
