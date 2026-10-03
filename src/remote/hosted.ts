@@ -70,6 +70,7 @@ export interface HostedFlowDeps {
   connect(
     device: RegisteredDevice,
     handlers: HostedConnectHandlers,
+    signal: AbortSignal,
   ): Promise<void>;
   /**
    * Kick off the GitHub OAuth redirect. Side-effecting (navigates the browser
@@ -104,6 +105,7 @@ const INITIAL: HostedState = {
 export class HostedFlow {
   private state: HostedState = { ...INITIAL };
   private readonly listeners = new Set<Listener>();
+  private connectAttempt: AbortController | null = null;
 
   constructor(private readonly deps: HostedFlowDeps) {}
 
@@ -174,6 +176,9 @@ export class HostedFlow {
 
   /** Select a device and connect the app to it over iroh. */
   async select(device: RegisteredDevice): Promise<void> {
+    this.connectAttempt?.abort();
+    const attempt = new AbortController();
+    this.connectAttempt = attempt;
     this.set({
       phase: "connecting",
       selected: device,
@@ -181,26 +186,40 @@ export class HostedFlow {
       error: null,
     });
     const handlers: HostedConnectHandlers = {
-      onPending: () => this.set({ connectStatus: "waiting-approval" }),
-      onOfflineRetry: () => this.set({ connectStatus: "offline-retrying" }),
-      onConnecting: () => this.set({ connectStatus: "connecting" }),
+      onPending: () => {
+        if (!attempt.signal.aborted) this.set({ connectStatus: "waiting-approval" });
+      },
+      onOfflineRetry: () => {
+        if (!attempt.signal.aborted) this.set({ connectStatus: "offline-retrying" });
+      },
+      onConnecting: () => {
+        if (!attempt.signal.aborted) this.set({ connectStatus: "connecting" });
+      },
     };
     try {
-      await this.deps.connect(device, handlers);
+      await this.deps.connect(device, handlers, attempt.signal);
     } catch (err) {
+      if (attempt.signal.aborted) return;
+      this.connectAttempt = null;
       this.onConnectFailed(err);
       return;
     }
+    if (attempt.signal.aborted) return;
+    this.connectAttempt = null;
     this.set({ phase: "connected", error: null });
   }
 
   /** Return to the device list (e.g. from a connect error). */
   backToDevices(): void {
+    this.connectAttempt?.abort();
+    this.connectAttempt = null;
     this.set({ phase: "devices", selected: null, error: null });
   }
 
   /** Return to sign-in (session expired / user chose to switch account). */
   reset(): void {
+    this.connectAttempt?.abort();
+    this.connectAttempt = null;
     this.state = { ...INITIAL };
     this.emit();
   }

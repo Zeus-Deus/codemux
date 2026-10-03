@@ -75,6 +75,31 @@ describe("HostedFlow: sign-in → list", () => {
 });
 
 describe("HostedFlow: select → connect", () => {
+  it("cancels a pending connection and ignores its late callbacks and completion", async () => {
+    let finish!: () => void;
+    let handlers!: HostedConnectHandlers;
+    let signal!: AbortSignal;
+    const flow = new HostedFlow({
+      signIn: async () => [device("a")],
+      connect: (_device, h, s) => {
+        handlers = h;
+        signal = s;
+        return new Promise<void>((resolve) => (finish = resolve));
+      },
+    });
+    await flow.submitSignIn("me@example.com", "pw");
+    const pending = flow.select(device("a"));
+    flow.backToDevices();
+    expect(signal?.aborted).toBe(true);
+    handlers.onPending();
+    handlers.onOfflineRetry();
+    finish();
+    await pending;
+    expect(flow.getState()).toMatchObject({
+      phase: "devices", selected: null, connectStatus: "connecting", error: null,
+    });
+  });
+
   it("connects and reaches the connected phase", async () => {
     const flow = new HostedFlow({
       signIn: async () => [device("a")],

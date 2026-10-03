@@ -40,6 +40,8 @@ export interface IrohConnectionOptions {
   /** A grant mint failed; advisory for UI ("device offline, retrying…"). The
    *  transport still retries on its own backoff. */
   onMintError?(err: DeviceRegistryError): void;
+  /** Dial/stream failure; advisory while the transport retries. */
+  onTransportError?(err: unknown): void;
   /** Override the random `browserNonce` generator (tests). */
   nonceFactory?(): string;
 }
@@ -102,6 +104,7 @@ export function createIrohConnection(
         if (kind === "fatal") fatal = true;
         else opts.onPending?.();
       },
+      onError: opts.onTransportError,
     });
 
   return { fetchImpl, wsFactory };
