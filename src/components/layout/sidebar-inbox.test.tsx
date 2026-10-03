@@ -3380,7 +3380,7 @@ describe("SidebarInbox — new workspace arrival", () => {
     expect(creating).toHaveTextContent("Add a dark mode toggle");
     expect(creating).not.toHaveTextContent("with tests");
     expect(creating).toHaveTextContent("Creating");
-    expect(creating).toHaveTextContent("Setting up workspace…");
+    expect(creating).toHaveTextContent("Creating worktree…");
     // It holds the slot the new card lands in: above the existing cards.
     expect(creating.compareDocumentPosition(existing())).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,

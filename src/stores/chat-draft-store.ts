@@ -85,8 +85,8 @@ export interface ChatDraft {
    *  deserialize unchanged. */
   lockedToHome?: boolean;
   /** Thread Scope redesign — where the agent should work relative to
-   *  the target project. `"current"` (default) sends into the
-   *  project's existing checkout; `"worktree"` defers creation of a
+   *  the target project. `"current"` sends into the project's existing
+   *  checkout; `"worktree"` (default for new drafts) defers creation of a
    *  fresh git worktree to submit time (`materializeAndSend`), named
    *  either from `worktreeName` (if set) or auto-derived from the
    *  first message / a random fallback. Irrelevant for `target.kind
@@ -294,7 +294,7 @@ function makeDraft(
     promoting: false,
     lastSendError: null,
     lockedToHome: opts.lockedToHome ?? false,
-    checkoutMode: "current",
+    checkoutMode: "worktree",
     worktreeName: "",
     baseBranch: "",
   };
