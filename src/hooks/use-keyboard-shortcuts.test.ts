@@ -280,7 +280,7 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
 
     it("newAgent opens the New Workspace dialog when agent chat is off", () => {
       // With the Agent Chat GUI opted out, the New agent shortcut falls
-      // back to the dialog (same as the sidebar + button). The flags
+      // back to the dialog (same as the sidebar New agent button). The flags
       // store boots ON to match the backend default, so opt out here.
       useFeatureFlags.setState({
         enableAgentChat: false,

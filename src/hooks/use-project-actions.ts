@@ -50,7 +50,7 @@ export async function openProjectFlow(): Promise<OpenProjectResult> {
   const name = basename(folder);
 
   // Non-git folders are accepted as-is — same as every other add path
-  // (sidebar "+", chat drafts, onboarding). The workspace runs in
+  // (sidebar project menu, chat drafts, onboarding). The workspace runs in
   // plain-directory mode and the UI offers an explicit "Initialize Git"
   // action instead of gating project-add on git (we never `git init` a
   // user's folder without an explicit click).

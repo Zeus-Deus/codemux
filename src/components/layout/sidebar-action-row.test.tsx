@@ -58,7 +58,7 @@ vi.mock("@/hooks/use-project-actions", () => ({
   }),
 }));
 
-import { SidebarActionRow } from "./sidebar-action-row";
+import { SidebarActionRow, SidebarHeaderActions } from "./sidebar-action-row";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 function renderRow() {
@@ -66,6 +66,8 @@ function renderRow() {
     <TooltipProvider>
       <SidebarProvider>
         <SidebarActionRow />
+        {/* Expanded, Search + New agent render in the inbox's header row. */}
+        <SidebarHeaderActions />
       </SidebarProvider>
     </TooltipProvider>,
   );

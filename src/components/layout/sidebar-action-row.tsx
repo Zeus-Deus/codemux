@@ -48,7 +48,7 @@ export function SidebarActionRow() {
   const { state } = useSidebar();
   // Only the floating titlebar overlays this header. With legacy chrome the
   // in-flow `h-9` bar already sits above the sidebar, so the extra clearance
-  // would just be dead padding above the search row.
+  // would just be dead padding above the header row.
   const titlebarOverlay = useTitlebarOverlay();
   const { getKeysForAction } = useResolvedKeybinds();
   const newAgentKeys = getKeysForAction("newAgent");
@@ -59,8 +59,8 @@ export function SidebarActionRow() {
   // Collapsed icon rail header: just the two create/find affordances,
   // centered and each labelled by a right-side tooltip. New agent is a neutral
   // ghost matching the expanded header's pencil; Search opens the command palette.
-  // Automations / Workspaces now live in the footer, and Add repository lives
-  // in the expanded inbox's repo-chip row — none of them belong here anymore.
+  // Automations / Workspaces now live in the footer, and Open / New project
+  // live at the bottom of the expanded inbox's project menu — none of them belong here anymore.
   if (state === "collapsed") {
     return (
       <ShadcnSidebarHeader className="gap-0 p-0">
@@ -109,50 +109,61 @@ export function SidebarActionRow() {
     );
   }
 
-  // Expanded inbox header: a search affordance (opens the command palette)
-  // + the neutral-ghost new-agent button. Add repository moved into the inbox's
-  // repo-chip row; Automations / Workspaces moved into the footer app menu.
+  // Expanded: the header itself is only the titlebar clearance. Search and
+  // New agent render inside the inbox's project-filter row
+  // (`SidebarHeaderActions`) so the whole header is a single row.
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
-      {/* Same insets + gap as the project-filter row below, and every control
-          in both rows is h-8 / rounded-md, so the two read as equal rows. */}
       <div
         data-testid="sidebar-action-row-expanded"
-        className={cn(
-          "flex items-center gap-1.5 px-2.5 pb-2.5",
-          titlebarOverlay ? "pt-11" : "pt-3",
-        )}
-      >
-        <button
-          type="button"
-          aria-label="Search"
-          onClick={() => setShowCommandPalette(true)}
-          className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-md border border-border/60 bg-surface-1 px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
-        >
-          <SearchIcon className="size-3.5 shrink-0" />
-          <span className="flex-1 text-left text-label">Search</span>
-          {paletteKeys && (
-            <kbd className="rounded-sm border border-border/60 px-1 py-px font-mono text-caption">
-              {paletteKeys}
-            </kbd>
-          )}
-        </button>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="New agent"
-              onClick={handleNewAgent}
-              className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
-            >
-              <SquarePen className="size-[15px]" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4} className="text-label">
-            New chat in home directory{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
-          </TooltipContent>
-        </Tooltip>
-      </div>
+        className={titlebarOverlay ? "pt-11" : "pt-3"}
+      />
     </ShadcnSidebarHeader>
+  );
+}
+
+/** Search + New agent, sized to sit at the end of the expanded inbox's
+ *  project-filter row. Search is icon-only here: the palette shortcut moves
+ *  into its tooltip so the project name keeps the row's width. */
+export function SidebarHeaderActions() {
+  const { getKeysForAction } = useResolvedKeybinds();
+  const newAgentKeys = getKeysForAction("newAgent");
+  const paletteKeys = getKeysForAction("commandPalette");
+  const setShowCommandPalette = useUIStore((s) => s.setShowCommandPalette);
+  const handleNewAgent = useNewAgentAction();
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label="Search"
+            onClick={() => setShowCommandPalette(true)}
+            className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+          >
+            <SearchIcon className="size-[15px]" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" sideOffset={4} className="text-label">
+          Search{paletteKeys ? ` · ${paletteKeys}` : ""}
+        </TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label="New agent"
+            onClick={handleNewAgent}
+            className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+          >
+            <SquarePen className="size-[15px]" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" sideOffset={4} className="text-label">
+          New chat in home directory{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
+        </TooltipContent>
+      </Tooltip>
+    </>
   );
 }

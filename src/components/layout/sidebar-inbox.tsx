@@ -21,7 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
-import { MENU_ROW_TWO_LINE, MenuKeycap } from "@/components/ui/menu-chrome";
+import { MenuKeycap } from "@/components/ui/menu-chrome";
 import {
   selectActiveWorkspaceId,
   useAppStore,
@@ -102,6 +102,7 @@ import {
 } from "./sidebar-draft-block";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SidebarEmptyState } from "./sidebar-empty-state";
+import { SidebarHeaderActions } from "./sidebar-action-row";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
@@ -1998,12 +1999,13 @@ export function SidebarInbox() {
 
   return (
     <div className="flex flex-1 flex-col">
-      {/* Sticky header block: the project filter plus the "needs you" strip.
+      {/* Sticky header block: the single header row (project menu, search,
+          new agent) plus the "needs you" strip.
           Both stay put while the card list scrolls beneath them, so blocked
           work is reachable from anywhere in a long list — that reachability
           is what lets the list below keep its static, status-blind order. */}
       <div className="sticky top-0 z-10 bg-sidebar">
-        <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5 min-w-0">
+        <div className="flex items-center gap-1 px-2.5 pb-2.5 min-w-0">
           <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
             <DropdownMenuTrigger asChild>
               <button
@@ -2074,54 +2076,30 @@ export function SidebarInbox() {
                   />
                 ))}
               </div>
+              {/* Project creation is pinned under the list, mirroring the
+                  pinned reset above it. Single-line rows sized like the
+                  project rows; the labels themselves carry the difference
+                  (adopt what's on disk vs start or clone a new repo). */}
+              <div className="shrink-0 border-t border-border/60 p-1.5">
+                <DropdownMenuItem
+                  onClick={() => openProject()}
+                  className="h-8 gap-2 rounded-md px-2 text-label"
+                >
+                  <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate">Open existing project</span>
+                  <MenuKeycap actionId="openProject" />
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setShowNewProjectScreen(true)}
+                  className="h-8 gap-2 rounded-md px-2 text-label"
+                >
+                  <FolderPlus className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate">Create or clone project</span>
+                </DropdownMenuItem>
+              </div>
             </DropdownMenuContent>
           </DropdownMenu>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                aria-label="Add repository"
-                className="flex size-8 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-body leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
-              >
-                +
-              </button>
-            </DropdownMenuTrigger>
-            {/* Two-line rows: "Open project" and "New project" are one word
-                apart and mean opposite things (adopt what's on disk vs clone
-                from a remote), so each carries the sentence that tells them
-                apart rather than making the user find out by clicking. */}
-            <DropdownMenuContent side="bottom" align="start" className="w-[246px]">
-              <DropdownMenuItem
-                onClick={() => openProject()}
-                className={MENU_ROW_TWO_LINE}
-              >
-                <FolderOpen />
-                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="flex items-center gap-2">
-                    <span className="flex-1">Open project</span>
-                    <MenuKeycap actionId="openProject" />
-                  </span>
-                  <span className="text-label leading-snug text-muted-foreground/70">
-                    Pick a repo already on this machine
-                  </span>
-                </span>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => setShowNewProjectScreen(true)}
-                className={MENU_ROW_TWO_LINE}
-              >
-                <FolderPlus />
-                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="flex items-center gap-2">
-                    <span className="flex-1">New project</span>
-                  </span>
-                  <span className="text-label leading-snug text-muted-foreground/70">
-                    Clone from a Git remote
-                  </span>
-                </span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <SidebarHeaderActions />
         </div>
 
         {/* Pinned "needs you" strip. Sits above the list rather than

@@ -3,7 +3,7 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 
 /**
  * Shared chrome for the app's popup menus (workspace right-click, the footer
- * gear menu, the projects `+` menu and their submenus).
+ * gear menu, the sidebar project menu and their submenus).
  *
  * These menus deliberately read as one surface with the command palette —
  * same radius, hairline border and elevation (`.cm-menu-surface` in
@@ -20,11 +20,6 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
  *  a 14px muted icon in the leading slot. */
 export const MENU_ROW =
   "h-8 gap-2.5 whitespace-nowrap rounded-md px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
-
-/** A row whose label wraps to a second, quieter description line. Taller than
- *  `MENU_ROW`, so the icon is top-aligned rather than centred. */
-export const MENU_ROW_TWO_LINE =
-  "items-start gap-2.5 rounded-md px-[9px] py-2 text-body [&>svg]:mt-0.5 [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /** A 36px row carrying a title plus a mono state line (the device list). */
 export const MENU_ROW_TWO_LINE_COMPACT =
