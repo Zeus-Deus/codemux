@@ -62,8 +62,9 @@ vi.mock("@/tauri/commands", () => ({
     .mockResolvedValue({ ok: true, message: "", rsync_summary: null }),
 }));
 
+const openProjectMock = vi.hoisted(() => vi.fn());
 vi.mock("@/hooks/use-project-actions", () => ({
-  useProjectActions: () => ({ openProject: vi.fn() }),
+  useProjectActions: () => ({ openProject: openProjectMock }),
 }));
 
 // Record the status each row hands its hover card (the card content itself is
@@ -678,6 +679,36 @@ describe("SidebarInbox — cards", () => {
 });
 
 describe("SidebarInbox — project filter", () => {
+  it("hosts project creation at the bottom of the menu, not a separate + button", async () => {
+    workspaces = [makeWorkspace({ title: "In myapp" })];
+    await renderInbox();
+    expect(screen.queryByRole("button", { name: "Add repository" })).toBeNull();
+
+    openProjectMock.mockClear();
+    await openFilterMenu();
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: /Open existing project/ }),
+    );
+    expect(openProjectMock).toHaveBeenCalledTimes(1);
+
+    useUIStore.setState({ showNewProjectScreen: false });
+    await openFilterMenu();
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Create or clone project" }),
+    );
+    expect(useUIStore.getState().showNewProjectScreen).toBe(true);
+    useUIStore.setState({ showNewProjectScreen: false });
+  });
+
+  it("puts Search and New agent in the same row as the project menu", async () => {
+    workspaces = [makeWorkspace({ title: "In myapp" })];
+    await renderInbox();
+    const row = screen.getByRole("button", { name: "Filter by project" })
+      .parentElement as HTMLElement;
+    expect(within(row).getByRole("button", { name: "Search" })).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "New agent" })).toBeInTheDocument();
+  });
+
   it("defaults to All projects and shows the picked project on the trigger", async () => {
     workspaces = [
       makeWorkspace({ title: "In myapp" }),
