@@ -715,6 +715,25 @@ describe("DraftChatSurface", () => {
       expect(document.activeElement).toBe(nextTextarea);
     });
 
+    it("consumes background focus before a later visit to the same draft", () => {
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const draft = seedProjectDraft();
+      const { container } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter", ctrlKey: true });
+      const nextId = useChatDraftStore.getState().activeDraftId!;
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+
+      act(() => useChatDraftStore.getState().setActiveDraft(draft.draftId));
+      const outside = document.createElement("button");
+      document.body.appendChild(outside);
+      outside.focus();
+      act(() => useChatDraftStore.getState().setActiveDraft(nextId));
+
+      expect(container.querySelector("textarea")).toHaveValue("");
+      expect(document.activeElement).toBe(outside);
+      outside.remove();
+    });
+
     it("keeps a failed background prompt recoverable without interrupting the next draft", async () => {
       vi.mocked(materializeAndSend).mockResolvedValueOnce({ success: false, error: "workspace lock" });
       const draft = seedProjectDraft();

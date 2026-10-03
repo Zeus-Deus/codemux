@@ -113,6 +113,11 @@ const EMPTY_ATTACHMENTS: Attachment[] = [];
 export function DraftChatSurface() {
   const draft = useChatDraftStore(selectActiveDraft);
   const [focusDraftId, setFocusDraftId] = useState<string | null>(null);
+  useEffect(() => {
+    // The child composer consumes the request on mount. Do not carry it
+    // into later visits to the same draft after the user moves focus away.
+    if (focusDraftId === draft?.draftId) setFocusDraftId(null);
+  }, [draft?.draftId, focusDraftId]);
   if (!draft) return null;
   // Key on the draft id so a slot swap (home → project) remounts with a
   // fresh resolved-cwd effect instead of carrying stale state.

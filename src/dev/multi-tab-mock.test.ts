@@ -41,3 +41,28 @@ it("does not corrupt tab selection for an unknown tab", async () => {
   const unchanged = after.workspaces.find((w) => w.workspace_id === workspace.workspace_id)!;
   expect([unchanged.active_tab_id, unchanged.active_surface_id]).toEqual(selected);
 });
+
+it.each([true, false])("selects a reused chat within its workspace with select:%s", async (select) => {
+  const before = await invoke("get_app_state") as AppStateSnapshot;
+  const workspace = before.workspaces.find((w) => w.workspace_id === "ws-codemux-chat")!;
+  const desktopWorkspace = before.workspaces.find((w) => w.workspace_id !== workspace.workspace_id)!;
+  const original = workspace.tabs[0];
+  const other = workspace.tabs[1];
+  const surface = workspace.surfaces.find((s) => s.surface_id === other.surface_id)!;
+  if (surface.root.kind !== "agent_chat") throw new Error("Expected seeded chat pane");
+  const pane = surface.root;
+  await invoke("activate_tab", { workspaceId: workspace.workspace_id, tabId: original.tab_id });
+  await invoke("activate_workspace", { workspaceId: desktopWorkspace.workspace_id });
+
+  const reused = await invoke("agent_chat_create_pane", {
+    workspaceId: workspace.workspace_id, threadId: pane.thread_id, select,
+  });
+  const after = await invoke("get_app_state") as AppStateSnapshot;
+  const target = after.workspaces.find((w) => w.workspace_id === workspace.workspace_id)!;
+  expect(reused).toBe(pane.pane_id);
+  expect(after.active_workspace_id).toBe(select ? workspace.workspace_id : desktopWorkspace.workspace_id);
+  expect(target.active_tab_id).toBe(other.tab_id);
+  expect(target.active_surface_id).toBe(surface.surface_id);
+  expect(target.surfaces.find((s) => s.surface_id === surface.surface_id)!.active_pane_id).toBe(pane.pane_id);
+  expect(target.surfaces).toHaveLength(workspace.surfaces.length);
+});
