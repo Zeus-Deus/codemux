@@ -57,7 +57,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "contentSearch", label: "Search in files", category: "search", defaultKeys: "Ctrl+Shift+F" },
 
   // ── Workspaces ──
-  { id: "newAgent", label: "New agent", category: "workspaces", defaultKeys: "Ctrl+N", description: "New chat in home directory, or the New Workspace dialog (same as the sidebar +)" },
+  { id: "newAgent", label: "New agent", category: "workspaces", defaultKeys: "Ctrl+N", description: "New chat in home directory, or the New Workspace dialog (same as the sidebar's New agent button)" },
   { id: "newWorkspaceInProject", label: "New workspace in current project", category: "workspaces", defaultKeys: "Ctrl+Shift+N", description: "Quick-create a workspace/agent in the active workspace's project" },
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },

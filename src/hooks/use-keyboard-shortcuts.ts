@@ -164,7 +164,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
 
-  // ── New agent (mirrors the sidebar "New agent" + button) ──
+  // ── New agent (mirrors the sidebar "New agent" button) ──
   // Works without an active workspace, so it sits before the appState guard.
   if (actionId === "newAgent") {
     const flags = useFeatureFlags.getState();
