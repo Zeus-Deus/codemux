@@ -39,7 +39,7 @@ interface HermesStore {
   catalogs: Record<string, CatalogSlot>;
   /** Installed profiles as last listed by Settings; not persisted. */
   profiles: HermesProfile[] | null;
-  loadProfiles: () => Promise<HermesProfile[]>;
+  loadProfiles: (force?: boolean) => Promise<HermesProfile[]>;
   /** `remember: false` keeps automatic picks from overriding later default changes. */
   select: (thread: string, project: string, profile: HermesProfile, remember?: boolean) => void;
   restore: (thread: string) => Promise<void>;
@@ -47,14 +47,19 @@ interface HermesStore {
 }
 const generations = new Map<string, number>();
 let pendingProfiles: Promise<HermesProfile[]> | null = null;
+let profilesGeneration = 0;
 export const useHermes = create<HermesStore>()(persist((set, get) => ({
   selections: {}, preferred: {}, fixed: {}, modes: {}, catalogs: {}, profiles: null,
-  loadProfiles() {
-    // Settings mounts two readers at once; share one listing between them.
-    pendingProfiles ??= invoke<HermesProfile[]>("hermes_profiles")
-      .then(profiles => { set({ profiles }); return profiles; })
-      .finally(() => { pendingProfiles = null; });
-    return pendingProfiles;
+  loadProfiles(force = false) {
+    // Settings mounts two readers at once; share one listing between them. An explicit
+    // refresh follows changed settings, so it starts a new listing that older ones cannot overwrite.
+    if (pendingProfiles && !force) return pendingProfiles;
+    const generation = ++profilesGeneration;
+    const request = invoke<HermesProfile[]>("hermes_profiles")
+      .then(profiles => { if (generation === profilesGeneration) set({ profiles }); return profiles; })
+      .finally(() => { if (pendingProfiles === request) pendingProfiles = null; });
+    pendingProfiles = request;
+    return request;
   },
   select(thread, project, profile, remember = true) {
     if (get().fixed[thread]) return;

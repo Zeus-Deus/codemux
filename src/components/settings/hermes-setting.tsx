@@ -52,7 +52,7 @@ export function HermesSetting() {
         await set("hermes.installation", installation);
         await set("hermes.root", root);
         useHermes.setState({catalogs:{}});
-        const values = await useHermes.getState().loadProfiles();
+        const values = await useHermes.getState().loadProfiles(true);
         setStatus(`${values.length} profiles found.`);
       } catch (e) { setStatus(String(e)); }
     })()}>Save and refresh</Button>

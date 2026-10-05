@@ -75,4 +75,14 @@ describe("loadProfiles", () => {
     await useHermes.getState().loadProfiles();
     expect(useHermes.getState().profiles).toEqual([profile("a")]);
   });
+  it("lets an explicit refresh replace a listing that started before settings changed", async () => {
+    const pending: Array<(v: HermesProfile[]) => void> = [];
+    vi.mocked(invoke).mockImplementation(() => new Promise(resolve => pending.push(resolve as (v: HermesProfile[]) => void)));
+    const stale = useHermes.getState().loadProfiles();
+    const fresh = useHermes.getState().loadProfiles(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledTimes(2);
+    pending[1]([profile("new")]); await fresh;
+    pending[0]([profile("old")]); await stale;
+    expect(useHermes.getState().profiles).toEqual([profile("new")]);
+  });
 });
