@@ -1850,6 +1850,25 @@ describe("SidebarInbox — parked shelves anchor to the bottom", () => {
     expect(shelves!.contains(card)).toBe(false);
   });
 
+  it("puts the snoozed shelf in the same bottom-anchored group", async () => {
+    const active = makeWorkspace();
+    const snoozed = makeWorkspace();
+    workspaces = [active, snoozed];
+    persistedSettled = JSON.stringify({
+      settled: [],
+      snoozed: [{ id: snoozed.workspace_id, at: Date.now(), until: Date.now() + 60_000 }],
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderInbox();
+
+    const shelves = container.querySelector("[data-parked-shelves]");
+    expect(shelves).not.toBeNull();
+    // The shelf starts collapsed, so its header is what renders.
+    const header = screen.getByRole("button", { name: "Snoozed (1)" });
+    expect(shelves!.contains(header)).toBe(true);
+  });
+
   it("renders no parked group when nothing is settled or snoozed", async () => {
     workspaces = [makeWorkspace()];
     const { container } = await renderInbox();
