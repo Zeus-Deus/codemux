@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useHermes, hermesProfileKey, hermesModelUnavailable, type HermesProfile } from "@/stores/hermes-store";
+import { useHermes, hermesProfileKey, hermesModelUnavailable, pickHermesProfile, type HermesProfile } from "@/stores/hermes-store";
 
 /** Lives inside the existing provider picker; only native layout metadata is displayed. */
 export function HermesProfileModels({ threadId, projectPath, model, onSelect, onProfileChange }: {
@@ -23,10 +23,9 @@ export function HermesProfileModels({ threadId, projectPath, model, onSelect, on
         const values = await invoke<HermesProfile[]>("hermes_profiles");
         if (disposed) return;
         setProfiles(values);
-        const preferred = useHermes.getState().preferred[projectPath ?? "home"];
-        if (threadId && !useHermes.getState().selections[threadId] && preferred && values.some(p => hermesProfileKey(p) === hermesProfileKey(preferred))) {
-          useHermes.getState().select(threadId, projectPath ?? "home", preferred);
-        }
+        const project = projectPath ?? "home";
+        const picked = threadId && !useHermes.getState().selections[threadId] ? pickHermesProfile(values, project) : null;
+        if (picked && threadId) useHermes.getState().select(threadId, project, picked, false);
       } catch (e) { if (!disposed) setError(String(e)); }
       finally { if (!disposed) setLoading(false); }
     })();

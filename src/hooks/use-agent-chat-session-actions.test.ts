@@ -27,6 +27,8 @@ vi.mock("@/tauri/commands", () => ({
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
 vi.mock("@/lib/toast", () => ({
   toast: {
     error: vi.fn(),
@@ -64,6 +66,7 @@ import {
 } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
 import { useHermes } from "@/stores/hermes-store";
+import { invoke } from "@tauri-apps/api/core";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -142,6 +145,17 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
       expect(useHermes.getState().selections[input.thread_id]).toEqual(profile);
       expect(input.permission_mode).toBeNull();
     } finally { restore.mockRestore(); }
+  });
+  it("starts a new Hermes conversation with the only installed profile", async () => {
+    const profile = {schema_version:1,host:"local",installation:"/official/hermes",root:"/test",id:"default",home:"/test/profiles/default",identity:"synthetic"};
+    useHermes.setState({selections:{},preferred:{},fixed:{}});
+    vi.mocked(invoke).mockImplementation(async command => command === "hermes_profiles" ? [profile] : null);
+    const { result } = renderHook(() => useAgentChatSessionActions(makePane({provider:"hermes"})));
+    await result.current.handleNewChat();
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("hermes");
+    expect(input.extra).toEqual({hermes_profile:profile});
+    expect(useHermes.getState().preferred).toEqual({});
   });
   it("starts the session in bypassPermissions, never null", async () => {
     const { result } = renderHook(() =>
