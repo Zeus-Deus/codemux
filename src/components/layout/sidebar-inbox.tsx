@@ -2197,84 +2197,94 @@ export function SidebarInbox() {
           </>
         )}
 
-        {snoozedRows.length > 0 && (
-          <>
-            <ShelfHeader
-              label="Snoozed"
-              count={snoozedRows.length}
-              showCount={snoozeCollapsed}
-              collapsed={snoozeCollapsed}
-              onToggle={() => setSnoozeCollapsed((c) => !c)}
-            />
-            {visibleSnoozed.map(({ entry, workspace }) => {
-              const repo = repoByWorkspace.get(workspace.workspace_id);
-              if (!repo) return null;
-              return (
-                <SnoozeRow
-                  key={workspace.workspace_id}
-                  workspace={workspace}
-                  repo={repo}
-                  isActive={workspace.workspace_id === activeWorkspaceId}
-                  selected={selectedIds.has(workspace.workspace_id)}
-                  status={statusOf(workspace)}
-                  timeUntil={formatTimeUntil(entry.until - now)}
-                  onWake={handleWake}
-                  onSelect={handleSelect}
-                  onMarkUnread={handleMarkUnread}
+        {/* The parked shelves sit on the floor of the sidebar, not under
+            the last active card. `mt-auto` soaks up the free space above
+            them, so a short active list keeps its breathing room and parked
+            work reads as a separate, out-of-the-way drawer. Once the list
+            outgrows the viewport the margin collapses to zero and everything
+            scrolls as one column. */}
+        {(snoozedRows.length > 0 || settledRows.length > 0) && (
+          <div data-parked-shelves className="mt-auto flex flex-col">
+            {snoozedRows.length > 0 && (
+              <>
+                <ShelfHeader
+                  label="Snoozed"
+                  count={snoozedRows.length}
+                  showCount={snoozeCollapsed}
+                  collapsed={snoozeCollapsed}
+                  onToggle={() => setSnoozeCollapsed((c) => !c)}
                 />
-              );
-            })}
-          </>
-        )}
+                {visibleSnoozed.map(({ entry, workspace }) => {
+                  const repo = repoByWorkspace.get(workspace.workspace_id);
+                  if (!repo) return null;
+                  return (
+                    <SnoozeRow
+                      key={workspace.workspace_id}
+                      workspace={workspace}
+                      repo={repo}
+                      isActive={workspace.workspace_id === activeWorkspaceId}
+                      selected={selectedIds.has(workspace.workspace_id)}
+                      status={statusOf(workspace)}
+                      timeUntil={formatTimeUntil(entry.until - now)}
+                      onWake={handleWake}
+                      onSelect={handleSelect}
+                      onMarkUnread={handleMarkUnread}
+                    />
+                  );
+                })}
+              </>
+            )}
 
-        {settledRows.length > 0 && (
-          <>
-            <ShelfHeader
-              label="Settled"
-              count={settledRows.length}
-              showCount
-              collapsed={settledCollapsed}
-              onToggle={() => setSettledCollapsed((c) => !c)}
-            />
-            {visibleSettled.map(({ entry, workspace }) => {
-              const repo = repoByWorkspace.get(workspace.workspace_id);
-              if (!repo) return null;
-              return (
-                <SettledRow
-                  key={workspace.workspace_id}
-                  workspace={workspace}
-                  repo={repo}
-                  isActive={workspace.workspace_id === activeWorkspaceId}
-                  selected={selectedIds.has(workspace.workspace_id)}
-                  status={statusOf(workspace)}
-                  time={formatElapsed(now - resolveSettledTimestamp(entry))}
-                  unread={isUnread(workspace)}
-                  justSettled={justSettledId === workspace.workspace_id}
-                  onUnsettle={handleUnsettle}
-                  onSelect={handleSelect}
-                  onMarkUnread={handleMarkUnread}
+            {settledRows.length > 0 && (
+              <>
+                <ShelfHeader
+                  label="Settled"
+                  count={settledRows.length}
+                  showCount
+                  collapsed={settledCollapsed}
+                  onToggle={() => setSettledCollapsed((c) => !c)}
                 />
-              );
-            })}
-            {!settledCollapsed &&
-              settledHidden > 0 &&
-              (() => {
-                const next = Math.min(SETTLED_PAGE_COUNT, settledHidden);
-                return (
-                  <button
-                    type="button"
-                    data-settled-more
-                    aria-label={`Show ${next} more settled workspaces (${settledHidden} hidden)`}
-                    onClick={() =>
-                      setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
-                    }
-                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
-                  >
-                    {`Show ${next} more (${settledHidden} hidden)`}
-                  </button>
-                );
-              })()}
-          </>
+                {visibleSettled.map(({ entry, workspace }) => {
+                  const repo = repoByWorkspace.get(workspace.workspace_id);
+                  if (!repo) return null;
+                  return (
+                    <SettledRow
+                      key={workspace.workspace_id}
+                      workspace={workspace}
+                      repo={repo}
+                      isActive={workspace.workspace_id === activeWorkspaceId}
+                      selected={selectedIds.has(workspace.workspace_id)}
+                      status={statusOf(workspace)}
+                      time={formatElapsed(now - resolveSettledTimestamp(entry))}
+                      unread={isUnread(workspace)}
+                      justSettled={justSettledId === workspace.workspace_id}
+                      onUnsettle={handleUnsettle}
+                      onSelect={handleSelect}
+                      onMarkUnread={handleMarkUnread}
+                    />
+                  );
+                })}
+                {!settledCollapsed &&
+                  settledHidden > 0 &&
+                  (() => {
+                    const next = Math.min(SETTLED_PAGE_COUNT, settledHidden);
+                    return (
+                      <button
+                        type="button"
+                        data-settled-more
+                        aria-label={`Show ${next} more settled workspaces (${settledHidden} hidden)`}
+                        onClick={() =>
+                          setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
+                        }
+                        className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                      >
+                        {`Show ${next} more (${settledHidden} hidden)`}
+                      </button>
+                    );
+                  })()}
+              </>
+            )}
+          </div>
         )}
       </div>
 
