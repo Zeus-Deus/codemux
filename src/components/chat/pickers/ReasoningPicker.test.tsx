@@ -242,7 +242,16 @@ describe("ReasoningPicker — dropdown structure", () => {
     await user.click(trigger!);
     // Section headings from cmdk's CommandGroup `heading` prop.
     expect(await screen.findByText("Effort")).toBeInTheDocument();
-    expect(await screen.findByText("Context Window")).toBeInTheDocument();
+    expect(await screen.findByText("Context window")).toBeInTheDocument();
+  });
+
+  it("starts the keyboard highlight on the current effort, not the first row", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ effortValue: "high" });
+    await user.click(trigger!);
+    const highlighted = await screen.findByRole("option", { selected: true });
+    expect(highlighted).toHaveTextContent("High");
+    expect(highlighted).not.toHaveTextContent("Extra High");
   });
 
   it("hides Context Window section when model has ≤1 option (Opus 4.5)", async () => {
@@ -253,7 +262,7 @@ describe("ReasoningPicker — dropdown structure", () => {
     });
     await user.click(trigger!);
     expect(await screen.findByText("Effort")).toBeInTheDocument();
-    expect(screen.queryByText("Context Window")).toBeNull();
+    expect(screen.queryByText("Context window")).toBeNull();
   });
 
   it("hides Effort section when model has no effort levels", async () => {
@@ -263,7 +272,7 @@ describe("ReasoningPicker — dropdown structure", () => {
       contextWindowValue: "1m",
     });
     await user.click(trigger!);
-    expect(await screen.findByText("Context Window")).toBeInTheDocument();
+    expect(await screen.findByText("Context window")).toBeInTheDocument();
     expect(screen.queryByText("Effort")).toBeNull();
   });
 

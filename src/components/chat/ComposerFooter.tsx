@@ -20,6 +20,7 @@ import type {
 } from "@/tauri/types";
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
+import { FOOTER_SEPARATOR } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
@@ -235,8 +236,8 @@ export function ComposerFooter({
                   : undefined
               }
               className={cn(
-                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors duration-150",
-                modelLeafLabel && "w-[34px] justify-center px-0",
+                "inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md border-0 px-2 text-body-sm font-medium leading-none transition-colors duration-150",
+                modelLeafLabel && "w-[30px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -263,7 +264,7 @@ export function ComposerFooter({
                 </>
               )}
             </button>
-            <span className="mx-0.5 h-4 w-px shrink-0 bg-border/50" aria-hidden />
+            <span className={FOOTER_SEPARATOR} aria-hidden />
           </>
         )}
 

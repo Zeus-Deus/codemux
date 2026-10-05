@@ -16,7 +16,19 @@ import {
 import { cn } from "@/lib/utils";
 import type { PermissionModeOption } from "@/tauri/types";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
-import { FOOTER_TRIGGER } from "./footer-trigger";
+import {
+  FOOTER_SEPARATOR,
+  FOOTER_TRIGGER,
+  PICKER_COLLISION_PADDING,
+  PICKER_COMMAND,
+  PICKER_CONTENT,
+  PICKER_GROUP,
+  PICKER_LIST,
+  PICKER_ROW,
+  PICKER_ROW_CHECK,
+  PICKER_ROW_DESCRIPTION,
+  PICKER_ROW_TITLE,
+} from "./footer-trigger";
 
 /**
  * Capability-driven permission-mode picker.
@@ -79,12 +91,7 @@ export function PermissionModePicker({
 
   return (
     <>
-      {withSeparator && (
-        <span
-          aria-hidden
-          className="mx-0.5 h-4 w-px shrink-0 self-center bg-border"
-        />
-      )}
+      {withSeparator && <span aria-hidden className={FOOTER_SEPARATOR} />}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
@@ -94,7 +101,7 @@ export function PermissionModePicker({
             aria-label={iconOnly ? `Access: ${label}` : undefined}
             title={iconOnly ? `Access: ${label}` : undefined}
           >
-            <Lock className="size-4" />
+            <Lock className="size-3.5" />
             {!iconOnly && (
               <span className="max-w-[140px] truncate">{label}</span>
             )}
@@ -102,14 +109,15 @@ export function PermissionModePicker({
           </button>
         </PopoverTrigger>
         <PopoverContent
-          className="w-[340px] p-0"
+          className={PICKER_CONTENT}
           align="start"
+          collisionPadding={PICKER_COLLISION_PADDING}
           onOpenAutoFocus={focusCmdkOnOpen}
         >
-          <Command>
-            <CommandList className="max-h-[300px]">
+          <Command className={PICKER_COMMAND} defaultValue={current}>
+            <CommandList className={PICKER_LIST}>
               <CommandEmpty>No permission modes</CommandEmpty>
-              <CommandGroup>
+              <CommandGroup className={PICKER_GROUP}>
                 {modes.map((mode) => (
                   <CommandItem
                     key={mode.value}
@@ -118,19 +126,22 @@ export function PermissionModePicker({
                       onChange(mode.value);
                       setOpen(false);
                     }}
-                    className="h-auto gap-2 py-2"
+                    className={PICKER_ROW}
+                    showCheckmark={false}
                   >
-                    <div className="flex flex-1 flex-col min-w-0">
-                      <span className="text-label text-foreground truncate">
+                    <div className="flex min-w-0 flex-1 flex-col gap-px">
+                      <span className={cn(PICKER_ROW_TITLE, "truncate")}>
                         {mode.label}
                       </span>
-                      <span className="text-label text-muted-foreground/80 truncate">
-                        {mode.description}
-                      </span>
+                      {mode.description ? (
+                        <span className={PICKER_ROW_DESCRIPTION}>
+                          {mode.description}
+                        </span>
+                      ) : null}
                     </div>
                     <Check
                       className={cn(
-                        "size-3.5 text-muted-foreground",
+                        PICKER_ROW_CHECK,
                         current === mode.value ? "opacity-100" : "opacity-0",
                       )}
                     />
