@@ -5,7 +5,7 @@ import { hermesProfileKey, hermesModelUnavailable, pickHermesProfile, useHermes,
 import { useSettingsStore } from "./settings-store";
 const profile = (id: string): HermesProfile => ({ schema_version:1, host:"local", installation:"/bin/hermes", root:"/profiles", id, home:`/profiles/${id}`, identity:id });
 const catalog = (model: string): HermesCatalog => ({state:"ready",message:null,session:{models:{currentModelId:model,availableModels:[]}}});
-beforeEach(() => {vi.mocked(invoke).mockReset();useHermes.setState({selections:{},preferred:{},fixed:{},catalogs:{}});useSettingsStore.setState({settings:{}});});
+beforeEach(() => {vi.mocked(invoke).mockReset();useHermes.setState({selections:{},preferred:{},fixed:{},catalogs:{},profiles:null});useSettingsStore.setState({settings:{}});});
 describe("Hermes profile catalogs", () => {
   it("keeps two profiles isolated and rejects an older refresh for the same profile", async () => {
     const pending: Array<(v: HermesCatalog) => void> = [];
@@ -58,5 +58,21 @@ describe("pickHermesProfile", () => {
     useHermes.getState().select("draft","project",profile("a"),false);
     expect(useHermes.getState().selections.draft).toEqual(profile("a"));
     expect(useHermes.getState().preferred.project).toBeUndefined();
+  });
+});
+describe("loadProfiles", () => {
+  it("shares one listing between concurrent readers", async () => {
+    vi.mocked(invoke).mockResolvedValue([profile("a")]);
+    const [first, second] = await Promise.all([useHermes.getState().loadProfiles(), useHermes.getState().loadProfiles()]);
+    expect(vi.mocked(invoke)).toHaveBeenCalledTimes(1);
+    expect(first).toBe(second);
+    expect(useHermes.getState().profiles).toEqual([profile("a")]);
+  });
+  it("leaves profiles unloaded after a failed listing so the next reader retries", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("hermes not found")).mockResolvedValueOnce([profile("a")]);
+    await expect(useHermes.getState().loadProfiles()).rejects.toThrow("hermes not found");
+    expect(useHermes.getState().profiles).toBeNull();
+    await useHermes.getState().loadProfiles();
+    expect(useHermes.getState().profiles).toEqual([profile("a")]);
   });
 });

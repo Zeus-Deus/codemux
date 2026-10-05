@@ -46,12 +46,15 @@ interface HermesStore {
   refresh: (profile: HermesProfile) => Promise<void>;
 }
 const generations = new Map<string, number>();
+let pendingProfiles: Promise<HermesProfile[]> | null = null;
 export const useHermes = create<HermesStore>()(persist((set, get) => ({
   selections: {}, preferred: {}, fixed: {}, modes: {}, catalogs: {}, profiles: null,
-  async loadProfiles() {
-    const profiles = await invoke<HermesProfile[]>("hermes_profiles");
-    set({ profiles });
-    return profiles;
+  loadProfiles() {
+    // Settings mounts two readers at once; share one listing between them.
+    pendingProfiles ??= invoke<HermesProfile[]>("hermes_profiles")
+      .then(profiles => { set({ profiles }); return profiles; })
+      .finally(() => { pendingProfiles = null; });
+    return pendingProfiles;
   },
   select(thread, project, profile, remember = true) {
     if (get().fixed[thread]) return;

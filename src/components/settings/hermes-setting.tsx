@@ -11,7 +11,8 @@ const AUTOMATIC = "__automatic__";
 function useHermesProfiles() {
   const profiles = useHermes(s => s.profiles);
   useEffect(() => {
-    if (!useHermes.getState().profiles) useHermes.getState().loadProfiles().catch(() => useHermes.setState({profiles: []}));
+    // A failed listing stays unloaded so the next mount retries instead of reporting profiles as missing.
+    if (!useHermes.getState().profiles) useHermes.getState().loadProfiles().catch(() => {});
   }, []);
   return profiles;
 }
@@ -21,14 +22,14 @@ export function HermesDefaultProfileSetting() {
   const id = useSettingsStore(s => s.settings[HERMES_DEFAULT_PROFILE_SETTING] ?? "");
   const set = useSettingsStore(s => s.set);
   const profiles = useHermesProfiles();
-  const missing = id && profiles && !profiles.some(p => p.id === id);
+  const unlisted = id && !profiles?.some(p => p.id === id);
   return <Select value={id || AUTOMATIC} onValueChange={v => set(HERMES_DEFAULT_PROFILE_SETTING, v === AUTOMATIC ? "" : v)}>
     <SelectTrigger aria-label="Default Hermes profile" className="h-9 w-48">
       <SelectValue />
     </SelectTrigger>
     <SelectContent>
       <SelectItem value={AUTOMATIC}>Automatic</SelectItem>
-      {missing && <SelectItem value={id}>{id} · not found</SelectItem>}
+      {unlisted && <SelectItem value={id}>{profiles ? `${id} · not found` : id}</SelectItem>}
       {profiles?.map(p => <SelectItem key={hermesProfileKey(p)} value={p.id}>{p.id}</SelectItem>)}
     </SelectContent>
   </Select>;
