@@ -2005,8 +2005,11 @@ export function SettingsView() {
                 description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
               >
                 <UtilityAgentSetting />
-                <HermesSetting />
               </SettingRow>
+              <Separator />
+              <div className="py-4">
+                <HermesSetting />
+              </div>
               <Separator />
               <SettingRow
                 label="Auto-configure MCP for workspaces"
