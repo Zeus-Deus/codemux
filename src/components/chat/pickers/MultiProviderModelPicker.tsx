@@ -467,9 +467,9 @@ export function MultiProviderModelPicker({
           // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
           // in for a tinted dot. Hairline pipes between footer
           // controls — not per-pill borders — carry the separation.
-          className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
+          className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink")}
         >
-          <ProviderLogo provider={provider} className="size-4 shrink-0" />
+          <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
           <span className="max-w-[180px] truncate">
             {leafLabel ? (
               leafModelName(triggerLabel)
@@ -485,9 +485,7 @@ export function MultiProviderModelPicker({
               triggerLabel
             )}
           </span>
-          <ChevronDown
-            className="-mx-0.5 size-3.5 shrink-0 opacity-70"
-          />
+          <ChevronDown className="size-3 shrink-0 opacity-50" />
         </button>
       </PopoverTrigger>
       <PopoverContent

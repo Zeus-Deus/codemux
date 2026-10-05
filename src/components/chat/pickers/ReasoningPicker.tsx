@@ -17,7 +17,20 @@ import {
 import { cn } from "@/lib/utils";
 import type { ChatModelInfo } from "@/tauri/types";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
-import { FOOTER_TRIGGER } from "./footer-trigger";
+import {
+  FOOTER_SEPARATOR,
+  FOOTER_TRIGGER,
+  PICKER_COLLISION_PADDING,
+  PICKER_COMMAND,
+  PICKER_CONTENT,
+  PICKER_GROUP,
+  PICKER_LIST,
+  PICKER_ROW,
+  PICKER_ROW_CHECK,
+  PICKER_ROW_DESCRIPTION,
+  PICKER_ROW_TITLE,
+  PICKER_SEPARATOR,
+} from "./footer-trigger";
 
 // Short description lines for each effort level. Verbs match
 // PermissionModePicker's density (two-line rows).
@@ -180,14 +193,41 @@ export function ReasoningPicker({
     ? `Reasoning: ${reasoningLabel}; service tier: ${fastMode ? "Fast" : "Standard"}`
     : `Service tier: ${fastMode ? "Fast" : "Standard"}`;
 
+  // Every row shares one recipe: title over a muted description (wraps
+  // rather than truncating, so provider blurbs stay readable), check on
+  // the right.
+  const optionRow = (
+    title: string,
+    description: string,
+    selected: boolean,
+    isDefault: boolean,
+  ) => (
+    <>
+      <div className="flex min-w-0 flex-1 flex-col gap-px">
+        <span className={cn(PICKER_ROW_TITLE, "truncate")}>
+          {title}
+          {isDefault ? (
+            <span className="ml-1.5 font-normal text-muted-foreground/60">
+              (default)
+            </span>
+          ) : null}
+        </span>
+        {description ? (
+          <span className={PICKER_ROW_DESCRIPTION}>{description}</span>
+        ) : null}
+      </div>
+      <Check
+        className={cn(
+          PICKER_ROW_CHECK,
+          selected ? "opacity-100" : "opacity-0",
+        )}
+      />
+    </>
+  );
+
   return (
     <>
-      {withSeparator && (
-        <span
-          aria-hidden
-          className="mx-0.5 h-4 w-px shrink-0 self-center bg-border"
-        />
-      )}
+      {withSeparator && <span aria-hidden className={FOOTER_SEPARATOR} />}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
@@ -204,7 +244,7 @@ export function ReasoningPicker({
                 className="size-3.5 fill-current text-foreground/80"
               />
             ) : reasoningLabel ? (
-              <Brain className="size-4" />
+              <Brain className="size-3.5" />
             ) : null}
             {!(iconOnly && (fastMode || reasoningLabel)) && (
               <span className="max-w-[200px] truncate">{triggerLabel}</span>
@@ -213,27 +253,35 @@ export function ReasoningPicker({
           </button>
         </PopoverTrigger>
         <PopoverContent
-          className="w-[340px] p-0"
+          className={PICKER_CONTENT}
           align="start"
+          collisionPadding={PICKER_COLLISION_PADDING}
           onOpenAutoFocus={focusCmdkOnOpen}
         >
-        <Command>
-          {hasEffortSection && ultrathinkInBodyText ? (
-            <div className="px-3 pt-2 pb-1 text-label text-muted-foreground/80">
-              Your prompt contains &quot;ultrathink&quot; in the text. Remove
-              it to change effort.
-            </div>
-          ) : null}
-          <CommandList className="max-h-[420px]">
-            <CommandEmpty>No reasoning options</CommandEmpty>
+          <Command
+            className={PICKER_COMMAND}
+            // Start keyboard focus on the current choice, so the highlight
+            // and the check mark never point at different rows on open.
+            defaultValue={
+              hasEffortSection && currentEffort
+                ? `effort:${currentEffort}`
+                : hasContextSection && currentContextWindow
+                  ? `ctx:${currentContextWindow}`
+                  : `service-tier:${fastMode ? "fast" : "standard"}`
+            }
+          >
+            {hasEffortSection && ultrathinkInBodyText ? (
+              <div className="px-2 pt-1.5 pb-1 text-label text-muted-foreground/80">
+                Your prompt contains &quot;ultrathink&quot; in the text. Remove
+                it to change effort.
+              </div>
+            ) : null}
+            <CommandList className={PICKER_LIST}>
+              <CommandEmpty>No reasoning options</CommandEmpty>
 
-            {hasEffortSection && (
-              <CommandGroup heading="Effort">
-                {effortLevels.map((level) => {
-                  const isDefault = level === model.default_effort;
-                  const title = effortLabel(labelMap, level);
-                  const description = effortDescription(model, level);
-                  return (
+              {hasEffortSection && (
+                <CommandGroup heading="Effort" className={PICKER_GROUP}>
+                  {effortLevels.map((level) => (
                     <CommandItem
                       key={`effort-${level}`}
                       value={`effort:${level}`}
@@ -242,126 +290,82 @@ export function ReasoningPicker({
                         if (ultrathinkInBodyText) return;
                         onEffortChange(level);
                       }}
-                      className="h-auto gap-2 py-2"
+                      className={PICKER_ROW}
+                      showCheckmark={false}
                     >
-                      <div className="flex flex-1 flex-col min-w-0">
-                        <span className="text-label text-foreground truncate">
-                          {title}
-                          {isDefault ? (
-                            <span className="ml-1.5 text-muted-foreground/60">
-                              (default)
-                            </span>
-                          ) : null}
-                        </span>
-                        {description ? (
-                          <span className="text-label text-muted-foreground/80 truncate">
-                            {description}
-                          </span>
-                        ) : null}
-                      </div>
-                      <Check
-                        className={cn(
-                          "size-3.5 text-muted-foreground",
-                          currentEffort === level
-                            ? "opacity-100"
-                            : "opacity-0",
-                        )}
-                      />
+                      {optionRow(
+                        effortLabel(labelMap, level),
+                        effortDescription(model, level),
+                        currentEffort === level,
+                        level === model.default_effort,
+                      )}
                     </CommandItem>
-                  );
-                })}
-              </CommandGroup>
-            )}
-
-            {hasEffortSection &&
-              (hasContextSection || hasServiceTierSection) && (
-                <CommandSeparator />
+                  ))}
+                </CommandGroup>
               )}
 
-            {hasContextSection && (
-              <CommandGroup heading="Context Window">
-                {contextOptions.map((option) => {
-                  const isDefault = option.is_default;
-                  return (
+              {hasEffortSection &&
+                (hasContextSection || hasServiceTierSection) && (
+                  <CommandSeparator className={PICKER_SEPARATOR} />
+                )}
+
+              {hasContextSection && (
+                <CommandGroup heading="Context window" className={PICKER_GROUP}>
+                  {contextOptions.map((option) => (
                     <CommandItem
                       key={`ctx-${option.value}`}
                       value={`ctx:${option.value}`}
                       onSelect={() => onContextWindowChange(option.value)}
-                      className="h-9 gap-2 py-2"
+                      className={PICKER_ROW}
+                      showCheckmark={false}
                     >
-                      <span className="flex-1 min-w-0 truncate text-label text-foreground">
-                        {option.label}
-                        {isDefault ? (
-                          <span className="ml-1.5 text-muted-foreground/60">
-                            (default)
-                          </span>
-                        ) : null}
-                      </span>
-                      <Check
-                        className={cn(
-                          "size-3.5 text-muted-foreground",
-                          currentContextWindow === option.value
-                            ? "opacity-100"
-                            : "opacity-0",
-                        )}
-                      />
+                      {optionRow(
+                        option.label,
+                        "",
+                        currentContextWindow === option.value,
+                        option.is_default,
+                      )}
                     </CommandItem>
-                  );
-                })}
-              </CommandGroup>
-            )}
+                  ))}
+                </CommandGroup>
+              )}
 
-            {hasContextSection && hasServiceTierSection && (
-              <CommandSeparator />
-            )}
+              {hasContextSection && hasServiceTierSection && (
+                <CommandSeparator className={PICKER_SEPARATOR} />
+              )}
 
-            {hasServiceTierSection && (
-              <CommandGroup heading="Service tier">
-                <CommandItem
-                  value="service-tier:standard"
-                  onSelect={() => onFastModeChange(false)}
-                  className="h-auto gap-2 py-2"
-                >
-                  <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-label text-foreground">
-                      Standard
-                      <span className="ml-1.5 text-muted-foreground/60">
-                        (default)
-                      </span>
-                    </span>
-                    <span className="text-label text-muted-foreground/80">
-                      Normal speed and usage rate
-                    </span>
-                  </div>
-                  <Check
-                    className={cn(
-                      "size-3.5 text-muted-foreground",
-                      fastMode ? "opacity-0" : "opacity-100",
+              {hasServiceTierSection && (
+                <CommandGroup heading="Service tier" className={PICKER_GROUP}>
+                  <CommandItem
+                    value="service-tier:standard"
+                    onSelect={() => onFastModeChange(false)}
+                    className={PICKER_ROW}
+                    showCheckmark={false}
+                  >
+                    {optionRow(
+                      "Standard",
+                      "Normal speed and usage rate",
+                      !fastMode,
+                      true,
                     )}
-                  />
-                </CommandItem>
-                <CommandItem
-                  value="service-tier:fast"
-                  onSelect={() => onFastModeChange(true)}
-                  className="h-auto gap-2 py-2"
-                >
-                  <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-label text-foreground">Fast</span>
-                    <span className="text-label text-muted-foreground/80">
-                      Faster output at a premium usage rate
-                    </span>
-                  </div>
-                  <Check
-                    className={cn(
-                      "size-3.5 text-muted-foreground",
-                      fastMode ? "opacity-100" : "opacity-0",
+                  </CommandItem>
+                  <CommandItem
+                    value="service-tier:fast"
+                    onSelect={() => onFastModeChange(true)}
+                    className={PICKER_ROW}
+                    showCheckmark={false}
+                  >
+                    {optionRow(
+                      "Fast",
+                      "Faster output at a premium usage rate",
+                      fastMode,
+                      false,
                     )}
-                  />
-                </CommandItem>
-              </CommandGroup>
-            )}
-          </CommandList>
-        </Command>
+                  </CommandItem>
+                </CommandGroup>
+              )}
+            </CommandList>
+          </Command>
         </PopoverContent>
       </Popover>
     </>
