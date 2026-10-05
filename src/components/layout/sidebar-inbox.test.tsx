@@ -1827,6 +1827,36 @@ describe("SidebarInbox — jump-to-card shortcuts", () => {
   });
 });
 
+describe("SidebarInbox — parked shelves anchor to the bottom", () => {
+  it("wraps the settled shelf in a bottom-anchored group below the active cards", async () => {
+    const active = makeWorkspace();
+    const parked = makeWorkspace();
+    workspaces = [active, parked];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: parked.workspace_id, at: Date.now() }],
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderInbox();
+
+    const shelves = container.querySelector("[data-parked-shelves]");
+    expect(shelves).not.toBeNull();
+    // `mt-auto` pushes the group to the floor of the sidebar's flex column.
+    expect(shelves).toHaveClass("mt-auto");
+    expect(shelves!.querySelector("[data-settled-row]")).not.toBeNull();
+    // The active card stays outside the parked group.
+    const card = container.querySelector(`[data-inbox-card="${active.workspace_id}"]`);
+    expect(card).not.toBeNull();
+    expect(shelves!.contains(card)).toBe(false);
+  });
+
+  it("renders no parked group when nothing is settled or snoozed", async () => {
+    workspaces = [makeWorkspace()];
+    const { container } = await renderInbox();
+    expect(container.querySelector("[data-parked-shelves]")).toBeNull();
+  });
+});
+
 describe("SidebarInbox — settled-tail pagination", () => {
   it("collapses a long settled list to a head with a Show-more button", async () => {
     const at = Date.now();
