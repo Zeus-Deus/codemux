@@ -3,15 +3,38 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
 import { HermesProfileModels } from "./HermesProfileModels";
-import { useHermes, type HermesProfile } from "@/stores/hermes-store";
+import { useHermes, HERMES_DEFAULT_PROFILE_SETTING, type HermesProfile } from "@/stores/hermes-store";
+import { useSettingsStore } from "@/stores/settings-store";
 const profile: HermesProfile = {schema_version:1, host:"local", installation:"/bin/hermes", root:"/hermes", id:"coder", home:"/hermes/profiles/coder", identity:"1"};
 const catalog = {state:"ready", session:{models:{currentModelId:"service:current", availableModels:[{modelId:"service:current",name:"Native model label",_meta:{provider:"Native service"}},{modelId:"custom:named:model",name:"Unsupported named custom"}]}}};
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
   useHermes.setState({selections:{},preferred:{},fixed:{},modes:{},catalogs:{}});
+  useSettingsStore.setState({settings:{}});
   vi.mocked(invoke).mockImplementation(async command => command === "hermes_binding" ? null : command === "hermes_profiles" ? [profile] : catalog);
 });
 afterEach(cleanup);
+it("starts with the only installed profile without remembering it for the project", async () => {
+  render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={vi.fn()}/>);
+  await screen.findByRole("heading",{name:"Native service"});
+  expect((screen.getByLabelText("Hermes profile") as HTMLSelectElement).value).toBe(JSON.stringify([profile.host,profile.installation,profile.root,profile.home,profile.identity]));
+  expect(useHermes.getState().selections.draft).toEqual(profile);
+  expect(useHermes.getState().preferred["/project"]).toBeUndefined();
+});
+it("starts with the Settings default when several profiles exist", async () => {
+  const research = {...profile, id:"research", home:"/hermes/profiles/research", identity:"2"};
+  vi.mocked(invoke).mockImplementation(async command => command === "hermes_binding" ? null : command === "hermes_profiles" ? [profile, research] : catalog);
+  useSettingsStore.setState({settings:{[HERMES_DEFAULT_PROFILE_SETTING]:"research"}});
+  render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={vi.fn()}/>);
+  await waitFor(() => expect(useHermes.getState().selections.draft).toEqual(research));
+});
+it("asks for a profile when several exist and no default is set", async () => {
+  vi.mocked(invoke).mockImplementation(async command => command === "hermes_binding" ? null : command === "hermes_profiles" ? [profile, {...profile, id:"research", home:"/hermes/profiles/research", identity:"2"}] : catalog);
+  render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={vi.fn()}/>);
+  await screen.findByRole("option",{name:"research"});
+  expect((screen.getByLabelText("Hermes profile") as HTMLSelectElement).value).toBe("");
+  expect(useHermes.getState().selections.draft).toBeUndefined();
+});
 it("selects an existing profile, groups its native catalog and gates the known resume route", async () => {
   const onSelect=vi.fn(), onProfileChange=vi.fn();
   render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={onSelect} onProfileChange={onProfileChange}/>);

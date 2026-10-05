@@ -2,7 +2,7 @@ import { MobileInstall } from "@/components/mobile/mobile-install";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
-import { HermesSetting } from "./hermes-setting";
+import { HermesDefaultProfileSetting, HermesSetting } from "./hermes-setting";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
@@ -2008,6 +2008,16 @@ export function SettingsView() {
               </SettingRow>
               <Separator />
               <div className="py-4">
+                <HermesSetting />
+              </div>
+              <Separator />
+              <SettingRow
+                label="Default Hermes profile"
+                description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
+              >
+                <HermesDefaultProfileSetting />
+              </SettingRow>
+              <div className="pb-4">
                 <HermesSetting />
               </div>
               <Separator />

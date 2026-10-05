@@ -1,16 +1,46 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useSettingsStore } from "@/stores/settings-store";
-import { useHermes, hermesProfileKey, type HermesProfile } from "@/stores/hermes-store";
+import { useHermes, hermesProfileKey, HERMES_DEFAULT_PROFILE_SETTING } from "@/stores/hermes-store";
+
+const AUTOMATIC = "__automatic__";
+
+function useHermesProfiles() {
+  const profiles = useHermes(s => s.profiles);
+  useEffect(() => {
+    // A failed listing stays unloaded so the next mount retries instead of reporting profiles as missing.
+    if (!useHermes.getState().profiles) useHermes.getState().loadProfiles().catch(() => {});
+  }, []);
+  return profiles;
+}
+
+/** Which profile a new Hermes chat starts with; the chat picker can still switch before the first turn. */
+export function HermesDefaultProfileSetting() {
+  const id = useSettingsStore(s => s.settings[HERMES_DEFAULT_PROFILE_SETTING] ?? "");
+  const set = useSettingsStore(s => s.set);
+  const profiles = useHermesProfiles();
+  const unlisted = id && !profiles?.some(p => p.id === id);
+  return <Select value={id || AUTOMATIC} onValueChange={v => set(HERMES_DEFAULT_PROFILE_SETTING, v === AUTOMATIC ? "" : v)}>
+    <SelectTrigger aria-label="Default Hermes profile" className="h-9 w-48">
+      <SelectValue />
+    </SelectTrigger>
+    <SelectContent>
+      <SelectItem value={AUTOMATIC}>Automatic</SelectItem>
+      {unlisted && <SelectItem value={id}>{profiles ? `${id} · not found` : id}</SelectItem>}
+      {profiles?.map(p => <SelectItem key={hermesProfileKey(p)} value={p.id}>{p.id}</SelectItem>)}
+    </SelectContent>
+  </Select>;
+}
 
 export function HermesSetting() {
   const settings = useSettingsStore(s => s.settings);
   const set = useSettingsStore(s => s.set);
   const [installation, setInstallation] = useState(settings["hermes.installation"] ?? "hermes");
   const [root, setRoot] = useState(settings["hermes.root"] ?? "");
-  const [profiles, setProfiles] = useState<HermesProfile[]>([]);
+  const profiles = useHermesProfiles();
   const [status, setStatus] = useState("");
   return <section className="space-y-3 rounded-lg border border-border p-4" aria-label="Hermes setup">
     <h3 className="text-body font-medium">Hermes · experimental ACP integration</h3>
@@ -22,12 +52,12 @@ export function HermesSetting() {
         await set("hermes.installation", installation);
         await set("hermes.root", root);
         useHermes.setState({catalogs:{}});
-        const values = await invoke<HermesProfile[]>("hermes_profiles");
-        setProfiles(values); setStatus(`${values.length} profiles found. Select a profile in chat to check ACP and model compatibility.`);
+        const values = await useHermes.getState().loadProfiles(true);
+        setStatus(`${values.length} profiles found.`);
       } catch (e) { setStatus(String(e)); }
     })()}>Save and refresh</Button>
     <p role="status" className="text-label text-muted-foreground">{status}</p>
-    {profiles.map(p => <div key={p.home} className="flex items-center justify-between text-label"><span>{p.id}</span><Button type="button" variant="ghost" size="xs" onClick={() => void (async () => {
+    {profiles?.map(p => <div key={p.home} className="flex items-center justify-between text-label"><span>{p.id}</span><Button type="button" variant="ghost" size="xs" onClick={() => void (async () => {
       await useHermes.getState().refresh(p);
       const slot = useHermes.getState().catalogs[hermesProfileKey(p)];
       setStatus(slot.error ?? slot.value?.message ?? `${p.id}: ${slot.value?.state ?? "unknown"}. External authentication and compressed-history recovery are not certified.`);

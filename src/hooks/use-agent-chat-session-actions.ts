@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
 import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
@@ -10,7 +11,7 @@ import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
-import { useHermes } from "@/stores/hermes-store";
+import { useHermes, pickHermesProfile, type HermesProfile } from "@/stores/hermes-store";
 import {
   agentChatListMessagesAfter,
   agentChatStartSession,
@@ -228,7 +229,8 @@ export function useAgentChatSessionActions(
     try {
       if (provider === "hermes" && threadId) await useHermes.getState().restore(threadId);
       const hermesProfile = provider === "hermes"
-        ? (threadId ? useHermes.getState().selections[threadId] : useHermes.getState().preferred[cwd])
+        ? (threadId ? useHermes.getState().selections[threadId] : undefined)
+          ?? pickHermesProfile(await invoke<HermesProfile[]>("hermes_profiles"), cwd)
         : null;
       if (provider === "hermes" && !hermesProfile) {
         throw new Error("Choose a Hermes profile before starting a new chat.");
@@ -240,7 +242,7 @@ export function useAgentChatSessionActions(
         useAgentChatStore.getState().resetThread(threadId);
       }
       const newLocalThreadId = `chat-${paneId}-${Date.now()}`;
-      if (hermesProfile) useHermes.getState().select(newLocalThreadId, cwd, hermesProfile);
+      if (hermesProfile) useHermes.getState().select(newLocalThreadId, cwd, hermesProfile, false);
       // Launch in the provider default mode (Full access) — the same mode
       // the fresh store slice advertises in the footer pill. Passing `null`
       // here would boot the provider in `default` (prompt-for-every-tool)
