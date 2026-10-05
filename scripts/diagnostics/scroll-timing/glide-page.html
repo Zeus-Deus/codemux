@@ -1,0 +1,32 @@
+<!doctype html>
+<style>body{margin:0;background:#202020;color:white}#s{height:100vh;overflow:auto}p{height:60px;margin:0;border-bottom:1px solid #444}</style>
+<div id="s"></div>
+<script type="module">
+const params = new URLSearchParams(location.search);
+if (params.get('smooth') === 'app') {
+  const {installWheelScrolling} = await import('/src/lib/wheel-scrolling.ts');
+  installWheelScrolling();
+}
+const s = document.querySelector('#s');
+s.innerHTML = Array.from({length:2000}, (_,i) => '<p>Mock row '+i+'</p>').join('');
+s.scrollTop = 10000;
+if (params.has('stopBubble')) s.addEventListener('wheel', e => e.stopPropagation());
+if (params.get('owner') === 'horizontal') {
+  s.setAttribute('data-native-wheel', '');
+  s.style.overflowY = 'hidden';
+  s.innerHTML = '<div style="width:100000px;height:100vh">Mock horizontal wheel owner</div>';
+  s.addEventListener('wheel', e => { s.scrollLeft += e.deltaY; e.preventDefault(); }, {passive:false});
+}
+const result = {frames:[], wheels:[], ua:navigator.userAgent, viewport:[innerWidth, innerHeight]};
+document.addEventListener('wheel', e => result.wheels.push([performance.now(),e.deltaY,e.deltaMode,e.isTrusted,e.cancelable,e.defaultPrevented]), {capture:true,passive:true});
+const emit = (kind,data) => {
+  if (window.webkit?.messageHandlers?.[kind]) window.webkit.messageHandlers[kind].postMessage(JSON.stringify(data));
+  else console.log(kind.toUpperCase()+':'+JSON.stringify(data));
+};
+requestAnimationFrame(function tick(t) {
+  result.frames.push([t,s.scrollTop]);
+  if (result.frames.length === 1) emit('ready', {x:innerWidth/2,y:innerHeight/2});
+  if (t-result.frames[0][0] < 7800) requestAnimationFrame(tick);
+  else { result.horizontal = s.scrollLeft; emit('probe', result); }
+});
+</script>

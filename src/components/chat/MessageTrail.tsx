@@ -12,6 +12,7 @@ import {
 
 import { cn } from "@/lib/utils";
 import { normalizeWheelDelta } from "@/lib/wheel";
+import { tryAnimatedWheelScroll } from "@/lib/wheel-scrolling";
 
 import {
   buildTrailEntries,
@@ -217,6 +218,7 @@ const TrailRail = memo(function TrailRail({
   // rail must be forwarded to LegendList's scroll node.
   const forwardWheel = useCallback(
     (e: React.WheelEvent) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey || e.deltaX !== 0) return;
       const viewport = listRef.current?.getScrollableNode();
       if (!viewport) return;
       viewport.dispatchEvent(
@@ -228,7 +230,8 @@ const TrailRail = memo(function TrailRail({
           cancelable: true,
         }),
       );
-      viewport.scrollTop += normalizeWheelDelta(e.deltaY, e.deltaMode);
+      const delta = normalizeWheelDelta(e.deltaY, e.deltaMode);
+      if (!tryAnimatedWheelScroll(viewport, delta)) viewport.scrollTop += delta;
     },
     [listRef],
   );
@@ -254,6 +257,7 @@ const TrailRail = memo(function TrailRail({
     <nav
       ref={railRef}
       aria-label="Conversation turns"
+      data-wheel-forwarder=""
       onWheel={forwardWheel}
       onMouseLeave={hidePreview}
       onBlur={hidePreview}
