@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, stat } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -93,9 +93,11 @@ const stalePath = process.env[pathKey].split(';').filter(entry => {
 const staleEnv = { ...process.env, [pathKey]: stalePath };
 const repairedEnv = { ...staleEnv, [pathKey]: `${dirname(install.cli)};${stalePath}` };
 const sidecar = resolve('sidecar/claude-agent/dist/codemux-claude-sidecar-windows-x64.exe');
+const stagedSidecar = resolve('src-tauri/binaries/codemux-claude-sidecar-x86_64-pc-windows-msvc.exe');
 let debugPolicy = false;
 let socket;
 let hiddenCli;
+let hiddenSidecar;
 try {
   for (const [label, env, expected] of [['stale', staleEnv, false], ['repaired', repairedEnv, true]]) {
     const client = rpc(sidecar, env);
@@ -128,6 +130,13 @@ try {
   await mkdir(appDir, { recursive: true });
   // NSIS requires /D= to be the final, unquoted argument, including spaces.
   await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
+  const bundledSidecar = join(appDir, 'binaries', 'codemux-claude-sidecar-x86_64-pc-windows-msvc.exe');
+  assert.ok((await stat(bundledSidecar)).size > 0, 'Installer must ship the Claude sidecar');
+  evidence.bundledSidecar = bundledSidecar;
+  // A debug app can fall back to the checkout's staged sidecar. Hide that
+  // copy so GUI checks prove the installed resource actually works.
+  await rename(stagedSidecar, `${stagedSidecar}.smoke-backup`);
+  hiddenSidecar = `${stagedSidecar}.smoke-backup`;
   await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'enable']);
   debugPolicy = true;
   const guiCases = [['stale', staleEnv, !expectPathFailure], ['repaired', repairedEnv, true]];
@@ -204,6 +213,7 @@ try {
 } finally {
   for (const child of owned) await stop(child);
   if (hiddenCli) await rename(hiddenCli, install.cli);
+  if (hiddenSidecar) await rename(hiddenSidecar, stagedSidecar);
   if (debugPolicy) await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'disable']);
   await writeFile(join(evidenceDir, 'smoke.json'), JSON.stringify(evidence, null, 2));
 }
