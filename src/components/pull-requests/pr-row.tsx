@@ -127,7 +127,7 @@ function HostMark({ kind }: { kind: string }) {
       aria-hidden
       data-testid={`host-mark-${kind}`}
       className={cn(
-        "size-2 shrink-0 rounded-[2px]",
+        "size-2 shrink-0 rounded-sm",
         kind === "gitlab" ? "bg-accent-ember/80" : "bg-foreground/35",
       )}
     />
