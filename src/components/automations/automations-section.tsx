@@ -47,6 +47,14 @@ import {
   type RepoAccessResult,
 } from "@/tauri/commands";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useProbedProviderHealth } from "@/stores/provider-health-store";
+import {
+  AUTOMATION_AGENTS,
+  AUTOMATION_PROVIDERS,
+  AgentReadinessRow,
+  agentBlocked,
+  preferredAutomationAgent,
+} from "./agent-readiness";
 
 /** A project currently open in the Codemux sidebar — the source for
  *  the project picker. */
@@ -76,11 +84,6 @@ const WEEKDAYS: Array<{ value: string; label: string }> = [
   { value: "FR", label: "Friday" },
   { value: "SA", label: "Saturday" },
   { value: "SU", label: "Sunday" },
-];
-
-const AGENTS: Array<{ value: string; label: string }> = [
-  { value: "claude", label: "Claude Code" },
-  { value: "codex", label: "Codex" },
 ];
 
 function pad2(n: number): string {
@@ -189,6 +192,9 @@ interface FormDraft {
   /** True once the user has chosen "Other path…" in the project picker,
    *  so the manual-path input stays open even while it is still empty. */
   projectCustom: boolean;
+  /** False only on a new automation whose agent is still the default, so
+   *  the form may move it to an agent that is ready on this machine. */
+  agentPicked: boolean;
 }
 
 function emptyDraft(): FormDraft {
@@ -204,6 +210,7 @@ function emptyDraft(): FormDraft {
     rawSchedule: "",
     rawMode: false,
     projectCustom: false,
+    agentPicked: false,
   };
 }
 
@@ -221,6 +228,7 @@ function draftFromAutomation(a: AutomationView): FormDraft {
     rawSchedule: a.schedule,
     rawMode: parsed === null,
     projectCustom: false,
+    agentPicked: true,
   };
 }
 
@@ -595,7 +603,7 @@ function AutomationDetail({
       : (hosts.find((h) => h.id === automation.host_id)?.name ??
         "Removed host");
   const agentLabel =
-    AGENTS.find((a) => a.value === automation.agent)?.label ??
+    AUTOMATION_AGENTS.find((a) => a.value === automation.agent)?.label ??
     automation.agent;
 
   return (
@@ -838,6 +846,23 @@ function AutomationForm({
     draft.prompt.trim() !== "" &&
     draft.projectPath.trim() !== "";
 
+  const local = draft.hostId === null;
+  const agentHealth = useProbedProviderHealth(AUTOMATION_PROVIDERS, local);
+  const preferredAgent =
+    local && !draft.agentPicked ? preferredAutomationAgent(agentHealth) : null;
+  useEffect(() => {
+    if (!preferredAgent) return;
+    setDraft((prev) =>
+      prev && !prev.agentPicked
+        ? { ...prev, agent: preferredAgent, agentPicked: true }
+        : prev,
+    );
+  }, [preferredAgent, setDraft]);
+  const agentLabel =
+    AUTOMATION_AGENTS.find((a) => a.value === draft.agent)?.label ??
+    draft.agent;
+  const agentWarning = local && agentBlocked(agentHealth, draft.agent);
+
   return (
     <div className="space-y-5">
       <h3 className="text-body-lg font-semibold tracking-tight text-foreground">
@@ -867,12 +892,15 @@ function AutomationForm({
 
       <div className="grid grid-cols-2 gap-4">
         <Field label="Agent">
-          <Select value={draft.agent} onValueChange={(v) => patch({ agent: v })}>
+          <Select
+            value={draft.agent}
+            onValueChange={(v) => patch({ agent: v, agentPicked: true })}
+          >
             <SelectTrigger className="h-9 text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {AGENTS.map((agent) => (
+              {AUTOMATION_AGENTS.map((agent) => (
                 <SelectItem key={agent.value} value={agent.value}>
                   {agent.label}
                 </SelectItem>
@@ -902,6 +930,12 @@ function AutomationForm({
           </Select>
         </Field>
       </div>
+
+      <AgentReadinessRow
+        agent={draft.agent}
+        local={local}
+        health={agentHealth}
+      />
 
       <RepoAccessRow
         hostId={draft.hostId}
@@ -934,11 +968,18 @@ function AutomationForm({
       </div>
 
       <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
-        {!canSave && (
+        {!canSave ? (
           <span className="mr-auto text-label text-muted-foreground/60">
             Name, prompt and project are required.
           </span>
-        )}
+        ) : agentWarning ? (
+          <span
+            data-testid="automation-agent-save-warning"
+            className="mr-auto text-label text-warning"
+          >
+            {agentLabel} isn't ready here, so runs will fail until it is.
+          </span>
+        ) : null}
         <Button
           type="button"
           variant="ghost"

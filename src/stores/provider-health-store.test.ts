@@ -15,6 +15,7 @@
 //    git treat the whole store file as binary.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
 
 const mockProbe = vi.fn();
 
@@ -25,9 +26,12 @@ vi.mock("@/tauri/commands", () => ({
 import {
   emptyHealthSlot,
   healthBannerKey,
+  providerReadiness,
   selectVisibleHealthReport,
+  useProbedProviderHealth,
   useProviderHealth,
 } from "./provider-health-store";
+import type { AgentChatProviderKind } from "@/tauri/types";
 import type { ProviderHealthReport } from "@/tauri/types";
 
 function report(
@@ -295,6 +299,58 @@ describe("provider-health-store", () => {
       selectVisibleHealthReport(useProviderHealth.getState(), "claude")
         ?.message,
     ).toBe("Claude CLI is not authenticated.");
+    warn.mockRestore();
+  });
+
+  it("reads a report as ready, unverified, not ready or not installed", () => {
+    expect(providerReadiness(report("ready"))).toBe("ready");
+    expect(providerReadiness(report("warning", "Could not verify."))).toBe(
+      "unverified",
+    );
+    expect(
+      providerReadiness({ ...report("error", "Run `claude login`."), installed: true }),
+    ).toBe("not_ready");
+    expect(providerReadiness(report("error", "Not on PATH."))).toBe(
+      "not_installed",
+    );
+  });
+
+  it("probes each provider once while active and reports pending until it settles", async () => {
+    const PROVIDERS: AgentChatProviderKind[] = ["claude", "codex"];
+    const claude = deferred();
+    let rejectCodex: (err: Error) => void = () => {};
+    const codex = new Promise<ProviderHealthReport>((_, reject) => {
+      rejectCodex = reject;
+    });
+    mockProbe.mockImplementation((provider: string) =>
+      provider === "claude" ? claude.promise : codex,
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { result, rerender } = renderHook(
+      ({ active }) => useProbedProviderHealth(PROVIDERS, active),
+      { initialProps: { active: false } },
+    );
+    expect(mockProbe).not.toHaveBeenCalled();
+    expect(result.current.claude).toEqual({ report: null, pending: true });
+
+    rerender({ active: true });
+    expect(mockProbe).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      claude.resolve(report("ready"));
+      await claude.promise;
+    });
+    expect(result.current.claude?.pending).toBe(false);
+    expect(result.current.claude?.report?.status).toBe("ready");
+    expect(result.current.codex?.pending).toBe(true);
+
+    // An IPC failure settles the probe with no report: unknown, not pending.
+    await act(async () => {
+      rejectCodex(new Error("IPC down"));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(result.current.codex).toEqual({ report: null, pending: false });
     warn.mockRestore();
   });
 });
