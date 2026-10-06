@@ -1,6 +1,9 @@
 /** Short wheel glides with continuous velocity when another tick arrives. */
 const TICK_DURATION_MS = 200;
 const MIN_DURATION_MS = 30;
+const CONTINUOUS_DURATION_MS = 30;
+const CONTINUOUS_MIN_DURATION_MS = 8;
+type WheelPacing = "wheel" | "fine-wheel" | "continuous";
 
 export interface WheelScrollAdapter {
   read(): number;
@@ -31,11 +34,19 @@ export function createWheelScrollAnimation(
   let startTime = 0;
   let duration = TICK_DURATION_MS;
   let remainder = 0;
+  let lastInputTime: number | null = null;
+  let fineInterval = TICK_DURATION_MS / 4;
+  let fineCadenceKnown = false;
+  let lastPacing: WheelPacing | null = null;
 
   const cancel = () => {
     if (frame !== null) clock.cancel(frame);
     frame = null;
     remainder = 0;
+    lastInputTime = null;
+    fineInterval = TICK_DURATION_MS / 4;
+    fineCadenceKnown = false;
+    lastPacing = null;
   };
 
   // A cubic Hermite segment starts at the current position/velocity and
@@ -57,7 +68,7 @@ export function createWheelScrollAnimation(
     // Layout anchoring, keyboard navigation and following a new message own
     // their position. Never pull the viewport back to an obsolete destination.
     if (adapter.connected?.() === false || Math.abs(adapter.read() - lastWritten) > 1) {
-      remainder = 0;
+      cancel();
       return;
     }
     maximum = Math.max(0, adapter.maximum());
@@ -75,10 +86,21 @@ export function createWheelScrollAnimation(
 
   return {
     cancel,
-    scrollBy(delta: number): boolean {
+    scrollBy(delta: number, pacing: WheelPacing = "wheel"): boolean {
       if (!Number.isFinite(delta) || delta === 0) return false;
       const actual = adapter.read();
       const now = clock.now();
+      const interval = lastInputTime === null || Math.abs(actual - lastWritten) > 1
+        ? Infinity : now - lastInputTime;
+      // Keep cadence across a naturally completed segment, but reset it when
+      // another scroll owner moves the viewport or the input policy changes.
+      const continuingFine = pacing === "fine-wheel" && lastPacing === pacing && interval <= TICK_DURATION_MS;
+      const sampleInterval = Math.min(TICK_DURATION_MS / 4, Math.max(0, interval));
+      // Start with the first observed interval so a newly fast wheel does not
+      // accumulate a long-glide backlog before the cadence estimate catches up.
+      const cadence = continuingFine
+        ? fineCadenceKnown ? fineInterval * 0.75 + sampleInterval * 0.25 : sampleInterval
+        : TICK_DURATION_MS / 4;
       if (frame === null || Math.abs(actual - lastWritten) > 1) {
         const residual = Math.abs(actual - lastWritten) <= 1 ? remainder : 0;
         cancel();
@@ -91,15 +113,24 @@ export function createWheelScrollAnimation(
       const next = Math.max(0, Math.min(maximum, destination + delta));
       if (next === position && frame === null) return false;
       destination = next;
+      lastInputTime = now;
+      lastPacing = pacing;
+      fineInterval = cadence;
+      fineCadenceKnown = continuingFine;
       const distance = destination - position;
       // Small ticks glide for ~200 ms. Larger accumulated movement and an
       // already moving wheel shorten the segment, so fast input keeps up.
-      duration = TICK_DURATION_MS -
+      // Fine mouse samples use a gradual cadence estimate: a single interval
+      // crossing 30 ms must not switch between a long glide and a short pulse.
+      // Continuous touchpad input retains the previous short timing.
+      duration = pacing === "fine-wheel"
+        ? Math.max(CONTINUOUS_DURATION_MS, 4 * fineInterval)
+        : pacing === "continuous" ? CONTINUOUS_DURATION_MS : TICK_DURATION_MS -
         Math.min(360, Math.max(0, Math.abs(distance) - 120)) / 360 * 100;
       if (velocity * distance > 0) {
         duration = Math.min(duration, 2.5 * Math.abs(distance / velocity));
       }
-      duration = Math.max(MIN_DURATION_MS, duration);
+      duration = Math.max(pacing === "wheel" ? MIN_DURATION_MS : CONTINUOUS_MIN_DURATION_MS, duration);
       startPosition = position;
       // Bound extreme slopes near an edge, while allowing a brief continuous
       // turnaround on reversal as Chromium does. Signed input is never lost.
@@ -113,19 +144,36 @@ export function createWheelScrollAnimation(
 }
 
 const nativeInput = ".xterm, .cm-editor, textarea, input, select, [contenteditable]:not([contenteditable=false]), [data-native-wheel]";
-let scrollInstalledElement: ((element: HTMLElement, delta: number) => boolean) | null = null;
+let scrollInstalledElement: ((element: HTMLElement, delta: number, event?: WheelEvent) => boolean) | null = null;
+
+/**
+ * GTK smooth mouse events use a viewport-derived pixel scale; other devices
+ * use 40px per unit. Legacy wheel ticks retain that original unit, truncated
+ * to an integer. Only classify a mouse when its delta excludes the entire
+ * possible 40px interval; ambiguous/tiny input keeps its existing timing.
+ */
+export function isWebKitMouseWheel(event: WheelEvent): event is WheelEvent & { readonly wheelDeltaY: number } {
+  if (event.deltaMode !== 0 || !Number.isFinite(event.deltaY) ||
+      !("wheelDeltaY" in event) || typeof event.wheelDeltaY !== "number") return false;
+  const ticks = event.wheelDeltaY;
+  if (!Number.isInteger(ticks) || Math.abs(ticks) < 1 || event.deltaY * ticks >= 0) return false;
+  const pixels = Math.abs(event.deltaY);
+  const minimum = Math.abs(ticks) * 40 / 120;
+  const maximum = (Math.abs(ticks) + 1) * 40 / 120;
+  return pixels < minimum - 0.01 || pixels > maximum + 0.01;
+}
 
 /** Used by the transcript navigation rail, which is a sibling of its viewport. */
-export function tryAnimatedWheelScroll(element: HTMLElement, delta: number): boolean {
-  return scrollInstalledElement?.(element, delta) ?? false;
+export function tryAnimatedWheelScroll(element: HTMLElement, delta: number, event?: WheelEvent): boolean {
+  return scrollInstalledElement?.(element, delta, event) ?? false;
 }
 
 /**
- * Default Linux wheel behavior. DOM wheel events cannot reliably distinguish
- * a high-res mouse from a vertical trackpad gesture. Horizontal input and
- * controls with their own wheel behavior keep their native path.
+ * Default Linux wheel behavior. WebKit's unit relationship identifies mouse
+ * samples conservatively; ambiguous input retains its existing timing.
+ * Horizontal input and controls with their own wheel behavior keep their path.
  */
-export function installWheelScrolling(doc: Document = document): () => void {
+export function installWheelScrolling(doc: Document = document, preciseWheelAvailable: () => boolean = () => false): () => void {
   const win = doc.defaultView;
   if (!win) return () => {};
   const reducedMotion = win.matchMedia?.("(prefers-reduced-motion: reduce)");
@@ -134,12 +182,16 @@ export function installWheelScrolling(doc: Document = document): () => void {
     request: (callback) => win.requestAnimationFrame(callback),
     cancel: (frame) => win.cancelAnimationFrame(frame),
   };
-  let active: { element: HTMLElement; animation: ReturnType<typeof createWheelScrollAnimation> } | null = null;
+  let active: {
+    element: HTMLElement;
+    animation: ReturnType<typeof createWheelScrollAnimation>;
+    lastFineMouseInput: number | null;
+  } | null = null;
   const cancel = () => {
     active?.animation.cancel();
     active = null;
   };
-  const animate = (element: HTMLElement, delta: number) => {
+  const animate = (element: HTMLElement, delta: number, event?: WheelEvent) => {
     if (reducedMotion?.matches || !element.isConnected) return false;
     if (active?.element !== element) {
       const maximum = element.scrollHeight - element.clientHeight;
@@ -148,6 +200,7 @@ export function installWheelScrolling(doc: Document = document): () => void {
       cancel();
       active = {
         element,
+        lastFineMouseInput: null,
         animation: createWheelScrollAnimation({
           read: () => element.scrollTop,
           write: (position) => { element.scrollTop = position; },
@@ -156,7 +209,23 @@ export function installWheelScrolling(doc: Document = document): () => void {
         }, clock),
       };
     }
-    return active!.animation.scrollBy(delta);
+    let pacing: WheelPacing = "wheel";
+    if (event?.deltaMode === 0 && preciseWheelAvailable()) {
+      if (isWebKitMouseWheel(event)) {
+        const now = clock.now();
+        // Coalescing can combine fractional wheel samples into a full tick.
+        // Keep those packets on the gesture's policy instead of changing pace.
+        if (Math.abs(event.wheelDeltaY) < 120 ||
+            (active!.lastFineMouseInput !== null && now - active!.lastFineMouseInput <= TICK_DURATION_MS)) {
+          pacing = "fine-wheel";
+          active!.lastFineMouseInput = now;
+        }
+      } else {
+        active!.lastFineMouseInput = null;
+        if (Math.abs(delta) < Math.pow(win.innerHeight, 2 / 3) * 0.8) pacing = "continuous";
+      }
+    }
+    return active!.animation.scrollBy(delta, pacing);
   };
   scrollInstalledElement = animate;
 
@@ -185,7 +254,7 @@ export function installWheelScrolling(doc: Document = document): () => void {
       if (node.scrollHeight <= node.clientHeight) continue;
       const delta = event.deltaY * (event.deltaMode === 1 ? 16 :
         event.deltaMode === 2 ? node.clientHeight : 1);
-      if (animate(node, delta)) {
+      if (animate(node, delta, event)) {
         event.preventDefault();
         return;
       }

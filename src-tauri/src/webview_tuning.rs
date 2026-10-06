@@ -551,10 +551,38 @@ pub fn apply_to_webview<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
         let enabled = SMOOTH_SCROLLING.load(Ordering::Relaxed);
         let _ = webview.with_webview(move |platform| {
             use webkit2gtk::{SettingsExt, WebViewExt};
+            crate::precise_wheel::attach(&platform.inner());
             if let Some(settings) = platform.inner().settings() {
                 settings.set_enable_smooth_scrolling(enabled);
             }
         });
+    }
+}
+
+/// Whether the Linux native wheel path preserves Wayland fractional notches.
+/// Other backends retain their existing input handling.
+#[tauri::command]
+#[allow(unused_variables)]
+pub async fn get_precise_wheel_available<R: tauri::Runtime>(window: tauri::WebviewWindow<R>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Page effects may run before the finished-load hook. Initialize on
+        // GTK's thread before answering this one-time frontend query.
+        let (send, receive) = tokio::sync::oneshot::channel();
+        if window
+            .with_webview(move |platform| {
+                let available = crate::precise_wheel::attach(&platform.inner());
+                let _ = send.send(available);
+            })
+            .is_err()
+        {
+            return false;
+        }
+        receive.await.unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 

@@ -231,7 +231,7 @@ const TrailRail = memo(function TrailRail({
         }),
       );
       const delta = normalizeWheelDelta(e.deltaY, e.deltaMode);
-      if (!tryAnimatedWheelScroll(viewport, delta)) viewport.scrollTop += delta;
+      if (!tryAnimatedWheelScroll(viewport, delta, e.nativeEvent)) viewport.scrollTop += delta;
     },
     [listRef],
   );

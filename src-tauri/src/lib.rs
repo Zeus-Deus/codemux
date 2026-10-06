@@ -90,6 +90,8 @@ pub mod trace;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
+#[cfg(target_os = "linux")]
+mod precise_wheel;
 // Reloads the main window when its WebKitGTK web process dies (Linux).
 pub mod webview_recovery;
 // VS Code Marketplace theme import — search the public gallery and pull the
@@ -2757,6 +2759,7 @@ fn build_core_app<R: tauri::Runtime>(
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            webview_tuning::get_precise_wheel_available,
             // "Reload interface" in the command palette: reloads only the
             // main webview, like Ctrl+Alt+R and `codemux reload-ui`.
             webview_recovery::reload_interface,
