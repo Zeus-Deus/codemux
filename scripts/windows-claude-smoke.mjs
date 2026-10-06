@@ -11,6 +11,7 @@ assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 const evidenceDir = resolve('windows-claude-evidence');
 const install = JSON.parse((await readFile(join(evidenceDir, 'install.json'), 'utf8')).replace(/^\uFEFF/, ''));
 const evidence = { commit: process.env.GITHUB_SHA, install, checks: [] };
+const expectPathFailure = process.argv.includes('--expect-path-failure');
 const owned = new Set();
 function start(program, args, env = process.env, options = {}) {
   const child = spawn(program, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...options });
@@ -105,19 +106,30 @@ try {
       assert.notEqual(absolute.version, 'unknown');
       const models = await client.request('list-models', { cwd: process.env.RUNNER_TEMP, pathToClaudeCodeExecutable: install.cli });
       assert.ok(models.models.length > 0, 'Real SDK initialization must return models without inference');
+      if (label === 'repaired') {
+        // Exercise the same bare executable name the agent GUI passes. Session
+        // initialization exchanges control messages only; never submit a turn.
+        await client.request('start-session', {
+          threadId: 'windows-install-smoke', cwd: process.env.RUNNER_TEMP,
+          pathToClaudeCodeExecutable: 'claude',
+        });
+        const initialized = await client.request('initialization-result', { threadId: 'windows-install-smoke' });
+        assert.ok(initialized && typeof initialized === 'object');
+        await client.request('stop-session', { threadId: 'windows-install-smoke' });
+      }
       evidence.checks.push({ label, probe, absolute, modelCount: models.models.length });
       console.log(`Real sidecar (${label} PATH): ${JSON.stringify(evidence.checks.at(-1))}`);
     } finally { await stop(client.child); }
   }
 
-  const installer = resolve('windows-claude-input/codemux_0.23.1_x64-setup.exe');
+  const installer = resolve(process.argv[2]);
   const appDir = join(process.env.RUNNER_TEMP, 'Codemux install with spaces');
   await mkdir(appDir, { recursive: true });
   // NSIS requires /D= to be the final, unquoted argument, including spaces.
   await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
   await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'enable']);
   debugPolicy = true;
-  for (const [label, env, expected] of [['stale', staleEnv, false], ['repaired', repairedEnv, true]]) {
+  for (const [label, env, expected] of [['stale', staleEnv, !expectPathFailure], ['repaired', repairedEnv, true]]) {
     const desktop = start(join(appDir, 'codemux.exe'), [], env);
     try {
       const target = await until('Installed app WebView2', async () => {
@@ -139,6 +151,13 @@ try {
         pending.set(id, result => { clearTimeout(timer); resolve(result); });
         socket.send(JSON.stringify({ id, method, params }));
       });
+      await until('Native Tauri IPC initialized', async () => {
+        const result = await cdp('Runtime.evaluate', {
+          expression: 'typeof window.__TAURI_INTERNALS__?.invoke === "function"',
+          returnByValue: true,
+        });
+        return result.result?.result?.value === true;
+      });
       const result = await cdp('Runtime.evaluate', {
         expression: 'window.__TAURI_INTERNALS__.invoke("agent_chat_provider_health", {provider:"claude"})',
         awaitPromise: true, returnByValue: true,
@@ -148,7 +167,7 @@ try {
       evidence.checks.push({ label: `installed-gui-${label}`, health });
       assert.equal(health.installed, expected, JSON.stringify(health));
       assert.equal(health.version !== undefined && health.version !== null, expected);
-      console.log(`Stock installed GUI (${label} PATH): ${JSON.stringify(health)}`);
+      console.log(`Installed GUI (${label} PATH): ${JSON.stringify(health)}`);
       socket.close(); socket = undefined;
     } finally {
       socket?.close(); socket = undefined;

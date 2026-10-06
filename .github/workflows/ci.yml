@@ -56,7 +56,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release download v0.23.1 --repo Zeus-Deus/codemux --pattern codemux_0.23.1_x64-setup.exe --dir windows-claude-input
       - name: Test installed GUI and compiled sidecar
-        run: node scripts/windows-claude-smoke.mjs
+        run: node scripts/windows-claude-smoke.mjs windows-claude-input/codemux_0.23.1_x64-setup.exe --expect-path-failure
       - uses: actions/upload-artifact@v4
         if: always()
         with:
