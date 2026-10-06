@@ -547,10 +547,9 @@ fn build_core_app<R: tauri::Runtime>(
     }
 
     builder
-        // Every finished page load re-applies the current smooth-scrolling
-        // preference, so windows created after `setup` (and any reload) get
-        // it without a separate window-created hook — each webview owns its
-        // own WebKitSettings object.
+        // Every finished page load configures precise wheel input and disables
+        // WebKit's native animation. New windows and reloads share the default
+        // app glide without a separate window-created hook.
         //
         // A finished load on the main window is also the app's first proof
         // that the webview came up, which clears the renderer crash sentinel
@@ -772,12 +771,9 @@ fn build_core_app<R: tauri::Runtime>(
             // size, position, save, or float, so the whole block is skipped
             // there.
             if mode == AppMode::Gui {
-            // Turn WebKitGTK's smooth-scrolling animation off for every window
-            // that already exists. Its 200 ms eased retarget restarts on each
-            // high-resolution wheel event, so a fast flick scrolls *less* than
-            // a slow one (WebKit bug 258926). Windows created later pick the
-            // same setting up from the page-load hook, and the frontend can
-            // flip it at runtime via the `set_smooth_scrolling` command.
+            // Configure existing windows before wheel input starts. Later
+            // windows and reloads receive the same policy from the page-load
+            // hook; the frontend owns glides with native animation disabled.
             webview_tuning::refresh_all(&handle);
 
             // A dead or hung renderer leaves the window blank while the
@@ -2754,8 +2750,6 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
             web_remote::web_remote_retry,
-            // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
-            webview_tuning::set_smooth_scrolling,
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,

@@ -531,29 +531,18 @@ pub fn get_renderer_mode() -> Result<String, String> {
     }
 }
 
-/// Desired `enable-smooth-scrolling` state for every webview.
-///
-/// Off by default: WebKitGTK's smooth-scrolling animation restarts its 200 ms
-/// eased retarget on every high-resolution wheel event, so a fast flick ends up
-/// travelling *less* than a slow one (WebKit bug 258926). With the setting off,
-/// wheel deltas are applied directly and scrolling tracks the input device.
-/// The frontend can flip it at runtime through [`set_smooth_scrolling`].
-#[cfg(target_os = "linux")]
-static SMOOTH_SCROLLING: AtomicBool = AtomicBool::new(false);
-
-/// Push the current desired smooth-scrolling state onto a single webview.
-/// Used by the page-load hook so windows created after setup — and any page
-/// that reloads — pick the setting up without extra bookkeeping.
+/// Configure precise input and disable WebKit's native wheel animation.
+/// The frontend owns the glide; enabling both animations delays rapid input.
+/// Apply per webview so newly created windows and reloads share that policy.
 #[allow(unused_variables)]
 pub fn apply_to_webview<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
     #[cfg(target_os = "linux")]
     {
-        let enabled = SMOOTH_SCROLLING.load(Ordering::Relaxed);
         let _ = webview.with_webview(move |platform| {
             use webkit2gtk::{SettingsExt, WebViewExt};
             crate::precise_wheel::attach(&platform.inner());
             if let Some(settings) = platform.inner().settings() {
-                settings.set_enable_smooth_scrolling(enabled);
+                settings.set_enable_smooth_scrolling(false);
             }
         });
     }
@@ -586,8 +575,7 @@ pub async fn get_precise_wheel_available<R: tauri::Runtime>(window: tauri::Webvi
     }
 }
 
-/// Push the current desired smooth-scrolling state onto every existing
-/// webview window.
+/// Apply the default wheel policy to windows already present during setup.
 #[allow(unused_variables)]
 pub fn refresh_all<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     #[cfg(target_os = "linux")]
@@ -597,24 +585,6 @@ pub fn refresh_all<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             apply_to_webview(window.as_ref());
         }
     }
-}
-
-/// Toggle WebKitGTK smooth scrolling for every webview window at runtime.
-///
-/// Linux-only in effect; other platforms have no equivalent setting and
-/// return `Ok(())` unchanged so the frontend can call this unconditionally.
-#[tauri::command]
-#[allow(unused_variables)]
-pub fn set_smooth_scrolling<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    enabled: bool,
-) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        SMOOTH_SCROLLING.store(enabled, Ordering::Relaxed);
-        refresh_all(&app);
-    }
-    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
