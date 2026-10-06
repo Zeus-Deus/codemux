@@ -8,6 +8,7 @@ import {
   paceOf,
   remainingPercent,
 } from "./usage-limits";
+import { isKnownProvider, seriesFill, seriesLabel } from "./usage-format";
 import { parseRateDraft } from "./usage-model-dialog";
 import { costTypeSegments } from "./usage-share-bar";
 
@@ -94,5 +95,14 @@ describe("cost by type", () => {
     });
     expect(segments.find((s) => s.label === "Unsplit")?.value).toBe(0);
     expect(segments.find((s) => s.label === "Output")?.value).toBe(2);
+  });
+});
+
+describe("provider presentation", () => {
+  it("treats inherited object keys as unknown providers", () => {
+    expect(isKnownProvider("claude")).toBe(true);
+    expect(isKnownProvider("constructor")).toBe(false);
+    expect(seriesLabel("constructor")).toBe("constructor");
+    expect(seriesFill("toString")).toBe("bg-muted-foreground/40");
   });
 });

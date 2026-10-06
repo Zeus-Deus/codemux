@@ -797,6 +797,11 @@ fn split_cost(
 /// Settings key holding the user's per-model price overrides as JSON.
 const PRICE_OVERRIDES_KEY: &str = "usage.price_overrides";
 
+/// Serializes read-modify-write of the overrides map. Tauri runs commands
+/// concurrently, so a Remove and an Edit in quick succession could otherwise
+/// both read the old map and one would overwrite the other's change.
+static PRICE_OVERRIDES_LOCK: Mutex<()> = Mutex::new(());
+
 fn load_price_overrides(db: &DatabaseStore) -> HashMap<String, PriceOverride> {
     db.get_setting(PRICE_OVERRIDES_KEY)
         .and_then(|raw| serde_json::from_str::<HashMap<String, PriceOverride>>(&raw).ok())
@@ -1005,6 +1010,7 @@ pub async fn usage_set_price_override(
     if model.is_empty() {
         return Err("model must not be empty".into());
     }
+    let _guard = PRICE_OVERRIDES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut overrides = load_price_overrides(&db);
     match price {
         Some(price) if price.is_valid() => {

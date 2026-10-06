@@ -233,11 +233,10 @@ fn claude_reading_from_get_usage(response: &Value) -> QuotaReading {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let plan_label = subscription.map(claude_plan_label);
-    let auth_mode = if subscription.is_some() || available {
-        Some(PlanAuthMode::Subscription)
-    } else {
-        Some(PlanAuthMode::ApiKey)
-    };
+    // No plan and no limits is not proof of an API key: Bedrock, Vertex, and
+    // a login without the profile scope answer the same way. Claim only what
+    // the response shows.
+    let auth_mode = (subscription.is_some() || available).then_some(PlanAuthMode::Subscription);
 
     let mut windows = Vec::new();
     let Some(limits) = response.get("rate_limits").filter(|v| v.is_object()) else {
@@ -509,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn get_usage_without_a_plan_reads_as_api_key() {
+    fn get_usage_without_a_plan_claims_no_billing_mode() {
         let response = json!({
             "subscription_type": null,
             "rate_limits_available": false,
@@ -518,7 +517,9 @@ mod tests {
         let reading = claude_reading_from_get_usage(&response);
         assert!(reading.windows.is_empty());
         assert_eq!(reading.plan_label, None);
-        assert_eq!(reading.auth_mode, Some(PlanAuthMode::ApiKey));
+        // Bedrock, Vertex, and a missing profile scope look the same as an
+        // API key here, so the page says "no limits reported", not "API key".
+        assert_eq!(reading.auth_mode, None);
     }
 
     #[test]

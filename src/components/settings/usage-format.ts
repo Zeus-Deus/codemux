@@ -1,5 +1,11 @@
 import type { AgentChatProviderKind } from "@/tauri/types";
 
+/** A lookup that ignores inherited keys. Provider ids come from the ledger,
+ *  and a plain index would answer "constructor" with a function. */
+function own<T>(table: Record<string, T>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
 /** 8.0B / 1.4M / 82K / 640 — the design's `toks`.
  *
  *  The B tier is not hypothetical: provider history on a busy machine
@@ -54,7 +60,7 @@ const SERIES_COLOR: Record<string, { color: string; opacity: number }> = {
 const UNKNOWN_COLOR = { color: "var(--muted-foreground)", opacity: 0.5 };
 
 export function seriesColor(provider: string): { color: string; opacity: number } {
-  return SERIES_COLOR[provider] ?? UNKNOWN_COLOR;
+  return own(SERIES_COLOR, provider) ?? UNKNOWN_COLOR;
 }
 
 const SERIES_LABEL: Record<string, string> = {
@@ -71,13 +77,13 @@ const SERIES_LABEL: Record<string, string> = {
 const UNKNOWN_FILL = "bg-muted-foreground/40";
 
 export function seriesFill(provider: string): string {
-  return SERIES_FILL[provider] ?? UNKNOWN_FILL;
+  return own(SERIES_FILL, provider) ?? UNKNOWN_FILL;
 }
 
 export function seriesLabel(provider: string): string {
-  return SERIES_LABEL[provider] ?? provider;
+  return own(SERIES_LABEL, provider) ?? provider;
 }
 
 export function isKnownProvider(provider: string): provider is AgentChatProviderKind {
-  return provider in SERIES_LABEL;
+  return own(SERIES_LABEL, provider) !== undefined;
 }
