@@ -69,8 +69,11 @@ pub struct SyncResult {
 }
 
 /// Snapshot of the engine's current state for the frontend.
+///
+/// `rename_all` only renames the variant tags; `rename_all_fields` is what
+/// makes the variant fields camelCase, which is the shape the frontend reads.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "state")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "state")]
 pub enum SyncStateSnapshot {
     /// Engine is between syncs.
     Idle {
@@ -673,6 +676,43 @@ mod tests {
             scope: scope.into(),
             updated_at: updated_at_iso.into(),
         }
+    }
+
+    // ── SyncStateSnapshot wire shape ───────────────────────────
+
+    #[test]
+    fn sync_state_snapshot_serializes_camel_case_fields() {
+        let idle = serde_json::to_value(SyncStateSnapshot::Idle {
+            last_sync_at_millis: Some(1_700_000_000_000),
+        })
+        .unwrap();
+        assert_eq!(
+            idle,
+            serde_json::json!({ "state": "idle", "lastSyncAtMillis": 1_700_000_000_000u64 })
+        );
+
+        let never = serde_json::to_value(SyncStateSnapshot::default()).unwrap();
+        assert_eq!(
+            never,
+            serde_json::json!({ "state": "idle", "lastSyncAtMillis": null })
+        );
+
+        let syncing =
+            serde_json::to_value(SyncStateSnapshot::Syncing { started_at_millis: 5 }).unwrap();
+        assert_eq!(
+            syncing,
+            serde_json::json!({ "state": "syncing", "startedAtMillis": 5 })
+        );
+
+        let error = serde_json::to_value(SyncStateSnapshot::Error {
+            last_error: "boom".into(),
+            at_millis: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({ "state": "error", "lastError": "boom", "atMillis": 7 })
+        );
     }
 
     // ── skill_name_from_path ───────────────────────────────────

@@ -76,6 +76,20 @@ describe("SyncStatusDisplay", () => {
     expect(screen.getByRole("button", { name: /sync now/i })).toBeEnabled();
   });
 
+  it("idle without a last-sync field never renders Invalid Date", async () => {
+    // Older backends emitted snake_case variant fields, so the camelCase
+    // key arrived missing rather than null.
+    vi.mocked(skillsSyncStatus).mockResolvedValue({
+      state: "idle",
+    } as unknown as Awaited<ReturnType<typeof skillsSyncStatus>>);
+    render(<SyncStatusDisplay />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Sync ready")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Invalid Date|Last synced/)).toBeNull();
+  });
+
   it("idle with a recent last sync renders the relative-time line", async () => {
     const oneMinuteAgo = Date.now() - 60_000;
     vi.mocked(skillsSyncStatus).mockResolvedValue({
