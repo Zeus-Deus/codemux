@@ -15,6 +15,9 @@ const mocks = vi.hoisted(() => ({
   applyPreset: vi.fn().mockResolvedValue(undefined),
   createTab: vi.fn().mockResolvedValue("tab-new"),
   createBrowserPane: vi.fn().mockResolvedValue("pane-b"),
+  getPresetAvailability: vi
+    .fn<() => Promise<Record<string, boolean>>>()
+    .mockResolvedValue({}),
   setShowSettings: vi.fn(),
   launchDraftWithPreset: vi.fn().mockResolvedValue({
     success: true,
@@ -33,6 +36,7 @@ vi.mock("@/tauri/commands", () => ({
   applyPreset: (...a: unknown[]) => mocks.applyPreset(...a),
   createTab: (...a: unknown[]) => mocks.createTab(...a),
   createBrowserPane: (...a: unknown[]) => mocks.createBrowserPane(...a),
+  getPresetAvailability: () => mocks.getPresetAvailability(),
 }));
 
 vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
@@ -50,6 +54,7 @@ vi.mock("@/stores/ui-store", () => ({
 }));
 
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
+import { usePresetAvailabilityStore } from "@/hooks/use-preset-availability";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import { AgentLauncher, DraftAgentLauncher } from "./agent-launcher";
 
@@ -169,6 +174,8 @@ beforeEach(() => {
   mocks.createBrowserPane.mockClear();
   mocks.launchDraftWithPreset.mockClear();
   mocks.setShowSettings.mockClear();
+  mocks.getPresetAvailability.mockReset().mockResolvedValue({});
+  usePresetAvailabilityStore.setState({ installed: {} });
   localStorage.clear();
   useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
@@ -205,6 +212,62 @@ describe("AgentLauncher", () => {
     expect(screen.getByText("Terminal")).toBeInTheDocument();
     expect(screen.getByText("Browser")).toBeInTheDocument();
     expect(screen.getByText("Manage presets…")).toBeInTheDocument();
+  });
+
+  it("marks CLI agents that are not installed, re-checking on every open", async () => {
+    mocks.getPresetAvailability.mockResolvedValue({
+      "builtin-claude": true,
+      "builtin-codex": false,
+    });
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    await act(async () => {
+      openLauncher();
+    });
+
+    expect(mocks.getPresetAvailability).toHaveBeenCalledTimes(1);
+    const codex = screen.getByTestId("launcher-cli-builtin-codex");
+    expect(codex).toHaveAttribute("data-installed", "false");
+    expect(
+      screen.getByTestId("launcher-destination-builtin-codex"),
+    ).toHaveTextContent("not installed");
+    expect(screen.getByTestId("launcher-cli-builtin-claude")).toHaveAttribute(
+      "data-installed",
+      "true",
+    );
+    expect(
+      screen.getByTestId("launcher-destination-builtin-claude"),
+    ).toHaveTextContent("terminal");
+
+    // Still selectable: launching explains why it cannot start.
+    act(() => {
+      fireEvent.click(codex);
+    });
+    expect(mocks.applyPreset).toHaveBeenCalledWith(
+      "ws-1",
+      "builtin-codex",
+      "new_tab",
+      null,
+      null,
+    );
+
+    await act(async () => {
+      openLauncher();
+    });
+    expect(mocks.getPresetAvailability).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats an unchecked preset as installed when the probe fails", async () => {
+    mocks.getPresetAvailability.mockRejectedValue(new Error("ipc"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    await act(async () => {
+      openLauncher();
+    });
+    expect(screen.getByTestId("launcher-cli-builtin-codex")).toHaveAttribute(
+      "data-installed",
+      "true",
+    );
+    warn.mockRestore();
   });
 
   it("uses the 1a trailing slot, scrollbar, fades, and sticky footer", () => {
@@ -447,6 +510,23 @@ describe("DraftAgentLauncher", () => {
       fireEvent.keyDown(input, { key: "Enter" });
     });
     expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
+  });
+
+  it("marks CLI agents that are not installed in the draft launcher", async () => {
+    mocks.getPresetAvailability.mockResolvedValue({ "builtin-codex": false });
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    await act(async () => {
+      openDraftLauncher();
+    });
+    expect(
+      screen.getByTestId("draft-launcher-cli-builtin-codex"),
+    ).toHaveAttribute("data-installed", "false");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-codex"),
+    ).toHaveTextContent("not installed");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-claude"),
+    ).toHaveTextContent("terminal");
   });
 
   it("materialises the draft with the chosen CLI preset", () => {

@@ -2656,6 +2656,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,
+            commands::get_preset_availability,
             commands::create_preset,
             commands::update_preset,
             commands::delete_preset,

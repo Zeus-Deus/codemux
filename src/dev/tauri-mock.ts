@@ -4685,6 +4685,17 @@ const handlers: Record<string, Handler> = {
 
   // ── Presets ──
   get_presets: () => presetState,
+  // Gemini and Copilot play the agents this machine doesn't have, so the
+  // launcher's "not installed" rows show up in dev.
+  get_preset_availability: () =>
+    Object.fromEntries(
+      presetState.presets
+        .filter((p) => p.kind === "cli")
+        .map((p) => [
+          p.id,
+          p.id !== "builtin-gemini" && p.id !== "builtin-copilot",
+        ]),
+    ),
   create_preset: (a) => {
     const id = `custom-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     presetState.presets.push(
