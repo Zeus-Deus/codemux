@@ -2,6 +2,7 @@ import { Lock } from "lucide-react";
 import { useMemo } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   isRunning,
@@ -20,6 +21,7 @@ import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
+import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 import { buildTranscriptSlots } from "./transcript-slots";
@@ -151,6 +153,8 @@ function SubItem({
     case "tool_call":
       return isTaskSummaryTool(item as ToolCallItem) ? (
         <TaskSummaryCard item={item as ToolCallItem} />
+      ) : isInlineHtmlRender(item as ToolCallItem) ? (
+        <HtmlRenderFrame item={item as ToolCallItem} />
       ) : (
         <ToolCallCard item={item as ToolCallItem} approval={null} onDecide={NOOP} />
       );

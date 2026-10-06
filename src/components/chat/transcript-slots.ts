@@ -7,6 +7,7 @@ import type {
   UserMessageItem,
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
@@ -78,6 +79,7 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *    approval footer must render on a standalone `ToolCallCard`.
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
+ *  - `html_render` pages — the page is part of the reply, not process.
  * (`subagent_run` items are not tool calls; the slot builder joins them into
  * the same work-log line separately.)
  */
@@ -85,7 +87,8 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
     item.kind === "tool_call" &&
     item.approval_request_id == null &&
-    !isTaskSummaryTool(item)
+    !isTaskSummaryTool(item) &&
+    !isInlineHtmlRender(item)
   );
 }
 
@@ -165,8 +168,10 @@ function isFoldableSettledItem(
     case "reasoning":
       return true;
     case "tool_call":
+      // An `html_render` page stays beside the answer it belongs to.
       return !(
-        item.approval_request_id && pendingRequestIds.has(item.approval_request_id)
+        (item.approval_request_id && pendingRequestIds.has(item.approval_request_id)) ||
+        isInlineHtmlRender(item)
       );
     case "subagent_run":
       return subagentRunSettled(item);

@@ -25,6 +25,7 @@ import {
 } from "react";
 
 import { Button } from "@/components/ui/button";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import type {
   ChatViewItem,
   PermissionRequestItem,
@@ -46,6 +47,7 @@ import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
+import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
@@ -1827,6 +1829,8 @@ function renderAssistantBody(
     case "tool_call":
       return isTaskSummaryTool(item) ? (
         <TaskSummaryCard item={item} workspaceId={handlers.workspaceId} />
+      ) : isInlineHtmlRender(item) ? (
+        <HtmlRenderFrame item={item} />
       ) : (
         <ToolCallCard
           item={item}
