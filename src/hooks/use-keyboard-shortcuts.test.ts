@@ -237,6 +237,32 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(useUIStore.getState().showSettings).toBe(false);
     });
 
+    it("leaves settings open when a layer inside it already took the Escape", () => {
+      useUIStore.setState({ showSettings: true });
+      const claimed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      claimed.preventDefault();
+
+      expect(dispatch("closeOverlay", claimed)).toBe(false);
+      expect(useUIStore.getState().showSettings).toBe(true);
+    });
+
+    it("leaves settings open while a sheet inside it is open", () => {
+      useUIStore.setState({ showSettings: true });
+      const sheet = document.createElement("div");
+      sheet.setAttribute("role", "dialog");
+      sheet.setAttribute("data-state", "open");
+      document.body.appendChild(sheet);
+      try {
+        expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(false);
+        expect(useUIStore.getState().showSettings).toBe(true);
+      } finally {
+        sheet.remove();
+      }
+      // The next press, with nothing left on top, leaves Settings.
+      expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(false);
+    });
+
     it("closes fileSearch before contentSearch", () => {
       useUIStore.setState({ showFileSearch: true, showContentSearch: true });
       dispatch("closeOverlay", FAKE_EVENT);

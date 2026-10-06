@@ -17,6 +17,7 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
+import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { stepInterfaceSize } from "@/lib/typography";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
@@ -82,7 +83,7 @@ export function useKeyboardShortcuts() {
  * event; the command palette calls it without one, so a palette row and its
  * shortcut always execute the exact same code path.
  */
-export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
+export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
@@ -103,6 +104,9 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       return true;
     }
     if (ui.showSettings) {
+      // Settings hosts sheets, selects, dialogs and its own command palette.
+      // Escape belongs to the innermost of those; a second press leaves.
+      if (event && escapeClaimedElsewhere(event)) return false;
       ui.setShowSettings(false);
       return true;
     }
