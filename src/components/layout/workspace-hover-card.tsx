@@ -17,7 +17,7 @@ import { openExternalUrl } from "@/lib/open-url";
 import {
   prSetComposition,
   prSetSummary,
-  stackOrder,
+  stackGroups,
   workspacePrs,
   type WorkspacePrRef,
 } from "@/lib/workspace-prs";
@@ -488,7 +488,10 @@ const PR_SET_VISIBLE = 10;
  *  and which are still open. Each row carries its own state icon and color,
  *  so "four merged, five open" is read off the column of glyphs rather than
  *  counted. The head branch rides alongside because in a stack it is the only
- *  thing that says what each PR is *for*. */
+ *  thing that says what each PR is *for*.
+ *
+ *  PRs that build on one another are joined by a rail through their icons, so
+ *  a stack reads as one piece of work and unrelated PRs stand apart. */
 function PrSetRows({
   prs,
   provider,
@@ -497,19 +500,48 @@ function PrSetRows({
   provider: ReturnType<typeof providerForWorkspace>;
 }) {
   const summary = prSetSummary(prs);
-  const ordered = stackOrder(prs);
+  const groups = stackGroups(prs);
+  const ordered = groups.flatMap((group) =>
+    group.map((pr, index) => ({
+      pr,
+      linksDown: index > 0,
+      linksUp: index < group.length - 1,
+    })),
+  );
   const visible = ordered.slice(0, PR_SET_VISIBLE);
   const hidden = ordered.length - visible.length;
+  const singleStack = groups.length === 1 && summary.total > 1;
   return (
     <div data-pr-set>
       <DetailRow
-        label={`${summary.total} ${provider.nounPlural}`}
+        label={
+          singleStack
+            ? `Stack of ${summary.total}`
+            : `${summary.total} ${provider.nounPlural}`
+        }
         value={prSetComposition(summary)}
         muted
       />
       <ul className="flex flex-col pb-1">
-        {visible.map((pr) => (
-          <li key={pr.number}>
+        {visible.map(({ pr, linksDown, linksUp }) => (
+          <li key={pr.number} className="relative">
+            {/* Rail segments stop short of the icon (centred 14px in: px-2
+                plus half of size-3) so the line joins glyphs without
+                striking through them. */}
+            {linksDown && (
+              <span
+                aria-hidden
+                data-pr-stack-rail
+                className="pointer-events-none absolute left-[13.5px] top-0 bottom-[calc(50%+7px)] w-px bg-muted-foreground/40"
+              />
+            )}
+            {linksUp && (
+              <span
+                aria-hidden
+                data-pr-stack-rail
+                className="pointer-events-none absolute left-[13.5px] top-[calc(50%+7px)] bottom-0 w-px bg-muted-foreground/40"
+              />
+            )}
             <button
               type="button"
               data-pr-set-row={pr.number}
