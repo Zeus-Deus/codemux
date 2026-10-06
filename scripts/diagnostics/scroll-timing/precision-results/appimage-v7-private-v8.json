@@ -1,0 +1,21 @@
+{
+  "production_module": "src-tauri/src/precise_wheel.rs",
+  "library": "libwayland-client.so.0",
+  "library_sha256": "43160e2723f964256f3399ef40e0e729157ef7cea78e3ba63763bcfb852935d6",
+  "runtime_seat_table_version": 7,
+  "runtime_pointer_table_version": 7,
+  "passed_tests": 9,
+  "private_seat_version": 8,
+  "private_pointer_version": 8,
+  "decoded_value120": [
+    15,
+    -15
+  ],
+  "decoded_notch_fractions": [
+    0.125,
+    -0.125
+  ],
+  "real_client_marshaller_and_decoder": true,
+  "socketpair_mock_server": true,
+  "original_gtk_protocol_tables_unchanged": true
+}

@@ -1,0 +1,14 @@
+<!DOCTYPE html><style>body{margin:0;background:#202020;color:white}#s{height:100vh;overflow:auto}p{height:60px;margin:0;border-bottom:1px solid #444}</style><div id=s></div><script type="module">
+if(new URLSearchParams(location.search).get('smooth')==='app') {
+  const {installWheelScrolling}=await import('/src/lib/wheel-scrolling.ts');installWheelScrolling();
+}
+const s=document.querySelector('#s');s.innerHTML=Array.from({length:2000},(_,i)=>'<p>Mock row '+i+'</p>').join('');
+let frames=[],wheels=[],scrolls=[],start;
+s.addEventListener('wheel',e=>wheels.push([performance.now(),e.deltaY,e.deltaMode,e.isTrusted]),{passive:true});
+s.addEventListener('scroll',()=>scrolls.push([performance.now(),s.scrollTop]),{passive:true});
+requestAnimationFrame(function tick(t){start??=t;frames.push([t,s.scrollTop]);if(t-start<6000)requestAnimationFrame(tick);else {
+ const result=JSON.stringify({frames,wheels,scrolls,ua:navigator.userAgent,viewport:[innerWidth,innerHeight]});
+ if(window.webkit?.messageHandlers?.probe)window.webkit.messageHandlers.probe.postMessage(result);
+ else console.log('PROBE:'+result);
+}});
+</script>

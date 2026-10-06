@@ -1,0 +1,238 @@
+{
+  "date": "2026-10-06",
+  "deterministic_5ms_frames": {
+    "alternating29_31": {
+      "before": {
+        "inputCount": 40,
+        "total": 620,
+        "finalError": 0,
+        "lastInput": 1169,
+        "inputEndBacklog": 30.333984375,
+        "settleTailMs": 31,
+        "max5msSpeedChange": -0.7045329275762924,
+        "worstSpeedTime": 60,
+        "peakSpeed": 1.4661438613242352,
+        "peakSpeedTime": 45,
+        "maxAccelerationJump": 0.19144176583333009,
+        "maxVelocityDiscontinuity": 0
+      },
+      "candidate": {
+        "inputCount": 40,
+        "total": 620,
+        "finalError": 0,
+        "lastInput": 1169,
+        "inputEndBacklog": 46.456230966632575,
+        "settleTailMs": 121,
+        "max5msSpeedChange": 0.05103089725380415,
+        "worstSpeedTime": 40,
+        "peakSpeed": 0.5311524241431471,
+        "peakSpeedTime": 170,
+        "maxAccelerationJump": 0.009790408089327966,
+        "maxVelocityDiscontinuity": 0
+      }
+    },
+    "sparse80": {
+      "before": {
+        "inputCount": 12,
+        "total": 186,
+        "finalError": 0,
+        "lastInput": 880,
+        "inputEndBacklog": 28.856457176494587,
+        "settleTailMs": 200,
+        "max5msSpeedChange": 0.011043749999953433,
+        "worstSpeedTime": 10,
+        "peakSpeed": 0.20039137492494774,
+        "peakSpeedTime": 285,
+        "maxAccelerationJump": 0.002325,
+        "maxVelocityDiscontinuity": 0
+      },
+      "candidate": {
+        "inputCount": 12,
+        "total": 186,
+        "finalError": 0,
+        "lastInput": 880,
+        "inputEndBacklog": 28.856457176494587,
+        "settleTailMs": 200,
+        "max5msSpeedChange": 0.011043749999953433,
+        "worstSpeedTime": 10,
+        "peakSpeed": 0.20039137492494774,
+        "peakSpeedTime": 285,
+        "maxAccelerationJump": 0.002325,
+        "maxVelocityDiscontinuity": 0
+      }
+    },
+    "mixed20": {
+      "before": {
+        "inputCount": 40,
+        "total": 1162.5,
+        "finalError": 0,
+        "lastInput": 780,
+        "inputEndBacklog": 127.5227839141553,
+        "settleTailMs": 200,
+        "max5msSpeedChange": 2.4953754691650833,
+        "worstSpeedTime": 170,
+        "peakSpeed": 6.113472575030391,
+        "peakSpeedTime": 175,
+        "maxAccelerationJump": 0.7563725809769627,
+        "maxVelocityDiscontinuity": 1.1102230246251565e-16
+      },
+      "candidate": {
+        "inputCount": 40,
+        "total": 1162.5,
+        "finalError": 0,
+        "lastInput": 780,
+        "inputEndBacklog": 151.37034329565904,
+        "settleTailMs": 80,
+        "max5msSpeedChange": 0.4507216897553008,
+        "worstSpeedTime": 150,
+        "peakSpeed": 2.6612946855133486,
+        "peakSpeedTime": 820,
+        "maxAccelerationJump": 0.10887718005087896,
+        "maxVelocityDiscontinuity": 0
+      }
+    },
+    "burst5": {
+      "before": {
+        "inputCount": 250,
+        "total": 3875,
+        "finalError": 0,
+        "lastInput": 1245,
+        "inputEndBacklog": 64.74033149171191,
+        "settleTailMs": 30,
+        "max5msSpeedChange": 0.7879098229594093,
+        "worstSpeedTime": 15,
+        "peakSpeed": 3.156207073828045,
+        "peakSpeedTime": 55,
+        "maxAccelerationJump": 0.20275614583333051,
+        "maxVelocityDiscontinuity": 0
+      },
+      "candidate": {
+        "inputCount": 250,
+        "total": 3875,
+        "finalError": 0,
+        "lastInput": 1245,
+        "inputEndBacklog": 64.74033149171191,
+        "settleTailMs": 30,
+        "max5msSpeedChange": 0.7879098229594093,
+        "worstSpeedTime": 15,
+        "peakSpeed": 3.156207073828045,
+        "peakSpeedTime": 55,
+        "maxAccelerationJump": 0.20275614583333051,
+        "maxVelocityDiscontinuity": 0
+      }
+    },
+    "reversalSlow": {
+      "before": {
+        "inputCount": 6,
+        "total": 0,
+        "finalError": 0,
+        "lastInput": 400,
+        "inputEndBacklog": -26.30357977235508,
+        "settleTailMs": 200,
+        "max5msSpeedChange": -0.16440288329577016,
+        "worstSpeedTime": 245,
+        "peakSpeed": 0.19419422380015022,
+        "peakSpeedTime": 215,
+        "maxAccelerationJump": 0.002325,
+        "maxVelocityDiscontinuity": 0.16131657984000458
+      },
+      "candidate": {
+        "inputCount": 6,
+        "total": 0,
+        "finalError": 0,
+        "lastInput": 400,
+        "inputEndBacklog": -26.30357977235508,
+        "settleTailMs": 200,
+        "max5msSpeedChange": -0.16440288329577016,
+        "worstSpeedTime": 245,
+        "peakSpeed": 0.19419422380015022,
+        "peakSpeedTime": 215,
+        "maxAccelerationJump": 0.002325,
+        "maxVelocityDiscontinuity": 0.16131657984000458
+      }
+    },
+    "reversalFast": {
+      "before": {
+        "inputCount": 60,
+        "total": 0,
+        "finalError": 0,
+        "lastInput": 295,
+        "inputEndBacklog": -64.73814651617977,
+        "settleTailMs": 30,
+        "max5msSpeedChange": -1.7098924539830478,
+        "worstSpeedTime": 160,
+        "peakSpeed": 3.156207073828045,
+        "peakSpeedTime": 55,
+        "maxAccelerationJump": 0.31099563830237403,
+        "maxVelocityDiscontinuity": 0.37698881384101224
+      },
+      "candidate": {
+        "inputCount": 60,
+        "total": 0,
+        "finalError": 0,
+        "lastInput": 295,
+        "inputEndBacklog": -64.73814651617977,
+        "settleTailMs": 30,
+        "max5msSpeedChange": -1.7098924539830478,
+        "worstSpeedTime": 160,
+        "peakSpeed": 3.156207073828045,
+        "peakSpeedTime": 55,
+        "maxAccelerationJump": 0.31099563830237403,
+        "maxVelocityDiscontinuity": 0.37698881384101224
+      }
+    },
+    "strongReversal": {
+      "before": {
+        "inputCount": 2,
+        "total": 0,
+        "finalError": 0,
+        "lastInput": 100,
+        "inputEndBacklog": -62.51954766753988,
+        "settleTailMs": 200,
+        "max5msSpeedChange": 0.08931363952506217,
+        "worstSpeedTime": 10,
+        "peakSpeed": 0.9346409689122084,
+        "peakSpeedTime": 100,
+        "maxAccelerationJump": 0.0279761841453487,
+        "maxVelocityDiscontinuity": 1.1102230246251565e-16
+      },
+      "candidate": {
+        "inputCount": 2,
+        "total": 0,
+        "finalError": 0,
+        "lastInput": 100,
+        "inputEndBacklog": -62,
+        "settleTailMs": 200,
+        "max5msSpeedChange": 0.08834999999999127,
+        "worstSpeedTime": 10,
+        "peakSpeed": 0.9292249999998603,
+        "peakSpeedTime": 100,
+        "maxAccelerationJump": 0.0279,
+        "maxVelocityDiscontinuity": 0
+      }
+    }
+  },
+  "native_precision": {
+    "total": 992,
+    "height": 1390,
+    "offset": 992,
+    "frontend": true,
+    "native": false,
+    "prevented": 64,
+    "validation": {
+      "input_frames": 64,
+      "input_value120": 15,
+      "gtk_legacy_duplicate_frames": 8,
+      "observed_dom_events": 64,
+      "all_trusted": true,
+      "all_cancelable": true,
+      "duplicates_suppressed": true,
+      "distance_preserved": true,
+      "production_module": "src-tauri/src/precise_wheel.rs",
+      "scroll_mode": "frontend",
+      "no_javascript_scroll_writes": false,
+      "fractional_paint_measured": false
+    }
+  },
+  "limitations": "Deterministic curves use floating-point positions. Native precision verifies wheel events and DOM travel, not rendered pixels or physical mouse feel."
+}

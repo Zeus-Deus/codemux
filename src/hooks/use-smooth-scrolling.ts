@@ -1,52 +1,22 @@
-/**
- * Smooth (animated) wheel scrolling for the Linux WebKitGTK webview.
- *
- * The webview ships with kinetic wheel animation off by default: the animation
- * runs on a fixed timeline, so a high-resolution wheel that emits many small
- * deltas per flick queues up animations and the page ends up moving *slower*
- * the faster you scroll. Users who prefer the animated feel can turn it back
- * on in Settings → Appearance; the preference lives in the machine-local
- * settings store (`appearance.smooth_scrolling`) and is pushed to the webview
- * through the `set_smooth_scrolling` command. No effect off Linux.
- */
-import { useEffect, useRef } from "react";
+/** Default short wheel glides in the Linux desktop webview. */
+import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-
 import { isRemoteClient } from "@/components/remote/is-remote-client";
-import { useSettingsStore, selectSmoothScrolling } from "@/stores/settings-store";
+import { isLinuxWebKitGtk } from "@/lib/webkit";
+import { installWheelScrolling } from "@/lib/wheel-scrolling";
 
-/**
- * Push the preference to the webview. Failures are logged, never thrown — the
- * command is Linux-only and absent from the dev mock, and a webview setting is
- * never worth breaking a render or a settings write over.
- */
-export async function applySmoothScrolling(enabled: boolean): Promise<void> {
-  try {
-    await invoke<void>("set_smooth_scrolling", { enabled });
-  } catch (err) {
-    console.error("[smooth-scrolling] set_smooth_scrolling failed:", err);
-  }
-}
-
-/**
- * Boot hook: once the machine-local settings have loaded, re-apply a persisted
- * "on" to the fresh webview. Off is the native default, so it needs no call.
- * Runs at most once per app session — later changes are pushed by the Settings
- * toggle itself.
- *
- * Desktop only: on the web remote client the command would reconfigure the
- * *desktop host's* webview, not the browser the user is scrolling in.
- */
 export function useSmoothScrollingInit(): void {
-  const loaded = useSettingsStore((s) => s.loaded);
-  const enabled = useSettingsStore(selectSmoothScrolling);
-  const applied = useRef(false);
-
   useEffect(() => {
-    if (isRemoteClient()) return;
-    if (!loaded || applied.current) return;
-    applied.current = true;
-    if (!enabled) return;
-    void applySmoothScrolling(true);
-  }, [loaded, enabled]);
+    // Other platforms and remote browsers own their native wheel animation.
+    // WebKit's animation stays off in the backend; the app handles short
+    // wheel glides without requiring a setting or waiting for persisted data.
+    if (isRemoteClient() || !isLinuxWebKitGtk(navigator.userAgent)) return;
+    let live = true;
+    let precise = false;
+    const stop = installWheelScrolling(document, () => precise);
+    void invoke<boolean>("get_precise_wheel_available").then((available) => {
+      if (live) precise = available === true;
+    }).catch(() => { /* Older backends and the dev mock keep the baseline. */ });
+    return () => { live = false; stop(); };
+  }, []);
 }

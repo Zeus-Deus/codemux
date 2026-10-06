@@ -139,8 +139,7 @@ function App() {
   useTerminalCwdPoll();
   useAutomationFireToast();
   useActiveWorkspacePersistenceErrors();
-  // Re-apply a persisted "smooth scrolling: on" to the fresh webview once the
-  // machine-local settings have loaded. Off is the native default — no-op.
+  // Default short Linux wheel glides; native WebKit animation stays off.
   useSmoothScrollingInit();
   // Ask the backend which renderer it ended up on, so composited-only UI
   // effects (the transcript edge-fade) switch themselves off when the webview

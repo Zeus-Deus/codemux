@@ -1,0 +1,273 @@
+{
+  "webkit": "2.52.6",
+  "gtk_height": 1390,
+  "temporary_source": "TOUCHPAD",
+  "samples": [
+    {
+      "deltaY": 0.12400000542402267,
+      "wheelDeltaY": 0,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 0.001
+    },
+    {
+      "deltaY": 1.1159999370574951,
+      "wheelDeltaY": -1,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 0.009
+    },
+    {
+      "deltaY": 9.920000076293945,
+      "wheelDeltaY": -9,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 0.08
+    },
+    {
+      "deltaY": 15.5,
+      "wheelDeltaY": -15,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 0.125
+    },
+    {
+      "deltaY": 15.624000549316406,
+      "wheelDeltaY": -15,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 0.126
+    },
+    {
+      "deltaY": 62,
+      "wheelDeltaY": -60,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 0.5
+    },
+    {
+      "deltaY": 153.0159912109375,
+      "wheelDeltaY": -148,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 1.234
+    },
+    {
+      "deltaY": 992,
+      "wheelDeltaY": -960,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": 8
+    },
+    {
+      "deltaY": -0.12400000542402267,
+      "wheelDeltaY": 0,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": -0.001
+    },
+    {
+      "deltaY": -1.1159999370574951,
+      "wheelDeltaY": 1,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": -0.009
+    },
+    {
+      "deltaY": -15.5,
+      "wheelDeltaY": 15,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": -0.125
+    },
+    {
+      "deltaY": -153.0159912109375,
+      "wheelDeltaY": 148,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": true,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "mouse",
+      "raw_delta": -1.234
+    },
+    {
+      "deltaY": 0.04000000283122063,
+      "wheelDeltaY": 0,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 0.001
+    },
+    {
+      "deltaY": 0.35999998450279236,
+      "wheelDeltaY": -1,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 0.009
+    },
+    {
+      "deltaY": 3.1999998092651367,
+      "wheelDeltaY": -9,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 0.08
+    },
+    {
+      "deltaY": 5,
+      "wheelDeltaY": -15,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 0.125
+    },
+    {
+      "deltaY": 5.039999961853027,
+      "wheelDeltaY": -15,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 0.126
+    },
+    {
+      "deltaY": 20,
+      "wheelDeltaY": -60,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 0.5
+    },
+    {
+      "deltaY": 49.36000061035156,
+      "wheelDeltaY": -148,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 1.234
+    },
+    {
+      "deltaY": 320,
+      "wheelDeltaY": -960,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": 8
+    },
+    {
+      "deltaY": -0.04000000283122063,
+      "wheelDeltaY": 0,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": -0.001
+    },
+    {
+      "deltaY": -0.35999998450279236,
+      "wheelDeltaY": 1,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": -0.009
+    },
+    {
+      "deltaY": -5,
+      "wheelDeltaY": 15,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": -0.125
+    },
+    {
+      "deltaY": -49.36000061035156,
+      "wheelDeltaY": 148,
+      "deltaMode": 0,
+      "isTrusted": true,
+      "mouse": false,
+      "innerHeight": 1390,
+      "devicePixelRatio": 1,
+      "source": "touchpad",
+      "raw_delta": -1.234
+    }
+  ],
+  "expected_count": 24,
+  "actual_count": 24
+}

@@ -1,0 +1,116 @@
+Wheel scrolling research — 2026-10-05
+====================================
+
+Historical report
+-----------------
+The findings below describe the October5 fixed30ms candidate. The October6
+adaptive mouse-only pacing candidate and its measurements are documented in
+precision-results/adaptive-README.txt. Native interpolation remains diagnostic.
+The latest cadence revision is documented in precision-results/cadence-README.txt.
+
+Conclusion
+----------
+The input recovery is supported by an independently shipped Firefox fix. The
+remaining microsteps need animation/painting work, not another scroll-distance
+multiplier. Keep the accepted baseline commit 8ef3cca0 intact. The current dev
+app still uses the short-filter candidate; this research did not change its
+production animation policy or desktop configuration.
+
+Confirmed precedent
+-------------------
+Mozilla bug 1836886 describes GTK3/Wayland ignoring fine mouse-wheel movements
+while trackpads and Chromium/Electron work. It was resolved in Firefox 133.
+Firefox owns a newer Wayland pointer on the GTK display, receives axis_value120,
+normalizes by 120, and forwards wheel-source fractions to its widget input.
+This corroborates CodeMux's native input bridge, including its normalization.
+https://bugzilla.mozilla.org/show_bug.cgi?id=1836886
+https://github.com/mozilla/gecko-dev/blob/master/widget/gtk/nsWaylandDisplay.cpp
+
+A G502 user independently reports that Firefox 133 fixed the free-wheel issue.
+That report is corroboration, not proof of CodeMux's animation behavior.
+https://forum.manjaro.org/t/issue-with-high-resolution-scrolling-mouse-logitech-g502-in-firefox-and-xwayland/166720
+
+Why the remaining steps are plausible
+------------------------------------
+Current Chromium mouse-wheel easing uses inverse-delta duration: small movement
+starts around 200ms; large movement approaches 100ms. Retargeting bounds duration
+using current velocity. This is upstream source, not a measurement of t3code's
+particular Electron build. Chromium developers also describe the tradeoff that
+shorter animation can look jumpier for slowly spaced input.
+https://github.com/chromium/chromium/blob/main/cc/animation/scroll_offset_animation_curve_factory.cc
+https://github.com/chromium/chromium/blob/main/cc/animation/scroll_offset_animation_curve.cc
+https://groups.google.com/a/chromium.org/g/chromium-dev/c/UhE1rxzhkkk
+
+WebKit's JavaScript Element.scrollTop setter accepts an integer; scrollTo also
+constructs integer coordinates. CodeMux's fractional carry preserves distance
+but cannot make those setters paint fractional positions. Fractional CSSOM
+support remains an open upstream issue. WebKit's GTK native scrolling path
+uses floating positions through its coordinated compositor instead.
+https://github.com/WebKit/WebKit/blob/main/Source/WebCore/dom/Element.cpp
+https://bugs.webkit.org/show_bug.cgi?id=188045
+Exact installed-engine native source and limits are in
+precision-results/native-engine-README.txt.
+
+WebKit bug 258926 reports a high-resolution Logitech wheel feeling delayed and
+continuing after release with native smooth scrolling enabled. Disabling it
+helps that reporter. It concerns GTK4, so it is evidence of an animation failure
+mode rather than proof of our GTK3 mechanism. Its discussion also warns that
+fine and whole wheel deltas can mix; a small delta alone does not identify a
+high-resolution device.
+https://bugs.webkit.org/show_bug.cgi?id=258926
+
+New controlled measurements
+---------------------------
+The passive native probe receives 64 trusted/cancelable 15.5px events, suppresses
+8 legacy duplicates, prevents no events, performs no JS scroll writes, and
+finishes at exactly 992px. Thus the native engine retains fractional accumulated
+distance. Its DOM getter is integer; this is not pixel-level paint verification.
+See precision-results/native-engine.json and native-engine-README.txt.
+
+Using the same mock page, trusted GTK events, 200Hz mode timer, and production
+frontend handler, a ~25.29px isolated input produced:
+  30ms filter: first observed DOM movement at 9ms, last at 34ms, 6 changes.
+  200ms baseline: first movement at 32ms, last at 197ms, 25 changes.
+At 50ms input spacing, the short-filter samples finished by ~36ms and therefore
+paused before the next sample. The baseline remained moving between samples.
+The longer curve also has greater initial delay, so blindly restoring 200ms is
+not established as the correct proportional response.
+See precision-results/research-timing-summary.json and research-*.json.
+These are single-run callback/DOM observations on mock content, not physical
+scanout timings or a subjective smoothness result. Window sizing changed the
+requested 25.4px injection slightly; compare recorded DOM deltas, not nominal
+input. An initial probe failed with a Wayland rendering protocol error; rerunning
+with WEBKIT_DMABUF_RENDERER_FORCE_SHM=1 passed. Both probe windows auto-closed.
+
+Recommended next experiment
+--------------------------
+Preserve recovered fractional input and exact distance. Compare native
+fractional rendering with a continuous velocity-preserving animation against
+JS interpolation. Verify initial response, pauses between samples, reversals,
+fast input, final travel, nested scroll ownership, and reduced-motion handling.
+Any native interpolation must preserve input source and ownership; pretending
+a mouse is a trackpad changes gain and behavior. The actual native app's
+capability-command response still needs direct runtime confirmation before
+assuming that its frontend has selected the 30ms branch.
+
+Firsthand descriptions matching the user
+---------------------------------------
+These users distinguish proportionally small motion from smooth animation of
+large steps, and report smooth trackpads or other apps on the same system:
+https://www.reddit.com/r/firefox/comments/1ep37t3/scrolling_is_too_discrete/
+https://www.reddit.com/r/LogitechG/comments/z9urca/is_there_no_way_to_get_real_smooth_scrolling_with/
+https://discourse.gnome.org/t/better-support-for-an-inertia-wheel-mouse-smooth-scroll/34007
+They establish that the symptom is recognizable, not which fix fits CodeMux.
+
+Hardware resolution
+-------------------
+High-resolution wheel packets are finite fractions of a notch, often 4 or 8
+packets per normal wheel click. Free-spinning mechanics do not imply a
+continuous coordinate stream. Apps must retain those fractions and animate
+between them appropriately. Do not process both legacy and fine event streams.
+https://wayland.freedesktop.org/libinput/doc/latest/wheel-api.html
+
+No system-driver workaround is indicated by the measured CodeMux input:
+fine wheel packets are already present. Disabling high-resolution mode or
+changing compositor scroll gain would hide that precision rather than address
+the remaining animation behavior for all users.
