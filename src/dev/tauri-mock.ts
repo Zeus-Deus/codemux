@@ -6672,6 +6672,12 @@ function routePlugin(cmd: string, args: Args): unknown {
   if (cmd === "plugin:app|identifier") return "dev.codemux.mock";
   if (cmd.startsWith("plugin:app|")) return undefined;
 
+  // Path resolution — a fixed fake tree, enough for "Show log file".
+  if (cmd === "plugin:path|resolve_directory") {
+    return "/home/mock/.local/share/dev.codemux.mock/logs";
+  }
+  if (cmd === "plugin:path|join") return (args.paths as string[]).join("/");
+
   // Process control — log the intent, do nothing.
   if (cmd.startsWith("plugin:process|")) {
     console.log(`[dev mock] ${cmd} (no-op in browser)`);

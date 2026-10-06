@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, within, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -109,12 +109,15 @@ vi.mock("@/stores/synced-settings-store", () => ({
         git: { default_base_branch: "main" },
         keyboard: { shortcuts: {} },
         notifications: { sound_enabled: true, desktop_enabled: true },
+        session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
+        agent_chat: { checkpoints_enabled: false, background_browser_desktop_viewport: true },
       },
       updateSetting: vi.fn(),
     }),
   selectTerminalCursorStyle: () => "bar",
   selectDefaultEditor: () => "",
   selectDefaultBaseBranch: () => "main",
+  selectBrowserDefaultViewport: () => null,
   selectNotificationSoundEnabled: () => true,
   selectDesktopNotificationsEnabled: () => true,
 }));
@@ -132,6 +135,9 @@ vi.mock("@/tauri/commands", () => ({
   getProjectScripts: vi.fn().mockResolvedValue(null),
   setProjectScripts: vi.fn().mockResolvedValue(undefined),
   getWorkspaceConfig: vi.fn().mockResolvedValue(null),
+  hasCodemuxinclude: vi.fn().mockResolvedValue(false),
+  getBrowserDataSize: vi.fn().mockResolvedValue(0),
+  getPackageFormat: vi.fn().mockResolvedValue("appimage"),
   getPresets: vi.fn().mockResolvedValue({ presets: [], bar_visible: true, default_preset_id: null }),
   setPresetPinned: vi.fn().mockResolvedValue(undefined),
   setPresetBarVisible: vi.fn().mockResolvedValue(undefined),
@@ -203,6 +209,7 @@ vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
 
 import { SettingsView } from "./settings-view";
 import * as commands from "@/tauri/commands";
+import { SETTINGS_SEARCH_ENTRIES } from "@/lib/settings-search";
 
 describe("SettingsPanel", () => {
   beforeEach(() => {
@@ -213,8 +220,9 @@ describe("SettingsPanel", () => {
     render(<SettingsView />);
 
     // Group headers
-    expect(screen.getByText("PERSONAL")).toBeInTheDocument();
-    expect(screen.getByText("EDITOR & WORKFLOW")).toBeInTheDocument();
+    for (const group of ["PERSONAL", "AGENTS", "WORKSPACES", "TOOLS", "SYSTEM"]) {
+      expect(screen.getByText(group)).toBeInTheDocument();
+    }
 
     // Nav items
     expect(screen.getByRole("button", { name: /Account/i })).toBeInTheDocument();
@@ -506,7 +514,6 @@ describe("SettingsPanel — Appearance Agents section", () => {
     openAppearance();
     for (const label of [
       "Typography",
-      "Border radius",
       "Resource monitor",
       "Density",
       "Wrap code in chat",
@@ -516,6 +523,11 @@ describe("SettingsPanel — Appearance Agents section", () => {
     ]) {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
+  });
+
+  it("drops the read-only Border radius row", () => {
+    openAppearance();
+    expect(screen.queryByText("Border radius")).toBeNull();
   });
 });
 
@@ -565,5 +577,108 @@ describe("Settings footer navigation", () => {
     expect(view.getByRole("button", { name: "Unpin from footer" })).toBeInTheDocument();
     view.unmount();
     requestedSection = null;
+  });
+});
+
+// ── Settings search ──
+
+describe("Settings search", () => {
+  beforeEach(() => {
+    cleanup();
+    requestedSection = null;
+    navigationVersion = 0;
+  });
+
+  const searchField = (view: ReturnType<typeof render>) =>
+    view.getByRole("combobox", { name: "Search settings" });
+
+  it("lists matching rows by page and opens the page on Enter", async () => {
+    const view = render(<SettingsView />);
+    fireEvent.change(searchField(view), { target: { value: "orb" } });
+
+    const results = view.getByRole("listbox", { name: "Settings search results" });
+    expect(within(results).getByRole("group", { name: "Appearance" })).toBeInTheDocument();
+    expect(within(results).getByRole("option", { name: /Match the orb to the activity/ }))
+      .toHaveAttribute("aria-selected", "true");
+    // The nav is replaced while searching.
+    expect(view.queryByRole("button", { name: "Account" })).toBeNull();
+
+    fireEvent.keyDown(searchField(view), { key: "Enter" });
+
+    expect(view.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
+    expect(searchField(view)).toHaveValue("");
+    // The row search named is lit once the page has painted.
+    await waitFor(() =>
+      expect(
+        view.getByText("Match the orb to the activity").closest("[data-settings-row]"),
+      ).toHaveAttribute("data-settings-flash"),
+    );
+    view.unmount();
+  });
+
+  it("moves through results with the arrow keys", () => {
+    const view = render(<SettingsView />);
+    fireEvent.change(searchField(view), { target: { value: "cursor" } });
+    const options = () => view.getAllByRole("option");
+    expect(options()[0]).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(searchField(view), { key: "ArrowDown" });
+    expect(options()[1]).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(searchField(view), { key: "ArrowUp" });
+    fireEvent.keyDown(searchField(view), { key: "ArrowUp" });
+    expect(options()[options().length - 1]).toHaveAttribute("aria-selected", "true");
+    view.unmount();
+  });
+
+  it("says so when nothing matches, and Escape clears the query", () => {
+    const view = render(<SettingsView />);
+    fireEvent.change(searchField(view), { target: { value: "zzzz" } });
+    expect(view.getByRole("status")).toHaveTextContent("No settings match");
+    fireEvent.keyDown(searchField(view), { key: "Escape" });
+    expect(searchField(view)).toHaveValue("");
+    expect(view.getByRole("button", { name: "Account" })).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("focuses the field on Ctrl+F, and on / outside a text field", () => {
+    const view = render(<SettingsView />);
+    const field = searchField(view);
+
+    fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    expect(field).toHaveFocus();
+
+    field.blur();
+    fireEvent.keyDown(document.body, { key: "/" });
+    expect(field).toHaveFocus();
+
+    // "/" typed into another field is text, not a shortcut.
+    const other = document.createElement("input");
+    document.body.appendChild(other);
+    other.focus();
+    fireEvent.keyDown(other, { key: "/" });
+    expect(other).toHaveFocus();
+    other.remove();
+    view.unmount();
+  });
+
+  it("finds every indexed row on the page it points at", async () => {
+    // The index stands in for pages that are not rendered, so a renamed row
+    // must be renamed here too or search lands on the top of the page.
+    const view = render(<SettingsView />);
+    const sections = new Set(SETTINGS_SEARCH_ENTRIES.map((entry) => entry.section));
+    for (const section of sections) {
+      requestedSection = section;
+      navigationVersion++;
+      view.rerender(<SettingsView />);
+      for (const entry of SETTINGS_SEARCH_ENTRIES.filter((e) => e.section === section)) {
+        // Some pages fill in after an async load (Presets).
+        await waitFor(() =>
+          expect(
+            view.queryAllByText(entry.label, { exact: true }).length,
+            `${section} → ${entry.label}`,
+          ).toBeGreaterThan(0),
+        );
+      }
+    }
+    view.unmount();
   });
 });

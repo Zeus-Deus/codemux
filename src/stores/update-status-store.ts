@@ -36,6 +36,11 @@ interface UpdateStatusStore {
   installAndRestart: (() => void) | null;
   /** Web only: ask the desktop to run its update + restart flow. */
   requestDesktopUpdate: (() => void) | null;
+  /** Desktop only: run a check now instead of waiting for the next poll. */
+  checkNow: (() => void) | null;
+  /** When the last check finished and whether it reached the update server,
+   *  so "up to date" is only claimed after a check actually said so. */
+  lastCheck: { at: number; ok: boolean } | null;
   publish: (
     snapshot: Pick<
       UpdateStatusStore,
@@ -46,6 +51,8 @@ interface UpdateStatusStore {
       | "startDownload"
       | "installAndRestart"
       | "requestDesktopUpdate"
+      | "checkNow"
+      | "lastCheck"
     >,
   ) => void;
 }
@@ -59,6 +66,8 @@ const INITIAL = {
   startDownload: null,
   installAndRestart: null,
   requestDesktopUpdate: null,
+  checkNow: null,
+  lastCheck: null,
 };
 
 export const useUpdateStatusStore = create<UpdateStatusStore>((set) => ({

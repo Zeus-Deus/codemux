@@ -267,6 +267,8 @@ describe("AppMenuFooter — update strip", () => {
       startDownload: null,
       installAndRestart: null,
       requestDesktopUpdate: null,
+      checkNow: null,
+      lastCheck: null,
       ...overrides,
     });
   }

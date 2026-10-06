@@ -1008,6 +1008,33 @@ body.pane-resizing iframe {
   }
 }
 
+/* A Settings row that search just landed on: lit with the selected fill, then
+ * fading out, so the eye finds it after the scroll. The box-shadow widens the
+ * fill past the row's text without shifting its layout. Reduced motion keeps
+ * the highlight but drops the fade; the attribute is removed after ~900ms. */
+@keyframes cm-settings-flash {
+  from {
+    background-color: var(--surface-3);
+    box-shadow: 0 0 0 0.5rem var(--surface-3);
+  }
+  to {
+    background-color: transparent;
+    box-shadow: 0 0 0 0.5rem transparent;
+  }
+}
+[data-settings-flash] {
+  /* The `rounded-md` step of the radius ladder. */
+  border-radius: calc(var(--radius) - 2px);
+  animation: cm-settings-flash 0.8s ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-settings-flash] {
+    animation: none;
+    background-color: var(--surface-3);
+    box-shadow: 0 0 0 0.5rem var(--surface-3);
+  }
+}
+
 /* Live-status text shimmer for the agent-chat streaming marker
  * ("Working…", "Running <tool>…") and the reasoning block header while
  * thinking (design D9 / D5). A soft light band sweeps across the glyphs
