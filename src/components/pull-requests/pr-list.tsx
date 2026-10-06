@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { resolveProvider } from "@/lib/source-control";
+import { withTimeFormat } from "@/lib/time-format";
 import {
   btnCard,
   shortAge,
@@ -49,10 +50,10 @@ const EMPTY_MOVED: Set<string> = new Set();
 /** `14:12` — the user's own clock, because the only question it answers
  *  is "when can I look again". */
 export function clockTime(epochMs: number): string {
-  return new Date(epochMs).toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return new Date(epochMs).toLocaleTimeString(
+    undefined,
+    withTimeFormat({ hour: "2-digit", minute: "2-digit" }),
+  );
 }
 
 const STATE_LABEL: Record<PrStateFilter, string> = {

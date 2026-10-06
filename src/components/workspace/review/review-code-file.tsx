@@ -12,6 +12,7 @@ import {
   type PrDiffFile,
 } from "@/lib/pr-diff";
 import { groupDigits, tzBody, tzMeta, tzMetaNum } from "./review-ui";
+import { getDiffFileState } from "@/stores/settings-store";
 import type { DiffLayout } from "./pr-drafts";
 
 interface Props {
@@ -45,7 +46,11 @@ export function ReviewCodeFile({
   pendingNotes,
   forceOpen = false,
 }: Props) {
-  const [manuallyCollapsed, setManuallyCollapsed] = useState(false);
+  // Settings → Git → Diffs decides whether files start open; the header
+  // toggle still flips each one.
+  const [manuallyCollapsed, setManuallyCollapsed] = useState(
+    () => getDiffFileState() === "collapsed",
+  );
   // Numbers, not vibes: a 2,000-line file is opened on request, not by
   // default — otherwise the file you came to read is ten screens down.
   const [loadedAnyway, setLoadedAnyway] = useState(false);

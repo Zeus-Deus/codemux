@@ -41,6 +41,7 @@ import {
   useSettingsStore,
   selectSidebarShowGitStats,
   selectSidebarAutoSettleDays,
+  getTimeFormat,
 } from "@/stores/settings-store";
 import { formatElapsed } from "@/stores/sidebar-density-store";
 import { getWorkspaceProviders, getWorkspaceStatus } from "@/lib/pane-status";
@@ -2317,7 +2318,7 @@ export function SidebarInbox() {
             {canBulkSnooze && (
               <DropdownMenuSub
                 onOpenChange={(open) => {
-                  if (open) setBulkSnoozePresets(computeSnoozePresets(Date.now()));
+                  if (open) setBulkSnoozePresets(computeSnoozePresets(Date.now(), getTimeFormat()));
                 }}
               >
                 <DropdownMenuSubTrigger className="text-label">

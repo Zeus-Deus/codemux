@@ -81,6 +81,7 @@ import type {
   TranscriptSlot,
 } from "./transcript-slots";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { withTimeFormat } from "@/lib/time-format";
 
 interface Props {
   messages: ChatViewItem[];
@@ -1618,7 +1619,10 @@ function SessionStartMarker({ startedAt }: { startedAt?: number }) {
 function formatSessionStart(startedAt?: number): string {
   if (startedAt == null) return "Session started";
   const d = new Date(startedAt);
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = d.toLocaleTimeString(
+    [],
+    withTimeFormat({ hour: "2-digit", minute: "2-digit" }),
+  );
   const sameDay = d.toDateString() === new Date().toDateString();
   const datePart = sameDay
     ? "Today"

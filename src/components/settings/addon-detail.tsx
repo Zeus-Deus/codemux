@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { addonInvoke } from "@/lib/addons/bridge";
 import { refreshAddons } from "@/lib/addons/platform";
+import { withTimeFormat } from "@/lib/time-format";
 import {
   addonMessage,
   type AddonCredentialState,
@@ -196,7 +197,7 @@ const LEVEL_LABELS: Record<(typeof LEVELS)[number], [string, string]> = {
   log: ["log", "logs"],
   debug: ["debug", "debug"],
 };
-const time = (at: number) => new Date(at).toLocaleTimeString();
+const time = (at: number) => new Date(at).toLocaleTimeString(undefined, withTimeFormat());
 /** Bounded log activity: counts, levels, sizes and times, never text. */
 function Diagnostics({ id }: { id: string }) {
   const [value, setValue] = useState<AddonDiagnostics | null>(null);
