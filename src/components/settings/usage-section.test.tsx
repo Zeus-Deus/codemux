@@ -16,15 +16,22 @@ vi.mock("@/tauri/commands", () => ({
   usageSummary: vi.fn(),
   usageExportCsv: vi.fn(),
   usageScanProviderHistory: vi.fn(),
+  usageRefreshQuota: vi.fn(),
+  usagePriceOverrides: vi.fn(),
+  usageSetPriceOverride: vi.fn(),
 }));
 
 import {
   usageExportCsv,
+  usagePriceOverrides,
+  usageRefreshQuota,
   usageScanProviderHistory,
+  usageSetPriceOverride,
   usageSummary,
 } from "@/tauri/commands";
-import type { PlanUsageWindow, UsageSummary } from "@/tauri/commands";
+import type { FlatModelUsage, PlanUsageWindow, UsageSummary } from "@/tauri/commands";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   UsageSection,
   formatMoney,
@@ -35,6 +42,43 @@ import {
 } from "./usage-section";
 
 afterEach(() => cleanup());
+
+beforeEach(() => {
+  // Period/metric/view choices persist per device; tests start clean.
+  localStorage.clear();
+  vi.mocked(usageRefreshQuota).mockReset();
+  vi.mocked(usageRefreshQuota).mockResolvedValue({
+    quota: {},
+    statuses: [],
+    refreshed_at_ms: 0,
+  });
+  vi.mocked(usagePriceOverrides).mockReset();
+  vi.mocked(usagePriceOverrides).mockResolvedValue({});
+  vi.mocked(usageSetPriceOverride).mockReset();
+});
+
+function flatModel(overrides: Partial<FlatModelUsage>): FlatModelUsage {
+  return {
+    provider: "codex",
+    model: "gpt-5-codex",
+    tokens: 0,
+    cost_usd: 0,
+    priced: true,
+    provider_reported: false,
+    price_overridden: false,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    reasoning_tokens: 0,
+    unpriced_tokens: 0,
+    session_count: 1,
+    category_cost: { input: 0, output: 0, cache_read: 0, cache_write: 0, unsplit: 0 },
+    rates: null,
+    buckets: Array.from({ length: 7 }, () => ({ tokens: 0, cost_usd: 0 })),
+    ...overrides,
+  };
+}
 
 const DAY = 86_400_000;
 const START = 1_800_000_000_000;
@@ -114,29 +158,48 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
       cache_savings_usd: 41.2,
       cache_savings_multiplier: 3.2,
     },
+    category_cost: {
+      input: 7.0,
+      output: 17.5,
+      cache_read: 2.96,
+      cache_write: 2.5,
+      unsplit: 0,
+    },
     confidence: {
       provider_reported_share: 0.09,
       table_priced_share: 0.91,
+      override_priced_share: 0,
       unpriced_token_share: 0.04,
       cache_savings_usd: 41.2,
     },
     models: [
-      {
+      flatModel({
         provider: "codex",
         model: "gpt-5-codex",
         tokens: 2_700_000,
         cost_usd: 19.24,
-        priced: true,
-        provider_reported: false,
-      },
-      {
+        input_tokens: 500_000,
+        output_tokens: 200_000,
+        cache_read_tokens: 1_900_000,
+        cache_write_tokens: 100_000,
+        session_count: 4,
+        rates: { input: 1.25, output: 10, cache_read: 0.125, cache_write: 0 },
+        category_cost: { input: 0.63, output: 2.0, cache_read: 0.24, cache_write: 0, unsplit: 16.37 },
+        buckets: Array.from({ length: 7 }, (_, i) => ({
+          tokens: i === 6 ? 2_700_000 : 0,
+          cost_usd: i === 6 ? 19.24 : 0,
+        })),
+      }),
+      flatModel({
         provider: "opencode",
         model: "openrouter/kimi-k2",
         tokens: 340_000,
         cost_usd: 0,
         priced: false,
-        provider_reported: false,
-      },
+        unpriced_tokens: 340_000,
+        input_tokens: 240_000,
+        output_tokens: 100_000,
+      }),
     ],
     quota: {},
     synced_at_ms: START,
@@ -187,7 +250,7 @@ describe("UsageSection", () => {
   });
 
   it("renders the simple headline totals", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("Estimated cost")).toBeInTheDocument();
     });
@@ -202,7 +265,7 @@ describe("UsageSection", () => {
   });
 
   it("defaults to 7 days and refetches when the period changes", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageSummary).toHaveBeenCalledWith("7d"));
 
     await userEvent.click(screen.getByRole("radio", { name: "30 days" }));
@@ -232,7 +295,7 @@ describe("UsageSection", () => {
       }),
     );
 
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(
         screen.getByText(/Yesterday 13:00 – Today 12:00/),
@@ -241,7 +304,7 @@ describe("UsageSection", () => {
   });
 
   it("shows a tooltip with per-provider figures for the hovered bucket", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByRole("img", { name: /Estimated cost per bucket/ })).toBeInTheDocument();
     });
@@ -266,7 +329,7 @@ describe("UsageSection", () => {
   });
 
   it("switches the chart between cost and tokens", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByRole("img", { name: /Estimated cost per bucket/ })).toBeInTheDocument();
     });
@@ -282,7 +345,7 @@ describe("UsageSection", () => {
   });
 
   it("labels lane costs as API equivalents", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getAllByText("Provider history").length).toBeGreaterThan(0);
     });
@@ -311,7 +374,7 @@ describe("UsageSection", () => {
       }),
     );
 
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     expect((await screen.findAllByText("Grok")).length).toBeGreaterThan(0);
     expect(screen.getByAltText("Grok")).toHaveAttribute(
       "data-provider",
@@ -320,7 +383,7 @@ describe("UsageSection", () => {
   });
 
   it("reveals per-model rows only when a lane is expanded", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     // "Claude Code" appears in both the legend and the lane header.
     await waitFor(() => {
       expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0);
@@ -364,7 +427,7 @@ describe("UsageSection", () => {
         },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(
         screen.getByText("No agent activity in this period."),
@@ -375,7 +438,7 @@ describe("UsageSection", () => {
 
   it("surfaces a load failure inline", async () => {
     vi.mocked(usageSummary).mockRejectedValue(new Error("db locked"));
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText(/Failed to load usage/)).toBeInTheDocument();
     });
@@ -388,7 +451,7 @@ describe("UsageSection", () => {
     const revokeObjectURL = vi.fn();
     Object.assign(URL, { createObjectURL, revokeObjectURL });
 
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageSummary).toHaveBeenCalled());
 
     await userEvent.click(screen.getByRole("radio", { name: "30 days" }));
@@ -471,7 +534,7 @@ describe("plan quota meters", () => {
         },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("41%")).toBeInTheDocument();
     });
@@ -483,7 +546,7 @@ describe("plan quota meters", () => {
   });
 
   it("leaves a lane with no quota exactly as before", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getAllByText("Provider history").length).toBeGreaterThan(0);
     });
@@ -506,7 +569,7 @@ describe("plan quota meters", () => {
         },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getAllByText("API equivalent").length).toBeGreaterThan(0);
     });
@@ -523,13 +586,14 @@ describe("composition, breakdown and cost confidence", () => {
   });
 
   it("renders the five composition figures with their sub-notes", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("Processed")).toBeInTheDocument();
     });
     expect(screen.getByText("Cached input")).toBeInTheDocument();
     expect(screen.getByText("Uncached input")).toBeInTheDocument();
-    expect(screen.getByText("Output")).toBeInTheDocument();
+    // "Output" also labels a segment in both by-type bars.
+    expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
     // "Cache savings" appears in the strip AND the confidence block —
     // both are specified, so assert presence rather than uniqueness.
     expect(screen.getAllByText("Cache savings").length).toBe(2);
@@ -541,9 +605,9 @@ describe("composition, breakdown and cost confidence", () => {
   });
 
   it("hides the reasoning note when no provider reported a split", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
-      expect(screen.getByText("Output")).toBeInTheDocument();
+      expect(screen.getByText("Processed")).toBeInTheDocument();
     });
     expect(screen.queryByText(/reasoning/)).not.toBeInTheDocument();
   });
@@ -554,14 +618,14 @@ describe("composition, breakdown and cost confidence", () => {
         composition: { ...summary().composition, reasoning_tokens: 220_000 },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("includes 220K reasoning")).toBeInTheDocument();
     });
   });
 
   it("lists models flat across providers, em-dashing the unpriced one", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("gpt-5-codex")).toBeInTheDocument();
     });
@@ -572,7 +636,7 @@ describe("composition, breakdown and cost confidence", () => {
   });
 
   it("switches the breakdown between Model and Day", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("gpt-5-codex")).toBeInTheDocument();
     });
@@ -597,32 +661,34 @@ describe("composition, breakdown and cost confidence", () => {
         confidence: {
           provider_reported_share: 0,
           table_priced_share: 1,
+          override_priced_share: 0,
           unpriced_token_share: 0,
           cache_savings_usd: 0,
         },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(screen.getByText("Cost confidence")).toBeInTheDocument();
     });
     expect(screen.getByText("Provider reported")).toBeInTheDocument();
     expect(screen.getByText("Model priced")).toBeInTheDocument();
     expect(screen.getByText("Unpriced")).toBeInTheDocument();
+    expect(screen.getByText("Your prices")).toBeInTheDocument();
     // Zero rows still render so the block keeps a stable shape.
-    expect(screen.getByText("0%")).toBeInTheDocument();
+    expect(screen.getAllByText("0%").length).toBeGreaterThan(0);
     expect(screen.getByText("0% tok")).toBeInTheDocument();
   });
 
   it("offers a 90-day period that refetches", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageSummary).toHaveBeenCalledWith("7d"));
     await userEvent.click(screen.getByRole("radio", { name: "90 days" }));
     await waitFor(() => expect(usageSummary).toHaveBeenCalledWith("90d"));
   });
 
   it("refetches when the refresh button is pressed", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageSummary).toHaveBeenCalledTimes(1));
     await userEvent.click(screen.getByRole("button", { name: "Refresh usage" }));
     await waitFor(() => expect(usageSummary).toHaveBeenCalledTimes(2));
@@ -647,7 +713,7 @@ describe("provider history", () => {
   });
 
   it("renders the footer note with all provider histories", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(
         screen.getByText(/from this machine's Claude Code, Codex, and OpenCode histories/),
@@ -658,7 +724,7 @@ describe("provider history", () => {
   });
 
   it("scans provider history on open with no launcher-specific toggle", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageScanProviderHistory).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(usageSummary).toHaveBeenCalledWith("7d"));
     expect(screen.queryByRole("switch")).not.toBeInTheDocument();
@@ -676,7 +742,7 @@ describe("provider history", () => {
         },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(
         screen.getByText(/Includes 430 provider sessions/),
@@ -697,7 +763,7 @@ describe("provider history", () => {
         },
       }),
     );
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => {
       expect(
         screen.getByText(/Includes 1 provider session/),
@@ -710,7 +776,7 @@ describe("provider history", () => {
       createObjectURL: vi.fn(() => "blob:x"),
       revokeObjectURL: vi.fn(),
     });
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageSummary).toHaveBeenCalled());
     await userEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     await waitFor(() => expect(usageExportCsv).toHaveBeenCalledWith("7d"));
@@ -718,9 +784,201 @@ describe("provider history", () => {
 
   /// A refresh must re-scan too, or new provider records stay invisible.
   it("re-scans on refresh", async () => {
-    render(<UsageSection />);
+    render(<UsageSection />, { wrapper: TooltipProvider });
     await waitFor(() => expect(usageScanProviderHistory).toHaveBeenCalledTimes(1));
     await userEvent.click(screen.getByRole("button", { name: "Refresh usage" }));
     await waitFor(() => expect(usageScanProviderHistory).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("limits view", () => {
+  const HOUR = 3_600_000;
+
+  beforeEach(() => {
+    vi.mocked(usageSummary).mockReset();
+    vi.mocked(usageScanProviderHistory).mockReset();
+    vi.mocked(usageSummary).mockResolvedValue(summary());
+  });
+
+  it("reads plan limits directly on open", async () => {
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await waitFor(() => expect(usageRefreshQuota).toHaveBeenCalledTimes(1));
+  });
+
+  it("lists every window with quota left and a reset countdown", async () => {
+    const now = Date.now();
+    vi.mocked(usageRefreshQuota).mockResolvedValue({
+      quota: {
+        claude: {
+          windows: [
+            { kind: "seven_day", used_pct: 72, resets_at_ms: now + 50 * HOUR, window_mins: 10_080 },
+            { kind: "five_hour", used_pct: 10, resets_at_ms: now + 2 * HOUR + 60_000, window_mins: 300 },
+            { kind: "other", used_pct: 0, resets_at_ms: null, label: "Weekly · Fable" },
+          ],
+          plan_label: "Claude Max",
+          received_at_ms: now,
+        },
+      },
+      statuses: [
+        { provider: "claude", outcome: "ok" },
+        { provider: "codex", outcome: "failed", message: "timed out" },
+      ],
+      refreshed_at_ms: now,
+    });
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("radio", { name: "Limits" }));
+
+    expect(await screen.findByText("Claude Max")).toBeInTheDocument();
+    // Five-hour first, whatever order the provider reported.
+    const labels = screen.getAllByText(/^(5-hour|Weekly|Weekly · Fable)$/).map((el) => el.textContent);
+    expect(labels).toEqual(["5-hour", "Weekly", "Weekly · Fable"]);
+    expect(screen.getByText("90%")).toBeInTheDocument();
+    expect(screen.getByText("28%")).toBeInTheDocument();
+    // Render time trails the fixture's clock by a few ms, so match the hour.
+    expect(screen.getByText(/^resets in 2h [01]m$/)).toBeInTheDocument();
+    // A failed read is said out loud, not shown as an empty provider.
+    expect(screen.getByText("Could not read limits: timed out")).toBeInTheDocument();
+    // The period does not apply to limits.
+    expect(screen.getByRole("radio", { name: "7 days" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Export CSV" })).toBeDisabled();
+  });
+
+  it("explains an empty result instead of rendering nothing", async () => {
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("radio", { name: "Limits" }));
+    expect(
+      await screen.findByText(/No provider on this machine reports plan limits/),
+    ).toBeInTheDocument();
+  });
+
+  it("re-reads limits from the refresh button without rescanning history", async () => {
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("radio", { name: "Limits" }));
+    await waitFor(() => expect(usageRefreshQuota).toHaveBeenCalledTimes(1));
+    const scans = vi.mocked(usageScanProviderHistory).mock.calls.length;
+    await userEvent.click(screen.getByRole("button", { name: "Refresh limits" }));
+    await waitFor(() => expect(usageRefreshQuota).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(usageScanProviderHistory).mock.calls.length).toBe(scans);
+  });
+
+  it("feeds direct readings into the lane meters", async () => {
+    const now = Date.now();
+    vi.mocked(usageRefreshQuota).mockResolvedValue({
+      quota: {
+        claude: {
+          windows: [{ kind: "five_hour", used_pct: 33, resets_at_ms: null }],
+          plan_label: "Claude Max",
+          received_at_ms: now,
+        },
+      },
+      statuses: [{ provider: "claude", outcome: "ok" }],
+      refreshed_at_ms: now,
+    });
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    expect(await screen.findByText("33%")).toBeInTheDocument();
+    expect(screen.getByText("Claude Max")).toBeInTheDocument();
+  });
+
+  it("remembers the chosen view and period across visits", async () => {
+    const first = render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("radio", { name: "30 days" }));
+    await userEvent.click(screen.getByRole("radio", { name: "Limits" }));
+    first.unmount();
+
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    expect(await screen.findByRole("radio", { name: "Limits" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: "30 days" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+});
+
+describe("model details and prices", () => {
+  beforeEach(() => {
+    vi.mocked(usageSummary).mockReset();
+    vi.mocked(usageScanProviderHistory).mockReset();
+    vi.mocked(usageSummary).mockResolvedValue(summary());
+  });
+
+  it("splits the period's cost and tokens by type", async () => {
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    expect(await screen.findByText("Cost by type")).toBeInTheDocument();
+    expect(screen.getByText("Tokens by type")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: /^Cost by type: Input \$7\.00/ })).toBeInTheDocument();
+  });
+
+  it("opens a model's detail with its own stats", async () => {
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("button", { name: "Open gpt-5-codex details" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("gpt-5-codex");
+    expect(dialog).toHaveTextContent("$19.24");
+    expect(dialog).toHaveTextContent("Cache hit");
+    // 1.9M reads of 2.5M observed input.
+    expect(dialog).toHaveTextContent("76%");
+    expect(dialog).toHaveTextContent("Per 1M tokens");
+    expect(dialog).toHaveTextContent("Codemux's list-price table");
+  });
+
+  it("prices an unpriced model and refetches with the new price", async () => {
+    vi.mocked(usageSetPriceOverride).mockResolvedValue({
+      "openrouter/kimi-k2": { input: 0.6, output: 2.5, cache_read: 0, cache_write: 0 },
+    });
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Open openrouter/kimi-k2 details" }),
+    );
+    expect(await screen.findByText("340K tokens have no known price")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Set price" }));
+
+    await userEvent.type(screen.getByLabelText("Input"), "0.6");
+    await userEvent.type(screen.getByLabelText("Output"), "2.5");
+    const fetches = vi.mocked(usageSummary).mock.calls.length;
+    await userEvent.click(screen.getByRole("button", { name: "Save price" }));
+
+    await waitFor(() =>
+      expect(usageSetPriceOverride).toHaveBeenCalledWith("openrouter/kimi-k2", {
+        input: 0.6,
+        output: 2.5,
+        cache_read: 0,
+        cache_write: 0,
+      }),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(usageSummary).mock.calls.length).toBeGreaterThan(fetches),
+    );
+  });
+
+  it("lists custom prices and removes one", async () => {
+    vi.mocked(usagePriceOverrides).mockResolvedValue({
+      "openrouter/kimi-k2": { input: 0.6, output: 2.5, cache_read: 0, cache_write: 0 },
+    });
+    vi.mocked(usageSetPriceOverride).mockResolvedValue({});
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("button", { name: "Model prices" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("openrouter/kimi-k2");
+    expect(dialog).toHaveTextContent("$2.50");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Remove price for openrouter/kimi-k2" }),
+    );
+    await waitFor(() =>
+      expect(usageSetPriceOverride).toHaveBeenCalledWith("openrouter/kimi-k2", null),
+    );
+    expect(await screen.findByText(/No custom prices yet/)).toBeInTheDocument();
+  });
+
+  it("breaks each day down by provider", async () => {
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("radio", { name: "Day" }));
+    expect(screen.getByText("Total")).toBeInTheDocument();
+    // Claude spent $9.40 every day in the fixture, OpenCode $0.92.
+    expect(screen.getAllByText("$9.40").length).toBe(7);
+    expect(screen.getAllByText("$0.92").length).toBe(7);
+    expect(screen.getAllByText("$10.32").length).toBe(7);
   });
 });

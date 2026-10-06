@@ -2442,6 +2442,8 @@ export interface PlanUsageWindow {
   /** Unix ms when the window rolls over, when the provider said. */
   resets_at_ms: number | null;
   label?: string | null;
+  /** Window length in minutes, when known — places the even-pace mark. */
+  window_mins?: number | null;
 }
 
 /** One provider's live plan-quota reading. Absent for providers that
@@ -2472,9 +2474,29 @@ export interface UsageComposition {
 export interface CostConfidence {
   provider_reported_share: number;
   table_priced_share: number;
+  /** Share of cost priced from the user's own model prices. */
+  override_priced_share: number;
   /** Share of TOKENS from unpriced rows (a cost share would always be 0). */
   unpriced_token_share: number;
   cache_savings_usd: number;
+}
+
+/** Cost split by the kind of token that incurred it. `unsplit` holds
+ *  provider-reported cost for models with no known rates to split by. */
+export interface CategoryCost {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  unsplit: number;
+}
+
+/** Per-model rates, USD per million tokens. */
+export interface PriceOverride {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
 }
 
 /** One row of the flat, cross-provider model breakdown. */
@@ -2485,6 +2507,20 @@ export interface FlatModelUsage {
   cost_usd: number;
   priced: boolean;
   provider_reported: boolean;
+  /** Priced from the user's own model price. */
+  price_overridden: boolean;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  unpriced_tokens: number;
+  session_count: number;
+  category_cost: CategoryCost;
+  /** The rates the model is priced at (override, else the static table). */
+  rates: PriceOverride | null;
+  /** This model's slice of every bucket, aligned with `UsageSummary.buckets`. */
+  buckets: UsageBucketSlice[];
 }
 
 export interface UsageSummary {
@@ -2495,6 +2531,8 @@ export interface UsageSummary {
   providers: UsageProvider[];
   totals: UsageTotals;
   composition: UsageComposition;
+  /** The period's cost split by token kind. */
+  category_cost: CategoryCost;
   confidence: CostConfidence;
   /** Flat cross-provider model breakdown, most expensive first. */
   models: FlatModelUsage[];
@@ -2541,6 +2579,41 @@ export interface UsageImportReport {
  *  and safe to call repeatedly. */
 export const usageScanProviderHistory = () =>
   invoke<UsageImportReport>("usage_scan_provider_history");
+
+export type QuotaProbeOutcome =
+  | "ok"
+  | "unavailable"
+  | "failed"
+  | "not_installed";
+
+export interface QuotaProbeStatus {
+  provider: string;
+  outcome: QuotaProbeOutcome;
+  message?: string;
+}
+
+export interface QuotaRefreshReport {
+  quota: Record<string, ProviderQuota>;
+  /** Empty when the call joined a refresh already in flight. */
+  statuses: QuotaProbeStatus[];
+  refreshed_at_ms: number;
+}
+
+/** Ask Claude and Codex for their plan limits now, rather than waiting
+ *  for a session to report them. Spawns each CLI briefly. */
+export const usageRefreshQuota = () =>
+  invoke<QuotaRefreshReport>("usage_refresh_quota");
+
+/** The user's per-model prices, keyed by model id. */
+export const usagePriceOverrides = () =>
+  invoke<Record<string, PriceOverride>>("usage_price_overrides");
+
+/** Set a model's price, or remove it with `null`. Returns every override. */
+export const usageSetPriceOverride = (model: string, price: PriceOverride | null) =>
+  invoke<Record<string, PriceOverride>>("usage_set_price_override", {
+    model,
+    price,
+  });
 
 // ── Skills ──
 

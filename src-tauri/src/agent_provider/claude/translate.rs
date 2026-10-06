@@ -747,6 +747,7 @@ fn translate_rate_limit_event(
         used_pct,
         resets_at_ms,
         label: raw_kind.map(|s| s.to_string()),
+        window_mins: kind.implied_window_mins(),
     }];
 
     // The overage bucket rides along on the same event when the account
@@ -769,6 +770,7 @@ fn translate_rate_limit_event(
                 .and_then(|v| v.as_f64())
                 .map(|secs| (secs * 1000.0) as i64),
             label: Some("overage".to_string()),
+            window_mins: None,
         });
     }
 

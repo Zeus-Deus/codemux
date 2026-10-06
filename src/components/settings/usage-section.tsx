@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ChevronDown, ChevronUp, Loader2, RefreshCw } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  RefreshCw,
+  SlidersHorizontal,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ProviderLogo } from "@/components/chat/provider-logo";
@@ -8,6 +14,8 @@ import { SegmentedControl } from "./settings-primitives";
 import { UsageAreaChart, UsageSparkline } from "./usage-area-chart";
 import {
   usageExportCsv,
+  usagePriceOverrides,
+  usageRefreshQuota,
   usageScanProviderHistory,
   usageSummary,
 } from "@/tauri/commands";
@@ -15,6 +23,8 @@ import type {
   CostConfidence,
   FlatModelUsage,
   PlanUsageWindow,
+  PriceOverride,
+  QuotaProbeStatus,
   UsageComposition,
   PlanWindowKind,
   ProviderQuota,
@@ -23,15 +33,53 @@ import type {
   UsageProvider,
   UsageSummary,
 } from "@/tauri/commands";
-import type { AgentChatProviderKind } from "@/tauri/types";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import {
+  formatMoney,
+  formatPercent,
+  formatTokens,
+  isKnownProvider,
+  seriesColor,
+  seriesFill,
+  seriesLabel,
+} from "./usage-format";
+import { UsageLimitsView, formatCheckedAgo } from "./usage-limits";
+import {
+  ModelPricesDialog,
+  PriceEditorDialog,
+  UsageModelDialog,
+} from "./usage-model-dialog";
+import {
+  readUsagePreferences,
+  saveUsagePreferences,
+  type UsageBreakdown,
+  type UsageMetric,
+  type UsagePreferences,
+  type UsageView,
+} from "./usage-preferences";
+import { UsageShareBar, costTypeSegments, tokenTypeSegments } from "./usage-share-bar";
+
+export { formatMoney, formatTokens } from "./usage-format";
 
 /** How often to re-poll while the page is open. The ledger only grows
  *  when an agent is mid-turn, so this is about keeping an open settings
  *  tab honest, not about being live. */
 const POLL_MS = 30_000;
+
+/** Entering Limits re-reads the providers when the last read is older
+ *  than this; each read briefly spawns the Claude and Codex CLIs. */
+const QUOTA_REFRESH_AFTER_MS = 60_000;
+
+/** Countdown cadence on the Limits view. Minutes are the finest unit it
+ *  shows, so a faster tick would repaint for nothing. */
+const LIMITS_TICK_MS = 30_000;
+
+const VIEW_OPTIONS: { value: UsageView; label: string }[] = [
+  { value: "activity", label: "Usage" },
+  { value: "limits", label: "Limits" },
+];
 
 const PERIOD_OPTIONS: { value: UsagePeriod; label: string }[] = [
   { value: "today", label: "Today" },
@@ -40,97 +88,28 @@ const PERIOD_OPTIONS: { value: UsagePeriod; label: string }[] = [
   { value: "90d", label: "90 days" },
 ];
 
-type Metric = "cost" | "tokens";
+type Metric = UsageMetric;
 
 const METRIC_OPTIONS: { value: Metric; label: string }[] = [
   { value: "cost", label: "Est. cost" },
   { value: "tokens", label: "Tokens" },
 ];
 
-/** Series colors, per the design-system token rules — no raw palette
- *  classes. Claude takes the brand accent, OpenCode the green status
- *  tone, and Codex a neutral foreground tint (Codemux has no third
- *  brand hue, and inventing one would imply a status meaning). */
-const SERIES_FILL: Record<string, string> = {
-  claude: "bg-accent-ember",
-  codex: "bg-foreground/45",
-  cursor: "bg-accent-violet",
-  grok: "bg-foreground/70",
-  opencode: "bg-status-open",
-};
-
-/** The same series tones as CSS colors, for the SVG chart. Codex's
- *  neutral tint is expressed as foreground at reduced opacity so it
- *  follows the palette the way the `bg-foreground/45` swatch does. */
-const SERIES_COLOR: Record<string, { color: string; opacity: number }> = {
-  claude: { color: "var(--accent-ember)", opacity: 1 },
-  codex: { color: "var(--foreground)", opacity: 0.55 },
-  cursor: { color: "var(--accent-violet)", opacity: 1 },
-  grok: { color: "var(--foreground)", opacity: 0.8 },
-  opencode: { color: "var(--status-open)", opacity: 1 },
-};
-
-const UNKNOWN_COLOR = { color: "var(--muted-foreground)", opacity: 0.5 };
-
-function seriesColor(provider: string): { color: string; opacity: number } {
-  return SERIES_COLOR[provider] ?? UNKNOWN_COLOR;
-}
-
-const SERIES_LABEL: Record<string, string> = {
-  claude: "Claude Code",
-  codex: "Codex",
-  cursor: "Cursor",
-  grok: "Grok",
-  opencode: "OpenCode",
-};
-
-/** Fallback for a provider id the frontend does not know — the ledger
- *  outlives the provider list, so a row from a since-removed adapter
- *  must still render rather than crash. */
-const UNKNOWN_FILL = "bg-muted-foreground/40";
-
-function seriesFill(provider: string): string {
-  return SERIES_FILL[provider] ?? UNKNOWN_FILL;
-}
-
-function seriesLabel(provider: string): string {
-  return SERIES_LABEL[provider] ?? provider;
-}
-
-function isKnownProvider(provider: string): provider is AgentChatProviderKind {
-  return (
-    provider === "claude" ||
-    provider === "codex" ||
-    provider === "cursor" ||
-    provider === "grok" ||
-    provider === "opencode"
-  );
-}
-
-// ── formatting ──
-
-/** 8.0B / 1.4M / 82K / 640 — the design's `toks`.
- *
- *  The B tier is not hypothetical: provider history on a busy machine
- *  puts the 30-day figure in the billions, and without it the hero read
- *  "7961.5M" — technically correct, unreadable, and visibly wider than
- *  the stat next to it. */
-export function formatTokens(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `${Math.round(n / 1e3)}K`;
-  return String(Math.round(n));
-}
-
-/** Thousands separators keep large API-equivalent estimates readable. */
-const MONEY = new Intl.NumberFormat("en-US", {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
-/** $12.34 / $36,999.88 — an API/list-price equivalent, not an invoice. */
-export function formatMoney(n: number): string {
-  return `$${MONEY.format(Number.isFinite(n) ? n : 0)}`;
+/** Per provider, whichever reading is newer: the summary's snapshot of
+ *  the session-fed store, or the last direct read. */
+function newestQuota(
+  ...sources: (Record<string, ProviderQuota> | undefined)[]
+): Record<string, ProviderQuota> {
+  const merged: Record<string, ProviderQuota> = {};
+  for (const source of sources) {
+    for (const [provider, quota] of Object.entries(source ?? {})) {
+      const current = merged[provider];
+      if (!current || quota.received_at_ms >= current.received_at_ms) {
+        merged[provider] = quota;
+      }
+    }
+  }
+  return merged;
 }
 
 /** Short name for each quota window, for the meter's row label. */
@@ -202,10 +181,6 @@ export function meterNote(quota: ProviderQuota): string {
   return parts.join(" · ");
 }
 
-function formatPercent(fraction: number): string {
-  return `${Math.round((Number.isFinite(fraction) ? fraction : 0) * 100)}%`;
-}
-
 /**
  * "Usage" settings section — token and cost accounting per provider,
  * model, and session, read from the local `agent_usage_ledger`.
@@ -215,18 +190,43 @@ function formatPercent(fraction: number): string {
  * actually billed.
  */
 export function UsageSection() {
-  const [period, setPeriod] = useState<UsagePeriod>("7d");
-  const [metric, setMetric] = useState<Metric>("cost");
+  const [preferences, setPreferences] = useState<UsagePreferences>(readUsagePreferences);
+  const { view, period, metric, breakdown } = preferences;
+  const updatePreferences = useCallback((patch: Partial<UsagePreferences>) => {
+    setPreferences((current) => {
+      const next = { ...current, ...patch };
+      saveUsagePreferences(next);
+      return next;
+    });
+  }, []);
+  const setPeriod = (value: UsagePeriod) => updatePreferences({ period: value });
+  const setMetric = (value: Metric) => updatePreferences({ metric: value });
+  const setBreakdown = (value: UsageBreakdown) => updatePreferences({ breakdown: value });
+
   const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [breakdown, setBreakdown] = useState<BreakdownView>("model");
   const [scanning, setScanning] = useState(false);
   /// Whether the open-time provider-history scan has settled.
   const [scanned, setScanned] = useState(false);
+
+  // Plan limits read directly from the providers (see `usage_quota.rs`).
+  const [directQuota, setDirectQuota] = useState<Record<string, ProviderQuota>>();
+  const [quotaStatuses, setQuotaStatuses] = useState<QuotaProbeStatus[]>([]);
+  const [quotaLoading, setQuotaLoading] = useState(true);
+  const lastQuotaRefresh = useRef(0);
+  const [now, setNow] = useState(() => Date.now());
+
+  const [overrides, setOverrides] = useState<Record<string, PriceOverride>>({});
+  const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
+  const [priceEditor, setPriceEditor] = useState<{
+    model: string | null;
+    rates: PriceOverride | null;
+  } | null>(null);
+  const [pricesOpen, setPricesOpen] = useState(false);
 
   const refresh = useCallback(() => {
     setError(null);
@@ -257,12 +257,37 @@ export function UsageSection() {
     await refresh();
   }, [scan, refresh]);
 
+  const refreshQuota = useCallback(async () => {
+    lastQuotaRefresh.current = Date.now();
+    setQuotaLoading(true);
+    try {
+      const report = await usageRefreshQuota();
+      setDirectQuota(report.quota);
+      // A call that joined a read already in flight reports no statuses;
+      // keep the ones that read produced.
+      if (report.statuses.length > 0) setQuotaStatuses(report.statuses);
+    } catch (err) {
+      setQuotaStatuses([
+        { provider: "claude", outcome: "failed", message: String(err) },
+      ]);
+    } finally {
+      setQuotaLoading(false);
+      setNow(Date.now());
+    }
+  }, []);
+
   // A scan on page open keeps provider history current. The scan is
-  // incremental, so unchanged sources are cheap.
+  // incremental, so unchanged sources are cheap. Limits are read alongside,
+  // so the lane meters and the Limits view do not wait for a session to
+  // report them.
   //
   // Deliberately mount-only: a period change cannot affect source data.
   useEffect(() => {
     void scan().finally(() => setScanned(true));
+    void refreshQuota();
+    void usagePriceOverrides()
+      .then(setOverrides)
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -284,11 +309,41 @@ export function UsageSection() {
     return () => window.clearInterval(id);
   }, [scanThenRefresh]);
 
+  // Entering Limits with an old reading re-reads it; while Limits is open
+  // the countdowns advance on their own.
+  useEffect(() => {
+    if (view !== "limits") return;
+    if (Date.now() - lastQuotaRefresh.current > QUOTA_REFRESH_AFTER_MS) {
+      void refreshQuota();
+    }
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), LIMITS_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [view, refreshQuota]);
+
   // A hovered bucket index is only meaningful for the period it was
   // taken in — a stale index would read out the wrong bar.
   useEffect(() => {
     setHovered(null);
   }, [period]);
+
+  const quota = useMemo(
+    () => newestQuota(summary?.quota, directQuota),
+    [summary?.quota, directQuota],
+  );
+  const selectedModel =
+    selectedModelKey === null
+      ? undefined
+      : summary?.models.find((m) => `${m.provider}:${m.model}` === selectedModelKey);
+
+  const handleRefresh = () => {
+    if (view === "limits") {
+      void refreshQuota();
+      return;
+    }
+    void scanThenRefresh();
+    void refreshQuota();
+  };
 
   const handleExport = async () => {
     setExporting(true);
@@ -308,35 +363,61 @@ export function UsageSection() {
     }
   };
 
+  const onPricesChanged = (next: Record<string, PriceOverride>) => {
+    setOverrides(next);
+    void refresh();
+  };
+
+  const busy = view === "limits" ? quotaLoading : refreshing || scanning;
+  const newestReading = Math.max(
+    0,
+    ...Object.values(quota)
+      .filter((q) => q.windows.length > 0)
+      .map((q) => q.received_at_ms),
+  );
+
   return (
     <div>
       <div className="mb-6 flex items-end justify-between gap-4">
         <div className="min-w-0">
           <h2 className="text-body-lg font-semibold tracking-tight">Usage</h2>
           <p className="mt-1 text-body-sm text-muted-foreground">
-            {summary ? rangeLabel(summary) : "Loading…"} ·{" "}
-            {refreshing ? "refreshing…" : "live"}
+            {view === "limits"
+              ? quotaLoading
+                ? "Plan limits · reading…"
+                : newestReading > 0
+                  ? `Plan limits · checked ${formatCheckedAgo(newestReading, now)}`
+                  : "Plan limits"
+              : `${summary ? rangeLabel(summary) : "Loading…"} · ${
+                  refreshing ? "refreshing…" : "live"
+                }`}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          <SegmentedControl
+            value={view}
+            onChange={(value) => updatePreferences({ view: value })}
+            options={VIEW_OPTIONS}
+            ariaLabel="Usage view"
+          />
+          {/* The period does not apply to Limits; it stays in place but
+              disabled, so switching views does not shift the controls. */}
           <SegmentedControl
             value={period}
             onChange={setPeriod}
             options={PERIOD_OPTIONS}
             ariaLabel="Usage period"
+            disabled={view === "limits"}
           />
           <Button
             variant="ghost"
             size="icon-sm"
-            aria-label="Refresh usage"
-            onClick={() => scanThenRefresh()}
-            disabled={refreshing || scanning}
+            aria-label={view === "limits" ? "Refresh limits" : "Refresh usage"}
+            onClick={handleRefresh}
+            disabled={busy}
           >
             <RefreshCw
-              className={cn(
-                "size-3.5",
-                (refreshing || scanning) && "animate-spin",
-              )}
+              className={cn("size-3.5", busy && "animate-spin")}
               aria-hidden
             />
           </Button>
@@ -344,54 +425,112 @@ export function UsageSection() {
             variant="outline"
             size="sm"
             onClick={handleExport}
-            disabled={exporting || !summary}
+            disabled={exporting || !summary || view === "limits"}
           >
             Export CSV
           </Button>
         </div>
       </div>
 
-      {error && (
-        <p className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive">
-          Failed to load usage: {error}
-        </p>
+      {view === "limits" ? (
+        <UsageLimitsView
+          quota={quota}
+          statuses={quotaStatuses}
+          now={now}
+          loading={quotaLoading}
+        />
+      ) : (
+        <>
+          {error && (
+            <p className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive">
+              Failed to load usage: {error}
+            </p>
+          )}
+
+          {summary === null ? (
+            !error && (
+              <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" aria-hidden />
+                Loading usage…
+              </div>
+            )
+          ) : summary.totals.total_tokens === 0 ? (
+            <div className="rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center text-body text-muted-foreground">
+              No agent activity in this period.
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <OverviewCard
+                summary={summary}
+                metric={metric}
+                onMetricChange={setMetric}
+                hovered={hovered}
+                onHover={setHovered}
+              />
+              <CompositionRow composition={summary.composition} />
+              <TypeSplitCard summary={summary} />
+              <LanesCard
+                summary={summary}
+                quota={quota}
+                expanded={expanded}
+                onToggle={(provider) =>
+                  setExpanded((current) => (current === provider ? null : provider))
+                }
+              />
+              <BreakdownCard
+                summary={summary}
+                view={breakdown}
+                onViewChange={setBreakdown}
+                onSelectModel={(model) =>
+                  setSelectedModelKey(`${model.provider}:${model.model}`)
+                }
+                onOpenPrices={() => setPricesOpen(true)}
+              />
+              <ProviderHistoryFooter busy={scanning} sessionCount={summary.totals.session_count} />
+            </div>
+          )}
+        </>
       )}
 
-      {summary === null ? (
-        !error && (
-          <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-            <Loader2 className="size-4 animate-spin" aria-hidden />
-            Loading usage…
-          </div>
-        )
-      ) : summary.totals.total_tokens === 0 ? (
-        <div className="rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center text-body text-muted-foreground">
-          No agent activity in this period.
-        </div>
-      ) : (
-        <div className="space-y-4">
-          <OverviewCard
-            summary={summary}
-            metric={metric}
-            onMetricChange={setMetric}
-            hovered={hovered}
-            onHover={setHovered}
-          />
-          <CompositionRow composition={summary.composition} />
-          <LanesCard
-            summary={summary}
-            expanded={expanded}
-            onToggle={(provider) =>
-              setExpanded((current) => (current === provider ? null : provider))
-            }
-          />
-          <BreakdownCard
-            summary={summary}
-            view={breakdown}
-            onViewChange={setBreakdown}
-          />
-          <ProviderHistoryFooter busy={scanning} sessionCount={summary.totals.session_count} />
-        </div>
+      {selectedModel && summary && view === "activity" && (
+        <UsageModelDialog
+          model={selectedModel}
+          buckets={summary.buckets}
+          totalCost={summary.totals.estimated_cost_usd}
+          metric={metric}
+          onClose={() => setSelectedModelKey(null)}
+          onEditPrice={(model) => {
+            setSelectedModelKey(null);
+            setPriceEditor({
+              model: model.model,
+              rates: overrides[model.model] ?? model.rates,
+            });
+          }}
+        />
+      )}
+      {pricesOpen && (
+        <ModelPricesDialog
+          overrides={overrides}
+          onClose={() => setPricesOpen(false)}
+          onChanged={onPricesChanged}
+          onAdd={() => {
+            setPricesOpen(false);
+            setPriceEditor({ model: null, rates: null });
+          }}
+          onEdit={(model) => {
+            setPricesOpen(false);
+            setPriceEditor({ model, rates: overrides[model] ?? null });
+          }}
+        />
+      )}
+      {priceEditor && (
+        <PriceEditorDialog
+          model={priceEditor.model}
+          initialRates={priceEditor.rates}
+          hasOverride={priceEditor.model !== null && priceEditor.model in overrides}
+          onClose={() => setPriceEditor(null)}
+          onSaved={onPricesChanged}
+        />
       )}
     </div>
   );
@@ -641,9 +780,37 @@ function CompositionRow({ composition }: { composition: UsageComposition }) {
   );
 }
 
+// ── cost and tokens by type ──
+
+/** Where the money went (input, output, cache reads and writes) beside
+ *  where the tokens went. They differ sharply: cache reads dominate the
+ *  tokens and barely register in the cost. */
+function TypeSplitCard({ summary }: { summary: UsageSummary }) {
+  const tokens = {
+    input_tokens: summary.composition.input_tokens,
+    cache_read_tokens: summary.composition.cache_read_tokens,
+    cache_write_tokens: summary.composition.cache_write_tokens,
+    output_tokens: summary.composition.output_tokens,
+  };
+  return (
+    <div className="grid gap-x-10 gap-y-5 rounded-lg border border-border/60 bg-muted/30 p-4 lg:grid-cols-2">
+      <UsageShareBar
+        label="Cost by type"
+        segments={costTypeSegments(summary.category_cost)}
+        format={formatMoney}
+      />
+      <UsageShareBar
+        label="Tokens by type"
+        segments={tokenTypeSegments(tokens)}
+        format={formatTokens}
+      />
+    </div>
+  );
+}
+
 // ── flat model / day breakdown ──
 
-type BreakdownView = "model" | "day";
+type BreakdownView = UsageBreakdown;
 
 const BREAKDOWN_OPTIONS: { value: BreakdownView; label: string }[] = [
   { value: "model", label: "Model" },
@@ -656,10 +823,14 @@ function BreakdownCard({
   summary,
   view,
   onViewChange,
+  onSelectModel,
+  onOpenPrices,
 }: {
   summary: UsageSummary;
   view: BreakdownView;
   onViewChange: (view: BreakdownView) => void;
+  onSelectModel: (model: FlatModelUsage) => void;
+  onOpenPrices: () => void;
 }) {
   const totalCost = summary.models.reduce((sum, m) => sum + m.cost_usd, 0);
   const totalTokens = summary.models.reduce((sum, m) => sum + m.tokens, 0);
@@ -670,13 +841,19 @@ function BreakdownCard({
         <Eyebrow>
           Breakdown
         </Eyebrow>
-        <SegmentedControl
-          value={view}
-          onChange={onViewChange}
-          options={BREAKDOWN_OPTIONS}
-          ariaLabel="Breakdown grouping"
-          size="sm"
-        />
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={onOpenPrices}>
+            <SlidersHorizontal className="size-3.5" aria-hidden />
+            Model prices
+          </Button>
+          <SegmentedControl
+            value={view}
+            onChange={onViewChange}
+            options={BREAKDOWN_OPTIONS}
+            ariaLabel="Breakdown grouping"
+            size="sm"
+          />
+        </div>
       </div>
 
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
@@ -686,6 +863,7 @@ function BreakdownCard({
               models={summary.models}
               totalCost={totalCost}
               totalTokens={totalTokens}
+              onSelect={onSelectModel}
             />
           ) : (
             <DayRows summary={summary} />
@@ -701,10 +879,12 @@ function ModelRows({
   models,
   totalCost,
   totalTokens,
+  onSelect,
 }: {
   models: FlatModelUsage[];
   totalCost: number;
   totalTokens: number;
+  onSelect: (model: FlatModelUsage) => void;
 }) {
   if (models.length === 0) {
     return (
@@ -714,10 +894,13 @@ function ModelRows({
   return (
     <div className="flex flex-col">
       {models.map((m, i) => (
-        <div
+        <button
+          type="button"
           key={`${m.provider}-${m.model}`}
+          onClick={() => onSelect(m)}
+          aria-label={`Open ${m.model} details`}
           className={cn(
-            "flex items-center gap-3 py-1.5",
+            "-mx-2 flex items-center gap-3 rounded-md px-2 py-1.5 text-left transition-colors duration-150 hover:bg-accent/30 focus-visible:bg-accent/30 focus-visible:outline-none",
             i > 0 && "border-t border-border/30",
           )}
         >
@@ -728,6 +911,11 @@ function ModelRows({
           )}
           <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
             {m.model}
+            {m.price_overridden && (
+              <span className="ml-2 font-sans text-caption text-muted-foreground/80">
+                your price
+              </span>
+            )}
           </span>
           <span className="w-[78px] shrink-0 select-text text-right font-mono text-body-sm tabular-nums">
             {/* An unpriced model has no cost to show — an em-dash is
@@ -742,7 +930,7 @@ function ModelRows({
           <span className="w-[64px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
             {formatTokens(m.tokens)}
           </span>
-        </div>
+        </button>
       ))}
     </div>
   );
@@ -751,20 +939,22 @@ function ModelRows({
 function DayRows({ summary }: { summary: UsageSummary }) {
   // Derived from the buckets the chart already uses, so the two can
   // never disagree. Newest first — the opposite of the chart's axis,
-  // because a table is read from the top.
+  // because a table is read from the top. One cost column per provider,
+  // in lane order, so a spike can be traced to whoever caused it.
+  const order = summary.providers.map((p) => p.provider);
   const rows = summary.buckets
     .map((bucket) => {
       const providers = Object.values(bucket.providers);
       return {
         key: bucket.start_ms,
         label: bucket.sub_label,
+        byProvider: bucket.providers,
         cost: providers.reduce((sum, p) => sum + p.cost_usd, 0),
         tokens: providers.reduce((sum, p) => sum + p.tokens, 0),
       };
     })
     .filter((r) => r.tokens > 0)
     .reverse();
-  const totalCost = rows.reduce((sum, r) => sum + r.cost, 0);
 
   if (rows.length === 0) {
     return (
@@ -773,26 +963,47 @@ function DayRows({ summary }: { summary: UsageSummary }) {
       </p>
     );
   }
+  const columns = `minmax(5.5rem,1fr) repeat(${order.length}, minmax(4.5rem,5.5rem)) 5.5rem 4.5rem`;
   return (
-    <div className="flex flex-col">
-      {rows.map((r, i) => (
+    <div className="flex flex-col overflow-x-auto">
+      <div
+        className="grid items-center gap-x-3 pb-1.5 text-caption text-muted-foreground"
+        style={{ gridTemplateColumns: columns }}
+      >
+        <span>{summary.period === "today" ? "Hour" : "Day"}</span>
+        {order.map((provider) => (
+          <span key={provider} className="flex items-center justify-end gap-1.5 truncate">
+            <span
+              className={cn("size-1.5 shrink-0 rounded-sm", seriesFill(provider))}
+              aria-hidden
+            />
+            {seriesLabel(provider)}
+          </span>
+        ))}
+        <span className="text-right">Total</span>
+        <span className="text-right">Tokens</span>
+      </div>
+      {rows.map((r) => (
         <div
           key={r.key}
-          className={cn(
-            "flex items-center gap-3 py-1.5",
-            i > 0 && "border-t border-border/30",
-          )}
+          className="grid items-center gap-x-3 border-t border-border/30 py-1.5"
+          style={{ gridTemplateColumns: columns }}
         >
-          <span className="min-w-0 flex-1 truncate text-label text-muted-foreground">
+          <span className="min-w-0 truncate text-label text-muted-foreground">
             {r.label}
           </span>
-          <span className="w-[78px] shrink-0 select-text text-right font-mono text-body-sm tabular-nums">
+          {order.map((provider) => (
+            <span
+              key={provider}
+              className="select-text text-right font-mono text-label tabular-nums text-muted-foreground"
+            >
+              {r.byProvider[provider] ? formatMoney(r.byProvider[provider].cost_usd) : "—"}
+            </span>
+          ))}
+          <span className="select-text text-right font-mono text-body-sm tabular-nums">
             {formatMoney(r.cost)}
           </span>
-          <span className="w-[64px] shrink-0 text-right font-mono text-caption tabular-nums text-muted-foreground">
-            {formatPercent(totalCost > 0 ? r.cost / totalCost : 0)}
-          </span>
-          <span className="w-[64px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
+          <span className="select-text text-right font-mono text-label tabular-nums text-muted-foreground">
             {formatTokens(r.tokens)}
           </span>
         </div>
@@ -810,6 +1021,10 @@ function CostConfidenceBlock({ confidence }: { confidence: CostConfidence }) {
       value: formatPercent(confidence.provider_reported_share),
     },
     { label: "Model priced", value: formatPercent(confidence.table_priced_share) },
+    {
+      label: "Your prices",
+      value: formatPercent(confidence.override_priced_share ?? 0),
+    },
     { label: "Unpriced", value: `${formatPercent(confidence.unpriced_token_share)} tok` },
     { label: "Cache savings", value: formatMoney(confidence.cache_savings_usd) },
   ];
@@ -869,10 +1084,12 @@ const SPARK_HEIGHT_PX = 30;
 
 function LanesCard({
   summary,
+  quota,
   expanded,
   onToggle,
 }: {
   summary: UsageSummary;
+  quota: Record<string, ProviderQuota>;
   expanded: string | null;
   onToggle: (provider: string) => void;
 }) {
@@ -882,7 +1099,7 @@ function LanesCard({
         <ProviderLane
           key={provider.provider}
           provider={provider}
-          quota={summary.quota?.[provider.provider]}
+          quota={quota[provider.provider]}
           buckets={summary.buckets}
           open={expanded === provider.provider}
           onToggle={() => onToggle(provider.provider)}

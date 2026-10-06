@@ -2378,6 +2378,7 @@ fn rate_limited_turn_synthesizes_an_armed_usage_limit_notice() {
             used_pct: 100.0,
             resets_at_ms: Some(reset),
             label: Some("five_hour".into()),
+            window_mins: None,
         }],
         None,
         None,

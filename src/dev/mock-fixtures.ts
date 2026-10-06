@@ -2551,6 +2551,73 @@ const USAGE_MODELS: Record<string, { model: string; weight: number; subagent?: b
   ],
 };
 
+/** List-price-shaped rates (USD per 1M: input, output, cache read, cache
+ *  write) for the mock's models. Kimi is deliberately absent so the
+ *  unpriced path renders until the user sets a price for it. */
+const USAGE_MODEL_RATES: Record<string, [number, number, number, number]> = {
+  "claude-opus-4-5": [5, 25, 0.5, 6.25],
+  "claude-sonnet-4-5": [3, 15, 0.3, 3.75],
+  "claude-haiku-4-5": [1, 5, 0.1, 1.25],
+  "gpt-5-codex": [1.25, 10, 0.125, 0],
+  "gpt-5-codex-mini": [0.25, 2, 0.025, 0],
+  "anthropic/claude-sonnet-4-5": [3, 15, 0.3, 3.75],
+  "openai/gpt-5-mini": [0.25, 2, 0.025, 0],
+};
+
+interface MockPrice {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+}
+
+/** In-memory user price overrides for `usage_set_price_override`. */
+const mockPriceOverrides: Record<string, MockPrice> = {};
+
+export function mockUsagePriceOverrides(): Record<string, MockPrice> {
+  return { ...mockPriceOverrides };
+}
+
+export function mockSetUsagePriceOverride(
+  model: string,
+  price: MockPrice | null,
+): Record<string, MockPrice> {
+  if (price) mockPriceOverrides[model] = price;
+  else delete mockPriceOverrides[model];
+  return mockUsagePriceOverrides();
+}
+
+/** Plan quota for the two providers that actually report it, shaped like
+ *  the real direct read. OpenCode has no quota API at all, so it stays
+ *  absent and its lane renders meter-less. */
+export function mockUsageQuota(now: number = Date.now()): Record<string, unknown> {
+  const resetIn = (mins: number) => now + mins * 60_000;
+  return {
+    claude: {
+      windows: [
+        { kind: "five_hour", used_pct: 41, resets_at_ms: resetIn(134), label: "five_hour", window_mins: 300 },
+        { kind: "seven_day", used_pct: 88, resets_at_ms: resetIn(3_400), label: "seven_day", window_mins: 10_080 },
+        // A per-model weekly window, to exercise the "shown in the note,
+        // not as a bar" path in the lanes and its own row in Limits.
+        { kind: "seven_day_opus", used_pct: 72, resets_at_ms: resetIn(3_400), label: "seven_day_opus", window_mins: 10_080 },
+        { kind: "other", used_pct: 9, resets_at_ms: resetIn(3_400), label: "Weekly · Fable", window_mins: 10_080 },
+      ],
+      plan_label: "Claude Max",
+      auth_mode: "subscription",
+      received_at_ms: now,
+    },
+    codex: {
+      windows: [
+        { kind: "five_hour", used_pct: 18, resets_at_ms: resetIn(220), window_mins: 300 },
+        { kind: "seven_day", used_pct: 63, resets_at_ms: resetIn(5_000), window_mins: 10_080 },
+      ],
+      plan_label: "ChatGPT Pro",
+      auth_mode: "subscription",
+      received_at_ms: now,
+    },
+  };
+}
+
 const USAGE_MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -2575,7 +2642,12 @@ export function mockUsageSummary(period: string): unknown {
   const newestStart = Math.floor(now / bucketMs) * bucketMs;
   const startMs = newestStart - (count - 1) * bucketMs;
 
-  const buckets = [];
+  const buckets: {
+    start_ms: number;
+    label: string;
+    sub_label: string;
+    providers: Record<string, { tokens: number; cost_usd: number }>;
+  }[] = [];
   // Per-provider running totals, accumulated from the same numbers the
   // buckets render so the lanes and the chart always agree.
   const totals: Record<string, number> = {
@@ -2664,33 +2736,7 @@ export function mockUsageSummary(period: string): unknown {
   const totalTokens = providers.reduce((sum, p) => sum + p.tokens, 0);
   const cacheRead = providers.reduce((sum, p) => sum + p.cache_read_tokens, 0);
 
-  // Plan quota for the two providers that actually report it. OpenCode
-  // has no quota API at all, so it stays absent and its lane renders
-  // meter-less — the same shape the real backend produces.
-  const resetIn = (mins: number) => now + mins * 60_000;
-  const quota = {
-    claude: {
-      windows: [
-        { kind: "five_hour", used_pct: 41, resets_at_ms: resetIn(134) },
-        { kind: "seven_day", used_pct: 88, resets_at_ms: resetIn(3_400) },
-        // A per-model weekly window, to exercise the "shown in the note,
-        // not as a bar" path.
-        { kind: "seven_day_opus", used_pct: 72, resets_at_ms: resetIn(3_400) },
-      ],
-      plan_label: "Max 20×",
-      auth_mode: "subscription",
-      received_at_ms: now,
-    },
-    codex: {
-      windows: [
-        { kind: "five_hour", used_pct: 18, resets_at_ms: resetIn(220) },
-        { kind: "seven_day", used_pct: 63, resets_at_ms: resetIn(5_000) },
-      ],
-      plan_label: "ChatGPT Pro",
-      auth_mode: "subscription",
-      received_at_ms: now,
-    },
-  };
+  const quota = mockUsageQuota(now);
 
   // Composition + confidence + flat models, derived from the same
   // totals the lanes use so the mock stays internally consistent.
@@ -2710,22 +2756,90 @@ export function mockUsageSummary(period: string): unknown {
   const allCost = providers.reduce((n, p) => n + p.cost_usd, 0);
   const savings = allCost * 2.2;
 
+  const zeroCost = () => ({ input: 0, output: 0, cache_read: 0, cache_write: 0, unsplit: 0 });
+  const categoryCost = zeroCost();
+  let overrideCost = 0;
   const models = providers
     .flatMap((p) =>
-      p.models.map((m) => ({
-        provider: p.provider,
-        model: m.model,
-        tokens: m.tokens,
-        cost_usd: m.cost_usd,
-        // One deliberately unpriced model so the em-dash / token-share
-        // path renders in the dev mock.
-        priced: m.model !== "openrouter/kimi-k2",
-        provider_reported: p.provider === "opencode",
-      })),
+      p.models.map((m) => {
+        const weight = p.tokens > 0 ? m.tokens / p.tokens : 0;
+        const split = {
+          input_tokens: Math.round(m.tokens * 0.18),
+          output_tokens: Math.round(m.tokens * 0.12),
+          cache_read_tokens: Math.round(m.tokens * 0.64),
+          cache_write_tokens: Math.round(m.tokens * 0.06),
+        };
+        const override = mockPriceOverrides[m.model];
+        const table = USAGE_MODEL_RATES[m.model];
+        const rates = override
+          ? override
+          : table
+            ? { input: table[0], output: table[1], cache_read: table[2], cache_write: table[3] }
+            : null;
+        const weights = rates
+          ? [
+              split.input_tokens * rates.input,
+              split.output_tokens * rates.output,
+              split.cache_read_tokens * rates.cache_read,
+              split.cache_write_tokens * rates.cache_write,
+            ]
+          : null;
+        // One deliberately unpriced model (until the user prices it) so
+        // the em-dash / token-share / "Set price" path renders.
+        const priced = m.model !== "openrouter/kimi-k2" || override != null;
+        const cost = override
+          ? weights!.reduce((a, b) => a + b, 0) / 1e6
+          : priced
+            ? m.cost_usd
+            : 0;
+        if (override) overrideCost += cost;
+        const weightSum = weights ? weights.reduce((a, b) => a + b, 0) : 0;
+        const category = zeroCost();
+        if (cost > 0 && weights && weightSum > 0) {
+          category.input = (cost * weights[0]) / weightSum;
+          category.output = (cost * weights[1]) / weightSum;
+          category.cache_read = (cost * weights[2]) / weightSum;
+          category.cache_write = (cost * weights[3]) / weightSum;
+        } else if (cost > 0) {
+          category.unsplit = cost;
+        }
+        categoryCost.input += category.input;
+        categoryCost.output += category.output;
+        categoryCost.cache_read += category.cache_read;
+        categoryCost.cache_write += category.cache_write;
+        categoryCost.unsplit += category.unsplit;
+        return {
+          provider: p.provider,
+          model: m.model,
+          tokens: m.tokens,
+          cost_usd: cost,
+          priced,
+          provider_reported: p.provider === "opencode" && !override,
+          price_overridden: override != null,
+          ...split,
+          reasoning_tokens:
+            p.provider === "claude" ? 0 : Math.round(split.output_tokens * 0.38),
+          unpriced_tokens: priced ? 0 : m.tokens,
+          session_count: Math.max(1, Math.round(p.session_count * weight)),
+          category_cost: category,
+          rates,
+          // The model's slice of each bucket, in proportion to its share
+          // of the provider — the same series the lanes chart.
+          buckets: buckets.map((bucket) => {
+            const slice = bucket.providers[p.provider];
+            const tokens = Math.round((slice?.tokens ?? 0) * weight);
+            return {
+              tokens,
+              cost_usd: m.tokens > 0 ? (cost * tokens) / m.tokens : 0,
+            };
+          }),
+        };
+      }),
     )
     .sort((a, b) =>
       a.priced === b.priced ? b.cost_usd - a.cost_usd : Number(b.priced) - Number(a.priced),
     );
+  const pricedCost = models.reduce((n, m) => n + m.cost_usd, 0);
 
   return {
     period,
@@ -2744,10 +2858,13 @@ export function mockUsageSummary(period: string): unknown {
       cache_savings_usd: savings,
       cache_savings_multiplier: 3.2,
     },
+    category_cost: categoryCost,
     confidence: {
       provider_reported_share: allCost > 0 ? providerPricedCost / allCost : 0,
-      table_priced_share: allCost > 0 ? 1 - providerPricedCost / allCost : 0,
-      unpriced_token_share: 0.041,
+      table_priced_share:
+        pricedCost > 0 ? 1 - providerPricedCost / allCost - overrideCost / pricedCost : 0,
+      override_priced_share: pricedCost > 0 ? overrideCost / pricedCost : 0,
+      unpriced_token_share: mockPriceOverrides["openrouter/kimi-k2"] ? 0 : 0.041,
       cache_savings_usd: savings,
     },
     models,
