@@ -21,13 +21,21 @@
  */
 
 /**
- * The width the panel opens at until the user drags it.
+ * The width the panel opens at until the user drags it, on a roomy window.
  *
  * Modest on purpose: enough for a couple of labelled tabs beside the
  * titlebar cluster, without taking over the chat. The tab row scrolls rather
  * than wraps, so nothing needs a wider panel to look right.
  */
 export const RIGHT_PANEL_DEFAULT_WIDTH = 540;
+
+/**
+ * The most of the content row the *default* width may take. On a small
+ * window 540px would leave the chat and terminal beside it a sliver, so
+ * there the default scales down instead. A dragged width is the user's
+ * call and isn't held to this.
+ */
+export const RIGHT_PANEL_DEFAULT_FRACTION = 0.4;
 
 /**
  * Where the dragged width persists (`ui_state`).
@@ -81,6 +89,35 @@ export const MIN_CONTENT_WIDTH = 240;
  * producing an absurd inline style.
  */
 export const RIGHT_PANEL_MAX_STORED_WIDTH = 4000;
+
+/** The width an undragged panel opens at, given the space it shares. */
+export function defaultRightPanelWidth(available: number): number {
+  if (!Number.isFinite(available) || available <= 0) {
+    return RIGHT_PANEL_DEFAULT_WIDTH;
+  }
+  return Math.max(
+    RIGHT_PANEL_MIN_WIDTH,
+    Math.min(
+      RIGHT_PANEL_DEFAULT_WIDTH,
+      Math.round(available * RIGHT_PANEL_DEFAULT_FRACTION),
+    ),
+  );
+}
+
+/**
+ * The width the panel actually renders at: the stored width (or the
+ * default, if the user never dragged it) clamped to what fits. Before the
+ * row has been measured (first paint, or a test with no ResizeObserver) it
+ * skips the clamp — the observer corrects it on the very next frame, and
+ * clamping against a width of 0 would snap every panel to its minimum.
+ */
+export function resolveRightPanelWidth(
+  stored: number | null,
+  available: number,
+): number {
+  const width = stored ?? defaultRightPanelWidth(available);
+  return available > 0 ? clampRightPanelWidth(width, available) : width;
+}
 
 /** The widest the panel may render given the space it has to share. */
 export function maxRightPanelWidth(available: number): number {

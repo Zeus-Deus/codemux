@@ -84,7 +84,7 @@ import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
 import {
   maxRightPanelWidth,
-  RIGHT_PANEL_DEFAULT_WIDTH,
+  resolveRightPanelWidth,
   RIGHT_PANEL_WIDTH_UI_KEY,
 } from "@/lib/right-panel-width";
 import { cn } from "@/lib/utils";
@@ -241,7 +241,9 @@ export const RightPanel = memo(function RightPanel({
   const reorderRightPanelPanes = useUIStore((s) => s.reorderRightPanelPanes);
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
-  const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
+  const rightPanelWidth = useUIStore((s) =>
+    resolveRightPanelWidth(s.rightPanelWidth, s.rightPanelRowWidth),
+  );
   const rightPanelRowWidth = useUIStore((s) => s.rightPanelRowWidth);
   const storedPanes = useUIStore((s) => s.rightPanelPanes[workspaceId]);
   const storedDismissed = useUIStore(
@@ -611,11 +613,14 @@ export const RightPanel = memo(function RightPanel({
       : rightPanelWidth;
   const expanded = rightPanelWidth >= panelMaxWidth;
   const handleToggleExpand = useCallback(() => {
-    // Restores to the default width; the other endpoint is whatever the
-    // current layout allows — see `@/lib/right-panel-width`.
-    const next = expanded ? RIGHT_PANEL_DEFAULT_WIDTH : Math.round(panelMaxWidth);
+    // Restores to the window-relative default (`null`, persisted as "");
+    // the other endpoint is whatever the current layout allows — see
+    // `@/lib/right-panel-width`.
+    const next = expanded ? null : Math.round(panelMaxWidth);
     setRightPanelWidth(next);
-    dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, String(next)).catch(console.error);
+    dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, next === null ? "" : String(next)).catch(
+      console.error,
+    );
   }, [expanded, panelMaxWidth, setRightPanelWidth]);
 
   // The store owns collapsing (it undocks a docked agent browser — a

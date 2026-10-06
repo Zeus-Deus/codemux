@@ -185,7 +185,7 @@ function DeckTabChip({
           event.stopPropagation();
           onClose();
         }}
-        className="group/close flex size-[18px] shrink-0 items-center justify-center rounded-sm hover:bg-foreground/10"
+        className="group/close flex size-[18px] shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
       >
         <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden" />
         <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block" />

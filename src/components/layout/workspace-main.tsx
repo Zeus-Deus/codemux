@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   clampRightPanelWidth,
+  resolveRightPanelWidth,
   RIGHT_PANEL_WIDTH_UI_KEY,
 } from "@/lib/right-panel-width";
 import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
@@ -321,14 +322,11 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
   // zero-width workspace column with nothing beside it.
   const maximized = showRightPanel && (mobile || rightPanelMaximized);
   // The stored width is what the user asked for; this is what fits right
-  // now. Before the row has been measured (first paint, or a test with no
-  // ResizeObserver) fall back to the stored value — the observer corrects
-  // it on the very next frame, and clamping against a width of 0 would
-  // snap every panel to its minimum.
-  const effectiveRightPanelWidth =
-    contentRowWidth > 0
-      ? clampRightPanelWidth(storedRightPanelWidth, contentRowWidth)
-      : storedRightPanelWidth;
+  // now.
+  const effectiveRightPanelWidth = resolveRightPanelWidth(
+    storedRightPanelWidth,
+    contentRowWidth,
+  );
   const activeTab = activeWorkspace.tabs.find(
     (t) => t.tab_id === activeWorkspace.active_tab_id,
   );
