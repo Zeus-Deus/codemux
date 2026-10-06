@@ -2070,6 +2070,26 @@ describe("SidebarInbox — wrapping-up tier", () => {
     expect(cardOrder(container)).toEqual(["ws-2", "ws-1"]);
   });
 
+  it("anchors the tier to the bottom of the sidebar with the parked shelves", async () => {
+    const base = Date.now();
+    workspaces = [
+      makeWorkspace({ title: "Handed off", worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN", ...readStamps(base) }),
+      makeWorkspace({ title: "Live work" }),
+    ];
+    const { container } = await flushRender();
+
+    const shelves = container.querySelector("[data-parked-shelves]");
+    expect(shelves).toHaveClass("mt-auto");
+    expect(shelves!.contains(divider(container))).toBe(true);
+    expect(
+      shelves!.contains(container.querySelector('[data-inbox-card="ws-1"]')),
+    ).toBe(true);
+    // Live work keeps the top of the list.
+    expect(
+      shelves!.contains(container.querySelector('[data-inbox-card="ws-2"]')),
+    ).toBe(false);
+  });
+
   it("collapses and expands the tier from its header", async () => {
     const base = Date.now();
     workspaces = [

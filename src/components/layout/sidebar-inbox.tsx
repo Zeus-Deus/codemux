@@ -2177,34 +2177,37 @@ export function SidebarInbox() {
           </div>
         ))}
 
-        {/* The wind-down tier. Same full card, same actions — only its place
-            in the list changed, and only while the rule above holds. No
-            header at all when nothing qualifies: an empty section header
-            would imply a category the list isn't currently using. */}
-        {wrappingUpTier.length > 0 && (
-          <>
-            <ShelfHeader
-              label="Wrapping up"
-              count={wrappingUpTier.length}
-              showCount={wrappingUpCollapsed}
-              collapsed={wrappingUpCollapsed}
-              onToggle={() => setWrappingUpCollapsed((c) => !c)}
-              marker="data-wrapping-up-divider"
-            />
-            {visibleWrappingUp.map((ws, index) =>
-              renderCard(ws, pinnedCards.length + topTier.length + index),
-            )}
-          </>
-        )}
-
-        {/* The parked shelves sit on the floor of the sidebar, not under
-            the last active card. `mt-auto` soaks up the free space above
-            them, so a short active list keeps its breathing room and parked
-            work reads as a separate, out-of-the-way drawer. Once the list
-            outgrows the viewport the margin collapses to zero and everything
-            scrolls as one column. */}
-        {(snoozedRows.length > 0 || settledRows.length > 0) && (
+        {/* Wrapping up, Snoozed and Settled sit on the floor of the sidebar,
+            not under the last active card. `mt-auto` soaks up the free space
+            above them, so the top of the list belongs to live work and
+            everything waiting on someone else reads as a separate drawer.
+            Once the list outgrows the viewport the margin collapses to zero
+            and everything scrolls as one column. */}
+        {(wrappingUpTier.length > 0 ||
+          snoozedRows.length > 0 ||
+          settledRows.length > 0) && (
           <div data-parked-shelves className="mt-auto flex flex-col">
+            {/* The wind-down tier. Same full card, same actions — only its
+                place in the list changed, and only while the rule above
+                holds. No header at all when nothing qualifies: an empty
+                section header would imply a category the list isn't
+                currently using. */}
+            {wrappingUpTier.length > 0 && (
+              <>
+                <ShelfHeader
+                  label="Wrapping up"
+                  count={wrappingUpTier.length}
+                  showCount={wrappingUpCollapsed}
+                  collapsed={wrappingUpCollapsed}
+                  onToggle={() => setWrappingUpCollapsed((c) => !c)}
+                  marker="data-wrapping-up-divider"
+                />
+                {visibleWrappingUp.map((ws, index) =>
+                  renderCard(ws, pinnedCards.length + topTier.length + index),
+                )}
+              </>
+            )}
+
             {snoozedRows.length > 0 && (
               <>
                 <ShelfHeader
