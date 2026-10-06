@@ -541,7 +541,9 @@ fn deserialize_service_tiers<'de, D>(deserializer: D) -> Result<Vec<ModelService
 where
     D: serde::Deserializer<'de>,
 {
-    let entries = Option::<Vec<Value>>::deserialize(deserializer)?.unwrap_or_default();
+    let Value::Array(entries) = Value::deserialize(deserializer)? else {
+        return Ok(vec![]);
+    };
     Ok(entries
         .into_iter()
         .filter_map(|value| serde_json::from_value::<ModelServiceTier>(value).ok())

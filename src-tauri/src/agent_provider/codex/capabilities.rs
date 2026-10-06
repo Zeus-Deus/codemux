@@ -657,6 +657,15 @@ mod tests {
         );
         assert_eq!(tiers[1].description, "Higher usage");
 
+        for malformed in [json!({"unexpected": true}), json!("invalid"), json!(null), json!(42)] {
+            let model: ModelEntry = serde_json::from_value(json!({
+                "id": "model-malformed", "serviceTiers": malformed
+            })).unwrap();
+            let info = &build_capabilities(vec![model]).models[0];
+            assert_eq!(info.id, "model-malformed");
+            assert!(info.service_tiers.is_empty());
+        }
+
         let mut legacy = entry("model-legacy", false, vec![]);
         legacy.additional_speed_tiers = vec!["fast".into()];
         assert_eq!(
