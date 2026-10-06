@@ -1,3 +1,7 @@
+Current accepted behavior and future investigation: see FINDINGS.txt.
+The narrative below preserves historical trials; older candidate/test counts
+are labeled by their phase and do not describe the final cadence revision.
+
 Linux scroll timing investigation
 
 All results are from this machine; environment.json records versions and limitations.
@@ -38,6 +42,24 @@ smoother long-chat scrolling and fast wheel movement. Small initial up/down
 movements still feel stepped; that remains a separate follow-up. Preserve this
 tested animation as the baseline before changing its start or reversal curve.
 
+Rejected follow-up start response: the trial started a fresh glide at 75% of its average speed,
+rather than zero. Duration, signed destination and moving retarget velocity are
+preserved. Native onset-results compare this against commit 8ef3cca0 in separate
+GTK/WebKit probes using identical small up/down inputs. The ~25 px downward
+tick's first recorded pixel changed from 37 ms to 16 ms; the upward tick's
+second pixel changed from 37 ms to 18 ms. A ~120 px downward tick started at
+8 ms versus 19 ms. All 11 alternating onset events were trusted and intercepted.
+The separate 250-event rapid burst covered 92.8% by input end and settled to
+6,349 px of 6,350 requested, retaining the subpixel remainder. Native callback
+median stayed 5 ms. These are single paired trials of recorded scroll positions,
+not physical input-to-presentation measurements. Very small ~5 px ticks still
+have observable whole-pixel stepping; this does not eliminate WebKit rounding.
+The trial passed npm run check and all 16 affected wheel-scrolling tests, but
+the user reported an initial push. Its seeded velocity was removed; the accepted
+zero-velocity baseline is retained. Callback onset alone is not sufficient to
+validate physical wheel control.
+To reproduce the onset pattern, pass `onset` after the glide_probe.py URL.
+
 The after traces named mode-clock-* load the actual production Rust module in
 an isolated GTK process, rather than the fixed diagnostic C shim. The native
 executable export mechanism was separately verified with a linked probe; this
@@ -57,14 +79,15 @@ baseline was 49/107 ms; the Electron shell was 10/20.1 ms. Rendering A/B trials
 are in rendering-ab and did not justify retaining a speculative library or CSS
 change. No claim of eliminating every transcript hitch is supported.
 
-Validation: current npm run check and 61 affected frontend tests pass; earlier
+Historical baseline validation: npm run check and 61 affected frontend tests passed; earlier
 cargo check -j 2 and
 7 scoped vblank_fallback Rust tests passed. Mock visual inspection could not be
 completed: browser tooling initially lacked a control endpoint; the running dev
 instance later returned "No pane found" for browser creation. Computer-use
 reported no available browser. No system driver setting or installed app changed.
 
-These probes do not record the physical mouse. Native GDK input and Electron
+The original injected probes do not record the physical mouse. The later
+bounded physical precision investigation is documented below. Native GDK input and Electron
 sendInputEvent enter their browser event paths, but scheduling/batching differs.
 The Electron comparison shell is the locally available 41.5.0 runtime; it is not
 a measurement of the existing t3code process. Mock UI results use Vite development
@@ -104,3 +127,48 @@ Rebuild summary and chart:
 
 The current ordinary-tick comparison is glide-chart.png/svg; timing-chart.png/svg
 is the archived rapid-input investigation of the first attempted animator.
+
+Physical input investigation (2026-10-05): a bounded read-only numeric wheel
+recording of a G502 showed REL_WHEEL_HI_RES increments of +/-15 (one eighth of
+a 120-unit notch). The paired real Tauri DOM sample showed 264 wheel events,
+all deltaY +/-186 and deltaMode 0; 2,014 high-resolution increments and 257
+coarse events occurred in the overlapping physical capture. The windows
+partly differ at their boundaries, so these counts are not an exact event
+matching assertion. Fine motion exists at the device and is absent at the DOM.
+GTK3 binds wl_seat v5; axis_value120 requires v8. Hyprland 0.56.2 accumulates
+fractional wheel values for the legacy path while preserving value120 on v8.
+This is an input precision problem, independent of the fixed frame timing.
+Temporary app recording collected only numeric wheel deltas/scroll positions
+into /tmp and was removed immediately afterward; no telemetry is shipped.
+
+Precision follow-up: src-tauri/src/precise_wheel.rs binds a version-8 pointer
+on GTK's existing Wayland connection. Only own-surface mouse-wheel frames with
+value120 are translated to native GDK smooth events, at value120/120 wheel
+units. Matching GTK legacy copies are suppressed by input timestamp; native
+replacement propagation copies are retained. Older compositors, X11, touchpads,
+unmapped/unknown surfaces and unsupported multi-seat configurations keep GTK.
+CODEMUX_PRECISE_WHEEL=0 disables the bridge. The protocol flag is learned once
+at boot; only fractional pixel deltas use a 30 ms filter, with zero initial
+velocity. Full notches retain the accepted longer glide. No per-device gain
+calibration or input device permissions are required by the application.
+
+The physical Wayland prototype received 2,129 fractional wheel frames while GTK
+received 276 smooth events. The native WebKit module test received exactly 64
+trusted, cancelable DOM wheel events of 15.5 px for 64 eighth-notch frames; eight
+matching coarse GTK events added no movement. Total was 992 px. These native
+module injection results are separate from the physical protocol observation,
+and do not claim measured physical input-to-presentation latency. At the main
+app's recorded 1,386 px viewport, one normal GTK wheel unit is 124 px: the new
+eighth-notch input is 15.5 px. The old Hyprland compatibility path generated
+1.5 units (186 px) only at coarse notches. Whole-notch distance now follows
+standard wheel units rather than that compositor-specific legacy multiplier.
+
+The short-filter WebKit trace precision-results/short-filter-onset.json shows
+~25.3 px input settling within 1 px in 33-35 ms, and ~5 px input in 29-33 ms.
+Full ~119.5 px notches still glide over ~200 ms. These are single diagnostic
+callback traces, not an assertion that all perceived hitches are resolved.
+
+Earlier short-filter frontend verification: npm run check and the 42 affected wheel, boot-hook
+and MessageTrail tests passed. Precision capability discovery schedules native
+initialization on the GTK thread before returning, avoiding a race with React
+effects at startup. Unsupported backends retain the committed baseline.

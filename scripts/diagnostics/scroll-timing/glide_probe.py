@@ -17,14 +17,31 @@ window.set_accept_focus(False)
 window.add(view)
 pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
 injections = []
+ready_received = False
 
 def ready(_, value):
+    global ready_received
+    if ready_received:
+        return
+    ready_received = True
     point = json.loads(value.get_js_value().to_string())
     events = [(1200, 25.4, 'single25'), (1900, 120, 'single120')]
     for start, interval in [(2700, 50), (3700, 100), (4900, 150)]:
         events += [(start+i*interval, 25.4, f'spaced{interval}') for i in range(5)]
     events += [(6300+i*8, 25.4, 'burst8') for i in range(20)]
     events += [(6420, -120, 'reversal')]
+    if len(sys.argv)>2 and sys.argv[2] == 'onset':
+        events = [(1200, 25.4, 'small-down'), (1900, -25.4, 'small-up'),
+                  (2700, 5, 'tiny-down'), (3400, -5, 'tiny-up'),
+                  (4200, 120, 'notch-down'), (4900, -120, 'notch-up')]
+        events += [(5800+i*150, 25.4 if i%2 == 0 else -25.4,
+                    'alternating') for i in range(5)]
+    if len(sys.argv)>2 and sys.argv[2] == 'precision':
+        events = [(1200, 15.5, 'isolated-fraction')]
+        events += [(2000+i*80, 15.5, 'slow-fractions') for i in range(6)]
+        events += [(3400+i*5, 15.5, 'fast-fractions') for i in range(64)]
+        events += [(4900+i*80, 15.5 if i<3 else -15.5,
+                    'direction-change') for i in range(6)]
     def wheel(delta, label):
         event = Gdk.Event.new(Gdk.EventType.SCROLL)
         event.window = view.get_window()

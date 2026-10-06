@@ -5,7 +5,7 @@
 const params = new URLSearchParams(location.search);
 if (params.get('smooth') === 'app') {
   const {installWheelScrolling} = await import('/src/lib/wheel-scrolling.ts');
-  installWheelScrolling();
+  installWheelScrolling(document, () => params.has('precise'));
 }
 const s = document.querySelector('#s');
 s.innerHTML = Array.from({length:2000}, (_,i) => '<p>Mock row '+i+'</p>').join('');
@@ -18,7 +18,7 @@ if (params.get('owner') === 'horizontal') {
   s.addEventListener('wheel', e => { s.scrollLeft += e.deltaY; e.preventDefault(); }, {passive:false});
 }
 const result = {frames:[], wheels:[], ua:navigator.userAgent, viewport:[innerWidth, innerHeight]};
-document.addEventListener('wheel', e => result.wheels.push([performance.now(),e.deltaY,e.deltaMode,e.isTrusted,e.cancelable,e.defaultPrevented]), {capture:true,passive:true});
+document.addEventListener('wheel', e => result.wheels.push([performance.now(),e.deltaY,e.deltaMode,e.isTrusted,e.cancelable,e.defaultPrevented,e.wheelDeltaY]), {capture:true,passive:true});
 const emit = (kind,data) => {
   if (window.webkit?.messageHandlers?.[kind]) window.webkit.messageHandlers[kind].postMessage(JSON.stringify(data));
   else console.log(kind.toUpperCase()+':'+JSON.stringify(data));

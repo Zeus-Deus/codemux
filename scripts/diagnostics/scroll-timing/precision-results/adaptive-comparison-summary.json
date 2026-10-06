@@ -1,0 +1,32 @@
+[
+  {
+    "profile": "fine-short30",
+    "events": 77,
+    "total": 1095.641676902771,
+    "final_travel": 1095,
+    "slow_intervals": 79,
+    "flat_intervals": 50,
+    "flat_time_ms": 250,
+    "sampled_time_ms": 395
+  },
+  {
+    "profile": "fine-continuous200",
+    "events": 77,
+    "total": 1095.641676902771,
+    "final_travel": 1095,
+    "slow_intervals": 79,
+    "flat_intervals": 17,
+    "flat_time_ms": 83,
+    "sampled_time_ms": 395
+  },
+  {
+    "profile": "fine-adaptive",
+    "events": 77,
+    "total": 1095.641676902771,
+    "final_travel": 1095,
+    "slow_intervals": 36,
+    "flat_intervals": 12,
+    "flat_time_ms": 57,
+    "sampled_time_ms": 403
+  }
+]
