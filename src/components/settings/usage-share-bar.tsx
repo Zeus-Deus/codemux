@@ -88,7 +88,7 @@ export function UsageShareBar({
           <Tooltip key={segment.label}>
             <TooltipTrigger asChild>
               <div
-                className="h-full min-w-1 rounded-[2px] first:rounded-l-full last:rounded-r-full"
+                className="h-full min-w-1 rounded-sm first:rounded-l-full last:rounded-r-full"
                 style={{ flex: `${segment.value} 1 0`, backgroundColor: segment.color }}
               />
             </TooltipTrigger>
@@ -103,7 +103,7 @@ export function UsageShareBar({
           <span key={segment.label} className="inline-flex items-center gap-1.5">
             <span
               aria-hidden
-              className="size-2 rounded-[2px]"
+              className="size-2 rounded-sm"
               style={{ backgroundColor: segment.color }}
             />
             <span className="text-muted-foreground">{segment.label}</span>
