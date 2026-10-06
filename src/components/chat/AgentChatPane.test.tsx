@@ -2579,9 +2579,9 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     expect(agentChatGetSession).toHaveBeenCalledWith("thread-x");
     const [threadId, model] = setModelMock.mock.calls[0];
     expect(threadId).toBe("thread-x");
-    // defaultModelForProvider("claude") falls back to "claude-opus-4-8"
-    // when capabilities aren't in the test environment.
-    expect(model).toBe("claude-opus-4-8");
+    // defaultModelForProvider("claude") falls back to the CLI's
+    // "default" alias when capabilities aren't in the test environment.
+    expect(model).toBe("default");
   });
 
   it("seeds the persisted model over the Opus default", async () => {

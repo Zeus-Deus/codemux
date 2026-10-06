@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   chatDraftHasUserContent,
   partializeChatDraftStoreState,
+  reseedBootstrapDrafts,
   selectActiveDraft,
   selectDraftForWorkspace,
   useChatDraftStore,
@@ -10,6 +11,34 @@ import {
   type DraftId,
 } from "./chat-draft-store";
 import { useAgentChatStore } from "./agent-chat-store";
+import { useProviderCapabilities } from "./provider-capabilities-store";
+import type { ChatModelInfo, ProviderChatCapabilities } from "@/tauri/types";
+
+function claudeCaps(
+  models: Array<Pick<ChatModelInfo, "id" | "label"> & Partial<ChatModelInfo>>,
+): ProviderChatCapabilities {
+  return {
+    models: models.map((m) => ({
+      description: null,
+      effort_levels: [],
+      default_effort: null,
+      prompt_injected_effort_levels: [],
+      context_window_options: [],
+      supports_adaptive_thinking: false,
+      supports_thinking_toggle: false,
+      supports_fast_mode: false,
+      supports_images: false,
+      sub_provider: null,
+      is_free: false,
+      ...m,
+    })),
+    effort_granularity: "per_session",
+    effort_label_map: {},
+    permission_modes: [],
+    default_permission_mode: "bypassPermissions",
+    permission_granularity: "per_session",
+  };
+}
 
 function resetStore() {
   useChatDraftStore.setState({
@@ -19,6 +48,7 @@ function resetStore() {
     activeDraftId: null,
   });
   useAgentChatStore.setState({ threads: {} });
+  useProviderCapabilities.setState({ claude: null });
 }
 
 describe("chat-draft-store", () => {
@@ -45,13 +75,13 @@ describe("chat-draft-store", () => {
       // Default model is seeded so capability-dependent pickers
       // (Effort, ContextWindow) render on first paint. In the test
       // environment the `provider-capabilities-store` is not
-      // hydrated, so `defaultModelId` returns the hardcoded fallback
-      // `claude-opus-4-8`, and `capabilityDefaults` returns null
+      // hydrated, so `defaultModelId` returns the CLI's `default`
+      // alias, and `capabilityDefaults` returns null
       // effort / contextWindow because the model payload isn't
       // available yet. The Stage C Effort-lock fix means these null
       // values flow through materialize into the slice; real runtime
       // gets non-null values once caps hydrate.
-      expect(draft.model).toBe("claude-opus-4-8");
+      expect(draft.model).toBe("default");
       expect(draft.effort).toBeNull();
       expect(draft.contextWindow).toBeNull();
       expect(draft.threadId).toBeTruthy();
@@ -414,6 +444,97 @@ describe("chat-draft-store", () => {
       expect(
         useChatDraftStore.getState().draftsById[homeDraft.draftId],
       ).toBeDefined();
+    });
+  });
+
+  describe("placeholder model reseed", () => {
+    let unsubscribe: () => void = () => {};
+    beforeEach(() => {
+      unsubscribe = useProviderCapabilities.subscribe(reseedBootstrapDrafts);
+    });
+    afterEach(() => unsubscribe());
+
+    const roster = claudeCaps([
+      {
+        id: "opus",
+        label: "Claude Opus 5.5",
+        effort_levels: ["low", "high"],
+        default_effort: "high",
+        context_window_options: [
+          { value: "1m", label: "1M", is_default: true, context_window_tokens: 1_000_000 },
+        ],
+      },
+      { id: "claude-opus-4-8", label: "Opus 4.8" },
+    ]);
+
+    it("moves a pre-hydration draft onto the roster default once caps load", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(draft.model).toBe("default");
+
+      useProviderCapabilities.setState({ claude: roster });
+
+      const after = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(after.model).toBe("opus");
+      expect(after.effort).toBe("high");
+      expect(after.contextWindow).toBe("1m");
+    });
+
+    it("reseeds against a roster that was already restored from storage", () => {
+      unsubscribe();
+      useProviderCapabilities.setState({
+        claude: claudeCaps([{ id: "opus", label: "Claude Opus 5.5" }]),
+      });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore
+        .getState()
+        .updateDraftConfig(draft.draftId, { model: "claude-opus-4-8" });
+
+      reseedBootstrapDrafts();
+
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].model,
+      ).toBe("opus");
+    });
+
+    it("migrates the legacy hardcoded id when the roster does not list it", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore
+        .getState()
+        .updateDraftConfig(draft.draftId, { model: "claude-opus-4-8" });
+
+      useProviderCapabilities.setState({
+        claude: claudeCaps([{ id: "opus", label: "Claude Opus 5.5" }]),
+      });
+
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].model,
+      ).toBe("opus");
+    });
+
+    it("keeps a model the roster lists, even a former placeholder id", () => {
+      useProviderCapabilities.setState({ claude: roster });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, {
+        model: "claude-opus-4-8",
+        effort: "low",
+      });
+
+      useProviderCapabilities.setState({ claude: { ...roster } });
+
+      const after = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(after.model).toBe("claude-opus-4-8");
+      expect(after.effort).toBe("low");
+    });
+
+    it("leaves drafts that are already being sent alone", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+
+      useProviderCapabilities.setState({ claude: roster });
+
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].model,
+      ).toBe("default");
     });
   });
 

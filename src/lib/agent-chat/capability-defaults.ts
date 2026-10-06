@@ -17,7 +17,11 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * synchronous and non-null.
  */
 const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> = {
-  claude: "claude-opus-4-8",
+  // The CLI's own `default` alias: it launches whatever the installed
+  // Claude Code currently recommends, and `selectModel` resolves it to the
+  // roster's leading row once capabilities hydrate. A concrete id here goes
+  // stale with every model release and silently pins drafts to it.
+  claude: "default",
   codex: "gpt-5.4",
   // Cursor resolves this provider-native alias until its live ACP model
   // catalogue has hydrated. No concrete Cursor model is hardcoded.
@@ -35,6 +39,48 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> 
   // pre-hydration window still produces a recognisable identifier.
   opencode: "anthropic/claude-sonnet-4-6",
 };
+
+/** Bootstrap ids earlier releases seeded before capabilities hydrated.
+ *  Unsent persisted drafts can still carry them; they never reflect a
+ *  user's choice, because the picker has no rows to pick from until the
+ *  roster loads. */
+const LEGACY_BOOTSTRAP_MODEL_IDS: Partial<
+  Record<AgentChatProviderKind, ReadonlyArray<string>>
+> = {
+  claude: ["claude-opus-4-8"],
+};
+
+/** Whether `modelId` is a pre-hydration placeholder rather than a model
+ *  the user picked from the roster. */
+export function isBootstrapModelId(
+  provider: AgentChatProviderKind,
+  modelId: string | null | undefined,
+): boolean {
+  if (!modelId) return false;
+  return (
+    modelId === FALLBACK_DEFAULT_MODEL_BY_PROVIDER[provider] ||
+    (LEGACY_BOOTSTRAP_MODEL_IDS[provider]?.includes(modelId) ?? false)
+  );
+}
+
+const CLAUDE_MODEL_ID =
+  /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(?:\[[^\]]+\])?$/;
+
+/** Human label for a model id the roster can't resolve (capabilities not
+ *  hydrated yet, or a thread started on a model the CLI no longer lists).
+ *  Provider aliases read as "Default" and Claude's versioned ids as
+ *  "Claude Opus 4.8"; anything else keeps its id, which is the only
+ *  truthful name available. */
+export function fallbackModelLabel(modelId: string): string {
+  if (modelId === "default") return "Default";
+  const claude = CLAUDE_MODEL_ID.exec(modelId);
+  if (claude) {
+    const [, family, major, minor] = claude;
+    const version = minor ? `${major}.${minor}` : major;
+    return `Claude ${family.charAt(0).toUpperCase()}${family.slice(1)} ${version}`;
+  }
+  return modelId;
+}
 
 /**
  * Provider-native permission defaults used before the asynchronous
@@ -173,9 +219,9 @@ export function modelsForProvider(
   );
 }
 
-/** Look up a model's display label by id. Falls back to the raw id
- *  when the model is not in the capabilities payload (or caps haven't
- *  hydrated). Routed through `selectModel` so a persisted `"default"`
+/** Look up a model's display label by id. Falls back to
+ *  {@link fallbackModelLabel} when the model is not in the capabilities
+ *  payload (or caps haven't hydrated). Routed through `selectModel` so a persisted `"default"`
  *  id from before the alias fold resolves to `models[0]`'s label — the
  *  concrete model the alias pointed at — instead of showing the raw
  *  string. */
@@ -187,7 +233,7 @@ export function modelLabel(
     useProviderCapabilities.getState(),
     provider,
   );
-  return selectModel(caps, modelId)?.label ?? modelId;
+  return selectModel(caps, modelId)?.label ?? fallbackModelLabel(modelId);
 }
 
 export interface CapabilityDefaults {

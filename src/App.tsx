@@ -25,6 +25,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
+import { useReseedBootstrapDrafts } from "@/stores/chat-draft-store";
 import { useTranscriptSelectionHighlight } from "@/hooks/use-transcript-selection-highlight";
 import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
@@ -134,6 +135,7 @@ function App() {
   useScrollbackSerializer();
   useFeatureFlagsInit();
   useEnsureDraftWhenEmpty();
+  useReseedBootstrapDrafts();
   useTerminalCacheGc();
   useTerminalThemeSync();
   useTerminalCwdPoll();
