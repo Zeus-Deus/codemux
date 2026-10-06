@@ -1,7 +1,9 @@
 /**
  * Module-level holder for the sidebar inbox's jump targets: the ordered list
  * of visible active-card workspace ids, in the exact order the user sees them
- * (filter-scoped, unparked). SidebarInbox writes this from an effect; the
+ * (filter-scoped, unparked). SidebarInbox writes this from an effect, and the
+ * collapsed rail (SidebarRailWorkspaces) writes its own button order while it
+ * stands in for the inbox; the
  * window-level keyboard handler reads it so a "jump to workspace N" shortcut
  * can resolve the Nth card without the handler having to reach into React.
  *
@@ -15,6 +17,9 @@
 /** The default modifier the jump shortcuts bind to (Ctrl+1..9 are the terminal
  *  tab switches, so digit jumps use Alt to avoid the conflict). */
 export const DEFAULT_JUMP_MODIFIER = "Alt";
+
+/** How many leading targets get a jump badge — the digit shortcuts only reach 1-9. */
+export const MAX_JUMP_HINTS = 9;
 
 let jumpTargets: readonly string[] = [];
 

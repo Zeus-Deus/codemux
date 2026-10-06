@@ -50,7 +50,13 @@ export function resolveKeybinds(
 
   const conflicts: Array<{ combo: string; ids: string[] }> = [];
   for (const [combo, ids] of reverseMap) {
-    if (ids.length > 1) conflicts.push({ combo, ids });
+    // A composer-scoped action only fires inside a focused chat composer, so
+    // sharing a combo with a window action (Escape) is not a clash.
+    const composer = ids.filter((id) => keybindMap.get(id)?.when === "composer");
+    const windowScoped = ids.filter((id) => keybindMap.get(id)?.when !== "composer");
+    for (const scoped of [windowScoped, composer]) {
+      if (scoped.length > 1) conflicts.push({ combo, ids: scoped });
+    }
   }
 
   return {

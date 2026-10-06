@@ -5,6 +5,7 @@ import {
   createTab,
   closeTab,
   activateTab,
+  activatePane,
   activateWorkspace,
   createEmptyWorkspace,
   runProjectDevCommand,
@@ -23,6 +24,14 @@ import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
+import { jumpToNextNeedsYou } from "@/lib/needs-you";
+import {
+  findPaneInDirection,
+  leafPaneIds,
+  measurePaneRects,
+  type PaneDirection,
+} from "@/lib/pane-navigation";
+import { usePaneZoomStore } from "@/stores/pane-zoom-store";
 import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
@@ -56,10 +65,11 @@ export function useKeyboardShortcuts() {
       const actionIds = reverseMapRef.current.get(combo);
       if (!actionIds || actionIds.length === 0) return;
 
-      // Find the first window-level action (skip terminal-only actions)
+      // Find the first window-level action (skip actions a focused terminal or
+      // chat composer handles itself)
       const actionId = actionIds.find((id) => {
         const entry = getRegistryEntry(id);
-        return !entry || entry.when !== "terminal";
+        return !entry || (entry.when !== "terminal" && entry.when !== "composer");
       });
       if (!actionId) return;
 
@@ -223,11 +233,16 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   const jumpMatch = actionId.match(/^workspaceJump([1-9])$/);
   if (jumpMatch) {
     const target = getJumpTarget(parseInt(jumpMatch[1], 10));
-    if (target) {
-      activateWorkspaceInteraction(target).catch(console.error);
-    }
-    // Consume the combo regardless so a held Alt+digit never leaks to the page.
+    if (!target) return false;
+    activateWorkspaceInteraction(target).catch(console.error);
     return true;
+  }
+
+  // ── Jump to the next workspace that needs you ──
+  // The keyboard twin of the sidebar's "Needs you" strip, reachable from
+  // anywhere, including with the sidebar collapsed.
+  if (actionId === "jumpToNeedsYou") {
+    return jumpToNextNeedsYou();
   }
 
   if (!appState) return false;
@@ -316,6 +331,17 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
 
+  // Next / previous tab, wrapping at either end
+  if (actionId === "nextTab" || actionId === "prevTab") {
+    if (ws.tabs.length > 1) {
+      const at = ws.tabs.findIndex((t) => t.tab_id === ws.active_tab_id);
+      const step = actionId === "nextTab" ? 1 : -1;
+      const next = ws.tabs[(at + step + ws.tabs.length) % ws.tabs.length];
+      activateTab(ws.workspace_id, next.tab_id).catch(console.error);
+    }
+    return true;
+  }
+
   // ── Panes ──
   if (actionId === "splitPaneRight") {
     if (activePaneId) splitPane(activePaneId, "horizontal").catch(console.error);
@@ -327,6 +353,41 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
   if (actionId === "closePane") {
     if (activePaneId) closePane(activePaneId).catch(console.error);
+    return true;
+  }
+
+  // Move focus to the neighbouring pane on screen
+  const focusMatch = actionId.match(/^focusPane(Left|Right|Up|Down)$/);
+  if (focusMatch) {
+    if (!surface || !activePaneId || surface.root.kind !== "split") return true;
+    const direction = focusMatch[1].toLowerCase() as PaneDirection;
+    const move = () => {
+      const rects = measurePaneRects(leafPaneIds(surface.root));
+      const active = rects.get(activePaneId);
+      if (!active) return;
+      const candidates = [...rects]
+        .filter(([id]) => id !== activePaneId)
+        .map(([id, rect]) => ({ id, rect }));
+      const target = findPaneInDirection(active, candidates, direction);
+      if (target) activatePane(target).catch(console.error);
+    };
+    // A zoom hides the neighbours, so leave it first (as tmux does) and
+    // measure once the split has painted again.
+    const zoom = usePaneZoomStore.getState();
+    if (zoom.zoomedPaneBySurface[surface.surface_id]) {
+      zoom.clear(surface.surface_id);
+      requestAnimationFrame(() => requestAnimationFrame(move));
+    } else {
+      move();
+    }
+    return true;
+  }
+
+  if (actionId === "togglePaneZoom") {
+    // A lone pane already fills the surface; there is nothing to zoom.
+    if (surface && activePaneId && surface.root.kind === "split") {
+      usePaneZoomStore.getState().toggle(surface.surface_id, activePaneId);
+    }
     return true;
   }
 
