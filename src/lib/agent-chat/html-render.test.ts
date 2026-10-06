@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { BUILT_IN_THEMES } from "@/lib/themes";
 
@@ -120,5 +120,41 @@ describe("bridge messages", () => {
     const message = (url: string) => ({ jsonrpc: "2.0", method: "ui/open-link", params: { url } });
     expect(readHtmlRenderLinkRequest(message("https://example.com"))).toBe("https://example.com");
     expect(readHtmlRenderLinkRequest(message("file:///etc/passwd"))).toBeUndefined();
+  });
+});
+
+describe("bootstrap link handling", () => {
+  it("scrolls #fragment links in place and forwards only http(s) links", async () => {
+    const page = buildHtmlRenderDocument("<p>x</p>", htmlRenderTheme(BUILT_IN_THEMES[0]!, FONTS));
+    const script = /<script>([\s\S]*?)<\/script>/.exec(page)![1]!;
+    // jsdom is the top window here, so the page's posts land on this window.
+    new Function(script)();
+    const posted: unknown[] = [];
+    const onMessage = (event: MessageEvent) => {
+      if (readHtmlRenderLinkRequest(event.data)) posted.push(event.data);
+    };
+    window.addEventListener("message", onMessage);
+    document.body.innerHTML =
+      '<a id="frag" href="#target">jump</a><a id="mail" href="mailto:a@example.com">mail</a>' +
+      '<a id="ext" href="https://example.com/docs">ext</a><h2 id="target">T</h2>';
+    const target = document.getElementById("target")!;
+    target.scrollIntoView = vi.fn();
+    const click = (id: string) => {
+      const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+      document.getElementById(id)!.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+
+    expect(click("frag")).toBe(true);
+    expect(target.scrollIntoView).toHaveBeenCalledOnce();
+    expect(click("mail")).toBe(true);
+    expect(click("ext")).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    window.removeEventListener("message", onMessage);
+    document.body.innerHTML = "";
+
+    expect(posted).toEqual([
+      { jsonrpc: "2.0", method: "ui/open-link", params: { url: "https://example.com/docs" } },
+    ]);
   });
 });
