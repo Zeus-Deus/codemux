@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       claude_install_only:
-        description: Test real Claude installers and the installed Windows agent GUI
+        description: Run only Windows Claude install checks (false runs full CI)
         type: boolean
         default: true
   push:
