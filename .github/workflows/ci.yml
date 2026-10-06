@@ -157,11 +157,12 @@ jobs:
       matrix:
         include: ${{ inputs.claude_install_only && fromJSON('[{"os":"windows-latest","method":"powershell"},{"os":"windows-latest","method":"cmd"}]') || fromJSON('[{"os":"ubuntu-latest"},{"os":"windows-latest"}]') }}
     runs-on: ${{ matrix.os }}
+    # Windows also builds an installer and verifies real Claude discovery.
     # A cold Windows run can spend nearly 30 min building and testing, before
     # the post-job Rust cache save starts. Leave room for that cleanup so a
     # passing test run is not cancelled while saving its cache. Test execution
     # has its own tighter limit below; Linux keeps the existing job ceiling.
-    timeout-minutes: ${{ inputs.claude_install_only && 60 || (matrix.os == 'windows-latest' && 45 || 30) }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 30 }}
     env:
       # Full DWARF/PDB debuginfo is the default for dev/test builds and is a
       # large share of Windows link time (one PDB per test executable) and of
@@ -485,12 +486,12 @@ jobs:
         run: cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
 
       - name: Install real Claude with the official installer
-        if: inputs.claude_install_only
+        if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/windows-claude-install.ps1 -Method ${{ matrix.method }}
+        run: ./scripts/windows-claude-install.ps1 -Method ${{ matrix.method || 'powershell' }}
 
       - name: Build the current Windows installer for Claude acceptance
-        if: inputs.claude_install_only
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # Dependency binaries are already staged above. Avoid rebuilding them
@@ -501,7 +502,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows acceptance installer build failed' }
 
       - name: Verify real SDK initialization and installed agent GUI
-        if: inputs.claude_install_only
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $installer = @(Get-ChildItem src-tauri/target/debug/bundle/nsis -Filter '*-setup.exe')
@@ -510,8 +511,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows Claude installation smoke failed' }
 
       - uses: actions/upload-artifact@v4
-        if: always() && inputs.claude_install_only
+        if: always() && runner.os == 'Windows'
         with:
-          name: windows-claude-${{ matrix.method }}
+          name: windows-claude-${{ matrix.method || 'powershell' }}
           path: windows-claude-evidence/
           if-no-files-found: warn
