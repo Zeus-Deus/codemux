@@ -3722,7 +3722,11 @@ impl DatabaseStore {
             ("permission_mode", bind(&config.permission_mode)),
             (
                 "fast_mode",
-                bind_bool(tier.as_ref().map(|tier| tier != "default")),
+                // Other native tiers (for example Flex) must not look like
+                // premium Fast to a legacy client that cannot represent them.
+                bind_bool(tier.as_ref().map(|tier| {
+                    matches!(tier.as_str(), "fast" | "priority" | "ultrafast")
+                })),
             ),
         ];
         let mut set_clauses: Vec<String> = Vec::new();
@@ -9327,6 +9331,17 @@ mod tests {
             db.get_agent_chat_session("new").unwrap().service_tier,
             "ultrafast"
         );
+        db.update_agent_chat_session_config(
+            "new",
+            &AgentChatSessionConfig {
+                service_tier: Some("flex".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let flexible = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(flexible.service_tier, "flex");
+        assert!(!flexible.fast_mode);
         db.update_agent_chat_session_config(
             "new",
             &AgentChatSessionConfig {
