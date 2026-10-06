@@ -127,6 +127,18 @@ export function isVersionDismissed(
   return dismissedVersion !== null && dismissedVersion === currentVersion;
 }
 
+/**
+ * Dev builds skip the native check, except when the browser mock opts in
+ * with `?updateMock=…` so the toast and footer states can be exercised.
+ */
+function updaterDisabledInDev(): boolean {
+  return (
+    import.meta.env.DEV &&
+    (window as { __CODEMUX_MOCK_UPDATER__?: boolean })
+      .__CODEMUX_MOCK_UPDATER__ !== true
+  );
+}
+
 export function useUpdateChecker(): UpdateCheckerResult {
   const isRemote = isRemoteClient();
 
@@ -172,7 +184,7 @@ export function useUpdateChecker(): UpdateCheckerResult {
 
   // ── Desktop: native updater plugin ─────────────────────────────────
   useEffect(() => {
-    if (import.meta.env.DEV) return;
+    if (updaterDisabledInDev()) return;
     // The remote client's shim nulls the updater plugin, so the native check
     // machinery must never run there — the web variant below drives it instead.
     if (isRemote) return;
