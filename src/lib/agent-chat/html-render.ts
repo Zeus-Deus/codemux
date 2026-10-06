@@ -249,19 +249,19 @@ export function buildHtmlRenderDocument(html: string, theme: HtmlRenderTheme): s
   const markup =
     (/<meta\s[^>]*charset/i.test(html.slice(0, 4096)) ? "" : '<meta charset="utf-8">') +
     `<style id="codemux-theme">${themeCss(theme)}</style><script>${BOOTSTRAP_SCRIPT}</script>`;
-  // Only tags before the body count: a `<head>` in body text or an attribute
-  // value is content, not the document head.
+  // A document's own `<html>` and `<head>` tags open it: only a doctype, the
+  // `<html>` tag, whitespace, and comments (already blanked) can precede
+  // them. Anywhere later, in body text or an attribute value, they are
+  // content, not the document head.
   const scan = blankNonMarkup(html);
-  const bodyAt = scan.search(/<body[\s>]/i);
-  const scope = bodyAt === -1 ? scan : scan.slice(0, bodyAt);
-  const head = /<head(?:\s[^>]*)?>/i.exec(scope);
+  const head = /^\s*(?:<!doctype[^>]*>\s*)?(?:<html(?:\s[^>]*)?>\s*)?<head(?:\s[^>]*)?>/i.exec(scan);
   if (head) {
-    const at = head.index + head[0].length;
+    const at = head[0].length;
     return html.slice(0, at) + markup + html.slice(at);
   }
-  const root = /<html(?:\s[^>]*)?>/i.exec(scope);
+  const root = /^\s*(?:<!doctype[^>]*>\s*)?<html(?:\s[^>]*)?>/i.exec(scan);
   if (root) {
-    const at = root.index + root[0].length;
+    const at = root[0].length;
     return `${html.slice(0, at)}<head>${markup}</head>${html.slice(at)}`;
   }
   const doctype = /^\s*<!doctype[^>]*>/i.exec(html);

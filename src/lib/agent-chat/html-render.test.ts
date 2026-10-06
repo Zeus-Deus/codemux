@@ -109,11 +109,27 @@ describe("buildHtmlRenderDocument", () => {
     expect(html.endsWith(page)).toBe(true);
   });
 
-  it("ignores a <head> that appears in body content", () => {
-    const page = '<body><p data-x="<head>">x</p><pre><html><head></pre></body>';
+  it.each([
+    '<body><p data-x="<head>">x</p><pre><html><head></pre></body>',
+    "<pre><head>sample</head></pre>",
+    '<p data-x="<head>">x</p>',
+  ])("ignores a <head> that appears in page content: %s", (page) => {
     const html = buildHtmlRenderDocument(page, theme);
     expect(html.startsWith("<!doctype html><head>")).toBe(true);
     expect(html.endsWith(page)).toBe(true);
+  });
+
+  it("finds the head after a doctype, comments, and the html tag", () => {
+    const page = '<!doctype html>\n<!-- note --><html lang="en"><head><title>x</title></head><body></body></html>';
+    const html = buildHtmlRenderDocument(page, theme);
+    const at = page.indexOf("<head>") + "<head>".length;
+    expect(html.slice(0, at)).toBe(page.slice(0, at));
+    expect(html.slice(at).startsWith('<meta charset="utf-8"><style id="codemux-theme">')).toBe(true);
+  });
+
+  it("adds a head right after a headless html tag", () => {
+    const html = buildHtmlRenderDocument("<!doctype html><html><body><p>x</p></body></html>", theme);
+    expect(html.startsWith('<!doctype html><html><head><meta charset="utf-8"><style id="codemux-theme">')).toBe(true);
   });
 
   it("strips characters that could break out of the theme rule", () => {
