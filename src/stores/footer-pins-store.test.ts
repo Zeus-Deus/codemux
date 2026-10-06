@@ -37,7 +37,7 @@ describe("footer preferences", () => {
     store.setIcon("codemux.settings.appearance", "star");
     const saved = JSON.parse(localStorage.getItem(FOOTER_STORAGE_KEY)!);
     expect(saved.version).toBe(1);
-    expect(saved.state.pins[3]).toEqual({
+    expect(saved.state.pins[4]).toEqual({
       id: "codemux.settings.appearance",
       iconId: "star",
     });
@@ -56,6 +56,7 @@ describe("footer preferences", () => {
       "codemux.devices.open",
       "codemux.pull-requests.open",
       "codemux.automations.open",
+      "codemux.settings.usage",
       "codemux.ports.open",
     ]);
     reorderPin("codemux.ports.open", "codemux.devices.open");
@@ -64,6 +65,7 @@ describe("footer preferences", () => {
       "codemux.devices.open",
       "codemux.pull-requests.open",
       "codemux.automations.open",
+      "codemux.settings.usage",
     ]);
     const before = useFooterPinsStore.getState().pins;
     reorderPin("codemux.ports.open", "codemux.settings.appearance");

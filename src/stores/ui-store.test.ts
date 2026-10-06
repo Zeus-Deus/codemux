@@ -221,6 +221,28 @@ describe("ui-store — onboarding state", () => {
       expect(useUIStore.getState().pendingPrSelection).toBeNull();
     });
 
+    it("keeps at most one utility page open, and Back closes it", () => {
+      useUIStore.getState().setShowPullRequests(true, { projectRoot: "/repo", number: 1 });
+      useUIStore.getState().setShowDevices(true);
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+      expect(useUIStore.getState().pendingPrSelection).toBeNull();
+      expect(useUIStore.getState().showDevices).toBe(true);
+
+      useUIStore.getState().setShowAutomations(true);
+      expect(useUIStore.getState().showDevices).toBe(false);
+      expect(useUIStore.getState().showAutomations).toBe(true);
+
+      useUIStore.getState().setShowUsage(true);
+      expect(useUIStore.getState().showAutomations).toBe(false);
+      expect(useUIStore.getState().showUsage).toBe(true);
+
+      useUIStore.getState().closeUtilityPages();
+      expect(useUIStore.getState().showAutomations).toBe(false);
+      expect(useUIStore.getState().showDevices).toBe(false);
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+      expect(useUIStore.getState().showUsage).toBe(false);
+    });
+
     it("accumulates the badge keys the page has shown", () => {
       useUIStore.setState({ prBadgeSeen: [] });
       useUIStore.getState().markPrBadgeSeen(["/repo 1", "/repo 2"]);

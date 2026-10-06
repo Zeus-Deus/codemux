@@ -7,6 +7,7 @@ import {
 import { useAppStore } from "@/stores/app-store";
 import { undockBrowserFromRightPanel } from "@/tauri/commands";
 import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
+import { selectUtilityPage } from "@/lib/utility-pages";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
 export type RightPanelCorePane =
@@ -126,6 +127,7 @@ interface UIStore {
   showAutomations: boolean;
   showDevices: boolean;
   showPullRequests: boolean;
+  showUsage: boolean;
   /** A pull request the page should select as it opens — set by the
    *  palette or a link, consumed and cleared by the page. `url` is where
    *  a link came from, so the page can hand it to the browser if the
@@ -246,6 +248,10 @@ interface UIStore {
   clearPendingPresetCreate: () => void;
   setShowAutomations: (show: boolean) => void;
   setShowDevices: (show: boolean) => void;
+  setShowUsage: (show: boolean) => void;
+  /** Leave whichever utility page is open (Automations, Devices, Pull
+   *  requests, Usage) and return to the workspace underneath it. */
+  closeUtilityPages: () => void;
   /** Open the Pull Requests page, optionally on a given pull request. */
   setShowPullRequests: (
     show: boolean,
@@ -289,6 +295,14 @@ interface UIStore {
   dismissSubagentAttention: (id: string) => void;
 }
 
+const NO_UTILITY_PAGE = {
+  showAutomations: false,
+  showDevices: false,
+  showPullRequests: false,
+  showUsage: false,
+  pendingPrSelection: null,
+} as const;
+
 export const useUIStore = create<UIStore>()(
   persist(
     (set, get) => ({
@@ -310,6 +324,7 @@ export const useUIStore = create<UIStore>()(
       showAutomations: false,
       showDevices: false,
       showPullRequests: false,
+      showUsage: false,
       pendingPrSelection: null,
       prBadgeSeen: [],
       renameWorkspaceId: null,
@@ -575,14 +590,24 @@ export const useUIStore = create<UIStore>()(
           pendingPresetCreate: true,
         }),
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
-      setShowAutomations: (show) => set({ showAutomations: show }),
+      // Utility pages share the main area beside the sidebar, so opening
+      // one replaces whichever other one was showing.
+      setShowAutomations: (show) =>
+        set(show ? { ...NO_UTILITY_PAGE, showAutomations: true } : { showAutomations: false }),
       setShowDevices: (show) =>
-        set({ showDevices: show }),
+        set(show ? { ...NO_UTILITY_PAGE, showDevices: true } : { showDevices: false }),
+      setShowUsage: (show) =>
+        set(show ? { ...NO_UTILITY_PAGE, showUsage: true } : { showUsage: false }),
       setShowPullRequests: (show, select = null) =>
         set({
+          ...(show ? NO_UTILITY_PAGE : {}),
           showPullRequests: show,
           pendingPrSelection: show ? select : null,
         }),
+      closeUtilityPages: () =>
+        set((state) =>
+          selectUtilityPage(state) === null ? state : NO_UTILITY_PAGE,
+        ),
       clearPendingPrSelection: () => set({ pendingPrSelection: null }),
       markPrBadgeSeen: (keys) =>
         set((state) => ({

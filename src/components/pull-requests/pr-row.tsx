@@ -1,4 +1,12 @@
 import { memo, useState } from "react";
+import {
+  CircleCheck,
+  CircleX,
+  GitMerge,
+  GitPullRequest,
+  GitPullRequestClosed,
+  GitPullRequestDraft,
+} from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
@@ -24,10 +32,27 @@ function compactAge(iso: string | null): string | null {
 }
 
 /**
- * The CI colour that leads the row.
+ * The pull request's own state, leading the row: open, draft, merged or
+ * closed, in the colours the hosts use for them.
+ */
+function StateGlyph({ row }: { row: PrRowData }) {
+  const state = row.state?.toUpperCase();
+  const [Icon, tone, label] =
+    state === "MERGED"
+      ? [GitMerge, "text-accent-violet", "Merged"]
+      : state === "CLOSED"
+        ? [GitPullRequestClosed, "text-destructive", "Closed"]
+        : row.is_draft
+          ? [GitPullRequestDraft, "text-muted-foreground", "Draft"]
+          : [GitPullRequest, "text-status-open", "Open"];
+  return <Icon aria-label={label} className={cn("size-4 shrink-0", tone)} />;
+}
+
+/**
+ * The CI verdict beside the title.
  *
- * A draft's dot is dashed and grey whatever CI says: a draft is not
- * asking for a verdict yet, and a green dot on one reads as "ready".
+ * A draft shows nothing whatever CI says: a draft is not asking for a
+ * verdict yet, and a green check on one reads as "ready".
  *
  * `checks === null` is the row painting before its rollup has arrived.
  * It gets a placeholder — dimmer than "no checks", not a colour and not
@@ -35,40 +60,33 @@ function compactAge(iso: string | null): string | null {
  * would claim a verdict. It is the shape the answer will take, holding
  * the space the answer will fill.
  */
-function StateDot({ checks, draft }: { checks: string | null; draft: boolean }) {
-  if (draft) {
-    return (
-      <span
-        aria-hidden
-        data-state="draft"
-        className="size-2.5 shrink-0 rounded-full border-[1.5px] border-dashed border-muted-foreground/70"
-      />
-    );
-  }
+function ChecksMark({ checks, draft }: { checks: string | null; draft: boolean }) {
+  if (draft) return null;
   if (checks === "pending") {
     return (
       <span
-        aria-hidden
+        role="img"
+        aria-label="Checks running"
         data-state="pending"
-        className="size-2.5 shrink-0 animate-spin rounded-full border-[1.6px] border-status-working border-r-transparent"
+        className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-status-working border-r-transparent"
       />
     );
   }
   if (checks === "failing") {
     return (
-      <span
-        aria-hidden
+      <CircleX
+        aria-label="Checks failing"
         data-state="failing"
-        className="size-2.5 shrink-0 rounded-full bg-destructive"
+        className="size-3.5 shrink-0 text-destructive"
       />
     );
   }
   if (checks === "passing") {
     return (
-      <span
-        aria-hidden
+      <CircleCheck
+        aria-label="Checks passing"
         data-state="passing"
-        className="size-2.5 shrink-0 rounded-full border-[1.6px] border-status-open bg-status-open/25"
+        className="size-3.5 shrink-0 text-status-open"
       />
     );
   }
@@ -82,12 +100,22 @@ function StateDot({ checks, draft }: { checks: string | null; draft: boolean }) 
       />
     );
   }
+  return null;
+}
+
+/** The author's initial in a round chip — the hosts' avatars aren't in
+ *  the overview payload, and a letter is enough to tell people apart. */
+function AuthorChip({ author }: { author: string }) {
   return (
-    <span
-      aria-hidden
-      data-state="none"
-      className="size-2.5 shrink-0 rounded-full border-[1.5px] border-border"
-    />
+    <span className="flex min-w-0 items-center gap-1">
+      <span
+        aria-hidden
+        className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] font-semibold uppercase leading-none text-foreground/80"
+      >
+        {author.charAt(0)}
+      </span>
+      <span className="truncate">{author}</span>
+    </span>
   );
 }
 
@@ -99,8 +127,8 @@ function HostMark({ kind }: { kind: string }) {
       aria-hidden
       data-testid={`host-mark-${kind}`}
       className={cn(
-        "size-[12px] shrink-0 rounded-sm",
-        kind === "gitlab" ? "bg-accent-ember/80" : "bg-foreground/40",
+        "size-2 shrink-0 rounded-[2px]",
+        kind === "gitlab" ? "bg-accent-ember/80" : "bg-foreground/35",
       )}
     />
   );
@@ -173,6 +201,8 @@ function PrRowImpl({
       .finally(() => setBusy(false));
   };
 
+  const ref = providerRef(provider, row.number);
+
   if (dense) {
     return (
       <div
@@ -182,22 +212,24 @@ function PrRowImpl({
         data-focused={focused}
         onClick={onSelect}
         className={cn(
-          "group flex cursor-default items-center gap-2 py-1.5 pr-2.5",
-          selected
-            ? "border-l-2 border-accent-ember bg-card pl-[9px]"
-            : "pl-2.5 hover:bg-muted/30",
+          "group flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-1.5 transition-colors duration-150",
+          selected ? "bg-accent" : "hover:bg-accent/50",
         )}
       >
-        <StateDot checks={row.checks} draft={row.is_draft} />
-        <span className={cn("shrink-0 font-mono text-muted-foreground", tzMetaNum)}>
-          {providerRef(provider, row.number)}
+        <StateGlyph row={row} />
+        <span className={cn("shrink-0 font-mono tabular-nums text-muted-foreground", tzMetaNum)}>
+          {ref}
         </span>
-        <span className={cn("min-w-0 flex-1 truncate text-foreground", tzBodyLg)}>
+        <span className={cn("min-w-0 flex-1 truncate text-foreground/90", tzBodyLg)}>
           {row.title}
         </span>
         {moved && <MovedMark />}
         <span className={cn("shrink-0 text-muted-foreground", tzMetaNum)}>{row.author}</span>
-        {age && <span className={cn("shrink-0 text-muted-foreground", tzMetaNum)}>{age}</span>}
+        {age && (
+          <span className={cn("w-8 shrink-0 text-right tabular-nums text-muted-foreground", tzMetaNum)}>
+            {age}
+          </span>
+        )}
       </div>
     );
   }
@@ -210,106 +242,114 @@ function PrRowImpl({
       data-focused={focused}
       onClick={onSelect}
       className={cn(
-        "group flex cursor-default flex-col gap-1.5 py-2 pr-2.5",
-        selected
-          ? "border-l-2 border-accent-ember bg-card pl-[9px]"
-          : "pl-2.5 hover:bg-muted/30",
-        row.is_draft && "opacity-70",
+        "group flex cursor-pointer items-start gap-2.5 rounded-md px-3 py-2.5 transition-colors duration-150",
+        selected ? "bg-accent" : "hover:bg-accent/50",
       )}
     >
-      <div className="flex items-center gap-1.5">
-        <StateDot checks={row.checks} draft={row.is_draft} />
-        {/* Titles never wrap: a two-line title pushes the row below it
-            off the fold and makes every row a different height. */}
-        <span
-          className={cn("min-w-0 flex-1 truncate font-semibold text-foreground", tzRowTitle)}
-          title={row.title}
-        >
-          {row.title}
-        </span>
+      <span className="mt-[3px] flex shrink-0">
+        <StateGlyph row={row} />
+      </span>
 
-        {row.is_draft && (
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className={cn("shrink-0 font-mono tabular-nums text-muted-foreground", tzMetaNum)}>
+            {ref}
+          </span>
+          {/* Titles never wrap: a two-line title pushes the row below it
+              off the fold and makes every row a different height. */}
           <span
             className={cn(
-              "shrink-0 rounded-sm border border-border px-1.5 py-px text-muted-foreground",
-              tzEyebrow,
+              "min-w-0 truncate font-medium",
+              row.is_draft ? "text-foreground/70" : "text-foreground",
+              tzRowTitle,
             )}
+            title={row.title}
           >
-            Draft
+            {row.title}
           </span>
-        )}
-        {label && (
-          <span
-            data-testid="pr-row-state-label"
-            className={cn("shrink-0", tzMeta, label.className)}
-          >
-            {label.text}
-          </span>
-        )}
+          <ChecksMark checks={row.checks} draft={row.is_draft} />
 
-        {/* The action's slot is held open whether or not the action is
-            showing. It used to be inserted on hover, which pushed the
-            title and slid the state label sideways — so running the
-            pointer down the list made every row twitch as you passed it.
-            The button is hidden by visibility, not by display: the row's
-            geometry is now identical at rest and on hover. */}
-        <span
-          data-testid="pr-row-action-slot"
-          className="flex w-[78px] shrink-0 justify-end"
-        >
-          {row.head_branch && (
-            <button
-              type="button"
-              data-testid="pr-row-checkout"
-              disabled={busy}
-              // Nothing to tab to while it is invisible.
-              tabIndex={-1}
-              onClick={checkOut}
+          {row.is_draft && (
+            <span
               className={cn(
-                "invisible max-w-full shrink-0 truncate rounded-sm bg-card px-2 py-0.5 text-foreground/90",
-                tzMeta,
-                "transition-colors duration-150 hover:bg-accent/60 disabled:opacity-60",
-                "group-hover:visible group-data-[focused=true]:visible",
+                "shrink-0 rounded-sm border border-border px-1.5 leading-4 text-muted-foreground",
+                tzEyebrow,
               )}
             >
-              {existingWorkspaceId ? "Switch" : "Check out"}
-            </button>
+              Draft
+            </span>
           )}
-        </span>
-      </div>
+          {label && (
+            <span
+              data-testid="pr-row-state-label"
+              className={cn("shrink-0", tzMeta, label.className)}
+            >
+              {label.text}
+            </span>
+          )}
 
-      <div
-        className={cn(
-          "flex min-w-0 items-center gap-1.5 text-muted-foreground",
-          tzMetaNum,
-        )}
-      >
-        <HostMark kind={row.providerKind} />
-        <span className="shrink-0 font-mono">{providerRef(provider, row.number)}</span>
-        <span className="shrink-0 opacity-40">·</span>
-        <span className="min-w-0 max-w-[40%] truncate">{row.repo}</span>
-        {row.author && (
-          <>
-            <span className="shrink-0 opacity-40">·</span>
-            <span className="shrink-0 truncate">{row.author}</span>
-          </>
-        )}
-        {existingWorkspaceId && (
-          <>
-            <span className="shrink-0 opacity-40">·</span>
-            <span className="shrink-0 text-status-open">checked out</span>
-          </>
-        )}
-        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          <span className="min-w-2 flex-1" />
+          {/* The action's slot is held open whether or not the action is
+              showing. It used to be inserted on hover, which pushed the
+              title and slid the state label sideways — so running the
+              pointer down the list made every row twitch as you passed it.
+              The button is hidden by visibility, not by display: the row's
+              geometry is now identical at rest and on hover. */}
+          <span
+            data-testid="pr-row-action-slot"
+            className="-my-1 flex w-[78px] shrink-0 justify-end"
+          >
+            {row.head_branch && (
+              <button
+                type="button"
+                data-testid="pr-row-checkout"
+                disabled={busy}
+                // Nothing to tab to while it is invisible.
+                tabIndex={-1}
+                onClick={checkOut}
+                className={cn(
+                  "invisible max-w-full shrink-0 truncate rounded-md border border-border bg-background px-2 py-0.5 text-foreground/90",
+                  tzMeta,
+                  "transition-colors duration-150 hover:bg-accent disabled:opacity-60",
+                  "group-hover:visible group-data-[focused=true]:visible",
+                )}
+              >
+                {existingWorkspaceId ? "Switch" : "Check out"}
+              </button>
+            )}
+          </span>
           {moved && <MovedMark />}
-          {row.additions != null && row.additions > 0 && (
-            <span className="font-mono text-status-open">+{groupDigits(row.additions)}</span>
+          {(row.additions ?? 0) + (row.deletions ?? 0) > 0 && (
+            <span className={cn("flex shrink-0 items-baseline gap-1 font-mono tabular-nums", tzMetaNum)}>
+              {row.additions != null && row.additions > 0 && (
+                <span className="text-status-open">+{groupDigits(row.additions)}</span>
+              )}
+              {row.deletions != null && row.deletions > 0 && (
+                <span className="text-destructive">−{groupDigits(row.deletions)}</span>
+              )}
+            </span>
           )}
-          {row.deletions != null && row.deletions > 0 && (
-            <span className="font-mono text-destructive">−{groupDigits(row.deletions)}</span>
+        </div>
+
+        <div
+          className={cn(
+            "flex min-w-0 items-center gap-1.5 text-muted-foreground",
+            tzMetaNum,
           )}
-          {age && <span>{age}</span>}
-        </span>
+        >
+          {row.author && <AuthorChip author={row.author} />}
+          {row.author && <span className="shrink-0 opacity-40">·</span>}
+          <HostMark kind={row.providerKind} />
+          <span className="min-w-0 truncate">{row.repo}</span>
+          {existingWorkspaceId && (
+            <>
+              <span className="shrink-0 opacity-40">·</span>
+              <span className="shrink-0 text-status-open">checked out</span>
+            </>
+          )}
+          <span className="min-w-2 flex-1" />
+          {age && <span className="shrink-0 tabular-nums">{age}</span>}
+        </div>
       </div>
     </div>
   );

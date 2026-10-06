@@ -55,6 +55,9 @@ vi.mock("@/stores/workspaces-sync-store", () => ({
   ),
 }));
 
+let showPullRequestsFlag = false;
+const closeUtilityPagesMock = vi.fn();
+const setShowUsageMock = vi.fn();
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector) => {
     const state = {
@@ -62,6 +65,9 @@ vi.mock("@/stores/ui-store", () => ({
       toggleCommandPalette: toggleCommandPaletteMock,
       setShowAutomations: setShowAutomationsMock,
       setShowDevices: setShowDevicesMock,
+      showPullRequests: showPullRequestsFlag,
+      closeUtilityPages: closeUtilityPagesMock,
+      setShowUsage: setShowUsageMock,
     };
     return selector(state);
   }),
@@ -155,14 +161,14 @@ describe("SidebarFooterBar — expanded", () => {
       Array.from(footer.querySelectorAll("button")).map((el) =>
         el.getAttribute("aria-label"),
       ),
-    ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Ports"]);
+    ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Usage", "Ports"]);
     // The menu is pinned first and is not a drag handle; every destination is.
     expect(footer.firstElementChild?.getAttribute("aria-label")).toBe("Menu");
     expect(
       Array.from(footer.querySelectorAll('[data-testid^="footer-pin-"]')).map(
         (el) => el.querySelector("button")?.getAttribute("aria-label"),
       ),
-    ).toEqual(["Automations", "Devices", "Pull requests", "Ports"]);
+    ).toEqual(["Automations", "Devices", "Pull requests", "Usage", "Ports"]);
     // Nothing pushes a group to the right, so the strip stays left-aligned.
     expect(footer.querySelector(".ml-auto")).toBeNull();
   });
@@ -343,6 +349,7 @@ describe("SidebarFooterBar — collapsed", () => {
       "Menu",
       "Automations",
       "Pull requests",
+      "Usage",
       "Ports",
     ]);
   });
@@ -355,6 +362,7 @@ describe("SidebarFooterBar — collapsed", () => {
       "Automations",
       "Devices",
       "Pull requests",
+      "Usage",
       "Ports",
     ]);
   });
@@ -406,7 +414,7 @@ describe("footer customization", () => {
     await userEvent.click(screen.getByRole("button", { name: "Menu" }));
     await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
     await userEvent.click(screen.getByRole("button", { name: "Move Ports up" }));
-    expect(useFooterPinsStore.getState().pins[2].id).toBe("codemux.ports.open");
+    expect(useFooterPinsStore.getState().pins[3].id).toBe("codemux.ports.open");
     await userEvent.click(screen.getByRole("button", { name: "Remove Automations" }));
     expect(useFooterPinsStore.getState().pins.some((pin) => pin.id === "codemux.automations.open")).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
@@ -432,5 +440,35 @@ describe("footer customization", () => {
     await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
     expect(screen.getByText("Hidden until available")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pin Settings · Permissions" })).toBeNull();
+  });
+});
+
+describe("SidebarFooterBar — Usage", () => {
+  it("opens the Usage page beside the sidebar rather than Settings", () => {
+    setShowUsageMock.mockClear();
+    setShowSettingsMock.mockClear();
+    renderFooter(true);
+    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+    expect(setShowUsageMock).toHaveBeenCalledWith(true);
+    expect(setShowSettingsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("SidebarFooterBar — while a utility page is open", () => {
+  afterEach(() => {
+    showPullRequestsFlag = false;
+    closeUtilityPagesMock.mockClear();
+  });
+
+  it("swaps the destinations for a Back button that leaves the page", () => {
+    showPullRequestsFlag = true;
+    const { getByTestId, container } = renderFooter(true);
+
+    expect(container.querySelector('button[aria-label="Automations"]')).toBeNull();
+    const back = getByTestId("sidebar-back");
+    expect(back).toHaveTextContent("Back");
+
+    fireEvent.click(back);
+    expect(closeUtilityPagesMock).toHaveBeenCalledTimes(1);
   });
 });

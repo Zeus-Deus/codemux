@@ -59,6 +59,7 @@ import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
+import { selectUtilityPage } from "@/lib/utility-pages";
 import { toast } from "@/lib/toast";
 import { applyPreset, openInEditor } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
@@ -545,6 +546,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       : false,
   );
   const rightPanelMaximized = useUIStore((s) => s.rightPanelMaximized);
+  // A utility page (Pull requests, Devices, …) covers the workspace and
+  // draws its own header in this band, so the workspace's tabs, actions
+  // and panel controls step aside while it is open.
+  const pageOpen = useUIStore((s) => selectUtilityPage(s) !== null);
   // The measured content row — the only honest width for "the panel covers
   // everything" while full-expand is on, since the panel then has no inline
   // width of its own.
@@ -647,11 +652,17 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           data-testid="titlebar-drag-layer"
           data-tauri-drag-region
           className="pointer-events-auto absolute inset-y-0 left-0"
-          style={{
-            right: rightPanelOpen
-              ? `${panelBandWidth + (panelMaximized ? 0 : RIGHT_PANEL_RESIZER_REACH)}px`
-              : 0,
-          }}
+          style={
+            pageOpen
+              ? // The page header is its own drag surface, and a layer over
+                // it would swallow clicks on its controls.
+                { width: `${sidebarGapWidth}px` }
+              : {
+                  right: rightPanelOpen
+                    ? `${panelBandWidth + (panelMaximized ? 0 : RIGHT_PANEL_RESIZER_REACH)}px`
+                    : 0,
+                }
+          }
         />
       )}
 
@@ -692,7 +703,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         data-testid="titlebar-floating-band"
         className={cn(
           "absolute top-1 z-10 flex h-8 min-w-0 items-center gap-2",
-          panelMaximized && "hidden",
+          (panelMaximized || pageOpen) && "hidden",
         )}
         style={{
           left: `${sidebarGapWidth + 6}px`,
@@ -763,7 +774,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           the native buttons — the one cluster in this band whose position
           never depends on the panel. Workspace-only: a draft renders no
           right panel, so there is nothing for it to control. */}
-      {guiChrome && activeWorkspaceId && (
+      {guiChrome && activeWorkspaceId && !pageOpen && (
         <RightPanelChromeCluster workspaceId={activeWorkspaceId} />
       )}
 

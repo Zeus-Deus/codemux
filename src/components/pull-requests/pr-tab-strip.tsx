@@ -25,6 +25,8 @@ export interface PrTabStripProps {
   candidates: PrRow[];
   onSelect: (row: PrRow) => void;
   onClose: (key: string) => void;
+  /** Hide the panel; its tabs come back with the next pull request opened. */
+  onClosePanel: () => void;
   onOpenInBrowser: () => void;
 }
 
@@ -44,6 +46,7 @@ export function PrTabStrip({
   candidates,
   onSelect,
   onClose,
+  onClosePanel,
   onOpenInBrowser,
 }: PrTabStripProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -57,7 +60,7 @@ export function PrTabStrip({
 
   return (
     <div
-      className="flex h-[33px] shrink-0 items-center gap-0.5 border-b border-border/40 px-2"
+      className="flex h-10 shrink-0 items-center gap-0.5 border-b border-border/40 px-2"
       data-testid="pr-tab-strip"
     >
       {tabs.map((row) => {
@@ -77,8 +80,8 @@ export function PrTabStrip({
               }
             }}
             className={cn(
-              "group flex h-[25px] shrink-0 cursor-default items-center gap-1.5 rounded-sm px-2.5",
-              active ? "bg-card" : "hover:bg-muted/40",
+              "group flex h-7 shrink-0 cursor-default items-center gap-1.5 rounded-md px-2.5",
+              active ? "bg-accent" : "hover:bg-accent/50",
             )}
             onClick={() => onSelect(row)}
           >
@@ -184,6 +187,16 @@ export function PrTabStrip({
         className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
       >
         <ExternalLink className="size-3" />
+      </button>
+      <button
+        type="button"
+        aria-label="Close panel"
+        title="Close (Esc)"
+        data-testid="pr-panel-close"
+        onClick={onClosePanel}
+        className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
+      >
+        <X className="size-3.5" />
       </button>
     </div>
   );

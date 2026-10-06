@@ -42,8 +42,10 @@ import {
   MoreHorizontal,
   LogOut,
   ExternalLink,
+  ArrowLeft,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
+import { selectUtilityPage } from "@/lib/utility-pages";
 import { useAuthStore } from "@/stores/auth-store";
 import { useUpdateStatusStore } from "@/stores/update-status-store";
 import { cn } from "@/lib/utils";
@@ -288,6 +290,7 @@ function FooterDestination({
 }) {
   const setShowAutomations = useUIStore((s) => s.setShowAutomations);
   const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const setShowUsage = useUIStore((s) => s.setShowUsage);
   const action = getFooterAction(pin.id)!;
   const Icon = pin.iconId ? FOOTER_ICONS[pin.iconId] : action.icon;
   if (pin.id === "codemux.devices.open")
@@ -324,9 +327,11 @@ function FooterDestination({
         fullWidth && "w-full justify-start",
       )}
       onClick={() =>
-        action.section
-          ? setShowSettings(true, action.section)
-          : setShowAutomations(true)
+        action.section === "usage"
+          ? setShowUsage(true)
+          : action.section
+            ? setShowSettings(true, action.section)
+            : setShowAutomations(true)
       }
     >
       <Icon className={labeled ? "size-[13px]" : "size-[18px]"} />
@@ -380,9 +385,43 @@ function SortableFooterDestination({
   );
 }
 
+/**
+ * The footer while a utility page is open: one way out, back to the
+ * workspace the page opened over. Destinations return once you're back.
+ */
+function SidebarBackButton({ collapsed }: { collapsed: boolean }) {
+  const closeUtilityPages = useUIStore((s) => s.closeUtilityPages);
+  const button = (
+    <Button
+      variant="ghost"
+      size={collapsed ? "icon-sm" : "sm"}
+      aria-label="Back"
+      data-testid="sidebar-back"
+      className={cn(
+        "text-muted-foreground hover:bg-surface-2 hover:text-foreground",
+        !collapsed && "h-8 flex-1 justify-start gap-2 px-2 font-medium",
+      )}
+      onClick={closeUtilityPages}
+    >
+      <ArrowLeft className="size-4" />
+      {!collapsed && "Back"}
+    </Button>
+  );
+  if (!collapsed) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent side="right" sideOffset={4} className="text-label">
+        Back
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 export function SidebarFooterBar() {
   const { state } = useSidebar();
   const collapsed = state === "collapsed";
+  const pageOpen = useUIStore((s) => selectUtilityPage(s) !== null);
   const pins = useFooterPinsStore((s) => s.pins);
   const { agentChatEnabled, hasDevices } = useFooterAvailability();
   const [customizing, setCustomizing] = useState(false);
@@ -444,71 +483,77 @@ export function SidebarFooterBar() {
             : "h-[42px] items-center px-2",
         )}
       >
-        {/* The app menu anchors the start of the row; destinations pack
-            beside it so the strip reads as one left-aligned group. */}
-        <AppMenu
-          tooltipSide={tooltipSide}
-          onCustomize={() => setCustomizing(true)}
-        />
-        {/* Destinations reorder by drag; the menu stays outside the sortable
-            list so it always anchors the start. */}
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          onDragEnd={handleDragEnd}
-        >
-          <SortableContext
-            items={visible.map((pin) => pin.id)}
-            strategy={
-              collapsed
-                ? verticalListSortingStrategy
-                : horizontalListSortingStrategy
-            }
-          >
-            {visible.map((pin) => (
-              <SortableFooterDestination
-                key={pin.id}
-                pin={pin}
-                tooltipSide={tooltipSide}
-              />
-            ))}
-          </SortableContext>
-        </DndContext>
-        {overflow.length > 0 && (
-          <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="More footer destinations"
-                title="More footer destinations"
-                className="size-7 shrink-0 text-muted-foreground"
-              >
-                <MoreHorizontal className="size-4" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent
-              side={collapsed ? "right" : "top"}
-              align="start"
-              className="w-64 p-2"
+        {pageOpen ? (
+          <SidebarBackButton collapsed={collapsed} />
+        ) : (
+          <>
+            {/* The app menu anchors the start of the row; destinations pack
+                beside it so the strip reads as one left-aligned group. */}
+            <AppMenu
+              tooltipSide={tooltipSide}
+              onCustomize={() => setCustomizing(true)}
+            />
+            {/* Destinations reorder by drag; the menu stays outside the sortable
+                list so it always anchors the start. */}
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
             >
-              <p className="px-2 py-1 text-label font-medium text-muted-foreground">
-                Footer destinations
-              </p>
-              <div className="thin-scrollbar [scrollbar-gutter:stable] max-h-[50vh] overflow-y-auto p-1">
-                {overflow.map((pin) => (
-                  <div key={pin.id} className="py-0.5">
-                    <FooterDestination
-                      pin={pin}
-                      labeled
-                      fullWidth
-                      tooltipSide="right"
-                    />
-                  </div>
+              <SortableContext
+                items={visible.map((pin) => pin.id)}
+                strategy={
+                  collapsed
+                    ? verticalListSortingStrategy
+                    : horizontalListSortingStrategy
+                }
+              >
+                {visible.map((pin) => (
+                  <SortableFooterDestination
+                    key={pin.id}
+                    pin={pin}
+                    tooltipSide={tooltipSide}
+                  />
                 ))}
-              </div>
-            </PopoverContent>
-          </Popover>
+              </SortableContext>
+            </DndContext>
+            {overflow.length > 0 && (
+              <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="More footer destinations"
+                    title="More footer destinations"
+                    className="size-7 shrink-0 text-muted-foreground"
+                  >
+                    <MoreHorizontal className="size-4" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side={collapsed ? "right" : "top"}
+                  align="start"
+                  className="w-64 p-2"
+                >
+                  <p className="px-2 py-1 text-label font-medium text-muted-foreground">
+                    Footer destinations
+                  </p>
+                  <div className="thin-scrollbar [scrollbar-gutter:stable] max-h-[50vh] overflow-y-auto p-1">
+                    {overflow.map((pin) => (
+                      <div key={pin.id} className="py-0.5">
+                        <FooterDestination
+                          pin={pin}
+                          labeled
+                          fullWidth
+                          tooltipSide="right"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
+            )}
+          </>
         )}
       </div>
       {customizing && (

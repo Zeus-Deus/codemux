@@ -1,26 +1,20 @@
 import { useEffect } from "react";
 
-import { ArrowLeft } from "lucide-react";
-
-import { Button } from "@/components/ui/button";
-import { WindowChrome } from "@/components/layout/window-chrome";
+import { UtilityPage } from "@/components/layout/utility-page";
 import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { useUIStore } from "@/stores/ui-store";
 import { DevicesSection } from "./devices-section";
 
 /**
- * Full-screen Devices page — the account's other machines and the work
- * that lives on them. Local workspaces stay in the sidebar; this page only
+ * The Devices page — the account's other machines and the work that
+ * lives on them. Local workspaces stay in the sidebar; this page only
  * moves work between devices.
- *
- * Mirrors `AutomationsView`'s chrome: a `WindowChrome` drag strip, a
- * back-button header, then the body.
  */
 export function DevicesView() {
   const setShowDevices = useUIStore((s) => s.setShowDevices);
 
-  // Escape closes the view, matching the other full-screen overlays — but
-  // not while the sweep or pull dialog owns the key: unmounting the page
+  // Escape closes the view, matching the other utility pages — but not
+  // while the sweep or pull dialog owns the key: unmounting the page
   // mid-transfer would take the dialog's spinner and outcome toast wiring
   // with it.
   useEffect(() => {
@@ -33,32 +27,20 @@ export function DevicesView() {
   }, [setShowDevices]);
 
   return (
-    <div className="relative flex h-screen flex-col bg-background">
-      <WindowChrome />
-      {/* `pt-7` (= the 28px WindowChrome drag strip) keeps the back
-          button's hit area entirely below the drag region. */}
-      <div className="flex shrink-0 items-center gap-2 px-3 pt-7 pb-2">
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Close devices"
-          className="text-muted-foreground hover:text-foreground hover:bg-surface-2"
-          onClick={() => setShowDevices(false)}
-        >
-          <ArrowLeft className="size-4" />
-        </Button>
-        <span className="text-body font-bold tracking-tight text-foreground">
-          Devices
-        </span>
-        <span className="ml-auto hidden truncate text-label text-muted-foreground/70 sm:inline">
+    <UtilityPage
+      title="Devices"
+      backLabel="Close devices"
+      onBack={() => setShowDevices(false)}
+      actions={
+        <span className="hidden truncate text-label text-muted-foreground/70 lg:inline">
           Remote Control lets you <em>use</em> another device — this page
           moves work <em>between</em> them.
         </span>
-      </div>
-
-      <div className="flex-1 min-h-0 overflow-hidden">
+      }
+    >
+      <div className="min-h-0 flex-1 overflow-hidden">
         <DevicesSection />
       </div>
-    </div>
+    </UtilityPage>
   );
 }
