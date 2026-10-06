@@ -42,6 +42,7 @@ fn fresh_start_input(thread_id: &str) -> StartSessionInput {
         effort: Some("high".into()),
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         env: None,
         workspace_id: None,

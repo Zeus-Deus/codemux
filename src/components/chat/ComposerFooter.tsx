@@ -38,7 +38,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -64,7 +64,7 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onSubmit: () => void;
   onBackgroundSubmit?: () => void;
   onStop: () => void;
@@ -119,7 +119,7 @@ export function ComposerFooter({
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -137,7 +137,7 @@ export function ComposerFooter({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onSubmit,
   onBackgroundSubmit,
   onStop,
@@ -296,10 +296,10 @@ export function ComposerFooter({
               contextWindowValue={contextWindow}
               labelMap={effortLabelMap}
               ultrathinkInBodyText={ultrathinkInBodyText}
-              fastMode={fastMode}
+              serviceTier={serviceTier}
               onEffortChange={onEffortChange}
               onContextWindowChange={onContextWindowChange}
-              onFastModeChange={onFastModeChange}
+              onServiceTierChange={onServiceTierChange}
               disabled={configurationDisabled}
               withSeparator
               iconOnly={effortIconOnly}

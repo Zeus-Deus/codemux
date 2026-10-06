@@ -33,6 +33,37 @@ use super::protocol::{
 };
 use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
+fn resolve_catalog_service_tier(
+    models: &[super::protocol::ModelEntry],
+    model: Option<&str>,
+    tier: &str,
+) -> String {
+    let entry = model
+        .and_then(|id| {
+            models
+                .iter()
+                .find(|entry| entry.id == id || entry.model == id)
+        })
+        .or_else(|| {
+            if model.is_none() {
+                models.iter().find(|entry| entry.is_default)
+            } else {
+                None
+            }
+        });
+    let Some(entry) = entry else {
+        return "default".into();
+    };
+    let tiers = super::capabilities::service_tiers_for_model(entry);
+    if tiers.iter().any(|option| option.value == tier) {
+        return tier.into();
+    }
+    if tier == "fast" && tiers.iter().any(|option| option.value == "priority") {
+        return "priority".into();
+    }
+    "default".into()
+}
+
 /// Default per-request timeout, mirroring the upstream reference's
 /// `sendRequest(..., 20_000)` default.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -130,7 +161,8 @@ pub(crate) struct CodexSessionState {
     /// Service-speed tier applied to subsequent `turn/start` requests.
     /// Codex accepts this per turn, so changing Fast mode does not require
     /// rebuilding or resuming the provider thread.
-    pub fast_mode: bool,
+    pub service_tier: String,
+    pub tier_models: Vec<super::protocol::ModelEntry>,
     /// Follow-up turns queued while a turn was in flight, in FIFO
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
@@ -255,7 +287,7 @@ impl CodexSession {
         model: Option<String>,
         permission_mode: Option<String>,
         effort: Option<String>,
-        fast_mode: bool,
+        service_tier: String,
         resume_cursor: Option<Value>,
         caller_env: Option<HashMap<String, String>>,
         // Owning workspace of the calling chat pane; stored on the
@@ -357,16 +389,29 @@ impl CodexSession {
 
         // Best-effort probes. Failures are non-fatal — we log via
         // RuntimeWarning and continue.
-        match child.request("model/list", json!({})).await {
-            Ok(_) => {}
+        let tier_models = match child.request("model/list", json!({})).await {
+            Ok(value) => serde_json::from_value::<super::protocol::ModelListResponse>(value)
+                .map(|response| response.data)
+                .unwrap_or_default(),
             Err(e) => {
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
                     message: format!("model/list probe failed: {e}"),
                     original_payload: None,
                 });
+                vec![]
             }
+        };
+        let resolved_tier =
+            resolve_catalog_service_tier(&tier_models, model.as_deref(), &service_tier);
+        if resolved_tier == "default" && service_tier != "default" {
+            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: "Saved service tier is unavailable for this model; using Standard.".into(),
+                original_payload: None,
+            });
         }
+        let service_tier = resolved_tier;
         // account/read is the canonical "can this provider run?" check.
         // `requires_openai_auth` describes the active provider and stays true
         // for a logged-in ChatGPT/API-key account, so only gate when the
@@ -476,7 +521,9 @@ impl CodexSession {
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
                             model: model.clone(),
-                            service_tier: Some(fast_mode.then(|| "fast".to_string())),
+                            service_tier: Some(
+                                (service_tier != "default").then(|| service_tier.clone()),
+                            ),
                             cwd: Some(cwd.clone()),
                             collaboration_mode: None,
                             approval_policy,
@@ -507,7 +554,15 @@ impl CodexSession {
                                     ),
                                     original_payload: None,
                                 });
-                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?
+                                start_fresh_thread(
+                                    &child,
+                                    cwd.clone(),
+                                    model.clone(),
+                                    permission_mode.clone(),
+                                    service_tier.clone(),
+                                    dynamic_tools.clone(),
+                                )
+                                .await?
                             }
                             Err(e) => {
                                 return Err(ProviderError::RpcError {
@@ -516,10 +571,30 @@ impl CodexSession {
                             }
                         }
                     }
-                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?,
+                    None => {
+                        start_fresh_thread(
+                            &child,
+                            cwd.clone(),
+                            model.clone(),
+                            permission_mode.clone(),
+                            service_tier.clone(),
+                            dynamic_tools.clone(),
+                        )
+                        .await?
+                    }
                 }
             }
-            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?,
+            None => {
+                start_fresh_thread(
+                    &child,
+                    cwd.clone(),
+                    model.clone(),
+                    permission_mode.clone(),
+                    service_tier.clone(),
+                    dynamic_tools.clone(),
+                )
+                .await?
+            }
         };
 
         // --- assemble session handle ----------------------------------------
@@ -531,7 +606,8 @@ impl CodexSession {
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
-            fast_mode,
+            service_tier,
+            tier_models,
             queued_turns: VecDeque::new(),
         });
         let session = Arc::new(Self {
@@ -1091,13 +1167,17 @@ impl CodexSession {
         effort_override: Option<String>,
         client_id: Option<String>,
     ) -> Result<TurnId, TurnStartError> {
-        let (codex_thread_id, model_default, effort_default, fast_mode) = {
+        let (codex_thread_id, model_default, effort_default, service_tier) = {
             let state = self.state.lock().await;
             (
                 state.codex_thread_id.clone(),
                 state.model.clone(),
                 state.default_effort.clone(),
-                state.fast_mode,
+                resolve_catalog_service_tier(
+                    &state.tier_models,
+                    model_override.as_deref().or(state.model.as_deref()),
+                    &state.service_tier,
+                ),
             )
         };
 
@@ -1127,7 +1207,7 @@ impl CodexSession {
             // thread keeps whatever tier the user configured. Send an explicit
             // `default` when Fast is off: omission would inherit the thread's
             // tier and silently keep a previous Fast turn's speed.
-            service_tier_for_turn: Some(if fast_mode { "fast" } else { "default" }.into()),
+            service_tier_for_turn: Some(service_tier),
             effort,
             collaboration_mode,
         };
@@ -1419,9 +1499,40 @@ impl CodexSession {
 
     /// Update the service tier used by subsequent turns without replacing
     /// the Codex app-server or its loaded thread.
-    pub async fn set_fast_mode(&self, fast_mode: bool) {
+    pub async fn set_service_tier(&self, tier: String) -> Result<(), ProviderError> {
+        // Refresh when choosing a premium tier: entitlement can change while
+        // the conversation stays alive. Standard always clears a stale choice.
+        let models = if tier != "default" {
+            let value = self
+                .child
+                .request("model/list", json!({}))
+                .await
+                .map_err(|error| ProviderError::RpcError {
+                    message: error.to_string(),
+                })?;
+            Some(
+                serde_json::from_value::<super::protocol::ModelListResponse>(value)
+                    .map_err(|error| ProviderError::RpcError {
+                        message: error.to_string(),
+                    })?
+                    .data,
+            )
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
-        state.fast_mode = fast_mode;
+        if let Some(models) = models {
+            state.tier_models = models;
+        }
+        let resolved =
+            resolve_catalog_service_tier(&state.tier_models, state.model.as_deref(), &tier);
+        if resolved == "default" && tier != "default" {
+            return Err(ProviderError::ValidationError {
+                message: "service tier is unavailable for this Codex model or account".into(),
+            });
+        }
+        state.service_tier = resolved;
+        Ok(())
     }
 
     /// Gracefully shut the session down: close the JSON-RPC child
@@ -1495,7 +1606,7 @@ async fn start_fresh_thread(
     cwd: PathBuf,
     model: Option<String>,
     permission_mode: Option<String>,
-    fast_mode: bool,
+    service_tier: String,
     dynamic_tools: Option<Vec<DynamicToolSpec>>,
 ) -> Result<String, ProviderError> {
     let (approval_policy, sandbox) =
@@ -1507,7 +1618,7 @@ async fn start_fresh_thread(
         model,
         // `Some(None)` deliberately serializes as JSON null: it clears a
         // user-level fast default so the composer's Standard choice is honest.
-        service_tier: Some(fast_mode.then(|| "fast".to_string())),
+        service_tier: Some((service_tier != "default").then(|| service_tier.clone())),
         cwd: Some(cwd),
         collaboration_mode: None,
         approval_policy,

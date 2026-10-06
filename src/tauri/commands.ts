@@ -1591,7 +1591,7 @@ export interface AgentChatStartSessionInput {
   /** Claude only — context-window selector (e.g. "1m" adds [1m] bracket). */
   context_window?: string | null;
   /** Premium provider speed tier. Capability-gated by the active model. */
-  fast_mode?: boolean;
+  service_tier?: string;
   additional_directories: string[];
   env: Record<string, string> | null;
   extra?: unknown;
@@ -1913,11 +1913,11 @@ export const agentChatSetModel = (
   model: string | null,
 ) => invoke<void>("agent_chat_set_model", { provider, threadId, model });
 
-export const agentChatSetFastMode = (
+export const agentChatSetServiceTier = (
   provider: AgentChatProviderKind,
   threadId: string,
-  fastMode: boolean,
-) => invoke<void>("agent_chat_set_fast_mode", { provider, threadId, fastMode });
+  serviceTier: string,
+) => invoke<void>("agent_chat_set_service_tier", { provider, threadId, serviceTier });
 
 export const agentChatSetPermissionMode = (
   provider: AgentChatProviderKind,
@@ -1957,7 +1957,7 @@ export interface AgentChatSessionRecord {
   effort: string | null;
   context_window: string | null;
   permission_mode: string | null;
-  fast_mode?: boolean;
+  service_tier?: string;
 }
 
 /** Provider-neutral conversation row for the composer's `@session:` picker.
@@ -2032,7 +2032,7 @@ export interface AgentChatSessionConfigUpdate {
   effort?: string | null;
   context_window?: string | null;
   permission_mode?: string | null;
-  fast_mode?: boolean;
+  service_tier?: string;
 }
 
 export const agentChatListSessions = (

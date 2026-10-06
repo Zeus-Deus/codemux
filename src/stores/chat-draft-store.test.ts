@@ -488,7 +488,7 @@ describe("chat-draft-store", () => {
       expect(parsed.state.draftsById[draft.draftId].inputDraft).toBe("remembered");
       expect(parsed.state.projectDraftIdByPath["/persist"]).toBe(draft.draftId);
       expect(parsed.state.activeDraftId).toBe(draft.draftId);
-      expect(parsed.version).toBe(2);
+      expect(parsed.version).toBe(3);
     });
 
     it("wipes draft state on v1→v2 migration (context-window default flip)", async () => {
@@ -538,4 +538,25 @@ describe("chat-draft-store", () => {
       expect(state.activeDraftId).toBeNull();
     });
   });
+
+  it("migrates legacy Fast drafts without losing their text or identity", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore.persist.clearStorage();
+    window.localStorage.setItem("codemux:chat-drafts:v1", JSON.stringify({
+      version: 2,
+      state: {
+        draftsById: { [draft.draftId]: { ...draft, inputDraft: "Keep this draft", fastMode: true, serviceTier: undefined } },
+        activeHomeDraftId: draft.draftId,
+        activeDraftId: draft.draftId,
+        projectDraftIdByPath: {},
+      },
+    }));
+    await useChatDraftStore.persist.rehydrate();
+    const restored = useChatDraftStore.getState().draftsById[draft.draftId];
+    expect(restored.serviceTier).toBe("fast");
+    expect(restored.inputDraft).toBe("Keep this draft");
+    expect(restored.threadId).toBe(draft.threadId);
+    expect(restored).not.toHaveProperty("fastMode");
+  });
+
 });

@@ -186,7 +186,7 @@ export function useAgentChatSessionActions(
             permission_mode: resolvedMode,
             effort: record.effort,
             context_window: record.context_window,
-            fast_mode: record.fast_mode ?? false,
+            service_tier: record.service_tier ?? "default",
             additional_directories: [],
             env: null,
           },
@@ -205,7 +205,7 @@ export function useAgentChatSessionActions(
         store.setModel(newThreadId, resolvedModel);
         store.setEffort(newThreadId, record.effort);
         store.setContextWindow(newThreadId, record.context_window);
-        store.setFastMode(newThreadId, record.fast_mode ?? false);
+        store.setServiceTier(newThreadId, record.service_tier ?? "default");
         if (resolvedMode !== null) {
           store.setPermissionMode(newThreadId, resolvedMode);
         }
@@ -259,7 +259,7 @@ export function useAgentChatSessionActions(
           model: null,
           resume_cursor: null,
           permission_mode: startMode,
-          fast_mode: false,
+          service_tier: "default",
           additional_directories: [],
           env: null,
           ...(hermesProfile ? { extra: { hermes_profile: hermesProfile } } : {}),
@@ -278,7 +278,7 @@ export function useAgentChatSessionActions(
       if (startMode !== null) {
         store.setPermissionMode(newThreadId, startMode);
       }
-      store.setFastMode(newThreadId, false);
+      store.setServiceTier(newThreadId, "default");
       store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {
       if (adoptPaneBindingFromError(error)) return;

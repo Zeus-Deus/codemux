@@ -159,11 +159,12 @@ pub struct StartSessionInput {
     /// id before the SDK call.
     #[serde(default)]
     pub context_window: Option<String>,
-    /// Whether to request the provider's premium fast inference tier.
-    /// Capability gating happens in the UI; providers that do not expose
-    /// fast mode ignore this field.
+    /// Legacy Fast flag retained for older clients. New clients use service_tier.
     #[serde(default)]
     pub fast_mode: bool,
+    /// Provider-native service tier. Takes precedence over legacy Fast mode.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Optional list of extra directories the agent should be allowed to
     /// access beyond `cwd`.
     pub additional_directories: Vec<PathBuf>,
@@ -195,6 +196,20 @@ pub struct StartSessionInput {
     /// per-message counters ignore it.
     #[serde(default)]
     pub recorded_usage_baseline: Option<UsageBaseline>,
+}
+
+impl StartSessionInput {
+    /// Resolve the legacy flag for providers whose native protocol is boolean.
+    pub fn boolean_fast_mode(&self) -> Result<bool, super::errors::ProviderError> {
+        match self.service_tier.as_deref() {
+            None => Ok(self.fast_mode),
+            Some("default") => Ok(false),
+            Some("fast") => Ok(true),
+            Some(_) => Err(super::errors::ProviderError::ValidationError {
+                message: "provider does not support this service tier".into(),
+            }),
+        }
+    }
 }
 
 /// Token totals already recorded in the usage ledger for one thread.
@@ -327,6 +342,14 @@ pub struct PermissionModeOption {
     pub is_default: bool,
 }
 
+/// A provider-native tier advertised for a model and the current account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceTierOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
 /// Chat-side model metadata — what the composer pickers need to know.
 ///
 /// Separate from the per-provider runtime capabilities (`capabilities()` on
@@ -371,6 +394,9 @@ pub struct ChatModelInfo {
     /// True when the model supports the fast-mode flag.
     #[serde(default)]
     pub supports_fast_mode: bool,
+    /// Live provider catalog; empty on adapters with a boolean Fast option.
+    #[serde(default)]
+    pub service_tiers: Vec<ServiceTierOption>,
     /// True when the model accepts image attachments (multimodal
     /// input). Drives the `+ → Image…` enable state and whether the
     /// composer's paste/drop handlers stage attachments at all.

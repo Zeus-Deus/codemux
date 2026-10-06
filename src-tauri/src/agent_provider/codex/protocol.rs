@@ -523,6 +523,17 @@ pub struct ModelEntry {
     /// Maps to the picker's fast-mode toggle when `"fast"` is present.
     #[serde(default)]
     pub additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTier>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// One element of [`ModelEntry::supported_reasoning_efforts`].

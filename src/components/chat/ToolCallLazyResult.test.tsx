@@ -140,7 +140,7 @@ function emptyish() {
     resumeCursor: null,
     effort: null,
     contextWindow: null,
-    fastMode: false,
+    serviceTier: "default",
     mode: "default" as const,
     modePriorPermissionMode: null,
     hasDebugActivity: false,

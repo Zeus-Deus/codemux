@@ -29,6 +29,7 @@ pub enum MockCall {
     RespondToRequest(ThreadId, RequestId),
     SetModel(ThreadId, String),
     SetFastMode(ThreadId, bool),
+    SetServiceTier(ThreadId, String),
     SetPermissionMode(ThreadId, String),
     RollbackConversation(ThreadId, u32),
     StopSession(ThreadId),
@@ -227,6 +228,27 @@ impl AgentProvider for MockAgentProvider {
 
     async fn set_fast_mode(&self, thread_id: ThreadId, fast_mode: bool) -> Result<(), ProviderError> {
         self.calls.push(MockCall::SetFastMode(thread_id, fast_mode));
+        match self.fast_mode_error.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn set_service_tier(
+        &self,
+        thread_id: ThreadId,
+        tier: String,
+    ) -> Result<(), ProviderError> {
+        if self.kind != ProviderKind::Codex {
+            return match tier.as_str() {
+                "default" => self.set_fast_mode(thread_id, false).await,
+                "fast" => self.set_fast_mode(thread_id, true).await,
+                _ => Err(ProviderError::ValidationError {
+                    message: "unsupported tier".into(),
+                }),
+            };
+        }
+        self.calls.push(MockCall::SetServiceTier(thread_id, tier));
         match self.fast_mode_error.lock().unwrap().take() {
             Some(error) => Err(error),
             None => Ok(()),

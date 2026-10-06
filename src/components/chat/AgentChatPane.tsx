@@ -1,3 +1,4 @@
+import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
@@ -105,7 +106,7 @@ import {
   agentChatRevertTurnCheckpoint,
   agentChatRespondToRequest,
   agentChatSendTurn,
-  agentChatSetFastMode,
+  agentChatSetServiceTier,
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -499,7 +500,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permissionMode: match.permissionMode,
         effort: match.effort,
         contextWindow: match.contextWindow,
-        fastMode: match.fastMode ?? false,
+        serviceTier: match.serviceTier ?? "default",
       };
     }),
   );
@@ -599,7 +600,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
-  const setStoreFastMode = useAgentChatStore((s) => s.setFastMode);
+  const setStoreServiceTier = useAgentChatStore((s) => s.setServiceTier);
   const setStoreResumeCursor = useAgentChatStore((s) => s.setResumeCursor);
   const setStoreMode = useAgentChatStore((s) => s.setMode);
   const setStoreModePriorPermissionMode = useAgentChatStore(
@@ -678,7 +679,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permissionMode: t?.permissionMode ?? null,
         effort: t?.effort ?? null,
         contextWindow: t?.contextWindow ?? null,
-        fastMode: t?.fastMode ?? false,
+        serviceTier: t?.serviceTier ?? "default",
         mode: t?.mode ?? ("default" as ChatMode),
         hasDebugActivity: t?.hasDebugActivity ?? false,
         debugActivityResolved: t?.debugActivityResolved ?? false,
@@ -943,7 +944,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     mode,
     hasDebugActivity,
     debugActivityResolved,
@@ -1088,8 +1089,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             (!current || current.contextWindow === null)
           )
             setStoreContextWindow(seedThreadId, record.context_window);
-          if (!current || current.fastMode === false)
-            setStoreFastMode(seedThreadId, record.fast_mode ?? false);
+          if (!current || current.serviceTier === "default")
+            setStoreServiceTier(seedThreadId, record.service_tier ?? "default");
         }
         if (
           record.permission_mode != null &&
@@ -1130,7 +1131,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModel,
     setStoreEffort,
     setStoreContextWindow,
-    setStoreFastMode,
+    setStoreServiceTier,
     setStorePermissionMode,
     setStoreResumeCursor,
   ]);
@@ -1376,7 +1377,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permission_mode: recoveryMode,
         effort: draft.effort,
         context_window: draft.contextWindow,
-        fast_mode: draft.fastMode ?? false,
+        service_tier: draft.serviceTier ?? "default",
         additional_directories: [],
         env: null,
       };
@@ -1398,7 +1399,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           }
           setStoreEffort(id, draft.effort);
           setStoreContextWindow(id, draft.contextWindow);
-          setStoreFastMode(id, draft.fastMode ?? false);
+          setStoreServiceTier(id, draft.serviceTier ?? "default");
           setSessionLaunchMode(id, recoveryMode);
           // Mark the draft as promoted so subsequent mounts take the
           // existing promotedDraftThreadId branch above instead of
@@ -1492,7 +1493,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       model: null,
       resume_cursor: null,
       permission_mode: startMode,
-      fast_mode: false,
+      service_tier: "default",
       additional_directories: [],
       env: null,
     };
@@ -1548,7 +1549,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStorePermissionMode,
     setStoreEffort,
     setStoreContextWindow,
-    setStoreFastMode,
+    setStoreServiceTier,
     setSessionLaunchMode,
     providerDefaultPermissionMode,
     markDraftPromoted,
@@ -2541,7 +2542,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           : currentSlice.contextWindow;
       const nextModel =
         updates.model !== undefined ? updates.model : currentSlice.model;
-      const nextFastMode = currentSlice.fastMode;
+      const nextServiceTier = currentSlice.serviceTier;
       void (async () => {
         try {
           await agentChatStopSession(provider, threadId);
@@ -2564,7 +2565,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               permission_mode: nextMode,
               effort: nextEffort,
               context_window: nextContext,
-              fast_mode: nextFastMode,
+              service_tier: nextServiceTier,
               additional_directories: [],
               env: null,
             },
@@ -2964,12 +2965,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStoreModel(threadId, previous.model);
         setStoreEffort(threadId, previous.effort);
         setStoreContextWindow(threadId, previous.contextWindow);
-        setStoreFastMode(threadId, previous.fastMode);
+        setStoreServiceTier(threadId, previous.serviceTier);
         persistSessionConfig({
           model: previous.model,
           effort: previous.effort,
           context_window: previous.contextWindow,
-          fast_mode: previous.fastMode,
+          service_tier: previous.serviceTier,
         });
       };
       setStoreModel(threadId, next);
@@ -2982,7 +2983,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         newModel: nextModel,
         currentEffort: effort,
         currentContextWindow: contextWindow,
-        currentFastMode: fastMode,
+        currentServiceTier: serviceTier,
       });
       // Fold the model change and any compat-driven effort/context
       // resets into a single persisted patch so a restart doesn't
@@ -2996,9 +2997,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStoreContextWindow(threadId, plan.resetContextWindow);
         configPatch.context_window = plan.resetContextWindow;
       }
-      if (plan.resetFastMode !== undefined) {
-        setStoreFastMode(threadId, plan.resetFastMode);
-        configPatch.fast_mode = plan.resetFastMode;
+      if (plan.resetServiceTier !== undefined) {
+        setStoreServiceTier(threadId, plan.resetServiceTier);
+        configPatch.service_tier = plan.resetServiceTier;
       }
       persistSessionConfig(configPatch);
       agentChatSetModel(provider, threadId, next).catch((err) => {
@@ -3022,11 +3023,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         rollback();
         toast.error(`Failed to set model: ${formatProviderError(err)}`);
       });
-      // A compat-driven Fast reset rides the live session too: both
-      // Fast-capable providers apply the tier without a relaunch, so the
+      // A compatibility reset rides the live session too: supported
+      // providers apply the tier without a relaunch, so the
       // model swap above stays the only reason to touch the session.
-      if (plan.resetFastMode !== undefined) {
-        agentChatSetFastMode(provider, threadId, plan.resetFastMode).catch(
+      if (plan.resetServiceTier !== undefined) {
+        agentChatSetServiceTier(provider, threadId, plan.resetServiceTier).catch(
           (err) => {
             toast.error(`Failed to set service tier: ${err}`);
           },
@@ -3040,11 +3041,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       capabilities,
       effort,
       contextWindow,
-      fastMode,
+      serviceTier,
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
-      setStoreFastMode,
+      setStoreServiceTier,
       persistSessionConfig,
       restartSessionWith,
     ],
@@ -3165,43 +3166,47 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ],
   );
 
-  const fastModeChangesInFlightRef = useRef(new Set<string>());
-  const handleFastModeChange = useCallback(
-    (next: boolean) => {
-      if (!threadId || (next && !activeModel?.supports_fast_mode)) return;
+  const serviceTierChangesInFlightRef = useRef(new Set<string>());
+  const handleServiceTierChange = useCallback(
+    (next: string) => {
+      if (!threadId || (next !== "default" && resolveServiceTier(activeModel, next) !== next)) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
-      if (fastModeChangesInFlightRef.current.has(threadId)) return;
+      if (serviceTierChangesInFlightRef.current.has(threadId)) return;
       const current = useAgentChatStore.getState().threads[threadId];
-      if (!current || current.fastMode === next) return;
-      fastModeChangesInFlightRef.current.add(threadId);
+      if (!current || current.serviceTier === next) return;
+      serviceTierChangesInFlightRef.current.add(threadId);
       // Codex carries the service tier on `turn/start`; Cursor exposes a live
       // ACP Fast config option. Neither requires replacing the conversation.
-      agentChatSetFastMode(provider, threadId, next)
+      agentChatSetServiceTier(provider, threadId, next)
         // Reflect the tier only after the provider accepts it. Keep requests
         // for this thread sequential so an older result cannot win a race.
-        .then(() => setStoreFastMode(threadId, next))
+        .then(() => setStoreServiceTier(threadId, next))
         .catch((err) => {
-          toast.error(`Failed to set service tier: ${err}`);
+          const message = formatProviderError(err);
+          toast.error(`Failed to set service tier: ${message}`);
+          if (provider === "codex" && message.includes("service tier is unavailable")) {
+            void useProviderCapabilities.getState().refresh(provider);
+          }
         })
-        .finally(() => fastModeChangesInFlightRef.current.delete(threadId));
+        .finally(() => serviceTierChangesInFlightRef.current.delete(threadId));
     },
     [
       threadId,
       provider,
       activeModel,
       grokConfigurationBusy,
-      setStoreFastMode,
+      setStoreServiceTier,
     ],
   );
 
   // Capability payloads can change between app launches. If a persisted
-  // Fast choice is no longer valid for the resolved model, heal it back to
-  // Standard instead of keeping a hidden premium-tier override alive.
+  // tier choice is no longer valid for the resolved model, resolve it
+  // against the current catalog instead of keeping a hidden premium-tier override alive.
   useEffect(() => {
-    if (conversationWritable && fastMode && activeModel && !activeModel.supports_fast_mode) {
-      handleFastModeChange(false);
+    if (conversationWritable && activeModel && resolveServiceTier(activeModel, serviceTier) !== serviceTier) {
+      handleServiceTierChange(resolveServiceTier(activeModel, serviceTier));
     }
-  }, [conversationWritable, fastMode, activeModel, handleFastModeChange]);
+  }, [conversationWritable, serviceTier, activeModel, handleServiceTierChange]);
 
   // Grok's installed CLI owns this catalogue and the store refreshes it while
   // Codemux is running. Reconcile removals as well as additions: a retired
@@ -3240,7 +3245,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       newModel: advertisedModel,
       currentEffort: effort,
       currentContextWindow: contextWindow,
-      currentFastMode: fastMode,
+      currentServiceTier: serviceTier,
     });
     const previousEffort = effort;
     const effortAttemptKey =
@@ -3299,7 +3304,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     handleModelChange,
     persistSessionConfig,
     setStoreEffort,
@@ -3355,7 +3360,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               context_window: defaults.contextWindow,
               // Speed tiers are provider/model-scoped: never carry a Fast
               // selection across a provider switch.
-              fast_mode: false,
+              service_tier: "default",
               additional_directories: [],
               env: null,
             },
@@ -3376,7 +3381,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           setStoreContextWindow(targetThreadId, defaults.contextWindow);
           setStorePermissionMode(targetThreadId, nextDisplayMode);
           setSessionLaunchMode(targetThreadId, nextLaunchMode);
-          setStoreFastMode(targetThreadId, false);
+          setStoreServiceTier(targetThreadId, "default");
           setStoreResumeCursor(targetThreadId, null);
           // Provider-specific transient modes cannot safely cross adapters.
           setStoreMode(targetThreadId, "default");
@@ -3397,7 +3402,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 permission_mode: oldLaunchMode,
                 effort: currentSlice.effort,
                 context_window: currentSlice.contextWindow,
-                fast_mode: currentSlice.fastMode ?? false,
+                service_tier: currentSlice.serviceTier ?? "default",
                 additional_directories: [],
                 env: null,
               },
@@ -3434,7 +3439,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setStoreContextWindow,
       setStorePermissionMode,
       setSessionLaunchMode,
-      setStoreFastMode,
+      setStoreServiceTier,
       setStoreResumeCursor,
       setStoreMode,
       setStoreModePriorPermissionMode,
@@ -3940,7 +3945,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       permissionMode={permissionMode}
       effort={effort}
       contextWindow={contextWindow}
-      fastMode={fastMode}
+      serviceTier={serviceTier}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -4004,7 +4009,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
-      onFastModeChange={handleFastModeChange}
+      onServiceTierChange={handleServiceTierChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />

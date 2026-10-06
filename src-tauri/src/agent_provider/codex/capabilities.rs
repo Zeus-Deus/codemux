@@ -246,15 +246,46 @@ pub fn build_capabilities(entries: Vec<ModelEntry>) -> ProviderChatCapabilities 
     }
 }
 
-fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
-    let supports_images = entry
-        .input_modalities
-        .iter()
-        .any(|m| m == "image");
-    let supports_fast_mode = entry
+/// Prefer the current catalog, with compatibility for older Codex binaries.
+pub fn service_tiers_for_model(
+    entry: &ModelEntry,
+) -> Vec<crate::agent_provider::types::ServiceTierOption> {
+    use crate::agent_provider::types::ServiceTierOption;
+    if !entry.service_tiers.is_empty() {
+        return entry
+            .service_tiers
+            .iter()
+            .map(|tier| ServiceTierOption {
+                value: tier.id.clone(),
+                label: tier.name.clone(),
+                description: tier.description.clone(),
+            })
+            .collect();
+    }
+    entry
         .additional_speed_tiers
         .iter()
-        .any(|t| t == "fast");
+        .map(|id| ServiceTierOption {
+            value: id.clone(),
+            label: match id.as_str() {
+                "fast" => "Fast",
+                "ultrafast" => "Ultrafast",
+                _ => id,
+            }
+            .into(),
+            description: match id.as_str() {
+                "fast" => "Faster output at a premium usage rate",
+                "ultrafast" => "Even faster output at a higher usage rate",
+                _ => "",
+            }.into(),
+        })
+        .collect()
+}
+
+fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
+    let supports_images = entry.input_modalities.iter().any(|modality| modality == "image");
+    let service_tiers = service_tiers_for_model(&entry);
+    let supports_fast_mode = service_tiers.iter().any(|tier| tier.value == "fast" || tier.value == "priority");
     let effort_levels: Vec<String> = entry
         .supported_reasoning_efforts
         .iter()
@@ -302,6 +333,7 @@ fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
         supports_adaptive_thinking: false,
         supports_thinking_toggle: false,
         supports_fast_mode,
+        service_tiers,
         supports_images,
         sub_provider: None,
         is_free: false,
@@ -597,5 +629,35 @@ mod tests {
         let info = model_entry_to_chat_info(entry("gpt-5", false, vec!["text"]));
         assert!(info.max_context_tokens.is_none());
         assert!(info.context_window_options.is_empty());
+    }
+
+    #[test]
+    fn service_tiers_prefer_current_catalog_and_keep_legacy_compatibility() {
+        let current: ModelEntry = serde_json::from_value(json!({
+            "id": "model-current", "additionalSpeedTiers": ["fast"],
+            "serviceTiers": [
+                {"id": "priority", "name": "Fast", "description": "Premium speed"},
+                {"id": "ultrafast", "name": "Ultrafast", "description": "Higher usage"}
+            ]
+        }))
+        .unwrap();
+        let caps = build_capabilities(vec![current]);
+        let tiers = &caps.models[0].service_tiers;
+        assert!(caps.models[0].supports_fast_mode);
+        assert_eq!(
+            tiers
+                .iter()
+                .map(|tier| tier.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["priority", "ultrafast"]
+        );
+        assert_eq!(tiers[1].description, "Higher usage");
+
+        let mut legacy = entry("model-legacy", false, vec![]);
+        legacy.additional_speed_tiers = vec!["fast".into()];
+        assert_eq!(
+            build_capabilities(vec![legacy]).models[0].service_tiers[0].value,
+            "fast"
+        );
     }
 }

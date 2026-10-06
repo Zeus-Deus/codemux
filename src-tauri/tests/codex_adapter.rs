@@ -125,6 +125,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         effort: None,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         recorded_usage_baseline: None,
         env: None,
@@ -2480,4 +2481,130 @@ async fn gui_queued_steer_failure_keeps_message_cancellable() {
     let id = queued.queued_id.expect("busy send must queue");
     assert!(provider.steer_queued_turn(thread.clone(), id.clone()).await.is_err());
     assert!(provider.cancel_queued_turn(thread, id).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_tier_ultrafast_roundtrips_and_rejects_unavailable_choices() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_path = dir.path().join("models.json");
+    let capture_path = dir.path().join("turn.json");
+    let trace_path = dir.path().join("trace.jsonl");
+    let tiers = json!([
+        {"id": "priority", "name": "Fast", "description": "Premium speed"},
+        {"id": "ultrafast", "name": "Ultrafast", "description": "Higher usage"}
+    ]);
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&json!([
+            {"id": "gpt-test", "model": "gpt-test", "isDefault": true, "serviceTiers": tiers},
+            {"id": "gpt-small", "model": "gpt-small", "serviceTiers": [tiers[0]]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let script = write_script(json!([{
+        "after": "turn/start", "delay_ms": 5, "emit": "notification", "method": "turn/started",
+        "params": {"threadId": "c-1", "turnId": "tier-test"}
+    }, {
+        "after": "turn/start", "delay_ms": 20, "emit": "notification", "method": "turn/completed",
+        "params": {"threadId": "c-1", "turnId": "tier-test", "status": "succeeded"}
+    }]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_SCRIPT", script.path.to_str().unwrap()),
+        ("FAKE_CODEX_MODELS", catalog_path.to_str().unwrap()),
+        ("FAKE_CODEX_CAPTURE_TURN", capture_path.to_str().unwrap()),
+        ("FAKE_CODEX_TRACE", trace_path.to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let thread = ThreadId("tier-roundtrip".into());
+    let mut input = start_input(&thread.0);
+    input.model = Some("gpt-test".into());
+    input.service_tier = Some("ultrafast".into());
+    input.resume_cursor = Some(json!({"resume": "native-tier-thread"}));
+    start_session_resilient(&provider, input).await.unwrap();
+
+    async fn send_and_capture(
+        provider: &CodexAgentProvider,
+        thread: &ThreadId,
+        path: &std::path::Path,
+    ) -> String {
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: thread.clone(),
+                text: "continue".into(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+                display_text: None,
+                skill_invocations: vec![],
+                turn_checkpoint: None,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while provider.turn_active(thread).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("fixture turn should complete before the next send");
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(value.get("serviceTier").is_none());
+        value["serviceTierForTurn"].as_str().unwrap().into()
+    }
+
+    assert_eq!(
+        send_and_capture(&provider, &thread, &capture_path).await,
+        "ultrafast"
+    );
+    assert!(provider
+        .set_service_tier(thread.clone(), "flex".into())
+        .await
+        .is_err());
+    assert_eq!(
+        send_and_capture(&provider, &thread, &capture_path).await,
+        "ultrafast"
+    );
+    provider
+        .set_service_tier(thread.clone(), "priority".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        send_and_capture(&provider, &thread, &capture_path).await,
+        "priority"
+    );
+    provider
+        .set_service_tier(thread.clone(), "default".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        send_and_capture(&provider, &thread, &capture_path).await,
+        "default"
+    );
+    provider
+        .set_service_tier(thread.clone(), "ultrafast".into())
+        .await
+        .unwrap();
+    provider
+        .set_model(thread.clone(), "gpt-small".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        send_and_capture(&provider, &thread, &capture_path).await,
+        "default"
+    );
+    assert!(provider
+        .set_service_tier(thread.clone(), "ultrafast".into())
+        .await
+        .is_err());
+    provider.stop_session(thread).await.unwrap();
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("\"method\":\"thread/resume\""))
+            .count(),
+        1
+    );
+    assert!(!trace.contains("\"method\":\"thread/start\""));
 }
