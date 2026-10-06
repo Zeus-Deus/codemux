@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -23,7 +24,14 @@ const STEALTH_CHROMIUM_ARGS: &str = "\
 --password-store=basic";
 
 /// Detect installed Chrome/Chromium version and return a realistic user-agent string.
-fn stealth_user_agent() -> String {
+fn stealth_user_agent() -> &'static str {
+    // The browser version is stable for the lifetime of this process. Probing
+    // it for every DOM action adds a subprocess round-trip to every command.
+    static USER_AGENT: OnceLock<String> = OnceLock::new();
+    USER_AGENT.get_or_init(detect_stealth_user_agent)
+}
+
+fn detect_stealth_user_agent() -> String {
     let candidates = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
     for bin in candidates {
         let mut cmd = std::process::Command::new(bin);
@@ -728,23 +736,15 @@ fn extract_eval_result(stdout: &str) -> String {
 fn resolve_binary() -> String {
     // 1. System PATH (AUR/system package, cargo install, manual install).
     //
-    // Unix-only: `which` is a Unix tool, and Git Bash on Windows has
-    // different extension-handling semantics — on `windows-latest` CI it
-    // was returning paths without the `.exe` suffix that looked valid but
-    // pointed at non-existent files, breaking downstream callers. The
-    // Windows discovery is not native yet; for now, Windows falls through to
-    // the Tauri sidecar lookup and then the `npx agent-browser` fallback.
+    // Resolve PATH in-process instead of spawning the `which` command.
+    // Windows prefers its bundled sidecar before trying PATH below.
     #[cfg(unix)]
     {
-        let mut which_cmd = std::process::Command::new("which");
-        which_cmd.arg("agent-browser");
-        if let Ok(output) = output_capture_with_timeout(which_cmd, PROC_CONTROL_TIMEOUT) {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                // Skip the node_modules/.bin shim — we want the native binary directly
-                if !path.is_empty() && !path.contains("node_modules/.bin") {
-                    return path;
-                }
+        if let Ok(path) = which::which("agent-browser") {
+            let path = path.to_string_lossy();
+            // Skip the node_modules/.bin shim — we want the native binary directly.
+            if !path.contains("node_modules/.bin") {
+                return path.into_owned();
             }
         }
     }
@@ -1021,13 +1021,8 @@ fn format_dpr(dpr: f64) -> String {
     }
 }
 
-/// Argv-form sibling of `build_agent_browser_command`. Returns a list of
-/// argument vectors, one per agent-browser invocation: most actions are
-/// single-shot, but the historical `open_url` shell form was
-/// `<bin> open <url> --session <sid> && <bin> wait --load load --session <sid>`,
-/// which becomes two sequential argv groups. Used only on Windows so we can
-/// spawn `agent-browser.exe` directly without going through `sh -c` (and
-/// therefore without depending on Git Bash being installed).
+/// Argv-form sibling of `build_agent_browser_command`. Used only on Windows
+/// to spawn agent-browser.exe without depending on Git Bash being installed.
 #[cfg(target_os = "windows")]
 fn build_agent_browser_argv_groups(
     session: &str,
@@ -1050,18 +1045,9 @@ fn build_agent_browser_argv_groups(
             // the user hit.
             let mut open_argv: Vec<String> = windows_executable_path_args();
             open_argv.extend(["open".into(), url, "--session".into(), s.clone()]);
-            // The follow-up `wait --load load` doesn't need
-            // --executable-path; it talks to the already-running daemon.
-            vec![
-                open_argv,
-                vec![
-                    "wait".into(),
-                    "--load".into(),
-                    "load".into(),
-                    "--session".into(),
-                    s,
-                ],
-            ]
+            // agent-browser open already waits for load. A second wait
+            // subscribes after that event and can stall until its timeout.
+            vec![open_argv]
         }
         "screenshot" => vec![vec!["screenshot".into(), "--session".into(), s]],
         "snapshot" | "accessibility_snapshot" => vec![vec![
@@ -1246,7 +1232,7 @@ fn build_agent_browser_command(session: &str, action: &str, params: &serde_json:
         "open_url" | "open" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
             format!(
-                "{bin} open {url} --session {s} && {bin} wait --load load --session {s}",
+                "{bin} open {url} --session {s}",
                 bin = bin,
                 url = shell_quote(url),
                 s = session,
@@ -2497,13 +2483,13 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn build_command_open_chains_wait_load() {
+    fn build_command_open_uses_navigation_load_wait_only() {
         let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
         let bin = resolve_binary();
         assert!(cmd.starts_with(&bin), "Command should start with resolved binary: {}", cmd);
         assert!(cmd.contains("--session test-session"));
         assert!(cmd.contains("https://example.com"));
-        assert!(cmd.contains("wait --load load"), "Should wait for load event: {}", cmd);
+        assert!(!cmd.contains("wait --load"), "open already waits for load: {}", cmd);
         assert!(!cmd.contains("stream disable"), "Should NOT restart stream: {}", cmd);
     }
 
@@ -2648,14 +2634,14 @@ mod tests {
     /// argv shape directly instead of trying to share assertions.
     #[cfg(target_os = "windows")]
     #[test]
-    fn build_argv_open_chains_wait_load() {
+    fn build_argv_open_uses_navigation_load_wait_only() {
         let groups = build_agent_browser_argv_groups(
             "test-session",
             "open",
             &serde_json::json!({"url": "https://example.com"}),
         )
         .unwrap();
-        assert_eq!(groups.len(), 2, "open should produce open + wait groups");
+        assert_eq!(groups.len(), 1, "open already waits for load");
 
         // `windows_executable_path_args()` may prepend a global
         // `--executable-path <path>` pair when Chrome / Brave / Edge is
@@ -2681,9 +2667,7 @@ mod tests {
         assert!(argv.contains(&"https://example.com".to_string()));
         assert!(argv.contains(&"--session".to_string()));
         assert!(argv.contains(&"test-session".to_string()));
-        assert_eq!(groups[1][0], "wait");
-        assert!(groups[1].contains(&"--load".to_string()));
-        assert!(groups[1].contains(&"load".to_string()));
+        assert!(!argv.contains(&"wait".to_string()));
     }
 
     #[cfg(target_os = "windows")]
