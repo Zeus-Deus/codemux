@@ -326,6 +326,13 @@ describe("stackGroups", () => {
     expect(stackGroups(prs).map((g) => g.map((p) => p.number))).toEqual([[1, 2, 3]]);
   });
 
+  it("keeps PRs based on each other in one group whatever order they arrive in", () => {
+    const a = pr(1, "OPEN", "x", "y");
+    const b = pr(2, "OPEN", "y", "x");
+    expect(stackGroups([a, b])).toHaveLength(1);
+    expect(stackGroups([b, a])).toHaveLength(1);
+  });
+
   it("does not call a single PR a stack", () => {
     expect(isSingleStack([pr(1, "OPEN")])).toBe(false);
   });

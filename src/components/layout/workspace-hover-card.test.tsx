@@ -282,6 +282,23 @@ describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
     expect(screen.queryByText("Pull request")).not.toBeInTheDocument();
   });
 
+  it("ends a stack's rail at the last row shown when the list is capped", () => {
+    const stack = Array.from({ length: 12 }, (_, i) => ({
+      number: 100 + i,
+      state: "OPEN",
+      url: `https://github.com/u/r/pull/${100 + i}`,
+      head_branch: `layer-${i + 1}`,
+      base_branch: i === 0 ? "main" : `layer-${i}`,
+      source: "worktree" as const,
+    }));
+    const { container } = renderBody(makeWorkspace({ prs: stack }));
+
+    expect(container.querySelectorAll("[data-pr-set-row]")).toHaveLength(10);
+    expect(screen.getByText("+2 more")).toBeInTheDocument();
+    // Nine joins between ten visible glyphs, two segments each — none past the last.
+    expect(container.querySelectorAll("[data-pr-stack-rail]")).toHaveLength(18);
+  });
+
   it("shows PR number and state with the shared PR tone", () => {
     renderBody(makeWorkspace({ pr_number: 140, pr_state: "merged" }));
     expect(valueFor("Pull request")).toBe("#140 · merged");

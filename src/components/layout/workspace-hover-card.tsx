@@ -510,6 +510,14 @@ function PrSetRows({
   );
   const visible = ordered.slice(0, PR_SET_VISIBLE);
   const hidden = ordered.length - visible.length;
+  // A stack cut off by the cap ends its rail at the last glyph shown rather
+  // than dangling into the "+N more" line.
+  if (hidden > 0) {
+    visible[visible.length - 1] = {
+      ...visible[visible.length - 1],
+      linksUp: false,
+    };
+  }
   const singleStack = groups.length === 1 && summary.total > 1;
   return (
     <div data-pr-set>

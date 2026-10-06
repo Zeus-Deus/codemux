@@ -241,12 +241,17 @@ export function stackOrder(prs: readonly WorkspacePrRef[]): WorkspacePrRef[] {
 export function stackGroups(prs: readonly WorkspacePrRef[]): WorkspacePrRef[][] {
   const rootOf = (pr: WorkspacePrRef): number => {
     let cursor = pr;
-    const seen = new Set<number>([cursor.number]);
+    const path = [cursor.number];
     for (;;) {
       const parent = stackedOn(cursor, prs);
-      // A cycle has no root; its first-seen member stands in for one.
-      if (!parent || seen.has(parent.number)) return cursor.number;
-      seen.add(parent.number);
+      if (!parent) return cursor.number;
+      const loopStart = path.indexOf(parent.number);
+      if (loopStart !== -1) {
+        // A cycle has no root. Its lowest number stands in for one, so every
+        // member — and anything stacked on it — answers the same.
+        return Math.min(...path.slice(loopStart));
+      }
+      path.push(parent.number);
       cursor = parent;
     }
   };
