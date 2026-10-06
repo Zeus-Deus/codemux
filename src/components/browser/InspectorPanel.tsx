@@ -1,15 +1,18 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Copy, Check, Terminal, X } from "lucide-react";
+import { Copy, Check, MessageSquarePlus, X } from "lucide-react";
 import type { ElementInfo } from "./inspector";
 
 interface Props {
   element: ElementInfo;
+  /** Title of the pane "Send to agent" would deliver to; null when the
+   *  workspace has no agent chat or terminal to receive it. */
+  agentTargetTitle: string | null;
   onDismiss: () => void;
-  onTellAgent: (selector: string) => void;
+  onTellAgent: (element: ElementInfo) => void;
 }
 
-export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
+export function InspectorPanel({ element, agentTargetTitle, onDismiss, onTellAgent }: Props) {
   const [copied, setCopied] = useState(false);
 
   const copySelector = async () => {
@@ -18,8 +21,12 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
     setTimeout(() => setCopied(false), 1500);
   };
 
+  const sendTitle = agentTargetTitle
+    ? `Send to agent (${agentTargetTitle})`
+    : "No agent in this workspace";
+
   return (
-    <div className="flex shrink-0 items-center gap-2 border-b border-border/50 bg-card px-2 py-1">
+    <div className="flex shrink-0 items-center gap-2 border-b border-border/50 bg-card px-2 py-1 motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-1 motion-safe:duration-150">
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <span className="shrink-0 rounded-sm bg-primary/10 px-1.5 py-0.5 font-mono text-label font-semibold text-primary">
           {element.tag}
@@ -47,15 +54,18 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
         >
           {copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
         </Button>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Tell Agent"
-          title="Tell Agent"
-          onClick={() => onTellAgent(element.selector)}
-        >
-          <Terminal className="size-3" />
-        </Button>
+        {/* The wrapper carries the tooltip: a disabled button gets no hover. */}
+        <span title={sendTitle} className="inline-flex">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Send to agent"
+            disabled={!agentTargetTitle}
+            onClick={() => onTellAgent(element)}
+          >
+            <MessageSquarePlus className="size-3" />
+          </Button>
+        </span>
         <Button
           variant="ghost"
           size="icon-xs"

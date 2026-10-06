@@ -1,17 +1,27 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
 import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { toast } from "@/lib/toast";
+import { Button } from "@/components/ui/button";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
-import { Loader2, Globe } from "lucide-react";
-import type { ElementInfo } from "./inspector";
+import { Loader2, Globe, RotateCw, Copy } from "lucide-react";
+import type { AgentTarget, ElementInfo } from "./inspector";
 import {
   INSPECTOR_INJECT_SCRIPT,
   INSPECTOR_CLEANUP_SCRIPT,
   buildElementQueryScript,
   parseEvalResult,
-  findFirstTerminalPane,
+  findAgentTarget,
+  buildTellAgentPrompt,
 } from "./inspector";
+import {
+  browserChromeShortcut,
+  browserViewportPresetSize,
+  runBrowserNav,
+  type BrowserViewportPresetId,
+} from "./browser-nav";
 import {
   type CdpButton,
   type ClickState,
@@ -64,6 +74,32 @@ interface Props {
    *  doesn't force the agent's page to reflow at popover dimensions.
    *  Absent = today's container-sync behavior, unchanged. */
   fixedViewport?: { width: number; height: number };
+  /** Reports the stream status so a host without the full-pane status
+   *  states (the peek overlay's header dot) can reflect it. */
+  onStatusChange?: (status: BrowserStreamStatus) => void;
+}
+
+export type BrowserStreamStatus = "starting" | "connecting" | "waiting" | "live" | "error";
+
+type AppStoreState = ReturnType<typeof useAppStore.getState>;
+
+/** The active workspace's agent pane, which "Send to agent" writes to. */
+function resolveAgentTarget(s: AppStoreState): AgentTarget | null {
+  const workspaceId = selectActiveWorkspaceId(s);
+  const ws = s.appState?.workspaces.find((w) => w.workspace_id === workspaceId);
+  const surface = ws?.surfaces.find((sf) => sf.surface_id === ws.active_surface_id);
+  return surface ? findAgentTarget(surface) : null;
+}
+
+/** "Retrying in Ns" for the slow reconnect loop, ticking once a second. */
+function RetryCountdown({ at }: { at: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const seconds = Math.max(0, Math.ceil((at - now) / 1000));
+  return <span className="tabular-nums">Retrying in {seconds}s</span>;
 }
 
 // Move-forwarding cadence (ms). Drags run tight for smooth text
@@ -93,19 +129,32 @@ interface PendingMove {
 // PaneNode drives this with primitive props (browserId/focused/visible), so the
 // pane skips re-render on backend ticks that don't touch them. Export-only
 // wrapper: the component body below is unchanged.
-export const BrowserPane = memo(function BrowserPane({ browserId, focused, visible, workspaceId, traceWorkspaceId, hideToolbar, fixedViewport }: Props) {
+export const BrowserPane = memo(function BrowserPane({ browserId, focused, visible, workspaceId, traceWorkspaceId, hideToolbar, fixedViewport, onStatusChange }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const urlInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const viewportRef = useRef<ViewportInfo>({ width: 1280, height: 720 });
-  // Ref-mirror of the `fixedViewport` prop so the WebSocket and
+  // A toolbar viewport preset pins the viewport the same way the
+  // `fixedViewport` prop does; the prop (peek overlay) always wins.
+  const [viewportPreset, setViewportPreset] = useState<BrowserViewportPresetId>("fit");
+  // Ref-mirror of the effective pinned viewport so the WebSocket and
   // ResizeObserver effects can read it without listing it in their
   // dependency arrays (an inline object literal from the caller would
   // otherwise reconnect the stream every render).
   const fixedViewportRef = useRef(fixedViewport);
-  fixedViewportRef.current = fixedViewport;
-  const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
+  fixedViewportRef.current = fixedViewport ?? browserViewportPresetSize(viewportPreset) ?? undefined;
+  const [status, setStatus] = useState<BrowserStreamStatus>("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Bumping this re-runs the stream effect from the top: "Retry now".
+  const [retryNonce, setRetryNonce] = useState(0);
+  // When the slow reconnect loop will try next; null while not waiting.
+  const [retryAt, setRetryAt] = useState<number | null>(null);
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+  useEffect(() => {
+    onStatusChangeRef.current?.(status);
+  }, [status]);
   const [hasFrame, setHasFrame] = useState(false);
   const hasFrameRef = useRef(false);
   const frameCountRef = useRef(0);
@@ -216,20 +265,31 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     if (canvas) canvas.style.cursor = inspectorActive ? "crosshair" : "default";
   }, [inspectorActive]);
 
-  // Tell Agent: write selector to first terminal pane
-  const handleTellAgent = useCallback(async (selector: string) => {
-    const appState = useAppStore.getState().appState;
-    if (!appState) return;
-    const ws = appState.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()));
-    if (!ws) return;
-    const surface = ws.surfaces.find((s) => s.surface_id === ws.active_surface_id);
-    if (!surface) return;
-    const termPane = findFirstTerminalPane(surface.root);
-    if (!termPane) return;
-    await activatePane(termPane.pane_id);
-    const prompt = `In the browser, select the element "${selector}" and `;
-    await writeToPty(termPane.session_id, prompt);
-    setSelectedElement(null);
+  // Only the title is subscribed: a string keeps the selector stable
+  // across unrelated store ticks. The full target is re-resolved on click.
+  const agentTargetTitle = useAppStore((s) => resolveAgentTarget(s)?.title ?? null);
+
+  // Send to agent: a chat composer gets the reference appended to its
+  // draft; a terminal gets it typed at the prompt (never submitted).
+  const handleTellAgent = useCallback(async (element: ElementInfo) => {
+    const target = resolveAgentTarget(useAppStore.getState());
+    if (!target) return;
+    const prompt = buildTellAgentPrompt(element, currentUrlRef.current);
+    try {
+      if (target.kind === "agent_chat") {
+        const chat = useAgentChatStore.getState();
+        const current = chat.threads[target.threadId]?.inputDraft ?? "";
+        chat.setInputDraft(target.threadId, current.trim() ? `${current}\n${prompt}` : prompt);
+        await activatePane(target.paneId);
+      } else {
+        await activatePane(target.paneId);
+        await writeToPty(target.sessionId, prompt);
+      }
+      toast.success(`Sent to ${target.title}`);
+      setSelectedElement(null);
+    } catch (err) {
+      toast.error("Couldn't send to the agent", { description: String(err) });
+    }
   }, []);
 
   // Keep the stream URL reactive.
@@ -253,10 +313,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
 
     let ws: WebSocket | null = null;
     let active = true;
+    let slowRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    const slowRetryMs = 10000;
 
     (async () => {
       setStatus("starting");
       setErrorMsg(null);
+      setRetryAt(null);
       frameCountRef.current = 0;
 
       const streamSessionId = browserSession?.agent_session_name ?? browserId;
@@ -273,6 +336,10 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         console.error("[browser] startBrowserStream FAILED", err);
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
+        // Same slow cadence as the reconnect loop: the daemon may come
+        // back on its own, and the user can always retry sooner.
+        setRetryAt(Date.now() + slowRetryMs);
+        slowRetryTimer = setTimeout(() => setRetryNonce((n) => n + 1), slowRetryMs);
         return;
       }
 
@@ -307,10 +374,10 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       // self-heal when it does.
       let retries = 0;
       const maxRetries = 15;
-      const slowRetryMs = 10000;
 
       function connectWS() {
         if (!active) return;
+        setRetryAt(null);
         if (retries === 0) setStatus("connecting");
         else if (retries < maxRetries) setStatus("waiting");
         // Past the fast budget: stay in "error" while slow-retrying so
@@ -421,8 +488,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
 
                 drawInfoRef.current = { x: drawX, y: drawY, w: drawW, h: drawH };
 
-                ctx.fillStyle = '#000';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                // Clear rather than paint the letterbox: the pane's themed
+                // background shows through, in light and dark alike.
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
                 ctx.drawImage(img, drawX, drawY, drawW, drawH);
               };
               img.src = `data:image/jpeg;base64,${msg.data}`;
@@ -462,8 +530,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             setTimeout(connectWS, 1500);
           } else {
             setStatus("error");
-            setErrorMsg("Stream disconnected — retrying…");
-            setTimeout(connectWS, slowRetryMs);
+            setErrorMsg("Stream disconnected");
+            setRetryAt(Date.now() + slowRetryMs);
+            slowRetryTimer = setTimeout(connectWS, slowRetryMs);
           }
         };
       }
@@ -497,6 +566,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     return () => {
       active = false;
       clearInterval(livenessInterval);
+      if (slowRetryTimer) clearTimeout(slowRetryTimer);
       // Close WebSocket on cleanup so the stream server's client count resets.
       // On StrictMode remount, the daemon is already running (*running = true),
       // so startBrowserStream returns instantly and a fresh WS connects.
@@ -509,7 +579,36 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     // `reactiveStreamUrl` is included so a port re-allocation in the
     // backend (after a teardown/respawn cycle) tears down this WS and
     // reconnects against the fresh URL — the bug the old deps array missed.
-  }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl]);
+  }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl, retryNonce]);
+
+  const retryNow = () => setRetryNonce((n) => n + 1);
+
+  const copyErrorDetails = () => {
+    const details = [
+      `Browser session: ${effectiveSessionId}`,
+      `Status: ${status}`,
+      `Error: ${errorMsg ?? "Connection failed"}`,
+    ].join("\n");
+    navigator.clipboard
+      .writeText(details)
+      .then(() => toast.success("Copied error details"))
+      .catch(() => toast.error("Couldn't copy to the clipboard"));
+  };
+
+  // Toolbar viewport presets. A preset pins the viewport (the frame is
+  // letterboxed into the pane); "Fit pane" hands it back to the container.
+  const applyViewportPreset = (preset: BrowserViewportPresetId) => {
+    setViewportPreset(preset);
+    const size = browserViewportPresetSize(preset);
+    const container = containerRef.current;
+    const target = size ?? (container
+      ? { width: Math.round(container.clientWidth), height: Math.round(container.clientHeight) }
+      : null);
+    if (!target || target.width < 10 || target.height < 10) return;
+    viewportRef.current = target;
+    agentBrowserRun(effectiveSessionId, "viewport", target).catch(() => {});
+    sendInput({ type: "resize", ...target });
+  };
 
   // ── Pointer input ──────────────────────────────────────────────────
   //
@@ -820,6 +919,24 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     const combo = (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey;
     const key = e.key.toLowerCase();
 
+    // Browser-chrome shortcuts the page would otherwise swallow.
+    const shortcut = browserChromeShortcut(e);
+    if (shortcut === "address") {
+      const input = urlInputRef.current;
+      if (input) {
+        e.preventDefault();
+        e.stopPropagation();
+        input.focus();
+        input.select();
+        return;
+      }
+    } else if (shortcut) {
+      e.preventDefault();
+      e.stopPropagation();
+      runBrowserNav(effectiveSessionId, shortcut).catch(console.error);
+      return;
+    }
+
     if (combo && (key === "c" || key === "x")) {
       e.preventDefault();
       e.stopPropagation();
@@ -910,11 +1027,16 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           loading={status === "starting" || status === "connecting"}
           inspectorActive={inspectorActive}
           onInspectorToggle={toggleInspector}
+          urlInputRef={urlInputRef}
+          viewportPreset={viewportPreset}
+          // A remote viewer follows the desktop's viewport; it never sets it.
+          onViewportPresetChange={fixedViewport || isRemoteClient() ? undefined : applyViewportPreset}
         />
       )}
       {selectedElement && (
         <InspectorPanel
           element={selectedElement}
+          agentTargetTitle={agentTargetTitle}
           onDismiss={() => setSelectedElement(null)}
           onTellAgent={handleTellAgent}
         />
@@ -924,15 +1046,30 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             Once content exists, reconnects keep the last frame visible
             and surface a corner pill instead of blanking the pane. */}
         {status !== "live" && !hasFrame && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10 px-4 text-center">
             {status === "error" ? (
               <>
                 <Globe className="size-8 text-muted-foreground/30 mb-2" />
-                <p className="text-label text-destructive">{errorMsg || "Connection failed"}</p>
+                <p className="max-w-sm text-label text-destructive">{errorMsg || "Connection failed"}</p>
+                {retryAt !== null && (
+                  <p className="mt-1 text-label text-muted-foreground">
+                    <RetryCountdown at={retryAt} />
+                  </p>
+                )}
+                <div className="mt-3 flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={retryNow}>
+                    <RotateCw className="size-3.5" />
+                    Retry now
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={copyErrorDetails}>
+                    <Copy className="size-3.5" />
+                    Copy details
+                  </Button>
+                </div>
               </>
             ) : (
               <>
-                <Loader2 className="size-6 animate-spin text-muted-foreground mb-2" />
+                <Loader2 className="size-6 motion-safe:animate-spin text-muted-foreground mb-2" />
                 <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
@@ -951,10 +1088,22 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               <>
                 <Globe className="size-3 text-destructive" />
                 <span className="text-label text-destructive">{errorMsg || "Stream disconnected"}</span>
+                {retryAt !== null && (
+                  <span className="text-label text-muted-foreground">
+                    · <RetryCountdown at={retryAt} />
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={retryNow}
+                  className="rounded-sm text-label font-medium text-foreground underline-offset-2 hover:underline"
+                >
+                  Retry now
+                </button>
               </>
             ) : (
               <>
-                <Loader2 className="size-3 animate-spin text-muted-foreground" />
+                <Loader2 className="size-3 motion-safe:animate-spin text-muted-foreground" />
                 <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}
@@ -963,7 +1112,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         <canvas
           ref={canvasRef}
           tabIndex={0}
-          className="absolute inset-0 w-full h-full outline-none"
+          aria-label="Browser page"
+          // The canvas takes every key, so focus has to show on it.
+          className="absolute inset-0 w-full h-full outline-none focus:outline-solid focus:outline-1 focus:-outline-offset-1 focus:outline-ring/60"
           onPointerDown={handlePointerDown}
           onPointerUp={handlePointerUp}
           onPointerMove={handlePointerMove}
