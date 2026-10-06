@@ -55,10 +55,10 @@ function StateGlyph({ row }: { row: PrRowData }) {
  * verdict yet, and a green check on one reads as "ready".
  *
  * `checks === null` is the row painting before its rollup has arrived.
- * It gets a placeholder — dimmer than "no checks", not a colour and not
- * a spinner, because a spinner would claim CI is running and a colour
- * would claim a verdict. It is the shape the answer will take, holding
- * the space the answer will fill.
+ * It gets a dim placeholder — not a colour and not a spinner, because a
+ * spinner would claim CI is running and a colour would claim a verdict.
+ * `"none"` is the host's answer that this pull request runs no checks,
+ * and renders nothing: there is no verdict to show.
  */
 function ChecksMark({ checks, draft }: { checks: string | null; draft: boolean }) {
   if (draft) return null;

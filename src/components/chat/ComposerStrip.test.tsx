@@ -240,6 +240,21 @@ describe("ComposerStrip — list", () => {
     expect(screen.getByTestId("composer-strip")).not.toHaveAttribute("data-open");
   });
 
+  it("leaves Escape to the page above it while its workspace is inert", () => {
+    // A utility page (Pull requests, Usage, …) covers the workspace and
+    // marks it `inert`. Claiming Escape there would leave the page open.
+    const { container } = render(
+      <div inert>
+        <Harness messages={busy} />
+      </div>,
+    );
+    fireEvent.click(screen.getByTestId("composer-strip-toggle"));
+    const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(within(container).getByTestId("composer-strip")).toHaveAttribute("data-open");
+  });
+
   it("closes when the list empties, and stays closed when work returns", () => {
     const { rerender } = render(<Harness messages={busy} />);
     fireEvent.click(screen.getByTestId("composer-strip-toggle"));

@@ -8,7 +8,7 @@ import {
   EllipsisVertical,
   Hourglass,
 } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import {
@@ -230,12 +230,16 @@ export function ComposerStrip({
   }, [hasGoal]);
 
   const anyOpen = open || goalOpen;
+  const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!anyOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       // Anything that already consumed Escape (a composer popup closing)
       // keeps it.
       if (e.key !== "Escape" || e.defaultPrevented) return;
+      // Under a utility page the workspace is `inert`; the page owns
+      // Escape, and claiming it here would leave the page open.
+      if (rootRef.current?.closest("[inert]")) return;
       e.preventDefault();
       setOpen(false);
       setGoalOpen(false);
@@ -282,6 +286,7 @@ export function ComposerStrip({
 
   return (
     <div
+      ref={rootRef}
       data-testid="composer-strip"
       data-open={open || undefined}
       data-lead={goal ? "goal" : lead.kind}
