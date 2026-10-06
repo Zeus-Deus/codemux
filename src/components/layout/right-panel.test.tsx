@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -466,20 +466,50 @@ describe("RightPanel deck", () => {
     expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe(RIGHT_PANEL_EMPTY);
   });
 
-  it("offers every openable surface as a card when the deck is empty", async () => {
+  it("offers every openable surface as a row when the deck is empty", async () => {
     const user = userEvent.setup();
     useUIStore.setState({ rightPanelPanes: { "ws-1": [] } });
     renderDeck({ activeTab: RIGHT_PANEL_EMPTY });
 
     const picker = screen.getByTestId("right-panel-picker");
     expect(picker).toHaveTextContent("Open a surface");
-    expect(picker).toHaveTextContent("Choose what to show in the right panel.");
-    // Every card carries its one-line description from the registry.
-    expect(picker).toHaveTextContent("Browse and read the workspace tree.");
+    // Each row's one-line description from the registry is its tooltip.
+    expect(screen.getByTestId("right-panel-picker-files")).toHaveAttribute(
+      "title",
+      "Browse and read the workspace tree.",
+    );
 
     await user.click(screen.getByTestId("right-panel-picker-changes"));
     expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("changes");
     expect(useUIStore.getState().getRightPanelPanes("ws-1")).toContain("changes");
+  });
+
+  it("closes the other tabs from a tab's context menu and lands on it", async () => {
+    const user = userEvent.setup();
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files", "changes", "review"] },
+    });
+    renderDeck({ activeTab: "files" });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Changes" }));
+    await user.click(
+      await screen.findByRole("menuitem", { name: "Close other tabs" }),
+    );
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual(["changes"]);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("changes");
+  });
+
+  it("closes every tab from the context menu and lands on the picker", async () => {
+    const user = userEvent.setup();
+    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "changes"] } });
+    renderDeck({ activeTab: "changes" });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Files" }));
+    await user.click(
+      await screen.findByRole("menuitem", { name: "Close all tabs" }),
+    );
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual([]);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe(RIGHT_PANEL_EMPTY);
   });
 
   // Terminal is a *workspace* pane, so its card must route to the same

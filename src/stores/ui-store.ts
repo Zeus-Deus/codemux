@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MAX_STORED_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
@@ -297,7 +298,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
-      rightPanelWidth: 320,
+      rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
       fileSearchTarget: "editor",
@@ -695,7 +696,7 @@ export const useUIStore = create<UIStore>()(
     }),
     {
       name: "codemux-ui",
-      version: 1,
+      version: 2,
       partialize: (state) => ({
         rightPanelTabs: state.rightPanelTabs,
         rightPanelLastTabs: state.rightPanelLastTabs,
@@ -711,11 +712,16 @@ export const useUIStore = create<UIStore>()(
       // when the panel itself was renamed (Phase 3). Rewrite any persisted
       // values so users keep their active tab on upgrade instead of having
       // it silently fall back to the default.
+      //
+      // v1 → v2: drop the saved panel width, for the same reason the
+      // SQLite copy moved to a new key (see `RIGHT_PANEL_WIDTH_UI_KEY`).
       migrate: (persistedState, version) => {
-        if (version >= 1) return persistedState;
         const state = persistedState as {
           rightPanelTabs?: Record<string, string | null>;
+          rightPanelWidth?: number;
         };
+        if (version < 2 && state) delete state.rightPanelWidth;
+        if (version >= 1) return state;
         if (state?.rightPanelTabs) {
           const migrated: Record<string, string | null> = {};
           for (const [wsId, tab] of Object.entries(state.rightPanelTabs)) {

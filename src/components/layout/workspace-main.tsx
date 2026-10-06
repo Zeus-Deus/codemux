@@ -6,7 +6,10 @@ import {
   useLayoutEffect,
   useState,
 } from "react";
-import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import {
+  clampRightPanelWidth,
+  RIGHT_PANEL_WIDTH_UI_KEY,
+} from "@/lib/right-panel-width";
 import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -110,7 +113,7 @@ function RightPanelResizer() {
         // Commit to React state + persist to SQLite (single re-render)
         if (lastWidth > 0) {
           setRightPanelWidth(lastWidth);
-          dbSetUiState("right_panel_width", String(lastWidth)).catch(console.error);
+          dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, String(lastWidth)).catch(console.error);
         }
       };
 
@@ -182,7 +185,7 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
 
   // Load persisted right panel width from SQLite on mount
   useEffect(() => {
-    dbGetUiState("right_panel_width").then((val) => {
+    dbGetUiState(RIGHT_PANEL_WIDTH_UI_KEY).then((val) => {
       if (val) useUIStore.getState().setRightPanelWidth(Number(val));
     }).catch(() => {});
   }, []);

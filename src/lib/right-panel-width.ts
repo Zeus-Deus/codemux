@@ -21,6 +21,24 @@
  */
 
 /**
+ * The width the panel opens at until the user drags it.
+ *
+ * Modest on purpose: enough for a couple of labelled tabs beside the
+ * titlebar cluster, without taking over the chat. The tab row scrolls rather
+ * than wraps, so nothing needs a wider panel to look right.
+ */
+export const RIGHT_PANEL_DEFAULT_WIDTH = 540;
+
+/**
+ * Where the dragged width persists (`ui_state`).
+ *
+ * `_v2` drops widths saved before the tab row stopped wrapping: until then
+ * dragging the panel very wide was the only way to keep its tabs on one
+ * line, so those values say little about the size anyone actually wanted.
+ */
+export const RIGHT_PANEL_WIDTH_UI_KEY = "right_panel_width_v2";
+
+/**
  * Never narrower than this — below it the tab strip stops being usable.
  *
  * It used to be 240, back when the panel's tab row had the panel's full
@@ -28,9 +46,7 @@
  * end is spoken for by the fixed panel cluster and the native window buttons
  * drawn above it — `topRightReserve()` in `@/lib/titlebar-geometry`, 174px on
  * desktop. At 240 that left about 60px for the tabs *and* the active pane's
- * actions, i.e. no visible tab at all. 360 leaves roughly one full tab plus
- * stubs beside a pane's controls, which is the least this row can do and
- * still be a tab row.
+ * actions. 360 leaves room for about one tab, with the rest scrolled.
  *
  * Deliberately larger than {@link MIN_CONTENT_WIDTH} now: the two floors stop
  * meaning the same thing. The chat side's floor is about *reading*; this one
