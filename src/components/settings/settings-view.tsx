@@ -58,11 +58,22 @@ import {
   selectSidebarShowGitStats,
   selectAutoResumeUsageLimit,
   selectOrbMatchActivity,
+  selectNewChatCheckout,
+  selectDiffLayoutPreference,
+  selectHideWhitespacePreference,
+  selectDiffFileState,
+  selectTimeFormat,
   type AppearanceDensity,
   type AutoSettleDays,
+  type DiffFileState,
+  type DiffLayoutPreference,
+  type NewChatCheckout,
+  type TimeFormat,
 } from "@/stores/settings-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { ThemeSettings } from "./theme-settings";
 import { UtilityAgentSetting } from "./utility-agent-setting";
+import { NewChatModelSetting } from "./new-chat-model-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { NON_INTERACTIVE_CLI_PROVIDERS } from "@/lib/agent-chat/capability-defaults";
 import { CommandPalette } from "@/components/overlays/command-palette";
@@ -1245,6 +1256,11 @@ export function SettingsView() {
   );
   const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
+  const newChatCheckout = useSettingsStore(selectNewChatCheckout);
+  const diffLayout = useSettingsStore(selectDiffLayoutPreference);
+  const hideWhitespace = useSettingsStore(selectHideWhitespacePreference);
+  const diffFileState = useSettingsStore(selectDiffFileState);
+  const timeFormat = useSettingsStore(selectTimeFormat);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -1587,6 +1603,21 @@ export function SettingsView() {
                     }
                   />
                 </SettingRow>
+                <SettingRow
+                  label="Time format"
+                  description={`How clock times read in chats, tasks, pull requests and snooze menus. System follows your locale (it reads ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} right now).`}
+                >
+                  <SegmentedControl<TimeFormat>
+                    ariaLabel="Time format"
+                    value={timeFormat}
+                    onChange={(value) => storeSet("appearance.time_format", value)}
+                    options={[
+                      { value: "system", label: "System" },
+                      { value: "12h", label: "12-hour" },
+                      { value: "24h", label: "24-hour" },
+                    ]}
+                  />
+                </SettingRow>
               </div>
             </SectionGroup>
 
@@ -1896,6 +1927,54 @@ export function SettingsView() {
 
             <SectionGroup>
               <SubsectionHeader
+                title="Diffs"
+                description="Starting state for diff tabs and the pull request Code tab. Toggles in a diff toolbar update these too."
+              />
+              <div className="space-y-1">
+                <SettingRow
+                  label="Diff layout"
+                  description="Unified stacks old and new lines in one column. Split shows them side by side."
+                >
+                  <SegmentedControl<DiffLayoutPreference>
+                    ariaLabel="Diff layout"
+                    value={diffLayout}
+                    onChange={(value) => storeSet("diff.layout", value)}
+                    options={[
+                      { value: "unified", label: "Unified" },
+                      { value: "split", label: "Split" },
+                    ]}
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Hide whitespace changes"
+                  description="Skip lines that only change indentation or spacing when reviewing a pull request."
+                >
+                  <Switch
+                    checked={hideWhitespace}
+                    onCheckedChange={(checked) =>
+                      storeSet("diff.hide_whitespace", checked ? "true" : "false")
+                    }
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Files start"
+                  description="Whether each file of a pull request diff opens expanded or collapsed to its header. Files you mark viewed always collapse."
+                >
+                  <SegmentedControl<DiffFileState>
+                    ariaLabel="Diff file state"
+                    value={diffFileState}
+                    onChange={(value) => storeSet("diff.file_state", value)}
+                    options={[
+                      { value: "expanded", label: "Expanded" },
+                      { value: "collapsed", label: "Collapsed" },
+                    ]}
+                  />
+                </SettingRow>
+              </div>
+            </SectionGroup>
+
+            <SectionGroup>
+              <SubsectionHeader
                 title="AI Tools"
                 description="AI-assisted git workflows. Requires the Claude CLI."
               />
@@ -1999,89 +2078,129 @@ export function SettingsView() {
               title="Agent"
               description="Configure how Codemux integrates with AI coding agents."
             />
-            <div className="space-y-1">
-              <SettingRow
-                label="Utility agent"
-                description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
-              >
-                <UtilityAgentSetting />
-              </SettingRow>
-              <Separator />
-              <div className="py-4">
-                <HermesSetting />
-              </div>
-              <Separator />
-              <SettingRow
-                label="Default Hermes profile"
-                description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
-              >
-                <HermesDefaultProfileSetting />
-              </SettingRow>
-              <div className="pb-4">
-                <HermesSetting />
-              </div>
-              <Separator />
-              <SettingRow
-                label="Auto-configure MCP for workspaces"
-                description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
-              >
-                <Switch
-                  checked={autoMcpConfig}
-                  onCheckedChange={(checked) => {
-                    setAutoMcpConfig(checked);
-                    storeSet("auto_mcp_config", String(checked));
-                  }}
+            {/* Chat drafts are an Agent Chat surface; the CLI interface
+                launches agents from presets instead. */}
+            {enableAgentChat && (
+              <SectionGroup>
+                <SubsectionHeader
+                  title="New chats"
+                  description="What a new chat starts with. You can still change any of it in the composer before sending."
                 />
-              </SettingRow>
-              {/* True turn checkpoints are an Agent Chat affordance. */}
+                <div className="space-y-1">
+                  <SettingRow
+                    label="Default model"
+                    description="Automatic starts on Claude's default model. Custom picks the provider, model and reasoning level for every new chat."
+                  >
+                    <NewChatModelSetting />
+                  </SettingRow>
+                  <SettingRow
+                    label="Workspace"
+                    description="New worktree gives each chat its own branch and checkout. Current checkout works directly on the project's checked-out branch."
+                  >
+                    <SegmentedControl<NewChatCheckout>
+                      ariaLabel="Where new chats run"
+                      value={newChatCheckout}
+                      onChange={(value) => {
+                        storeSet("chat.default_checkout", value);
+                        useChatDraftStore.getState().applyNewChatDefaults();
+                      }}
+                      options={[
+                        { value: "worktree", label: "New worktree" },
+                        { value: "current", label: "Current checkout" },
+                      ]}
+                    />
+                  </SettingRow>
+                </div>
+              </SectionGroup>
+            )}
+            <SectionGroup>
               {enableAgentChat && (
-                <>
-                  <Separator />
-                  <SettingRow
-                    label="Per-turn revert checkpoints"
-                    description="Before each supported agent turn, snapshot the workspace so Revert can rewind files, the provider conversation, and the transcript together. Currently available for Codex."
-                  >
-                    <Switch
-                      checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
-                      onCheckedChange={(checked) => {
-                        updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
-                      }}
-                    />
-                  </SettingRow>
-                  <Separator />
-                  <SettingRow
-                    label="Resume automatically after usage limits reset"
-                    description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
-                  >
-                    <Switch
-                      checked={autoResumeUsageLimit}
-                      onCheckedChange={(checked) =>
-                        storeSet(
-                          "agents.auto_resume_usage_limit",
-                          checked ? "true" : "false",
-                        )
-                      }
-                    />
-                  </SettingRow>
-                  <Separator />
-                  {/* GUI-mode background browser viewport pin. Like the
-                      checkpoint toggle, only meaningful with the Agent
-                      Chat GUI on — the peek popover it affects is a
-                      GUI-chrome surface. */}
-                  <SettingRow
-                    label="Desktop-size background browser"
-                    description="Pin the agent's background browser to a real desktop viewport (the Browser section's default viewport, 1280×800 out of the box) so pages render at full size in the peek popover, scaled to fit."
-                  >
-                    <Switch
-                      checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
-                      onCheckedChange={(checked) => {
-                        updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
-                      }}
-                    />
-                  </SettingRow>
-                </>
+                <SubsectionHeader
+                  title="Tools & runtime"
+                  description="Background helpers, provider setup, and how agent sessions behave."
+                />
               )}
-            </div>
+              <div className="space-y-1">
+                <SettingRow
+                  label="Utility agent"
+                  description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
+                >
+                  <UtilityAgentSetting />
+                </SettingRow>
+                <Separator />
+                <div className="py-4">
+                  <HermesSetting />
+                </div>
+                <Separator />
+                <SettingRow
+                  label="Default Hermes profile"
+                  description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
+                >
+                  <HermesDefaultProfileSetting />
+                </SettingRow>
+                <Separator />
+                <SettingRow
+                  label="Auto-configure MCP for workspaces"
+                  description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
+                >
+                  <Switch
+                    checked={autoMcpConfig}
+                    onCheckedChange={(checked) => {
+                      setAutoMcpConfig(checked);
+                      storeSet("auto_mcp_config", String(checked));
+                    }}
+                  />
+                </SettingRow>
+                {/* True turn checkpoints are an Agent Chat affordance. */}
+                {enableAgentChat && (
+                  <>
+                    <Separator />
+                    <SettingRow
+                      label="Per-turn revert checkpoints"
+                      description="Before each supported agent turn, snapshot the workspace so Revert can rewind files, the provider conversation, and the transcript together. Currently available for Codex."
+                    >
+                      <Switch
+                        checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
+                        onCheckedChange={(checked) => {
+                          updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
+                        }}
+                      />
+                    </SettingRow>
+                    <Separator />
+                    <SettingRow
+                      label="Resume automatically after usage limits reset"
+                      description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
+                    >
+                      <Switch
+                        checked={autoResumeUsageLimit}
+                        onCheckedChange={(checked) =>
+                          storeSet(
+                            "agents.auto_resume_usage_limit",
+                            checked ? "true" : "false",
+                          )
+                        }
+                      />
+                    </SettingRow>
+                    <Separator />
+                    {/* GUI-mode background browser viewport pin. Like the
+                        checkpoint toggle, only meaningful with the Agent
+                        Chat GUI on — the peek popover it affects is a
+                        GUI-chrome surface. */}
+                    <SettingRow
+                      label="Desktop-size background browser"
+                      description="Pin the agent's background browser to a real desktop viewport (the Browser section's default viewport, 1280×800 out of the box) so pages render at full size in the peek popover, scaled to fit."
+                    >
+                      <Switch
+                        checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
+                        onCheckedChange={(checked) => {
+                          updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
+                        }}
+                      />
+                    </SettingRow>
+                  </>
+                )}
+              </div>
+            </SectionGroup>
           </div>
         );
 

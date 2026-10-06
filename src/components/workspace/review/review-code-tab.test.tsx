@@ -24,6 +24,8 @@ vi.mock("@/tauri/commands", () => ({
   checkoutDefaultBranchInWorkspace: vi.fn().mockResolvedValue("main"),
   gitPullChanges: vi.fn().mockResolvedValue(undefined),
   gitStashPush: vi.fn().mockResolvedValue(undefined),
+  // The layout and whitespace toggles persist through the settings store.
+  dbSetSetting: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -42,6 +44,7 @@ vi.mock("@/lib/pr-agent-handoff", () => ({
 
 import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
 import { _resetPrDrafts } from "./pr-drafts";
+import { useSettingsStore } from "@/stores/settings-store";
 import { resolveProvider } from "@/lib/source-control";
 import { ALL_OPERATIONS } from "@/lib/provider-auth";
 
@@ -251,6 +254,26 @@ describe("the Code tab", () => {
       expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
     );
     expect(file).toHaveAttribute("data-viewed", "true");
+  });
+
+  it("starts files collapsed when that is the setting, and opens one on request", async () => {
+    useSettingsStore.setState((s) => ({
+      settings: { ...s.settings, "diff.file_state": "collapsed" },
+    }));
+    try {
+      const user = userEvent.setup();
+      renderDetail();
+      await openCodeTab(user);
+      const [file] = screen.getAllByTestId("code-file");
+      expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0);
+      await user.click(within(file).getByRole("button", { expanded: false }));
+      expect(file.querySelectorAll("[data-diff-line]").length).toBeGreaterThan(0);
+    } finally {
+      useSettingsStore.setState((s) => {
+        const { "diff.file_state": _state, ...settings } = s.settings;
+        return { settings };
+      });
+    }
   });
 });
 

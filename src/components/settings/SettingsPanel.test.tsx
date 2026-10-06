@@ -63,6 +63,11 @@ vi.mock("@/stores/settings-store", () => {
     "agents.orb_match_activity": "true",
     "agents.auto_resume_usage_limit": "true",
     "chat.code_wrap": "false",
+    "chat.default_checkout": "worktree",
+    "diff.layout": "unified",
+    "diff.hide_whitespace": "false",
+    "diff.file_state": "expanded",
+    "appearance.time_format": "system",
   };
   // Built lazily: `mockSettingsSet` is hoisted below this factory.
   const state = () => ({
@@ -87,6 +92,13 @@ vi.mock("@/stores/settings-store", () => {
     selectSidebarAutoSettleDays: () => 3,
     selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
+    selectNewChatCheckout: () => "worktree",
+    selectDiffLayoutPreference: () => "unified",
+    selectHideWhitespacePreference: () => false,
+    selectDiffFileState: () => "expanded",
+    selectTimeFormat: () => "system",
+    getNewChatCheckout: () => "worktree",
+    getTimeFormat: () => "system",
   };
 });
 
@@ -425,6 +437,34 @@ describe("SettingsPanel — Git section model pickers", () => {
 // picker and the indicator-color swatches were deleted outright when the
 // orb replaced them — there is nothing left to pick.
 
+describe("SettingsPanel — Git section diff defaults", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openGitSection() {
+    render(<SettingsView />);
+    fireEvent.click(screen.getAllByRole("button", { name: /Git/i })[0]);
+  }
+
+  it("writes the diff layout and file state defaults", () => {
+    openGitSection();
+    fireEvent.click(screen.getAllByRole("radio", { name: /^Split$/i })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.layout", "split");
+    fireEvent.click(screen.getAllByRole("radio", { name: /^Collapsed$/i })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.file_state", "collapsed");
+  });
+
+  it("toggling Hide whitespace changes writes diff.hide_whitespace", () => {
+    openGitSection();
+    const row = screen
+      .getAllByText("Hide whitespace changes")[0]
+      .closest("div")!.parentElement!;
+    fireEvent.click(within(row).getByRole("switch"));
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.hide_whitespace", "true");
+  });
+});
+
 describe("SettingsPanel — Appearance Agents section", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -480,6 +520,13 @@ describe("SettingsPanel — Appearance Agents section", () => {
       "sidebar.auto_settle_days",
       "7",
     );
+  });
+
+  it("choosing a time format writes appearance.time_format", () => {
+    openAppearance();
+    const [twentyFour] = screen.getAllByRole("radio", { name: /^24-hour$/i });
+    fireEvent.click(twentyFour);
+    expect(mockSettingsSet).toHaveBeenCalledWith("appearance.time_format", "24h");
   });
 
   it("toggling Match the orb to the activity writes agents.orb_match_activity", () => {

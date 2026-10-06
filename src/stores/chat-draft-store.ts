@@ -1,9 +1,8 @@
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
-import {
-  capabilityDefaults,
-  defaultModelId,
-} from "@/lib/agent-chat/capability-defaults";
+import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
+import { resolveNewChatModelDefaults } from "@/lib/agent-chat/new-chat-defaults";
+import { getNewChatCheckout } from "@/stores/settings-store";
 import { discardStagedImage } from "@/lib/agent-chat/image-staging";
 import {
   useAgentChatStore,
@@ -177,6 +176,10 @@ export interface ChatDraftStore {
    *  inherit them. */
   discardDraft: (draftId: DraftId) => void;
   clearDraft: (draftId: DraftId) => void;
+  /** Re-seed every untouched draft (no text, no attachments, not sent)
+   *  from the current new-chat settings, so changing the default in
+   *  Settings shows up in the composer that is already open. */
+  applyNewChatDefaults: () => void;
   /** When `projectPath === homeDir`, also sweeps home-target
    *  drafts so closing the sidebar's Home group clears the draft
    *  that would otherwise respawn on next "+" click. Pass `null`
@@ -262,30 +265,48 @@ function discardDraftRuntime(draft: ChatDraft): void {
   chat.resetThread(draft.threadId);
 }
 
+type NewChatConfig = Pick<
+  ChatDraft,
+  | "provider"
+  | "model"
+  | "effort"
+  | "contextWindow"
+  | "fastMode"
+  | "permissionMode"
+  | "checkoutMode"
+>;
+
+function newChatConfig(): NewChatConfig {
+  // The user's Settings → Agent → New chats choice (Claude on its default
+  // model when unset), then fully configured from the capabilities store:
+  // the model's `default_effort` unless a saved effort applies, its
+  // default context-window option and the provider's default permission
+  // mode. Drafts entering the composer with non-null effort/contextWindow
+  // means the Effort and ContextWindow pickers render from minute zero —
+  // and the slice materialize seeds inherits the same values, so pickers
+  // stay visible post-first-send too (Stage C Effort-lock fix).
+  const choice = resolveNewChatModelDefaults();
+  const defaults = capabilityDefaults(choice.provider, choice.model);
+  return {
+    provider: choice.provider,
+    model: defaults.model,
+    effort: choice.effort ?? defaults.effort,
+    contextWindow: defaults.contextWindow,
+    fastMode: false,
+    permissionMode: defaults.permissionMode,
+    checkoutMode: getNewChatCheckout(),
+  };
+}
+
 function makeDraft(
   target: DraftTarget,
   opts: { lockedToHome?: boolean } = {},
 ): ChatDraft {
-  const provider: AgentChatProviderKind = "claude";
-  // Fully-configure the draft from the capabilities store: default
-  // model + its `default_effort` + its default context-window option
-  // + the provider's default permission mode. Drafts entering the
-  // composer with non-null effort/contextWindow means the Effort and
-  // ContextWindow pickers render from minute zero — and the slice
-  // materialize seeds inherits the same values, so pickers stay
-  // visible post-first-send too (Stage C Effort-lock fix).
-  const modelId = defaultModelId(provider);
-  const defaults = capabilityDefaults(provider, modelId);
   return {
+    ...newChatConfig(),
     draftId: newDraftId(),
     createdAt: new Date().toISOString(),
     target,
-    provider,
-    model: defaults.model,
-    effort: defaults.effort,
-    contextWindow: defaults.contextWindow,
-    fastMode: false,
-    permissionMode: defaults.permissionMode,
     mode: "default",
     inputDraft: "",
     threadId: newThreadId(),
@@ -294,7 +315,6 @@ function makeDraft(
     promoting: false,
     lastSendError: null,
     lockedToHome: opts.lockedToHome ?? false,
-    checkoutMode: "worktree",
     worktreeName: "",
     baseBranch: "",
   };
@@ -615,6 +635,21 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           return patch as ChatDraftStore;
         });
       },
+
+      applyNewChatDefaults: () =>
+        set((s) => {
+          const untouched = Object.values(s.draftsById).filter(
+            (draft) =>
+              isReusableDraft(draft) && !draftHasLiveUserContent(draft),
+          );
+          if (untouched.length === 0) return s;
+          const config = newChatConfig();
+          const draftsById = { ...s.draftsById };
+          for (const draft of untouched) {
+            draftsById[draft.draftId] = { ...draft, ...config };
+          }
+          return { draftsById };
+        }),
 
       clearDraft: (draftId) =>
         set((s) => {

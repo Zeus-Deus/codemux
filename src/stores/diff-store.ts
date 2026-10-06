@@ -1,5 +1,9 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import {
+  getDiffLayoutPreference,
+  useSettingsStore,
+} from "@/stores/settings-store";
 
 export interface DiffTabState {
   filePath: string | null;
@@ -20,6 +24,12 @@ const DEFAULT_TAB: DiffTabState = {
   fileIndex: 0,
   baseBranch: null,
 };
+
+/** A new diff tab opens in the Settings → Git → Diffs layout; a tab that
+ *  already has state keeps its own. */
+function newTabState(): DiffTabState {
+  return { ...DEFAULT_TAB, layout: getDiffLayoutPreference() };
+}
 
 interface DiffStore {
   tabs: Record<string, DiffTabState>;
@@ -46,7 +56,7 @@ export const useDiffStore = create<DiffStore>()(
           tabs: {
             ...s.tabs,
             [tabId]: {
-              ...DEFAULT_TAB,
+              ...newTabState(),
               ...s.tabs[tabId],
               ...(opts?.file != null ? { filePath: opts.file } : {}),
               ...(opts?.staged != null ? { staged: opts.staged } : {}),
@@ -62,13 +72,17 @@ export const useDiffStore = create<DiffStore>()(
           },
         })),
 
-      setLayout: (tabId, layout) =>
+      setLayout: (tabId, layout) => {
+        // The toolbar toggle is also the remembered default, matching the
+        // pull request Code tab.
+        useSettingsStore.getState().set("diff.layout", layout);
         set((s) => ({
           tabs: {
             ...s.tabs,
             [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), layout },
           },
-        })),
+        }));
+      },
 
       toggleFocusMode: (tabId) =>
         set((s) => {

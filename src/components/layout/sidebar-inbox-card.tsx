@@ -38,6 +38,7 @@ import { useProjectAppearance } from "./use-project-appearance";
 import { isRowActivationKey } from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
+import { getTimeFormat } from "@/stores/settings-store";
 import { CardProgressSweep } from "./sidebar-creating-card";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import { providerForWorkspace, providerRef } from "@/lib/source-control";
@@ -216,7 +217,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // nobody had opened — the exact cost that shows up with many workspaces.
   const [snoozePresets, setSnoozePresets] = useState<SnoozePreset[]>([]);
   const handleSnoozeMenuOpenChange = (open: boolean) => {
-    if (open) setSnoozePresets(computeSnoozePresets(Date.now()));
+    if (open) setSnoozePresets(computeSnoozePresets(Date.now(), getTimeFormat()));
     setSnoozeMenuOpen(open);
   };
 

@@ -8,6 +8,9 @@
  *  faking timers and the menu can't disagree with the sweep that wakes the
  *  card. */
 
+import { withTimeFormat } from "@/lib/time-format";
+import type { TimeFormat } from "@/stores/settings-store";
+
 const HOUR_MS = 3_600_000;
 
 /** Only ever used to *round* a difference between two local day starts (see
@@ -104,12 +107,16 @@ function localDaysBetween(now: number, at: number): number {
  *  Pure like the rest of this module: the "which day is it" comparison is made
  *  against the caller's `now`, never `Date.now()`, so the tests can sit on a
  *  DST boundary and the menu can't disagree with the sweep. */
-export function formatWakeLabel(now: number, at: number): string {
+export function formatWakeLabel(
+  now: number,
+  at: number,
+  timeFormat: TimeFormat = "system",
+): string {
   const when = new Date(at);
-  const time = when.toLocaleTimeString(undefined, {
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  const time = when.toLocaleTimeString(
+    undefined,
+    withTimeFormat({ hour: "numeric", minute: "2-digit" }, timeFormat),
+  );
   const days = localDaysBetween(now, at);
   if (days <= 0) return time;
   if (days === 1) return `Tomorrow ${time}`;
@@ -124,13 +131,16 @@ export function formatWakeLabel(now: number, at: number): string {
  *  preset built on the inbox's coarse tick can name a wake time half a minute
  *  in the past by the time it is clicked, and every card recomputing on every
  *  tick re-renders the whole sidebar for a menu nobody opened. */
-export function computeSnoozePresets(now: number): SnoozePreset[] {
+export function computeSnoozePresets(
+  now: number,
+  timeFormat: TimeFormat = "system",
+): SnoozePreset[] {
   const at = (
     id: SnoozePreset["id"],
     label: string,
     when: number,
   ): SnoozePreset => {
-    const whenLabel = formatWakeLabel(now, when);
+    const whenLabel = formatWakeLabel(now, when, timeFormat);
     return {
       id,
       label,

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   chatDraftHasUserContent,
@@ -10,6 +10,7 @@ import {
   type DraftId,
 } from "./chat-draft-store";
 import { useAgentChatStore } from "./agent-chat-store";
+import { useSettingsStore } from "./settings-store";
 
 function resetStore() {
   useChatDraftStore.setState({
@@ -536,6 +537,49 @@ describe("chat-draft-store", () => {
       expect(state.draftsById).toEqual({});
       expect(state.activeHomeDraftId).toBeNull();
       expect(state.activeDraftId).toBeNull();
+    });
+  });
+
+  describe("new-chat defaults", () => {
+    afterEach(() => {
+      useSettingsStore.setState({ settings: {} });
+    });
+
+    it("starts drafts in the configured checkout mode", () => {
+      useSettingsStore.setState({
+        settings: { "chat.default_checkout": "current" },
+      });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(draft.checkoutMode).toBe("current");
+    });
+
+    it("re-seeds untouched drafts and leaves ones with text alone", () => {
+      const store = useChatDraftStore.getState();
+      const empty = store.getOrCreateHomeDraft();
+      const typed = store.getOrCreateProjectDraft("/repo");
+      store.updateDraftInput(typed.draftId, "keep me");
+
+      useSettingsStore.setState({
+        settings: {
+          "chat.default_provider": "codex",
+          "chat.default_model": "gpt-5.4",
+          "chat.default_checkout": "current",
+        },
+      });
+      useChatDraftStore.getState().applyNewChatDefaults();
+
+      const { draftsById } = useChatDraftStore.getState();
+      expect(draftsById[empty.draftId]).toMatchObject({
+        provider: "codex",
+        model: "gpt-5.4",
+        permissionMode: "danger-full-access",
+        checkoutMode: "current",
+        threadId: empty.threadId,
+      });
+      expect(draftsById[typed.draftId]).toMatchObject({
+        provider: "claude",
+        checkoutMode: "worktree",
+      });
     });
   });
 });

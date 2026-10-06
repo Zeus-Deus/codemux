@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { TaskSnapshotItem, TasksSnapshot } from "@/tauri/events";
+import { withTimeFormat } from "@/lib/time-format";
 
 /** Overall run state, derived from the rows: every row done → complete;
  *  any row in progress → working; otherwise the plan is still queued. */
@@ -115,11 +116,14 @@ export function TasksPanel({
           </span>
           {updatedAt != null && (
             <span className="shrink-0 font-mono text-label tabular-nums text-muted-foreground">
-              {new Date(updatedAt).toLocaleTimeString([], {
-                hour: "numeric",
-                minute: "2-digit",
-                second: "2-digit",
-              })}
+              {new Date(updatedAt).toLocaleTimeString(
+                [],
+                withTimeFormat({
+                  hour: "numeric",
+                  minute: "2-digit",
+                  second: "2-digit",
+                }),
+              )}
             </span>
           )}
         </div>
