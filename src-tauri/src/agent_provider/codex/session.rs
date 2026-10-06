@@ -390,9 +390,17 @@ impl CodexSession {
         // Best-effort probes. Failures are non-fatal — we log via
         // RuntimeWarning and continue.
         let tier_models = match child.request("model/list", json!({})).await {
-            Ok(value) => serde_json::from_value::<super::protocol::ModelListResponse>(value)
-                .map(|response| response.data)
-                .unwrap_or_default(),
+            Ok(value) => match serde_json::from_value::<super::protocol::ModelListResponse>(value) {
+                Ok(response) => response.data,
+                Err(error) => {
+                    let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(thread_id.clone()),
+                        message: format!("model/list decode failed: {error}"),
+                        original_payload: None,
+                    });
+                    vec![]
+                }
+            },
             Err(e) => {
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
@@ -407,7 +415,7 @@ impl CodexSession {
         if resolved_tier == "default" && service_tier != "default" {
             let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                 thread_id: Some(thread_id.clone()),
-                message: "Saved service tier is unavailable for this model; using Standard.".into(),
+                message: "service-tier-fallback: Saved service tier could not be verified for this model/account; using Standard.".into(),
                 original_payload: None,
             });
         }

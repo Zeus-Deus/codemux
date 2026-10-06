@@ -523,7 +523,7 @@ pub struct ModelEntry {
     /// Maps to the picker's fast-mode toggle when `"fast"` is present.
     #[serde(default)]
     pub additional_speed_tiers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_service_tiers")]
     pub service_tiers: Vec<ModelServiceTier>,
 }
 
@@ -534,6 +534,19 @@ pub struct ModelServiceTier {
     pub name: String,
     #[serde(default)]
     pub description: String,
+}
+
+// A malformed optional tier must not hide the model or its valid tiers.
+fn deserialize_service_tiers<'de, D>(deserializer: D) -> Result<Vec<ModelServiceTier>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = Option::<Vec<Value>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<ModelServiceTier>(value).ok())
+        .filter(|tier| !tier.id.is_empty() && !tier.name.is_empty())
+        .collect())
 }
 
 /// One element of [`ModelEntry::supported_reasoning_efforts`].

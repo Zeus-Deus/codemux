@@ -1,3 +1,4 @@
+import { SERVICE_TIER_FALLBACK_PREFIX } from "@/lib/agent-chat/runtime-notice";
 import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
@@ -1207,6 +1208,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Anything that is not a `content_delta` still applies synchronously —
   // see lib/agent-chat/event-batcher.ts.
   const handleEvent = useCallback((payload: AgentChatEventPayload) => {
+    if (
+      payload.event.type === "runtime_warning" &&
+      payload.event.message.startsWith(SERVICE_TIER_FALLBACK_PREFIX)
+    ) {
+      void useProviderCapabilities.getState().refresh("codex");
+    }
     enqueueAgentChatEvent(
       payload.thread_id,
       payload.event,

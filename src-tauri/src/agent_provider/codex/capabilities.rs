@@ -637,7 +637,11 @@ mod tests {
             "id": "model-current", "additionalSpeedTiers": ["fast"],
             "serviceTiers": [
                 {"id": "priority", "name": "Fast", "description": "Premium speed"},
-                {"id": "ultrafast", "name": "Ultrafast", "description": "Higher usage"}
+                {"id": "ultrafast", "name": "Ultrafast", "description": "Higher usage"},
+                {"id": "malformed-no-name"},
+                {"name": "Missing id"},
+                {"id": "", "name": "Empty id"},
+                42
             ]
         }))
         .unwrap();

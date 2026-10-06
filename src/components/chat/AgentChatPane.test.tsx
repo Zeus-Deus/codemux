@@ -451,7 +451,7 @@ vi.mock("@/hooks/use-chat-code-plugin", () => ({ useChatCodePlugin: () => undefi
 vi.mock("@/hooks/use-mcp-runtime", () => ({ useMcpRuntime: () => ({ runtimes: {} }) }));
 
 vi.mock("@/hooks/use-agent-chat-events", () => ({
-  useAgentChatEvents: () => {},
+  useAgentChatEvents: vi.fn(),
 }));
 
 vi.mock("@/tauri/events", () => ({
@@ -712,6 +712,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       getState: () => ({
         threads: buildThreads(),
         applyEvent: applyEventMock,
+        applyLiveEvents: vi.fn(),
         // Session bring-up seeds the agent-chat slice through these
         // after start_session resolves.
         ensureThread: vi.fn(),
@@ -745,6 +746,7 @@ vi.mock("@/stores/agent-chat-store", () => {
 });
 
 import { AgentChatPane } from "./AgentChatPane";
+import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { TranscriptCacheProvider } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
@@ -4341,4 +4343,26 @@ describe("GUI delivery commands", () => {
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "/steer Use SQLite"));
   });
+});
+
+
+it("refreshes the Codex catalog when startup falls back from a saved tier", async () => {
+  vi.mocked(agentChatListMessagesAfter).mockReset().mockResolvedValue([]);
+  const refresh = vi.spyOn(useProviderCapabilities.getState(), "refresh").mockResolvedValue();
+  try {
+    render(<AgentChatPane pane={pane} />);
+    const handler = vi.mocked(useAgentChatEvents).mock.lastCall?.[1];
+    expect(handler).toBeDefined();
+    await act(async () => handler?.({
+      thread_id: "thread-x",
+      event: {
+        type: "runtime_warning", thread_id: "thread-x",
+        message: "service-tier-fallback: Saved tier is unavailable; using Standard.",
+        original_payload: null,
+      },
+    }));
+    expect(refresh).toHaveBeenCalledWith("codex");
+  } finally {
+    refresh.mockRestore();
+  }
 });

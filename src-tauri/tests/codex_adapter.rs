@@ -2608,3 +2608,63 @@ async fn service_tier_ultrafast_roundtrips_and_rejects_unavailable_choices() {
     );
     assert!(!trace.contains("\"method\":\"thread/start\""));
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_tier_startup_fallback_reports_catalog_errors_and_downgrades() {
+    for malformed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_path = dir.path().join("models.json");
+        let capture_path = dir.path().join("turn.json");
+        let catalog = if malformed {
+            json!({"unexpected": "shape"})
+        } else {
+            json!([{"id": "gpt-test", "model": "gpt-test", "isDefault": true}])
+        };
+        std::fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let wrapper = wrapper_with_env(&[
+            ("FAKE_CODEX_MODELS", catalog_path.to_str().unwrap()),
+            ("FAKE_CODEX_CAPTURE_TURN", capture_path.to_str().unwrap()),
+        ]);
+        let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+        let mut events = provider.event_stream();
+        let thread = ThreadId("tier-fallback".into());
+        let mut input = start_input(&thread.0);
+        input.service_tier = Some("ultrafast".into());
+        start_session_resilient(&provider, input).await.unwrap();
+        let mut decode_failure = false;
+        timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                if let ProviderRuntimeEvent::RuntimeWarning { message, .. } = event {
+                    decode_failure |= message.starts_with("model/list decode failed:");
+                    if message.starts_with("service-tier-fallback: ") {
+                        assert!(message.contains("using Standard"));
+                        return;
+                    }
+                }
+            }
+            panic!("missing service-tier fallback warning");
+        })
+        .await
+        .expect("fallback warning should arrive");
+        assert_eq!(decode_failure, malformed);
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: thread.clone(),
+                text: "continue".into(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+                display_text: None,
+                skill_invocations: vec![],
+                turn_checkpoint: None,
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(capture_path).unwrap()).unwrap();
+        assert_eq!(value["serviceTierForTurn"], "default");
+        provider.stop_session(thread).await.unwrap();
+    }
+}
