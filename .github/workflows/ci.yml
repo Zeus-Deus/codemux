@@ -1,6 +1,12 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      claude_install_only:
+        description: Run the Windows Claude installation investigation only
+        type: boolean
+        default: true
   push:
     # Only main here — feature branches are covered by the `pull_request`
     # trigger below. Previously this also listed "feature/**", which meant a
@@ -21,6 +27,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-claude-install:
+    if: github.event_name == 'workflow_dispatch' && inputs.claude_install_only
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        method: [powershell, cmd]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - name: Compile the shipped Windows Claude sidecar
+        working-directory: sidecar/claude-agent
+        run: |
+          bun install --frozen-lockfile
+          bun run build:windows-x64
+      - name: Install real Claude with the official installer
+        shell: pwsh
+        run: ./scripts/windows-claude-install.ps1 -Method ${{ matrix.method }}
+      - name: Download stock Codemux installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v0.23.1 --repo Zeus-Deus/codemux --pattern codemux_0.23.1_x64-setup.exe --dir windows-claude-input
+      - name: Test installed GUI and compiled sidecar
+        run: node scripts/windows-claude-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-claude-${{ matrix.method }}
+          path: windows-claude-evidence/
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # Lightweight JS + sidecar checks. These need neither the Rust toolchain, the
   # Linux GTK/WebKit system libraries, nor the staged sidecar binaries, so they
@@ -31,6 +74,7 @@ jobs:
   # ubuntu + windows matrix.
   # ---------------------------------------------------------------------------
   web-checks:
+    if: github.event_name != 'workflow_dispatch' || !inputs.claude_install_only
     name: web-checks (${{ matrix.os }})
     strategy:
       # Never fail-fast — we always want to see both Linux and Windows results,
@@ -108,6 +152,7 @@ jobs:
   # already-long desktop Rust critical path.
   # ---------------------------------------------------------------------------
   iroh-wasm:
+    if: github.event_name != 'workflow_dispatch' || !inputs.claude_install_only
     name: iroh-wasm
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -139,6 +184,7 @@ jobs:
   # `cargo test`. That work lives here (and only here).
   # ---------------------------------------------------------------------------
   rust:
+    if: github.event_name != 'workflow_dispatch' || !inputs.claude_install_only
     name: rust (${{ matrix.os }})
     strategy:
       # Never fail-fast — we always want to see both Linux and Windows
