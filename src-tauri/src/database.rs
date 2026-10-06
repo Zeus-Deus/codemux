@@ -3600,7 +3600,10 @@ impl DatabaseStore {
                      permission_mode
                  ),
                  service_tier = COALESCE(
-                     (SELECT service_tier FROM agent_chat_sessions WHERE thread_id = ?1),
+                     (SELECT COALESCE(service_tier,
+                         CASE WHEN fast_mode IS NOT NULL
+                              THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END)
+                      FROM agent_chat_sessions WHERE thread_id = ?1),
                      service_tier
                  ),
                  fast_mode = COALESCE(
@@ -4421,8 +4424,12 @@ impl DatabaseStore {
                  ),
                  service_tier = COALESCE(
                      service_tier,
-                     (SELECT service_tier FROM agent_chat_sessions
-                      WHERE sdk_session_id = ?1 AND service_tier IS NOT NULL
+                     CASE WHEN fast_mode IS NOT NULL
+                          THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END,
+                     (SELECT COALESCE(service_tier,
+                         CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+                      FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND (service_tier IS NOT NULL OR fast_mode IS NOT NULL)
                       ORDER BY last_active_at DESC LIMIT 1)
                  ),
                  fast_mode = COALESCE(
@@ -9358,4 +9365,60 @@ mod tests {
             "ultrafast"
         );
     }
+
+    #[test]
+    fn service_tier_legacy_choices_remain_authoritative_when_aliases_merge() {
+        for (fast, expected) in [(false, "default"), (true, "fast")] {
+            let db = init_test_database();
+            for thread in ["legacy", "target", "old-duplicate", "new-duplicate"] {
+                db.upsert_agent_chat_session(thread, "ws", None, "codex")
+                    .unwrap();
+            }
+            for thread in ["target", "old-duplicate"] {
+                db.update_agent_chat_session_config(
+                    thread,
+                    &AgentChatSessionConfig {
+                        service_tier: Some("ultrafast".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            // Reproduce rows saved by the boolean-only client: the new
+            // column is absent, but Standard/Fast was explicitly selected.
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET fast_mode = ?1, service_tier = NULL
+                 WHERE thread_id IN ('legacy', 'new-duplicate')",
+                    params![i64::from(fast)],
+                )
+                .unwrap();
+            db.migrate_agent_chat_session("legacy", "target").unwrap();
+            assert_eq!(
+                db.get_agent_chat_session("target").unwrap().service_tier,
+                expected
+            );
+            for thread in ["old-duplicate", "new-duplicate"] {
+                db.set_agent_chat_sdk_session_id(thread, "shared-tier-sdk")
+                    .unwrap();
+            }
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET last_active_at = '2099-01-01'
+                 WHERE thread_id = 'new-duplicate'",
+                    [],
+                )
+                .unwrap();
+            db.collapse_duplicate_agent_chat_sessions("shared-tier-sdk")
+                .unwrap();
+            let record = db.get_agent_chat_session("new-duplicate").unwrap();
+            assert_eq!(record.service_tier, expected);
+            assert_eq!(record.fast_mode, fast);
+        }
+    }
+
 }
