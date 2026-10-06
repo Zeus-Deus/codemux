@@ -337,11 +337,14 @@ function ProviderLimits({
 export function UsageLimitsView({
   quota,
   statuses,
+  error = null,
   now,
   loading,
 }: {
   quota: Record<string, ProviderQuota>;
   statuses: QuotaProbeStatus[];
+  /** The read failed as a whole, before any provider answered. */
+  error?: string | null;
   now: number;
   /** True until the first direct read settles. */
   loading: boolean;
@@ -361,7 +364,15 @@ export function UsageLimitsView({
     return a.localeCompare(b);
   });
 
+  const errorNotice = error ? (
+    <p className="flex items-center gap-2 rounded-lg border border-border/60 px-4 py-2.5 text-label text-status-attention">
+      <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
+      Could not read plan limits: {error}
+    </p>
+  ) : null;
+
   if (providers.length === 0) {
+    if (errorNotice && !loading) return errorNotice;
     return loading ? (
       <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
         <Loader2 className="size-4 animate-spin" aria-hidden />
@@ -377,6 +388,7 @@ export function UsageLimitsView({
 
   return (
     <div className="flex flex-col gap-6">
+      {errorNotice}
       {providers.map((provider) => (
         <ProviderLimits
           key={provider}

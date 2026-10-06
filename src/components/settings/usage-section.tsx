@@ -216,6 +216,8 @@ export function UsageSection() {
   // Plan limits read directly from the providers (see `usage_quota.rs`).
   const [directQuota, setDirectQuota] = useState<Record<string, ProviderQuota>>();
   const [quotaStatuses, setQuotaStatuses] = useState<QuotaProbeStatus[]>([]);
+  /// The refresh command itself failed, so no provider was read at all.
+  const [quotaError, setQuotaError] = useState<string | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(true);
   const lastQuotaRefresh = useRef(0);
   const [now, setNow] = useState(() => Date.now());
@@ -262,14 +264,13 @@ export function UsageSection() {
     setQuotaLoading(true);
     try {
       const report = await usageRefreshQuota();
+      setQuotaError(null);
       setDirectQuota(report.quota);
       // A call that joined a read already in flight reports no statuses;
       // keep the ones that read produced.
       if (report.statuses.length > 0) setQuotaStatuses(report.statuses);
     } catch (err) {
-      setQuotaStatuses([
-        { provider: "claude", outcome: "failed", message: String(err) },
-      ]);
+      setQuotaError(String(err));
     } finally {
       setQuotaLoading(false);
       setNow(Date.now());
@@ -436,6 +437,7 @@ export function UsageSection() {
         <UsageLimitsView
           quota={quota}
           statuses={quotaStatuses}
+          error={quotaError}
           now={now}
           loading={quotaLoading}
         />

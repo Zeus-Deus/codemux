@@ -25,7 +25,7 @@ use crate::agent_provider::{
     SEVEN_DAY_WINDOW_MINS,
 };
 use crate::commands::usage::{PlanQuotaStore, ProviderQuota};
-use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
+use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 
 /// Upper bound on one provider read, spawn included. A probe that hangs must
 /// not hold the refresh button forever.
@@ -413,7 +413,11 @@ async fn read_codex_limits(child: &JsonRpcChild) -> Result<QuotaReading, ProbeEr
         .request("account/rateLimits/read", json!({}))
         .await
         .map_err(|e| {
-            ProbeError::Unavailable(format!("This Codex build cannot report plan limits ({e})."))
+            if is_unknown_method(&e) {
+                ProbeError::Unavailable("Update Codex to read plan limits.".into())
+            } else {
+                ProbeError::Failed(format!("account/rateLimits/read: {e}"))
+            }
         })
         .and_then(|v| {
             serde_json::from_value(v)
@@ -428,6 +432,23 @@ async fn read_codex_limits(child: &JsonRpcChild) -> Result<QuotaReading, ProbeEr
         plan_label: plan_label.or(limits.rate_limits.limit_name),
         auth_mode,
     })
+}
+
+/// Whether the app-server rejected the method itself, i.e. a build that
+/// predates it. Timeouts, crashes, and other errors are real failures and
+/// must not read as "no limits".
+fn is_unknown_method(error: &RpcChildError) -> bool {
+    match error {
+        RpcChildError::RpcError(rpc) => {
+            let message = rpc.message.to_ascii_lowercase();
+            // JSON-RPC "method not found", or the app-server's serde
+            // rejection of a method name it has no variant for.
+            rpc.code == -32601
+                || message.contains("unknown variant")
+                || message.contains("method not found")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +529,32 @@ mod tests {
             "rate_limits": { "five_hour": { "utilization": null, "resets_at": null } }
         });
         assert!(claude_reading_from_get_usage(&response).windows.is_empty());
+    }
+
+    #[test]
+    fn only_an_unknown_method_reads_as_unavailable() {
+        use crate::json_rpc_child::RpcError;
+        let rpc = |code, message: &str| {
+            RpcChildError::RpcError(RpcError {
+                code,
+                message: message.into(),
+                data: None,
+            })
+        };
+        assert!(is_unknown_method(&rpc(-32601, "Method not found")));
+        assert!(is_unknown_method(&rpc(
+            -32600,
+            "Invalid request: unknown variant `account/rateLimits/read`"
+        )));
+        assert!(!is_unknown_method(&rpc(-32000, "upstream returned 503")));
+        assert!(!is_unknown_method(&RpcChildError::Timeout {
+            method: "account/rateLimits/read".into(),
+            elapsed: Duration::from_secs(25),
+        }));
+        assert!(!is_unknown_method(&RpcChildError::ChildExited {
+            code: Some(1),
+            stderr_tail: String::new(),
+        }));
     }
 
     #[test]

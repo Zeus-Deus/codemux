@@ -843,6 +843,16 @@ describe("limits view", () => {
     expect(screen.getByRole("button", { name: "Export CSV" })).toBeDisabled();
   });
 
+  it("reports a failed read without blaming one provider", async () => {
+    vi.mocked(usageRefreshQuota).mockRejectedValue("IPC unavailable");
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("radio", { name: "Limits" }));
+    expect(
+      await screen.findByText("Could not read plan limits: IPC unavailable"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
+  });
+
   it("explains an empty result instead of rendering nothing", async () => {
     render(<UsageSection />, { wrapper: TooltipProvider });
     await userEvent.click(await screen.findByRole("radio", { name: "Limits" }));
