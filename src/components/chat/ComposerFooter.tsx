@@ -8,7 +8,7 @@ import {
   Plus,
   Square,
 } from "lucide-react";
-import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactNode, Ref } from "react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -94,13 +94,17 @@ interface Props {
   gap?: ReactNode;
   /** Pointer-down on the gap — the composer focuses its textarea. */
   onGapPointerDown?: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  /** The gap element, measured by the composer to fit the row. */
+  gapRef?: Ref<HTMLDivElement>;
   /** The context ring lives in the expanded card only. Defaults to true. */
   showContextMeter?: boolean;
   /** Width ladder: model label shortens to its leaf name. */
   modelLeafLabel?: boolean;
+  /** Width ladder: provider/model control keeps only its provider mark. */
+  modelIconOnly?: boolean;
   /** Width ladder: effort drops its text label. */
   effortIconOnly?: boolean;
-  /** Width ladder: access drops its text label. */
+  /** Width ladder: access, tasks and delivery drop their text labels. */
   accessIconOnly?: boolean;
   /** Width ladder: effort + access leave the row for the `+` menu. */
   configInMenu?: boolean;
@@ -155,8 +159,10 @@ export function ComposerFooter({
   onTasksClick,
   gap = null,
   onGapPointerDown,
+  gapRef,
   showContextMeter = true,
   modelLeafLabel = false,
+  modelIconOnly = false,
   effortIconOnly = false,
   accessIconOnly = false,
   configInMenu = false,
@@ -193,6 +199,7 @@ export function ComposerFooter({
       )}
 
       <div
+        ref={gapRef}
         data-testid="composer-gap"
         onPointerDown={onGapPointerDown}
         // Reserve the meter's space even while collapsed, so it cannot
@@ -230,13 +237,13 @@ export function ComposerFooter({
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               aria-label={
-                modelLeafLabel
+                accessIconOnly
                   ? `Tasks: ${tasks.completed} of ${tasks.total} complete`
                   : undefined
               }
               className={cn(
                 "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors duration-150",
-                modelLeafLabel && "w-[34px] justify-center px-0",
+                accessIconOnly && "w-[34px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -254,7 +261,7 @@ export function ComposerFooter({
               ) : (
                 <ListTodo className="size-3.5" aria-hidden />
               )}
-              {!modelLeafLabel && (
+              {!accessIconOnly && (
                 <>
                   <span>Tasks</span>
                   <span className="text-label tabular-nums opacity-70">
@@ -277,6 +284,7 @@ export function ComposerFooter({
             disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
             leafLabel={modelLeafLabel}
+            iconOnly={modelIconOnly}
           />
         ) : (
           <ModelPicker
@@ -286,6 +294,7 @@ export function ComposerFooter({
             disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
             leafLabel={modelLeafLabel}
+            iconOnly={modelIconOnly}
           />
         )}
         {!configInMenu && (
@@ -318,7 +327,7 @@ export function ComposerFooter({
           </>
         )}
 
-        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} />}
+        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
         {streaming && showStopButton ? (
           <>
           {onDeliveryChange && <button type="button" onClick={onSubmit} disabled={!canSubmit} aria-label={delivery === "interrupt" ? "Interrupt and send" : delivery === "steer" ? "Steer" : "Queue message"}

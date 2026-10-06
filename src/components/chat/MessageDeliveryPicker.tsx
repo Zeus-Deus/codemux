@@ -7,6 +7,7 @@ import {
   STEERING_UNAVAILABLE,
   type MessageDelivery,
 } from "@/lib/agent-chat/message-delivery";
+import { cn } from "@/lib/utils";
 import { focusCmdkOnOpen } from "./pickers/focus-cmdk-root";
 
 const deliveryIcons = { queue: ListEnd, steer: CornerDownRight, interrupt: Square };
@@ -16,11 +17,15 @@ export function MessageDeliveryPicker({
   supportsSteering,
   disabled,
   onChange,
+  iconOnly = false,
 }: {
   value: MessageDelivery;
   supportsSteering: boolean;
   disabled?: boolean;
   onChange: (value: MessageDelivery) => void;
+  /** Narrow composer: keep only the delivery icon (label stays the
+   *  accessible name). */
+  iconOnly?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const selected = MESSAGE_DELIVERY_OPTIONS.find((option) => option.value === value)!;
@@ -33,11 +38,18 @@ export function MessageDeliveryPicker({
           disabled={disabled}
           aria-label={`Message delivery: ${selected.label}`}
           title={selected.description}
-          className="inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-full px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40"
+          className={cn(
+            "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-full px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40",
+            iconOnly && "w-[34px] justify-center px-0",
+          )}
         >
           <Icon className="size-3.5" aria-hidden />
-          <span>{value === "interrupt" ? "Interrupt" : selected.label}</span>
-          <ChevronDown className="size-3" aria-hidden />
+          {!iconOnly && (
+            <>
+              <span>{value === "interrupt" ? "Interrupt" : selected.label}</span>
+              <ChevronDown className="size-3" aria-hidden />
+            </>
+          )}
         </button>
       </PopoverTrigger>
       <PopoverContent
