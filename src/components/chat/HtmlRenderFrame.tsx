@@ -19,16 +19,33 @@ import type { ToolCallItem } from "@/lib/agent-chat/types";
 import { openExternalUrl } from "@/lib/open-url";
 import { getActiveTheme, subscribeActiveTheme } from "@/lib/themes";
 
-/** The active app theme and fonts, as handed to HTML renders. */
+// `applyTypography` writes the font stacks onto the root element's inline
+// style, so a change there is the signal that they may have moved.
+function subscribeRootStyle(listener: () => void): () => void {
+  const observer = new MutationObserver(listener);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
+  return () => observer.disconnect();
+}
+
+function readFonts(): string {
+  const root = getComputedStyle(document.documentElement);
+  return [root.getPropertyValue("--font-interface"), root.getPropertyValue("--font-code")]
+    .map((value) => value.trim())
+    .join("\n");
+}
+
+/** The active app theme and fonts, as handed to HTML renders. Stable until
+ *  the theme or a font stack changes. */
 function useHtmlRenderTheme(): HtmlRenderTheme {
   const theme = useSyncExternalStore(subscribeActiveTheme, getActiveTheme);
+  const fonts = useSyncExternalStore(subscribeRootStyle, readFonts);
   return useMemo(() => {
-    const root = getComputedStyle(document.documentElement);
+    const [sans, mono] = fonts.split("\n");
     return htmlRenderTheme(theme, {
-      sans: root.getPropertyValue("--font-interface").trim() || "system-ui, sans-serif",
-      mono: root.getPropertyValue("--font-code").trim() || "ui-monospace, monospace",
+      sans: sans || "system-ui, sans-serif",
+      mono: mono || "ui-monospace, monospace",
     });
-  }, [theme]);
+  }, [theme, fonts]);
 }
 
 /**

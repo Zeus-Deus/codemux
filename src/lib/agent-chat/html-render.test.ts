@@ -53,6 +53,8 @@ describe("readHtmlRender", () => {
   it("ignores other tools, including a same-named tool on another server", () => {
     expect(readHtmlRender(call({ tool_name: "Read" }))).toBeNull();
     expect(readHtmlRender(call({ tool_name: "mcp__other__html_render" }))).toBeNull();
+    expect(readHtmlRender(call({ tool_name: "mcp__my-codemux__html_render" }))).toBeNull();
+    expect(readHtmlRender(call({ tool_name: "mcp__my_codemux__html_render" }))).toBeNull();
   });
 
   it("ignores a call without a page", () => {

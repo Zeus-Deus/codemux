@@ -65,6 +65,27 @@ describe("HtmlRenderFrame", () => {
     expect(frame.style.height).toBe(before);
   });
 
+  it("posts new font stacks to an open page without reloading it", async () => {
+    render(<HtmlRenderFrame item={renderCall()} />);
+    const frame = screen.getByTitle<HTMLIFrameElement>("Weekly turns");
+    const srcdoc = frame.getAttribute("srcdoc");
+    const posted: unknown[] = [];
+    frame.contentWindow!.postMessage = ((message: unknown) => posted.push(message)) as Window["postMessage"];
+    await act(async () => {
+      document.documentElement.style.setProperty("--font-interface", "Test Sans");
+      await Promise.resolve();
+    });
+    document.documentElement.style.removeProperty("--font-interface");
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+    expect(posted).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          styles: { variables: expect.objectContaining({ "--font-sans": "Test Sans" }) },
+        }),
+      }),
+    );
+  });
+
   it("holds a placeholder while the call is in flight", () => {
     render(<HtmlRenderFrame item={renderCall({ status: "running", input: {} })} />);
     expect(screen.getByText("Building visualization…")).toBeInTheDocument();

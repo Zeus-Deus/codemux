@@ -24,8 +24,9 @@ export interface HtmlRender {
 
 // Claude sees Codemux tools as `mcp__codemux__mcp__codemux__html_render`,
 // Codex as `codemux_mcp__codemux__html_render`; both end in the server-scoped
-// name. A same-named tool on another MCP server does not match.
-const TOOL_NAME_SUFFIX = "codemux__html_render";
+// name after a `__` separator. A same-named tool on another MCP server
+// (`mcp__my-codemux__html_render`, `mcp__other__html_render`) does not match.
+const TOOL_NAME = /(?:^|__)codemux__html_render$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -55,14 +56,14 @@ function toolCall(item: ToolCallItem): { name: string; args: unknown } {
 
 /** Whether a tool call is an `html_render` call, whatever its state. */
 export function isHtmlRenderTool(item: ToolCallItem): boolean {
-  return toolCall(item).name.endsWith(TOOL_NAME_SUFFIX);
+  return TOOL_NAME.test(toolCall(item).name);
 }
 
 /** The page an `html_render` call shows, or `null` while its input is
  *  incomplete or for any other tool. */
 export function readHtmlRender(item: ToolCallItem): HtmlRender | null {
   const { name, args } = toolCall(item);
-  if (!name.endsWith(TOOL_NAME_SUFFIX) || !isRecord(args)) return null;
+  if (!TOOL_NAME.test(name) || !isRecord(args)) return null;
   const { title, html, height } = args;
   if (typeof html !== "string" || html.trim() === "") return null;
   return {
