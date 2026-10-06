@@ -12,10 +12,11 @@ const evidenceDir = resolve('windows-claude-evidence');
 const install = JSON.parse((await readFile(join(evidenceDir, 'install.json'), 'utf8')).replace(/^\uFEFF/, ''));
 const evidence = { commit: process.env.GITHUB_SHA, install, checks: [] };
 const owned = new Set();
-function start(program, args, env = process.env) {
-  const child = spawn(program, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+function start(program, args, env = process.env, options = {}) {
+  const child = spawn(program, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...options });
   owned.add(child);
   child.once('exit', () => owned.delete(child));
+  child.once('error', () => owned.delete(child));
   let output = '';
   child.stdout.on('data', data => { output = (output + data).slice(-20000); });
   child.stderr.on('data', data => { output = (output + data).slice(-20000); });
@@ -33,8 +34,8 @@ async function stop(child) {
   await new Promise(done => killer.once('exit', done));
   await child.done;
 }
-async function run(program, args, env) {
-  const child = start(program, args, env);
+async function run(program, args, env, options) {
+  const child = start(program, args, env, options);
   const timer = setTimeout(() => { void stop(child); }, 90000);
   try {
     const result = await child.done;
@@ -105,13 +106,15 @@ try {
       const models = await client.request('list-models', { cwd: process.env.RUNNER_TEMP, pathToClaudeCodeExecutable: install.cli });
       assert.ok(models.models.length > 0, 'Real SDK initialization must return models without inference');
       evidence.checks.push({ label, probe, absolute, modelCount: models.models.length });
+      console.log(`Real sidecar (${label} PATH): ${JSON.stringify(evidence.checks.at(-1))}`);
     } finally { await stop(client.child); }
   }
 
   const installer = resolve('windows-claude-input/codemux_0.23.1_x64-setup.exe');
   const appDir = join(process.env.RUNNER_TEMP, 'Codemux install with spaces');
   await mkdir(appDir, { recursive: true });
-  await run(installer, ['/S', `/D=${appDir}`]);
+  // NSIS requires /D= to be the final, unquoted argument, including spaces.
+  await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
   await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'enable']);
   debugPolicy = true;
   for (const [label, env, expected] of [['stale', staleEnv, false], ['repaired', repairedEnv, true]]) {
