@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { btnCard, btnCardStrong, tzBodyLg, tzMeta } from "./review-ui";
+
+// The handler accepts Ctrl or Cmd; show whichever this platform calls it.
+const SUBMIT_HINT = formatKeyCombo("Ctrl+Enter");
 
 interface Props {
   /** "line 43" or "lines 43–44". */
@@ -131,7 +135,7 @@ export function ReviewLineComposer({
             </button>
           )}
           <span className="flex-1" />
-          <span className={cn("font-mono text-muted-foreground", tzMeta)}>⌘↵</span>
+          <span className={cn("font-mono text-muted-foreground", tzMeta)}>{SUBMIT_HINT}</span>
         </div>
       </div>
     </div>

@@ -18,6 +18,7 @@ import type {
 import type { ReviewThreadTask } from "@/lib/pr-agent-handoff";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { CollapsibleSection } from "./collapsible-section";
 import {
   btnCard,
@@ -29,6 +30,9 @@ import {
   tzMetaNum,
   tzRowTitle,
 } from "./review-ui";
+
+// The handler accepts Ctrl or Cmd; show whichever this platform calls it.
+const SUBMIT_HINT = formatKeyCombo("Ctrl+Enter");
 
 function ReviewStateIcon({ state }: { state: string }) {
   if (state === "APPROVED")
@@ -225,7 +229,7 @@ function ThreadReplyBox({
           {sending ? "Sending" : "Reply"}
         </button>
         <span className="flex-1" />
-        <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>⌘↵</span>
+        <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>{SUBMIT_HINT}</span>
       </div>
       {error && (
         // The drift notice's language, at comment scale: a dot, the
