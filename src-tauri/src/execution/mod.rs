@@ -4,6 +4,34 @@
 //! background CLI work cannot accidentally open windows on the user's host
 //! desktop. This is best-effort process hygiene, not a security boundary.
 
+/// Make native per-user CLI installs visible to every Windows agent surface.
+/// Call before starting the async runtime. Installers cannot update a running
+/// desktop's environment, so include this directory even before it exists.
+pub fn initialize_user_cli_path() {
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        if let Ok(path) = user_cli_path(
+            std::path::Path::new(&profile),
+            std::env::var_os("PATH").as_deref(),
+        ) {
+            std::env::set_var("PATH", path);
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn user_cli_path(
+    profile: &std::path::Path,
+    current: Option<&std::ffi::OsStr>,
+) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
+    let local_bin = profile.join(".local").join("bin");
+    let paths = current.map(std::env::split_paths).into_iter().flatten();
+    // Put the native CLI before WindowsApps aliases, just as our PTY does.
+    std::env::join_paths(std::iter::once(local_bin.clone()).chain(paths.filter(|path| {
+        !path.as_os_str().to_string_lossy().eq_ignore_ascii_case(&local_bin.to_string_lossy())
+    })))
+}
+
 /// Environment variable keys that leak host-display access to a child process.
 ///
 /// Clearing these stops well-behaved GTK/Qt/Xlib/Wayland/DBus clients from
@@ -385,6 +413,28 @@ pub fn host_command_tokio(program: impl AsRef<std::ffi::OsStr>) -> tokio::proces
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn user_cli_path_finds_installs_with_spaces_without_changing_other_entries() {
+        let profile = std::path::Path::new("User profile with spaces");
+        let other = std::path::Path::new("existing-tools");
+        let current = std::env::join_paths([other]).unwrap();
+        let actual = user_cli_path(profile, Some(&current)).unwrap();
+        assert_eq!(
+            std::env::split_paths(&actual).collect::<Vec<_>>(),
+            [profile.join(".local/bin"), other.to_path_buf()]
+        );
+        assert_eq!(user_cli_path(profile, Some(&actual)).unwrap(), actual);
+    }
+
+    #[test]
+    fn user_cli_path_includes_directory_before_any_cli_is_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = user_cli_path(root.path(), None).unwrap();
+        let local_bin = root.path().join(".local/bin");
+        assert!(!local_bin.exists());
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), [local_bin]);
+    }
 
     #[test]
     fn gui_env_keys_cover_common_escape_hatches() {

@@ -92,6 +92,7 @@ mod native_signal_log {
 }
 
 fn main() {
+    codemux_lib::execution::initialize_user_cli_path();
     // Generate unique startup ID to track multiple instances
     let startup_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)

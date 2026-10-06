@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       claude_install_only:
-        description: Run the Windows Claude installation investigation only
+        description: Test real Claude installers and the installed Windows agent GUI
         type: boolean
         default: true
   push:
@@ -27,43 +27,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows-claude-install:
-    if: github.event_name == 'workflow_dispatch' && inputs.claude_install_only
-    runs-on: windows-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        method: [powershell, cmd]
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-      - uses: oven-sh/setup-bun@v2
-      - name: Compile the shipped Windows Claude sidecar
-        working-directory: sidecar/claude-agent
-        run: |
-          bun install --frozen-lockfile
-          bun run build:windows-x64
-      - name: Install real Claude with the official installer
-        shell: pwsh
-        run: ./scripts/windows-claude-install.ps1 -Method ${{ matrix.method }}
-      - name: Download stock Codemux installer
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release download v0.23.1 --repo Zeus-Deus/codemux --pattern codemux_0.23.1_x64-setup.exe --dir windows-claude-input
-      - name: Test installed GUI and compiled sidecar
-        run: node scripts/windows-claude-smoke.mjs windows-claude-input/codemux_0.23.1_x64-setup.exe --expect-path-failure
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: windows-claude-${{ matrix.method }}
-          path: windows-claude-evidence/
-          if-no-files-found: error
-
   # ---------------------------------------------------------------------------
   # Lightweight JS + sidecar checks. These need neither the Rust toolchain, the
   # Linux GTK/WebKit system libraries, nor the staged sidecar binaries, so they
@@ -184,7 +147,6 @@ jobs:
   # `cargo test`. That work lives here (and only here).
   # ---------------------------------------------------------------------------
   rust:
-    if: github.event_name != 'workflow_dispatch' || !inputs.claude_install_only
     name: rust (${{ matrix.os }})
     strategy:
       # Never fail-fast — we always want to see both Linux and Windows
@@ -193,13 +155,13 @@ jobs:
       # point of having this matrix.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include: ${{ inputs.claude_install_only && fromJSON('[{"os":"windows-latest","method":"powershell"},{"os":"windows-latest","method":"cmd"}]') || fromJSON('[{"os":"ubuntu-latest"},{"os":"windows-latest"}]') }}
     runs-on: ${{ matrix.os }}
     # A cold Windows run can spend nearly 30 min building and testing, before
     # the post-job Rust cache save starts. Leave room for that cleanup so a
     # passing test run is not cancelled while saving its cache. Test execution
     # has its own tighter limit below; Linux keeps the existing job ceiling.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
+    timeout-minutes: ${{ inputs.claude_install_only && 60 || (matrix.os == 'windows-latest' && 45 || 30) }}
     env:
       # Full DWARF/PDB debuginfo is the default for dev/test builds and is a
       # large share of Windows link time (one PDB per test executable) and of
@@ -451,7 +413,7 @@ jobs:
         # That used to be false: `tauri::generate_context!()` wrote a cached
         # icon into OUT_DIR mid-compile, so the second invocation rebuilt the
         # whole crate (~6.5 min). build.rs now generates the context itself.
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
+        run: cargo test --manifest-path src-tauri/Cargo.toml ${{ inputs.claude_install_only && '-j 2 --test claude_windows_install' || '' }} --no-run
 
       - name: Provide Common Controls v6 manifests for Windows test executables
         if: matrix.os == 'windows-latest'
@@ -484,13 +446,15 @@ jobs:
       - name: Cargo test (Windows)
         if: matrix.os == 'windows-latest'
         timeout-minutes: 15
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml ${{ inputs.claude_install_only && '-j 2 --test claude_windows_install -- --test-threads=2' || '' }}
 
       - name: Build independent add-on examples
+        if: ${{ !inputs.claude_install_only }}
         shell: bash
         run: bash scripts/addons/build-examples.sh
 
       - name: Native installed add-on behavior
+        if: ${{ !inputs.claude_install_only }}
         shell: bash
         run: |
           suffix=linux-x64
@@ -517,5 +481,37 @@ jobs:
           cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
 
       - name: Windows native credential backend
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.claude_install_only
         run: cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
+
+      - name: Install real Claude with the official installer
+        if: inputs.claude_install_only
+        shell: pwsh
+        run: ./scripts/windows-claude-install.ps1 -Method ${{ matrix.method }}
+
+      - name: Build the current Windows installer for Claude acceptance
+        if: inputs.claude_install_only
+        shell: pwsh
+        run: |
+          # Dependency binaries are already staged above. Avoid rebuilding them
+          # in release mode; this disposable installer tests the current app.
+          @{ build = @{ beforeBuildCommand = 'npm run build' }; bundle = @{ createUpdaterArtifacts = $false } } |
+            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 ci-tauri-config.json
+          npm run tauri -- build --debug --bundles nsis --config ci-tauri-config.json
+          if ($LASTEXITCODE -ne 0) { throw 'Windows acceptance installer build failed' }
+
+      - name: Verify real SDK initialization and installed agent GUI
+        if: inputs.claude_install_only
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem src-tauri/target/debug/bundle/nsis -Filter '*-setup.exe')
+          if ($installer.Count -ne 1) { throw 'Expected exactly one current Windows installer' }
+          node scripts/windows-claude-smoke.mjs $installer[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Claude installation smoke failed' }
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.claude_install_only
+        with:
+          name: windows-claude-${{ matrix.method }}
+          path: windows-claude-evidence/
+          if-no-files-found: warn

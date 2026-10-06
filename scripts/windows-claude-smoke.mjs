@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -95,6 +95,7 @@ const repairedEnv = { ...staleEnv, [pathKey]: `${dirname(install.cli)};${stalePa
 const sidecar = resolve('sidecar/claude-agent/dist/codemux-claude-sidecar-windows-x64.exe');
 let debugPolicy = false;
 let socket;
+let hiddenCli;
 try {
   for (const [label, env, expected] of [['stale', staleEnv, false], ['repaired', repairedEnv, true]]) {
     const client = rpc(sidecar, env);
@@ -129,7 +130,13 @@ try {
   await run(installer, ['/S', `/D=${appDir}`], undefined, { windowsVerbatimArguments: true });
   await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'enable']);
   debugPolicy = true;
-  for (const [label, env, expected] of [['stale', staleEnv, !expectPathFailure], ['repaired', repairedEnv, true]]) {
+  const guiCases = [['stale', staleEnv, !expectPathFailure], ['repaired', repairedEnv, true]];
+  if (!expectPathFailure) guiCases.push(['installed-after-startup', staleEnv, false]);
+  for (const [label, env, expected] of guiCases) {
+    if (label === 'installed-after-startup') {
+      hiddenCli = `${install.cli}.smoke-backup`;
+      await rename(install.cli, hiddenCli);
+    }
     const desktop = start(join(appDir, 'codemux.exe'), [], env);
     try {
       const target = await until('Installed app WebView2', async () => {
@@ -168,6 +175,20 @@ try {
       assert.equal(health.installed, expected, JSON.stringify(health));
       assert.equal(health.version !== undefined && health.version !== null, expected);
       console.log(`Installed GUI (${label} PATH): ${JSON.stringify(health)}`);
+      if (hiddenCli) {
+        await rename(hiddenCli, install.cli);
+        hiddenCli = undefined;
+        const result = await cdp('Runtime.evaluate', {
+          expression: 'window.__TAURI_INTERNALS__.invoke("agent_chat_provider_health", {provider:"claude"})',
+          awaitPromise: true, returnByValue: true,
+        });
+        assert.equal(result.result?.exceptionDetails, undefined, JSON.stringify(result));
+        const health = result.result.result.value;
+        assert.equal(health.installed, true, 'Running GUI must find Claude installed after startup');
+        assert.ok(health.version);
+        evidence.checks.push({ label: 'same-running-gui-after-install', health });
+        console.log(`Same running GUI after installation: ${JSON.stringify(health)}`);
+      }
       socket.close(); socket = undefined;
     } finally {
       socket?.close(); socket = undefined;
@@ -182,6 +203,7 @@ try {
   throw error;
 } finally {
   for (const child of owned) await stop(child);
+  if (hiddenCli) await rename(hiddenCli, install.cli);
   if (debugPolicy) await run('powershell.exe', ['-NoProfile', '-File', 'scripts/addons/windows-webview-debug.ps1', '-Mode', 'disable']);
   await writeFile(join(evidenceDir, 'smoke.json'), JSON.stringify(evidence, null, 2));
 }
