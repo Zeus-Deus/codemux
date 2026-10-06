@@ -3483,17 +3483,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // context bar. Rendered at every message count:
     // an empty thread has nothing to choose either (see above), so the
     // strip never changes shape across the first send.
-    <div className={SCOPE_STRIP_INSET}>
+    <div className={`${SCOPE_STRIP_INSET} @container`}>
       <div className={SCOPE_STRIP} data-mobile-scope-strip>
-        <div className="flex min-w-0 items-center gap-0.5 text-label font-medium text-muted-foreground">
+        {/* As the pane narrows the branch goes first, then the project:
+            the status cluster on the right is what's actionable. Labels
+            truncate in between rather than spill under the cluster. */}
+        <div className="flex min-w-0 items-center gap-0.5 overflow-hidden text-label font-medium text-muted-foreground @max-[450px]:hidden">
           <span
-            className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
+            className="inline-flex h-6 min-w-0 items-center gap-1.5 rounded-md px-2"
             title={workspaceProjectRoot}
           >
             {isHomeWorkspace ? (
-              <Home className="size-3.5 text-status-remote" />
+              <Home className="size-3.5 shrink-0 text-status-remote" />
             ) : (
-              <Folder className="size-3.5 text-muted-foreground" />
+              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
             )}
             <span className="max-w-[140px] truncate">
               {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
@@ -3501,12 +3504,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           </span>
           {paneWorkspaceBranch && (
             <>
-              <span className="select-none text-muted-foreground/50">·</span>
+              <span className="shrink-0 select-none text-muted-foreground/50 @max-[500px]:hidden">·</span>
               <span
-                className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
+                className="inline-flex h-6 min-w-0 shrink-[2] items-center gap-1.5 rounded-md px-2 font-mono @max-[500px]:hidden"
                 title={`Branch: ${paneWorkspaceBranch}`}
               >
-                <GitBranch className="size-3 text-muted-foreground" />
+                <GitBranch className="size-3 shrink-0 text-muted-foreground" />
                 <span className="max-w-[160px] truncate">
                   {paneWorkspaceBranch}
                 </span>

@@ -17,7 +17,11 @@ import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
-import { FOOTER_TRIGGER, leafModelName } from "./footer-trigger";
+import {
+  FOOTER_TRIGGER,
+  FOOTER_TRIGGER_ICON_ONLY,
+  leafModelName,
+} from "./footer-trigger";
 import { refreshProviderCapabilitiesForIntent } from "@/stores/provider-capabilities-store";
 
 // The model list + default-model / label helpers moved to
@@ -70,6 +74,9 @@ interface Props {
   openSignal?: number;
   /** Narrow composer: show only the model's leaf name. */
   leafLabel?: boolean;
+  /** Tight composer: only the provider mark; the model name moves to the
+   *  tooltip and accessible name. */
+  iconOnly?: boolean;
 }
 
 export function ModelPicker({
@@ -79,6 +86,7 @@ export function ModelPicker({
   disabled,
   openSignal,
   leafLabel = false,
+  iconOnly = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const list = modelsForProvider(provider);
@@ -108,17 +116,27 @@ export function ModelPicker({
         <button
           type="button"
           disabled={disabled}
-          className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
+          className={cn(
+            FOOTER_TRIGGER,
+            "gap-1.5",
+            iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
+          )}
+          aria-label={
+            iconOnly ? `Model: ${modelLabel(provider, current)}` : undefined
+          }
+          title={modelLabel(provider, current)}
         >
           <ProviderLogo provider={provider} className="size-4 shrink-0" />
-          <span className="max-w-[140px] truncate">
-            {leafLabel
-              ? leafModelName(modelLabel(provider, current))
-              : modelLabel(provider, current)}
-          </span>
-          <ChevronDown
-            className="-mx-0.5 size-3.5 shrink-0 opacity-70"
-          />
+          {!iconOnly && (
+            <>
+              <span className="max-w-[140px] truncate">
+                {leafLabel
+                  ? leafModelName(modelLabel(provider, current))
+                  : modelLabel(provider, current)}
+              </span>
+              <ChevronDown className="-mx-0.5 size-3.5 shrink-0 opacity-70" />
+            </>
+          )}
         </button>
       </PopoverTrigger>
       <PopoverContent

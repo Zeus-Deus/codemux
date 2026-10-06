@@ -14,6 +14,11 @@
 export const FOOTER_TRIGGER =
   "inline-flex h-[34px] shrink-0 items-center gap-2 rounded-lg px-2.5 text-body font-medium leading-5 text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:opacity-50";
 
+/** Narrow composer: a FOOTER_TRIGGER reduced to its icon, the same 34px
+ *  square as the attach / send circles. The chevron goes too; the hover
+ *  surface and tooltip carry the affordance. */
+export const FOOTER_TRIGGER_ICON_ONLY = "w-[34px] justify-center px-0";
+
 /** A model label's leaf name — what the composer's narrow width ladder
  *  shows instead of the full label: the last `/` segment of routed ids
  *  ("openrouter/qwen3-coder" → "qwen3-coder"); plain labels pass through. */
