@@ -3,7 +3,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
 import { HermesDefaultProfileSetting, HermesSetting } from "./hermes-setting";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
 import { Button } from "@/components/ui/button";
@@ -333,6 +333,80 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       />
       <span className="truncate">{label}</span>
     </button>
+  );
+}
+
+/** Synced text setting that writes once per edit (blur or Enter) rather than
+ *  per keystroke, so other devices never see a half-typed branch name. An
+ *  empty value is refused and the saved one comes back. */
+function BaseBranchInput({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => {
+    const next = draft.trim();
+    if (!next) {
+      setDraft(value);
+      return;
+    }
+    if (next !== draft) setDraft(next);
+    if (next !== value) onCommit(next);
+  };
+  return (
+    <Input
+      aria-label="Default base branch"
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        else if (e.key === "Escape" && draft !== value) {
+          // Escape discards the unsaved edit.
+          e.preventDefault();
+          setDraft(value);
+        }
+      }}
+      placeholder="main"
+      className="w-36 h-9 font-mono"
+    />
+  );
+}
+
+/** Slider whose value reads live beside it while dragging but persists only
+ *  when the drag ends — one synced write instead of one per tick. */
+function CommitSlider({
+  value,
+  format,
+  onCommit,
+  min,
+  max,
+  step,
+}: {
+  value: number;
+  format: (v: number) => string;
+  onCommit: (v: number) => void;
+  min: number;
+  max: number;
+  step: number;
+}) {
+  const [live, setLive] = useState(value);
+  useEffect(() => setLive(value), [value]);
+  return (
+    <div className="flex items-center gap-3">
+      <span className="min-w-[6.5rem] text-right font-mono text-label tabular-nums text-muted-foreground">
+        {format(live)}
+      </span>
+      <Slider
+        value={[live]}
+        onValueChange={([v]) => setLive(v)}
+        onValueCommit={([v]) => {
+          if (v !== value) onCommit(v);
+        }}
+        min={min}
+        max={max}
+        step={step}
+        className="w-36"
+      />
+    </div>
   );
 }
 
@@ -778,6 +852,19 @@ function PresetEditorSheet({
     onOpenChange(false);
   };
 
+  // Text fields save on blur, but Escape or Done can close the sheet while one
+  // still has focus, and the unmount never blurs it. Flush those edits first.
+  const textEdited =
+    name !== preset.name ||
+    description !== (preset.description ?? "") ||
+    (structured
+      ? prompt !== (preset.launch_config?.prompt ?? "")
+      : commands.filter((c) => c.trim()).join("\n") !== preset.commands.join("\n"));
+  const handleOpenChange = (next: boolean) => {
+    if (!next && textEdited) save();
+    onOpenChange(next);
+  };
+
   const handlePinnedChange = (checked: boolean) => {
     setPinned(checked);
     if (isDraft) return;
@@ -834,7 +921,7 @@ function PresetEditorSheet({
   };
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet open={open} onOpenChange={handleOpenChange}>
       <SheetContent
         side="right"
         className="sm:max-w-xl w-full flex flex-col gap-0 p-0"
@@ -1142,7 +1229,7 @@ function PresetEditorSheet({
             onClick={
               isDraft
                 ? () => onCreate?.(buildCreatePayload())
-                : () => onOpenChange(false)
+                : () => handleOpenChange(false)
             }
           >
             {isDraft ? "Create preset" : "Done"}
@@ -1271,6 +1358,14 @@ export function SettingsView() {
     if (settingsSection !== null) setActiveSection(settingsSection);
   }, [settingsSection, settingsNavigationVersion]);
   const sectionAvailable = isSettingsSectionAvailable(activeSection, enableAgentChat);
+  // The nav scrolls on short windows; keep the active row visible when a
+  // deep link selects a section further down.
+  const navRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    navRef.current
+      ?.querySelector<HTMLElement>('[aria-current="page"]')
+      ?.scrollIntoView?.({ block: "nearest" });
+  }, [activeSection]);
   const editors = useDetectedEditors();
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
@@ -1522,7 +1617,7 @@ export function SettingsView() {
       case "appearance":
         // Unchanged from before the Theming handoff, with one exception: the
         // theme *grid* is gone. Picking a theme now lives in the command
-        // palette (⌘K → "theme"), where the whole app repaints behind the list
+        // palette (open it, type "theme"), where the whole app repaints behind the list
         // — so `ThemeSettings` is a single row stating what is on, and the
         // studio it opens is an app-level overlay. Everything else on this
         // page stayed exactly where it was.
@@ -1558,7 +1653,7 @@ export function SettingsView() {
             <SectionGroup>
               <SubsectionHeader
                 title="Theme"
-                description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — ⌘K, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
+                description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — open it, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
               />
               <ThemeSettings />
               <div className="mt-4 space-y-1">
@@ -1886,11 +1981,7 @@ export function SettingsView() {
             />
             <div className="space-y-1">
               <SettingRow label="Default base branch" description="Used as the default when creating new feature branches.">
-                <Input
-                  value={baseBranch}
-                  onChange={(e) => setBaseBranch(e.target.value)}
-                  className="w-36 h-9"
-                />
+                <BaseBranchInput value={baseBranch} onCommit={setBaseBranch} />
               </SettingRow>
             </div>
 
@@ -2017,9 +2108,6 @@ export function SettingsView() {
               >
                 <HermesDefaultProfileSetting />
               </SettingRow>
-              <div className="pb-4">
-                <HermesSetting />
-              </div>
               <Separator />
               <SettingRow
                 label="Auto-configure MCP for workspaces"
@@ -2329,7 +2417,7 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Session Restore"
-              description="Restore terminal scrollback and agent sessions when reopening Codemux."
+              description="Restore terminal scrollback when reopening Codemux."
             />
             <div className="space-y-1">
               <SettingRow
@@ -2346,33 +2434,33 @@ export function SettingsView() {
               <Separator />
               <SettingRow
                 label="Scrollback lines"
-                description={`${syncedSettings.session_restore.scrollback_lines.toLocaleString()} lines saved per terminal pane.`}
+                description="Lines saved per terminal pane."
               >
-                <Slider
-                  value={[syncedSettings.session_restore.scrollback_lines]}
-                  onValueChange={([v]) => {
+                <CommitSlider
+                  value={syncedSettings.session_restore.scrollback_lines}
+                  format={(v) => `${v.toLocaleString()} lines`}
+                  onCommit={(v) => {
                     updateSyncedSetting("session_restore", "scrollback_lines", v).catch(console.error);
                   }}
                   min={1000}
                   max={50000}
                   step={1000}
-                  className="w-36"
                 />
               </SettingRow>
               <Separator />
               <SettingRow
                 label="Max disk usage"
-                description={`${syncedSettings.session_restore.max_total_mb} MB maximum for all saved scrollback.`}
+                description="Maximum for all saved scrollback."
               >
-                <Slider
-                  value={[syncedSettings.session_restore.max_total_mb]}
-                  onValueChange={([v]) => {
+                <CommitSlider
+                  value={syncedSettings.session_restore.max_total_mb}
+                  format={(v) => `${v} MB`}
+                  onCommit={(v) => {
                     updateSyncedSetting("session_restore", "max_total_mb", v).catch(console.error);
                   }}
                   min={10}
                   max={500}
                   step={10}
-                  className="w-36"
                 />
               </SettingRow>
             </div>
@@ -2429,7 +2517,13 @@ export function SettingsView() {
             dividers) so the nav reads as one continuous list. Mono
             group captions echo the design system's metadata voice. */}
         {mobile && <select aria-label="Settings section" className="mobile-pane-picker" value={activeSection} onChange={e => setActiveSection(e.target.value as Section)}>{navGroups.map(group => <optgroup key={group.label} label={group.label}>{group.items.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</optgroup>)}</select>}
-        <nav className={cn("w-60 shrink-0 border-r border-border bg-background py-4", mobile && "hidden")}>
+        <nav
+          ref={navRef}
+          className={cn(
+            "thin-scrollbar w-60 shrink-0 overflow-y-auto overscroll-contain border-r border-border bg-background py-4",
+            mobile && "hidden",
+          )}
+        >
           <div className="space-y-5">
             {navGroups.map((group) => (
               <div key={group.label}>
@@ -2453,9 +2547,12 @@ export function SettingsView() {
         </nav>
 
         {/* Content */}
-        <ScrollArea className="flex-1 bg-card">
+        {/* Keyed by section: each page opens at its top instead of the
+            previous page's scroll offset, and fades in rather than cutting. */}
+        <ScrollArea key={activeSection} className="flex-1 bg-card">
           <div
             className={cn(
+              "animate-in fade-in-0 duration-150 motion-reduce:animate-none",
               mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
               WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",
             )}
