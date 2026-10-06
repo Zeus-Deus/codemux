@@ -16,6 +16,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
 });
 
 import {
+  collapseDisabledFor,
   Composer,
   composerFooterLadder,
   FOOTER_COMPACT_STEPS,
@@ -228,6 +229,13 @@ describe("Composer pill collapse", () => {
     expect(strip.compareDocumentPosition(wrapper())).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+  });
+});
+
+describe("collapseDisabledFor", () => {
+  it("keeps the pill expanded below 400px", () => {
+    expect(collapseDisabledFor(400)).toBe(false);
+    expect(collapseDisabledFor(399)).toBe(true);
   });
 });
 

@@ -383,6 +383,10 @@ const SEND_HOLD_MS = 400;
 /** Below this pill width the composer never collapses. */
 const COLLAPSE_DISABLED_BELOW_PX = 400;
 
+export function collapseDisabledFor(pillWidth: number): boolean {
+  return pillWidth < COLLAPSE_DISABLED_BELOW_PX;
+}
+
 /** The controls row compacts until the gap beside the placeholder is at
  *  least this wide, so the placeholder stays readable. */
 export const FOOTER_MIN_GAP_PX = 96;
@@ -2680,7 +2684,7 @@ export function Composer({
     const gap = footerGapRef.current?.getBoundingClientRect().width ?? 0;
     // No layout yet (or jsdom): stay at full width.
     if (pill <= 0) return;
-    setCollapseDisabled(pill < COLLAPSE_DISABLED_BELOW_PX);
+    setCollapseDisabled(collapseDisabledFor(pill));
     const measured = committedFitRef.current;
     setFooterFit((prev) =>
       prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap) : prev,
