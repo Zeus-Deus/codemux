@@ -71,6 +71,15 @@ Evidence and limits
   NVIDIA615.71.09, 200Hz display. Electron41.5.0 comparison was an isolated shell
   using the same mock content, not the existing t3code process. GLib/Electron
   input schedules differ; callbacks/DOM offsets are not input-to-photon timings.
+- Release export stress check: release_clock_probe.py compiles the current
+  production clock module with the exact build.rs export flag, opt-level3,
+  thin LTO and symbol stripping. With no direct Rust reference to the hook,
+  readelf finds its defined GLOBAL dynamic symbol; dlsym finds it before loading
+  libdrm and still resolves that executable symbol after libdrm is loaded.
+  See precision-results/release-clock-results.json. This establishes optimized
+  executable export retention/interposition, not a full CodeMux release/AppImage
+  GUI smoke test. Full release fallback logging/callback timing remains a
+  distinct packaging/runtime validation item, especially on other displays.
 - The real dev app's get_precise_wheel_available command returned true. This
   settled the earlier startup-race concern; the hook waits for native discovery.
 - Physical feedback validated the final candidate. Browser screenshot tooling
@@ -131,7 +140,7 @@ src/lib/wheel-scrolling.ts, src/hooks/use-smooth-scrolling.ts,
 src/components/chat/MessageTrail.tsx.
 Tests and reproducible commands: precision-results/cadence-README.txt,
 precision-results/README.txt, wheel-source-README.txt, native_precision_probe.py,
-native_protocol_probe.py, glide_probe.py, build_native_probe.py.
+native_protocol_probe.py, release_clock_probe.py, glide_probe.py, build_native_probe.py.
 Historical hypotheses/sources: research-findings.txt. It describes an earlier
 candidate; the shipped policy and capability confirmation above supersede it.
 Archived attempts: onset-results, precision-results, rendering-ab, glide-results.

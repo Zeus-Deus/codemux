@@ -1,0 +1,14 @@
+{
+  "production_module": "src-tauri/src/vblank_fallback.rs",
+  "source_sha256": "133aa03020fb7fd1287e7c67e57b36eb7bacc9887dc0dbce73e963b100e5ed79",
+  "production_linker_flag": "-Wl,--export-dynamic-symbol=drmWaitVBlank",
+  "release_profile": {
+    "opt_level": 3,
+    "lto": "thin",
+    "strip": "symbols"
+  },
+  "executable_sha256": "5d92210a83612a9f59078e83599ddc3b79f9ad96cde8f23d4883eaee3c6262f8",
+  "dynamic_symbol": "74: 0000000000017140  2660 FUNC    GLOBAL DEFAULT   15 drmWaitVBlank",
+  "result": "production export retained and interposes loaded libdrm",
+  "limitations": "Isolated production-module export test; not a full release CodeMux/AppImage launch, GUI callback or scanout measurement."
+}

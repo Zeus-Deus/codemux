@@ -1,6 +1,6 @@
 //! WebKitGTK renderer + scrolling tuning (Linux).
 //!
-//! Three independent knobs live here, all no-ops on non-Linux targets:
+//! Three independent policies live here, all no-ops on non-Linux targets:
 //!
 //! 1. **Display backend** — [`configure_gdk_backend_env`] prefers native
 //!    Wayland when it is available, including undoing the AppImage GTK
@@ -13,10 +13,9 @@
 //!    `dirs` (same logic as every other piece of local state) rather than
 //!    through an `AppHandle`, which does not exist yet.
 //!
-//! 3. **Smooth scrolling** — WebKitGTK's `enable-smooth-scrolling` setting,
-//!    applied per webview via `with_webview`. Each `WebviewWindow` owns its
-//!    own `WebKitSettings` object, so this is applied to every window, not
-//!    just `main`.
+//! 3. **Wheel input** — disables WebKit's native wheel animation and attaches
+//!    the Wayland value120 bridge, applied per webview via `with_webview`.
+//!    Each window owns its settings; the frontend handles the default glide.
 //!
 //! Escape hatch: set `CODEMUX_WEBKIT_COMPAT=1` to force the legacy
 //! compatibility renderer (`WEBKIT_DISABLE_DMABUF_RENDERER=1` +
