@@ -368,9 +368,11 @@ export const getOrCreateHomeWorkspace = () =>
 
 export const listChatProviderCapabilities = (
   provider: AgentChatProviderKind,
+  force?: boolean,
 ) =>
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
+    force,
   });
 
 /** Probe the health of a chat provider's local runtime (installed /

@@ -3984,6 +3984,7 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
 pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
+    force: Option<bool>,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -4040,6 +4041,9 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 }
                 .to_command_string()
             })?;
+            if force.unwrap_or(false) {
+                codex_cache.invalidate().await;
+            }
             codex_cache
                 .get_or_harvest(&binary_path, None)
                 .await
