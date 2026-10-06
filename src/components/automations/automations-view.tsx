@@ -1,24 +1,20 @@
 import { useEffect } from "react";
 
-import { ArrowLeft } from "lucide-react";
-
-import { Button } from "@/components/ui/button";
-import { WindowChrome } from "@/components/layout/window-chrome";
+import { UtilityPage } from "@/components/layout/utility-page";
 import { useUIStore } from "@/stores/ui-store";
 import { AutomationsSection } from "./automations-section";
 
 /**
- * Full-screen Automations view.
+ * The Automations page.
  *
  * A first-class destination reached from the left sidebar (not a
  * Settings sub-page) — the same placement Codex and Superset give it.
- * Mirrors `SettingsView`'s full-screen chrome: a `WindowChrome` drag
- * strip, a back-button header, then the management panel.
+ * Opens beside the sidebar like the other utility pages.
  */
 export function AutomationsView() {
   const setShowAutomations = useUIStore((s) => s.setShowAutomations);
 
-  // Escape closes the view, matching the other full-screen overlays.
+  // Escape closes the view, matching the other utility pages.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setShowAutomations(false);
@@ -28,30 +24,16 @@ export function AutomationsView() {
   }, [setShowAutomations]);
 
   return (
-    <div className="relative flex h-screen flex-col bg-background">
-      <WindowChrome />
-      {/* `pt-7` (= the 28px WindowChrome drag strip) keeps the back
-          button's hit area entirely below the drag region. */}
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 pt-7 pb-2">
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Close automations"
-          className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
-          onClick={() => setShowAutomations(false)}
-        >
-          <ArrowLeft className="size-4" />
-        </Button>
-        <span className="text-body font-medium text-foreground">
-          Automations
-        </span>
-      </div>
-
-      <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6">
+    <UtilityPage
+      title="Automations"
+      backLabel="Close automations"
+      onBack={() => setShowAutomations(false)}
+    >
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6 pt-4">
         <div className="mx-auto max-w-5xl">
           <AutomationsSection />
         </div>
       </div>
-    </div>
+    </UtilityPage>
   );
 }

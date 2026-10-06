@@ -1,16 +1,12 @@
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useQueryClient } from "@tanstack/react-query";
 
-import { Button } from "@/components/ui/button";
-import { WindowChrome } from "@/components/layout/window-chrome";
+import { UtilityPage } from "@/components/layout/utility-page";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { toast } from "@/lib/toast";
-import { cn } from "@/lib/utils";
-import { tzBodyLg, tzPageTitle } from "@/components/workspace/review/review-ui";
 import { badgeKeys, rowKey, type PrRow } from "@/lib/pr-overview";
 import {
   prHistoryKey,
@@ -24,23 +20,23 @@ import { PrList } from "./pr-list";
 import { PrTabStrip } from "./pr-tab-strip";
 import { PrDetailColumn } from "./pr-detail-column";
 
-/** The canvas measure. Wide enough for a title plus its state label,
- *  narrow enough to leave the detail column the room it needs. */
-const DEFAULT_LIST_WIDTH = 452;
-const MIN_LIST_WIDTH = 340;
-const MAX_LIST_WIDTH = 720;
+/** The detail panel opens at this share of the page, and the list keeps
+ *  at least `MIN_LIST_WIDTH` beside it however wide the panel is dragged. */
+const DEFAULT_PANEL_SHARE = 0.55;
+const MIN_PANEL_WIDTH = 440;
+const MIN_LIST_WIDTH = 360;
 
 /**
  * Pull requests, across every project you have open.
  *
- * A first-class destination like Automations and Workspaces: full
- * screen, its own sidebar entry, Escape to leave. The detail column is
- * the workspace Review panel's own component at a wider measure — the
- * same surface, not a second implementation of it.
+ * A utility page like Automations: it opens beside the sidebar, and the
+ * sidebar's Back (or Escape) leaves it. The list is the page; opening a
+ * pull request slides its detail in on the right — the workspace Review
+ * panel's own component at a wider measure, the same surface, not a
+ * second implementation of it.
  */
 export function PullRequestsView() {
   const mobile = useMobileLayout();
-  const [mobileDetail, setMobileDetail] = useState(false);
   const setShowPullRequests = useUIStore((s) => s.setShowPullRequests);
   const pendingSelection = useUIStore((s) => s.pendingPrSelection);
   const clearPendingPrSelection = useUIStore((s) => s.clearPendingPrSelection);
@@ -49,7 +45,10 @@ export function PullRequestsView() {
   const [stateFilter, setStateFilter] = useState<PrStateFilter>("open");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [tabKeys, setTabKeys] = useState<string[]>([]);
-  const [listWidth, setListWidth] = useState(DEFAULT_LIST_WIDTH);
+  // Whether the detail panel is showing. On mobile it replaces the list.
+  const [panelOpen, setPanelOpen] = useState(false);
+  // null until the user drags it: the panel then follows the page's width.
+  const [panelWidth, setPanelWidth] = useState<number | null>(null);
 
   const {
     rows,
@@ -82,14 +81,18 @@ export function PullRequestsView() {
   // whenever `escapeClaimedElsewhere` says an editor, overlay or open
   // dialog owns it — that guard, not per-component workarounds, is what
   // stands between a reply draft and oblivion.
+  //
+  // With a pull request open, the first Escape closes its panel and the
+  // second leaves the page.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || escapeClaimedElsewhere(event)) return;
-      setShowPullRequests(false);
+      if (panelOpen) setPanelOpen(false);
+      else setShowPullRequests(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [setShowPullRequests]);
+  }, [panelOpen, setShowPullRequests]);
 
   // Which workspace, if any, is standing on each branch. Resolved once
   // here rather than per row: the rows would otherwise each subscribe to
@@ -120,9 +123,19 @@ export function PullRequestsView() {
   const openRow = useCallback((row: PrRow) => {
     const key = rowKey(row);
     setSelectedKey(key);
-    setMobileDetail(true);
+    setPanelOpen(true);
     setTabKeys((keys) => (keys.includes(key) ? keys : [...keys, key]));
   }, []);
+
+  // ↑↓ in the list: with the panel open it follows the cursor, as it
+  // always has; closed, the cursor just moves and ↵ opens.
+  const moveTo = useCallback(
+    (row: PrRow) => {
+      if (panelOpen) openRow(row);
+      else setSelectedKey(rowKey(row));
+    },
+    [panelOpen, openRow],
+  );
 
   // The palette can ask for a specific pull request; honour it once the
   // row it names has actually loaded.
@@ -189,18 +202,6 @@ export function PullRequestsView() {
     })();
   }, [pendingSelection, byKey, queryClient, clearPendingPrSelection]);
 
-  // First load lands on the first thing that wants something from you.
-  useEffect(() => {
-    if (selectedKey || pendingSelection || rows.length === 0) return;
-    const first = rows.find((row) => {
-      const viewer = viewerByRoot.get(row.projectRoot);
-      return viewer && row.review_requested_from.some(
-        (login) => login.toLowerCase() === viewer.toLowerCase(),
-      );
-    });
-    if (first && !mobile) openRow(first);
-  }, [rows, viewerByRoot, selectedKey, pendingSelection, openRow, mobile]);
-
   // ── Rows that have left the list but are still open in a tab ──
   //
   // Merging or closing a pull request drops it out of the default "open"
@@ -244,21 +245,24 @@ export function PullRequestsView() {
         // nothing while you are working through a queue.
         setSelectedKey(next[Math.min(index, next.length - 1)] ?? null);
       }
+      if (next.length === 0) setPanelOpen(false);
       return next;
     });
   };
 
   const detailRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const startResize = (event: React.PointerEvent) => {
     event.preventDefault();
     const startX = event.clientX;
-    const startWidth = listWidth;
+    const startWidth = detailRef.current?.offsetWidth ?? MIN_PANEL_WIDTH;
+    const bodyWidth = bodyRef.current?.clientWidth ?? window.innerWidth;
     const onMove = (moveEvent: PointerEvent) => {
       const next = Math.min(
-        Math.max(startWidth + moveEvent.clientX - startX, MIN_LIST_WIDTH),
-        MAX_LIST_WIDTH,
+        Math.max(startWidth - (moveEvent.clientX - startX), MIN_PANEL_WIDTH),
+        Math.max(MIN_PANEL_WIDTH, bodyWidth - MIN_LIST_WIDTH),
       );
-      setListWidth(next);
+      setPanelWidth(next);
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
@@ -268,28 +272,24 @@ export function PullRequestsView() {
     window.addEventListener("pointerup", onUp);
   };
 
-  return (
-    <div className="relative flex h-screen flex-col bg-background">
-      <WindowChrome />
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 pb-2 pt-7">
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={mobile && mobileDetail ? "Back to pull requests" : "Close pull requests"}
-          className="text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          onClick={() => mobile && mobileDetail ? setMobileDetail(false) : setShowPullRequests(false)}
-        >
-          <ArrowLeft className="size-4" />
-        </Button>
-        <span className={cn("font-semibold tracking-tight text-foreground", tzPageTitle)}>
-          Pull requests
-        </span>
-      </div>
+  // ↵ in the list: open the row under the cursor and hand it the keyboard.
+  const openDetail = () => {
+    if (selected) openRow(selected);
+    requestAnimationFrame(() => detailRef.current?.focus());
+  };
 
-      <div className="flex min-h-0 flex-1">
+  const showPanel = panelOpen && selected !== null;
+
+  return (
+    <UtilityPage
+      title="Pull requests"
+      backLabel={mobile && showPanel ? "Back to pull requests" : "Close pull requests"}
+      onBack={() => (mobile && showPanel ? setPanelOpen(false) : setShowPullRequests(false))}
+    >
+      <div ref={bodyRef} className="flex min-h-0 flex-1">
         <div
-          className="flex min-h-0 shrink-0 flex-col border-r border-border/40"
-          style={{ width: mobile ? "100%" : listWidth, display: mobile && mobileDetail ? "none" : undefined }}
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+          style={{ display: mobile && showPanel ? "none" : undefined }}
         >
           <PrList
             rows={rows}
@@ -307,36 +307,47 @@ export function PullRequestsView() {
             selectedKey={selectedKey}
             stateFilter={stateFilter}
             onStateFilter={setStateFilter}
-            onSelect={openRow}
-            onOpenDetail={() => detailRef.current?.focus()}
+            onSelect={moveTo}
+            onOpen={openRow}
+            onOpenDetail={openDetail}
             onRefresh={refresh}
           />
         </div>
 
-        <div
-          hidden={mobile}
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize the list"
-          data-testid="pr-list-resizer"
-          onPointerDown={startResize}
-          className="w-1 shrink-0 cursor-col-resize transition-colors duration-150 hover:bg-foreground/20"
-        />
-
-        <div
-          style={{ display: mobile && !mobileDetail ? "none" : undefined }}
-          ref={detailRef}
-          tabIndex={-1}
-          className="flex min-h-0 min-w-0 flex-1 flex-col outline-none"
-        >
-          {selected ? (
-            <>
+        {showPanel && (
+          <>
+            <div
+              hidden={mobile}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize the pull request panel"
+              data-testid="pr-list-resizer"
+              onPointerDown={startResize}
+              className="w-1 shrink-0 cursor-col-resize border-l border-border/60 transition-colors duration-150 hover:bg-foreground/20"
+            />
+            <div
+              ref={detailRef}
+              tabIndex={-1}
+              data-testid="pr-detail-panel"
+              className="flex min-h-0 min-w-0 flex-col bg-background outline-none"
+              style={
+                mobile
+                  ? { flex: 1 }
+                  : {
+                      width: panelWidth ?? `${DEFAULT_PANEL_SHARE * 100}%`,
+                      minWidth: MIN_PANEL_WIDTH,
+                      maxWidth: `calc(100% - ${MIN_LIST_WIDTH}px)`,
+                      flexShrink: 0,
+                    }
+              }
+            >
               <PrTabStrip
                 tabs={tabs}
                 activeKey={selectedKey}
                 candidates={rows}
                 onSelect={openRow}
                 onClose={closeTab}
+                onClosePanel={() => setPanelOpen(false)}
                 onOpenInBrowser={() => {
                   openUrl(selected.url).catch((err) => toast.error(String(err)));
                 }}
@@ -357,17 +368,10 @@ export function PullRequestsView() {
                   viewerLogin={viewerByRoot.get(selected.projectRoot) ?? null}
                 />
               </div>
-            </>
-          ) : (
-            <div className="flex flex-1 items-center justify-center px-6">
-              <p className={cn("max-w-sm text-center leading-relaxed text-muted-foreground", tzBodyLg)}>
-                Pick a pull request on the left to read it here. ↑↓ moves through the
-                list, ↵ opens the one you're on.
-              </p>
             </div>
-          )}
-        </div>
+          </>
+        )}
       </div>
-    </div>
+    </UtilityPage>
   );
 }

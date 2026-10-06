@@ -64,6 +64,10 @@ vi.mock("./pr-detail-column", () => ({
   ),
 }));
 
+vi.mock("@/hooks/use-gui-chrome", () => ({
+  useTitlebarOverlay: () => false,
+}));
+
 vi.mock("@/components/layout/window-chrome", () => ({
   WindowChrome: () => null,
 }));
@@ -159,6 +163,21 @@ describe("Escape on the Pull Requests page", () => {
     // page's own Escape off for the most ordinary position on the page.
     screen.getByTestId("pr-list-rows").focus();
     expect(document.activeElement).toBe(screen.getByTestId("pr-list-rows"));
+
+    await user.keyboard("{Escape}");
+    expect(mockSetShowPullRequests).toHaveBeenCalledWith(false);
+  });
+
+  it("closes an open pull request's panel before the page", async () => {
+    const user = userEvent.setup();
+    renderView([row({ number: 1 })]);
+
+    await user.click(screen.getByText("pull request 1"));
+    expect(await screen.findByTestId("pr-detail")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("pr-detail")).toBeNull();
+    expect(mockSetShowPullRequests).not.toHaveBeenCalled();
 
     await user.keyboard("{Escape}");
     expect(mockSetShowPullRequests).toHaveBeenCalledWith(false);

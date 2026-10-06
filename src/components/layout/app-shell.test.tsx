@@ -101,16 +101,19 @@ vi.mock("@/components/ui/sidebar", () => ({
 }));
 
 vi.mock("@/stores/app-store", () => ({
-  useAppStore: vi.fn((selector: (s: unknown) => unknown) =>
-    selector({
-      appState: appStateReady
-        ? {
-            workspaces: hasWorkspacesFlag
-              ? [{ workspace_id: "ws-1" }]
-              : [],
-          }
-        : null,
-    }),
+  useAppStore: Object.assign(
+    vi.fn((selector: (s: unknown) => unknown) =>
+      selector({
+        appState: appStateReady
+          ? {
+              workspaces: hasWorkspacesFlag
+                ? [{ workspace_id: "ws-1" }]
+                : [],
+            }
+          : null,
+      }),
+    ),
+    { subscribe: () => () => {} },
   ),
 }));
 
@@ -281,15 +284,25 @@ describe("AppShell rendering gates", () => {
     expect(queryByTestId("empty-state")).toBeNull();
   });
 
-  it("renders the Devices page when its UI-store flag is set", async () => {
+  it("renders the Devices page beside the sidebar when its UI-store flag is set", async () => {
     hasWorkspacesFlag = true;
     showDevicesFlag = true;
-    const { findByTestId, queryByTestId } = render(<AppShell />);
+    const { findByTestId, getByTestId, queryByTestId } = render(<AppShell />);
     // The page is a lazy route, so it resolves after a microtask tick.
     expect(await findByTestId("devices-view")).toBeInTheDocument();
-    // The shell early-returns the overlay so neither the regular
-    // workspace pane nor the empty state should render alongside it.
-    expect(queryByTestId("workspace-main")).toBeNull();
+    // The sidebar stays, and the workspace stays mounted underneath the
+    // page — inert, so Back returns to it without remounting anything.
+    expect(getByTestId("app-sidebar")).toBeInTheDocument();
+    expect(getByTestId("workspace-main").parentElement).toHaveAttribute("inert");
+    expect(queryByTestId("empty-state")).toBeNull();
+  });
+
+  it("gives the Devices page the whole window when there is no workspace", async () => {
+    hasWorkspacesFlag = false;
+    showDevicesFlag = true;
+    const { findByTestId, queryByTestId } = render(<AppShell />);
+    expect(await findByTestId("devices-view")).toBeInTheDocument();
+    expect(queryByTestId("app-sidebar")).toBeNull();
     expect(queryByTestId("empty-state")).toBeNull();
   });
 

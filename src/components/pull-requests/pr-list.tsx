@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCw, Search } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Eye,
+  ListFilter,
+  PenLine,
+  RefreshCw,
+  Search,
+  Users,
+  type LucideIcon,
+} from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import {
@@ -14,9 +24,7 @@ import {
   shortAge,
   tzBody,
   tzEyebrow,
-  tzMeta,
   tzMetaNum,
-  tzPanelHeader,
 } from "@/components/workspace/review/review-ui";
 import {
   applyPlan,
@@ -88,7 +96,10 @@ export interface PrListProps {
   selectedKey: string | null;
   stateFilter: PrStateFilter;
   onStateFilter: (state: PrStateFilter) => void;
+  /** ↑↓ — move the list's cursor to a row. */
   onSelect: (row: PrRowData) => void;
+  /** A click on a row. Defaults to `onSelect`. */
+  onOpen?: (row: PrRowData) => void;
   /** ↵ — hand the keyboard to the detail column. */
   onOpenDetail: () => void;
   onRefresh: () => void;
@@ -111,6 +122,7 @@ export function PrList({
   stateFilter,
   onStateFilter,
   onSelect,
+  onOpen = onSelect,
   onOpenDetail,
   onRefresh,
 }: PrListProps) {
@@ -210,7 +222,7 @@ export function PrList({
     // Choosing a row is deliberate: the order the poll has been holding
     // applies now, while you are looking at the row you just picked.
     applyPendingOrder();
-    onSelect(row);
+    onOpen(row);
   };
 
   const renderRow = (row: PrRowData, dense = false) => {
@@ -252,186 +264,187 @@ export function PrList({
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col" data-testid="pr-list">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border/40 px-3 py-2">
-        <span className={cn("font-semibold text-foreground", tzPanelHeader)}>Pull requests</span>
-        <span className="flex-1" />
-        {age && (
-          <span
-            className={cn("text-muted-foreground", tzMetaNum)}
-            data-testid="pr-list-age"
-            data-carried={carried}
-          >
-            {carried ? `as of ${age} ago` : `${age} ago`}
-          </span>
-        )}
-        <button
-          type="button"
-          aria-label="Refresh pull requests"
-          data-testid="pr-list-refresh"
-          disabled={rateLimitedUntil > 0}
-          onClick={() => {
-            applyPendingOrder();
-            onRefresh();
-          }}
-          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
-        >
-          <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
-        </button>
-      </div>
-
-      <div className="flex shrink-0 items-center gap-1.5 border-b border-border/40 px-3 py-2">
-        <span className="flex flex-1 items-center gap-1.5 rounded-md bg-muted/40 px-2 py-1">
-          <Search className="size-3.5 shrink-0 text-muted-foreground" />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search, or is:draft ci:failing"
-            data-testid="pr-search"
-            className={cn(
-              "min-w-0 flex-1 bg-transparent text-foreground outline-none placeholder:text-muted-foreground",
-              tzBody,
-            )}
-          />
-        </span>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              data-testid="pr-state-filter"
-              className={cn(
-                "flex shrink-0 items-center gap-1 rounded-md bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors duration-150 hover:bg-accent/50",
-                tzBody,
-              )}
-            >
-              {STATE_LABEL[stateFilter]}
-              <span className={cn("text-muted-foreground", tzEyebrow)}>▾</span>
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-28">
-            {(["open", "closed", "all"] as PrStateFilter[]).map((state) => (
-              <DropdownMenuItem key={state} onSelect={() => onStateFilter(state)}>
-                {STATE_LABEL[state]}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-
-      {showStaleStrip && (
-        <StaleStrip
-          age={age}
-          hasRows={total > 0}
-          resumesAt={rateLimitedUntil > 0 ? rateLimitedUntil : null}
-          onRetry={onRefresh}
-        />
-      )}
-
-      <div
-        role="listbox"
-        aria-label="Pull requests"
-        tabIndex={0}
-        data-testid="pr-list-rows"
-        data-held={hold}
-        className="min-h-0 flex-1 overflow-y-auto outline-none"
-        onKeyDown={onKeyDown}
-        onFocus={() => setListFocused(true)}
-        onBlur={() => setListFocused(false)}
-        onMouseEnter={() => setPointerInside(true)}
-        onMouseLeave={() => setPointerInside(false)}
-      >
-        {total === 0 ? (
-          <EmptyList
-            hasRows={rows.length > 0}
-            hasHosts={hostCount > 0}
-            isLoading={isLoading}
-            unanswered={rateLimitedUntil > 0 && allRootsFailed}
-            query={query}
-            onClearQuery={() => setQuery("")}
-          />
-        ) : (
-          <>
-            {review.length > 0 && (
-              <>
-                <GroupHeader id="review" count={review.length} />
-                {review.map((row) => renderRow(row))}
-              </>
-            )}
-
-            {yours.length > 0 && (
-              <>
-                <GroupHeader id="yours" count={yours.length} />
-                {yours.map((row) => renderRow(row))}
-              </>
-            )}
-
-            {watching.length > 0 && (
-              <>
+      <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 px-5 pb-12 pt-3 sm:px-6">
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex h-8 min-w-0 flex-1 basis-56 items-center gap-2 rounded-md border border-border bg-background px-2.5 transition-colors duration-150 focus-within:border-ring/60 dark:bg-input/30">
+              <Search className="size-3.5 shrink-0 text-muted-foreground" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search pull requests, or is:draft ci:failing"
+                aria-label="Search pull requests"
+                data-testid="pr-search"
+                className={cn(
+                  "min-w-0 flex-1 bg-transparent text-foreground outline-none placeholder:text-muted-foreground",
+                  tzBody,
+                )}
+              />
+            </label>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  data-testid="pr-group-watching-toggle"
-                  aria-expanded={watchingOpen}
-                  onClick={() => setWatchingChoice(!watchingOpen)}
-                  className="mt-2 flex w-full items-center gap-1.5 border-t border-border/40 px-3 py-1.5 text-left"
+                  data-testid="pr-state-filter"
+                  className={cn(TOOLBAR_BUTTON, "gap-1.5 px-2.5")}
                 >
-                  <span className={cn("text-muted-foreground", tzMeta)}>
-                    {watchingOpen ? "▾" : "▸"}
-                  </span>
-                  <span
-                    className={cn(
-                      "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
-                      tzEyebrow,
-                    )}
-                  >
-                    {GROUP_LABEL.watching}
-                  </span>
-                  <span className="flex-1" />
-                  <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>
-                    {watching.length}
-                  </span>
+                  <ListFilter className="size-3.5 text-muted-foreground" />
+                  {STATE_LABEL[stateFilter]}
+                  <ChevronDown className="size-3 text-muted-foreground" />
                 </button>
-                {watchingOpen ? (
-                  watching.map((row) => renderRow(row, true))
-                ) : (
-                  <p className={cn("px-3 pb-1.5 leading-relaxed text-muted-foreground", tzMetaNum)}>
-                    Repositories you have open but aren't involved in.
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-28">
+                {(["open", "closed", "all"] as PrStateFilter[]).map((state) => (
+                  <DropdownMenuItem key={state} onSelect={() => onStateFilter(state)}>
+                    {STATE_LABEL[state]}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <button
+              type="button"
+              aria-label="Refresh pull requests"
+              title="Refresh"
+              data-testid="pr-list-refresh"
+              disabled={rateLimitedUntil > 0}
+              onClick={() => {
+                applyPendingOrder();
+                onRefresh();
+              }}
+              className={cn(TOOLBAR_BUTTON, "w-8 justify-center")}
+            >
+              <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
+            </button>
+          </div>
+
+          {showStaleStrip && (
+            <StaleStrip
+              age={age}
+              hasRows={total > 0}
+              resumesAt={rateLimitedUntil > 0 ? rateLimitedUntil : null}
+              onRetry={onRefresh}
+            />
+          )}
+
+          <div
+            role="listbox"
+            aria-label="Pull requests"
+            tabIndex={0}
+            data-testid="pr-list-rows"
+            data-held={hold}
+            className="flex flex-col gap-4 rounded-md outline-none focus-visible:ring-1 focus-visible:ring-ring/40"
+            onKeyDown={onKeyDown}
+            onFocus={() => setListFocused(true)}
+            onBlur={() => setListFocused(false)}
+            onMouseEnter={() => setPointerInside(true)}
+            onMouseLeave={() => setPointerInside(false)}
+          >
+            {total === 0 ? (
+              <EmptyList
+                hasRows={rows.length > 0}
+                hasHosts={hostCount > 0}
+                isLoading={isLoading}
+                unanswered={rateLimitedUntil > 0 && allRootsFailed}
+                query={query}
+                onClearQuery={() => setQuery("")}
+              />
+            ) : (
+              <>
+                {review.length > 0 && (
+                  <section className="flex flex-col gap-0.5">
+                    <GroupHeader id="review" count={review.length} />
+                    {review.map((row) => renderRow(row))}
+                  </section>
+                )}
+
+                {yours.length > 0 && (
+                  <section className="flex flex-col gap-0.5">
+                    <GroupHeader id="yours" count={yours.length} />
+                    {yours.map((row) => renderRow(row))}
+                  </section>
+                )}
+
+                {watching.length > 0 && (
+                  <section className="flex flex-col gap-0.5">
+                    <button
+                      type="button"
+                      data-testid="pr-group-watching-toggle"
+                      aria-expanded={watchingOpen}
+                      onClick={() => setWatchingChoice(!watchingOpen)}
+                      className={cn(GROUP_HEADER, "rounded-sm text-left hover:text-foreground")}
+                    >
+                      {watchingOpen ? (
+                        <ChevronDown aria-hidden className="size-3.5 shrink-0" />
+                      ) : (
+                        <ChevronRight aria-hidden className="size-3.5 shrink-0" />
+                      )}
+                      <Users aria-hidden className="size-3.5 shrink-0" />
+                      <span className="shrink-0">{GROUP_LABEL.watching}</span>
+                      <span className="shrink-0 tabular-nums text-muted-foreground/60">
+                        {watching.length}
+                      </span>
+                      <span aria-hidden className="h-px min-w-2 flex-1 bg-border/60" />
+                    </button>
+                    {watchingOpen ? (
+                      watching.map((row) => renderRow(row, true))
+                    ) : (
+                      <p className={cn("px-3 leading-relaxed text-muted-foreground/80", tzMetaNum)}>
+                        Repositories you have open but aren't involved in.
+                      </p>
+                    )}
+                  </section>
+                )}
+
+                {hidden > 0 && (
+                  <p className={cn("px-3 text-muted-foreground", tzMetaNum)}>
+                    Showing the first {MAX_RENDERED} of {review.length + yours.length + watching.length}.
+                    Narrow it with the search field above.
                   </p>
                 )}
               </>
             )}
+          </div>
 
-            {hidden > 0 && (
-              <p className={cn("px-3 py-2.5 text-muted-foreground", tzMetaNum)}>
-                Showing the first {MAX_RENDERED} of {review.length + yours.length + watching.length}.
-                Narrow it with the search field above.
-              </p>
-            )}
-          </>
-        )}
-      </div>
-
-      <div className="flex shrink-0 items-center gap-2 border-t border-border/40 px-3 py-1.5">
-        <span className={cn("min-w-0 flex-1 truncate text-muted-foreground", tzMetaNum)}>
-          {hostCount} {hostCount === 1 ? "repository" : "repositories"}
-          {failures.length > 0 && (
-            <>
-              {" · "}
-              <span
-                className="text-status-working"
-                data-testid="pr-list-failures"
-                title={failures.map((f) => `${f.root.name}: ${f.message}`).join("\n")}
-              >
-                {failures.length} unreachable
-              </span>
-            </>
-          )}
-        </span>
-        <span className={cn("shrink-0 font-mono text-muted-foreground", tzEyebrow)}>
-          ↑↓ move · ↵ open
-        </span>
+          <div className={cn("flex items-center gap-2 px-3 text-muted-foreground", tzMetaNum)}>
+            <span className="min-w-0 flex-1 truncate">
+              {hostCount} {hostCount === 1 ? "repository" : "repositories"}
+              {failures.length > 0 && (
+                <>
+                  {" · "}
+                  <span
+                    className="text-status-working"
+                    data-testid="pr-list-failures"
+                    title={failures.map((f) => `${f.root.name}: ${f.message}`).join("\n")}
+                  >
+                    {failures.length} unreachable
+                  </span>
+                </>
+              )}
+              {age && (
+                <>
+                  {" · "}
+                  <span data-testid="pr-list-age" data-carried={carried}>
+                    {carried ? `as of ${age} ago` : `updated ${age} ago`}
+                  </span>
+                </>
+              )}
+            </span>
+            <span className={cn("shrink-0 font-mono text-muted-foreground/70", tzEyebrow)}>
+              ↑↓ move · ↵ open
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
+
+/** The toolbar's outlined control shape, shared by the filter and refresh. */
+const TOOLBAR_BUTTON =
+  "flex h-8 shrink-0 items-center rounded-md border border-border bg-background text-body text-foreground/90 transition-colors duration-150 hover:bg-accent/60 disabled:pointer-events-none disabled:opacity-50 dark:bg-input/30";
+
+const GROUP_HEADER =
+  "flex w-full items-center gap-2 px-3 pb-1 text-label font-medium text-muted-foreground";
 
 /**
  * The refresh failed and you are reading what was there before.
@@ -489,7 +502,7 @@ function StaleStrip({
     <div
       role="status"
       data-testid="pr-stale-strip"
-      className="flex shrink-0 flex-wrap items-center gap-2 border-b border-status-working/25 bg-status-working/10 px-3 py-2"
+      className="flex shrink-0 flex-wrap items-center gap-2 rounded-md border border-status-working/25 bg-status-working/10 px-3 py-2"
     >
       <span aria-hidden className="size-2 shrink-0 rounded-full bg-status-working" />
       <span className={cn("min-w-[11rem] flex-1 leading-snug text-foreground/80", tzBody)}>
@@ -508,25 +521,22 @@ function StaleStrip({
   );
 }
 
+const GROUP_ICON: Record<"review" | "yours", LucideIcon> = {
+  review: Eye,
+  yours: PenLine,
+};
+
 function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
+  const Icon = GROUP_ICON[id];
   return (
-    <div
-      className="flex items-center gap-1.5 px-3 pb-1 pt-2.5"
-      data-testid={`pr-group-${id}`}
-    >
-      {id === "review" && (
-        <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-accent-ember" />
-      )}
-      <span
-        className={cn(
-          "font-mono font-semibold uppercase tracking-eyebrow text-foreground/80",
-          tzEyebrow,
-        )}
-      >
-        {GROUP_LABEL[id]}
-      </span>
-      <span className="h-px flex-1 bg-border/60" />
-      <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>{count}</span>
+    <div className={GROUP_HEADER} data-testid={`pr-group-${id}`}>
+      <Icon
+        aria-hidden
+        className={cn("size-3.5 shrink-0", id === "review" && "text-accent-ember")}
+      />
+      <h2 className="shrink-0">{GROUP_LABEL[id]}</h2>
+      <span className="shrink-0 tabular-nums text-muted-foreground/60">{count}</span>
+      <span aria-hidden className="h-px min-w-2 flex-1 bg-border/60" />
     </div>
   );
 }

@@ -882,7 +882,11 @@ export function Composer({
         { name: "settings", label: "Agent settings", section: "agent", description: "Open Codemux agent settings" },
         { name: "usage", label: "Usage", section: "usage", description: "View provider usage and limits" }].map((action): SlashCommandItem => ({
           id: `composer:${action.name}`, label: action.label, command: `/${action.name}`, icon: Settings,
-          description: action.description, group: "CHAT", onSelect: () => useUIStore.getState().setShowSettings(true, action.section),
+          description: action.description, group: "CHAT",
+          // Usage opens beside the sidebar; the others are Settings sections.
+          onSelect: () => action.section === "usage"
+            ? useUIStore.getState().setShowUsage(true)
+            : useUIStore.getState().setShowSettings(true, action.section),
         })),
       ...(provider === "codex" ? [{
         id: "composer:hooks", label: "Hooks", command: "/hooks", icon: Settings,

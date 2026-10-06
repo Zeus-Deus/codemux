@@ -213,8 +213,11 @@ function formatPercent(fraction: number): string {
  * Cost is always an API/list-price equivalent. Subscription quota is shown
  * separately when a provider reports it; the page never guesses what was
  * actually billed.
+ *
+ * Also the body of the Usage page, which already titles itself — there
+ * `showTitle` is off and only the range line and controls remain.
  */
-export function UsageSection() {
+export function UsageSection({ showTitle = true }: { showTitle?: boolean } = {}) {
   const [period, setPeriod] = useState<UsagePeriod>("7d");
   const [metric, setMetric] = useState<Metric>("cost");
   const [summary, setSummary] = useState<UsageSummary | null>(null);
@@ -312,8 +315,10 @@ export function UsageSection() {
     <div>
       <div className="mb-6 flex items-end justify-between gap-4">
         <div className="min-w-0">
-          <h2 className="text-body-lg font-semibold tracking-tight">Usage</h2>
-          <p className="mt-1 text-body-sm text-muted-foreground">
+          {showTitle && (
+            <h2 className="text-body-lg font-semibold tracking-tight">Usage</h2>
+          )}
+          <p className={cn("text-body-sm text-muted-foreground", showTitle && "mt-1")}>
             {summary ? rangeLabel(summary) : "Loading…"} ·{" "}
             {refreshing ? "refreshing…" : "live"}
           </p>
