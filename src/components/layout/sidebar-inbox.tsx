@@ -8,6 +8,7 @@ import {
   FolderOpen,
   FolderPlus,
   Loader2,
+  Undo2,
 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
@@ -587,9 +588,9 @@ const SettledRow = memo(function SettledRow({
         // 10px JetBrains Mono ref, which is 6px per glyph, so `#1234` needs
         // 54px and 56px leaves it a hair of slack. The meta track is sized to
         // the age label, not to the hover control: the widest common label
-        // (`14h19m`, six 6.6px glyphs) is ~40px, and the text-only Un-settle
-        // button is ~49px, so 48px fits both without leaving a wide gutter
-        // between the PR badge and the age at rest.
+        // (`14h19m`, six 6.6px glyphs) is ~40px, and the Un-settle glyph is
+        // 12px, so 48px fits both without leaving a wide gutter between the PR
+        // badge and the age at rest.
         "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_56px_48px] items-center gap-2 rounded-lg px-2",
         // Same off-screen containment as the cards (see `SidebarInboxCard`):
         // the Settled shelf is the list that actually grows without bound, and
@@ -719,24 +720,23 @@ const SettledRow = memo(function SettledRow({
             onUnsettle(workspace.workspace_id);
           }}
           aria-label={`Un-settle "${workspace.title}"`}
+          title="Un-settle"
           className={cn(
-            // Borderless, matching the cards' action cluster: a settled row is
-            // 30px tall and mostly negative space, and a bordered pill inside it
-            // read as a second object competing with the row rather than as the
-            // row's own affordance. The word stays — this is the one control on
-            // the shelf that changes a lifecycle, and an undo arrow alone is too
-            // close to "go back" to be trusted with it. The word alone is also
-            // what lets the meta column stay as narrow as the age label.
+            // Borderless and bare, matching the cards' Pin/Snooze glyphs: a
+            // settled row is 30px tall and mostly negative space, and the word
+            // "Un-settle" was wider than this column and rendered clipped. The
+            // undo arrow is the same glyph the right-click "Un-settle
+            // workspace" entry uses, and `title` names the verb on hover.
             // Filling the slot (`inset-0`, right-aligned content) makes the
             // control's hit area exactly its own column — never a pixel of it
             // over the PR badge next door.
-            "absolute inset-0 hidden items-center justify-end gap-1 border-none bg-transparent p-0",
-            "text-label font-semibold text-muted-foreground transition-colors duration-150",
+            "absolute inset-0 hidden items-center justify-end border-none bg-transparent p-0",
+            "text-muted-foreground transition-colors duration-150",
             "hover:text-foreground",
             "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
           )}
         >
-          Un-settle
+          <Undo2 className="size-3" />
         </button>
       </div>
     </div>
