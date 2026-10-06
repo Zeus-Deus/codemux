@@ -32,6 +32,7 @@ import {
   type AddonProblem,
 } from "./addon-presentation";
 import { AddonReviewDialog } from "./addon-review";
+import { SectionHeader } from "./settings-primitives";
 
 /** The outcome of the last "Check for update" on one release of a row. */
 type UpdateCheck = { release: string } & (
@@ -291,47 +292,42 @@ export function AddonsSettings() {
   );
   if (isRemoteClient())
     return (
-      <div className="space-y-3">
-        <h2 className="text-xl font-semibold">Add-ons</h2>
-        <p className="text-body text-muted-foreground">
-          Add-ons run in the local desktop app. Installation and plugin
-          operations are unavailable in a remote browser.
-        </p>
-      </div>
+      <SectionHeader
+        title="Add-ons"
+        description="Add-ons run in the local desktop app. Installation and plugin operations are unavailable in a remote browser."
+      />
     );
   return (
     <div className="max-w-3xl space-y-6">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-xl font-semibold">Add-ons</h2>
-          <p className="mt-1 text-body text-muted-foreground">
-            Optional tools for your projects and conversations.
-          </p>
-        </div>
-        {/* An unreadable registry cannot be paused or resumed; the registry
-            panel offers the reset that recovers it instead. */}
-        {!state.registryError && (
-          <Button
-            variant="outline"
-            disabled={busy}
-            onClick={() => {
-              void perform(
-                async () => {
-                  if (!state.paused) return addonInvoke("addon_pause_all");
-                  // Resuming also retries a manager that failed to open, whose
-                  // event stream then has to be opened again.
-                  await addonInvoke("addon_resume");
-                  await resubscribeAddons(activeAddonWorkspace);
-                },
-                { revoke: state.paused ? undefined : "*" },
-              );
-            }}
-          >
-            <Pause className="size-4" />
-            {state.paused ? "Resume add-ons" : "Pause all add-ons"}
-          </Button>
-        )}
-      </header>
+      <SectionHeader
+        title="Add-ons"
+        description="Optional tools for your projects and conversations."
+        action={
+          // An unreadable registry cannot be paused or resumed; the registry
+          // panel offers the reset that recovers it instead.
+          !state.registryError && (
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => {
+                void perform(
+                  async () => {
+                    if (!state.paused) return addonInvoke("addon_pause_all");
+                    // Resuming also retries a manager that failed to open, whose
+                    // event stream then has to be opened again.
+                    await addonInvoke("addon_resume");
+                    await resubscribeAddons(activeAddonWorkspace);
+                  },
+                  { revoke: state.paused ? undefined : "*" },
+                );
+              }}
+            >
+              <Pause className="size-4" />
+              {state.paused ? "Resume add-ons" : "Pause all add-ons"}
+            </Button>
+          )
+        }
+      />
       <ProblemAlert
         problem={
           // The registry panel below already shows the open failure.

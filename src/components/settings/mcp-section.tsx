@@ -27,6 +27,7 @@ import {
 } from "@/tauri/commands";
 
 import { McpToolModal } from "./mcp-tool-modal";
+import { SectionHeader } from "./settings-primitives";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 /** Slow-start threshold (ms). Servers stuck in `starting` longer than
@@ -116,31 +117,25 @@ export function McpSection({ projectRoot }: Props) {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-body-lg font-semibold tracking-tight">
-            MCP Servers
-          </h2>
-          <p className="mt-1 text-body text-muted-foreground">
-            Model Context Protocol servers expose tools to your agent.
-            Servers spawn lazily on first chat session start; toggle a
-            row off to stop it. Codemux's own MCP is always on.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void load()}
-          disabled={loading}
-          aria-label="Refresh MCP servers"
-        >
-          <RotateCw
-            className={cn("mr-1 size-3", loading && "animate-spin")}
-            aria-hidden
-          />
-          Refresh
-        </Button>
-      </div>
+      <SectionHeader
+        title="MCP Servers"
+        description="Model Context Protocol servers expose tools to your agent. Servers spawn lazily on first chat session start; toggle a row off to stop it. Codemux's own MCP is always on."
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void load()}
+            disabled={loading}
+            aria-label="Refresh MCP servers"
+          >
+            <RotateCw
+              className={cn("mr-1 size-3", loading && "animate-spin")}
+              aria-hidden
+            />
+            Refresh
+          </Button>
+        }
+      />
 
       {error && (
         <p

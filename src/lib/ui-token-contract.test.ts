@@ -46,6 +46,8 @@ interface Category {
   why?: string;
   /** Narrow the text each file contributes (default: its string literals). */
   scan?: (contents: string) => string[];
+  /** Only count files whose repo-relative path matches. */
+  path?: RegExp;
 }
 
 const CATEGORIES: Category[] = [
@@ -103,6 +105,17 @@ const CATEGORIES: Category[] = [
       "clone/sweep bars (300ms)",
   },
   {
+    label: "settings page titles styled by hand (use SectionHeader)",
+    pattern: /<h2\b[^>]*className=/g,
+    scan: (contents) => [contents],
+    // SectionHeader itself is the one place that styles the title.
+    path: /^src\/components\/settings\/(?!settings-primitives\.tsx)/,
+    budget: 2,
+    why:
+      "the Usage page (usage-section.tsx, owned by an open PR) and an " +
+      "add-on's own detail page title (addon-detail.tsx)",
+  },
+  {
     label: "per-icon strokeWidth (one base-layer rule owns icon weight)",
     pattern: /strokeWidth/g,
     scan: (contents) => [contents],
@@ -131,6 +144,9 @@ describe("UI token contract", () => {
   it.each(CATEGORIES)("stays within budget: $label", (category) => {
     const offenders: string[] = [];
     for (const file of files) {
+      if (category.path && !category.path.test(relative(root, file).split("\\").join("/"))) {
+        continue;
+      }
       const contents = readFileSync(file, "utf8");
       const chunks = category.scan
         ? category.scan(contents)

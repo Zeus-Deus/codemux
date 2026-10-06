@@ -4,6 +4,7 @@ import { Check, Copy, Gauge, MessageSquareText } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { Switch } from "@/components/ui/switch";
+import { SectionHeader } from "./settings-primitives";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { toast } from "@/lib/toast";
 import { copyToClipboard, COPY_FAILED_MESSAGE } from "@/lib/clipboard";
@@ -91,14 +92,10 @@ export function InterfaceSection() {
 
   return (
     <div>
-      <div className="mb-7">
-        <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
-          Interface
-        </h2>
-        <p className="text-body-lg text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
-          Choose how Codemux presents agent sessions.
-        </p>
-      </div>
+      <SectionHeader
+        title="Interface"
+        description="Choose how Codemux presents agent sessions."
+      />
 
       <div className="rounded-lg border border-border bg-card p-4 space-y-3">
         <div className="flex items-start justify-between gap-4">
