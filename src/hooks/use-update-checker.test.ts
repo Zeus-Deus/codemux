@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { renderHook, waitFor, cleanup } from "@testing-library/react";
+import { renderHook, waitFor, cleanup, act } from "@testing-library/react";
 import type { WebRemoteStatus } from "@/tauri/types";
 
 // The hook module imports Tauri plugins + web-remote helpers at the top level.
@@ -24,9 +24,16 @@ import {
   updateAdvanceAction,
   useUpdateChecker,
 } from "./use-update-checker";
-import { webRemoteStatus, webRemoteRequestUpdate } from "@/tauri/commands";
+import {
+  getPackageFormat,
+  webRemoteStatus,
+  webRemoteRequestUpdate,
+  webRemotePublishUpdateAvailable,
+} from "@/tauri/commands";
 import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
 import { listen } from "@tauri-apps/api/event";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   useUpdateStatusStore,
   __resetUpdateStatusStoreForTests,
@@ -152,6 +159,12 @@ describe("updateAdvanceAction (desktop handling of a web request)", () => {
     expect(updateAdvanceAction("update-available", true)).toBe("download");
   });
 
+  // A pacman/deb/rpm install cannot be replaced in place, so a browser's
+  // "update & restart desktop" request must not start a doomed download.
+  it("does not download on an install the updater cannot replace", () => {
+    expect(updateAdvanceAction("update-available", true, false)).toBe("none");
+  });
+
   it("does nothing without a real update or while mid-flight", () => {
     expect(updateAdvanceAction("update-available", false)).toBe("none");
     expect(updateAdvanceAction("idle", true)).toBe("none");
@@ -204,5 +217,106 @@ describe("useUpdateChecker → update status store mirror", () => {
       expect(s.isRemote).toBe(false);
       expect(s.startDownload).toBeTypeOf("function");
     });
+  });
+});
+
+describe("useUpdateChecker → desktop download failures", () => {
+  type Win = { __CODEMUX_MOCK_UPDATER__?: boolean };
+  const downloadAndInstall = vi.fn();
+
+  beforeEach(() => {
+    __resetUpdateStatusStoreForTests();
+    vi.useFakeTimers();
+    // Vitest runs with DEV set, where the native check is off unless the
+    // browser mock opts in; the same switch drives it here.
+    (window as Win).__CODEMUX_MOCK_UPDATER__ = true;
+    vi.mocked(check).mockResolvedValue({
+      version: "2.0.0",
+      downloadAndInstall,
+    } as unknown as Awaited<ReturnType<typeof check>>);
+    vi.mocked(listen).mockResolvedValue(() => {});
+    vi.mocked(webRemoteStatus).mockResolvedValue(status({}));
+    vi.mocked(onWebRemoteStateChanged).mockResolvedValue(() => {});
+    vi.mocked(webRemotePublishUpdateAvailable).mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    delete (window as Win).__CODEMUX_MOCK_UPDATER__;
+    vi.clearAllMocks();
+    downloadAndInstall.mockReset();
+  });
+
+  async function mountWithUpdate(format: string) {
+    vi.mocked(getPackageFormat).mockResolvedValue(format);
+    renderHook(() => useUpdateChecker());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(useUpdateStatusStore.getState().state).toBe("update-available");
+  }
+
+  it("keeps the failure reason and retries the download", async () => {
+    downloadAndInstall
+      .mockRejectedValueOnce("Download request failed with status: 404 Not Found")
+      .mockResolvedValueOnce(undefined);
+    await mountWithUpdate("appimage");
+
+    await act(async () => {
+      useUpdateStatusStore.getState().startDownload!();
+    });
+    let s = useUpdateStatusStore.getState();
+    expect(s.state).toBe("error");
+    expect(s.errorMessage).toBe(
+      "Download request failed with status: 404 Not Found",
+    );
+
+    await act(async () => {
+      useUpdateStatusStore.getState().retry!();
+    });
+    s = useUpdateStatusStore.getState();
+    expect(downloadAndInstall).toHaveBeenCalledTimes(2);
+    expect(s.state).toBe("ready");
+    expect(s.errorMessage).toBeNull();
+  });
+
+  it("retries the restart, not the download, when relaunch failed", async () => {
+    downloadAndInstall.mockResolvedValue(undefined);
+    vi.mocked(relaunch).mockRejectedValueOnce(new Error("spawn failed"));
+    await mountWithUpdate("appimage");
+
+    await act(async () => {
+      useUpdateStatusStore.getState().startDownload!();
+    });
+    await act(async () => {
+      useUpdateStatusStore.getState().installAndRestart!();
+    });
+    expect(useUpdateStatusStore.getState().errorMessage).toBe("spawn failed");
+
+    await act(async () => {
+      useUpdateStatusStore.getState().retry!();
+    });
+    expect(relaunch).toHaveBeenCalledTimes(2);
+    expect(downloadAndInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it("never downloads or announces to browsers on a pacman install", async () => {
+    await mountWithUpdate("pacman");
+    const s = useUpdateStatusStore.getState();
+    expect(s.canAutoUpdate).toBe(false);
+    expect(s.packageFormat).toBe("pacman");
+
+    await act(async () => {
+      s.startDownload!();
+    });
+    expect(downloadAndInstall).not.toHaveBeenCalled();
+    expect(useUpdateStatusStore.getState().state).toBe("update-available");
+    expect(webRemotePublishUpdateAvailable).not.toHaveBeenCalled();
+  });
+
+  it("announces auto-updatable installs to paired browsers", async () => {
+    await mountWithUpdate("appimage");
+    expect(webRemotePublishUpdateAvailable).toHaveBeenCalledWith(true, "2.0.0");
   });
 });

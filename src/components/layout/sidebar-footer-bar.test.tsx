@@ -89,6 +89,7 @@ import { useFooterPinsStore } from "@/stores/footer-pins-store";
 import { FOOTER_ACTIONS } from "@/lib/footer-actions";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { SidebarFooterBar } from "./sidebar-footer-bar";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useUpdateStatusStore,
   __resetUpdateStatusStoreForTests,
@@ -264,8 +265,12 @@ describe("AppMenuFooter — update strip", () => {
       updateVersion: null,
       downloadProgress: 0,
       isRemote: false,
+      canAutoUpdate: true,
+      packageFormat: "appimage",
+      errorMessage: null,
       startDownload: null,
       installAndRestart: null,
+      retry: null,
       requestDesktopUpdate: null,
       ...overrides,
     });
@@ -298,6 +303,48 @@ describe("AppMenuFooter — update strip", () => {
       ) as HTMLElement,
     );
     expect(startDownload).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the release page instead of downloading on a package-manager install", async () => {
+    // The in-app updater cannot replace a pacman/deb/rpm binary; calling
+    // `startDownload` there used to end in a reasonless "Update failed".
+    const startDownload = vi.fn();
+    publish({
+      state: "update-available",
+      updateVersion: "9.9.9",
+      canAutoUpdate: false,
+      packageFormat: "pacman",
+      startDownload,
+    });
+    const menuEl = await openMenu();
+
+    const button = Array.from(menuEl.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Update available"),
+    ) as HTMLElement;
+    expect(button.title).toBe("Version 9.9.9. Run: yay -S codemux-bin");
+    await userEvent.click(button);
+    expect(openUrl).toHaveBeenCalledWith(
+      "https://github.com/Zeus-Deus/codemux/releases/tag/v9.9.9",
+    );
+    expect(startDownload).not.toHaveBeenCalled();
+  });
+
+  it("says why an update failed and retries it from the strip", async () => {
+    const retry = vi.fn();
+    publish({
+      state: "error",
+      updateVersion: "9.9.9",
+      errorMessage: "404 Not Found",
+      retry,
+    });
+    const menuEl = await openMenu();
+
+    const button = Array.from(menuEl.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Retry update"),
+    ) as HTMLElement;
+    expect(button.title).toBe("Update failed: 404 Not Found");
+    await userEvent.click(button);
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 
   it("asks the desktop to update when the remote client clicks the strip", async () => {
