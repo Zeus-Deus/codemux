@@ -740,6 +740,16 @@ pub async fn agent_chat_start_session<R: Runtime>(
     mut input: StartSessionInput,
     expected_thread: Option<String>,
 ) -> Result<ThreadId, String> {
+    if let Some(tier) = input.service_tier.as_deref() {
+        input.fast_mode = match tier {
+            "default" => false,
+            "fast" => true,
+            _ if provider == ProviderKind::Codex => false,
+            _ => {
+                return Err("validation_error: provider does not support this service tier".into())
+            }
+        };
+    }
     crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if let Some(state) = app.try_state::<AppStateStore>() {
         if let Some(thread) = state.agent_chat_thread_id(&pane_id) {
@@ -817,6 +827,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         context_window: Some(input.context_window.clone()),
         permission_mode: Some(input.permission_mode.clone()),
         fast_mode: Some(input.fast_mode),
+        service_tier: input.service_tier.clone(),
     };
     // A restart of an existing durable CodeMux thread must not depend solely
     // on the frontend's in-memory cursor. That slice can be cold after sleep,
@@ -2166,6 +2177,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         effort: record.effort.clone(),
         context_window: record.context_window.clone(),
         fast_mode: record.fast_mode,
+        service_tier: Some(record.service_tier.clone()),
         additional_directories: vec![],
         env: env.clone(),
         workspace_id: workspace_id.clone(),
@@ -3860,6 +3872,37 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
     Ok(())
 }
 
+/// Apply and persist a provider-native service tier without replacing the thread.
+#[tauri::command]
+pub async fn agent_chat_set_service_tier<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    service_tier: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    let lock = resume_lock_for(&thread_id.0);
+    let _guard = lock.lock().await;
+    match impl_
+        .set_service_tier(thread_id.clone(), service_tier.clone())
+        .await
+    {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
+        Err(err) => return Err(provider_err(err)),
+    }
+    let db: State<'_, DatabaseStore> = app.state();
+    db.update_agent_chat_session_config(
+        &thread_id.0,
+        &AgentChatSessionConfig {
+            service_tier: Some(service_tier),
+            ..Default::default()
+        },
+    )
+}
+
 /// Change a session's permission mode (accept-edits, bypass, plan,
 /// etc.). The mode is passed through as a string; providers reject
 /// unknown values via `ProviderError::ValidationError`.
@@ -3941,6 +3984,7 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
 pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
+    force: Option<bool>,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -3997,6 +4041,9 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 }
                 .to_command_string()
             })?;
+            if force.unwrap_or(false) {
+                codex_cache.invalidate().await;
+            }
             codex_cache
                 .get_or_harvest(&binary_path, None)
                 .await

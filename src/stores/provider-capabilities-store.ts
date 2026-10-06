@@ -138,7 +138,11 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
         const startedEpoch = providerResetEpoch;
         const request = (async () => {
           try {
-            const caps = await listChatProviderCapabilities(provider);
+            // A refresh must re-check Codex entitlements rather than returning
+            // the native process's memoized catalog.
+            const caps = await (provider === "codex"
+              ? listChatProviderCapabilities(provider, true)
+              : listChatProviderCapabilities(provider));
             if (providerResetEpoch !== startedEpoch) return;
             set((state) => storeOk(state, provider, caps));
           } catch (err) {

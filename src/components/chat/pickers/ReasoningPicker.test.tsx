@@ -93,7 +93,7 @@ type Props = Parameters<typeof ReasoningPicker>[0];
 function renderPicker(overrides: Partial<Props> = {}) {
   const onEffortChange = vi.fn();
   const onContextWindowChange = vi.fn();
-  const onFastModeChange = vi.fn();
+  const onServiceTierChange = vi.fn();
   const utils = render(
     <TooltipProvider>
       <ReasoningPicker
@@ -102,10 +102,10 @@ function renderPicker(overrides: Partial<Props> = {}) {
         contextWindowValue={null}
         labelMap={LABEL_MAP}
         ultrathinkInBodyText={false}
-        fastMode={false}
+        serviceTier="default"
         onEffortChange={onEffortChange}
         onContextWindowChange={onContextWindowChange}
-        onFastModeChange={onFastModeChange}
+        onServiceTierChange={onServiceTierChange}
         {...overrides}
       />
     </TooltipProvider>,
@@ -115,7 +115,7 @@ function renderPicker(overrides: Partial<Props> = {}) {
     ...utils,
     onEffortChange,
     onContextWindowChange,
-    onFastModeChange,
+    onServiceTierChange,
     trigger,
   };
 }
@@ -141,7 +141,7 @@ describe("ReasoningPicker — render", () => {
     const { trigger } = renderPicker({
       model: FAST_CAPABLE,
       effortValue: "high",
-      fastMode: true,
+      serviceTier: "fast",
     });
     expect(trigger).toHaveTextContent("High");
     expect(trigger).not.toHaveTextContent("Fast");
@@ -156,7 +156,7 @@ describe("ReasoningPicker — render", () => {
     renderPicker({
       model: FAST_CAPABLE,
       effortValue: "high",
-      fastMode: false,
+      serviceTier: "default",
     });
     expect(screen.queryByTestId("fast-mode-indicator")).not.toBeInTheDocument();
   });
@@ -398,9 +398,9 @@ describe("ReasoningPicker — interaction", () => {
 
   it("selecting Fast fires the existing fast-mode callback", async () => {
     const user = userEvent.setup();
-    const { trigger, onFastModeChange } = renderPicker({
+    const { trigger, onServiceTierChange } = renderPicker({
       model: FAST_CAPABLE,
-      fastMode: false,
+      serviceTier: "default",
     });
     await user.click(trigger!);
     const options = await screen.findAllByRole("option");
@@ -409,14 +409,14 @@ describe("ReasoningPicker — interaction", () => {
     );
     expect(fast).toBeDefined();
     await user.click(fast!);
-    expect(onFastModeChange).toHaveBeenCalledWith(true);
+    expect(onServiceTierChange).toHaveBeenCalledWith("fast");
   });
 
   it("selecting Standard fires the existing fast-mode callback", async () => {
     const user = userEvent.setup();
-    const { trigger, onFastModeChange } = renderPicker({
+    const { trigger, onServiceTierChange } = renderPicker({
       model: FAST_CAPABLE,
-      fastMode: true,
+      serviceTier: "fast",
     });
     await user.click(trigger!);
     const options = await screen.findAllByRole("option");
@@ -425,7 +425,7 @@ describe("ReasoningPicker — interaction", () => {
     );
     expect(standard).toBeDefined();
     await user.click(standard!);
-    expect(onFastModeChange).toHaveBeenCalledWith(false);
+    expect(onServiceTierChange).toHaveBeenCalledWith("default");
   });
 });
 
@@ -476,5 +476,44 @@ describe("ReasoningPicker — effort descriptions", () => {
     await user.click(trigger!);
     expect(await screen.findByText("Thorough reasoning")).toBeInTheDocument();
     expect(screen.getByText("Extra-thorough reasoning")).toBeInTheDocument();
+  });
+});
+
+
+describe("advertised service tiers", () => {
+  const model: ChatModelInfo = {
+    ...FAST_CAPABLE,
+    service_tiers: [
+      { value: "priority", label: "Fast", description: "Premium speed" },
+      { value: "ultrafast", label: "Ultrafast", description: "Even faster, higher usage" },
+    ],
+  };
+
+  it("offers Ultrafast and sends its native ID", async () => {
+    const user = userEvent.setup();
+    const { trigger, onServiceTierChange } = renderPicker({ model });
+    await user.click(trigger!);
+    await user.click(screen.getByText("Ultrafast"));
+    expect(onServiceTierChange).toHaveBeenCalledWith("ultrafast");
+  });
+
+  it("uses the catalog Fast ID instead of the legacy boolean", async () => {
+    const user = userEvent.setup();
+    const { trigger, onServiceTierChange } = renderPicker({ model });
+    await user.click(trigger!);
+    await user.click(screen.getByText("Fast"));
+    expect(onServiceTierChange).toHaveBeenCalledWith("priority");
+  });
+
+  it("reflects Ultrafast in the accessible name", () => {
+    renderPicker({ model, serviceTier: "ultrafast" });
+    expect(screen.getByRole("button", { name: /service tier: Ultrafast/ })).toBeInTheDocument();
+  });
+
+  it("does not offer Ultrafast when the model only advertises Fast", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ model: { ...model, service_tiers: model.service_tiers?.slice(0, 1) } });
+    await user.click(trigger!);
+    expect(screen.queryByText("Ultrafast")).not.toBeInTheDocument();
   });
 });

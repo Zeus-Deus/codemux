@@ -1,4 +1,4 @@
-import type { ChatModelInfo } from "@/tauri/types";
+import type { ChatModelInfo, ServiceTierOption } from "@/tauri/types";
 
 /**
  * Resolvers that mirror a reference multi-provider client's
@@ -116,4 +116,30 @@ export function resolveClaudeApiModelId(
   const alreadyPinned = /\[[^\]]*\]$/.test(modelId);
   if (contextWindow === "1m" && !alreadyPinned) return `${modelId}[1m]`;
   return modelId;
+}
+
+/** Standard is always available. Older providers expose only a Fast boolean. */
+export function serviceTierOptions(
+  model: ChatModelInfo | null | undefined,
+): ServiceTierOption[] {
+  const tiers = model?.service_tiers?.length
+    ? model.service_tiers
+    : model?.supports_fast_mode
+      ? [{ value: "fast", label: "Fast", description: "Faster output at a premium usage rate" }]
+      : [];
+  return [
+    { value: "default", label: "Standard", description: "Normal speed and usage rate" },
+    ...tiers.filter((tier) => tier.value !== "default"),
+  ];
+}
+
+/** Resolve saved choices against the model, including the legacy Fast alias. */
+export function resolveServiceTier(
+  model: ChatModelInfo | null | undefined,
+  raw: string | null | undefined,
+): string {
+  const tiers = serviceTierOptions(model);
+  if (raw && tiers.some((tier) => tier.value === raw)) return raw;
+  if (raw === "fast" && tiers.some((tier) => tier.value === "priority")) return "priority";
+  return "default";
 }

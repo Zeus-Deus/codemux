@@ -142,6 +142,7 @@ console.log(
 
 let appState: AppStateSnapshot = createSeedAppState();
 // Synthetic, browser-only histories: never reads native provider files.
+const serviceTierFixture = new URLSearchParams(window.location.search).get("fixture") === "service-tiers";
 const sessionImportFixture = new URLSearchParams(window.location.search).get("fixture") === "session-import";
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
@@ -1379,6 +1380,33 @@ const CODEX_UTILITY_CAPABILITIES: ProviderChatCapabilities = {
   permission_modes: [],
   default_permission_mode: "danger-full-access",
   permission_granularity: "per_session",
+};
+
+/** Synthetic entitlement fixture for service-tier UI verification. */
+const CODEX_SERVICE_TIER_CAPABILITIES: ProviderChatCapabilities = {
+  ...CODEX_UTILITY_CAPABILITIES,
+  models: [
+    {
+      ...CODEX_UTILITY_CAPABILITIES.models[0],
+      id: "gpt-6-astra",
+      label: "GPT-6 Astra",
+      description: "Synthetic model with Ultrafast access",
+      default_effort: "medium",
+      supports_fast_mode: true,
+      service_tiers: [
+        { value: "priority", label: "Fast", description: "Faster output at a premium usage rate" },
+        { value: "ultrafast", label: "Ultrafast", description: "Even faster output at a higher usage rate" },
+      ],
+    },
+    {
+      ...CODEX_UTILITY_CAPABILITIES.models[0],
+      id: "gpt-6-sol",
+      label: "GPT-6 Sol",
+      description: "Synthetic model with Fast access",
+      supports_fast_mode: true,
+      service_tiers: [{ value: "priority", label: "Fast", description: "Faster output at a premium usage rate" }],
+    },
+  ],
 };
 
 /** Mirrors Cursor's ACP `cursor/list_available_models` extension: options
@@ -3744,7 +3772,8 @@ const handlers: Record<string, Handler> = {
     ({ ... (a.provider === "claude"
       ? CLAUDE_CAPABILITIES
       : a.provider === "codex"
-        ? CODEX_UTILITY_CAPABILITIES
+        ? (serviceTierFixture
+          ? CODEX_SERVICE_TIER_CAPABILITIES : CODEX_UTILITY_CAPABILITIES)
         : a.provider === "cursor"
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
@@ -4618,7 +4647,7 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   agent_chat_set_model: () => undefined,
-  agent_chat_set_fast_mode: () => undefined,
+  agent_chat_set_service_tier: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
   agent_chat_stop_session: () => undefined,
   agent_chat_rename_session: () => undefined,

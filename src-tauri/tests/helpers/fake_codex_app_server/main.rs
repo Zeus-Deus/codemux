@@ -158,6 +158,23 @@ fn fire_script_entries_for(
 
 fn main() {
     let script = load_script();
+    // An explicit synthetic catalog lets adapter tests exercise entitlement
+    // and model-specific tier changes without making real inference requests.
+    let default_model_catalog: Value = json!([{
+        "id": "gpt-test",
+        "model": "gpt-test",
+        "displayName": "GPT Test",
+        "description": "Fixture model",
+        "hidden": false,
+        "isDefault": true,
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [{
+            "reasoningEffort": "medium",
+            "description": "Fixture effort"
+        }],
+        "inputModalities": ["text"],
+        "additionalSpeedTiers": ["fast"]
+    }]);
     let fail_resume = env_truthy("FAKE_CODEX_FAIL_RESUME");
     let thread_id = std::env::var("FAKE_CODEX_THREAD_ID").unwrap_or_else(|_| "c-1".to_string());
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
@@ -250,26 +267,16 @@ fn main() {
                 // no-op notification
             }
             "model/list" => {
+                let model_catalog: Value = std::env::var("FAKE_CODEX_MODELS")
+                    .ok()
+                    .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+                    .unwrap_or_else(|| default_model_catalog.clone());
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
                         "result": {
-                            "data": [{
-                                "id": "gpt-test",
-                                "model": "gpt-test",
-                                "displayName": "GPT Test",
-                                "description": "Fixture model",
-                                "hidden": false,
-                                "isDefault": true,
-                                "defaultReasoningEffort": "medium",
-                                "supportedReasoningEfforts": [{
-                                    "reasoningEffort": "medium",
-                                    "description": "Fixture effort"
-                                }],
-                                "inputModalities": ["text"],
-                                "additionalSpeedTiers": []
-                            }],
+                            "data": model_catalog,
                             "nextCursor": null
                         },
                     }));

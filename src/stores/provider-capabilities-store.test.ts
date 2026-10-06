@@ -120,6 +120,13 @@ beforeEach(resetStore);
 afterEach(resetStore);
 
 describe("provider-capabilities-store", () => {
+  it("bypasses the native Codex catalog cache on refresh", async () => {
+    mockList.mockResolvedValue(makeCaps("codex-current"));
+    await useProviderCapabilities.getState().refresh("codex");
+    expect(mockList).toHaveBeenCalledWith("codex", true);
+    expect(useProviderCapabilities.getState().codex?.models[0]?.id).toBe("codex-current");
+  });
+
   it("refresh writes to the right slot", async () => {
     mockList.mockImplementation(async (provider: AgentChatProviderKind) =>
       makeCaps(`model-${provider}`),

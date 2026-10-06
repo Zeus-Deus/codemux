@@ -2498,6 +2498,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
+            commands::agent_chat_set_service_tier,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
             commands::hermes::hermes_profiles,

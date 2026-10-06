@@ -1,3 +1,4 @@
+import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
@@ -149,6 +150,14 @@ function DraftChatSurfaceInner({
 
   const updateDraftInput = useChatDraftStore((s) => s.updateDraftInput);
   const updateDraftConfig = useChatDraftStore((s) => s.updateDraftConfig);
+  useEffect(() => {
+    if (!activeModel || draft.promoting) return;
+    const resolved = resolveServiceTier(activeModel, draft.serviceTier);
+    if (resolved !== (draft.serviceTier ?? "default")) {
+      updateDraftConfig(draft.draftId, { serviceTier: resolved });
+    }
+  }, [activeModel, draft.draftId, draft.serviceTier, draft.promoting, updateDraftConfig]);
+
   const updateDraftTarget = useChatDraftStore((s) => s.updateDraftTarget);
   const setActiveDraft = useChatDraftStore((s) => s.setActiveDraft);
   const clearDraft = useChatDraftStore((s) => s.clearDraft);
@@ -605,7 +614,7 @@ function DraftChatSurfaceInner({
           setSessionLaunchMode: chat.setSessionLaunchMode,
           setEffort: chat.setEffort,
           setContextWindow: chat.setContextWindow,
-          setFastMode: chat.setFastMode,
+          setServiceTier: chat.setServiceTier,
           setMode: chat.setMode,
           refreshSkillSelection: (selection, effectiveCwd) =>
             refreshSkillSelectionForCwd(
@@ -1041,7 +1050,7 @@ function DraftChatSurfaceInner({
         contextWindow: defaults.contextWindow,
         // Speed tiers are provider/model-scoped: never carry a Fast
         // selection across a provider switch.
-        fastMode: false,
+        serviceTier: "default",
       });
     },
     [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
@@ -1052,12 +1061,10 @@ function DraftChatSurfaceInner({
       const nextModel = capabilities?.models.find((item) => item.id === next);
       updateDraftConfig(draft.draftId, {
         model: next,
-        ...(draft.fastMode && nextModel && !nextModel.supports_fast_mode
-          ? { fastMode: false }
-          : {}),
+        ...(nextModel ? { serviceTier: resolveServiceTier(nextModel, draft.serviceTier) } : {}),
       });
     },
-    [draft.draftId, draft.fastMode, capabilities, updateDraftConfig],
+    [draft.draftId, draft.serviceTier, capabilities, updateDraftConfig],
   );
   const handlePermissionModeChange = useCallback(
     (next: string) =>
@@ -1072,8 +1079,8 @@ function DraftChatSurfaceInner({
     (next: string) => updateDraftConfig(draft.draftId, { contextWindow: next }),
     [draft.draftId, updateDraftConfig],
   );
-  const handleFastModeChange = useCallback(
-    (next: boolean) => updateDraftConfig(draft.draftId, { fastMode: next }),
+  const handleServiceTierChange = useCallback(
+    (next: string) => updateDraftConfig(draft.draftId, { serviceTier: next }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -1163,7 +1170,7 @@ function DraftChatSurfaceInner({
       permissionMode={draft.permissionMode}
       effort={draft.effort}
       contextWindow={draft.contextWindow}
-      fastMode={draft.fastMode ?? false}
+      serviceTier={draft.serviceTier ?? "default"}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -1224,7 +1231,7 @@ function DraftChatSurfaceInner({
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
-      onFastModeChange={handleFastModeChange}
+      onServiceTierChange={handleServiceTierChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />

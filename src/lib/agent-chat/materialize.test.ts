@@ -82,7 +82,7 @@ function makeActions(): SpyActions {
     setSessionLaunchMode: vi.fn(),
     setEffort: vi.fn(),
     setContextWindow: vi.fn(),
-    setFastMode: vi.fn(),
+    setServiceTier: vi.fn(),
     setMode: vi.fn(),
   };
 }
@@ -427,6 +427,15 @@ describe("materializeAndSend", () => {
       expect(input.effort).toBe("high");
       expect(input.context_window).toBe("1m");
       expect(input.permission_mode).toBe("plan");
+    });
+
+    it("preserves the selected native service tier when materializing a draft", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({ provider: "codex", model: "gpt-6-astra", serviceTier: "ultrafast" });
+      await materializeAndSend(draft, "hello", "/home/user", actions);
+      const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(input.service_tier).toBe("ultrafast");
+      expect(actions.setServiceTier).toHaveBeenCalledWith(draft.threadId, "ultrafast");
     });
 
     it("sends the turn with the pre-minted thread_id and the submitted text", async () => {

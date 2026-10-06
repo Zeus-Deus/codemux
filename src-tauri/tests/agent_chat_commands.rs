@@ -69,6 +69,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         effort: None,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         recorded_usage_baseline: None,
         env: None,
@@ -1439,6 +1440,7 @@ mod auto_resume {
                 effort: None,
                 context_window: None,
                 fast_mode: false,
+                service_tier: None,
                 additional_directories: vec![],
                 recorded_usage_baseline: None,
                 env: None,
@@ -2446,4 +2448,75 @@ fn usage_limit_notice_is_deduped_per_turn_and_respects_the_setting() {
         .filter(|r| r["type"] == "usage_limit_reached")
         .count();
     assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn service_tier_persists_only_accepted_changes_and_survives_cold_resume() {
+    use codemux_lib::commands::agent_chat::{agent_chat_set_service_tier, ensure_live_session};
+    use codemux_lib::database::AgentChatSessionConfig;
+
+    for outcome in ["accepted", "rejected", "missing"] {
+        let app = mock_app_with_chat_state();
+        app.manage(test_observability(true));
+        let provider = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+        let registry = ProviderRegistry::new();
+        registry.set_codex(provider.clone()).await;
+        app.manage(registry);
+        let handle = app.handle().clone();
+        let thread = ThreadId("service-tier-test".into());
+        let db: State<'_, DatabaseStore> = handle.state();
+        db.upsert_agent_chat_session(&thread.0, "ws", None, "codex")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            &thread.0,
+            &AgentChatSessionConfig {
+                service_tier: Some("priority".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match outcome {
+            "rejected" => {
+                provider.fail_next_fast_mode(codemux_lib::agent_provider::ProviderError::RpcError {
+                    message: "tier unavailable".into(),
+                })
+            }
+            "missing" => provider.fail_next_fast_mode(
+                codemux_lib::agent_provider::ProviderError::SessionNotFound {
+                    thread_id: thread.clone(),
+                },
+            ),
+            _ => {}
+        }
+        let result = agent_chat_set_service_tier(
+            handle.clone(),
+            ProviderKind::Codex,
+            thread.clone(),
+            "ultrafast".into(),
+        )
+        .await;
+        assert_eq!(result.is_err(), outcome == "rejected");
+        assert_eq!(
+            db.get_agent_chat_session(&thread.0).unwrap().service_tier,
+            if outcome == "rejected" {
+                "priority"
+            } else {
+                "ultrafast"
+            }
+        );
+        if outcome == "missing" {
+            ensure_live_session(&handle, ProviderKind::Codex, &thread)
+                .await
+                .unwrap();
+            assert_eq!(
+                provider
+                    .start_inputs()
+                    .last()
+                    .unwrap()
+                    .service_tier
+                    .as_deref(),
+                Some("ultrafast")
+            );
+        }
+    }
 }

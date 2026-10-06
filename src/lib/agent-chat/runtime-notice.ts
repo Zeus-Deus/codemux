@@ -22,6 +22,9 @@ const RATE_LIMIT_REASON = "rate_limit";
  *  fresh one. The remainder is the ready-to-render notice text. */
 const RESUME_FALLBACK_PREFIX = "resume-fallback: ";
 
+/** Codex could not apply a saved premium tier and selected Standard. */
+export const SERVICE_TIER_FALLBACK_PREFIX = "service-tier-fallback: ";
+
 /** Defensive nested access: `originalPayload.rate_limit_info.status`. */
 function readRateLimitStatus(originalPayload: unknown): string | null {
   if (!originalPayload || typeof originalPayload !== "object") return null;
@@ -46,6 +49,8 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  *   the transcript record and the resume affordance.
  * - `"resume-fallback: <text>"` → `<text>` (stale-session recovery: the
  *   remainder is already user-ready copy explaining the fresh session).
+ * - "service-tier-fallback: <text>" → `<text>` (saved premium tier
+ *   could not be applied; the session uses Standard).
  * - anything else → null (SDK debug noise).
  */
 export function runtimeNoticeFromWarning(
@@ -61,6 +66,9 @@ export function runtimeNoticeFromWarning(
     const reason = message.slice(ASSISTANT_ERROR_PREFIX.length);
     if (reason === RATE_LIMIT_REASON) return null;
     return "Provider error: " + reason;
+  }
+  if (message.startsWith(SERVICE_TIER_FALLBACK_PREFIX)) {
+    return message.slice(SERVICE_TIER_FALLBACK_PREFIX.length);
   }
   if (message.startsWith(RESUME_FALLBACK_PREFIX)) {
     return message.slice(RESUME_FALLBACK_PREFIX.length);

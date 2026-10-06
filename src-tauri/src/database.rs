@@ -61,6 +61,12 @@ pub struct AgentChatSessionRecord {
     /// `false` for rows created before this column existed.
     #[serde(default)]
     pub fast_mode: bool,
+    #[serde(default = "standard_service_tier")]
+    pub service_tier: String,
+}
+
+fn standard_service_tier() -> String {
+    "default".into()
 }
 
 /// Lightweight provider-neutral conversation row used by the composer's
@@ -219,6 +225,8 @@ pub struct AgentChatSessionConfig {
     /// state, so a plain optional boolean can express leave/set-false/set-true.
     #[serde(default)]
     pub fast_mode: Option<bool>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 /// Deserialize a present field (whether `null` or a value) into the
@@ -435,7 +443,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             effort TEXT,
             context_window TEXT,
             permission_mode TEXT,
-            fast_mode INTEGER
+            fast_mode INTEGER,
+            service_tier TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_workspace
@@ -988,6 +997,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE agent_chat_sessions ADD COLUMN context_window TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN fast_mode INTEGER",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN service_tier TEXT",
         // Web-remote account mode (Stage A): how a session was admitted and,
         // for account-minted sessions, the verified Codemux account user id.
         // `source` defaults to 'pair' so every pre-existing (pairing-token) row
@@ -3589,6 +3599,13 @@ impl DatabaseStore {
                      (SELECT permission_mode FROM agent_chat_sessions WHERE thread_id = ?1),
                      permission_mode
                  ),
+                 service_tier = COALESCE(
+                     (SELECT COALESCE(service_tier,
+                         CASE WHEN fast_mode IS NOT NULL
+                              THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END)
+                      FROM agent_chat_sessions WHERE thread_id = ?1),
+                     service_tier
+                 ),
                  fast_mode = COALESCE(
                      (SELECT fast_mode FROM agent_chat_sessions WHERE thread_id = ?1),
                      fast_mode
@@ -3690,12 +3707,27 @@ impl DatabaseStore {
         fn bind_bool(field: Option<bool>) -> Option<Value> {
             field.map(|value| Value::Integer(i64::from(value)))
         }
+        // Legacy clients still write the boolean. Convert it unless a native
+        // tier was supplied, and keep the old column coherent for those clients.
+        let tier = config.service_tier.clone().or_else(|| {
+            config
+                .fast_mode
+                .map(|fast| if fast { "fast" } else { "default" }.into())
+        });
         let columns = [
+            ("service_tier", tier.clone().map(Value::Text)),
             ("model", bind(&config.model)),
             ("effort", bind(&config.effort)),
             ("context_window", bind(&config.context_window)),
             ("permission_mode", bind(&config.permission_mode)),
-            ("fast_mode", bind_bool(config.fast_mode)),
+            (
+                "fast_mode",
+                // Other native tiers (for example Flex) must not look like
+                // premium Fast to a legacy client that cannot represent them.
+                bind_bool(tier.as_ref().map(|tier| {
+                    matches!(tier.as_str(), "fast" | "priority" | "ultrafast")
+                })),
+            ),
         ];
         let mut set_clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
@@ -3791,6 +3823,7 @@ impl DatabaseStore {
                 context_window: row.get(10)?,
                 permission_mode: row.get(11)?,
                 fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                service_tier: row.get(14)?,
             })
         };
         // Only surface rows that actually have an sdk_session_id —
@@ -3802,7 +3835,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -3815,7 +3848,7 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -4393,6 +4426,16 @@ impl DatabaseStore {
                       WHERE sdk_session_id = ?1 AND permission_mode IS NOT NULL
                       ORDER BY last_active_at DESC LIMIT 1)
                  ),
+                 service_tier = COALESCE(
+                     service_tier,
+                     CASE WHEN fast_mode IS NOT NULL
+                          THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END,
+                     (SELECT COALESCE(service_tier,
+                         CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+                      FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND (service_tier IS NOT NULL OR fast_mode IS NOT NULL)
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 ),
                  fast_mode = COALESCE(
                      fast_mode,
                      (SELECT fast_mode FROM agent_chat_sessions
@@ -4446,7 +4489,7 @@ impl DatabaseStore {
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -4465,6 +4508,7 @@ impl DatabaseStore {
                     context_window: row.get(10)?,
                     permission_mode: row.get(11)?,
                     fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                    service_tier: row.get(14)?,
                 })
             },
         )
@@ -7642,6 +7686,7 @@ mod tests {
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("acceptEdits"),
                 fast_mode: Some(true),
+                service_tier: None,
             },
         )
         .unwrap();
@@ -7670,6 +7715,7 @@ mod tests {
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("default"),
                 fast_mode: Some(true),
+                service_tier: None,
             },
         )
         .unwrap();
@@ -7733,6 +7779,7 @@ mod tests {
                 context_window: Some(None),
                 permission_mode: None,
                 fast_mode: None,
+                service_tier: None,
             },
         )
         .unwrap();
@@ -7800,6 +7847,7 @@ mod tests {
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
                 fast_mode: Some(true),
+                service_tier: None,
             },
         )
         .unwrap();
@@ -9245,4 +9293,147 @@ mod tests {
         );
         assert_eq!(db.list_automation_runs(a.id, 10)[0].status, "running");
     }
+
+    #[test]
+    fn service_tier_legacy_read_roundtrip_and_thread_migration() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("old", "ws", None, "codex")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("old", "sdk-tier").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_chat_sessions SET fast_mode = 1 WHERE thread_id = 'old'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("old").unwrap().service_tier,
+            "fast"
+        );
+        db.update_agent_chat_session_config(
+            "old",
+            &AgentChatSessionConfig {
+                service_tier: Some("ultrafast".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_agent_chat_sessions("ws", None, 10)[0].service_tier,
+            "ultrafast"
+        );
+        db.upsert_agent_chat_session("new", "ws", None, "codex")
+            .unwrap();
+        db.migrate_agent_chat_session("old", "new").unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("new").unwrap().service_tier,
+            "ultrafast"
+        );
+        db.update_agent_chat_session_config(
+            "new",
+            &AgentChatSessionConfig {
+                service_tier: Some("flex".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let flexible = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(flexible.service_tier, "flex");
+        assert!(!flexible.fast_mode);
+        db.update_agent_chat_session_config(
+            "new",
+            &AgentChatSessionConfig {
+                service_tier: Some("default".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let record = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(record.service_tier, "default");
+        assert!(!record.fast_mode);
+    }
+
+    #[test]
+    fn service_tier_survives_duplicate_session_collapse() {
+        let db = init_test_database();
+        for thread in ["old", "new"] {
+            db.upsert_agent_chat_session(thread, "ws", None, "codex")
+                .unwrap();
+            db.set_agent_chat_sdk_session_id(thread, "sdk-tier")
+                .unwrap();
+        }
+        db.update_agent_chat_session_config(
+            "old",
+            &AgentChatSessionConfig {
+                service_tier: Some("ultrafast".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute("UPDATE agent_chat_sessions SET last_active_at = '2099-01-01' WHERE thread_id = 'new'", []).unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-tier")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("new").unwrap().service_tier,
+            "ultrafast"
+        );
+    }
+
+    #[test]
+    fn service_tier_legacy_choices_remain_authoritative_when_aliases_merge() {
+        for (fast, expected) in [(false, "default"), (true, "fast")] {
+            let db = init_test_database();
+            for thread in ["legacy", "target", "old-duplicate", "new-duplicate"] {
+                db.upsert_agent_chat_session(thread, "ws", None, "codex")
+                    .unwrap();
+            }
+            for thread in ["target", "old-duplicate"] {
+                db.update_agent_chat_session_config(
+                    thread,
+                    &AgentChatSessionConfig {
+                        service_tier: Some("ultrafast".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            // Reproduce rows saved by the boolean-only client: the new
+            // column is absent, but Standard/Fast was explicitly selected.
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET fast_mode = ?1, service_tier = NULL
+                 WHERE thread_id IN ('legacy', 'new-duplicate')",
+                    params![i64::from(fast)],
+                )
+                .unwrap();
+            db.migrate_agent_chat_session("legacy", "target").unwrap();
+            assert_eq!(
+                db.get_agent_chat_session("target").unwrap().service_tier,
+                expected
+            );
+            for thread in ["old-duplicate", "new-duplicate"] {
+                db.set_agent_chat_sdk_session_id(thread, "shared-tier-sdk")
+                    .unwrap();
+            }
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET last_active_at = '2099-01-01'
+                 WHERE thread_id = 'new-duplicate'",
+                    [],
+                )
+                .unwrap();
+            db.collapse_duplicate_agent_chat_sessions("shared-tier-sdk")
+                .unwrap();
+            let record = db.get_agent_chat_session("new-duplicate").unwrap();
+            assert_eq!(record.service_tier, expected);
+            assert_eq!(record.fast_mode, fast);
+        }
+    }
+
 }

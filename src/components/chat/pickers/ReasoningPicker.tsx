@@ -1,3 +1,4 @@
+import { serviceTierOptions, resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { useState } from "react";
 import { Brain, Check, ChevronDown, Zap } from "lucide-react";
 
@@ -48,15 +49,15 @@ interface Props {
   /** True when the composer's draft text contains "ultrathink" outside
    *  the canonical prefix — disables the effort section. */
   ultrathinkInBodyText: boolean;
-  /** Premium service tier for models that advertise fast-mode support. */
-  fastMode: boolean;
+  /** Premium service tier for models that advertise service tiers. */
+  serviceTier: string;
   /** Fires when the user picks an effort row. `"ultrathink"` carries
    *  the special meaning of "prepend to the prompt"; caller handles that. */
   onEffortChange: (nextValue: string) => void;
   /** Fires when the user picks a context-window row. */
   onContextWindowChange: (nextValue: string) => void;
-  /** Fires when the user picks Standard or Fast service tier. */
-  onFastModeChange: (fastMode: boolean) => void;
+  /** Fires when the user picks a service tier. */
+  onServiceTierChange: (serviceTier: string) => void;
   disabled?: boolean;
   /** Render a leading hairline pipe. Lives inside the picker (not the
    *  footer) so the pipe disappears together with the control when the
@@ -111,10 +112,10 @@ export function ReasoningPicker({
   contextWindowValue,
   labelMap,
   ultrathinkInBodyText,
-  fastMode,
+  serviceTier,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange,
+  onServiceTierChange,
   disabled,
   withSeparator,
   iconOnly = false,
@@ -130,7 +131,11 @@ export function ReasoningPicker({
   const contextOptions = model.context_window_options;
   const hasEffortSection = effortLevels.length > 0;
   const hasContextSection = contextOptions.length > 1;
-  const hasServiceTierSection = model.supports_fast_mode;
+  const tiers = serviceTierOptions(model);
+  const hasServiceTierSection = tiers.length > 1;
+  const currentTier = resolveServiceTier(model, serviceTier);
+  const tierLabel = tiers.find((tier) => tier.value === currentTier)?.label ?? "Standard";
+  const accelerated = ["fast", "priority", "ultrafast"].includes(currentTier);
 
   // Haiku and other models without any configurable runtime choice: hide.
   if (!hasEffortSection && !hasContextSection && !hasServiceTierSection) {
@@ -175,10 +180,10 @@ export function ReasoningPicker({
     }
     return effortLabelText ?? contextLabelText ?? null;
   })();
-  const triggerLabel = reasoningLabel ?? (fastMode ? "Fast" : "Standard");
+  const triggerLabel = reasoningLabel ?? tierLabel;
   const triggerAriaLabel = reasoningLabel
-    ? `Reasoning: ${reasoningLabel}; service tier: ${fastMode ? "Fast" : "Standard"}`
-    : `Service tier: ${fastMode ? "Fast" : "Standard"}`;
+    ? `Reasoning: ${reasoningLabel}; service tier: ${tierLabel}`
+    : `Service tier: ${tierLabel}`;
 
   return (
     <>
@@ -197,7 +202,7 @@ export function ReasoningPicker({
             title={triggerAriaLabel}
             className={FOOTER_TRIGGER}
           >
-            {fastMode ? (
+            {accelerated ? (
               <Zap
                 aria-hidden
                 data-testid="fast-mode-indicator"
@@ -206,7 +211,7 @@ export function ReasoningPicker({
             ) : reasoningLabel ? (
               <Brain className="size-4" />
             ) : null}
-            {!(iconOnly && (fastMode || reasoningLabel)) && (
+            {!(iconOnly && (accelerated || reasoningLabel)) && (
               <span className="max-w-[200px] truncate">{triggerLabel}</span>
             )}
             <ChevronDown className="size-3 opacity-50" />
@@ -217,14 +222,14 @@ export function ReasoningPicker({
           align="start"
           onOpenAutoFocus={focusCmdkOnOpen}
         >
-        <Command>
+        <Command className="max-h-[calc(var(--radix-popover-content-available-height)-2px)]">
           {hasEffortSection && ultrathinkInBodyText ? (
             <div className="px-3 pt-2 pb-1 text-label text-muted-foreground/80">
               Your prompt contains &quot;ultrathink&quot; in the text. Remove
               it to change effort.
             </div>
           ) : null}
-          <CommandList className="max-h-[420px]">
+          <CommandList className="min-h-0 max-h-[420px]">
             <CommandEmpty>No reasoning options</CommandEmpty>
 
             {hasEffortSection && (
@@ -317,47 +322,32 @@ export function ReasoningPicker({
 
             {hasServiceTierSection && (
               <CommandGroup heading="Service tier">
-                <CommandItem
-                  value="service-tier:standard"
-                  onSelect={() => onFastModeChange(false)}
-                  className="h-auto gap-2 py-2"
-                >
-                  <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-label text-foreground">
-                      Standard
-                      <span className="ml-1.5 text-muted-foreground/60">
-                        (default)
+                {tiers.map((tier) => (
+                  <CommandItem
+                    key={tier.value}
+                    value={`service-tier:${tier.value}`}
+                    onSelect={() => onServiceTierChange(tier.value)}
+                    className="h-auto gap-2 py-2"
+                  >
+                    <div className="flex min-w-0 flex-1 flex-col">
+                      <span className="text-label text-foreground">
+                        {tier.label}
+                        {tier.value === "default" && (
+                          <span className="ml-1.5 text-muted-foreground/60">(default)</span>
+                        )}
                       </span>
-                    </span>
-                    <span className="text-label text-muted-foreground/80">
-                      Normal speed and usage rate
-                    </span>
-                  </div>
-                  <Check
-                    className={cn(
-                      "size-3.5 text-muted-foreground",
-                      fastMode ? "opacity-0" : "opacity-100",
-                    )}
-                  />
-                </CommandItem>
-                <CommandItem
-                  value="service-tier:fast"
-                  onSelect={() => onFastModeChange(true)}
-                  className="h-auto gap-2 py-2"
-                >
-                  <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-label text-foreground">Fast</span>
-                    <span className="text-label text-muted-foreground/80">
-                      Faster output at a premium usage rate
-                    </span>
-                  </div>
-                  <Check
-                    className={cn(
-                      "size-3.5 text-muted-foreground",
-                      fastMode ? "opacity-100" : "opacity-0",
-                    )}
-                  />
-                </CommandItem>
+                      {tier.description && (
+                        <span className="text-label text-muted-foreground/80">{tier.description}</span>
+                      )}
+                    </div>
+                    <Check
+                      className={cn(
+                        "size-3.5 text-muted-foreground",
+                        currentTier === tier.value ? "opacity-100" : "opacity-0",
+                      )}
+                    />
+                  </CommandItem>
+                ))}
               </CommandGroup>
             )}
           </CommandList>

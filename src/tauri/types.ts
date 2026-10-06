@@ -977,6 +977,12 @@ export interface ContextWindowOption {
   context_window_tokens?: number | null;
 }
 
+export interface ServiceTierOption {
+  value: string;
+  label: string;
+  description: string;
+}
+
 export interface ChatModelInfo {
   id: string;
   label: string;
@@ -994,6 +1000,8 @@ export interface ChatModelInfo {
   supports_adaptive_thinking: boolean;
   supports_thinking_toggle: boolean;
   supports_fast_mode: boolean;
+  /** Provider-advertised tiers; missing on older capability payloads. */
+  service_tiers?: ServiceTierOption[];
   /** Step 8 Stage 6 — true when the model accepts image attachments.
    *  Drives the `+ → Image…` enable state and whether the composer's
    *  paste/drop handlers stage attachments at all. */

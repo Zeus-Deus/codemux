@@ -97,6 +97,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "agent_chat_resume_after_usage_limit"
             | "agent_chat_cancel_usage_resume"
             | "agent_chat_set_fast_mode"
+            | "agent_chat_set_service_tier"
             | "agent_chat_set_model"
             | "agent_chat_set_permission_mode"
             | "agent_chat_stage_image"

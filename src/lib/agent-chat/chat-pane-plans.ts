@@ -16,6 +16,7 @@ import type {
   ProviderChatCapabilities,
 } from "@/tauri/types";
 
+import { resolveServiceTier } from "./model-resolution";
 import {
   resolveContextWindow,
   resolveEffort,
@@ -116,14 +117,14 @@ export function planEffortChange(
 export interface ModelChangePlan {
   resetEffort: string | null | undefined;
   resetContextWindow: string | null | undefined;
-  resetFastMode: false | undefined;
+  resetServiceTier: string | undefined;
 }
 
 export interface PlanModelChangeInput {
   newModel: ChatModelInfo | null;
   currentEffort: string | null;
   currentContextWindow: string | null;
-  currentFastMode?: boolean;
+  currentServiceTier?: string;
 }
 
 export function planModelChange(
@@ -134,19 +135,20 @@ export function planModelChange(
     return {
       resetEffort: undefined,
       resetContextWindow: undefined,
-      resetFastMode: undefined,
+      resetServiceTier: undefined,
     };
   }
   const resolvedEffort = resolveEffort(newModel, currentEffort);
   const resolvedCtx = resolveContextWindow(newModel, currentContextWindow);
+  const resolvedTier = resolveServiceTier(newModel, input.currentServiceTier);
   return {
     resetEffort:
       resolvedEffort !== currentEffort ? resolvedEffort : undefined,
     resetContextWindow:
       resolvedCtx !== currentContextWindow ? resolvedCtx : undefined,
-    resetFastMode:
-      input.currentFastMode && !newModel.supports_fast_mode
-        ? false
+    resetServiceTier:
+      resolvedTier !== (input.currentServiceTier ?? "default")
+        ? resolvedTier
         : undefined,
   };
 }
