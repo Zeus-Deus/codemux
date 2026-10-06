@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   commandSearchText,
   compareWorkspaceOrder,
+  demoteCurrentWorkspace,
   groupCountLabel,
   parsePaletteQuery,
+  prModeEmptyState,
   previewedThemeId,
+  pushRecentCommand,
   rankByQuery,
   rankPalettePrs,
   rankThemeGroup,
@@ -317,5 +320,58 @@ describe("pr mode", () => {
     ];
     const ranked = rankByQuery(commands, query, commandSearchText, commandSearchText);
     expect(ranked[0].label).toBe("Pull requests");
+  });
+
+  it("keeps 'pr ' mode one Backspace away from ordinary search", () => {
+    // Deleting the space after `pr` already leaves the mode, so the prefix
+    // never needs its own Backspace handling.
+    expect(parsePaletteQuery("pr ").mode).toBe("prs");
+    expect(parsePaletteQuery("pr").mode).toBe("all");
+  });
+});
+
+describe("demoteCurrentWorkspace", () => {
+  const row = (key: string, parked = false) => ({ key, parked });
+
+  it("moves the current workspace behind the other active rows", () => {
+    const rows = [row("a"), row("b"), row("c"), row("p", true)];
+    expect(demoteCurrentWorkspace(rows, "a").map((r) => r.key)).toEqual(["b", "c", "a", "p"]);
+  });
+
+  it("keeps the current workspace inside the resting cap", () => {
+    const rows = [row("a"), row("b"), row("c"), row("d")];
+    expect(demoteCurrentWorkspace(rows, "a", 3).map((r) => r.key)).toEqual(["b", "c", "a", "d"]);
+  });
+
+  it("leaves the order alone when the current workspace is parked or absent", () => {
+    const rows = [row("a"), row("p", true)];
+    expect(demoteCurrentWorkspace(rows, "p").map((r) => r.key)).toEqual(["a", "p"]);
+    expect(demoteCurrentWorkspace(rows, "zzz").map((r) => r.key)).toEqual(["a", "p"]);
+    expect(demoteCurrentWorkspace(rows, null).map((r) => r.key)).toEqual(["a", "p"]);
+  });
+});
+
+describe("pushRecentCommand", () => {
+  it("puts the newest first without duplicates and caps the list", () => {
+    expect(pushRecentCommand(["a", "b"], "b")).toEqual(["b", "a"]);
+    expect(pushRecentCommand(["a", "b", "c", "d", "e"], "f")).toEqual(["f", "a", "b", "c", "d"]);
+  });
+});
+
+describe("prModeEmptyState", () => {
+  const base = { needle: "", rowCount: 0, isLoading: false, allRootsFailed: false, rateLimitedUntil: 0 };
+
+  it("says loading rather than 'no matches' while the first fetch is out", () => {
+    expect(prModeEmptyState({ ...base, needle: "123", isLoading: true }).kind).toBe("loading");
+  });
+
+  it("names a spent rate limit and a failed fetch", () => {
+    expect(prModeEmptyState({ ...base, rateLimitedUntil: 5 })).toEqual({ kind: "rate-limited", until: 5 });
+    expect(prModeEmptyState({ ...base, allRootsFailed: true }).kind).toBe("unreachable");
+  });
+
+  it("only reports no matches when there were rows to search", () => {
+    expect(prModeEmptyState({ ...base, needle: "x", rowCount: 3, isLoading: true }).kind).toBe("no-match");
+    expect(prModeEmptyState(base).kind).toBe("none");
   });
 });

@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
     openThemeStudio: vi.fn(),
     takeCommandPaletteQuery: vi.fn<() => string | null>(() => null),
     setShowNewWorkspaceDialog: vi.fn(),
+    setShowAutomations: vi.fn(),
+    setRightPanelTab: vi.fn(),
   },
   synced: {
     settings: {
@@ -23,10 +25,16 @@ const mocks = vi.hoisted(() => ({
   },
   backend: {
     dbGetUiState: vi.fn(),
-    prOverview: vi.fn(() => ({ rows: [] })),
+    prOverview: vi.fn((_enabled: boolean) => ({
+      rows: [] as unknown[],
+      isLoading: false,
+      allRootsFailed: false,
+      rateLimitedUntil: 0,
+    })),
     agentChatSearch: vi.fn(),
     openConversationSearchResult: vi.fn(),
     reloadInterface: vi.fn(),
+    agentChatInterruptTurn: vi.fn(),
   },
 }));
 
@@ -81,6 +89,7 @@ vi.mock("@/lib/perf/instrumented-activate", () => ({
 vi.mock("@/tauri/commands", () => ({
   dbGetUiState: mocks.backend.dbGetUiState,
   dbSetSetting: vi.fn().mockResolvedValue(undefined),
+  dbSetUiState: vi.fn().mockResolvedValue(undefined),
   agentChatSearch: mocks.backend.agentChatSearch,
   createBrowserPane: vi.fn(),
   cyclePane: vi.fn(),
@@ -88,6 +97,9 @@ vi.mock("@/tauri/commands", () => ({
   regenerateMcpConfig: vi.fn(),
   reloadInterface: mocks.backend.reloadInterface,
   setPresetBarVisible: vi.fn(),
+  agentChatInterruptTurn: mocks.backend.agentChatInterruptTurn,
+  detectEditors: vi.fn().mockResolvedValue([]),
+  openInEditor: vi.fn(),
 }));
 
 vi.mock("@/lib/agent-chat/conversation-search", () => ({
@@ -96,7 +108,9 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 
 vi.mock("@/lib/addons/platform", () => ({ executeAddon: vi.fn() }));
 
-import { CommandPalette } from "./command-palette";
+import { CommandPalette, PALETTE_COMMANDS } from "./command-palette";
+import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useSidebarInboxStore, __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
@@ -135,6 +149,13 @@ Element.prototype.scrollTo ??= () => {};
 Element.prototype.scrollIntoView ??= () => {};
 
 beforeEach(() => {
+  window.localStorage.clear();
+  mocks.backend.prOverview.mockImplementation(() => ({
+    rows: [],
+    isLoading: false,
+    allRootsFailed: false,
+    rateLimitedUntil: 0,
+  }));
   useSettingsStore.setState({ settings: { "appearance.theme_source": "manual" }, loaded: true });
   useOmarchyStore.setState({ theme: null, loaded: true });
   vi.clearAllMocks();
@@ -387,7 +408,7 @@ describe("command palette — stable async sections", () => {
     renderPalette();
     expect(screen.getByText("Settings")).toBeInTheDocument();
     expect(screen.queryByText("Workspaces")).not.toBeInTheDocument();
-    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:new-agent"));
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:rename-workspace"));
     await act(async () => resolveInbox(JSON.stringify({ settled: [{ id: "ws-1", at: 1 }] })));
     const workspaceOptions = screen.getAllByRole("option").filter((el) => el.dataset.value?.startsWith("ws:"));
     expect(workspaceOptions.map((el) => el.dataset.value)).toEqual(["ws:ws-2", "ws:ws-1"]);
@@ -403,11 +424,11 @@ describe("command palette — stable async sections", () => {
     ] };
     const user = userEvent.setup();
     renderPalette();
-    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:new-agent"));
+    await waitFor(() => expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", "cmd:rename-workspace"));
     if (inputKind === "keyboard") await user.keyboard("{ArrowDown}");
     else await user.hover(screen.getByText("Settings"));
     const selected = document.querySelector('[cmdk-item][aria-selected="true"]')?.getAttribute("data-value");
-    expect(selected).not.toBe("cmd:new-agent");
+    expect(selected).not.toBe("cmd:rename-workspace");
     await act(async () => resolveInbox(null));
     expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveAttribute("data-value", selected);
   });
@@ -771,5 +792,178 @@ describe("command palette — reload interface", () => {
     expect(row).toHaveTextContent("Ctrl+Alt+R");
     await user.click(screen.getByText("Reload interface"));
     expect(mocks.backend.reloadInterface).toHaveBeenCalledTimes(1);
+  });
+});
+
+const selectedValue = () =>
+  document.querySelector('[cmdk-item][aria-selected="true"]')?.getAttribute("data-value");
+const optionValues = (prefix: string) =>
+  screen
+    .getAllByRole("option")
+    .map((el) => el.dataset.value ?? "")
+    .filter((value) => value.startsWith(prefix));
+const workspace = (id: string, title: string, extra: Record<string, unknown> = {}) => ({
+  workspace_id: id,
+  title,
+  cwd: "/repo",
+  git_branch: null,
+  surfaces: [],
+  active_surface_id: "",
+  ...extra,
+});
+const chatSurface = (paneId: string, threadId: string) => ({
+  surface_id: "surface-1",
+  title: "Chat",
+  active_pane_id: paneId,
+  root: { kind: "agent_chat", pane_id: paneId, title: "Chat", thread_id: threadId, provider: "claude", cwd: "/repo" },
+});
+
+describe("command palette — switching away from the current workspace", () => {
+  beforeEach(() => {
+    mocks.app.appState = {
+      active_workspace_id: "ws-here",
+      pane_statuses: {},
+      workspaces: [
+        workspace("ws-here", "Here", { last_active_at: 2_000 }),
+        workspace("ws-there", "There", { last_active_at: 1_000 }),
+      ],
+    };
+  });
+
+  it("preselects another workspace and tags the current one", async () => {
+    renderPalette();
+    expect(optionValues("ws:")).toEqual(["ws:ws-there", "ws:ws-here"]);
+    await waitFor(() => expect(selectedValue()).toBe("ws:ws-there"));
+    expect(screen.getByRole("option", { name: /Here/ })).toHaveTextContent("current");
+    expect(screen.getByRole("option", { name: /There/ })).not.toHaveTextContent("current");
+  });
+
+  it("still ranks the current workspace by match once you search", async () => {
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("here");
+    renderPalette();
+    expect(optionValues("ws:")[0]).toBe("ws:ws-here");
+  });
+});
+
+describe("command palette — command catalogue", () => {
+  it("offers every window-level keybind action", () => {
+    // Pure slot actions and the guards that exist only to swallow a key.
+    const notCommands = new Set(["commandPalette", "closeOverlay", "blockReload", "blockHardReload", "blockF5Reload"]);
+    const missing = KEYBIND_REGISTRY.filter(
+      (entry) =>
+        entry.when !== "terminal" &&
+        !/^(workspaceJump|switchTab)\d$/.test(entry.id) &&
+        !notCommands.has(entry.id) &&
+        !PALETTE_COMMANDS.some((command) => command.actionId === entry.id),
+    ).map((entry) => entry.id);
+    expect(missing).toEqual([]);
+  });
+
+  it("finds the theme picker from command mode and opens it in place", async () => {
+    const user = userEvent.setup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">theme");
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Change theme/ }));
+    expect(screen.getByRole("combobox")).toHaveValue("theme");
+    expect(document.querySelector('[data-palette-group="Themes"]')).not.toBeNull();
+    expect(screen.getByText("Ember")).toBeInTheDocument();
+  });
+
+  it("opens Automations", async () => {
+    const user = userEvent.setup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">automations");
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Automations/ }));
+    expect(mocks.ui.setShowAutomations).toHaveBeenCalledWith(true);
+  });
+
+  it("lists recently run commands first in the resting palette", async () => {
+    const user = userEvent.setup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">automations");
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Automations/ }));
+    cleanup();
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(null);
+    renderPalette();
+    expect(document.querySelector('[data-palette-group="Recent"]')).not.toBeNull();
+    expect(optionValues("recent:")).toEqual(["recent:automations"]);
+  });
+});
+
+describe("command palette — this workspace", () => {
+  it("stops the running agent from '>stop'", async () => {
+    mocks.backend.agentChatInterruptTurn.mockResolvedValue(true);
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: { "pane-1": "working" },
+      workspaces: [
+        workspace("ws-1", "Busy", {
+          surfaces: [chatSurface("pane-1", "thread-1")],
+          active_surface_id: "surface-1",
+        }),
+      ],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">stop");
+    const user = userEvent.setup();
+    renderPalette();
+    await waitFor(() => expect(selectedValue()).toBe("cmd:stop-agent"));
+    // Live work is never swept aside.
+    expect(screen.queryByText("Settle workspace")).toBeNull();
+    await user.click(screen.getByRole("option", { name: /Stop agent/ }));
+    expect(mocks.backend.agentChatInterruptTurn).toHaveBeenCalledWith("claude", "thread-1", null);
+  });
+
+  it("offers no Stop agent when nothing is running", () => {
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: {},
+      workspaces: [workspace("ws-1", "Idle", { surfaces: [chatSurface("pane-1", "thread-1")], active_surface_id: "surface-1" })],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">");
+    renderPalette();
+    expect(screen.queryByText("Stop agent")).toBeNull();
+    expect(document.querySelector('[data-palette-group="This workspace"]')).not.toBeNull();
+  });
+
+  it("settles an idle workspace and moves on to the next one", async () => {
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: {},
+      workspaces: [workspace("ws-1", "Done", { last_active_at: 5 }), workspace("ws-2", "Next")],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(">settle");
+    const user = userEvent.setup();
+    renderPalette();
+    await user.click(screen.getByRole("option", { name: /Settle workspace/ }));
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toContain("ws-1");
+    expect(activateWorkspaceInteraction).toHaveBeenCalledWith("ws-2");
+  });
+});
+
+describe("command palette — pull-request mode", () => {
+  it("shows the mode and says it is loading rather than 'no matches'", () => {
+    mocks.backend.prOverview.mockImplementation(() => ({
+      rows: [],
+      isLoading: true,
+      allRootsFailed: false,
+      rateLimitedUntil: 0,
+    }));
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("pr 123");
+    renderPalette();
+    expect(screen.getByText("Pull requests")).toBeInTheDocument();
+    expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
+    expect(screen.queryByText(/No matches/)).toBeNull();
+  });
+
+  it("says when no repository could be reached", () => {
+    mocks.backend.prOverview.mockImplementation(() => ({
+      rows: [],
+      isLoading: false,
+      allRootsFailed: true,
+      rateLimitedUntil: 0,
+    }));
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue("pr 123");
+    renderPalette();
+    expect(screen.getByText("Couldn't reach your pull requests")).toBeInTheDocument();
   });
 });
