@@ -76,12 +76,14 @@ export function readHtmlRender(item: ToolCallItem): HtmlRender | null {
   };
 }
 
-/** Whether a transcript row renders as an inline page rather than a work-log
- *  step: an `html_render` call in flight (a placeholder) or one that
+/** Whether a transcript row renders as an inline page rather than a tool
+ *  card: an `html_render` call in flight (a placeholder) or one that
  *  succeeded with a complete page. A failed call stays a generic tool step
- *  so its error remains readable. */
+ *  so its error remains readable, and a call tied to an approval stays a
+ *  `ToolCallCard` until it settles, since only that card carries the
+ *  Allow/Deny footer. */
 export function isInlineHtmlRender(item: ToolCallItem): boolean {
-  if (item.status === "running") return isHtmlRenderTool(item);
+  if (item.status === "running") return item.approval_request_id == null && isHtmlRenderTool(item);
   return item.status === "done" && readHtmlRender(item) !== null;
 }
 
@@ -231,7 +233,7 @@ function themeCss(theme: HtmlRenderTheme): string {
 // a srcdoc page's base URL is the app's, so following it natively would load
 // the app into the frame. The page also
 // reports its content height so the app can fit the frame to it.
-const BOOTSTRAP_SCRIPT = `(function(){var s=document.getElementById("codemux-theme"),b=${JSON.stringify(BASE_CSS)};window.addEventListener("message",function(e){var d=e.data,p=d&&d.params;if(e.source!==window.parent||!d||d.jsonrpc!=="2.0"||d.method!==${JSON.stringify(HOST_CONTEXT_CHANGED)}||!p||!p.styles||!s)return;var v=p.styles.variables,c=":root{color-scheme:"+(p.theme==="light"?"light":"dark")+";";for(var k in v){if(/^--[a-z0-9-]+$/.test(k))c+=k+":"+String(v[k]).replace(/[;{}<>]/g,"")+";";}s.textContent=c+"}"+b;});document.addEventListener("click",function(e){var l=e.composedPath().find(function(t){return t&&t.matches&&t.matches("a[href]");}),u;if(!l)return;e.preventDefault();var r=l.getAttribute("href");if(r.charAt(0)==="#"){var i=decodeURIComponent(r.slice(1)),t=i?document.getElementById(i)||document.getElementsByName(i)[0]:document.documentElement;if(t)t.scrollIntoView();return;}try{u=new URL(r,document.baseURI);}catch(x){return;}if(/^https?:$/.test(u.protocol))window.parent.postMessage({jsonrpc:"2.0",method:${JSON.stringify(OPEN_LINK)},params:{url:u.href}},"*");},true);var h,z=function(){var r=document.documentElement,v=Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height);if(v===h)return;h=v;window.parent.postMessage({jsonrpc:"2.0",method:${JSON.stringify(SIZE_CHANGED)},params:{height:v}},"*");};if(window.ResizeObserver){var o=new ResizeObserver(z);o.observe(document.documentElement);document.addEventListener("DOMContentLoaded",function(){if(document.body)o.observe(document.body);});}document.addEventListener("DOMContentLoaded",z);window.addEventListener("load",z);})();`;
+const BOOTSTRAP_SCRIPT = `(function(){var s=document.getElementById("codemux-theme"),b=${JSON.stringify(BASE_CSS)};window.addEventListener("message",function(e){var d=e.data,p=d&&d.params;if(e.source!==window.parent||!d||d.jsonrpc!=="2.0"||d.method!==${JSON.stringify(HOST_CONTEXT_CHANGED)}||!p||!p.styles||!s)return;var v=p.styles.variables,c=":root{color-scheme:"+(p.theme==="light"?"light":"dark")+";";for(var k in v){if(/^--[a-z0-9-]+$/.test(k))c+=k+":"+String(v[k]).replace(/[;{}<>]/g,"")+";";}s.textContent=c+"}"+b;});document.addEventListener("click",function(e){var l=e.composedPath().find(function(t){return t&&t.matches&&t.matches("a[href]");}),u;if(!l)return;e.preventDefault();var r=l.getAttribute("href");if(r.charAt(0)==="#"){var i=r.slice(1),t;try{i=decodeURIComponent(i);}catch(x){}t=i?document.getElementById(i)||document.getElementsByName(i)[0]:document.documentElement;if(t)t.scrollIntoView();return;}try{u=new URL(r,document.baseURI);}catch(x){return;}if(/^https?:$/.test(u.protocol))window.parent.postMessage({jsonrpc:"2.0",method:${JSON.stringify(OPEN_LINK)},params:{url:u.href}},"*");},true);var h,z=function(){var r=document.documentElement,v=Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height);if(v===h)return;h=v;window.parent.postMessage({jsonrpc:"2.0",method:${JSON.stringify(SIZE_CHANGED)},params:{height:v}},"*");};if(window.ResizeObserver){var o=new ResizeObserver(z);o.observe(document.documentElement);document.addEventListener("DOMContentLoaded",function(){if(document.body)o.observe(document.body);});}document.addEventListener("DOMContentLoaded",z);window.addEventListener("load",z);})();`;
 
 // Comments and raw-text elements are blanked to the same length, so a
 // `<head>` inside a script string or comment cannot receive the bootstrap.
@@ -247,13 +249,17 @@ export function buildHtmlRenderDocument(html: string, theme: HtmlRenderTheme): s
   const markup =
     (/<meta\s[^>]*charset/i.test(html.slice(0, 4096)) ? "" : '<meta charset="utf-8">') +
     `<style id="codemux-theme">${themeCss(theme)}</style><script>${BOOTSTRAP_SCRIPT}</script>`;
+  // Only tags before the body count: a `<head>` in body text or an attribute
+  // value is content, not the document head.
   const scan = blankNonMarkup(html);
-  const head = /<head(?:\s[^>]*)?>/i.exec(scan);
+  const bodyAt = scan.search(/<body[\s>]/i);
+  const scope = bodyAt === -1 ? scan : scan.slice(0, bodyAt);
+  const head = /<head(?:\s[^>]*)?>/i.exec(scope);
   if (head) {
     const at = head.index + head[0].length;
     return html.slice(0, at) + markup + html.slice(at);
   }
-  const root = /<html(?:\s[^>]*)?>/i.exec(scan);
+  const root = /<html(?:\s[^>]*)?>/i.exec(scope);
   if (root) {
     const at = root.index + root[0].length;
     return `${html.slice(0, at)}<head>${markup}</head>${html.slice(at)}`;

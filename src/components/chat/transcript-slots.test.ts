@@ -192,6 +192,34 @@ describe("buildTranscriptSlots — activity grouping", () => {
     expect(slots[2].messageId).toBe("tc-2");
   });
 
+  it("keeps an approval-gated html_render call on its own tool card row", () => {
+    const gated = tool(1, {
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+      status: "running",
+      approval_request_id: "req-1",
+    });
+    const request: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "pr-2",
+      seq: 2,
+      request_id: "req-1",
+      turn_id: "t1",
+      request_kind: "tool",
+      payload: {},
+      tool_use_id: "tu-1",
+      resolution: { state: "pending" },
+    };
+    const slots = buildTranscriptSlots([
+      tool(0, { tool_name: "Bash", input: { command: "ls" } }),
+      gated,
+      request,
+    ]);
+    // The request row merges into the call's card footer rather than rendering twice.
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item"]);
+    expect(slots[1].messageId).toBe("tc-1");
+  });
+
   it("folds a failed html_render call like any other failed step", () => {
     const failed = tool(1, {
       tool_name: "mcp__codemux__mcp__codemux__html_render",

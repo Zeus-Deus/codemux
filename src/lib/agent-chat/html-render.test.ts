@@ -69,6 +69,12 @@ describe("isInlineHtmlRender", () => {
     expect(isInlineHtmlRender(call({ status: "error" }))).toBe(false);
     expect(isInlineHtmlRender(call({ tool_name: "Bash", status: "running" }))).toBe(false);
   });
+
+  it("leaves an approval-gated call on the tool card until it settles", () => {
+    const gated = { input: { title: "Chart", html: "<p>hi</p>" }, approval_request_id: "req-1" };
+    expect(isInlineHtmlRender(call({ ...gated, status: "running" }))).toBe(false);
+    expect(isInlineHtmlRender(call({ ...gated, status: "done" }))).toBe(true);
+  });
 });
 
 describe("htmlRenderTheme", () => {
@@ -98,6 +104,13 @@ describe("buildHtmlRenderDocument", () => {
 
   it("does not inject into a <head> inside a script or comment", () => {
     const page = '<!-- <head> --><script>const s = "<head>";</script><p>x</p>';
+    const html = buildHtmlRenderDocument(page, theme);
+    expect(html.startsWith("<!doctype html><head>")).toBe(true);
+    expect(html.endsWith(page)).toBe(true);
+  });
+
+  it("ignores a <head> that appears in body content", () => {
+    const page = '<body><p data-x="<head>">x</p><pre><html><head></pre></body>';
     const html = buildHtmlRenderDocument(page, theme);
     expect(html.startsWith("<!doctype html><head>")).toBe(true);
     expect(html.endsWith(page)).toBe(true);
@@ -136,7 +149,8 @@ describe("bootstrap link handling", () => {
     window.addEventListener("message", onMessage);
     document.body.innerHTML =
       '<a id="frag" href="#target">jump</a><a id="mail" href="mailto:a@example.com">mail</a>' +
-      '<a id="ext" href="https://example.com/docs">ext</a><h2 id="target">T</h2>';
+      '<a id="ext" href="https://example.com/docs">ext</a><a id="bad" href="#100%">bad</a>' +
+      '<h2 id="target">T</h2><h2 id="100%">P</h2>';
     const target = document.getElementById("target")!;
     target.scrollIntoView = vi.fn();
     const click = (id: string) => {
@@ -147,6 +161,11 @@ describe("bootstrap link handling", () => {
 
     expect(click("frag")).toBe(true);
     expect(target.scrollIntoView).toHaveBeenCalledOnce();
+    // A fragment that is not valid percent-encoding is matched as written.
+    const percent = document.getElementById("100%")!;
+    percent.scrollIntoView = vi.fn();
+    expect(click("bad")).toBe(true);
+    expect(percent.scrollIntoView).toHaveBeenCalledOnce();
     expect(click("mail")).toBe(true);
     expect(click("ext")).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 0));
