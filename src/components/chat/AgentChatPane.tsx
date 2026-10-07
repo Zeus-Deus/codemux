@@ -771,6 +771,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
+        // Claims the key, so the composer's Escape-to-stop leaves the run be.
+        e.preventDefault();
         setEnteredSubagentId(null);
       }
     };

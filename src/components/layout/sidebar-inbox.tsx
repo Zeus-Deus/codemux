@@ -68,8 +68,6 @@ import {
   prStatusTextClass,
   type PrStatusState,
 } from "@/components/github/pr-status-icon";
-import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
-import { parseKeyCombo } from "@/lib/keybind-utils";
 import { useChatDraftStore, type ChatDraft } from "@/stores/chat-draft-store";
 import { useShallow } from "zustand/react/shallow";
 import { SidebarCreatingCard } from "./sidebar-creating-card";
@@ -77,10 +75,8 @@ import {
   promotionStartedAt,
   selectNewWorkspaceDraftsInFlight,
 } from "./new-workspace-sends";
-import {
-  setJumpTargets,
-  DEFAULT_JUMP_MODIFIER,
-} from "./sidebar-inbox-jump";
+import { setJumpTargets, MAX_JUMP_HINTS } from "./sidebar-inbox-jump";
+import { useJumpHintsVisible } from "./use-jump-hints-visible";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
   providerForWorkspace,
@@ -103,9 +99,6 @@ import {
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { SidebarEmptyState } from "./sidebar-empty-state";
 import { SidebarHeaderActions } from "./sidebar-action-row";
-
-/** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
-const MAX_JUMP_HINTS = 9;
 
 /** How long the settle collapse runs before the card actually moves below
  *  the divider. Matches the card wrapper's `duration-250`. */
@@ -1871,46 +1864,8 @@ export function SidebarInbox() {
     setJumpTargets(activeCardIdsKey ? activeCardIdsKey.split(" ") : []);
   }, [activeCardIdsKey]);
   useEffect(() => () => setJumpTargets([]), []);
-
-  // Which physical modifier reveals the jump badges. Respect the user's actual
-  // resolved binding for slot 1 (so a rebind to Ctrl/Alt tracks the right key);
-  // fall back to the default modifier. A rebind to a non-Alt/Ctrl chord (e.g.
-  // Shift-only) simply shows no held-modifier hints.
-  const { keybindMap } = useResolvedKeybinds();
-  const jumpModifierKey = useMemo(() => {
-    const keys =
-      keybindMap.get("workspaceJump1")?.activeKeys ??
-      `${DEFAULT_JUMP_MODIFIER}+1`;
-    const parsed = parseKeyCombo(keys);
-    if (parsed.ctrl) return "Control";
-    if (parsed.alt) return "Alt";
-    return null;
-  }, [keybindMap]);
-
-  // Show the badges only while the modifier is physically held. Clear on keyup,
-  // blur, and visibilitychange so the hints can never get stuck open.
-  const [jumpHintsVisible, setJumpHintsVisible] = useState(false);
-  useEffect(() => {
-    if (!jumpModifierKey) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === jumpModifierKey) setJumpHintsVisible(true);
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === jumpModifierKey) setJumpHintsVisible(false);
-    };
-    const clear = () => setJumpHintsVisible(false);
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", clear);
-    document.addEventListener("visibilitychange", clear);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", clear);
-      document.removeEventListener("visibilitychange", clear);
-      setJumpHintsVisible(false);
-    };
-  }, [jumpModifierKey]);
+  // Show the badges only while the jump modifier is physically held.
+  const jumpHintsVisible = useJumpHintsVisible();
 
   // Whether the project filter dropdown is open — drives the trigger chevron
   // rotation.

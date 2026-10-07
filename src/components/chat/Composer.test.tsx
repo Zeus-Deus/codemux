@@ -190,6 +190,72 @@ describe("Composer", () => {
       const { container } = renderComposer({ streaming: true });
       expect(container.querySelector('button[aria-label="Stop"]')).not.toBeNull();
     });
+
+    it("names the stop key in the Stop button's tooltip", () => {
+      const { container } = renderComposer({ streaming: true });
+      expect(container.querySelector('button[aria-label="Stop"]')).toHaveAttribute(
+        "title",
+        "Stop (Esc)",
+      );
+    });
+  });
+
+  describe("keyboard stop", () => {
+    afterEach(() => vi.useRealTimers());
+
+    function pressIn(container: HTMLElement, init: KeyboardEventInit) {
+      fireEvent.keyDown(container.querySelector("textarea")!, init);
+      act(() => {
+        vi.runAllTimers();
+      });
+    }
+
+    it("stops a running agent on Escape", () => {
+      vi.useFakeTimers();
+      const onStop = vi.fn();
+      const { container } = renderComposer({ streaming: true, onStop });
+      pressIn(container, { key: "Escape" });
+      expect(onStop).toHaveBeenCalledOnce();
+    });
+
+    it("leaves Escape alone when nothing is running or Stop is hidden", () => {
+      vi.useFakeTimers();
+      const onStop = vi.fn();
+      const idle = renderComposer({ onStop });
+      pressIn(idle.container, { key: "Escape" });
+      idle.unmount();
+      const hidden = renderComposer({ streaming: true, showStopButton: false, onStop });
+      pressIn(hidden.container, { key: "Escape" });
+      expect(onStop).not.toHaveBeenCalled();
+    });
+
+    it("yields Escape to anything that claimed it first", () => {
+      vi.useFakeTimers();
+      const onStop = vi.fn();
+      // Stands in for the composer strip or the subagent drill-in closing.
+      const claim = (e: KeyboardEvent) => e.preventDefault();
+      window.addEventListener("keydown", claim);
+      try {
+        const { container } = renderComposer({ streaming: true, onStop });
+        pressIn(container, { key: "Escape" });
+      } finally {
+        window.removeEventListener("keydown", claim);
+      }
+      expect(onStop).not.toHaveBeenCalled();
+    });
+
+    it("stops on Ctrl+C only while the composer is empty", () => {
+      vi.useFakeTimers();
+      const onStop = vi.fn();
+      const typed = renderComposer({ streaming: true, draft: "half a thought", onStop });
+      pressIn(typed.container, { key: "c", ctrlKey: true });
+      expect(onStop).not.toHaveBeenCalled();
+      typed.unmount();
+
+      const empty = renderComposer({ streaming: true, onStop });
+      pressIn(empty.container, { key: "c", ctrlKey: true });
+      expect(onStop).toHaveBeenCalledOnce();
+    });
   });
 
   describe("zone1Override (§12)", () => {

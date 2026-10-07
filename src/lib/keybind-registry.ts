@@ -6,6 +6,7 @@ export type KeybindCategory =
   | "workspaces"
   | "tabs"
   | "panes"
+  | "chat"
   | "terminal";
 
 export interface KeybindEntry {
@@ -23,8 +24,11 @@ export interface KeybindEntry {
    *   kept out of the intercept list so the pty still receives the key (F2 in
    *   htop, mc or nano), and xterm stops the event before it reaches the window
    *   handler. Anywhere else — sidebar, chat, overview — the action fires.
+   * - `"composer"`: handled by a focused chat composer; the window handler
+   *   never dispatches it. The narrower scope is why it may share a combo with
+   *   a window action (Escape) without either one shadowing the other.
    */
-  when?: "always" | "terminal" | "non-terminal";
+  when?: "always" | "terminal" | "non-terminal" | "composer";
   /**
    * Handled by the desktop app itself (`src-tauri/src/webview_recovery.rs`),
    * before the page ever sees the key, so it still works when the interface is
@@ -76,6 +80,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "workspaceJump7", label: "Jump to workspace 7", category: "workspaces", defaultKeys: "Alt+7" },
   { id: "workspaceJump8", label: "Jump to workspace 8", category: "workspaces", defaultKeys: "Alt+8" },
   { id: "workspaceJump9", label: "Jump to workspace 9", category: "workspaces", defaultKeys: "Alt+9" },
+  { id: "jumpToNeedsYou", label: "Jump to a workspace that needs you", category: "workspaces", defaultKeys: "Ctrl+Shift+J", description: "Cycles through workspaces waiting on you, longest-waiting first" },
 
   // ── Tabs ──
   { id: "newTab", label: "New terminal tab", category: "tabs", defaultKeys: "Ctrl+T" },
@@ -89,11 +94,23 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "switchTab7", label: "Switch to tab 7", category: "tabs", defaultKeys: "Ctrl+7" },
   { id: "switchTab8", label: "Switch to tab 8", category: "tabs", defaultKeys: "Ctrl+8" },
   { id: "switchTab9", label: "Switch to tab 9", category: "tabs", defaultKeys: "Ctrl+9" },
+  // Ctrl+PageDown/PageUp, the browser and editor convention, rather than
+  // Ctrl+Tab, which stays with the programs running in a terminal.
+  { id: "nextTab", label: "Next tab", category: "tabs", defaultKeys: "Ctrl+PageDown" },
+  { id: "prevTab", label: "Previous tab", category: "tabs", defaultKeys: "Ctrl+PageUp" },
 
   // ── Panes ──
   { id: "splitPaneRight", label: "Split pane right", category: "panes", defaultKeys: "Ctrl+Shift+D" },
   { id: "splitPaneDown", label: "Split pane down", category: "panes", defaultKeys: "Ctrl+Shift+E" },
   { id: "closePane", label: "Close pane", category: "panes", defaultKeys: "Ctrl+Shift+W" },
+  { id: "focusPaneLeft", label: "Focus pane left", category: "panes", defaultKeys: "Alt+Shift+ArrowLeft" },
+  { id: "focusPaneRight", label: "Focus pane right", category: "panes", defaultKeys: "Alt+Shift+ArrowRight" },
+  { id: "focusPaneUp", label: "Focus pane above", category: "panes", defaultKeys: "Alt+Shift+ArrowUp" },
+  { id: "focusPaneDown", label: "Focus pane below", category: "panes", defaultKeys: "Alt+Shift+ArrowDown" },
+  { id: "togglePaneZoom", label: "Zoom pane", category: "panes", defaultKeys: "Ctrl+Shift+Enter", description: "Show only the active pane at full size. Press again to bring the split back" },
+
+  // ── Chat ──
+  { id: "interruptAgent", label: "Stop the agent", category: "chat", defaultKeys: "Escape", when: "composer", description: "From the chat composer while the agent works. Ctrl+C in an empty composer stops it too" },
 
   // ── Terminal (handled inside xterm) ──
   { id: "copySelection", label: "Copy selection", category: "terminal", defaultKeys: "Ctrl+Shift+C", when: "terminal" },
@@ -134,6 +151,7 @@ export const KEYBIND_CATEGORIES: readonly KeybindCategory[] = [
   "workspaces",
   "tabs",
   "panes",
+  "chat",
   "terminal",
 ];
 
@@ -144,5 +162,6 @@ export const CATEGORY_LABELS: Record<KeybindCategory, string> = {
   workspaces: "Workspaces",
   tabs: "Tabs",
   panes: "Panes",
+  chat: "Chat",
   terminal: "Terminal",
 };

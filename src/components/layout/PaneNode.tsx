@@ -18,6 +18,7 @@ import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { containsPane } from "@/lib/pane-navigation";
 
 const TerminalPane = React.lazy(() =>
   import("@/components/terminal/TerminalPane").then((module) => ({
@@ -69,6 +70,9 @@ interface Props {
    *  keeps only useful cwd/status context plus pane actions; split children
    *  retain their local title because it identifies the pane. */
   isSurfaceRoot?: boolean;
+  /** The pane zoomed to fill the surface. Its siblings stay mounted (a
+   *  terminal keeps its scrollback, a browser its page) but are hidden. */
+  zoomedPaneId?: string;
 }
 
 function normalizeChildSizes(raw: number[], count: number): number[] {
@@ -238,6 +242,7 @@ function PaneNodeImpl({
   visible,
   workspaceId,
   isSurfaceRoot = false,
+  zoomedPaneId,
 }: Props) {
   // #127: hooks hoisted above the split branch so hook order stays stable if a
   // fiber flips between split↔leaf at the same position (the old code called
@@ -264,23 +269,37 @@ function PaneNodeImpl({
 
   if (node.kind === "split") {
     const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
-    const sizesFr = sizes.map((s) => `${Math.max(s, 0.05)}fr`);
+    // Under a zoom, only the branch holding the zoomed pane keeps a track.
+    const zoomedChild = zoomedPaneId
+      ? node.children.findIndex((c) => containsPane(c, zoomedPaneId))
+      : -1;
+    const zoomed = zoomedChild >= 0;
+    const template = zoomed
+      ? "1fr"
+      : sizes.map((s) => `${Math.max(s, 0.05)}fr`).join(" ");
     const gridStyle: React.CSSProperties =
       node.direction === "horizontal"
-        ? { display: "grid", gridTemplateColumns: sizesFr.join(" "), gap: "1px", height: "100%", width: "100%" }
-        : { display: "grid", gridTemplateRows: sizesFr.join(" "), gap: "1px", height: "100%", width: "100%" };
+        ? { display: "grid", gridTemplateColumns: template, gap: zoomed ? 0 : "1px", height: "100%", width: "100%" }
+        : { display: "grid", gridTemplateRows: template, gap: zoomed ? 0 : "1px", height: "100%", width: "100%" };
 
     return (
       <div style={gridStyle} data-split-container data-split-pane-id={node.pane_id}>
         {node.children.map((child, i) => (
-          <div key={child.pane_id} className="relative min-w-0 min-h-0 overflow-hidden">
+          <div
+            key={child.pane_id}
+            className={cn(
+              "relative min-w-0 min-h-0 overflow-hidden",
+              zoomed && i !== zoomedChild && "hidden",
+            )}
+          >
             <PaneNode
               node={child}
               activePaneId={activePaneId}
-              visible={visible}
+              visible={visible && (!zoomed || i === zoomedChild)}
               workspaceId={workspaceId}
+              zoomedPaneId={zoomed ? zoomedPaneId : undefined}
             />
-            {i < node.children.length - 1 && (
+            {!zoomed && i < node.children.length - 1 && (
               <div
                 className={`absolute z-20 opacity-0 hover:opacity-100 data-[dragging=true]:opacity-100 transition-opacity duration-100 ${
                   node.direction === "horizontal"

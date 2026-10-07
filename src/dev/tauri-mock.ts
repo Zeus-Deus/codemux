@@ -6165,6 +6165,90 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return tabId;
   },
+  // Splits and pane focus, so the pane keyboard moves (directional focus,
+  // zoom) can be tried in the browser.
+  split_pane: (a) => {
+    const paneId = String(a.paneId);
+    const n = ++mockTabSeq;
+    const newPaneId = `pane-mock-split-${n}`;
+    const sessionId = `sess-mock-split-${n}`;
+    const leaf: PaneNodeSnapshot = {
+      kind: "terminal",
+      pane_id: newPaneId,
+      session_id: sessionId,
+      title: `Terminal ${n}`,
+    };
+    const splitAt = (node: PaneNodeSnapshot): PaneNodeSnapshot | null => {
+      if (node.pane_id === paneId) {
+        return {
+          kind: "split",
+          pane_id: `split-mock-${n}`,
+          direction: a.direction === "vertical" ? "vertical" : "horizontal",
+          child_sizes: [0.5, 0.5],
+          children: [node, leaf],
+        };
+      }
+      if (node.kind !== "split") return null;
+      for (let i = 0; i < node.children.length; i++) {
+        const replaced = splitAt(node.children[i]);
+        if (replaced) {
+          const children = [...node.children];
+          children[i] = replaced;
+          return { ...node, children };
+        }
+      }
+      return null;
+    };
+    let found = false;
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((ws) => ({
+        ...ws,
+        surfaces: ws.surfaces.map((surface) => {
+          const root = found ? null : splitAt(surface.root);
+          if (!root) return surface;
+          found = true;
+          return { ...surface, root, active_pane_id: newPaneId };
+        }),
+      })),
+    };
+    if (!found) return newPaneId;
+    appState.terminal_sessions.push({
+      session_id: sessionId,
+      title: leaf.title,
+      shell: "/bin/bash",
+      cwd: "~",
+      cols: 120,
+      rows: 32,
+      state: "ready",
+      last_message: null,
+      exit_code: null,
+      original_command: null,
+      adapter_captures: {},
+    });
+    emitAppState();
+    return newPaneId;
+  },
+  activate_pane: (a) => {
+    const paneId = String(a.paneId);
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((ws) => {
+        const surface = ws.surfaces.find((s) =>
+          leafPaneNodes(s.root).some((node) => node.pane_id === paneId),
+        );
+        if (!surface || surface.active_pane_id === paneId) return ws;
+        return {
+          ...ws,
+          surfaces: ws.surfaces.map((s) =>
+            s === surface ? { ...s, active_pane_id: paneId } : s,
+          ),
+        };
+      }),
+    };
+    emitAppState();
+    return undefined;
+  },
   agent_chat_create_pane: (a) => {
     const ws = findWorkspace(a.workspaceId);
     const threadId = typeof a.threadId === "string" ? a.threadId : null;

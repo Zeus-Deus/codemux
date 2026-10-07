@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowDown } from "lucide-react";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { getWorkspaceStatus } from "@/lib/pane-status";
+import { sortOldestBlockedFirst } from "@/lib/needs-you";
 import {
   useSidebarDensityStore,
   formatElapsed,
@@ -130,24 +131,7 @@ export function SidebarNeedsYouStrip({
         }
       }
     }
-    return out
-      .map((entry, treeIndex) => {
-        const mark = statusSince[entry.workspace.workspace_id];
-        return {
-          entry,
-          treeIndex,
-          blockedAt:
-            mark?.status === "permission"
-              ? mark.at
-              : Number.POSITIVE_INFINITY,
-        };
-      })
-      .sort(
-        // `blockedAt - blockedAt` is NaN when both are unseeded (Infinity);
-        // NaN and 0 both fall through `||` to the stable tree-order tie-break.
-        (a, b) => a.blockedAt - b.blockedAt || a.treeIndex - b.treeIndex,
-      )
-      .map(({ entry }) => entry);
+    return sortOldestBlockedFirst(out, (e) => e.workspace.workspace_id, statusSince);
   }, [projectGroups, paneStatuses, filterPath, statusSince]);
 
   // Per-project colors, sourced from the same UI-state key the sidebar group

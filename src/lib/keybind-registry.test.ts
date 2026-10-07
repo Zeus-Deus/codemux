@@ -13,9 +13,31 @@ describe("keybind-registry", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("has no duplicate default key combos (excluding same-category tab switches)", () => {
-    const combos = KEYBIND_REGISTRY.map((e) => e.defaultKeys);
-    expect(new Set(combos).size).toBe(combos.length);
+  it("has no duplicate default key combos within one scope", () => {
+    // A composer-scoped binding only fires inside a focused chat composer, so
+    // it may reuse a window combo (Escape) without shadowing it.
+    const windowCombos = KEYBIND_REGISTRY.filter((e) => e.when !== "composer").map((e) => e.defaultKeys);
+    expect(new Set(windowCombos).size).toBe(windowCombos.length);
+    const composerCombos = KEYBIND_REGISTRY.filter((e) => e.when === "composer").map((e) => e.defaultKeys);
+    expect(new Set(composerCombos).size).toBe(composerCombos.length);
+  });
+
+  it("binds Escape to stop the agent, scoped to the composer", () => {
+    const entry = getRegistryEntry("interruptAgent");
+    expect(entry).toMatchObject({ defaultKeys: "Escape", category: "chat", when: "composer" });
+    // Escape still closes overlays everywhere else.
+    expect(getRegistryEntry("closeOverlay")!.defaultKeys).toBe("Escape");
+  });
+
+  it("registers tab cycling, directional pane focus, pane zoom and the needs-you jump", () => {
+    expect(getRegistryEntry("nextTab")!.defaultKeys).toBe("Ctrl+PageDown");
+    expect(getRegistryEntry("prevTab")!.defaultKeys).toBe("Ctrl+PageUp");
+    expect(getRegistryEntry("focusPaneLeft")!.defaultKeys).toBe("Alt+Shift+ArrowLeft");
+    expect(getRegistryEntry("focusPaneRight")!.defaultKeys).toBe("Alt+Shift+ArrowRight");
+    expect(getRegistryEntry("focusPaneUp")!.defaultKeys).toBe("Alt+Shift+ArrowUp");
+    expect(getRegistryEntry("focusPaneDown")!.defaultKeys).toBe("Alt+Shift+ArrowDown");
+    expect(getRegistryEntry("togglePaneZoom")!.defaultKeys).toBe("Ctrl+Shift+Enter");
+    expect(getRegistryEntry("jumpToNeedsYou")!.defaultKeys).toBe("Ctrl+Shift+J");
   });
 
   it("every entry has a non-empty label", () => {

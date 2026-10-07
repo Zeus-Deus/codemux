@@ -31,10 +31,11 @@ export function updateAppShortcuts(overrides: Record<string, string>) {
   for (const [id, entry] of resolved.keybindMap) {
     // `terminal` shortcuts are handled inside xterm, and `non-terminal` ones
     // deliberately yield to a focused pty — neither belongs in the list of
-    // combos the terminal has to give up.
+    // combos the terminal has to give up. `composer` ones only exist inside a
+    // focused chat composer, so a terminal never needs to yield them.
     // `native` ones are consumed by the desktop app before the page sees them.
     const reg = KEYBIND_REGISTRY.find((e) => e.id === id);
-    if (reg?.when === "terminal" || reg?.when === "non-terminal") continue;
+    if (reg?.when === "terminal" || reg?.when === "non-terminal" || reg?.when === "composer") continue;
     if (reg?.native) continue;
     if (!entry.activeKeys) continue;
 

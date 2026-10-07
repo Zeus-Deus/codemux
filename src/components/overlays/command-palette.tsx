@@ -8,6 +8,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Bot,
+  CircleAlert,
   ClipboardPaste,
   Columns2,
   FolderOpen,
@@ -17,6 +18,7 @@ import {
   Keyboard,
   LayoutGrid,
   LoaderCircle,
+  Maximize2,
   MessageSquareText,
   PanelLeft,
   Play,
@@ -182,6 +184,13 @@ const COMMANDS: PaletteCommand[] = [
   },
   { id: "next-workspace", label: "Next workspace", icon: ArrowRight, actionId: "nextWorkspace" },
   { id: "prev-workspace", label: "Previous workspace", icon: ArrowLeft, actionId: "prevWorkspace" },
+  {
+    id: "jump-needs-you",
+    label: "Jump to a workspace that needs you",
+    icon: CircleAlert,
+    actionId: "jumpToNeedsYou",
+    keywords: "waiting permission attention stuck",
+  },
 
   // Search
   { id: "file-search", label: "Find file by name", icon: Search, actionId: "fileSearch", keywords: "goto open" },
@@ -193,6 +202,16 @@ const COMMANDS: PaletteCommand[] = [
   { id: "close-pane", label: "Close pane", icon: X, actionId: "closePane", requiresWorkspace: true },
   { id: "new-tab", label: "New terminal tab", icon: Terminal, actionId: "newTab", keywords: "shell console", requiresWorkspace: true },
   { id: "close-tab", label: "Close tab", icon: X, actionId: "closeTab", requiresWorkspace: true },
+  { id: "next-tab", label: "Next tab", icon: ArrowRight, actionId: "nextTab", requiresWorkspace: true },
+  { id: "prev-tab", label: "Previous tab", icon: ArrowLeft, actionId: "prevTab", requiresWorkspace: true },
+  {
+    id: "zoom-pane",
+    label: "Zoom pane",
+    icon: Maximize2,
+    actionId: "togglePaneZoom",
+    keywords: "maximize fullscreen focus restore split",
+    requiresWorkspace: true,
+  },
   {
     id: "focus-next-pane",
     label: "Focus next pane",

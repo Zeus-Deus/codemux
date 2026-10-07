@@ -121,6 +121,8 @@ import { StoreSlashCommandPopup } from "./SlashCommandPopup";
 import { usePopupHighlightSelector, usePopupHighlightStore } from "./popup-highlight-store";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
+import { interruptUnlessClaimed, isInterruptKey } from "./composer-interrupt";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -2757,6 +2759,8 @@ export function Composer({
     });
   });
 
+  const interruptKeys = useResolvedKeybinds().getKeysForAction("interruptAgent");
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing) return;
     // Shift+Tab cycles modes regardless of popup state. preventDefault
@@ -2838,6 +2842,12 @@ export function Composer({
           return;
         }
       }
+    }
+
+    // Popups had first claim on Escape above; with none open it stops the run.
+    if (busy && showStopButton && isInterruptKey(e.nativeEvent, interruptKeys, draft)) {
+      interruptUnlessClaimed(e.nativeEvent, onStop);
+      return;
     }
 
     if (e.key === "Enter" && !e.shiftKey) {
@@ -3490,6 +3500,7 @@ export function Composer({
                 </div>
                 <textarea
                   ref={textareaRef}
+                  data-composer-input
                   value={draft}
                   readOnly={readOnly}
                   onChange={readOnly ? undefined : handleTextareaChange}
