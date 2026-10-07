@@ -181,6 +181,15 @@ function makeThreeTabWorkspace(): WorkspaceSnapshot {
 }
 
 describe("TitleBarTabs drag-to-reorder", () => {
+  it("marks only the active tab as current", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const tabButton = (title: string) =>
+      screen.getByText(title).closest("button") as HTMLElement;
+    expect(tabButton("term-a")).toHaveAttribute("aria-current", "page");
+    expect(tabButton("term-b")).not.toHaveAttribute("aria-current");
+    expect(tabButton("term-c")).not.toHaveAttribute("aria-current");
+  });
+
   function renderThreeTabs() {
     const utils = render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
     const pillFor = (title: string) =>

@@ -241,6 +241,7 @@ function TitleBarTab({
         type="button"
         className="flex min-w-0 items-center gap-1.5"
         onClick={handleActivate}
+        aria-current={isActive ? "page" : undefined}
         title={tab.title}
       >
         <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
@@ -308,6 +309,7 @@ function ActiveChatTab({
             <button
               type="button"
               className="flex min-w-0 items-center gap-1.5"
+              aria-current="page"
               title={tab.title}
               data-testid="titlebar-chat-tab-trigger"
             >

@@ -22,6 +22,7 @@ import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
+import { NeedsYouAnnouncer } from "./needs-you-announcer";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { markStartup } from "@/lib/perf/interaction-trace";
@@ -307,6 +308,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((o) => !o)}
       />
+      <NeedsYouAnnouncer />
       <SidebarProvider
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}

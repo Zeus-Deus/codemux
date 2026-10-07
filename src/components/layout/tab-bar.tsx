@@ -30,6 +30,7 @@ import type { WorkspaceSnapshot, TabKind, ActivePaneStatus, PaneStatus, PaneNode
 import { useAppStore } from "@/stores/app-store";
 import { useEditorStore } from "@/stores/editor-store";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
+import { cn } from "@/lib/utils";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 
 interface Props {
@@ -286,11 +287,11 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
                     data-tab-index={idx}
                     draggable
                     onDragStart={handleDragStart(tab.tab_id)}
-                    className={`h-full ${dragTabId === tab.tab_id ? "opacity-40" : ""}`}
+                    className={cn("group relative h-full", dragTabId === tab.tab_id && "opacity-40")}
                   >
                     <TabsTrigger
                       value={tab.tab_id}
-                      className="group relative gap-1 px-3 !h-full !py-0 !m-0 text-label !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
+                      className="relative gap-1 pl-3 pr-8 !h-full !py-0 !m-0 text-label !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
                     >
                       {tab.icon ? <PresetIcon icon={tab.icon} className="size-3" /> : tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
@@ -298,18 +299,19 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
                       {tabStatusMap.has(tab.tab_id) && (
                         <StatusIndicator status={tabStatusMap.get(tab.tab_id)!} />
                       )}
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 cursor-pointer"
-                        onClick={(e) => handleCloseTab(e, tab.tab_id)}
-                        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleCloseTab(e as unknown as React.MouseEvent, tab.tab_id); }}
-                        aria-label="Close tab"
-                        title="Close tab"
-                      >
-                        <X className="size-3" />
-                      </span>
                     </TabsTrigger>
+                    {/* A sibling over the trigger, not a child of it: a button
+                        nested inside the tab's own button is invalid and
+                        screen readers flatten it into the tab's name. */}
+                    <button
+                      type="button"
+                      className="absolute right-3 top-1/2 -translate-y-1/2 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                      onClick={(e) => handleCloseTab(e, tab.tab_id)}
+                      aria-label={`Close ${tab.title}`}
+                      title="Close tab"
+                    >
+                      <X className="size-3" />
+                    </button>
                   </div>
                 </ContextMenuTrigger>
                 <ContextMenuContent>

@@ -585,6 +585,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               role="button"
               tabIndex={0}
               data-inbox-card={workspace.workspace_id}
+              aria-current={isActive ? "page" : undefined}
               data-selected={selected || undefined}
               data-unread={unread || undefined}
               onClick={handleClick}
