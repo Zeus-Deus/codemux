@@ -97,8 +97,12 @@ export function FileSearchDialog() {
     getGitStatus(cwd)
       .then((files) => {
         if (cancelled || !Array.isArray(files)) return;
+        // Git collapses a brand-new folder into one untracked "dir/" entry,
+        // which the editor can't open, so only real file paths are offered.
         const changed = files
-          .filter((f) => f.status !== "deleted" && !opened.includes(f.path))
+          .filter(
+            (f) => f.status !== "deleted" && !f.path.endsWith("/") && !opened.includes(f.path),
+          )
           .slice(0, SUGGESTION_LIMIT)
           .map((f): Item => ({ path: f.path, section: "changed" }));
         setSuggestions((prev) => [...prev, ...changed]);

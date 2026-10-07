@@ -169,6 +169,7 @@ describe("file search", () => {
     commands.getGitStatus.mockResolvedValue([
       { path: "src/changed.ts", status: "modified" },
       { path: "src/gone.ts", status: "deleted" },
+      { path: "feature/", status: "untracked" },
     ]);
     useUIStore.setState({ showFileSearch: true });
     render(<FileSearchDialog />);
@@ -178,6 +179,8 @@ describe("file search", () => {
     expect(await screen.findByText("Changed")).toBeInTheDocument();
     expect(screen.getByText("changed.ts")).toBeInTheDocument();
     expect(screen.queryByText("gone.ts")).toBeNull();
+    // An untracked folder comes back from git as one "feature/" entry.
+    expect(screen.queryByText("feature")).toBeNull();
   });
 
   it("highlights the matched part of the file name", async () => {
