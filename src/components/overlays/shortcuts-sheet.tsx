@@ -139,9 +139,13 @@ export function ShortcutsSheet() {
           inputRef.current?.focus();
         }}
         data-testid="shortcuts-sheet"
+        // mobile.css centres every dialog's `top` on the mobile shell and
+        // relies on the default -50% translate, which the crisp position
+        // drops. Pin the sheet near the top instead, as the command palette
+        // does, and keep mobile.css's dialog padding off its edge-to-edge chrome.
         className={cn(
           DIALOG_CRISP_POSITION,
-          "flex max-h-[calc(100vh-12rem)] w-[640px] max-w-[calc(100vw-32px)] flex-col gap-0 overflow-hidden border border-border p-0 ring-0 sm:max-w-[640px]",
+          "flex max-h-[calc(100vh-12rem)] w-[640px] max-w-[calc(100vw-32px)] flex-col gap-0 overflow-hidden border border-border p-0 ring-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!",
         )}
       >
         <div className="flex items-center gap-2.5 border-b border-hairline py-3 pr-3 pl-4">
@@ -181,7 +185,9 @@ export function ShortcutsSheet() {
               No shortcuts match “{query.trim()}”
             </p>
           ) : (
-            <div className="gap-x-8 sm:columns-2">
+            // A lone group (say, after filtering) takes the full width, so its
+            // keycaps sit at the dialog's edge, not beside an empty column.
+            <div className={cn("gap-x-8", groups.length > 1 && "sm:columns-2")}>
               {groups.map((group) => (
                 <section
                   key={group.category}
@@ -193,9 +199,12 @@ export function ShortcutsSheet() {
                     {group.rows.map((row) => (
                       <li
                         key={row.id}
-                        className="flex h-7 items-center justify-between gap-3 text-body-sm"
+                        className="flex min-h-7 items-center justify-between gap-3 py-1 text-body-sm"
                       >
-                        <span className="min-w-0 truncate text-foreground/85">
+                        {/* Wraps instead of truncating: half of the 640px
+                            sheet is too narrow for labels such as "New
+                            workspace in current project". */}
+                        <span className="min-w-0 leading-snug text-foreground/85">
                           {row.label}
                         </span>
                         <kbd className="shrink-0 rounded-sm border border-hairline-strong bg-surface-1 px-1.5 py-0.5 font-mono text-caption leading-none text-muted-foreground">

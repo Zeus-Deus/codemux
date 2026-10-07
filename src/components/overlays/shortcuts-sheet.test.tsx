@@ -80,6 +80,16 @@ describe("ShortcutsSheet", () => {
     expect(screen.getByText(/No shortcuts match/)).toBeInTheDocument();
   });
 
+  it("gives a lone group the full width instead of half of two columns", () => {
+    render(<ShortcutsSheet />);
+    const layout = () => screen.getByRole("region", { name: "Panes" }).parentElement!;
+    expect(layout()).toHaveClass("sm:columns-2");
+    fireEvent.change(screen.getByLabelText("Filter shortcuts"), {
+      target: { value: "split" },
+    });
+    expect(layout()).not.toHaveClass("sm:columns-2");
+  });
+
   it("hands off to Settings ▸ Shortcuts for rebinding", () => {
     render(<ShortcutsSheet />);
     fireEvent.click(screen.getByRole("button", { name: "Customize…" }));
