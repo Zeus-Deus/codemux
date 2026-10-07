@@ -21,9 +21,11 @@ const URL_RE = /\bhttps?:\/\/[^\s"'`<>]+/g;
 // `name.ext` with neither is far more often prose ("Node.js", "e.g.") than a
 // file. Extensions start with a letter so version numbers never match.
 // Suffixes: `:12`, `:12:5` (most tools) and `(12,5)` (tsc). Windows output
-// uses `\` separators and a drive prefix (`C:\src\main.rs:12`).
+// uses `\` separators and a drive prefix (`C:\src\main.rs:12`). A match
+// may not start right after a `\`: that is the inside of a UNC path
+// (`\\server\share\a.ts`), which would otherwise resolve under the cwd.
 const FILE_RE =
-  /(?<![\w.~/@+-])((?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/)?(?:[\w.@+-]+[\\/])*[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\))?/g;
+  /(?<![\w.~/@+\\-])((?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/)?(?:[\w.@+-]+[\\/])*[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\))?/g;
 
 /** Punctuation that ends a sentence rather than a URL. */
 const URL_TRAILING = /[.,;:!?'")\]}>]+$/;

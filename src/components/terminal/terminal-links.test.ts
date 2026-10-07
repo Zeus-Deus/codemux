@@ -60,6 +60,11 @@ describe("findTerminalLinks", () => {
     ]);
   });
 
+  it("does not link a fragment of a UNC path", () => {
+    expect(findTerminalLinks("error in \\\\server\\share\\file.ts")).toEqual([]);
+    expect(findTerminalLinks("\\\\server\\share\\file.ts:12")).toEqual([]);
+  });
+
   it("does not report a path inside a URL as a file", () => {
     expect(findTerminalLinks("https://example.com/docs/a.html:3").map((l) => l.kind)).toEqual([
       "url",
