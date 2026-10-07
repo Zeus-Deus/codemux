@@ -2906,8 +2906,45 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   emitOsc7,
 };
 
+// ── Editor disk overlay ──────────────────────────────────────────────
+//
+// `write_file` lands here and `read_file` prefers it, so saves round-trip
+// in browser dev. `file_signature` bumps with every write, which lets the
+// editor's on-disk change detection be exercised: simulate an agent edit to
+// the most recently opened file with Ctrl+Alt+Shift+E, or
+//   window.__codemuxEditorMock.agentWrite("/path/file.ts", "new content")
+
+const mockDiskFiles = new Map<string, { content: string; version: number }>();
+let lastMockReadPath: string | null = null;
+
+function mockDiskWrite(path: string, content: string): void {
+  const version = (mockDiskFiles.get(path)?.version ?? 0) + 1;
+  mockDiskFiles.set(path, { content, version });
+}
+
+function mockFileSignature(path: string): string {
+  return `mock:${mockDiskFiles.get(path)?.version ?? 0}`;
+}
+
+function mockAgentEdit(path = lastMockReadPath): void {
+  if (!path) return;
+  const current = mockDiskFiles.get(path)?.content ?? mockReadFile(path);
+  const stamp = new Date().toLocaleTimeString();
+  mockDiskWrite(path, `${current.trimEnd()}\n// Edited by an agent at ${stamp}\n`);
+  console.info(`[mock::editor] agent edit -> ${path}`);
+}
+
+(
+  window as unknown as {
+    __codemuxEditorMock: {
+      agentWrite: typeof mockDiskWrite;
+      agentEdit: typeof mockAgentEdit;
+    };
+  }
+).__codemuxEditorMock = { agentWrite: mockDiskWrite, agentEdit: mockAgentEdit };
+
 // CLI-drivable triggers: the browser is driven by `codemux browser
-// key-press` (no JS eval), so bind two RARE combos to the same helpers.
+// key-press` (no JS eval), so bind RARE combos to the same helpers.
 // Capture phase + preventDefault/stopPropagation so the chord never
 // reaches xterm. `e.code` (physical key) is used so the binding is
 // layout-independent even while Alt mangles `e.key`.
@@ -2927,6 +2964,10 @@ window.addEventListener(
         "[mock::terminal] key-combo Ctrl+Alt+Shift+S -> emitSerializeBuffers()",
       );
       emitSerializeBuffers();
+    } else if (e.code === "KeyE") {
+      e.preventDefault();
+      e.stopPropagation();
+      mockAgentEdit();
     }
   },
   true,
@@ -3683,8 +3724,16 @@ const handlers: Record<string, Handler> = {
   // Browser dev has no filesystem; every path "exists" so chat file links
   // stay clickable against the synthetic contents `read_file` fabricates.
   file_exists: () => true,
+  file_signature: (a) => mockFileSignature(String(a.path ?? "")),
+  write_file: (a) => {
+    mockDiskWrite(String(a.path ?? ""), String(a.content ?? ""));
+    return null;
+  },
   read_file: (a) => {
     const path = String(a.path ?? "");
+    lastMockReadPath = path;
+    const written = mockDiskFiles.get(path);
+    if (written !== undefined) return written.content;
     // Template lookup is a series of speculative reads, and the answer
     // that matters most is "no". `mockReadFile` returns prose for any
     // `.md`, which would make every repository look like it had a
