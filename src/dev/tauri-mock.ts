@@ -3441,6 +3441,22 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+/** The repo-shaped file list behind both search dialogs in browser dev. */
+const MOCK_SEARCH_PATHS = [
+  "AGENTS.md",
+  "README.md",
+  "CLAUDE.md",
+  "package.json",
+  "CONTRIBUTING.md",
+  "src/components/layout/right-panel.tsx",
+  "src/stores/ui-store.ts",
+  "src-tauri/Cargo.toml",
+  // No real filesystem backs browser dev, so an opened image always
+  // 404s — which is exactly what makes the ImageViewer failure card
+  // reachable here.
+  "docs/screenshots/dashboard.png",
+];
+
 const handlers: Record<string, Handler> = {
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
@@ -3660,21 +3676,44 @@ const handlers: Record<string, Handler> = {
   // in browser dev.
   search_file_names: (a) => {
     const query = String(a.query ?? "").toLowerCase();
-    const paths = [
-      "AGENTS.md",
-      "README.md",
-      "CLAUDE.md",
-      "package.json",
-      "CONTRIBUTING.md",
-      "src/components/layout/right-panel.tsx",
-      "src/stores/ui-store.ts",
-      "src-tauri/Cargo.toml",
-      // No real filesystem backs browser dev, so an opened image always
-      // 404s — which is exactly what makes the ImageViewer failure card
-      // reachable here.
-      "docs/screenshots/dashboard.png",
-    ];
+    const paths = MOCK_SEARCH_PATHS;
     return query ? paths.filter((p) => p.toLowerCase().includes(query)) : paths;
+  },
+
+  // Searches the same synthetic contents `read_file` serves, so opening a
+  // hit lands on a line that really holds the match in the mock editor.
+  // Mirrors the real command: literal unless `regex`, case-insensitive
+  // unless `caseSensitive`, absolute paths, UTF-16 offsets, and a rejected
+  // promise for an invalid pattern.
+  search_in_files: (a) => {
+    const root = String(a.path ?? "");
+    const query = String(a.query ?? "");
+    if (!query) return [];
+    const source = a.regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(source, a.caseSensitive ? "" : "i");
+    } catch (err) {
+      return Promise.reject(err instanceof Error ? err.message : String(err));
+    }
+    const limit = Number(a.maxResults ?? 100);
+    const results: Array<Record<string, unknown>> = [];
+    for (const rel of MOCK_SEARCH_PATHS) {
+      if (rel.endsWith(".png")) continue;
+      const lines = mockReadFile(`${root}/${rel}`).split("\n");
+      lines.forEach((line, i) => {
+        const hit = pattern.exec(line);
+        if (!hit || hit[0].length === 0 || results.length >= limit) return;
+        results.push({
+          file_path: `${root}/${rel}`,
+          line_number: i + 1,
+          line_content: line,
+          match_start: hit.index,
+          match_end: hit.index + hit[0].length,
+        });
+      });
+    }
+    return results;
   },
 
   // Enough content for the editor surfaces (main-area tab and the right

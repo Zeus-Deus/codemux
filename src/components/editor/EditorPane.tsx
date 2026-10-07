@@ -298,8 +298,12 @@ export function EditorPane({
     const line = view.state.doc.line(lineNumber);
     const columnOffset = Math.max(0, (revealRequest.column ?? 1) - 1);
     const position = Math.min(line.to, line.from + columnOffset);
+    const head =
+      revealRequest.endColumn != null
+        ? Math.min(line.to, line.from + revealRequest.endColumn - 1)
+        : position;
     view.dispatch({
-      selection: { anchor: position },
+      selection: { anchor: position, head },
       effects: EditorView.scrollIntoView(position, { y: "center" }),
     });
     view.focus();

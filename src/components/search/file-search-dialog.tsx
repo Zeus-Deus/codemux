@@ -7,15 +7,59 @@ import {
   DIALOG_CRISP_POSITION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
-import { Input } from "@/components/ui/input";
-import { Loader2 } from "lucide-react";
+import { Eyebrow } from "@/components/ui/eyebrow";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
+import { useEditorStore } from "@/stores/editor-store";
 import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
-import { searchFileNames } from "@/tauri/commands";
+import { getGitStatus, searchFileNames } from "@/tauri/commands";
 import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { basename } from "@/lib/path";
+import {
+  MatchHighlight,
+  ResultCapNotice,
+  SearchFooter,
+  SearchQueryInput,
+  findMatchRange,
+  relativeToRoot,
+  staleListClass,
+} from "./search-dialog-parts";
+
+/** Results asked of the backend per query. Hitting it means there may be more. */
+export const FILE_SEARCH_LIMIT = 20;
+/** Per-section cap for the empty-query suggestions. */
+const SUGGESTION_LIMIT = 8;
+
+type SuggestionSection = "open" | "changed";
+interface Item {
+  path: string;
+  section?: SuggestionSection;
+}
+
+const SECTION_LABEL: Record<SuggestionSection, string> = {
+  open: "Open in editor",
+  changed: "Changed",
+};
+
+function activeWorkspace() {
+  const state = useAppStore.getState();
+  const activeId = selectActiveWorkspaceId(state);
+  return state.appState?.workspaces.find((w) => w.workspace_id === activeId);
+}
+
+/** Files already open in the active workspace's editor tabs. */
+function openEditorPaths(cwd: string): string[] {
+  const ws = activeWorkspace();
+  if (!ws) return [];
+  const editor = useEditorStore.getState();
+  const paths = ws.tabs
+    .filter((t) => t.kind === "editor")
+    .map((t) => editor.getTab(t.tab_id)?.filePath)
+    .filter((p): p is string => !!p)
+    .map((p) => relativeToRoot(cwd, p));
+  return [...new Set(paths)].slice(0, SUGGESTION_LIMIT);
+}
 
 export function FileSearchDialog() {
   const open = useUIStore((s) => s.showFileSearch);
@@ -28,43 +72,74 @@ export function FileSearchDialog() {
 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<string[]>([]);
+  const [suggestions, setSuggestions] = useState<Item[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Bumped per query so a slow response can't overwrite a newer one.
+  const requestRef = useRef(0);
 
-  // Reset state when dialog opens
+  // Reset state when dialog opens, and offer the files the user most likely
+  // wants before they type anything.
   useEffect(() => {
-    if (open) {
-      setQuery("");
-      setResults([]);
-      setSelectedIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 0);
-    }
-  }, [open]);
+    if (!open) return;
+    setQuery("");
+    setResults([]);
+    setSelectedIndex(0);
+    setTimeout(() => inputRef.current?.focus(), 0);
+
+    const opened = openEditorPaths(cwd);
+    setSuggestions(opened.map((path) => ({ path, section: "open" })));
+    if (!cwd) return;
+    let cancelled = false;
+    getGitStatus(cwd)
+      .then((files) => {
+        if (cancelled || !Array.isArray(files)) return;
+        const changed = files
+          .filter((f) => f.status !== "deleted" && !opened.includes(f.path))
+          .slice(0, SUGGESTION_LIMIT)
+          .map((f): Item => ({ path: f.path, section: "changed" }));
+        setSuggestions((prev) => [...prev, ...changed]);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [open, cwd]);
 
   // Debounced search
   useEffect(() => {
+    const request = ++requestRef.current;
     if (!open || !cwd || !query.trim()) {
       setResults([]);
+      setLoading(false);
       return;
     }
     setLoading(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      searchFileNames(cwd, query.trim(), 20)
+      searchFileNames(cwd, query.trim(), FILE_SEARCH_LIMIT)
         .then((files) => {
-          setResults(files);
+          if (request !== requestRef.current) return;
+          setResults(files ?? []);
           setSelectedIndex(0);
         })
-        .catch(() => setResults([]))
-        .finally(() => setLoading(false));
+        .catch(() => {
+          if (request === requestRef.current) setResults([]);
+        })
+        .finally(() => {
+          if (request === requestRef.current) setLoading(false);
+        });
     }, 200);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [open, cwd, query]);
+
+  const searching = !!query.trim();
+  const items: Item[] = searching ? results.map((path) => ({ path })) : suggestions;
 
   const openFile = useCallback(
     async (filePath: string) => {
@@ -72,10 +147,7 @@ export function FileSearchDialog() {
       // dialog doesn't subscribe to the workspace ref (which churns on
       // every backend tick). On user click, latency from a single
       // getState read is irrelevant.
-      const appState = useAppStore.getState().appState;
-      const ws = appState?.workspaces.find(
-        (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
-      );
+      const ws = activeWorkspace();
       if (!ws) return;
       try {
         const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
@@ -98,23 +170,25 @@ export function FileSearchDialog() {
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelectedIndex((i) => Math.min(i + 1, results.length - 1));
+      setSelectedIndex((i) => Math.min(i + 1, items.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSelectedIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter" && results[selectedIndex]) {
+    } else if (e.key === "Enter" && items[selectedIndex]) {
       e.preventDefault();
-      openFile(results[selectedIndex]);
+      openFile(items[selectedIndex].path);
     }
   };
 
   // Scroll selected item into view
   useEffect(() => {
-    const list = listRef.current;
-    if (!list) return;
-    const item = list.children[selectedIndex] as HTMLElement | undefined;
+    const item = listRef.current?.querySelector<HTMLElement>(
+      `[data-item-index="${selectedIndex}"]`,
+    );
     item?.scrollIntoView({ block: "nearest" });
   }, [selectedIndex]);
+
+  const capped = searching && results.length >= FILE_SEARCH_LIMIT;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -129,64 +203,90 @@ export function FileSearchDialog() {
        *  which landed on the search input's top-right corner because the
        *  content here is `p-0` rather than the `p-4` that button assumes. */}
       <DialogContent
-        className={cn(DIALOG_CRISP_POSITION, "gap-0 p-0")}
+        className={cn(DIALOG_CRISP_POSITION, "gap-0 overflow-hidden p-0")}
         showCloseButton={false}
         onKeyDown={handleKeyDown}
       >
         <DialogTitle className="sr-only">Search Files</DialogTitle>
         <DialogDescription className="sr-only">Find files by name</DialogDescription>
         <div className="p-3 pb-0">
-          <Input
-            ref={inputRef}
+          <SearchQueryInput
+            inputRef={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={setQuery}
             placeholder="Search files by name..."
-            className="h-9 text-body"
+            loading={loading}
           />
         </div>
-        <div ref={listRef} className="max-h-[50vh] overflow-y-auto p-1.5">
-          {!query.trim() && (
+        <div
+          ref={listRef}
+          className={cn("max-h-[50vh] overflow-y-auto p-1.5", staleListClass(loading))}
+        >
+          {!searching && items.length === 0 && (
             <p className="text-label text-muted-foreground text-center py-8">
               Type a file name to search
             </p>
           )}
-          {query.trim() && loading && (
-            <div className="flex justify-center py-8">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
-            </div>
-          )}
-          {query.trim() && !loading && results.length === 0 && (
+          {searching && !loading && results.length === 0 && (
             <p className="text-label text-muted-foreground text-center py-8">
               No matching files
             </p>
           )}
-          {results.map((filePath, idx) => {
-            const fileName = basename(filePath);
-            const parts = filePath.split(/[\\/]/);
+          {items.map((item, idx) => {
+            const fileName = basename(item.path);
+            const parts = item.path.split(/[\\/]/);
             parts.pop();
             const dirPath = parts.join("/");
+            const header =
+              item.section && item.section !== items[idx - 1]?.section ? item.section : null;
             return (
-              <button
-                key={filePath}
-                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-body ${
-                  idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50"
-                }`}
-                onClick={() => openFile(filePath)}
-                onMouseEnter={() => setSelectedIndex(idx)}
-              >
-                <FileTypeIcon filename={fileName} className="size-3.5 opacity-75" />
-                <div className="min-w-0 flex-1">
-                  <span className="font-medium">{fileName}</span>
+              <div key={`${item.section ?? "result"}:${item.path}`}>
+                {header && (
+                  <Eyebrow className={cn("px-2 pb-1", idx === 0 ? "pt-1" : "pt-2.5")}>
+                    {SECTION_LABEL[header]}
+                  </Eyebrow>
+                )}
+                <button
+                  data-item-index={idx}
+                  className={cn(
+                    "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-body",
+                    idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50",
+                  )}
+                  onClick={() => openFile(item.path)}
+                  onMouseEnter={() => setSelectedIndex(idx)}
+                >
+                  <FileTypeIcon filename={fileName} className="size-3.5 opacity-75" />
+                  <span className="max-w-[70%] shrink-0 truncate font-medium">
+                    <MatchHighlight
+                      text={fileName}
+                      range={searching ? findMatchRange(fileName, query) : null}
+                      className="rounded-sm bg-accent-ember/15 text-foreground"
+                    />
+                  </span>
                   {dirPath && (
-                    <span className="ml-2 text-label text-muted-foreground truncate">
-                      {dirPath}
+                    // RTL clips the start of a deep path, so the folder the
+                    // file actually sits in stays visible; <bdi> keeps the
+                    // path itself reading left to right.
+                    <span
+                      dir="rtl"
+                      className="min-w-0 flex-1 truncate text-left text-label text-muted-foreground"
+                    >
+                      <bdi>{dirPath}</bdi>
                     </span>
                   )}
-                </div>
-              </button>
+                </button>
+              </div>
             );
           })}
+          {capped && <ResultCapNotice limit={FILE_SEARCH_LIMIT} />}
         </div>
+        <SearchFooter
+          hints={[
+            { keys: "↑↓", label: "navigate" },
+            { keys: "↵", label: "open" },
+            { keys: "esc", label: "close" },
+          ]}
+        />
       </DialogContent>
     </Dialog>
   );
