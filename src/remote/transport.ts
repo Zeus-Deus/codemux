@@ -357,6 +357,10 @@ export class RemoteTransport {
     try {
       ticket = await this.fetchTicket();
     } catch (err) {
+      // Closed while the ticket was in flight: a late 401 belongs to a torn
+      // down attempt (e.g. a withdrawn pairing), not to whatever session the
+      // caller holds now, so it must not trigger the unauthorized hook.
+      if (this.closed) return;
       if (err instanceof UnauthorizedError) {
         this.closed = true;
         this.hooks.onUnauthorized();
