@@ -90,6 +90,27 @@ describe("ShortcutsSheet", () => {
     expect(layout()).not.toHaveClass("sm:columns-2");
   });
 
+  it("names the bound close key in the footer and hides it when unbound", () => {
+    const { unmount } = render(<ShortcutsSheet />);
+    expect(screen.getByText("escape to close")).toBeInTheDocument();
+    unmount();
+    useSyncedSettingsStore.setState({
+      settings: {
+        ...original,
+        keyboard: { ...original.keyboard, shortcuts: { closeOverlay: "" } },
+      },
+    });
+    render(<ShortcutsSheet />);
+    expect(screen.queryByText(/to close$/)).toBeNull();
+  });
+
+  it("pins the sheet near the top of the mobile shell", () => {
+    render(<ShortcutsSheet />);
+    const dialog = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')!;
+    expect(dialog).toHaveClass("in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]!");
+    expect(dialog).toHaveClass("in-[[data-mobile]]:p-0!");
+  });
+
   it("hands off to Settings ▸ Shortcuts for rebinding", () => {
     render(<ShortcutsSheet />);
     fireEvent.click(screen.getByRole("button", { name: "Customize…" }));

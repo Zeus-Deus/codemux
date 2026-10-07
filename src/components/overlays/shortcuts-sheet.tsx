@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Eyebrow } from "@/components/ui/eyebrow";
-import { formatKeyCombo } from "@/components/ui/menu-chrome";
+import { formatKeyCombo, useShortcutLabel } from "@/components/ui/menu-chrome";
 import {
   useResolvedKeybinds,
   type ResolvedEntry,
@@ -116,6 +116,9 @@ export function ShortcutsSheet() {
   const { keybindMap } = useResolvedKeybinds();
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Escape reaches the sheet only through `closeOverlay`, which is
+  // rebindable, so the hint names whatever actually closes it.
+  const closeKeys = useShortcutLabel("closeOverlay");
   const groups = useMemo(
     () => buildShortcutGroups(keybindMap, query),
     [keybindMap, query],
@@ -221,7 +224,7 @@ export function ShortcutsSheet() {
 
         <div className="flex shrink-0 items-center gap-2 border-t border-hairline bg-surface-1 px-4 py-2">
           <span className="flex-1 font-mono text-caption text-muted-foreground/60">
-            esc to close
+            {closeKeys && `${closeKeys.toLowerCase()} to close`}
           </span>
           <Button variant="ghost" size="sm" onClick={customize}>
             Customize…

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, cleanup, within } from "@testing-library/react";
+import { render, screen, act, cleanup, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const mockGetProjectScripts = vi.fn();
@@ -257,18 +257,24 @@ describe("RunButton — split variant", () => {
 
   it("follows a rebound run shortcut in the tooltip", async () => {
     const original = useSyncedSettingsStore.getState().settings;
-    useSyncedSettingsStore.setState({
-      settings: {
-        ...original,
-        keyboard: { ...original.keyboard, shortcuts: { runDevCommand: "Ctrl+Alt+P" } },
-      },
-    });
     try {
       renderSplitRunButton();
       await flushPromises();
       await userEvent.hover(screen.getByText("Set Run"));
       const tooltip = await screen.findByRole("tooltip");
-      expect(within(tooltip).getByText("Ctrl+Alt+P")).toBeInTheDocument();
+      expect(within(tooltip).getByText("Ctrl+Shift+G")).toBeInTheDocument();
+      // Rebind while the tooltip is already open: the keycap must re-render.
+      act(() => {
+        useSyncedSettingsStore.setState({
+          settings: {
+            ...original,
+            keyboard: { ...original.keyboard, shortcuts: { runDevCommand: "Ctrl+Alt+P" } },
+          },
+        });
+      });
+      await waitFor(() =>
+        expect(within(screen.getByRole("tooltip")).getByText("Ctrl+Alt+P")).toBeInTheDocument(),
+      );
       expect(screen.queryByText("Ctrl+Shift+G")).toBeNull();
     } finally {
       useSyncedSettingsStore.setState({ settings: original });
