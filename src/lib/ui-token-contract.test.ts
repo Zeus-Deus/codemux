@@ -118,6 +118,13 @@ const CATEGORIES: Category[] = [
     scan: (contents) => [contents],
     budget: 0,
   },
+  {
+    label: "raw errors folded into a toast title (use toast.failure(title, err))",
+    pattern: /toast\.error\(\s*`[^`]*\$\{(?:err|error|e)\}/g,
+    scan: (contents) => [contents],
+    budget: 12,
+    why: "AgentChatPane.tsx's turn, plan and picker failures, not yet migrated",
+  },
 ];
 
 function sourceFiles(directory: string): string[] {

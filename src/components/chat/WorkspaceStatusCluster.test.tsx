@@ -48,7 +48,13 @@ vi.mock("@/tauri/commands", () => ({
   gitPullChanges: (...args: unknown[]) => mocks.gitPullChanges(...args),
 }));
 vi.mock("@/lib/toast", () => ({
-  toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  toast: {
+    error: vi.fn(),
+    failure: vi.fn(),
+    success: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+  },
 }));
 
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
@@ -113,7 +119,7 @@ beforeEach(() => {
   mocks.getGithubIssue.mockReset().mockResolvedValue(null);
   mocks.gitPullChanges.mockReset().mockResolvedValue(undefined);
   mocks.agentBrowserSessions = [];
-  vi.mocked(toast.error).mockClear();
+  vi.mocked(toast.failure).mockClear();
   useBrowserPeekStore.setState({ openWorkspaceId: null });
 });
 
@@ -328,8 +334,9 @@ describe("WorkspaceStatusCluster", () => {
     await user.click(screen.getByRole("button", { name: "Workspace details" }));
     await user.click(screen.getByRole("button", { name: "Sync ↓3" }));
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith(
-        expect.stringContaining("Sync failed"),
+      expect(toast.failure).toHaveBeenCalledWith(
+        "Sync failed",
+        expect.objectContaining({ message: "offline" }),
       ),
     );
   });

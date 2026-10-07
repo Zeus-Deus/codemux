@@ -175,6 +175,13 @@ describe("errorMessage", () => {
     expect(errorMessage({ message: "denied" })).toBe("denied");
     expect(errorMessage("")).toBe("Unknown error");
   });
+
+  it("shows the fields of an object with no message instead of [object Object]", () => {
+    expect(errorMessage({ code: 42 })).toBe('{"code":42}');
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(errorMessage(cyclic)).toBe("[object Object]");
+  });
 });
 
 describe("toast.failure", () => {

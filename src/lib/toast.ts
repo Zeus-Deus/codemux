@@ -21,6 +21,16 @@ function fire(level: ToastLevel, message: string, opts?: ExternalToast) {
   });
 }
 
+/** `String({})` is "[object Object]"; JSON at least shows the fields. */
+function stringifyUnknown(err: unknown): string {
+  if (typeof err !== "object" || err === null) return String(err);
+  try {
+    return JSON.stringify(err) ?? String(err);
+  } catch {
+    return String(err);
+  }
+}
+
 /**
  * The readable part of a rejection. Tauri commands reject with plain strings
  * and JS throws `Error`s; either way the "Error: " prefix that `String(err)`
@@ -34,7 +44,7 @@ export function errorMessage(err: unknown): string {
         ? err.message
         : typeof err === "object" && err !== null && "message" in err && typeof err.message === "string"
           ? err.message
-          : String(err);
+          : stringifyUnknown(err);
   return raw.replace(/^(?:Uncaught\s+)?[A-Za-z]*Error:\s*/, "").trim() || "Unknown error";
 }
 

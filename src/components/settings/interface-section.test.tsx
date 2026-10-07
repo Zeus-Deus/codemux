@@ -121,7 +121,7 @@ describe("InterfaceSection", () => {
     );
   });
 
-  it("surfaces a toast.error and does NOT quit when set_agent_chat_enabled fails", async () => {
+  it("surfaces a failure toast and does NOT quit when set_agent_chat_enabled fails", async () => {
     const user = userEvent.setup();
     invokeMock.mockReset();
     invokeMock.mockRejectedValueOnce(new Error("disk full"));
