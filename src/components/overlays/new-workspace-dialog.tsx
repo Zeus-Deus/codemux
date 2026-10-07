@@ -177,6 +177,7 @@ export function branchNameError(name: string): string | null {
   if (branch === "@" || branch.includes("@{")) {
     return "Branch names can't be @ or contain @{";
   }
+  if (branch === "HEAD") return "HEAD is reserved by git";
   if (branch.startsWith("-")) return "Branch names can't start with -";
   if (branch.startsWith("/") || branch.endsWith("/") || branch.includes("//")) {
     return "Branch names can't start or end with / or contain //";
@@ -340,6 +341,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   // create when it was reopened from the pending row or the error toast.
   const prevOpenRef = useRef(false);
   const hydratedDraftRef = useRef<NewWorkspaceDraft | null>(null);
+  // A restored draft's model pick, for the model-resolve effect to honour
+  // once instead of replacing it with the remembered per-family pick.
+  const restoredModelRef = useRef<{
+    agentId: string | null;
+    selection: ModelSelection;
+  } | null>(null);
+  // The project this render settles on. `setProjectDir` below only lands on
+  // the next render, so the project-switch check must compare against the
+  // hydrated dir, not the stale state, or it would treat a Reopen into
+  // another project as a mid-dialog switch and drop the draft's base.
+  let renderProjectDir = projectDir;
   if (
     open &&
     (!prevOpenRef.current ||
@@ -352,6 +364,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       draft?.projectDir ??
       (storeProjectDir || activeWs?.project_root || activeWs?.cwd || "");
     if (projectDir !== dir) setProjectDir(dir);
+    renderProjectDir = dir;
     prevProjectDirRef.current = dir;
     setWorkspaceName(draft?.workspaceName ?? "");
     setBranchName(draft?.branchName ?? "");
@@ -360,6 +373,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       draft?.selectedAgentId ?? (lastSelectedAgentId || "builtin-claude"),
     );
     if (draft) setModelSelection(draft.modelSelection);
+    restoredModelRef.current = draft
+      ? { agentId: draft.selectedAgentId, selection: draft.modelSelection }
+      : null;
     setBaseBranch(draft?.baseBranch ?? "main");
     // Re-allow auto-adoption of the detected default branch on each open,
     // but keep a restored draft's base exactly as the user left it.
@@ -397,9 +413,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   // project's default branch wins over a stale pick from the previous
   // project. Tracked separately from the open-reset above because
   // projectDir can change without the dialog closing/reopening.
-  if (prevProjectDirRef.current !== projectDir) {
+  if (prevProjectDirRef.current !== renderProjectDir) {
     userPickedBaseRef.current = false;
-    prevProjectDirRef.current = projectDir;
+    prevProjectDirRef.current = renderProjectDir;
   }
 
   // Load data when dialog opens or project changes
@@ -408,6 +424,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     let cancelled = false;
 
     setIsGitRepo(null);
+    // Until the new listing lands, attachesToRoot() must not match the
+    // previous project's checked-out branch.
+    setCurrentBranch(null);
     setLocalBranches([]);
     setRemoteBranches([]);
     setDetailedBranches([]);
@@ -721,6 +740,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const presetsLoaded = presets.length > 0;
   useEffect(() => {
     if (!open || !presetsLoaded) return;
+    const restored = restoredModelRef.current;
+    restoredModelRef.current = null;
+    if (restored && restored.agentId === selectedAgentId) {
+      setModelSelection(restored.selection);
+      return;
+    }
     const cmd = presets.find((p) => p.id === selectedAgentId)?.commands?.[0];
     const family = detectLaunchFamily(cmd);
     if (!family) {
