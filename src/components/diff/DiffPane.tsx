@@ -156,10 +156,21 @@ export function DiffPane({
     ? `${cwd}\0${tab.filePath}\0${againstBase ? `base:${tab.baseBranch}` : tab.staged ? "staged" : "unstaged"}`
     : null;
 
+  // The read in flight. A poll tick never cancels it: a read slower than
+  // the poll would otherwise be dropped and restarted forever, and never
+  // land. Only a different source, Retry, or unmounting supersedes it.
+  const inFlightRef = useRef<{ readKey: string; cancelled: boolean } | null>(null);
+  const cancelInFlight = () => {
+    if (inFlightRef.current) inFlightRef.current.cancelled = true;
+    inFlightRef.current = null;
+  };
+  useEffect(() => cancelInFlight, []);
+
   // Read the diff when its source changes, on Retry, and quietly on
   // every poll tick.
   useEffect(() => {
     if (!tab?.filePath || !source) {
+      cancelInFlight();
       lastReadRef.current = null;
       setDiff(null);
       setError(null);
@@ -168,8 +179,12 @@ export function DiffPane({
     }
     const path = tab.filePath;
     const readKey = `${source}\0${retryKey}`;
+    // This diff is still being read: let that read land.
+    if (inFlightRef.current?.readKey === readKey) return;
+    cancelInFlight();
+    const read = { readKey, cancelled: false };
+    inFlightRef.current = read;
     const quiet = lastReadRef.current === readKey;
-    let cancelled = false;
     if (!quiet) {
       setLoading(true);
       // An error belongs to the read that failed, not to the next file.
@@ -181,7 +196,7 @@ export function DiffPane({
         : getGitDiff(cwd, path, tab.staged);
     fetchDiff
       .then((raw) => {
-        if (cancelled) return;
+        if (read.cancelled) return;
         setError(null);
         // An unchanged re-read keeps the same object, so nothing renders.
         setDiff((prev) =>
@@ -193,18 +208,15 @@ export function DiffPane({
       .catch((err: unknown) => {
         // A failed quiet re-read leaves the diff that is up alone; the
         // next tick tries again.
-        if (!cancelled && !quiet) setError(String(err));
+        if (!read.cancelled && !quiet) setError(String(err));
       })
       .finally(() => {
-        if (!cancelled) {
-          lastReadRef.current = readKey;
-          setLoading(false);
-        }
+        if (read.cancelled) return;
+        inFlightRef.current = null;
+        lastReadRef.current = readKey;
+        setLoading(false);
         if (!quiet) markPaneReady("diff", { target: workspace.workspace_id });
       });
-    return () => {
-      cancelled = true;
-    };
     // `source` folds in every tab field that picks which diff this is.
   }, [source, workspace.workspace_id, retryKey, pollTick]);
 
@@ -311,22 +323,36 @@ export function DiffPane({
     />
   );
 
+  // Every state shares one root, so the pane takes focus and Escape goes
+  // back even before a file is picked.
+  const root = (children: React.ReactNode) => (
+    <div
+      ref={rootRef}
+      // The pane takes focus as a whole so its keys work after a click
+      // anywhere in it; the file header says which pane that is.
+      tabIndex={-1}
+      onKeyDown={handleKeyDown}
+      data-testid="diff-pane"
+      className="flex h-full w-full flex-col overflow-hidden bg-card outline-none"
+    >
+      {toolbar}
+      {children}
+    </div>
+  );
+
   // Empty state
   if (!tab.filePath) {
-    return (
-      <div className="flex h-full w-full flex-col bg-card">
-        {toolbar}
-        <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-          <GitCompare className="size-8 opacity-30" />
-          <p className="text-label">Select a file to view changes</p>
-          {filteredFiles.length > 0 && (
-            <p className="text-caption text-muted-foreground/60">
-              {filteredFiles.length} file{filteredFiles.length !== 1 ? "s" : ""}{" "}
-              with changes
-            </p>
-          )}
-        </div>
-      </div>
+    return root(
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+        <GitCompare className="size-8 opacity-30" />
+        <p className="text-label">Select a file to view changes</p>
+        {filteredFiles.length > 0 && (
+          <p className="text-caption text-muted-foreground/60">
+            {filteredFiles.length} file{filteredFiles.length !== 1 ? "s" : ""}{" "}
+            with changes
+          </p>
+        )}
+      </div>,
     );
   }
 
@@ -389,17 +415,8 @@ export function DiffPane({
     );
   }
 
-  return (
-    <div
-      ref={rootRef}
-      // The pane takes focus as a whole so its keys work after a click
-      // anywhere in it; the file header says which pane that is.
-      tabIndex={-1}
-      onKeyDown={handleKeyDown}
-      data-testid="diff-pane"
-      className="flex h-full w-full flex-col overflow-hidden bg-card outline-none"
-    >
-      {toolbar}
+  return root(
+    <>
       {embedded && (
         <div
           data-testid="diff-file-header"
@@ -495,6 +512,6 @@ export function DiffPane({
         </span>
         {body}
       </div>
-    </div>
+    </>,
   );
 }

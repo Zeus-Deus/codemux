@@ -199,6 +199,36 @@ describe("the embedded diff pane", () => {
     expect(screen.getByRole("status")).toHaveTextContent("");
   });
 
+  it("lets a read slower than the poll land instead of restarting it", async () => {
+    vi.useFakeTimers();
+    let resolveRead: (raw: string) => void = () => {};
+    mockGetGitDiff.mockImplementation(
+      () => new Promise<string>((resolve) => (resolveRead = resolve)),
+    );
+    renderPane();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Loading diff…")).toBeInTheDocument();
+
+    // Two poll ticks pass while the first read is still out.
+    await act(() => vi.advanceTimersByTimeAsync(10000));
+    expect(mockGetGitDiff).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveRead(diffOf("src/a.ts", "const slow_read = 1;")));
+    expect(screen.getByText("const slow_read = 1;")).toBeInTheDocument();
+  });
+
+  it("goes back on Escape before a file is picked", () => {
+    useDiffStore.setState({ tabs: {} });
+    useDiffStore.getState().initTab(TAB);
+    const onBack = vi.fn();
+    renderPane({ onBack });
+    const pane = screen.getByTestId("diff-pane");
+    expect(pane).toHaveTextContent("Select a file to view changes");
+    expect(pane).toHaveFocus();
+    fireEvent.keyDown(pane, { key: "Escape" });
+    expect(onBack).toHaveBeenCalledTimes(1);
+  });
+
   it("hides a zero count in the header", async () => {
     mockGetGitStatus.mockResolvedValue([status("src/a.ts", 2, 0)]);
     renderPane();

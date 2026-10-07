@@ -79,7 +79,10 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                   key={i}
                   data-diff-hunk
                   className={cn(
-                    "flex bg-muted/30 whitespace-pre mt-1 first:mt-0",
+                    "flex bg-muted/30 mt-1 first:mt-0",
+                    // Wrapped like the code rows, so the function context
+                    // after the range stays readable in a narrow pane.
+                    wrap ? "whitespace-pre-wrap" : "whitespace-pre",
                     rowHeight,
                   )}
                 >
@@ -88,7 +91,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                     className={cn(
                       "text-muted-foreground/60 px-3",
                       gutterSize,
-                      wrap && "min-w-0 truncate",
+                      wrap && "min-w-0 break-words",
                     )}
                   >
                     {line.content}
