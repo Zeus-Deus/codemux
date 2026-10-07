@@ -133,7 +133,11 @@ export const ToolCallCard = memo(function ToolCallCard({
     canExpand && !isPendingApproval && !isResponding && !isDenied;
   const showBody = expanded && toggleable;
   const bodyId = useId();
-  const duration = stepDurationMs(item);
+  // An approval-gated call runs from the moment it was answered, not from
+  // when the request was raised.
+  const timed =
+    item.approved_at != null ? { ...item, started_at: item.approved_at } : item;
+  const duration = stepDurationMs(timed);
 
   // Tinted icon chip · mono command · elapsed · status glyph · chevron.
   // `min-w-0 truncate` on the label lets long commands ellipsize rather than
@@ -159,7 +163,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
       </span>
       {isExecuting ? (
-        <StepElapsed step={item} className={ELAPSED_CLASS} />
+        <StepElapsed step={timed} className={ELAPSED_CLASS} />
       ) : duration != null && (isSuccess || isError) ? (
         <span className={ELAPSED_CLASS}>{formatActivityDuration(duration)}</span>
       ) : null}

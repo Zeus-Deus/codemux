@@ -451,6 +451,53 @@ describe("agent-chat reducer", () => {
     expect(state.pendingRequestIds).toEqual([]);
   });
 
+  it("stamps approved_at on a gated call when its request is answered", () => {
+    let t = 1_000;
+    const clock: Clock = () => t;
+    let state = runEvents(
+      [
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_name: "Bash",
+            input: { command: "pwd" },
+            tool_use_id: "tool-gated",
+          },
+        },
+        {
+          type: "request_opened",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          request_id: "req-gated",
+          request_kind: "tool-permission",
+          payload: { tool_name: "Bash" },
+          tool_use_id: "tool-gated",
+        },
+      ],
+      createEmptyThreadState(),
+      clock,
+    );
+    t = 121_000;
+    state = applyEvent(
+      state,
+      {
+        type: "request_resolved",
+        thread_id: "t1",
+        request_id: "req-gated",
+        decision: { decision: "allow" },
+      },
+      clock,
+    );
+    const tool = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    expect(tool?.started_at).toBe(1_000);
+    expect(tool?.approved_at).toBe(121_000);
+  });
+
   it("keeps a resolved request resolved when a duplicate respond fails", () => {
     // Two windows on the same thread: the second respond loses the race and
     // the provider answers "not found" — which it cannot distinguish from

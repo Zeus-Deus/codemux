@@ -97,6 +97,7 @@ export const ActivityBlock = memo(function ActivityBlock({
         key={entry.id}
         step={entry}
         live={live}
+        ticking={working || turnLive}
         orbActivity={live ? orbActivity : undefined}
         expanded={expandedStepId === entry.id}
         onToggle={() => {
@@ -250,12 +251,18 @@ function TotalsLabel({ totals }: { totals: WorkLogTotals }) {
 function StepRow({
   step,
   live,
+  ticking,
   orbActivity,
   expanded,
   onToggle,
 }: {
   step: ActivityStep;
   live: boolean;
+  /** The step's turn is still running, so a `running` step really is. A
+   *  settled transcript can hold a call that never reported back (crash,
+   *  quit); its start time is no longer meaningful, so it keeps the static
+   *  meta instead of counting forever. */
+  ticking: boolean;
   orbActivity?: OrbActivity;
   expanded: boolean;
   onToggle: () => void;
@@ -280,7 +287,7 @@ function StepRow({
         <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
           {view.summary}
         </span>
-        {view.status === "running" && step.started_at != null ? (
+        {ticking && view.status === "running" && step.started_at != null ? (
           <StepElapsed step={step} className={META_CLASS} />
         ) : view.meta && !live ? (
           <span

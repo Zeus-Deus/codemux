@@ -303,8 +303,11 @@ function buildPresentationEntries(
     );
     const hiddenIds = new Set(hidden.map((item) => item.id));
     const turnId = turnIdFor(segment, ended);
-    const pinnedBy = hidden
-      .filter((item) => expandedTurnIds.has(item.id))
+    // Read pins off every entry, not just the foldable ones: a log whose
+    // first entry is still running (a background subagent) stays out of
+    // `hidden`, yet the rest of that log would fold away under the reader.
+    const pinnedBy = segment.items
+      .filter((item) => isWorkEntry(item) && expandedTurnIds.has(item.id))
       .map((item) => item.id);
     const expanded = expandedTurnIds.has(turnId) || pinnedBy.length > 0;
     const body: TurnFoldBody = {

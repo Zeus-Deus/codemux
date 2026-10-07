@@ -189,6 +189,40 @@ describe("ActivityBlock — step timing", () => {
     expect(screen.getByText("ok · 3s")).toBeInTheDocument();
   });
 
+  it("ticks a running step inside an open log while its turn runs", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      const { container } = render(
+        <ActivityBlock
+          items={[bash(0, "cargo test", { status: "running", started_at: 40_000 }), read(1, "/b")]}
+          working={false}
+          turnLive
+        />,
+      );
+      openLog(container);
+      expect(screen.getByTestId("step-elapsed").textContent).toBe("1m 0s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not tick a step left running in a settled transcript", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      const { container } = renderBlock(
+        [bash(0, "cargo test", { status: "running", started_at: 40_000 }), read(1, "/b")],
+        false,
+      );
+      openLog(container);
+      expect(screen.queryByTestId("step-elapsed")).toBeNull();
+      expect(screen.getByText("running")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ticks elapsed time on the live line while a tool runs", () => {
     vi.useFakeTimers();
     try {

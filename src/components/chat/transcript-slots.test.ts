@@ -311,6 +311,37 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     });
   });
 
+  it("settles expanded when the pinned log starts with a still-running subagent", () => {
+    // A background subagent keeps running after its turn settles, so it is
+    // not foldable — the pin on it must still hold the fold open.
+    const background: ChatViewItem = {
+      kind: "subagent_run",
+      id: "run-2",
+      seq: 2,
+      turn_id: "t1",
+      subagents: [{ id: "a", status: "running", items: [], toneIndex: 0 }],
+    };
+    const slots = buildTranscriptSlots(
+      [
+        userMsg(0, "please inspect this", 1_000),
+        assistantMsg(1, "Starting a background check."),
+        background,
+        tool(3),
+        assistantMsg(4, "Done."),
+        turnEnd(5, 14_400),
+      ],
+      false,
+      new Set(["run-2"]),
+    );
+    const fold = slots.find((slot) => slot.body.kind === "turn_fold")?.body;
+    if (fold?.kind !== "turn_fold") throw new Error("expected a fold");
+    expect(fold.expanded).toBe(true);
+    expect(fold.pinnedBy).toEqual(["run-2"]);
+    const log = slots.find((slot) => slot.body.kind === "activity")?.body;
+    if (log?.kind !== "activity") throw new Error("expected a work log");
+    expect(log.items.map((item) => item.id)).toEqual(["run-2", "tc-3"]);
+  });
+
   it("leaves pending approvals visible even after a terminal event", () => {
     const gated = tool(2, {
       status: "running",

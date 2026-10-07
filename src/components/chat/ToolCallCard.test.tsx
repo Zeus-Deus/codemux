@@ -319,6 +319,28 @@ describe("ToolCallCard", () => {
     }
   });
 
+  it("times an approval-gated call from its approval, not its request", () => {
+    // Raised at 1s, allowed at 121s, finished at 126s: the call ran for 5s.
+    render(
+      <ToolCallCard
+        item={makeTool({
+          status: "done",
+          result_content: "ok",
+          approval_request_id: "req-1",
+          started_at: 1_000,
+          approved_at: 121_000,
+          completed_at: 126_000,
+        })}
+        approval={makePendingApproval({
+          resolution: { state: "resolved", decision: { decision: "allow" } },
+        })}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("5s")).toBeInTheDocument();
+    expect(screen.queryByText("2m 5s")).toBeNull();
+  });
+
   it("opens when an image arrives asynchronously and respects a later manual collapse", () => {
     const onDecide = vi.fn();
     const { rerender } = render(
