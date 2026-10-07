@@ -252,8 +252,8 @@ function SidebarToggleButton({
           <PanelLeft className="size-3.5" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
-        Toggle sidebar (Ctrl+B)
+      <TooltipContent side="bottom" sideOffset={4} shortcut="toggleSidebar">
+        Toggle sidebar
       </TooltipContent>
     </Tooltip>
   );
@@ -313,6 +313,7 @@ function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
         active={open}
         testId="right-panel-toggle"
         size="titlebar"
+        shortcut="toggleRightPanel"
         onClick={togglePanel}
       />
     </div>

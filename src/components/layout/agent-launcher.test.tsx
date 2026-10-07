@@ -1,6 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
+// Tooltips need the provider `main.tsx` mounts around the whole app.
+const render = (ui: Parameters<typeof rtlRender>[0]) =>
+  rtlRender(ui, { wrapper: TooltipProvider });
 
 import type {
   PresetStoreSnapshot,
@@ -16,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   createTab: vi.fn().mockResolvedValue("tab-new"),
   createBrowserPane: vi.fn().mockResolvedValue("pane-b"),
   setShowSettings: vi.fn(),
+  launcherOpenRequest: 0,
   launchDraftWithPreset: vi.fn().mockResolvedValue({
     success: true,
     workspaceId: "ws-new",
@@ -44,9 +50,11 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 vi.mock("@/stores/ui-store", () => ({
-  useUIStore: Object.assign(vi.fn(), {
-    getState: () => ({ setShowSettings: mocks.setShowSettings }),
-  }),
+  useUIStore: Object.assign(
+    (select: (s: { launcherOpenRequest: number }) => unknown) =>
+      select({ launcherOpenRequest: mocks.launcherOpenRequest }),
+    { getState: () => ({ setShowSettings: mocks.setShowSettings }) },
+  ),
 }));
 
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
@@ -169,6 +177,7 @@ beforeEach(() => {
   mocks.createBrowserPane.mockClear();
   mocks.launchDraftWithPreset.mockClear();
   mocks.setShowSettings.mockClear();
+  mocks.launcherOpenRequest = 0;
   localStorage.clear();
   useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
@@ -180,6 +189,23 @@ afterEach(() => {
 });
 
 describe("AgentLauncher", () => {
+  it("opens for a launcher shortcut pressed after mount, not for an older one", () => {
+    mocks.launcherOpenRequest = 3;
+    const view = render(<AgentLauncher workspace={makeWorkspace()} />);
+    expect(screen.queryByTestId("agent-launcher-popover")).not.toBeInTheDocument();
+
+    mocks.launcherOpenRequest = 4;
+    view.rerender(<AgentLauncher workspace={makeWorkspace()} />);
+    expect(screen.getByTestId("agent-launcher-popover")).toBeInTheDocument();
+  });
+
+  it("ignores the launcher shortcut in the mobile sheet", () => {
+    const view = render(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    mocks.launcherOpenRequest = 1;
+    view.rerender(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    expect(screen.queryByTestId("agent-launcher-popover")).not.toBeInTheDocument();
+  });
+
   it("offers chat and utility panes on mobile without CLI presets or titlebar controls", async () => {
     render(<AgentLauncher workspace={makeWorkspace()} mobile />);
     openLauncher();

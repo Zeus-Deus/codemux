@@ -49,6 +49,11 @@ const RenameWorkspaceDialog = lazy(() =>
     default: module.RenameWorkspaceDialog,
   })),
 );
+const ShortcutsSheet = lazy(() =>
+  import("@/components/overlays/shortcuts-sheet").then((module) => ({
+    default: module.ShortcutsSheet,
+  })),
+);
 
 function App() {
   useAddonPlatform();
@@ -57,6 +62,7 @@ function App() {
   const sessionStatus = useAuthStore((s) => s.sessionStatus);
   const renameWorkspaceId = useUIStore((s) => s.renameWorkspaceId);
   const themeStudioRequest = useUIStore((s) => s.themeStudio);
+  const showShortcutsSheet = useUIStore((s) => s.showShortcutsSheet);
   const remotePathRequest = useRemotePathPickerStore((s) => s.request);
   const postPaintStartupBegan = useRef(false);
 
@@ -167,6 +173,16 @@ function App() {
           presentation="overlay"
         >
           <RenameWorkspaceDialog />
+        </LazyBoundary>
+      )}
+      {/* App-level so it layers over Settings and the full-screen pages too. */}
+      {showShortcutsSheet && (
+        <LazyBoundary
+          label="keyboard shortcuts"
+          className="fixed inset-0 z-50 h-screen"
+          presentation="overlay"
+        >
+          <ShortcutsSheet />
         </LazyBoundary>
       )}
       {/* App-level, not a child of the Appearance page: both of its doors —

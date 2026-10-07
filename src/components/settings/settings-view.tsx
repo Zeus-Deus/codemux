@@ -170,6 +170,7 @@ import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useShortcutLabel } from "@/components/ui/menu-chrome";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -2243,8 +2244,7 @@ export function SettingsView() {
                 label="Run"
                 helper={
                   <>
-                    A command to start your dev server, triggered via{" "}
-                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">Ctrl+Shift+G</kbd>.
+                    A command to start your dev server<RunShortcutHint />.
                   </>
                 }
               >
@@ -2485,6 +2485,19 @@ interface SortablePresetRowProps {
   onSelect: () => void;
   onTogglePin: () => void;
   onDelete: () => void;
+}
+
+/** The Run field's ", triggered via <keys>" tail, following the user's rebind
+ *  and dropped when the action is unbound. */
+function RunShortcutHint() {
+  const keys = useShortcutLabel("runDevCommand");
+  if (!keys) return null;
+  return (
+    <>
+      , triggered via{" "}
+      <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">{keys}</kbd>
+    </>
+  );
 }
 
 function SortablePresetRow({

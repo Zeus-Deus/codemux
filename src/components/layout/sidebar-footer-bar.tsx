@@ -229,7 +229,7 @@ function AppMenu({
         </DropdownMenuItem>
         <DropdownMenuItem
           className={MENU_ROW}
-          onClick={() => setShowSettings(true, "shortcuts")}
+          onClick={() => useUIStore.getState().setShowShortcutsSheet(true)}
         >
           <Keyboard />
           <span className="flex-1">Keyboard shortcuts</span>

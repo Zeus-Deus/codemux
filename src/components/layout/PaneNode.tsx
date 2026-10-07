@@ -1,6 +1,7 @@
 import React from "react";
 import { DisabledFeaturePlaceholder } from "@/components/layout/disabled-feature-placeholder";
 import { Button } from "@/components/ui/button";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
 import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
@@ -376,15 +377,21 @@ function PaneNodeImpl({
             data-terminal-pane-actions
           >
             <TerminalBackgroundBrowserIndicator active={isActive} />
-            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal />
-            </Button>
-            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical />
-            </Button>
-            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X />
-            </Button>
+            <ShortcutTooltip label="Split right" shortcut="splitPaneRight">
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right">
+                <SplitSquareHorizontal />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Split down" shortcut="splitPaneDown">
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down">
+                <SplitSquareVertical />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Close pane" shortcut="closePane">
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane">
+                <X />
+              </Button>
+            </ShortcutTooltip>
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
@@ -477,15 +484,21 @@ function PaneNodeImpl({
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal className="size-3.5" />
-            </Button>
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical className="size-3.5" />
-            </Button>
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X className="size-3.5" />
-            </Button>
+            <ShortcutTooltip label="Split right" shortcut="splitPaneRight">
+              <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right">
+                <SplitSquareHorizontal className="size-3.5" />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Split down" shortcut="splitPaneDown">
+              <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down">
+                <SplitSquareVertical className="size-3.5" />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Close pane" shortcut="closePane">
+              <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane">
+                <X className="size-3.5" />
+              </Button>
+            </ShortcutTooltip>
           </div>
         </PanelHeader>
         <div className="flex-1 min-h-0 overflow-hidden">

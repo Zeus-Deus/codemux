@@ -1,7 +1,12 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { memo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render as rtlRender, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
+// Tooltips need the provider `main.tsx` mounts around the whole app.
+const render = (ui: Parameters<typeof rtlRender>[0]) =>
+  rtlRender(ui, { wrapper: TooltipProvider });
 import userEvent from "@testing-library/user-event";
 
 import type {

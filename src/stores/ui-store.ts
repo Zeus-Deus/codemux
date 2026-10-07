@@ -158,6 +158,15 @@ interface UIStore {
    * list. Transient; never persisted.
    */
   commandPaletteQuery: string | null;
+  /** The read-only shortcuts cheat sheet that layers over whatever is open.
+   *  Rebinding stays on Settings ▸ Shortcuts. Not persisted. */
+  showShortcutsSheet: boolean;
+  /** Bumped by the `openLauncher` keybind; the mounted `+` launcher opens
+   *  when it changes. A counter rather than a flag, so the launcher never
+   *  has to clear it and a remount never replays an old request. */
+  launcherOpenRequest: number;
+  setShowShortcutsSheet: (show: boolean) => void;
+  requestOpenLauncher: () => void;
   /**
    * Theme Studio request, or null while it is closed. `"generate"` and
    * `"import"` open the two tabs the palette's last two rows point at; a
@@ -320,6 +329,8 @@ export const useUIStore = create<UIStore>()(
       lastModelSelections: {},
       showCommandPalette: false,
       commandPaletteQuery: null,
+      showShortcutsSheet: false,
+      launcherOpenRequest: 0,
       themeStudio: null,
       showLocalSessionImport: false,
       localSessionImportOfferDismissed: false,
@@ -628,6 +639,9 @@ export const useUIStore = create<UIStore>()(
       setShowCommandPalette: (show) => set({ showCommandPalette: show }),
       toggleCommandPalette: () =>
         set((s) => ({ showCommandPalette: !s.showCommandPalette })),
+      setShowShortcutsSheet: (show) => set({ showShortcutsSheet: show }),
+      requestOpenLauncher: () =>
+        set((s) => ({ launcherOpenRequest: s.launcherOpenRequest + 1 })),
 
       // Deliberately does NOT close Settings. Settings is a full-screen
       // destination, so this used to have to leave it for the palette to
