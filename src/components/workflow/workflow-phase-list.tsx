@@ -10,7 +10,12 @@ import type { SubagentView, WorkflowRunItem, WorkflowRunStatus } from "@/lib/age
 import { cn } from "@/lib/utils";
 
 import { combinePhases, type CombinedPhase } from "./workflow-phases";
-import { findingTone, workflowAgentTone, workflowPhaseTone } from "./workflow-tone";
+import {
+  findingTone,
+  workflowAgentOutcome,
+  workflowAgentTone,
+  workflowPhaseTone,
+} from "./workflow-tone";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 type AgentFilter = "all" | "running" | "issues";
@@ -236,7 +241,7 @@ function PhaseAgents({
 
 /** A check only for work that completed: a failure gets a cross and work
  *  that was stopped, interrupted or never started gets a dash. */
-function TerminalStatusIcon({
+export function TerminalStatusIcon({
   outcome,
   className,
 }: {
@@ -274,13 +279,7 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
           <span className="h-[7px] w-[7px] rounded-full border-[1.4px] border-muted-foreground" aria-hidden />
         ) : (
           <TerminalStatusIcon
-            outcome={
-              agent.status === "completed"
-                ? "completed"
-                : agent.status === "failed"
-                  ? "failed"
-                  : "halted"
-            }
+            outcome={workflowAgentOutcome(agent.status)}
             className={cn("size-3.5", tone.text)}
           />
         )}

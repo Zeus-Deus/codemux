@@ -55,6 +55,17 @@ export function workflowAgentTone(status: SubagentViewStatus): SubagentToneClass
   return statusTone(status);
 }
 
+/** Which terminal glyph an agent gets: a check only for completed work, a
+ *  cross for a failure, and a dash for anything stopped, interrupted or
+ *  never started. */
+export function workflowAgentOutcome(
+  status: SubagentViewStatus,
+): "completed" | "failed" | "halted" {
+  if (status === "completed") return "completed";
+  if (status === "failed") return "failed";
+  return "halted";
+}
+
 /** Tone for a `subagentFindingBadge` result ("green" | "red" | "muted"),
  *  used to tint the agent-detail header strip and Result card. */
 export function findingTone(tone: "green" | "red" | "muted"): SubagentToneClasses {

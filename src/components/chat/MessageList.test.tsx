@@ -30,6 +30,7 @@ import {
   resetTranscriptFadeCacheForTests,
   setRendererMode,
 } from "./transcript-fade";
+import { USER_INPUT_SKIPPED_MESSAGE } from "./ComposerPendingInputPanel";
 import { MessageList } from "./MessageList";
 import { TranscriptTopInsetContext } from "./transcript-top-inset";
 
@@ -527,13 +528,13 @@ describe("MessageList dispatch", () => {
     expect(screen.getByText("Styling")).toBeInTheDocument();
   });
 
-  it("falls back to the plain marker when a resolved user-input carries no answer", () => {
+  it("falls back to a plain marker when a user-input was cancelled without an answer", () => {
     renderList([
       askReq({
         resolution: { state: "resolved", decision: { decision: "cancel" } },
       }),
     ]);
-    expect(screen.getByText("Answered")).toBeInTheDocument();
+    expect(screen.getByText("Not answered")).toBeInTheDocument();
   });
 
   it("marks a skipped user-input prompt as skipped, not answered", () => {
@@ -541,7 +542,7 @@ describe("MessageList dispatch", () => {
       askReq({
         resolution: {
           state: "resolved",
-          decision: { decision: "deny", message: "skipped" },
+          decision: { decision: "deny", message: USER_INPUT_SKIPPED_MESSAGE },
         },
       }),
     ]);

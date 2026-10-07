@@ -37,6 +37,7 @@ import type {
 } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
+import { useChatProvider } from "./chat-provider-context";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolCallBody } from "./ToolCallBodies";
 import { ToolCallStatus } from "./ToolCallStatus";
@@ -286,6 +287,11 @@ function ApprovalFooter({
     [toolName, toolInput],
   );
   const anyInputRule: PermissionRuleSpec = { toolName };
+  // Settings rules (`Bash(git status:*)`) are Claude's model; other
+  // providers drop `updated_permissions`. They get the session-wide allow
+  // they do support instead of rules that would silently do nothing.
+  const provider = useChatProvider();
+  const claudeRules = provider === null || provider === "claude";
 
   // Take keyboard focus only when nothing else holds it. A focused
   // composer, even an empty one, is where the user is about to type, and
@@ -293,6 +299,11 @@ function ApprovalFooter({
   useEffect(() => {
     if (autoFocusedRequests.has(requestId)) return;
     autoFocusedRequests.add(requestId);
+    // Only recent requests can remount; keep the set bounded.
+    if (autoFocusedRequests.size > 64) {
+      const oldest = autoFocusedRequests.values().next().value;
+      if (oldest !== undefined) autoFocusedRequests.delete(oldest);
+    }
     const active = document.activeElement;
     if (active && active !== document.body) return;
     allowRef.current?.focus({ preventScroll: true });
@@ -339,6 +350,12 @@ function ApprovalFooter({
     }
   };
 
+  const allowForSession = () => {
+    if (dispatchedRef.current) return;
+    dispatchedRef.current = true;
+    onDecide({ decision: "allow_for_session" });
+  };
+
   const confirmDeny = () => {
     if (dispatchedRef.current) return;
     dispatchedRef.current = true;
@@ -354,7 +371,10 @@ function ApprovalFooter({
   // activates the focused Allow button, A opens the Allow-always menu and
   // D starts a denial.
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (denying || e.metaKey || e.ctrlKey || e.altKey) return;
+    // Keys typed in the open Allow-always menu bubble here through the
+    // React tree (the menu is portaled, not a DOM child). They belong to
+    // the menu's own navigation and typeahead.
+    if (menuOpen || denying || e.metaKey || e.ctrlKey || e.altKey) return;
     const key = e.key.toLowerCase();
     if (key === "a") {
       e.preventDefault();
@@ -407,10 +427,21 @@ function ApprovalFooter({
                 <ChevronDown className="ml-1 size-3" aria-hidden />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="w-80 text-label">
+            <DropdownMenuContent
+              align="start"
+              className={cn("text-label", claudeRules ? "w-80" : "w-48")}
+            >
+              {!claudeRules && (
+                <DropdownMenuItem
+                  onSelect={allowForSession}
+                  className="text-label"
+                >
+                  For this session
+                </DropdownMenuItem>
+              )}
               {/* The narrow rule leads; the any-input rule sits last and
                   says plainly how much it covers. */}
-              {scopedRule && (
+              {claudeRules && scopedRule && (
                 <>
                   <RuleScopeGroup
                     rule={scopedRule}
@@ -419,11 +450,13 @@ function ApprovalFooter({
                   <DropdownMenuSeparator />
                 </>
               )}
-              <RuleScopeGroup
-                rule={anyInputRule}
-                anyInput
-                onPick={(scope) => handleAllow(scope, anyInputRule)}
-              />
+              {claudeRules && (
+                <RuleScopeGroup
+                  rule={anyInputRule}
+                  anyInput
+                  onPick={(scope) => handleAllow(scope, anyInputRule)}
+                />
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
           <Button

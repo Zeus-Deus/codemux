@@ -20,6 +20,7 @@ import type {
 } from "@/lib/agent-chat/types";
 import { toast } from "@/lib/toast";
 
+import { ChatProviderContext } from "./chat-provider-context";
 import { ToolCallCard } from "./ToolCallCard";
 
 function makeTool(overrides: Partial<ToolCallItem> = {}): ToolCallItem {
@@ -284,6 +285,42 @@ describe("ToolCallCard", () => {
     fireEvent.keyDown(document.activeElement ?? allow, { key: "Escape" });
     fireEvent.keyDown(screen.getByText("Allow"), { key: "d" });
     expect(screen.getByPlaceholderText("Reason (optional)")).toHaveFocus();
+  });
+
+  it("D typed inside the open Allow-always menu leaves the menu alone", async () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-menu-keys" })}
+        approval={makePendingApproval({ request_id: "req-menu-keys" })}
+        onDecide={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(screen.getByText("Allow"), { key: "a" });
+    const [group] = await screen.findAllByRole("group");
+    fireEvent.keyDown(within(group).getAllByRole("menuitem")[0], { key: "d" });
+    expect(screen.queryByPlaceholderText("Reason (optional)")).toBeNull();
+    expect(screen.getAllByRole("group")).toHaveLength(2);
+  });
+
+  it("offers a session-wide allow, not Claude settings rules, to other providers", async () => {
+    const user = userEvent.setup();
+    const onDecide = vi.fn();
+    render(
+      <ChatProviderContext.Provider value="codex">
+        <ToolCallCard
+          item={makeTool({ approval_request_id: "req-codex" })}
+          approval={makePendingApproval({ request_id: "req-codex" })}
+          onDecide={onDecide}
+        />
+      </ChatProviderContext.Provider>,
+    );
+    await user.click(screen.getByText("Allow always"));
+    const items = await screen.findAllByRole("menuitem");
+    expect(items.map((item) => item.textContent)).toEqual(["For this session"]);
+    expect(screen.queryByText("Bash(ls:*)")).toBeNull();
+    await user.click(items[0]);
+    expect(onDecide).toHaveBeenCalledWith({ decision: "allow_for_session" });
+    expect(onDecide).toHaveBeenCalledTimes(1);
   });
 
   it("Deny reveals the reason textarea and Confirm deny ships the reason", () => {

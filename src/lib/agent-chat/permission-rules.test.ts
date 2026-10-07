@@ -155,6 +155,27 @@ describe("suggestPermissionRule", () => {
     expect(bash("   ")).toBeNull();
   });
 
+  it("offers no scoped rule for shells, interpreters and wrappers, which run anything", () => {
+    expect(bash("bash -c 'rm -rf /'")).toBeNull();
+    expect(bash("sh scripts/x.sh")).toBeNull();
+    expect(bash("python manage.py migrate")).toBeNull();
+    expect(bash("python3.12 -m pytest")).toBeNull();
+    expect(bash("/usr/bin/node build.js")).toBeNull();
+    expect(bash("sudo apt install jq")).toBeNull();
+    expect(bash("env npm test")).toBeNull();
+    expect(bash("xargs rm")).toBeNull();
+    expect(bash("timeout 10 cargo test")).toBeNull();
+    // A program that merely starts with an interpreter's name is fine.
+    expect(bash("shellcheck x.sh")).toEqual({ toolName: "Bash", ruleContent: "shellcheck:*" });
+  });
+
+  it("offers no rule whose content would break the Tool(content) syntax", () => {
+    expect(bash("(cd src)")).toBeNull();
+    expect(
+      suggestPermissionRule("Edit", { file_path: "/home/u/my (copy)/a.ts" }),
+    ).toBeNull();
+  });
+
   it("scopes file tools to the file's directory, using Edit rules for every editor", () => {
     expect(suggestPermissionRule("Edit", { file_path: "/repo/src/a.ts" })).toEqual({
       toolName: "Edit",

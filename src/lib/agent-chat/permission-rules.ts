@@ -81,6 +81,20 @@ const SHELL_CONTROL = /[;&|<>`\n]|\$\(/;
  *  path, file name or quoted argument. */
 const SUBCOMMAND = /^[a-z][a-z0-9-]*$/i;
 const FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
+/** Shells, interpreters and command wrappers. A prefix rule for them
+ *  (`Bash(python:*)`, `Bash(sudo:*)`) runs arbitrary code, so it is as
+ *  broad as the bare tool and must not be offered as the narrow choice. */
+const ARBITRARY_CODE_PROGRAMS = new Set([
+  "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
+  "env", "sudo", "doas", "su", "xargs", "exec", "eval", "command",
+  "builtin", "nohup", "nice", "ionice", "time", "timeout", "watch",
+  "stdbuf", "setsid", "chroot", "unshare", "flock",
+  "python", "python2", "python3", "node", "deno", "bun", "ruby", "perl",
+  "php", "lua", "osascript", "pwsh", "powershell", "awk", "gawk",
+]);
+/** Characters that would end or nest Claude's `Tool(content)` rule
+ *  syntax. */
+const RULE_DELIMITERS = /[()]/;
 
 /**
  * The narrowest useful rule for this call, or `null` when none can be
@@ -106,7 +120,15 @@ export function suggestPermissionRule(
     const trimmed = command.trim();
     if (!trimmed || SHELL_CONTROL.test(trimmed)) return null;
     const [program, ...rest] = trimmed.split(/\s+/);
-    if (!program || program.includes("=")) return null;
+    if (!program || program.includes("=") || RULE_DELIMITERS.test(program)) {
+      return null;
+    }
+    const base = program.slice(program.lastIndexOf("/") + 1);
+    // `python3.12`, `node18` and similar versioned binaries count too.
+    const family = base.replace(/[\d.]+$/, "");
+    if (ARBITRARY_CODE_PROGRAMS.has(base) || ARBITRARY_CODE_PROGRAMS.has(family)) {
+      return null;
+    }
     const words = [program];
     for (const word of rest) {
       if (words.length === 3 || !SUBCOMMAND.test(word)) break;
@@ -118,7 +140,7 @@ export function suggestPermissionRule(
   if (FILE_EDIT_TOOLS.has(toolName) || toolName === "Read") {
     const path = input.file_path ?? input.notebook_path;
     const dir = typeof path === "string" ? parentDirectory(path) : null;
-    if (!dir) return null;
+    if (!dir || RULE_DELIMITERS.test(dir)) return null;
     return {
       toolName: toolName === "Read" ? "Read" : "Edit",
       ruleContent: `/${dir}/**`,

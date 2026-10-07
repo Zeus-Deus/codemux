@@ -15,6 +15,7 @@ import { TranscriptBindingContext } from "./transcript-cache-binding";
 import { MessageList } from "./MessageList";
 import { AsyncQuestionThreadContext } from "./AsyncQuestionPanel";
 import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
+import { ChatProviderContext } from "./chat-provider-context";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
@@ -154,6 +155,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   const list = (
     <ChatMarkdownPassiveContext.Provider value={passive}>
       <AsyncQuestionThreadContext.Provider value={passive ? null : (threadKey ?? null)}>
+      <ChatProviderContext.Provider value={provider ?? null}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -184,6 +186,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+      </ChatProviderContext.Provider>
       </AsyncQuestionThreadContext.Provider>
     </ChatMarkdownPassiveContext.Provider>
   );

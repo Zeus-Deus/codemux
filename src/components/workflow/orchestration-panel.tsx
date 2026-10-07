@@ -13,7 +13,11 @@ import { formatCompactTokens } from "@/components/chat/WorkflowRunCard";
 import { TickingText } from "@/components/chat/TickingText";
 import { formatElapsed } from "@/lib/agent-chat/subagents";
 import { workflowRunStats } from "@/lib/agent-chat/workflows";
-import type { WorkflowRunItem } from "@/lib/agent-chat/types";
+import type {
+  ChatViewItem,
+  PermissionRequestItem,
+  WorkflowRunItem,
+} from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
 import { findAgentContext } from "./workflow-phases";
@@ -98,8 +102,18 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
     run.status === "pending_approval" ? run.approvalRequestId : null;
   const [sending, setSending] = useState<"allow" | "deny" | null>(null);
   useEffect(() => setSending(null), [approvalRequestId]);
+  // The thread's card can answer the same request. Once either surface
+  // has sent a decision the request is no longer pending, and a second
+  // send would reach the backend as a stale response that fails the run.
+  const requestState = useAgentChatStore((s) =>
+    threadId && approvalRequestId
+      ? findRequestState(s.threads[threadId]?.messages, approvalRequestId)
+      : null,
+  );
+  const answering =
+    sending !== null || (requestState !== null && requestState !== "pending");
   const respond = (choice: "allow" | "deny") => {
-    if (!threadId || !approvalRequestId || sending) return;
+    if (!threadId || !approvalRequestId || answering) return;
     const decision: ApprovalDecision =
       choice === "allow"
         ? { decision: "allow" }
@@ -163,7 +177,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                   <Button
                     variant="ghost"
                     size="sm"
-                    disabled={sending !== null}
+                    disabled={answering}
                     data-testid="workflow-deny"
                     onClick={() => respond("deny")}
                     className="text-muted-foreground hover:text-foreground"
@@ -172,7 +186,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                   </Button>
                   <Button
                     size="sm"
-                    disabled={sending !== null}
+                    disabled={answering}
                     data-testid="workflow-approve"
                     onClick={() => respond("allow")}
                     className="bg-foreground text-background hover:bg-foreground/90"
@@ -180,11 +194,13 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                     {sending === "allow" ? "Starting…" : "Run once"}
                   </Button>
                 </>
-              ) : (
+              ) : running ? (
+                // A finished run has nothing to stop; its status chip
+                // already says how it ended.
                 <Button
                   variant="outline"
                   size="icon-sm"
-                  disabled={!running || !threadId}
+                  disabled={!threadId}
                   aria-label="Stop workflow"
                   data-testid="workflow-stop"
                   onClick={handleStop}
@@ -192,7 +208,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                 >
                   <Square fill="currentColor" aria-hidden />
                 </Button>
-              )}
+              ) : null}
             </div>
           </div>
         )}
@@ -254,4 +270,20 @@ function useNow(active: boolean): number {
     return () => window.clearInterval(id);
   }, [active]);
   return now;
+}
+
+/** The approval request's resolution state, or `null` when the thread
+ *  does not hold it. */
+function findRequestState(
+  messages: readonly ChatViewItem[] | undefined,
+  requestId: string,
+): PermissionRequestItem["resolution"]["state"] | null {
+  if (!messages) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind === "permission_request" && item.request_id === requestId) {
+      return item.resolution.state;
+    }
+  }
+  return null;
 }

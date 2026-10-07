@@ -2,6 +2,7 @@ import { memo } from "react";
 
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { USER_INPUT_SKIPPED_MESSAGE } from "./ComposerPendingInputPanel";
 
 /**
  * Right-aligned reply bubble that echoes the user's answer to an
@@ -33,13 +34,9 @@ export const UserInputAnswer = memo(function UserInputAnswer({
   // or a future decision shape we don't parse) — fall back to the
   // original muted marker so the row is never blank.
   if (lines.length === 0) {
-    // A denied prompt is one the user skipped to answer in the chat.
-    const skipped =
-      item.resolution.state === "resolved" &&
-      item.resolution.decision.decision === "deny";
     return (
       <div className="py-0.5 text-label text-muted-foreground">
-        {skipped ? "Skipped" : "Answered"}
+        {unansweredLabel(item)}
       </div>
     );
   }
@@ -69,6 +66,22 @@ export const UserInputAnswer = memo(function UserInputAnswer({
     </div>
   );
 });
+
+/** Marker for a prompt resolved without a readable answer. Only the
+ *  user's own Skip reads "Skipped": providers also deny a question when
+ *  the run is interrupted ("Tool request was aborted."), which the user
+ *  never chose. */
+function unansweredLabel(item: PermissionRequestItem): string {
+  if (item.resolution.state !== "resolved") return "Answered";
+  const { decision } = item.resolution;
+  if (decision.decision === "deny") {
+    return decision.message === USER_INPUT_SKIPPED_MESSAGE
+      ? "Skipped"
+      : "Not answered";
+  }
+  if (decision.decision === "cancel") return "Not answered";
+  return "Answered";
+}
 
 interface AnswerLine {
   /** Short question header (the chip label), when we can recover it from
