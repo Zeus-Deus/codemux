@@ -6218,7 +6218,14 @@ const handlers: Record<string, Handler> = {
     const surfaceId = `surface-mock-tab-${n}`;
     const tabId = `tab-mock-tab-${n}`;
     const sessionId = `sess-mock-tab-${n}`;
-    const label = `Terminal ${ws.tabs.filter((t) => t.kind === "terminal").length + 1}`;
+    // Twin of `next_terminal_tab_title`: lowest unused number, with the
+    // default "Terminal" tab counting as 1 and Agent Chat tabs ignored.
+    const used = new Set(
+      ws.tabs.map((t) => (t.title === "Terminal" ? 1 : Number(/^Terminal (\d+)$/.exec(t.title)?.[1]))),
+    );
+    let next = 1;
+    while (used.has(next)) next++;
+    const label = `Terminal ${next}`;
 
     ws.surfaces.push({
       surface_id: surfaceId,
