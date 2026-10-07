@@ -188,7 +188,10 @@ export function prSetLabel(
   const opens = primary
     ? `. Opens ${providerRef(provider, primary.number)}`
     : "";
-  return `${summary.total} ${provider.nounPlural} — ${prSetComposition(summary)}${opens}`;
+  const count = isSingleStack(prs)
+    ? `Stack of ${summary.total} ${provider.nounPlural}`
+    : `${summary.total} ${provider.nounPlural}`;
+  return `${count} — ${prSetComposition(summary)}${opens}`;
 }
 
 /** The set in the order a reviewer reads a stack: each PR after the one it is
@@ -227,6 +230,46 @@ export function stackOrder(prs: readonly WorkspacePrRef[]): WorkspacePrRef[] {
   // A cycle (two PRs based on each other) has no root; keep it rather than drop it.
   for (const pr of prs) visit(pr);
   return ordered;
+}
+
+/** The set split into stacks, each bottom first, in `stackOrder`.
+ *
+ *  A group is one root and everything stacked on it, directly or not; a PR
+ *  that neither builds on nor carries another is a group of one. Grouping is
+ *  what lets a surface tell "nine PRs that each build on the last" from "nine
+ *  unrelated PRs" — the count alone reads the same for both. */
+export function stackGroups(prs: readonly WorkspacePrRef[]): WorkspacePrRef[][] {
+  const rootOf = (pr: WorkspacePrRef): number => {
+    let cursor = pr;
+    const path = [cursor.number];
+    for (;;) {
+      const parent = stackedOn(cursor, prs);
+      if (!parent) return cursor.number;
+      const loopStart = path.indexOf(parent.number);
+      if (loopStart !== -1) {
+        // A cycle has no root. Its lowest number stands in for one, so every
+        // member — and anything stacked on it — answers the same.
+        return Math.min(...path.slice(loopStart));
+      }
+      path.push(parent.number);
+      cursor = parent;
+    }
+  };
+  // Bucketed by root rather than split on runs of `stackOrder`: its cycle
+  // fallback can interleave two cycles, which would cut one stack in two.
+  const groups = new Map<number, WorkspacePrRef[]>();
+  for (const pr of stackOrder(prs)) {
+    const root = rootOf(pr);
+    const group = groups.get(root);
+    if (group) group.push(pr);
+    else groups.set(root, [pr]);
+  }
+  return [...groups.values()];
+}
+
+/** Is the whole set one stack of two or more PRs? */
+export function isSingleStack(prs: readonly WorkspacePrRef[]): boolean {
+  return prs.length > 1 && stackGroups(prs).length === 1;
 }
 
 /** "5 open, 4 merged" — the set's composition, open work first. */

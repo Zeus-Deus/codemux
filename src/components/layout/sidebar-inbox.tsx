@@ -7,6 +7,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Layers,
   Loader2,
 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
@@ -88,6 +89,7 @@ import {
   providerRefLabel,
 } from "@/lib/source-control";
 import {
+  isSingleStack,
   prSetLabel,
   prSetSummary,
   prsDescribeThisCheckout,
@@ -684,11 +686,19 @@ const SettledRow = memo(function SettledRow({
                 built-in `text-status-open`/etc. Swap that argument order inside
                 the icon and this badge silently goes back to a colored glyph on
                 a grey number — there is a test pinning it. */}
-            <PrStatusIcon
-              state={prState}
-              size={3}
-              className="shrink-0 text-current"
-            />
+            {isSingleStack(prs) ? (
+              <Layers
+                aria-hidden
+                data-pr-stack-icon
+                className="size-3 shrink-0"
+              />
+            ) : (
+              <PrStatusIcon
+                state={prState}
+                size={3}
+                className="shrink-0 text-current"
+              />
+            )}
             {primaryPr && (
               <span className="truncate">
                 {providerRef(provider, primaryPr.number)}

@@ -267,17 +267,36 @@ describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
       }),
     );
 
-    expect(valueFor("9 pull requests")).toBe("5 open, 4 merged");
+    expect(valueFor("Stack of 9")).toBe("5 open, 4 merged");
     const rows = [...container.querySelectorAll("[data-pr-set-row]")];
     expect(rows.map((r) => r.getAttribute("data-pr-set-row"))).toEqual(
       ["372", "373", "374", "375", "376", "377", "378", "379", "380"],
     );
+    // One rail segment between each adjacent pair of layers, drawn from both ends.
+    expect(container.querySelectorAll("[data-pr-stack-rail]")).toHaveLength(16);
     expect(screen.getByRole("button", { name: "#372 · merged · ui-pass/01" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "#380 · open · ui-pass/09" })).toBeInTheDocument();
     expect(screen.getByText("#372")).toHaveClass("text-accent-violet");
     expect(screen.getByText("#380")).toHaveClass("text-status-open");
     // The single-PR row would only name the primary — it must not also appear.
     expect(screen.queryByText("Pull request")).not.toBeInTheDocument();
+  });
+
+  it("ends a stack's rail at the last row shown when the list is capped", () => {
+    const stack = Array.from({ length: 12 }, (_, i) => ({
+      number: 100 + i,
+      state: "OPEN",
+      url: `https://github.com/u/r/pull/${100 + i}`,
+      head_branch: `layer-${i + 1}`,
+      base_branch: i === 0 ? "main" : `layer-${i}`,
+      source: "worktree" as const,
+    }));
+    const { container } = renderBody(makeWorkspace({ prs: stack }));
+
+    expect(container.querySelectorAll("[data-pr-set-row]")).toHaveLength(10);
+    expect(screen.getByText("+2 more")).toBeInTheDocument();
+    // Nine joins between ten visible glyphs, two segments each — none past the last.
+    expect(container.querySelectorAll("[data-pr-stack-rail]")).toHaveLength(18);
   });
 
   it("shows PR number and state with the shared PR tone", () => {
