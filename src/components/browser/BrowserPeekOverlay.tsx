@@ -1,8 +1,10 @@
-import { ExternalLink, X } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { PanelRightOpen, X } from "lucide-react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 
 import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
-import { BrowserPane } from "@/components/browser/BrowserPane";
+import { BrowserPane, type BrowserStreamStatus } from "@/components/browser/BrowserPane";
+import { toast } from "@/lib/toast";
+import type { AgentBrowserSession } from "@/tauri/types";
 import {
   Tooltip,
   TooltipContent,
@@ -11,7 +13,11 @@ import {
 import { useGuiChrome } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
 import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
-import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import {
+  clampPeekSize,
+  useBrowserPeekStore,
+  type PeekSize,
+} from "@/stores/browser-peek-store";
 import {
   parseViewportString,
   selectBackgroundBrowserDesktopViewport,
@@ -32,6 +38,30 @@ import { PanelHeader } from "@/components/ui/panel-header";
  *  instead — same size the backend applies to fresh daemons — so the
  *  peek and the agent's screenshots stay consistent. */
 const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
+
+/** Matches the `duration-250` (overlay) exit animation below. */
+const EXIT_MS = 250;
+
+const STATUS_DOT: Record<BrowserStreamStatus, { className: string; label: string }> = {
+  live: { className: "bg-status-open", label: "Live" },
+  starting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
+  connecting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
+  waiting: { className: "bg-muted-foreground/60 motion-safe:animate-pulse", label: "Connecting" },
+  error: { className: "bg-destructive", label: "Disconnected" },
+};
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
+type Shown = { workspaceId: string; session: AgentBrowserSession };
+
+function windowSize(): PeekSize {
+  return { width: window.innerWidth, height: window.innerHeight };
+}
 
 /**
  * Floating "peek" overlay for a GUI-mode background browser session: clicking the
@@ -68,8 +98,37 @@ export function BrowserPeekOverlay() {
   const pinnedViewport =
     parseViewportString(defaultViewportRaw) ?? DESKTOP_PEEK_VIEWPORT;
   const panelRef = useRef<HTMLDivElement>(null);
+  const [streamStatus, setStreamStatus] = useState<BrowserStreamStatus>("starting");
+  const storedSize = useBrowserPeekStore((s) => s.size);
+  const setStoredSize = useBrowserPeekStore((s) => s.setSize);
+  // Live size while a resize drag is in progress; committed on release.
+  const [dragSize, setDragSize] = useState<PeekSize | null>(null);
+  // The 60%-of-window cap has to follow the window, not just re-renders.
+  const [winSize, setWinSize] = useState<PeekSize>(windowSize);
 
   const open = guiChrome && isOpen && !!session && !!activeWorkspaceId;
+
+  // Closing keeps the last shown peek mounted for the exit animation.
+  // Switching workspaces skips it: the content no longer belongs here.
+  const current: Shown | null =
+    open && activeWorkspaceId && session
+      ? { workspaceId: activeWorkspaceId, session }
+      : null;
+  const lastShownRef = useRef<Shown | null>(null);
+  if (current) lastShownRef.current = current;
+  else if (lastShownRef.current?.workspaceId !== activeWorkspaceId) lastShownRef.current = null;
+  const [exitDone, setExitDone] = useState(true);
+  useEffect(() => {
+    if (open) {
+      setExitDone(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      lastShownRef.current = null;
+      setExitDone(true);
+    }, EXIT_MS);
+    return () => clearTimeout(timer);
+  }, [open, activeWorkspaceId]);
 
   // Switching workspaces dismisses the peek: it is a transient "look at
   // this now" affordance, so navigating A → B → back to A must not pop it
@@ -81,6 +140,14 @@ export function BrowserPeekOverlay() {
       closeAll();
     }
   }, [activeWorkspaceId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onResize = () => setWinSize(windowSize());
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [open]);
 
   // Escape closes.
   useEffect(() => {
@@ -106,7 +173,49 @@ export function BrowserPeekOverlay() {
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [open, activeWorkspaceId, close]);
 
-  if (!open || !activeWorkspaceId || !session) return null;
+  const last = lastShownRef.current;
+  const exiting = !current && !exitDone && last !== null && !prefersReducedMotion();
+  const shown = current ?? (exiting ? last : null);
+  if (!shown) return null;
+  const closing = !open;
+  const workspaceId = shown.workspaceId;
+  const size = clampPeekSize(dragSize ?? storedSize, winSize);
+  const dot = STATUS_DOT[streamStatus];
+
+  // Anchored top-right, so the handle sits bottom-left and the peek
+  // grows toward the chat it floats over.
+  const startResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const handle = e.currentTarget;
+    const origin = { x: e.clientX, y: e.clientY, ...size };
+    let latest = size;
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {
+      // Capture is best-effort; the drag still tracks over the handle.
+    }
+    const onMove = (ev: PointerEvent) => {
+      latest = clampPeekSize(
+        {
+          width: origin.width + (origin.x - ev.clientX),
+          height: origin.height + (ev.clientY - origin.y),
+        },
+        windowSize(),
+      );
+      setDragSize(latest);
+    };
+    const onEnd = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+      setDragSize(null);
+      setStoredSize(latest);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onEnd);
+    handle.addEventListener("pointercancel", onEnd);
+  };
 
   const handlePromote = async () => {
     // Promote into the right-panel deck, not a pane-tree split — the same
@@ -120,11 +229,13 @@ export function BrowserPeekOverlay() {
     // `cli_session_name`, same daemon), so the agent keeps driving the
     // browser the user just took hold of.
     try {
-      await dockBrowserInRightPanel(activeWorkspaceId);
-      useUIStore.getState().setRightPanelTab(activeWorkspaceId, "browser");
-      close(activeWorkspaceId);
+      await dockBrowserInRightPanel(workspaceId);
+      useUIStore.getState().setRightPanelTab(workspaceId, "browser");
+      close(workspaceId);
     } catch (err) {
-      console.error("[BrowserPeekOverlay] promote to panel failed:", err);
+      toast.error("Couldn't open the browser in the side panel", {
+        description: String(err),
+      });
     }
   };
 
@@ -133,19 +244,29 @@ export function BrowserPeekOverlay() {
       ref={panelRef}
       role="dialog"
       aria-label="Background browser preview"
+      data-state={closing ? "closed" : "open"}
+      style={
+        {
+          "--peek-w": `${size.width}px`,
+          "--peek-h": `${size.height}px`,
+        } as CSSProperties
+      }
       className={cn(
-        "absolute right-3.5 top-3.5 z-30 flex h-[300px] w-[440px] flex-col overflow-hidden",
+        "absolute right-3.5 top-3.5 z-30 flex h-(--peek-h) w-(--peek-w) flex-col overflow-hidden",
         "rounded-lg border border-border bg-popover shadow-2xl",
-        "animate-in fade-in slide-in-from-top-1 duration-150 ease-out",
+        "animate-in fade-in slide-in-from-top-1 duration-250 ease-out motion-reduce:animate-none",
+        "data-[state=closed]:pointer-events-none data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:slide-out-to-top-1 data-[state=closed]:fill-mode-forwards",
       )}
     >
       <PanelHeader>
         <span
-          className="h-[7px] w-[7px] shrink-0 rounded-full bg-status-open"
-          aria-hidden
+          role="img"
+          aria-label={dot.label}
+          title={dot.label}
+          className={cn("h-[7px] w-[7px] shrink-0 rounded-full", dot.className)}
         />
         <span className="min-w-0 flex-1 truncate rounded-md border border-border px-2 py-1 font-mono text-label text-muted-foreground">
-          {session.current_url ?? "about:blank"}
+          {shown.session.current_url ?? "about:blank"}
         </span>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -155,7 +276,7 @@ export function BrowserPeekOverlay() {
               aria-label="Open in side panel"
               className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
             >
-              <ExternalLink className="size-3.5" aria-hidden />
+              <PanelRightOpen className="size-3.5" aria-hidden />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>
@@ -164,7 +285,7 @@ export function BrowserPeekOverlay() {
         </Tooltip>
         <button
           type="button"
-          onClick={() => close(activeWorkspaceId)}
+          onClick={() => close(workspaceId)}
           aria-label="Close preview"
           className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
         >
@@ -173,14 +294,22 @@ export function BrowserPeekOverlay() {
       </PanelHeader>
       <div className="min-h-0 flex-1">
         <BrowserPane
-          browserId={session.cli_session_name}
-          workspaceId={activeWorkspaceId}
+          browserId={shown.session.cli_session_name}
+          workspaceId={workspaceId}
           focused={false}
           visible={open}
           hideToolbar
           fixedViewport={desktopViewport ? pinnedViewport : undefined}
+          onStatusChange={setStreamStatus}
         />
       </div>
+      <div
+        data-peek-resize
+        aria-hidden
+        title="Drag to resize"
+        onPointerDown={startResize}
+        className="absolute bottom-0 left-0 z-20 size-3 cursor-nesw-resize"
+      />
     </div>
   );
 }

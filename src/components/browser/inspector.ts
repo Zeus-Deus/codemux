@@ -1,4 +1,4 @@
-import type { PaneNodeSnapshot } from "@/tauri/types";
+import type { PaneNodeSnapshot, SurfaceSnapshot } from "@/tauri/types";
 
 export interface ElementInfo {
   tag: string;
@@ -104,16 +104,81 @@ export function parseEvalResult(result: unknown): ElementInfo | null {
   }
 }
 
-// Walk pane tree to find first terminal pane.
-export function findFirstTerminalPane(
-  node: PaneNodeSnapshot,
-): (PaneNodeSnapshot & { kind: "terminal" }) | null {
-  if (node.kind === "terminal") return node;
+/** Where "Send to agent" delivers an inspected element. */
+export type AgentTarget =
+  | { kind: "agent_chat"; paneId: string; threadId: string; title: string }
+  | { kind: "terminal"; paneId: string; sessionId: string; title: string };
+
+function leafPanes(node: PaneNodeSnapshot, out: PaneNodeSnapshot[] = []): PaneNodeSnapshot[] {
   if (node.kind === "split") {
-    for (const child of node.children) {
-      const found = findFirstTerminalPane(child);
-      if (found) return found;
-    }
+    for (const child of node.children) leafPanes(child, out);
+  } else {
+    out.push(node);
+  }
+  return out;
+}
+
+function isChatPane(node: PaneNodeSnapshot): boolean {
+  return node.kind === "agent_chat" && !!node.thread_id;
+}
+
+function toTarget(node: PaneNodeSnapshot | undefined): AgentTarget | null {
+  if (node?.kind === "agent_chat" && node.thread_id) {
+    return {
+      kind: "agent_chat",
+      paneId: node.pane_id,
+      threadId: node.thread_id,
+      title: node.title || "Agent chat",
+    };
+  }
+  if (node?.kind === "terminal") {
+    return {
+      kind: "terminal",
+      paneId: node.pane_id,
+      sessionId: node.session_id,
+      title: node.title || "Terminal",
+    };
   }
   return null;
+}
+
+/**
+ * The pane an inspected element should go to. An agent chat beats a
+ * terminal (a terminal may be a plain shell); within each kind the
+ * surface's active pane wins over tree order.
+ */
+export function findAgentTarget(surface: SurfaceSnapshot): AgentTarget | null {
+  const leaves = leafPanes(surface.root);
+  const active = leaves.find((n) => n.pane_id === surface.active_pane_id);
+  if (active && isChatPane(active)) return toTarget(active);
+  const chat = leaves.find(isChatPane);
+  if (chat) return toTarget(chat);
+  if (active?.kind === "terminal") return toTarget(active);
+  return toTarget(leaves.find((n) => n.kind === "terminal"));
+}
+
+// C0 controls, DEL and C1 controls. A terminal acts on these (CR/LF
+// submit the line, ^C/^D signal, ESC starts a sequence), so none of them
+// may reach a PTY.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]+/g;
+
+// A whole surrogate pair, or a surrogate without its other half. The page
+// can supply a lone one (its own text cut splits pairs), and a lone
+// surrogate fails JSON deserialization on the Rust side.
+const SURROGATES = /[\ud800-\udbff][\udc00-\udfff]|[\ud800-\udfff]/g;
+
+/**
+ * A complete reference to the element, left open for the user's
+ * instruction. The tag, text and selector come from the page (an element
+ * id can hold a newline), so every control character is replaced with a
+ * space: the result is one inert line that a terminal never submits. Lone
+ * surrogates become U+FFFD so the prompt always serializes.
+ */
+export function buildTellAgentPrompt(element: ElementInfo, pageUrl: string): string {
+  // Truncate by code point so the cut never splits a surrogate pair.
+  const text = Array.from(element.text.replace(/\s+/g, " ").trim()).slice(0, 60).join("");
+  const desc = `<${element.tag}>${text ? ` "${text}"` : ""}`;
+  const where = pageUrl && pageUrl !== "about:blank" ? ` at ${pageUrl}` : "";
+  const prompt = `In the browser${where}, the element \`${element.selector}\` (${desc}): `;
+  return prompt.replace(CONTROL_CHARS, " ").replace(SURROGATES, (m) => (m.length === 2 ? m : "\ufffd"));
 }
