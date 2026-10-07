@@ -77,7 +77,10 @@ export function AsyncQuestionPanel({
   );
   if (!selected && dismissed.length === 0) return null;
   return (
-    <section aria-label="Agent questions" className="pb-2">
+    <section
+      aria-label="Agent questions"
+      className="animate-in fade-in-0 slide-in-from-bottom-2 pb-2 duration-150 ease-out"
+    >
       <div className={CHAT_COLUMN_OUTER}>
         <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
           {selected && (

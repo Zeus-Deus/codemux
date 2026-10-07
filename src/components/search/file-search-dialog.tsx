@@ -8,7 +8,6 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
-import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
 import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
@@ -16,6 +15,7 @@ import { searchFileNames } from "@/tauri/commands";
 import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { basename } from "@/lib/path";
+import { Spinner } from "@/components/ui/spinner";
 
 export function FileSearchDialog() {
   const open = useUIStore((s) => s.showFileSearch);
@@ -152,7 +152,7 @@ export function FileSearchDialog() {
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              <Spinner className="size-4 text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (

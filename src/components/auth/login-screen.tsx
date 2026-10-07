@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { Github, Loader2, Mail } from "lucide-react";
+import { Github, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { WindowChrome } from "@/components/layout/window-chrome";
 import { useAuthStore } from "@/stores/auth-store";
 import { forgotPassword } from "@/tauri/commands";
+import { Spinner } from "@/components/ui/spinner";
 
 type View = "signin" | "signup" | "forgot-password" | "verify-email";
 
@@ -160,7 +161,7 @@ export function LoginScreen() {
                   disabled={resetLoading}
                 >
                   {resetLoading && (
-                    <Loader2 className="size-4 animate-spin mr-1.5" />
+                    <Spinner className="size-4 mr-1.5" aria-hidden />
                   )}
                   Send reset link
                 </Button>
@@ -216,7 +217,7 @@ export function LoginScreen() {
             disabled={isSigningIn}
           >
             {isSigningIn ? (
-              <Loader2 className="size-4 animate-spin" />
+              <Spinner className="size-4" aria-hidden />
             ) : (
               <Github className="size-4" />
             )}
@@ -303,7 +304,7 @@ export function LoginScreen() {
               disabled={isSigningIn}
             >
               {isSigningIn && (
-                <Loader2 className="size-4 animate-spin mr-1.5" />
+                <Spinner className="size-4 mr-1.5" aria-hidden />
               )}
               {view === "signin" ? "Sign in" : "Create account"}
             </Button>

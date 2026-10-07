@@ -184,6 +184,11 @@ function Sidebar({
   collapsible?: "offcanvas" | "icon" | "none"
 }) {
   const { isMobile, state, openMobile, setOpenMobile } = useSidebar()
+  // Marks the panel once the user has toggled it, so the toggle motion in
+  // globals.css never plays on first paint or when the shell remounts.
+  const initialState = React.useRef(state)
+  const [toggled, setToggled] = React.useState(false)
+  if (!toggled && state !== initialState.current) setToggled(true)
 
   if (collapsible === "none") {
     return (
@@ -263,6 +268,7 @@ function Sidebar({
         <div
           data-sidebar="sidebar"
           data-slot="sidebar-inner"
+          data-toggled={toggled || undefined}
           className="flex size-full flex-col bg-sidebar group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:shadow-sm group-data-[variant=floating]:ring-1 group-data-[variant=floating]:ring-sidebar-border"
         >
           {children}

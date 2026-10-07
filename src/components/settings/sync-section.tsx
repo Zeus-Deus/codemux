@@ -12,7 +12,7 @@
 //      the session is still settling or signed out)
 
 import { useState } from "react";
-import { FileDown, FileUp, Loader2 } from "lucide-react";
+import { FileDown, FileUp } from "lucide-react";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   exportSkillsToFile,
@@ -22,6 +22,7 @@ import {
   pickSaveFileDialog,
 } from "@/tauri/commands";
 import { SyncStatusDisplay } from "./sync-status-display";
+import { Spinner } from "@/components/ui/spinner";
 
 export function SyncSection() {
   const syncAvailable = useAuthStore((s) => s.syncAvailable);
@@ -123,7 +124,7 @@ function SyncReadyRow() {
           className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "export" ? (
-            <Loader2 className="size-3.5 animate-spin" />
+            <Spinner className="size-3.5" aria-hidden />
           ) : (
             <FileDown className="size-3.5" />
           )}
@@ -136,7 +137,7 @@ function SyncReadyRow() {
           className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "import" ? (
-            <Loader2 className="size-3.5 animate-spin" />
+            <Spinner className="size-3.5" aria-hidden />
           ) : (
             <FileUp className="size-3.5" />
           )}

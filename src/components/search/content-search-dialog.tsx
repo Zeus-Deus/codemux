@@ -9,12 +9,13 @@ import {
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
+import { FileCode, CaseSensitive, Regex } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchInFiles } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { SearchResult } from "@/tauri/types";
+import { Spinner } from "@/components/ui/spinner";
 
 interface GroupedResults {
   filePath: string;
@@ -190,7 +191,7 @@ export function ContentSearchDialog() {
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              <Spinner className="size-4 text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (

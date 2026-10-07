@@ -78,4 +78,20 @@ describe("desktop sidebar toggle", () => {
     fireEvent.click(screen.getByRole("button", { name: "Toggle Sidebar" }))
     expect(sidebar).toHaveAttribute("data-state", "expanded")
   })
+
+  it("marks the panel for its paint-only toggle motion only after a toggle", () => {
+    const { container } = render(
+      <SidebarProvider>
+        <SidebarTrigger />
+        <Sidebar collapsible="icon">Workspace</Sidebar>
+      </SidebarProvider>
+    )
+    const inner = container.querySelector('[data-slot="sidebar-inner"]')!
+    // First paint must not play the reveal.
+    expect(inner).not.toHaveAttribute("data-toggled")
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Sidebar" }))
+    expect(inner).toHaveAttribute("data-toggled", "true")
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Sidebar" }))
+    expect(inner).toHaveAttribute("data-toggled", "true")
+  })
 })

@@ -16,7 +16,6 @@ import {
   MonitorSmartphone,
   Keyboard,
   LayoutGrid,
-  LoaderCircle,
   MessageSquareText,
   PanelLeft,
   Play,
@@ -107,6 +106,7 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   open: boolean;
@@ -941,7 +941,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
                   "Loading workspaces…"
                 ) : conversationSearching ? (
                   <span className="inline-flex items-center gap-2">
-                    <LoaderCircle className="size-3.5 animate-spin" />
+                    <Spinner className="size-3.5" />
                     Searching conversations…
                   </span>
                 ) : query.needle === "" ? (

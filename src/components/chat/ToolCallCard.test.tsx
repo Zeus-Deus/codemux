@@ -59,6 +59,36 @@ describe("ToolCallCard", () => {
     vi.mocked(toast.success).mockReset();
   });
 
+  it("eases the body in only when the user expands it", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ status: "done", result_content: "total 0" })}
+        approval={null}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("tool-call-body")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(screen.getByTestId("tool-call-body")).toHaveClass(
+      "animate-in",
+      "duration-150",
+    );
+  });
+
+  it("does not replay the ease on a card that mounts expanded", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({
+          status: "error",
+          result_content: "boom",
+        })}
+        approval={null}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("tool-call-body")).not.toHaveClass("animate-in");
+  });
+
   it("pending_approval state renders the approval controls and input preview", () => {
     const onDecide = vi.fn();
     render(

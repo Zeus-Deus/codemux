@@ -8,12 +8,13 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { FolderOpen, Loader2 } from "lucide-react";
+import { FolderOpen } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { pickFolder } from "@/lib/file-dialog";
 import { useCloneProgress } from "@/hooks/use-clone-progress";
 import { CloneProgressRow } from "@/components/overlays/clone-progress-row";
+import { Spinner } from "@/components/ui/spinner";
 
 export function CloneDialog() {
   const open = useUIStore((s) => s.showCloneDialog);
@@ -151,7 +152,7 @@ export function CloneDialog() {
               disabled={!url.trim() || cloning}
               className="bg-foreground text-background hover:bg-foreground/90"
             >
-              {cloning && <Loader2 className="size-3 animate-spin mr-1" />}
+              {cloning && <Spinner className="size-3 mr-1" aria-hidden />}
               {cloning ? "Cloning..." : "Clone"}
             </Button>
           </div>

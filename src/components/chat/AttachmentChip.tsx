@@ -6,13 +6,13 @@ import {
   FolderOpen,
   GitPullRequest,
   Image as ImageIcon,
-  Loader2,
   MessagesSquare,
   Sparkles,
   X,
   type LucideIcon,
 } from "lucide-react";
 
+import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
@@ -296,8 +296,8 @@ export function AttachmentChip({
       data-preview={showPreview || undefined}
     >
       {metadata.isLoading ? (
-        <Loader2
-          className="size-3 animate-spin"
+        <Spinner
+          className="size-3"
           aria-hidden
           data-testid="attachment-chip-spinner"
         />

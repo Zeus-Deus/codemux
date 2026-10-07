@@ -26,7 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, Loader2, X } from "lucide-react";
+import { ChevronLeft, X } from "lucide-react";
 
 import {
   Select,
@@ -68,6 +68,7 @@ import {
   tzPanelHeader,
   tzRowTitle,
 } from "./review-ui";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Enough to describe any branch a person would open a pull request from;
  *  past this the description would be unreadable anyway. */
@@ -487,7 +488,7 @@ export function CreatePrForm({
           disabled={!title.trim() || busy != null}
           onClick={() => void create(true)}
         >
-          {busy === "draft" ? <Loader2 className="size-3 animate-spin" /> : null}
+          {busy === "draft" ? <Spinner className="size-3" aria-hidden /> : null}
           Draft
         </button>
         <button
@@ -497,7 +498,7 @@ export function CreatePrForm({
           disabled={!title.trim() || busy != null}
           onClick={() => void create(false)}
         >
-          {busy === "create" ? <Loader2 className="size-3 animate-spin" /> : null}
+          {busy === "create" ? <Spinner className="size-3" aria-hidden /> : null}
           {busy === "create" ? "Creating" : "Create"}
         </button>
       </div>

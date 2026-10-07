@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   CalendarClock,
   Check,
-  Loader2,
   Pause,
   Pencil,
   Play,
@@ -47,6 +46,7 @@ import {
   type RepoAccessResult,
 } from "@/tauri/commands";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /** A project currently open in the Codemux sidebar — the source for
  *  the project picker. */
@@ -390,7 +390,7 @@ export function AutomationsSection() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
-        <Loader2 className="mr-2 size-4 animate-spin" />
+        <Spinner className="mr-2 size-4" />
         Loading automations…
       </div>
     );
@@ -957,7 +957,7 @@ function AutomationForm({
           onClick={onSave}
         >
           {busy ? (
-            <Loader2 className="size-3.5 animate-spin" />
+            <Spinner className="size-3.5" aria-hidden />
           ) : (
             <Check className="size-3.5" />
           )}
@@ -1175,7 +1175,7 @@ function RepoAccessRow({
     <div className="flex items-start gap-2 text-body-sm leading-relaxed">
       {checking ? (
         <>
-          <Loader2 className="mt-0.5 size-3 shrink-0 animate-spin text-muted-foreground/60" />
+          <Spinner className="mt-0.5 size-3 shrink-0 text-muted-foreground/60" />
           <span className="text-muted-foreground/70">
             Checking repository access…
           </span>
