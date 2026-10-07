@@ -2557,17 +2557,6 @@ pub fn notify_attention<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-pub fn set_notification_sound_enabled<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: State<'_, AppStateStore>,
-    enabled: bool,
-) -> Result<(), String> {
-    state.set_notification_sound_enabled(enabled);
-    crate::state::emit_app_state(&app);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn set_ai_commit_message_enabled<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,

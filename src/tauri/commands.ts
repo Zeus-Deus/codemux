@@ -483,9 +483,6 @@ export const resizeActivePane = (delta: number) =>
 export const notifyAttention = (message: string, sessionId: string, paneId: string) =>
   invoke<string>("notify_attention", { message, sessionId, paneId });
 
-export const setNotificationSoundEnabled = (enabled: boolean) =>
-  invoke("set_notification_sound_enabled", { enabled });
-
 export const createBrowserPane = (paneId: string, url?: string) =>
   invoke<string>("create_browser_pane", { paneId, url: url ?? null });
 

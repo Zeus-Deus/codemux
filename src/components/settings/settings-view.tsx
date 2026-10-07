@@ -69,7 +69,6 @@ import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
 import {
-  setNotificationSoundEnabled,
   setAiCommitMessageEnabled,
   setAiCommitMessageCli,
   setAiCommitMessageModel,
@@ -2300,9 +2299,9 @@ export function SettingsView() {
                 description="Play a sound when an agent finishes or needs attention."
               >
                 <Switch
-                  checked={config?.notification_sound_enabled ?? false}
+                  aria-label="Notification sounds"
+                  checked={syncedSettings.notifications.sound_enabled}
                   onCheckedChange={(checked) => {
-                    setNotificationSoundEnabled(checked).catch(console.error);
                     updateSyncedSetting("notifications", "sound_enabled", checked).catch(console.error);
                   }}
                 />
@@ -2310,12 +2309,12 @@ export function SettingsView() {
               <Separator />
               <SettingRow
                 label="Desktop notifications"
-                description="Show system notifications via D-Bus when events occur."
+                description="Show a system notification when an agent finishes or needs your input. Click it to open the agent."
               >
                 <Switch
+                  aria-label="Desktop notifications"
                   checked={syncedSettings.notifications.desktop_enabled}
                   onCheckedChange={(checked) => {
-                    // TODO: wire to actual desktop notification system when implemented
                     updateSyncedSetting("notifications", "desktop_enabled", checked).catch(console.error);
                   }}
                 />
