@@ -14,6 +14,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
+import { MenuKeycap } from "@/components/ui/menu-chrome";
 import { Plus, X, Terminal, Globe, GitCompare, PanelRight, FileCode } from "lucide-react";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
@@ -346,21 +348,23 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
             ))}
           </TabsList>
           {!hideActions && <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className="ml-1 shrink-0 bg-muted/50 text-muted-foreground"
-                title="New tab"
-                aria-label="New tab"
-              >
-                <Plus className="size-3.5" />
-              </Button>
-            </DropdownMenuTrigger>
+            <ShortcutTooltip label="New tab" shortcut="newTab">
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="ml-1 shrink-0 bg-muted/50 text-muted-foreground"
+                  aria-label="New tab"
+                >
+                  <Plus className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+            </ShortcutTooltip>
             <DropdownMenuContent align="start">
               <DropdownMenuItem onClick={handleCreateTab}>
                 <Terminal className="size-3.5 mr-2" />
                 Terminal
+                <MenuKeycap actionId="newTab" className="pl-4" />
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => {
@@ -376,16 +380,21 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
         </div>
       </Tabs>
 
-      {!hideActions && <Button
-        variant="ghost"
-        size="icon-sm"
-        className={`ml-1 shrink-0 ${rightPanelTab ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-        onClick={togglePanel}
-        title={rightPanelTab ? "Close panel" : "Open panel"}
-        aria-pressed={rightPanelTab != null}
+      {!hideActions && <ShortcutTooltip
+        label={rightPanelTab ? "Close panel" : "Open panel"}
+        shortcut="toggleRightPanel"
       >
-        <PanelRight className="size-3.5" />
-      </Button>}
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className={`ml-1 shrink-0 ${rightPanelTab ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+          onClick={togglePanel}
+          aria-label={rightPanelTab ? "Close panel" : "Open panel"}
+          aria-pressed={rightPanelTab != null}
+        >
+          <PanelRight className="size-3.5" />
+        </Button>
+      </ShortcutTooltip>}
     </div>
   );
 }

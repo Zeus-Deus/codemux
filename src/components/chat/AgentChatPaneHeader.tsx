@@ -2,6 +2,7 @@ import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 
 import { SessionSelector } from "@/components/chat/SessionSelector";
 import { Button } from "@/components/ui/button";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
 import { closePane, splitPane } from "@/tauri/commands";
@@ -77,36 +78,39 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           target, 14px glyph, drop close to destructive-foreground when
           its red hover bg kicks in. */}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="text-muted-foreground hover:text-foreground"
-          onClick={() => handleSplit("horizontal")}
-          aria-label="Split right"
-          title="Split right"
-        >
-          <SplitSquareHorizontal className="size-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="text-muted-foreground hover:text-foreground"
-          onClick={() => handleSplit("vertical")}
-          aria-label="Split down"
-          title="Split down"
-        >
-          <SplitSquareVertical className="size-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground"
-          onClick={handleClose}
-          aria-label="Close pane"
-          title="Close pane"
-        >
-          <X className="size-3.5" />
-        </Button>
+        <ShortcutTooltip label="Split right" shortcut="splitPaneRight">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={() => handleSplit("horizontal")}
+            aria-label="Split right"
+          >
+            <SplitSquareHorizontal className="size-3.5" />
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip label="Split down" shortcut="splitPaneDown">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={() => handleSplit("vertical")}
+            aria-label="Split down"
+          >
+            <SplitSquareVertical className="size-3.5" />
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip label="Close pane" shortcut="closePane">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground"
+            onClick={handleClose}
+            aria-label="Close pane"
+          >
+            <X className="size-3.5" />
+          </Button>
+        </ShortcutTooltip>
       </div>
     </PanelHeader>
   );

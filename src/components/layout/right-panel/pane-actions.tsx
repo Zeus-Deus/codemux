@@ -28,6 +28,7 @@ export function PaneActionButton({
   disabled = false,
   testId,
   size = "pane",
+  shortcut,
 }: {
   label: string;
   icon: LucideIcon;
@@ -37,6 +38,8 @@ export function PaneActionButton({
   testId?: string;
   /** Titlebar controls match its 28px sidebar toggle; pane chrome stays dense. */
   size?: "pane" | "titlebar";
+  /** `keybind-registry` action id whose binding the tooltip shows. */
+  shortcut?: string;
 }) {
   return (
     <Tooltip>
@@ -67,7 +70,7 @@ export function PaneActionButton({
           />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
+      <TooltipContent side="bottom" sideOffset={4} shortcut={shortcut}>
         {label}
       </TooltipContent>
     </Tooltip>

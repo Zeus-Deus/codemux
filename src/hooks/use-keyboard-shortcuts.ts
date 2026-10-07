@@ -88,6 +88,12 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // ── Close overlay (Escape) — conditional ──
   if (actionId === "closeOverlay") {
+    // The shortcuts sheet layers over everything, Settings and onboarding
+    // included, so it is the first layer to go.
+    if (ui.showShortcutsSheet) {
+      ui.setShowShortcutsSheet(false);
+      return true;
+    }
     // Onboarding is a full-view replacement, not a modal — prioritize it over
     // dismissible overlays so Escape always provides an escape hatch.
     if (ui.onboardingProjectDir) {
@@ -191,8 +197,18 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   // ── Show keyboard shortcuts ──
+  // A cheat sheet over the current view, so checking a binding never means
+  // leaving the work. Pressing it again closes it.
   if (actionId === "showShortcuts") {
-    ui.setShowSettings(true, "shortcuts");
+    ui.setShowShortcutsSheet(!ui.showShortcutsSheet);
+    return true;
+  }
+
+  // ── Open the `+` launcher ──
+  // Works on a draft too (its launcher has no workspace yet), so it sits
+  // before the appState guard. Without a mounted launcher it does nothing.
+  if (actionId === "openLauncher") {
+    ui.requestOpenLauncher();
     return true;
   }
 

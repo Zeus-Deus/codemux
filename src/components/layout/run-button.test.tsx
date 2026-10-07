@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, act, cleanup, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const mockGetProjectScripts = vi.fn();
@@ -47,6 +47,7 @@ vi.mock("@/stores/app-store", () => ({
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { RunButton } from "./run-button";
 
 function flushPromises() {
@@ -249,14 +250,29 @@ describe("RunButton — split variant", () => {
     renderSplitRunButton();
     await flushPromises();
     await userEvent.hover(screen.getByText("Set Run"));
-    // Radix Tooltip renders both a visible content node and a visually
-    // hidden (sr-only) duplicate with identical text — `getAllByText`
-    // avoids the "multiple elements" ambiguity `getByText` would throw.
-    await waitFor(() =>
-      expect(
-        screen.getAllByText("Set Run · Ctrl+Shift+G").length,
-      ).toBeGreaterThan(0),
-    );
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Set Run");
+    expect(within(tooltip).getByText("Ctrl+Shift+G")).toBeInTheDocument();
+  });
+
+  it("follows a rebound run shortcut in the tooltip", async () => {
+    const original = useSyncedSettingsStore.getState().settings;
+    useSyncedSettingsStore.setState({
+      settings: {
+        ...original,
+        keyboard: { ...original.keyboard, shortcuts: { runDevCommand: "Ctrl+Alt+P" } },
+      },
+    });
+    try {
+      renderSplitRunButton();
+      await flushPromises();
+      await userEvent.hover(screen.getByText("Set Run"));
+      const tooltip = await screen.findByRole("tooltip");
+      expect(within(tooltip).getByText("Ctrl+Alt+P")).toBeInTheDocument();
+      expect(screen.queryByText("Ctrl+Shift+G")).toBeNull();
+    } finally {
+      useSyncedSettingsStore.setState({ settings: original });
+    }
   });
 
   it("shows the configured command + shortcut in the main segment's tooltip when configured", async () => {
@@ -268,11 +284,9 @@ describe("RunButton — split variant", () => {
     renderSplitRunButton();
     await flushPromises();
     await userEvent.hover(screen.getByText("Run"));
-    await waitFor(() =>
-      expect(
-        screen.getAllByText("npm run dev · Ctrl+Shift+G").length,
-      ).toBeGreaterThan(0),
-    );
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("npm run dev");
+    expect(within(tooltip).getByText("Ctrl+Shift+G")).toBeInTheDocument();
   });
 
   it("renders a borderless 28px run segment plus a 20px caret segment", async () => {
