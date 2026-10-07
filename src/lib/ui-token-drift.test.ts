@@ -17,8 +17,18 @@ import { describe, expect, it } from "vitest";
  * already open when it was set can land; tighten it once they have.
  */
 
+/**
+ * Quoted and backticked text outside comments. Comments are matched in the
+ * same alternation and dropped, so a docstring that quotes a class name does
+ * not move a budget, while a `//` inside a string (a URL) is left alone
+ * because the string starts first.
+ */
 function stringLiterals(contents: string): string[] {
-  return contents.match(/"[^"\n]*"|'[^'\n]*'|`[^`]*`/g) ?? [];
+  const tokens =
+    contents.match(
+      /\/\*[\s\S]*?\*\/|\/\/[^\n]*|"[^"\n]*"|'[^'\n]*'|`[^`]*`/g,
+    ) ?? [];
+  return tokens.filter((token) => !token.startsWith("/"));
 }
 
 interface Category {
@@ -59,7 +69,7 @@ const CATEGORIES: Category[] = [
     label: "arbitrary px icon and glyph boxes (use size-3 / size-3.5 / size-4)",
     pattern:
       /(?<![-\w])(?:size-\[\d+(?:\.\d+)?px\]|h-\[(\d+(?:\.\d+)?)px\] w-\[\1px\])/g,
-    budget: 85,
+    budget: 84,
     why:
       "status dots and swatches (true circles are carved out) plus icons " +
       "still to snap to the three-size ladder",
