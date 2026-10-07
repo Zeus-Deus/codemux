@@ -10,8 +10,9 @@ const ACTION_CLASS =
 /**
  * Transcript row for a run that failed because the provider's CLI is
  * signed out. Same red line as a session error, plus the two actions that
- * fix it. The actions hide once a probe says the provider is ready, so an
- * old thread does not keep offering a sign-in that already happened.
+ * fix it. The actions always show: the failed run is fresher evidence than
+ * the cached health report, which is often a `ready` probed when the pane
+ * mounted, before the CLI was signed out or its token was revoked.
  */
 export function SignInNotice({
   provider,
@@ -26,40 +27,35 @@ export function SignInNotice({
   const refresh = useProviderHealth((s) => s.refresh);
   const checking = useProviderHealth((s) => !!s.slots[provider].inFlight);
   const [signingIn, setSigningIn] = useState(false);
-  const ready = report?.status === "ready";
   return (
     <div
       data-testid="sign-in-notice"
       className="flex items-center gap-2 border-l-2 border-destructive/40 bg-destructive/10 py-1 pl-3 pr-1.5 text-body-sm text-destructive"
     >
       <span className="min-w-0 flex-1 select-text">{message}</span>
-      {!ready && (
-        <>
-          <button
-            type="button"
-            disabled={signingIn}
-            onClick={() => {
-              setSigningIn(true);
-              void signInToProvider(
-                provider,
-                report?.login_command,
-                workspaceId,
-              ).finally(() => setSigningIn(false));
-            }}
-            className={ACTION_CLASS}
-          >
-            Sign in
-          </button>
-          <button
-            type="button"
-            disabled={checking}
-            onClick={() => void refresh(provider, { force: true })}
-            className={ACTION_CLASS}
-          >
-            {checking ? "Checking…" : "Re-check"}
-          </button>
-        </>
-      )}
+      <button
+        type="button"
+        disabled={signingIn}
+        onClick={() => {
+          setSigningIn(true);
+          void signInToProvider(
+            provider,
+            report?.login_command,
+            workspaceId,
+          ).finally(() => setSigningIn(false));
+        }}
+        className={ACTION_CLASS}
+      >
+        Sign in
+      </button>
+      <button
+        type="button"
+        disabled={checking}
+        onClick={() => void refresh(provider, { force: true })}
+        className={ACTION_CLASS}
+      >
+        {checking ? "Checking…" : "Re-check"}
+      </button>
     </div>
   );
 }
