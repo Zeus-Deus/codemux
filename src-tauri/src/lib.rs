@@ -2557,6 +2557,7 @@ fn build_core_app<R: tauri::Runtime>(
             terminal::pause_pty_output,
             terminal::resume_pty_output,
             terminal::terminal_session_cwds,
+            terminal::terminal_foreground_jobs,
             terminal::write_to_pty,
             terminal::resize_pty,
             terminal::clear_agent_status,

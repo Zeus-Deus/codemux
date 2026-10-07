@@ -1368,6 +1368,12 @@ export const resumePtyOutput = (sessionId: string, generation?: number) =>
 export const terminalSessionCwds = (sessionIds: string[]) =>
   invoke<Record<string, string>>("terminal_session_cwds", { sessionIds });
 
+/** `session_id -> command name` for the sessions whose shell is running a
+ *  foreground job (a dev server, a build, an agent CLI). Idle shells, remote
+ *  panes and non-Linux hosts are omitted. See `terminal_foreground_jobs`. */
+export const terminalForegroundJobs = (sessionIds: string[]) =>
+  invoke<Record<string, string>>("terminal_foreground_jobs", { sessionIds });
+
 /** Attach an output subscriber to a session's PTY stream. Resolves with the
  *  subscriber generation token, which must be handed to `detachPtyOutput` /
  *  `pausePtyOutput` / `resumePtyOutput`. The real desktop backend, the

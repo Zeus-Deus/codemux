@@ -249,6 +249,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "start_skills_watcher"
             | "stop_skills_watcher"
             | "swap_panes"
+            | "terminal_foreground_jobs"
             | "terminal_session_cwds"
             | "touch_workspace"
             | "uncache_terminal_scrollback"

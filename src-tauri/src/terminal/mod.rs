@@ -2697,6 +2697,73 @@ fn read_process_cwd(pid: u32) -> Option<String> {
     }
 }
 
+/// `session_id -> command name` for every requested session whose shell has
+/// handed the terminal to a foreground job: a dev server, a build, an agent
+/// CLI. Sessions sitting at a prompt are omitted. The frontend asks before a
+/// tab or pane close would kill one of these.
+///
+/// Omits the same sessions `terminal_session_cwds` does — remote/SSH panes
+/// (no local pid), non-Linux hosts (no `/proc`) and exited shells — so a
+/// failed probe never blocks a close. Background jobs (`cmd &`) don't own
+/// the terminal and are not reported.
+#[tauri::command]
+pub async fn terminal_foreground_jobs(
+    terminal_state: State<'_, PtyState>,
+    session_ids: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    if session_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let pids = terminal_state.get_session_pids();
+    tokio::task::spawn_blocking(move || {
+        session_ids
+            .into_iter()
+            .filter_map(|id| {
+                let job = read_foreground_job(*pids.get(&id)?)?;
+                Some((id, job))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("terminal_foreground_jobs task join failed: {e}"))
+}
+
+/// `(pgrp, tpgid)` from a `/proc/<pid>/stat` line: the process's own group
+/// and its terminal's foreground group. `comm` may contain spaces and
+/// parentheses, so fields are counted from the last `)`.
+pub(crate) fn parse_stat_pgrp_tpgid(stat: &str) -> Option<(i32, i32)> {
+    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
+    // state ppid pgrp session tty_nr tpgid ...
+    let mut fields = after_comm.split_whitespace().skip(2);
+    let pgrp = fields.next()?.parse().ok()?;
+    let tpgid = fields.nth(2)?.parse().ok()?;
+    Some((pgrp, tpgid))
+}
+
+/// The command name of the job in the foreground of `shell_pid`'s terminal,
+/// or None when the shell itself owns the terminal (idle at a prompt) or the
+/// process can't be read.
+fn read_foreground_job(shell_pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+        let (pgrp, tpgid) = parse_stat_pgrp_tpgid(&stat)?;
+        if tpgid <= 0 || tpgid == pgrp {
+            return None;
+        }
+        // The foreground group's id is its leader's pid.
+        let name = std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
+            .map(|comm| comm.trim().to_string())
+            .unwrap_or_default();
+        Some(if name.is_empty() { "process".to_string() } else { name })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = shell_pid;
+        None
+    }
+}
+
 /// Resume one subscriber's view of a session's PTY output. `None` resumes every
 /// subscriber for the session. See `pause_pty_output`. Idempotent.
 #[tauri::command]
@@ -3225,6 +3292,23 @@ mod tests {
             !out.contains_key("remote"),
             "session with no local pid must be omitted"
         );
+    }
+
+    #[test]
+    fn parse_stat_pgrp_tpgid_counts_fields_after_the_last_paren() {
+        // A comm with spaces and a `)` must not shift the fields.
+        let stat = "4242 (my (odd) cmd) S 1 4242 4242 34817 5150 4194560 0 0";
+        assert_eq!(parse_stat_pgrp_tpgid(stat), Some((4242, 5150)));
+        // No controlling terminal.
+        let stat = "7 (sleep) S 1 7 7 0 -1 4194560";
+        assert_eq!(parse_stat_pgrp_tpgid(stat), Some((7, -1)));
+        assert_eq!(parse_stat_pgrp_tpgid("7 (sleep) S 1"), None);
+        assert_eq!(parse_stat_pgrp_tpgid("garbage"), None);
+    }
+
+    #[test]
+    fn read_foreground_job_is_none_for_unreadable_pids() {
+        assert_eq!(read_foreground_job(u32::MAX), None);
     }
 
     #[test]
@@ -5630,6 +5714,45 @@ mod tests {
             // the child before we run our kill logic.
             std::mem::forget(pty.master);
             (child, pid)
+        }
+
+        /// A process that owns its terminal is "at a prompt"; once a
+        /// job-control shell runs a command, that command is the foreground
+        /// job and is reported by name.
+        #[test]
+        #[serial]
+        #[cfg(target_os = "linux")]
+        fn read_foreground_job_reports_the_job_that_owns_the_terminal() {
+            let (mut idle, idle_pid) = spawn_on_pty(CommandBuilder::new("cat"));
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(read_foreground_job(idle_pid), None);
+            kill_session_tree(idle_pid);
+            wait_child_gone(&mut idle, Duration::from_secs(2));
+
+            // `set -m` turns on job control, so the shell moves `sleep` into
+            // its own process group and hands it the terminal.
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.arg("-c");
+            cmd.arg("set -m; sleep 3600");
+            let (mut shell, shell_pid) = spawn_on_pty(cmd);
+            let start = Instant::now();
+            let mut job = None;
+            while job.is_none() && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(20));
+                job = read_foreground_job(shell_pid);
+            }
+
+            // The job sits in its own group, out of reach of the shell's killpg.
+            let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok();
+            if let Some((_, tpgid)) = stat.as_deref().and_then(parse_stat_pgrp_tpgid) {
+                if tpgid > 1 {
+                    kill_session_tree(tpgid as u32);
+                }
+            }
+            kill_session_tree(shell_pid);
+            wait_child_gone(&mut shell, Duration::from_secs(2));
+
+            assert_eq!(job.as_deref(), Some("sleep"));
         }
 
         /// SIGTERM→200ms→SIGKILL should clear a simple long-sleeping child.

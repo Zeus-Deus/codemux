@@ -3,7 +3,8 @@ import { DisabledFeaturePlaceholder } from "@/components/layout/disabled-feature
 import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
-import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
+import { splitPane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
+import { requestClosePane } from "@/lib/close-guard";
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot, PaneStatus } from "@/tauri/types";
 import {
@@ -307,7 +308,7 @@ function PaneNodeImpl({
   };
 
   const handleClose = () => {
-    closePane(node.pane_id).catch(console.error);
+    void requestClosePane(node.pane_id);
   };
 
   if (node.kind === "terminal") {
