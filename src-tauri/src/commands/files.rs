@@ -206,6 +206,10 @@ pub async fn search_in_files(
     };
 
     tokio::task::spawn_blocking(move || {
+        // rg still exits with a JSON summary for a missing root, and the
+        // summary's searched-file count is unreliable before rg 15, so a
+        // vanished workspace is caught here rather than read from rg's output.
+        std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?;
         // Try ripgrep first; fall back to grep only when rg isn't installed.
         match search_with_rg(&path, &query, &opts) {
             Some(result) => result,
@@ -267,12 +271,16 @@ fn search_with_rg(
         .output()
         .ok()?;
 
+    // Exit 2 with nothing on stdout means rg never searched (bad pattern).
+    // Exit 2 alongside output is just an unreadable file among readable ones.
+    if output.status.code() == Some(2) && output.stdout.is_empty() {
+        return Some(Err(search_error_message(&String::from_utf8_lossy(
+            &output.stderr,
+        ))));
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
-    // Files rg actually opened, from its closing `summary` message. A missing
-    // root still prints a summary, so empty stdout alone can't tell us rg
-    // never searched.
-    let mut searched_files = 0;
 
     for line in stdout.lines() {
         if results.len() >= opts.limit as usize {
@@ -282,16 +290,8 @@ fn search_with_rg(
         let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        match val.get("type").and_then(|t| t.as_str()) {
-            Some("match") => {}
-            Some("summary") => {
-                searched_files = val
-                    .pointer("/data/stats/searches")
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0);
-                continue;
-            }
-            _ => continue,
+        if val.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
         }
         let Some(data) = val.get("data") else {
             continue;
@@ -331,15 +331,6 @@ fn search_with_rg(
             match_start,
             match_end,
         });
-    }
-
-    // Exit 2 without a single file searched means rg never ran the search
-    // (bad pattern, missing path). Exit 2 after searching is just an
-    // unreadable file among readable ones.
-    if output.status.code() == Some(2) && results.is_empty() && searched_files == 0 {
-        return Some(Err(search_error_message(&String::from_utf8_lossy(
-            &output.stderr,
-        ))));
     }
 
     Some(Ok(results))
@@ -1649,6 +1640,26 @@ mod tests {
         search_in_files(missing, "needle".to_string(), None, None, None)
             .await
             .expect_err("a vanished workspace is an error, not an empty result");
+    }
+
+    /// rg exits 2 here on every version, but only rg 15+ counts the readable
+    /// file in its summary, so the outcome must not depend on that count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_in_files_skips_an_unreadable_file_without_matches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("other.txt"), "no match here\n").unwrap();
+        let locked = dir.path().join("locked.txt");
+        fs::write(&locked, "needle\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let results =
+            search_in_files(path_str(dir.path()), "absent".to_string(), None, None, None)
+                .await
+                .expect("an unreadable file among readable ones is not a failed search");
+        assert!(results.is_empty(), "{results:?}");
     }
 
     /// Offsets are UTF-16 so the frontend can slice the line and place the
