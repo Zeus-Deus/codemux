@@ -1,8 +1,7 @@
-import { create } from "zustand";
-import { persist } from "zustand/middleware";
 import { ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { PermissionModeOption } from "@/tauri/types";
+import { useFullAccessNoticeStore } from "@/stores/full-access-notice-store";
 import { CHAT_COLUMN } from "./chat-column";
 
 /**
@@ -15,22 +14,6 @@ const FULL_ACCESS_MODES = new Set(["bypassPermissions", "danger-full-access"]);
 export function isFullAccessMode(mode: string | null | undefined): boolean {
   return mode != null && FULL_ACCESS_MODES.has(mode);
 }
-
-interface FullAccessNoticeStore {
-  dismissed: boolean;
-  dismiss: () => void;
-}
-
-/** Per machine: the explanation is shown until it is acknowledged once. */
-export const useFullAccessNoticeStore = create<FullAccessNoticeStore>()(
-  persist(
-    (set) => ({
-      dismissed: false,
-      dismiss: () => set({ dismissed: true }),
-    }),
-    { name: "codemux-full-access-notice" },
-  ),
-);
 
 /**
  * One-time explanation above a new chat's composer: agents start with

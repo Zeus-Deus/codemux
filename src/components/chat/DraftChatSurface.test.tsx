@@ -748,6 +748,27 @@ describe("DraftChatSurface", () => {
       expect(useDraftComposerFocusStore.getState().request).toBeNull();
     });
 
+    it("pulses the composer card once when New agent lands on the draft on screen", () => {
+      const animate = vi.fn();
+      const original = HTMLElement.prototype.animate;
+      HTMLElement.prototype.animate = animate as unknown as typeof original;
+      try {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        useChatDraftStore.getState().setActiveDraft(draft.draftId);
+        const { container } = renderSurface();
+        expect(animate).not.toHaveBeenCalled();
+
+        act(() => useDraftComposerFocusStore.getState().requestFocus(draft.draftId));
+        expect(animate).toHaveBeenCalledTimes(1);
+        expect(animate.mock.instances[0]).toBe(
+          container.querySelector('[data-testid="composer-wrapper"]'),
+        );
+        expect(animate.mock.calls[0][1]).toMatchObject({ duration: 300 });
+      } finally {
+        HTMLElement.prototype.animate = original;
+      }
+    });
+
     it("leaves a focus request for another draft alone", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);

@@ -2,11 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { PermissionModeOption } from "@/tauri/types";
-import {
-  FullAccessNotice,
-  isFullAccessMode,
-  useFullAccessNoticeStore,
-} from "./FullAccessNotice";
+import { useFullAccessNoticeStore } from "@/stores/full-access-notice-store";
+import { FullAccessNotice, isFullAccessMode } from "./FullAccessNotice";
 
 const MODES: PermissionModeOption[] = [
   {

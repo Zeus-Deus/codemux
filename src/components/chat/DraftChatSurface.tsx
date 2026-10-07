@@ -133,6 +133,24 @@ export function DraftChatSurface() {
   );
 }
 
+/**
+ * A single 300ms ring around the composer card, for a "New agent" press that
+ * lands on the draft already on screen. Run through the Web Animations API so
+ * it never fights the classes the Composer owns, and skipped under reduced
+ * motion (the caret moving into the composer is feedback enough there).
+ */
+function pulseComposerCard(card: HTMLElement): void {
+  if (typeof card.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  card.animate(
+    [
+      { outline: "2px solid color-mix(in oklab, var(--ring) 60%, transparent)", outlineOffset: "2px" },
+      { outline: "2px solid transparent", outlineOffset: "2px" },
+    ],
+    { duration: 300, easing: "ease-out" },
+  );
+}
+
 function DraftChatSurfaceInner({
   draft,
   focusOnMount,
@@ -1241,17 +1259,20 @@ function DraftChatSurfaceInner({
 
   // "New agent" asked for this draft's composer. Consumed once, after the
   // composer has mounted (child effects run first), so a repeat press on the
-  // draft already on screen still moves the caret into it.
+  // draft already on screen still moves the caret into it, and the card
+  // pulses once so the press is visible even though the page is unchanged.
   const surfaceRef = useRef<HTMLDivElement>(null);
   const composerFocusRequest = useDraftComposerFocusStore((s) => s.request);
   useEffect(() => {
     if (composerFocusRequest?.draftId !== draft.draftId) return;
     useDraftComposerFocusStore.getState().clear();
-    surfaceRef.current
-      ?.querySelector<HTMLTextAreaElement>(
-        '[data-testid="composer-wrapper"] textarea',
-      )
+    const card = surfaceRef.current?.querySelector<HTMLElement>(
+      '[data-testid="composer-wrapper"]',
+    );
+    card
+      ?.querySelector<HTMLTextAreaElement>("textarea")
       ?.focus({ preventScroll: true });
+    if (card) pulseComposerCard(card);
   }, [composerFocusRequest, draft.draftId]);
 
   // Opening a project from the empty home points this draft at it, the same

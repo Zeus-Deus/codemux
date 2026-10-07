@@ -2,12 +2,14 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock } = vi.hoisted(() => ({
+const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock, toastErrorMock } = vi.hoisted(() => ({
   openProjectMock: vi.fn(),
   openCloneDialogMock: vi.fn(),
   openProjectAtPathMock: vi.fn(),
   recentProjectsMock: vi.fn(),
+  toastErrorMock: vi.fn(),
 }));
+vi.mock("@/lib/toast", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }));
 vi.mock("@/hooks/use-project-actions", () => ({
   useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: openCloneDialogMock }),
   openProjectAtPath: openProjectAtPathMock,
@@ -26,7 +28,8 @@ import { useUIStore } from "@/stores/ui-store";
 import type { AppStateSnapshot } from "@/tauri/types";
 afterEach(cleanup);
 beforeEach(() => {
-  useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+  useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot, homeDir: null });
+  toastErrorMock.mockReset();
   useFeatureFlags.setState({ enableAgentChat: true });
   useUIStore.setState({ showLocalSessionImport: false, localSessionImportOfferDismissed: false });
   delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
@@ -121,6 +124,35 @@ describe("ChatHomeLanding", () => {
       await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/parser"));
       expect(openProjectAtPathMock).toHaveBeenCalledWith("/work/parser");
       expect(openProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("says so when opening the picked folder fails", async () => {
+      openProjectMock.mockRejectedValue(new Error("workspace limit reached"));
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      await vi.waitFor(() =>
+        expect(toastErrorMock).toHaveBeenCalledWith(
+          "Couldn't open the project: workspace limit reached",
+        ),
+      );
+      expect(onProjectOpened).not.toHaveBeenCalled();
+    });
+
+    it("still lists five recent projects when Home is among them", async () => {
+      useAppStore.setState({ homeDir: "/home/me" });
+      recentProjectsMock.mockResolvedValue(
+        ["/home/me", "/w/a", "/w/b", "/w/c", "/w/d", "/w/e"].map((path) => ({
+          path,
+          name: path.split("/").pop(),
+          last_opened_at: "2026-10-01T10:00:00Z",
+        })),
+      );
+      render(<ChatHomeLanding composer={<div />} />);
+      const list = await screen.findByRole("region", { name: "Recent projects" });
+      expect(recentProjectsMock).toHaveBeenCalledWith(6);
+      expect(list.querySelectorAll("li")).toHaveLength(5);
+      expect(list).not.toHaveTextContent("/home/me");
     });
 
     it("hides the project actions once a workspace exists", () => {

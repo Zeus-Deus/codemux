@@ -4,8 +4,10 @@ import { Button } from "@/components/ui/button";
 import { MenuKeycap } from "@/components/ui/menu-chrome";
 import {
   RecentProjectList,
+  describeError,
   useRecentProjects,
 } from "@/components/layout/recent-projects";
+import { toast } from "@/lib/toast";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useAppStore } from "@/stores/app-store";
 import { LocalSessionImportEntry } from "./LocalSessionImportEntry";
@@ -41,14 +43,20 @@ export function ChatHomeLanding({ composer, notice, onProjectOpened }: Props) {
         <h1 className="px-4 text-3xl font-medium tracking-tight text-foreground text-center">
           What should we do today?
         </h1>
-        {/* The composer carries the shared column rails itself (see
-            chat-column.ts), so the landing card lines up with the
-            mid-conversation composer at every pane width. */}
-        <div className="flex w-full flex-col gap-2">
-          {notice}
-          {composer}
+        {/* The project actions sit closer to the composer than the
+            headline does, so they read as part of the same start step. */}
+        <div className="flex w-full flex-col items-center gap-4">
+          {/* The composer carries the shared column rails itself (see
+              chat-column.ts), so the landing card lines up with the
+              mid-conversation composer at every pane width. */}
+          <div className="flex w-full flex-col gap-2">
+            {notice}
+            {composer}
+          </div>
+          {noWorkspaces && (
+            <FirstProjectActions onProjectOpened={onProjectOpened} />
+          )}
         </div>
-        {noWorkspaces && <FirstProjectActions onProjectOpened={onProjectOpened} />}
         <LocalSessionImportEntry firstRun />
       </div>
     </div>
@@ -64,12 +72,16 @@ function FirstProjectActions({
   const recentProjects = useRecentProjects(true);
 
   const handleOpenProject = async () => {
-    const result = await openProject();
-    if (result.success && result.path) onProjectOpened?.(result.path);
+    try {
+      const result = await openProject();
+      if (result.success && result.path) onProjectOpened?.(result.path);
+    } catch (err) {
+      toast.error(`Couldn't open the project: ${describeError(err)}`);
+    }
   };
 
   return (
-    <div className="-mt-4 flex w-full max-w-[400px] flex-col items-center gap-3 px-4">
+    <div className="flex w-full max-w-[400px] flex-col items-center gap-3 px-4">
       <div className="flex flex-wrap items-center justify-center gap-2">
         <Button variant="outline" size="sm" onClick={() => void handleOpenProject()}>
           <FolderOpen />

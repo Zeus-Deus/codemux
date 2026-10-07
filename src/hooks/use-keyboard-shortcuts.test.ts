@@ -18,6 +18,7 @@ import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { activateWorkspace, undockBrowserFromRightPanel } from "@/tauri/commands";
 import {
   setJumpTargets,
@@ -296,6 +297,22 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       useAppStore.setState({ appState: null });
       const handled = dispatch("newAgent", FAKE_EVENT);
       expect(handled).toBe(true);
+    });
+
+    it("newAgent shows the home draft and asks for its composer focus", () => {
+      // A repeat Ctrl+N lands on the empty home draft already on screen, so
+      // the focus request is the only visible effect; it must name that draft.
+      const handled = dispatch("newAgent", FAKE_EVENT);
+      expect(handled).toBe(true);
+      const { activeDraftId, draftsById } = useChatDraftStore.getState();
+      expect(activeDraftId).not.toBeNull();
+      expect(draftsById[activeDraftId!]?.lockedToHome).toBe(true);
+      expect(useDraftComposerFocusStore.getState().request?.draftId).toBe(activeDraftId);
+
+      useDraftComposerFocusStore.getState().clear();
+      dispatch("newAgent", FAKE_EVENT);
+      expect(useChatDraftStore.getState().activeDraftId).toBe(activeDraftId);
+      expect(useDraftComposerFocusStore.getState().request?.draftId).toBe(activeDraftId);
     });
 
     it("renameWorkspace targets the active workspace", () => {

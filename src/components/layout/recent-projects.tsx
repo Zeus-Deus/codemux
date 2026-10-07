@@ -27,13 +27,15 @@ export function useRecentProjects(enabled: boolean): RecentProject[] {
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
-    dbGetRecentProjects(RECENT_PROJECT_LIMIT)
+    // One extra row so dropping Home below still leaves a full list.
+    dbGetRecentProjects(RECENT_PROJECT_LIMIT + 1)
       .then((rows) => {
         if (cancelled) return;
         setProjects(
           (rows ?? [])
             // Home is a chat location, not a project to reopen.
             .filter((row) => row.path !== homeDir)
+            .slice(0, RECENT_PROJECT_LIMIT)
             .map(({ path, name }) => ({ path, name })),
         );
       })
@@ -47,7 +49,7 @@ export function useRecentProjects(enabled: boolean): RecentProject[] {
   return projects;
 }
 
-function describeError(err: unknown): string {
+export function describeError(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
 }
