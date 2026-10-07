@@ -97,12 +97,18 @@ const ARBITRARY_CODE_PROGRAMS = new Set([
 /** Package-manager subcommands that fetch or run an arbitrary package
  *  (`npm exec`, `pnpm dlx`, `yarn dlx`, `bun x`), at any depth. `uv tool
  *  run`, the long form of `uvx`, is checked separately because `run`
- *  alone (`npm run build`) is safe. */
+ *  alone (`npm run build`) is safe for most programs; `COMMAND_RUNNERS`
+ *  lists the exceptions. */
 const ARBITRARY_CODE_SUBCOMMANDS = new Set(["exec", "dlx", "x"]);
 /** Package managers with such a subcommand. A bare `Bash(npm:*)` rule,
  *  derived when a flag comes first (`npm --prefix app exec …`), would
  *  also allow it, so they need at least one subcommand word. */
 const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "uv"]);
+/** Programs whose `run` takes any command or remote package rather than a
+ *  project script (`uv run --with httpx python`, `poetry run bash`,
+ *  `go run example.com/tool@latest`). Their rule must name a command after
+ *  `run`, and not a shell or interpreter. */
+const COMMAND_RUNNERS = new Set(["uv", "poetry", "go"]);
 /** Characters that would end or nest Claude's `Tool(content)` rule
  *  syntax. */
 const RULE_DELIMITERS = /[()]/;
@@ -153,7 +159,11 @@ export function suggestPermissionRule(
       // (`uv tool --quiet run ruff`), would allow `uv tool run` too.
       (family === "uv" &&
         subcommands[0] === "tool" &&
-        (subcommands.length < 2 || subcommands[1] === "run"))
+        (subcommands.length < 2 || subcommands[1] === "run")) ||
+      (COMMAND_RUNNERS.has(family) &&
+        subcommands[0] === "run" &&
+        (subcommands.length < 2 ||
+          ARBITRARY_CODE_PROGRAMS.has(subcommands[1].replace(/\d+$/, ""))))
     ) {
       return null;
     }

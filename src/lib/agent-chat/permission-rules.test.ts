@@ -145,6 +145,7 @@ describe("suggestPermissionRule", () => {
     expect(bash("ls -la")).toEqual({ toolName: "Bash", ruleContent: "ls:*" });
     expect(bash("cat README.md")).toEqual({ toolName: "Bash", ruleContent: "cat:*" });
     expect(bash("uv tool list")).toEqual({ toolName: "Bash", ruleContent: "uv tool list:*" });
+    expect(bash("uv run pytest -x")).toEqual({ toolName: "Bash", ruleContent: "uv run pytest:*" });
   });
 
   it("offers no scoped rule for chained, redirected or env-prefixed commands", () => {
@@ -180,6 +181,15 @@ describe("suggestPermissionRule", () => {
     expect(bash("uv tool --directory app run ruff")).toBeNull();
     expect(bash("uv tool")).toBeNull();
     expect(bash("yarn")).toBeNull();
+    // `uv run`, `poetry run` and `go run` take any command or remote package.
+    expect(bash("uv run --python 3.12 python -c 'print(1)'")).toBeNull();
+    expect(bash("uv run python -c 'print(1)'")).toBeNull();
+    expect(bash("uv run python3 script.py")).toBeNull();
+    expect(bash("poetry run bash scripts/x.sh")).toBeNull();
+    expect(bash("go run example.com/tool@latest")).toBeNull();
+    expect(bash("go run main.go")).toBeNull();
+    // Run-anything verbs are refused at any depth, even under other programs.
+    expect(bash("docker compose exec web sh")).toBeNull();
     // A program that merely starts with an interpreter's name is fine.
     expect(bash("shellcheck x.sh")).toEqual({ toolName: "Bash", ruleContent: "shellcheck:*" });
   });
