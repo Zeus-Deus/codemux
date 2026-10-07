@@ -307,6 +307,16 @@ pub struct PrReviewThread {
     pub is_resolvable: bool,
     pub path: Option<String>,
     pub line: Option<u32>,
+    /// Which column `line` counts in: `"LEFT"` (the old file) or
+    /// `"RIGHT"` (the new one). A thread on a deleted line is numbered in
+    /// the old file, and drawing it at that number on the new side would
+    /// pin it to a line nobody commented on.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// First line of a multi-line thread, on the same side. What a
+    /// suggestion on the thread replaces runs from here to `line`.
+    #[serde(default)]
+    pub start_line: Option<u32>,
     pub comments: Vec<PrThreadComment>,
 }
 
@@ -2847,7 +2857,7 @@ repository(owner:$owner,name:$name){{\
 pullRequest(number:$number){{\
 reviewThreads(first:50,after:$endCursor){{\
 pageInfo{{hasNextPage endCursor}}\
-nodes{{id isResolved isOutdated path line \
+nodes{{id isResolved isOutdated path line startLine diffSide \
 comments(first:100){{pageInfo{{hasNextPage endCursor}}{THREAD_COMMENT_NODES}}}}}}}}}}}}}"
     )
 }
@@ -3034,6 +3044,8 @@ pub(crate) fn parse_review_threads(json: &str) -> Vec<PrReviewThread> {
                 is_resolvable: true,
                 path: node["path"].as_str().map(|s| s.to_string()),
                 line: node["line"].as_u64().map(|n| n as u32),
+                side: node["diffSide"].as_str().map(|s| s.to_string()),
+                start_line: node["startLine"].as_u64().map(|n| n as u32),
                 comments,
             });
         }
@@ -4978,7 +4990,7 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
 
     const UNRESOLVED_THREAD: &str = r#"{
         "id":"PRRT_kwDOA","isResolved":false,"isOutdated":false,
-        "path":"src/stores/draft-store.ts","line":84,
+        "path":"src/stores/draft-store.ts","line":84,"startLine":82,"diffSide":"RIGHT",
         "comments":{"nodes":[
           {"id":"PRRC_1","databaseId":8001,"author":{"login":"juliusm"},
            "body":"Worth a comment on why this survives a reload.","createdAt":"2026-08-16T09:00:00Z"},
@@ -5007,6 +5019,10 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         assert!(thread.is_resolvable);
         assert_eq!(thread.path.as_deref(), Some("src/stores/draft-store.ts"));
         assert_eq!(thread.line, Some(84));
+        // The side and the range start are what let the Code tab hang the
+        // thread on the right row and a suggestion replace the right lines.
+        assert_eq!(thread.side.as_deref(), Some("RIGHT"));
+        assert_eq!(thread.start_line, Some(82));
         assert_eq!(thread.comments.len(), 2);
         // The REST id rides along: it is what the reply endpoint
         // addresses and what the UI dedupes the flat list against.
@@ -5023,6 +5039,10 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         // A thread whose lines left the diff has no line, and that is
         // not an error — it is the definition of outdated.
         assert_eq!(threads[0].line, None);
+        // Fields the payload does not carry stay absent rather than
+        // being guessed.
+        assert_eq!(threads[0].side, None);
+        assert_eq!(threads[0].start_line, None);
     }
 
     /// `--paginate` concatenates one *object* per page here (the timeline

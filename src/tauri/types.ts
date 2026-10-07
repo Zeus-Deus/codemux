@@ -173,6 +173,11 @@ export interface PrReviewThread {
   is_resolvable: boolean;
   path: string | null;
   line: number | null;
+  /** Which column `line` counts in. Absent from older payloads, where
+   *  RIGHT (the new file) is the safe reading. */
+  side?: "LEFT" | "RIGHT" | null;
+  /** First line of a multi-line thread, on the same side. */
+  start_line?: number | null;
   comments: PrThreadComment[];
 }
 
@@ -588,6 +593,12 @@ export interface CommitFileEntry {
 export interface CommitSummary {
   short_hash: string;
   subject: string;
+  body: string;
+}
+
+/** Mirrors src-tauri/src/ai.rs:PrDescriptionDraft. */
+export interface PrDescriptionDraft {
+  title: string;
   body: string;
 }
 

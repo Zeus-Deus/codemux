@@ -351,3 +351,130 @@ describe("capability gating", () => {
     );
   });
 });
+
+describe("comment content", () => {
+  it("renders comment bodies as Markdown rather than raw text", () => {
+    renderThreads({
+      threads: [
+        thread({
+          comments: [
+            {
+              id: "C1",
+              database_id: 1,
+              author: "review-bot",
+              body: "**Nit:** use `MAX`.\n\n- one\n- two",
+              created_at: "",
+            },
+          ],
+        }),
+      ],
+      reviews: [review({ id: 77, body: "Looks *good*." })],
+    });
+    const open = screen.getByTestId("review-thread");
+    expect(within(open).getByText("Nit:").tagName).toBe("STRONG");
+    expect(within(open).getByText("MAX").tagName).toBe("CODE");
+    expect(within(open).getAllByRole("listitem")).toHaveLength(2);
+    expect(screen.getByText("good").tagName).toBe("EM");
+    expect(screen.queryByText(/\*\*Nit/)).not.toBeInTheDocument();
+  });
+
+  it("shows a suggestion as a change against its lines and applies it", async () => {
+    const user = userEvent.setup();
+    const onApply = vi.fn().mockResolvedValue(undefined);
+    const suggestionTargetFor = vi.fn().mockReturnValue({
+      start: 11,
+      original: ["  old one", "  old two"],
+      onApply,
+    });
+    renderThreads({
+      threads: [
+        thread({
+          line: 12,
+          start_line: 11,
+          comments: [
+            {
+              id: "C1",
+              database_id: 1,
+              author: "review-bot",
+              body: "Try this:\n```suggestion\n  new line\n```",
+              created_at: "",
+            },
+          ],
+        }),
+      ],
+      suggestionTargetFor,
+    });
+
+    expect(suggestionTargetFor).toHaveBeenCalledWith({
+      path: "src/a.ts",
+      side: "RIGHT",
+      start: 11,
+      end: 12,
+    });
+    const block = screen.getByTestId("comment-suggestion");
+    expect(within(block).getByText("old one", { exact: false })).toBeInTheDocument();
+    expect(within(block).getByText("new line", { exact: false })).toBeInTheDocument();
+    // The fence itself is never shown as text.
+    expect(screen.queryByText(/```/)).not.toBeInTheDocument();
+
+    await user.click(within(block).getByTestId("apply-suggestion"));
+    expect(onApply).toHaveBeenCalledWith(["  new line"]);
+    await waitFor(() =>
+      expect(within(block).getByTestId("apply-suggestion")).toHaveTextContent("Applied"),
+    );
+  });
+
+  it("offers no Apply where the branch is not checked out", () => {
+    renderThreads({
+      threads: [
+        thread({
+          comments: [
+            {
+              id: "C1",
+              database_id: 1,
+              author: "review-bot",
+              body: "```suggestion\nx\n```",
+              created_at: "",
+            },
+          ],
+        }),
+      ],
+      suggestionTargetFor: () => ({ start: 12, original: ["y"] }),
+    });
+    expect(screen.getByTestId("comment-suggestion")).toBeInTheDocument();
+    expect(screen.queryByTestId("apply-suggestion")).not.toBeInTheDocument();
+  });
+});
+
+describe("anchors", () => {
+  it("jumps to the thread's line, on its side, from open and resolved threads", async () => {
+    const user = userEvent.setup();
+    const onJumpToLine = vi.fn();
+    renderThreads({
+      threads: [
+        thread({ id: "T-open", path: "src/a.ts", line: 12 }),
+        thread({ id: "T-done", is_resolved: true, path: "src/b.ts", line: 4, side: "LEFT" }),
+      ],
+      onJumpToLine,
+    });
+    const [openAnchor, doneAnchor] = screen.getAllByTestId("thread-anchor");
+    await user.click(openAnchor);
+    expect(onJumpToLine).toHaveBeenLastCalledWith("src/a.ts", "RIGHT", 12);
+    await user.click(doneAnchor);
+    expect(onJumpToLine).toHaveBeenLastCalledWith("src/b.ts", "LEFT", 4);
+    // The resolved thread stayed folded: the anchor is not its header.
+    expect(screen.getByTestId("thread-resolved-header-T-done")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("is a plain label when there is no line to go to", () => {
+    renderThreads({
+      threads: [thread({ line: null, is_outdated: true })],
+      onJumpToLine: vi.fn(),
+    });
+    expect(screen.queryByTestId("thread-anchor")).not.toBeInTheDocument();
+    expect(screen.getByText("src/a.ts")).toBeInTheDocument();
+  });
+});

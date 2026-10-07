@@ -15,11 +15,13 @@ import {
   gitPullChanges,
   gitStashPush,
   mergePullRequest,
+  readFile,
   replyToPrThread,
   setPrReady,
   setPrThreadResolved,
   submitPrReview,
   submitPrReviewWithComments,
+  writeFile,
 } from "@/tauri/commands";
 import type {
   CheckInfo,
@@ -43,12 +45,19 @@ import {
   type ReviewThreadTask,
 } from "@/lib/pr-agent-handoff";
 import { checkOutPr } from "@/lib/pr-checkout";
+import { indexDiffRows } from "@/lib/pr-anchor";
+import { joinPath } from "@/lib/pr-draft";
+import { applySuggestion, hasSuggestion, originalLines } from "@/lib/pr-suggestion";
 import { ReviewHeader } from "./review-header";
 import { ReviewTabStrip, type ReviewTab } from "./review-tab-strip";
 import { ReviewChecks } from "./review-checks";
 import { ReviewReviewers } from "./review-reviewers";
 import { ReviewDescription } from "./review-description";
-import { ReviewThreads } from "./review-threads";
+import {
+  ReviewThreads,
+  type JumpToLine,
+  type SuggestionResolver,
+} from "./review-threads";
 import { ReviewActionBar, type ActionBarState } from "./review-action-bar";
 import { MergeSheet, type MergeRequestPayload } from "./merge-sheet";
 import {
@@ -187,6 +196,8 @@ export interface ReviewDetailProps {
   onOpenChanges?: () => void;
 }
 
+const NO_THREADS: PrReviewThread[] = [];
+
 /**
  * The PR detail surface.
  *
@@ -261,16 +272,49 @@ export function ReviewDetail(props: ReviewDetailProps) {
     setForcePushedAt(null);
   }, [key]);
 
+  const pollingActive = usePrPollingActive();
+  const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
+  const canFetch = pollingActive && !paused;
+
+  // ── Review threads ──
+  //
+  // Like the other conversation queries — a reply is not something
+  // you sit and watch arrive. Gated on `list_read` rather than on the
+  // two thread *write* operations, because reading who said what is
+  // reading: a host that serves threads but declares neither write shows
+  // them, without a composer or a Resolve button. A host that declares
+  // nothing never reaches this component at all.
+  const threadsQuery = useQuery({
+    queryKey: ["pr", "review-threads", cwd, pr.number] as const,
+    queryFn: () => getPrReviewThreads(cwd, pr.number),
+    enabled: canFetch && operations.list_read,
+    refetchOnWindowFocus: false,
+    staleTime: PR_CONVERSATION_POLL_MS,
+    refetchInterval: PR_CONVERSATION_POLL_MS,
+    retry: prQueryRetry,
+  });
+
+  // Stale and labelled beats blank: a failed refetch keeps the threads
+  // that are on screen (react-query holds the last good data), and the
+  // notice slot already says how old the surface's data is.
+  const threads: PrReviewThread[] = threadsQuery.data ?? NO_THREADS;
+
   // ── The diff ──
   //
   // Fetched for the Code tab, and also whenever notes are pending even
   // if you're reading Summary: a force-push has to be able to tell you
   // how many of your notes stopped matching without you going looking.
   // Keyed on the head sha, so a rewrite refetches by itself.
-  const pollingActive = usePrPollingActive();
-  const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
-  const canFetch = pollingActive && !paused;
-  const needsDiff = activeTab === "code" || lineDrafts.length > 0;
+  //
+  // A suggestion is shown as a change against the lines it replaces, and
+  // those lines come from the diff — so a thread carrying one is a reason
+  // to fetch it even on Summary.
+  const threadsHaveSuggestions = useMemo(
+    () => threads.some((t) => t.comments.some((c) => hasSuggestion(c.body))),
+    [threads],
+  );
+
+  const needsDiff = activeTab === "code" || lineDrafts.length > 0 || threadsHaveSuggestions;
   const diffQuery = useQuery({
     queryKey: ["pr", "review-diff", cwd, pr.number, pr.head_ref_oid],
     queryFn: () => getPrReviewDiff(cwd, pr.number),
@@ -289,6 +333,33 @@ export function ReviewDetail(props: ReviewDetailProps) {
     putDiffSnapshot(key, pr.head_ref_oid, diffText);
     reanchorLineDrafts(key, diffText, pr.head_ref_oid);
   }, [diffText, pr.head_ref_oid, key]);
+
+  // ── Suggestions ──
+  //
+  // Applied only where this branch is checked out, and only on the new
+  // side: that is the file a suggestion edits. Anywhere else the change
+  // is still shown, and the thread's Send to agent still hands it over.
+  const anchorIndex = useMemo(() => indexDiffRows(diffText), [diffText]);
+  const canApplySuggestions = checkedOutHere && !readOnly;
+  const suggestionTargetFor = useCallback<SuggestionResolver>(
+    ({ path, side, start, end }) => {
+      const original = originalLines(anchorIndex, path, side, start, end);
+      const applicable = canApplySuggestions && side === "RIGHT" && original != null;
+      return {
+        start,
+        original,
+        onApply: applicable
+          ? async (replacement: string[]) => {
+              const file = joinPath(cwd, path);
+              const text = await readFile(file);
+              await writeFile(file, applySuggestion(text, start, end, original, replacement));
+              toast.success(`Applied to ${path}`);
+            }
+          : undefined,
+      };
+    },
+    [anchorIndex, canApplySuggestions, cwd],
+  );
 
   const unanchoredCount = lineDrafts.filter((d) => d.status === "unanchored").length;
   const blockedSubmitReason = submitBlockedReason(lineDrafts, pr.head_ref_oid);
@@ -335,30 +406,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
     retry: prQueryRetry,
   });
 
-  // ── Review threads ──
-  //
-  // Like the other conversation queries — a reply is not something
-  // you sit and watch arrive. Gated on `list_read` rather than on the
-  // two thread *write* operations, because reading who said what is
-  // reading: a host that serves threads but declares neither write shows
-  // them, without a composer or a Resolve button. A host that declares
-  // nothing never reaches this component at all.
-  const threadsQuery = useQuery({
-    queryKey: ["pr", "review-threads", cwd, pr.number] as const,
-    queryFn: () => getPrReviewThreads(cwd, pr.number),
-    enabled: canFetch && operations.list_read,
-    refetchOnWindowFocus: false,
-    staleTime: PR_CONVERSATION_POLL_MS,
-    refetchInterval: PR_CONVERSATION_POLL_MS,
-    retry: prQueryRetry,
-  });
-
   usePrRefusal(cwd, provider.kind, [diffQuery, timelineQuery, threadsQuery]);
 
-  // Stale and labelled beats blank: a failed refetch keeps the threads
-  // that are on screen (react-query holds the last good data), and the
-  // notice slot already says how old the surface's data is.
-  const threads: PrReviewThread[] = threadsQuery.data ?? [];
 
   const replyToThread = useCallback(
     async (thread: PrReviewThread, body: string) => {
@@ -417,9 +466,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
       ? Date.now() - timelineQuery.dataUpdatedAt
       : null;
 
-  const openCodeTab = useCallback((kind: CodeTabIntent["kind"]) => {
+  const openCodeTab = useCallback((kind: "repin" | "old-diff") => {
     setActiveTab("code");
     setCodeIntent({ kind, nonce: Date.now() });
+  }, []);
+
+  const jumpToLine = useCallback<JumpToLine>((path, side, line) => {
+    setActiveTab("code");
+    setCodeIntent({ kind: "focus", path, side, line, nonce: Date.now() });
   }, []);
 
   // ── Check arithmetic, shared by the bar sentence and the rail ──
@@ -1110,6 +1164,13 @@ export function ReviewDetail(props: ReviewDetailProps) {
           canCommentNow={operations.line_comments && !readOnly}
           onPosted={onRefresh}
           intent={codeIntent}
+          threads={threads}
+          onSendToAgent={canHandOff ? sendThreadToAgent : undefined}
+          onReply={operations.thread_reply && !readOnly ? replyToThread : undefined}
+          onSetResolved={
+            operations.thread_resolve && !readOnly ? setThreadResolved : undefined
+          }
+          suggestionTargetFor={suggestionTargetFor}
         />
       ) : (
       /* Status before description, deliberately: what you need to know
@@ -1162,6 +1223,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
           onSetResolved={
             operations.thread_resolve && !readOnly ? setThreadResolved : undefined
           }
+          suggestionTargetFor={suggestionTargetFor}
+          onJumpToLine={jumpToLine}
         />
       </div>
       )}

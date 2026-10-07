@@ -6,8 +6,16 @@ import { anchorContext, indexDiffRows } from "@/lib/pr-anchor";
 import { splitDiffFiles, type PrDiffFile } from "@/lib/pr-diff";
 import type { DiffLine } from "@/lib/diff-parser";
 import type { DiffRowSide, DiffSelection } from "@/components/diff/diff-row";
+import type { ReviewThreadTask } from "@/lib/pr-agent-handoff";
+import type { PrReviewThread } from "@/tauri/types";
 import { ReviewCodeFile } from "./review-code-file";
 import { ReviewLineComposer } from "./review-line-composer";
+import {
+  CodeThread,
+  threadSide,
+  useOptimisticResolve,
+  type SuggestionResolver,
+} from "./review-threads";
 import { btnCard, tzBody, tzBodyLg, tzEyebrow, tzMeta, tzMetaNum } from "./review-ui";
 import {
   addLineDraft,
@@ -31,10 +39,10 @@ import {
  * the nonce to enter a mode. A nonce rather than a boolean so the same
  * action can be taken twice in a row.
  */
-export interface CodeTabIntent {
-  kind: "repin" | "old-diff";
-  nonce: number;
-}
+export type CodeTabIntent =
+  | { kind: "repin" | "old-diff"; nonce: number }
+  /** Scroll to one line and mark it — a thread's anchor was clicked. */
+  | { kind: "focus"; nonce: number; path: string; side: DiffRowSide; line: number };
 
 interface Props {
   draftKey: DraftKey;
@@ -59,6 +67,42 @@ interface Props {
   canCommentNow: boolean;
   onPosted: () => void;
   intent: CodeTabIntent | null;
+  /**
+   * The conversation already on this diff, drawn under the lines it is
+   * about so nobody repeats a point a reviewer or a bot already made.
+   */
+  threads?: PrReviewThread[];
+  onSendToAgent?: (task: ReviewThreadTask) => Promise<unknown>;
+  onReply?: (thread: PrReviewThread, body: string) => Promise<unknown>;
+  onSetResolved?: (thread: PrReviewThread, resolved: boolean) => Promise<unknown>;
+  suggestionTargetFor?: SuggestionResolver;
+}
+
+const NO_THREADS: PrReviewThread[] = [];
+
+function threadKey(path: string, side: DiffRowSide, line: number): string {
+  return `${path}\u0000${side}\u0000${line}`;
+}
+
+/**
+ * A brief ember wash on a row someone was sent to, so the eye lands on
+ * it after the scroll. Skipped under reduced motion, where the scroll
+ * alone is the signal.
+ */
+function flashRow(el: HTMLElement) {
+  if (typeof el.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  el.animate(
+    [
+      { backgroundColor: "color-mix(in oklch, var(--accent-ember) 20%, transparent)" },
+      { backgroundColor: "transparent" },
+    ],
+    { duration: 600, easing: "ease-out" },
+  );
+}
+
+function scrollBehavior(): ScrollBehavior {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
 }
 
 interface Selection {
@@ -82,6 +126,11 @@ export function ReviewCodeTab({
   canCommentNow,
   onPosted,
   intent,
+  threads = NO_THREADS,
+  onSendToAgent,
+  onReply,
+  onSetResolved,
+  suggestionTargetFor,
 }: Props) {
   const drafts = useLineDrafts(draftKey);
   const viewed = useViewedFiles(draftKey);
@@ -94,6 +143,14 @@ export function ReviewCodeTab({
   const [repinId, setRepinId] = useState<string | null>(null);
   /** Non-null while showing the diff a note was written against. */
   const [oldDiffOid, setOldDiffOid] = useState<string | null>(null);
+  /** The line a thread's anchor sent us to; its file stays open. */
+  const [focus, setFocus] = useState<{
+    path: string;
+    side: DiffRowSide;
+    line: number;
+    nonce: number;
+  } | null>(null);
+  const { resolvedOf, toggleResolved } = useOptimisticResolve(threads, onSetResolved);
   const rootRef = useRef<HTMLDivElement>(null);
 
   /**
@@ -126,6 +183,16 @@ export function ReviewCodeTab({
   useEffect(() => {
     if (!intent || intent.nonce === handledNonce.current) return;
     handledNonce.current = intent.nonce;
+    if (intent.kind === "focus") {
+      setOldDiffOid(null);
+      setFocus({
+        path: intent.path,
+        side: intent.side,
+        line: intent.line,
+        nonce: intent.nonce,
+      });
+      return;
+    }
     if (intent.kind === "old-diff") {
       const oid = drafts.find((d) => d.status === "unanchored")?.headOidAtDraft ?? null;
       setOldDiffOid(oid && getDiffSnapshot(draftKey, oid) ? oid : null);
@@ -159,6 +226,40 @@ export function ReviewCodeTab({
 
   const files = useMemo(() => splitDiffFiles(renderedDiff), [renderedDiff]);
   const anchorIndex = useMemo(() => indexDiffRows(diffText), [diffText]);
+
+  // Scroll once the target can exist: the diff may still be loading when
+  // the tab opens, and the file only expands on the render after `focus`.
+  const scrolledNonce = useRef(0);
+  useEffect(() => {
+    if (!focus || focus.nonce === scrolledNonce.current || files.length === 0) return;
+    scrolledNonce.current = focus.nonce;
+    requestAnimationFrame(() => {
+      const file = rootRef.current?.querySelector<HTMLElement>(
+        `[data-file-path="${CSS.escape(focus.path)}"]`,
+      );
+      const row = file?.querySelector<HTMLElement>(
+        `[data-diff-row="${focus.side}:${focus.line}"]`,
+      );
+      // A file too large to render by default has no rows yet; its
+      // header is the nearest honest place to land.
+      (row ?? file)?.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
+      if (row) flashRow(row);
+    });
+  }, [focus, files]);
+
+  /** Threads by the coordinate they hang under. Outdated threads have no
+   *  line in this diff and stay on Summary. */
+  const threadsByRow = useMemo(() => {
+    const map = new Map<string, PrReviewThread[]>();
+    for (const thread of threads) {
+      if (!thread.path || thread.line == null) continue;
+      const key = threadKey(thread.path, threadSide(thread), thread.line);
+      const list = map.get(key);
+      if (list) list.push(thread);
+      else map.set(key, [thread]);
+    }
+    return map;
+  }, [threads]);
 
   const draftsByFile = useMemo(() => {
     const map = new Map<string, LineDraft[]>();
@@ -387,11 +488,27 @@ export function ReviewCodeTab({
           selection?.path === file.path &&
           at(selection.side, selection.end) &&
           !editingId;
+        const rowThreads = coords.flatMap(
+          (c) => threadsByRow.get(threadKey(file.path, c.side, c.line)) ?? [],
+        );
 
-        if (!notes.length && !composerHere) return null;
+        if (!notes.length && !composerHere && !rowThreads.length) return null;
 
         return (
           <>
+            {/* What others already said comes before what you are
+                writing, the order you would read it on the host. */}
+            {rowThreads.map((thread) => (
+              <CodeThread
+                key={thread.id}
+                thread={thread}
+                resolved={resolvedOf(thread)}
+                onSendToAgent={onSendToAgent}
+                onReply={onReply}
+                onSetResolved={toggleResolved}
+                suggestionTargetFor={suggestionTargetFor}
+              />
+            ))}
             {notes.map((note) =>
               editingId === note.id ? (
                 <ReviewLineComposer
@@ -451,6 +568,12 @@ export function ReviewCodeTab({
       addNote,
       commentNow,
       canCommentNow,
+      threadsByRow,
+      resolvedOf,
+      toggleResolved,
+      onSendToAgent,
+      onReply,
+      suggestionTargetFor,
     ],
   );
 
@@ -610,12 +733,19 @@ export function ReviewCodeTab({
               layout={layout}
               hideWhitespace={hideWhitespace}
               viewed={viewed.has(file.path)}
-              onToggleViewed={() => toggleFileViewed(draftKey, file.path)}
+              onToggleViewed={() => {
+                // Marking the file you were sent to as viewed is asking
+                // for it to fold, so the reveal stops holding it open.
+                if (focus?.path === file.path) setFocus(null);
+                toggleFileViewed(draftKey, file.path);
+              }}
               // Reading a stale snapshot is reading, not reviewing:
               // notes written there would anchor to lines that are gone.
               selection={showingOld ? undefined : selectionFor(file)}
               pendingNotes={(draftsByFile.get(file.path) ?? []).length}
-              forceOpen={repinId != null && repinPath === file.path}
+              forceOpen={
+                (repinId != null && repinPath === file.path) || focus?.path === file.path
+              }
             />
           ))
         )}
