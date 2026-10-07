@@ -46,6 +46,7 @@ import {
 import { useUIStore } from "@/stores/ui-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useUpdateStatusStore } from "@/stores/update-status-store";
+import { manualUpdateCommand, releasePageUrl } from "@/lib/update-release";
 import { cn } from "@/lib/utils";
 import {
   MENU_ROW,
@@ -87,8 +88,12 @@ function AppMenuFooter({ version }: { version: string | null }) {
   const published = useUpdateStatusStore((s) => s.published);
   const updateVersion = useUpdateStatusStore((s) => s.updateVersion);
   const isRemote = useUpdateStatusStore((s) => s.isRemote);
+  const canAutoUpdate = useUpdateStatusStore((s) => s.canAutoUpdate);
+  const packageFormat = useUpdateStatusStore((s) => s.packageFormat);
+  const errorMessage = useUpdateStatusStore((s) => s.errorMessage);
   const startDownload = useUpdateStatusStore((s) => s.startDownload);
   const installAndRestart = useUpdateStatusStore((s) => s.installAndRestart);
+  const retry = useUpdateStatusStore((s) => s.retry);
   const requestDesktopUpdate = useUpdateStatusStore(
     (s) => s.requestDesktopUpdate,
   );
@@ -98,16 +103,29 @@ function AppMenuFooter({ version }: { version: string | null }) {
   let label = "Up to date";
   let tone = "text-status-open";
   let action: (() => void) | null = null;
+  let title = updateVersion ? `Version ${updateVersion}` : undefined;
   if (state === "checking") {
     label = "Checking…";
     tone = "text-muted-foreground";
   } else if (state === "update-available") {
     // The remote client has no updater plugin, so `startDownload` there is a
     // no-op; its only route is asking the desktop to update itself, exactly as
-    // the toast's "Update & restart desktop" button does.
+    // the toast's "Update & restart desktop" button does. A package-manager
+    // install cannot be replaced in place either, so it opens the release
+    // page, as the toast does.
     label = isRemote ? "Update desktop" : "Update available";
     tone = "text-status-working";
-    action = isRemote ? requestDesktopUpdate : startDownload;
+    if (isRemote) {
+      action = requestDesktopUpdate;
+    } else if (canAutoUpdate) {
+      action = startDownload;
+    } else {
+      action = () => void openUrl(releasePageUrl(updateVersion));
+      const command = manualUpdateCommand(packageFormat);
+      title = `Version ${updateVersion}. ${
+        command ? `Run: ${command}` : "Update with your package manager"
+      }`;
+    }
   } else if (state === "downloading") {
     label = "Downloading…";
     tone = "text-status-working";
@@ -116,8 +134,12 @@ function AppMenuFooter({ version }: { version: string | null }) {
     tone = "text-status-working";
     action = installAndRestart;
   } else if (state === "error") {
-    label = "Update failed";
+    // The strip has room for the action, not the reason; the reason rides in
+    // the tooltip and in full on the toast.
+    label = "Retry update";
     tone = "text-status-attention";
+    action = retry;
+    title = `Update failed${errorMessage ? `: ${errorMessage}` : ""}`;
   }
 
   const status = (
@@ -140,7 +162,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
         <button
           type="button"
           onClick={action}
-          title={updateVersion ? `Version ${updateVersion}` : undefined}
+          title={title}
           className={cn(
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single

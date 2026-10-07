@@ -3577,7 +3577,10 @@ const handlers: Record<string, Handler> = {
   // Empty by default: plugins never alter a clean core-only UI. Synthetic
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
-  get_package_format: () => "AppImage",
+  get_package_format: () =>
+    updateMockScenario === "pacman" || updateMockScenario === "other"
+      ? updateMockScenario
+      : "appimage",
 
   // ── Settings ──
   get_synced_settings: () => structuredClone(SYNCED_SETTINGS),
@@ -6632,6 +6635,58 @@ async function showOpenerToast(url: unknown): Promise<void> {
   }
 }
 
+// ── Updater scenarios ──────────────────────────────────────────────
+//
+// Dev builds never run the update check. `?updateMock=` opts in so the toast
+// and app-menu footer states can be exercised (screenshots, manual QA):
+//   appimage — in-app install; the download streams progress and succeeds
+//   fail     — in-app install; the download stops at ~60% with a 404
+//   pacman   — AUR install; the toast shows the yay command
+//   other    — deb/rpm install; the toast points at the release page
+// The check runs after the checker's usual 5s initial delay.
+const updateMockScenario = new URLSearchParams(location.search).get("updateMock");
+if (updateMockScenario) {
+  (window as { __CODEMUX_MOCK_UPDATER__?: boolean }).__CODEMUX_MOCK_UPDATER__ = true;
+}
+
+async function mockUpdaterDownload(channel: unknown): Promise<void> {
+  const id = (channel as { id?: number } | undefined)?.id;
+  let index = 0;
+  const send = (message: unknown) => {
+    const cb = typeof id === "number" ? callbacks.get(id) : undefined;
+    cb?.fn({ index: index++, message } as unknown as never);
+  };
+  const total = 48_000_000;
+  const chunk = total / 20;
+  send({ event: "Started", data: { contentLength: total } });
+  for (let i = 0; i < 20; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (updateMockScenario === "fail" && i === 12) {
+      throw "Download request failed with status: 404 Not Found";
+    }
+    send({ event: "Progress", data: { chunkLength: chunk } });
+  }
+  send({ event: "Finished" });
+}
+
+function routeUpdater(cmd: string, args: Args): unknown {
+  if (!updateMockScenario) return null;
+  if (cmd === "plugin:updater|check") {
+    return {
+      rid: 1,
+      currentVersion: "0.23.1",
+      version: "0.24.0",
+      date: null,
+      body: "Mock release",
+      rawJson: {},
+    };
+  }
+  if (cmd === "plugin:updater|download_and_install") {
+    return mockUpdaterDownload(args.onEvent);
+  }
+  return null;
+}
+
 function routePlugin(cmd: string, args: Args): unknown {
   // Event system — the backbone of listen()/emit()/once().
   if (cmd === "plugin:event|listen") {
@@ -6678,8 +6733,8 @@ function routePlugin(cmd: string, args: Args): unknown {
     return undefined;
   }
 
-  // Updater — always "no update available".
-  if (cmd.startsWith("plugin:updater|")) return null;
+  // Updater — "no update available" unless `?updateMock=` picks a scenario.
+  if (cmd.startsWith("plugin:updater|")) return routeUpdater(cmd, args);
 
   // Dialogs — cancelled (null) so file pickers resolve cleanly.
   if (cmd.startsWith("plugin:dialog|")) return null;

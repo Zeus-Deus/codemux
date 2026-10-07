@@ -11,6 +11,7 @@ import {
 import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import type { WebRemoteStatus } from "@/tauri/types";
+import { describeUpdateError } from "@/lib/update-release";
 
 import { useUpdateStatusStore, type UpdateState } from "@/stores/update-status-store";
 
@@ -21,8 +22,14 @@ interface UpdateCheckerResult {
   updateVersion: string | null;
   downloadProgress: number;
   canAutoUpdate: boolean;
+  /** `get_package_format`'s answer, or null until it resolves. */
+  packageFormat: string | null;
+  /** Why the last download or restart failed, while `state` is `error`. */
+  errorMessage: string | null;
   startDownload: () => void;
   installAndRestart: () => void;
+  /** Re-run whichever step failed: the download, or the restart after it. */
+  retry: () => void;
   dismiss: () => void;
   dismissed: boolean;
   /**
@@ -56,8 +63,8 @@ const UPDATE_REQUESTED_EVENT = "web-remote-update-requested";
 
 /**
  * Install formats whose updates the Tauri updater can download and apply
- * in place. Everything else (deb/rpm/unknown) can only be pointed at the
- * release page. Keep this in sync with `get_package_format` in
+ * in place. Everything else (deb/rpm/pacman/unknown) belongs to a package
+ * manager, so the app can only point at it or at the release page. Keep this in sync with `get_package_format` in
  * `src-tauri/src/commands/update.rs`.
  */
 const AUTO_UPDATABLE_FORMATS = new Set(["appimage", "nsis"]);
@@ -99,17 +106,33 @@ export function desktopUpdateFromStatus(
 /**
  * What the desktop should do when a web client asks it to update, given the
  * desktop's current updater state. `ready` → restart; a fresh
- * `update-available` (with a real `Update` in hand) → start the download;
- * anything mid-flight (`checking`/`downloading`) or with nothing available →
- * do nothing. Pure so the request-handler branch is unit-testable.
+ * `update-available` (with a real `Update` in hand, on an install the updater
+ * can replace) → start the download; anything mid-flight
+ * (`checking`/`downloading`), a package-manager install, or nothing available
+ * → do nothing. Pure so the request-handler branch is unit-testable.
  */
 export function updateAdvanceAction(
   state: UpdateState,
   hasUpdate: boolean,
+  canAutoUpdate = true,
 ): "download" | "restart" | "none" {
   if (state === "ready") return "restart";
-  if (state === "update-available" && hasUpdate) return "download";
+  if (state === "update-available" && hasUpdate && canAutoUpdate) {
+    return "download";
+  }
   return "none";
+}
+
+/**
+ * Dev builds skip the native check, except when the browser mock opts in
+ * with `?updateMock=…` so the toast and footer states can be exercised.
+ */
+function updaterDisabledInDev(): boolean {
+  return (
+    import.meta.env.DEV &&
+    (window as { __CODEMUX_MOCK_UPDATER__?: boolean })
+      .__CODEMUX_MOCK_UPDATER__ !== true
+  );
 }
 
 /**
@@ -133,7 +156,9 @@ export function useUpdateChecker(): UpdateCheckerResult {
   const [state, setState] = useState<UpdateState>("idle");
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
-  const [canAutoUpdate, setCanAutoUpdate] = useState(false);
+  const [packageFormat, setPackageFormat] = useState<string | null>(null);
+  const canAutoUpdate = canAutoUpdateFormat(packageFormat ?? "");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [dismissed, setDismissedState] = useState(false);
   const [remoteClientsConnected, setRemoteClientsConnected] = useState(false);
   const [updateRequested, setUpdateRequested] = useState(false);
@@ -143,6 +168,10 @@ export function useUpdateChecker(): UpdateCheckerResult {
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const canAutoUpdateRef = useRef(canAutoUpdate);
+  canAutoUpdateRef.current = canAutoUpdate;
+  // Which step `retry` re-runs: a failed restart must not download again.
+  const failedStepRef = useRef<"download" | "restart">("download");
   // Version the user dismissed this session. Not persisted — resets on
   // every launch so the update prompt keeps nagging until they update.
   const dismissedVersionRef = useRef<string | null>(null);
@@ -151,6 +180,12 @@ export function useUpdateChecker(): UpdateCheckerResult {
   const publishedVersionRef = useRef<string | null>(null);
 
   const doCheck = useCallback(async () => {
+    // The periodic poll must not knock an in-flight or installed update back
+    // to "available" — after "Later" on the ready prompt, restarting is the
+    // only step left.
+    if (stateRef.current === "downloading" || stateRef.current === "ready") {
+      return;
+    }
     try {
       setState("checking");
       const update = await check();
@@ -160,6 +195,7 @@ export function useUpdateChecker(): UpdateCheckerResult {
         setDismissedState(
           isVersionDismissed(dismissedVersionRef.current, update.version),
         );
+        setErrorMessage(null);
         setState("update-available");
       } else {
         setState("idle");
@@ -172,14 +208,14 @@ export function useUpdateChecker(): UpdateCheckerResult {
 
   // ── Desktop: native updater plugin ─────────────────────────────────
   useEffect(() => {
-    if (import.meta.env.DEV) return;
+    if (updaterDisabledInDev()) return;
     // The remote client's shim nulls the updater plugin, so the native check
     // machinery must never run there — the web variant below drives it instead.
     if (isRemote) return;
 
     getPackageFormat()
-      .then((fmt) => setCanAutoUpdate(canAutoUpdateFormat(fmt)))
-      .catch(() => setCanAutoUpdate(false));
+      .then(setPackageFormat)
+      .catch(() => setPackageFormat("other"));
 
     timeoutRef.current = setTimeout(() => {
       doCheck();
@@ -194,9 +230,16 @@ export function useUpdateChecker(): UpdateCheckerResult {
 
   const startDownload = useCallback(async () => {
     const update = updateRef.current;
-    if (!update) return;
+    // A package-manager install would fail here anyway, with an error that
+    // says nothing useful; its callers route to the release page instead.
+    if (!update || !canAutoUpdateRef.current) return;
 
     try {
+      failedStepRef.current = "download";
+      setErrorMessage(null);
+      // Starting the download is a deliberate act, so a toast dismissed
+      // earlier comes back to show progress and the restart prompt.
+      setDismissedState(false);
       setState("downloading");
       setDownloadProgress(0);
 
@@ -223,6 +266,8 @@ export function useUpdateChecker(): UpdateCheckerResult {
       setState("ready");
     } catch (e) {
       console.error("[update-checker] download failed:", e);
+      setErrorMessage(describeUpdateError(e));
+      setDismissedState(false);
       setState("error");
     }
   }, []);
@@ -232,9 +277,17 @@ export function useUpdateChecker(): UpdateCheckerResult {
       await relaunch();
     } catch (e) {
       console.error("[update-checker] relaunch failed:", e);
+      failedStepRef.current = "restart";
+      setErrorMessage(describeUpdateError(e));
+      setDismissedState(false);
       setState("error");
     }
   }, []);
+
+  const retry = useCallback(() => {
+    if (failedStepRef.current === "restart") void installAndRestart();
+    else void startDownload();
+  }, [startDownload, installAndRestart]);
 
   const dismiss = useCallback(() => {
     dismissedVersionRef.current = updateVersion;
@@ -247,13 +300,15 @@ export function useUpdateChecker(): UpdateCheckerResult {
   // paired browser (which has no updater plugin) can surface a "desktop update
   // available" prompt, and so late joiners see it via the `web_remote_status`
   // snapshot. Fires at most once per version; a no-op observable-side when no
-  // web client is listening.
+  // web client is listening. Package-manager installs are never announced:
+  // the browser's only action is "update & restart desktop", which those
+  // installs cannot do.
   useEffect(() => {
-    if (isRemote || !updateVersion) return;
+    if (isRemote || !updateVersion || !canAutoUpdate) return;
     if (publishedVersionRef.current === updateVersion) return;
     publishedVersionRef.current = updateVersion;
     webRemotePublishUpdateAvailable(true, updateVersion).catch(() => {});
-  }, [isRemote, updateVersion]);
+  }, [isRemote, updateVersion, canAutoUpdate]);
 
   // ── Desktop: track attached remote devices (only while an update exists) ──
   useEffect(() => {
@@ -289,6 +344,7 @@ export function useUpdateChecker(): UpdateCheckerResult {
       const action = updateAdvanceAction(
         stateRef.current,
         updateRef.current !== null,
+        canAutoUpdateRef.current,
       );
       if (action === "none") return;
       // Re-reveal the toast if it was dismissed on the desktop, so the standard
@@ -369,8 +425,12 @@ export function useUpdateChecker(): UpdateCheckerResult {
       updateVersion,
       downloadProgress,
       isRemote,
+      canAutoUpdate,
+      packageFormat,
+      errorMessage,
       startDownload,
       installAndRestart,
+      retry,
       requestDesktopUpdate,
     });
   }, [
@@ -379,8 +439,12 @@ export function useUpdateChecker(): UpdateCheckerResult {
     updateVersion,
     downloadProgress,
     isRemote,
+    canAutoUpdate,
+    packageFormat,
+    errorMessage,
     startDownload,
     installAndRestart,
+    retry,
     requestDesktopUpdate,
   ]);
 
@@ -389,8 +453,11 @@ export function useUpdateChecker(): UpdateCheckerResult {
     updateVersion,
     downloadProgress,
     canAutoUpdate,
+    packageFormat,
+    errorMessage,
     startDownload,
     installAndRestart,
+    retry,
     dismiss,
     dismissed,
     isRemote,
