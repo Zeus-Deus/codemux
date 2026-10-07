@@ -35,19 +35,20 @@ interface Props {
   onBack?: () => void;
 }
 
-/** The diff on screen and the file it belongs to. Kept together so a
+/** The diff on screen and which read it came from. Kept together so a
  *  file switch can leave the previous diff up until the next one lands. */
 interface LoadedDiff {
+  /** The file, side (staged or not) and base the diff was read for. A
+   *  new diff with the same source is a live refresh; anything else is a
+   *  different diff. */
+  source: string;
   path: string;
   raw: string;
   lines: DiffLine[];
 }
 
-/** Everything about a status row that moves when its diff does. */
-function statusSignature(file: GitFileStatus | undefined): string {
-  if (!file) return "";
-  return `${file.status}:${file.is_staged}:${file.is_unstaged}:${file.additions}:${file.deletions}`;
-}
+/** How often the open file's status and diff are read again. */
+const POLL_MS = 5000;
 
 function splitPath(path: string): { dir: string; name: string } {
   const i = path.lastIndexOf("/");
@@ -76,11 +77,16 @@ export function DiffPane({
   // Bumped when the open file's diff changes under you; keys the
   // "Updated" note so each refresh shows it again.
   const [updatedTick, setUpdatedTick] = useState(0);
+  // Bumped by the poll: re-reads the open diff quietly.
+  const [pollTick, setPollTick] = useState(0);
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [baseFiles, setBaseFiles] = useState<GitFileStatus[]>([]);
   const viewRef = useRef<DiffViewHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const prevDiffRef = useRef<LoadedDiff | null>(null);
+  // The last read that finished. Reading the same source again is a
+  // quiet re-read: no loading bar, and a failure leaves the view alone.
+  const lastReadRef = useRef<string | null>(null);
 
   // Initialize tab state if not exists
   useEffect(() => {
@@ -109,7 +115,13 @@ export function DiffPane({
         .catch(console.error);
     };
     fetchFiles();
-    const interval = setInterval(fetchFiles, 5000);
+    const interval = setInterval(() => {
+      fetchFiles();
+      // The status row can stay the same while an agent rewrites a line
+      // that was already changed (+1 −1 either way), so the open diff is
+      // read again on every tick. An unchanged read renders nothing.
+      setPollTick((n) => n + 1);
+    }, POLL_MS);
     return () => clearInterval(interval);
   }, [cwd]);
 
@@ -139,25 +151,32 @@ export function DiffPane({
     }
   }, [files, baseFiles, tab?.section]);
 
-  // The status poll is what notices an agent editing the open file; when
-  // its row moves, the diff is read again.
-  const openFileSignature = statusSignature(
-    files.find((f) => f.path === tab?.filePath),
-  );
+  const againstBase = tab?.section === "against_base" && !!tab?.baseBranch;
+  const source = tab?.filePath
+    ? `${cwd}\0${tab.filePath}\0${againstBase ? `base:${tab.baseBranch}` : tab.staged ? "staged" : "unstaged"}`
+    : null;
 
-  // Fetch diff when the file, or its status row, changes
+  // Read the diff when its source changes, on Retry, and quietly on
+  // every poll tick.
   useEffect(() => {
-    if (!tab?.filePath) {
+    if (!tab?.filePath || !source) {
+      lastReadRef.current = null;
       setDiff(null);
       setError(null);
       if (tab) markPaneReady("diff", { target: workspace.workspace_id });
       return;
     }
     const path = tab.filePath;
+    const readKey = `${source}\0${retryKey}`;
+    const quiet = lastReadRef.current === readKey;
     let cancelled = false;
-    setLoading(true);
+    if (!quiet) {
+      setLoading(true);
+      // An error belongs to the read that failed, not to the next file.
+      setError(null);
+    }
     const fetchDiff =
-      tab.section === "against_base" && tab.baseBranch
+      againstBase && tab.baseBranch
         ? getBaseBranchFileDiff(cwd, tab.baseBranch, path)
         : getGitDiff(cwd, path, tab.staged);
     fetchDiff
@@ -166,37 +185,35 @@ export function DiffPane({
         setError(null);
         // An unchanged re-read keeps the same object, so nothing renders.
         setDiff((prev) =>
-          prev?.path === path && prev.raw === raw
+          prev?.source === source && prev.raw === raw
             ? prev
-            : { path, raw, lines: parseDiff(raw) },
+            : { source, path, raw, lines: parseDiff(raw) },
         );
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(String(err));
+        // A failed quiet re-read leaves the diff that is up alone; the
+        // next tick tries again.
+        if (!cancelled && !quiet) setError(String(err));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
-        markPaneReady("diff", { target: workspace.workspace_id });
+        if (!cancelled) {
+          lastReadRef.current = readKey;
+          setLoading(false);
+        }
+        if (!quiet) markPaneReady("diff", { target: workspace.workspace_id });
       });
     return () => {
       cancelled = true;
     };
-  }, [
-    cwd,
-    tab?.filePath,
-    tab?.staged,
-    tab?.section,
-    tab?.baseBranch,
-    workspace.workspace_id,
-    openFileSignature,
-    retryKey,
-  ]);
+    // `source` folds in every tab field that picks which diff this is.
+  }, [source, workspace.workspace_id, retryKey, pollTick]);
 
-  // A new diff for the file already on screen is a live refresh: say so.
+  // A new diff from the same source is a live refresh: say so. Stepping
+  // to another file, or to the other side of the same file, is not.
   useEffect(() => {
     const prev = prevDiffRef.current;
     prevDiffRef.current = diff;
-    if (prev && diff && prev !== diff && prev.path === diff.path) {
+    if (prev && diff && prev !== diff && prev.source === diff.source) {
       setUpdatedTick((n) => n + 1);
     }
   }, [diff]);
@@ -250,16 +267,23 @@ export function DiffPane({
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const target = e.target as HTMLElement;
       if (target.closest("input, textarea, select, [contenteditable='true']")) return;
+      // Shift picks files, not the letter's case: with Caps Lock on, `j`
+      // arrives as "J" and still means the next change.
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       const action =
-        e.key === "j" || e.key === "]"
-          ? handleNextHunk
-          : e.key === "k" || e.key === "["
-            ? handlePrevHunk
-            : e.key === "J"
-              ? handleNextFile
-              : e.key === "K"
-                ? handlePrevFile
-                : e.key === "Escape"
+        key === "j"
+          ? e.shiftKey
+            ? handleNextFile
+            : handleNextHunk
+          : key === "k"
+            ? e.shiftKey
+              ? handlePrevFile
+              : handlePrevHunk
+            : key === "]"
+              ? handleNextHunk
+              : key === "["
+                ? handlePrevHunk
+                : key === "Escape"
                   ? onBack
                   : undefined;
       if (!action) return;
@@ -307,7 +331,7 @@ export function DiffPane({
   }
 
   // `diff` can still be the previous file's while the next one loads.
-  const current = diff?.path === tab.filePath;
+  const current = diff?.source === source;
   const entry = filteredFiles.find((f) => f.path === tab.filePath);
   const { dir, name } = splitPath(tab.filePath);
   const fileCount = filteredFiles.length;
@@ -350,7 +374,7 @@ export function DiffPane({
     // its scroll position with it.
     body = (
       <div
-        key={diff.path}
+        key={diff.source}
         className={cn(
           "flex min-h-0 flex-1 flex-col transition-opacity duration-150 motion-safe:animate-in motion-safe:fade-in-0",
           !current && "opacity-50",
@@ -381,16 +405,20 @@ export function DiffPane({
           data-testid="diff-file-header"
           className="flex h-7 shrink-0 items-center gap-1 border-b border-hairline pr-1 pl-2.5"
         >
-          {/* The directory truncates first: the file name is the part you
-              read when the panel is narrow. */}
+          {/* The directory truncates first, and from its start: the file
+              name and the folders nearest it are what tell two files apart
+              in a narrow panel. The inner ltr span keeps the trailing slash
+              where it belongs inside the rtl truncation. */}
           <span className="flex min-w-0 flex-1 font-mono text-label" title={tab.filePath}>
-            <span className="truncate text-muted-foreground/70">{dir}</span>
+            <span dir="rtl" className="truncate text-muted-foreground/70">
+              <span dir="ltr">{dir}</span>
+            </span>
             <span className="shrink-0 text-foreground">{name}</span>
           </span>
           {entry && (entry.additions > 0 || entry.deletions > 0) && (
             <span className="flex shrink-0 gap-1 font-mono text-caption tabular-nums">
-              <span className="text-success">+{entry.additions}</span>
-              <span className="text-danger">−{entry.deletions}</span>
+              {entry.additions > 0 && <span className="text-success">+{entry.additions}</span>}
+              {entry.deletions > 0 && <span className="text-danger">−{entry.deletions}</span>}
             </span>
           )}
           <Button
@@ -448,15 +476,23 @@ export function DiffPane({
             className="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-primary/60 motion-safe:animate-pulse"
           />
         )}
-        {updatedTick > 0 && !error && (
-          <span
-            key={updatedTick}
-            role="status"
-            className="pointer-events-none absolute top-1.5 right-3 z-10 rounded-sm bg-surface-3 px-1.5 text-caption text-muted-foreground motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150"
-          >
-            Updated
-          </span>
-        )}
+        {/* Always mounted, so screen readers announce the text when it
+            changes; a live region that arrives already filled is often
+            skipped. */}
+        <span
+          role="status"
+          data-testid="diff-updated"
+          className="pointer-events-none absolute top-1.5 right-3 z-10"
+        >
+          {updatedTick > 0 && !error && (
+            <span
+              key={updatedTick}
+              className="block rounded-sm bg-surface-3 px-1.5 text-caption text-muted-foreground motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150"
+            >
+              Updated
+            </span>
+          )}
+        </span>
         {body}
       </div>
     </div>

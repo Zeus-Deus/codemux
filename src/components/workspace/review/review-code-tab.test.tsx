@@ -842,6 +842,10 @@ describe("a viewed file", () => {
       expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
     );
     expect(screen.getByTestId("viewed-count")).toHaveTextContent("1 of 3 viewed");
+    expect(screen.getByRole("progressbar", { name: "Files viewed" })).toHaveAttribute(
+      "aria-valuenow",
+      "1",
+    );
 
     await user.click(within(file).getByRole("button", { expanded: false }));
     expect(file.querySelectorAll("[data-diff-line]").length).toBeGreaterThan(0);

@@ -122,6 +122,14 @@ describe("the embedded diff pane", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("reads the diff once on open, not again when the first status lands", async () => {
+    vi.useFakeTimers();
+    renderPane();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("const in_src_a_ts = 1;")).toBeInTheDocument();
+    expect(mockGetGitDiff).toHaveBeenCalledTimes(1);
+  });
+
   it("re-reads the open file when an edit moves its status row, keeping the view up", async () => {
     vi.useFakeTimers();
     renderPane();
@@ -137,11 +145,65 @@ describe("the embedded diff pane", () => {
     expect(screen.getByText("const edited_by_agent = 2;")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Updated");
     expect(screen.queryByText("Loading diff…")).toBeNull();
+    expect(screen.queryByTestId("diff-loading-bar")).toBeNull();
 
-    // An unchanged status row reads nothing again.
-    const reads = mockGetGitDiff.mock.calls.length;
+    // An unchanged re-read changes nothing on screen, and the note clears.
     await act(() => vi.advanceTimersByTimeAsync(5000));
-    expect(mockGetGitDiff.mock.calls.length).toBe(reads);
-    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("const edited_by_agent = 2;")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("");
+  });
+
+  it("picks up an edit that leaves the +/− counts where they were", async () => {
+    vi.useFakeTimers();
+    renderPane();
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("const in_src_a_ts = 1;")).toBeInTheDocument();
+
+    // `+x = 1` becoming `+x = 2`: the status row does not move at all.
+    mockGetGitDiff.mockImplementation((_cwd: string, path: string) =>
+      Promise.resolve(diffOf(path, "const in_src_a_ts = 2;")),
+    );
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(screen.getByText("const in_src_a_ts = 2;")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Updated");
+  });
+
+  it("does not carry one file's read error over to the next file", async () => {
+    mockGetGitDiff.mockRejectedValueOnce("index.lock exists");
+    renderPane();
+    await screen.findByRole("alert");
+    await waitFor(() => expect(screen.getByTestId("diff-file-position")).toHaveTextContent("1/2"));
+
+    fireEvent.keyDown(screen.getByTestId("diff-pane"), { key: "J", shiftKey: true });
+    expect(screen.queryByRole("alert")).toBeNull();
+    await screen.findByText("const in_src_lib_b_ts = 1;");
+  });
+
+  it("reads Caps Lock j as the next change, not the next file", async () => {
+    renderPane();
+    await screen.findByText("const in_src_a_ts = 1;");
+    await waitFor(() => expect(screen.getByTestId("diff-file-position")).toHaveTextContent("1/2"));
+
+    fireEvent.keyDown(screen.getByTestId("diff-pane"), { key: "J", shiftKey: false });
+    expect(useDiffStore.getState().tabs[TAB].filePath).toBe("src/a.ts");
+  });
+
+  it("does not call switching to the staged side of the same file an update", async () => {
+    renderPane();
+    await screen.findByText("const in_src_a_ts = 1;");
+    mockGetGitDiff.mockImplementation((_cwd: string, path: string, staged: boolean) =>
+      Promise.resolve(diffOf(path, staged ? "const staged_side = 1;" : "const other = 1;")),
+    );
+    act(() => useDiffStore.getState().setFile(TAB, "src/a.ts", true));
+    await screen.findByText("const staged_side = 1;");
+    expect(screen.getByRole("status")).toHaveTextContent("");
+  });
+
+  it("hides a zero count in the header", async () => {
+    mockGetGitStatus.mockResolvedValue([status("src/a.ts", 2, 0)]);
+    renderPane();
+    await screen.findByText("const in_src_a_ts = 1;");
+    await waitFor(() => expect(screen.getByTestId("diff-file-header")).toHaveTextContent("+2"));
+    expect(screen.getByTestId("diff-file-header")).not.toHaveTextContent("−0");
   });
 });

@@ -53,12 +53,16 @@ const FILES = [
   file("src/two.ts", false),
 ];
 
-function renderPanel(onOpenDiff = vi.fn()) {
+function renderPanel(onOpenDiff = vi.fn(), returnFocusPath: string | null = null) {
   const client = new QueryClient();
   render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <ChangesPanel workspace={WORKSPACE} onOpenDiff={onOpenDiff} />
+        <ChangesPanel
+          workspace={WORKSPACE}
+          onOpenDiff={onOpenDiff}
+          returnFocusPath={returnFocusPath}
+        />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -117,6 +121,32 @@ describe("file rows from the keyboard", () => {
     fireEvent.keyDown(one, { key: "s" });
     expect(mockStage).toHaveBeenCalledWith("/repo", ["src/one.ts"]);
     expect(two).toHaveFocus();
+  });
+
+  it("stages with Shift+S or Caps Lock too", async () => {
+    renderPanel();
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    const one = rows()[1];
+    one.focus();
+
+    fireEvent.keyDown(one, { key: "S", shiftKey: true });
+    expect(mockStage).toHaveBeenCalledWith("/repo", ["src/one.ts"]);
+  });
+
+  it("gives focus back to the row a diff was opened from", async () => {
+    renderPanel(vi.fn(), "src/two.ts");
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    await waitFor(() => expect(rows()[2]).toHaveFocus());
+  });
+
+  it("does not take focus from something the user picked", async () => {
+    const elsewhere = document.createElement("button");
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+    renderPanel(vi.fn(), "src/two.ts");
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    expect(elsewhere).toHaveFocus();
+    elsewhere.remove();
   });
 
   it("discards only on a second Delete", async () => {

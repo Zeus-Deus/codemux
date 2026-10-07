@@ -480,7 +480,25 @@ export function ReviewCodeTab({
     // scrollbar inside it turns "keep reading" into "find the right
     // scrollbar first".
     <div ref={rootRef} className="flex flex-1 flex-col">
-      <div className="flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
+      <div className="relative flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
+        {/* Review progress, drawn over the header's bottom edge so it
+            appears without moving the files below. */}
+        {viewedCount > 0 && (
+          <div
+            role="progressbar"
+            aria-label="Files viewed"
+            aria-valuemin={0}
+            aria-valuemax={files.length}
+            aria-valuenow={viewedCount}
+            data-testid="viewed-rail"
+            className="pointer-events-none absolute inset-x-0 -bottom-px h-0.5"
+          >
+            <div
+              className="h-full bg-status-open/70 transition-[width] duration-150 motion-reduce:transition-none"
+              style={{ width: `${(viewedCount / files.length) * 100}%` }}
+            />
+          </div>
+        )}
         <span className={cn("flex-1 text-muted-foreground", tzMetaNum)}>
           {files.length === 1 ? "1 file" : `${files.length} files`} changed
           {viewedCount > 0 && (

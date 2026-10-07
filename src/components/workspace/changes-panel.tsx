@@ -95,6 +95,10 @@ interface Props {
   /** Where a file row's diff opens. Defaults to a main-area diff tab; the
    *  deck routes it to its own Diff pane so the click stays in the panel. */
   onOpenDiff?: (filePath: string, staged: boolean) => void;
+  /** The file whose diff the user just backed out of. Its row takes focus
+   *  once the list loads, so the keyboard review loop (Enter, Escape,
+   *  ArrowDown, Enter) picks up where it left off. */
+  returnFocusPath?: string | null;
 }
 
 // ── File-status icon mapping ──
@@ -204,7 +208,9 @@ function FileRow({
         e.preventDefault();
         focusSiblingRow(row, e.key === "ArrowDown" ? 1 : -1);
         return;
+      // Caps Lock or Shift must not turn the stage key into a no-op.
       case "s":
+      case "S":
         e.preventDefault();
         handFocusOn(row);
         void toggleStage();
@@ -225,6 +231,7 @@ function FileRow({
           role="button"
           tabIndex={0}
           data-file-row
+          data-path={file.path}
           data-confirm-discard={confirmDiscard ? "true" : undefined}
           onClick={() => onOpenDiff(file.path, staged)}
           onKeyDown={handleKeyDown}
@@ -399,6 +406,7 @@ export function ChangesPanel({
   refreshKey = 0,
   sectionFilter = "all",
   onOpenDiff: onOpenDiffOverride,
+  returnFocusPath = null,
 }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const queryClient = useQueryClient();
@@ -408,6 +416,22 @@ export function ChangesPanel({
   // this one lands, an empty list means "not read yet", not "clean".
   const [loadedCwd, setLoadedCwd] = useState<string | null>(null);
   const loaded = loadedCwd === cwd;
+  const listRef = useRef<HTMLDivElement>(null);
+  const focusReturned = useRef(false);
+
+  // Back from a diff, the row it came from takes focus again — but only
+  // when focus fell to the page (the diff unmounted under it), never away
+  // from something the user picked.
+  useEffect(() => {
+    if (!loaded || !returnFocusPath || focusReturned.current) return;
+    focusReturned.current = true;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    const rows = listRef.current?.querySelectorAll<HTMLElement>("[data-file-row]") ?? [];
+    Array.from(rows)
+      .find((row) => row.dataset.path === returnFocusPath)
+      ?.focus();
+  }, [loaded, returnFocusPath]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
   const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
@@ -830,7 +854,7 @@ export function ChangesPanel({
               </div>
             )
           ) : (
-            <div data-changes-list className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150">
+            <div ref={listRef} data-changes-list className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150">
               {(sectionFilter === "all" || sectionFilter === "staged") && (
                 <FileSection
                   label="Staged"

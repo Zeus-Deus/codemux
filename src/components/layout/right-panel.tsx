@@ -514,6 +514,8 @@ export const RightPanel = memo(function RightPanel({
   // A side panel is narrow, so a long line wraps by default; the pane
   // bar turns it off when sideways scrolling reads better.
   const [diffWrap, setDiffWrap] = useState(true);
+  // Escape from the diff hands focus back to the Changes row it came from.
+  const [changesFocusPath, setChangesFocusPath] = useState<string | null>(null);
 
   /** Hand the panel's diff to a full main-area tab, which has the room
    *  for hunk/file navigation and focus mode. */
@@ -991,6 +993,7 @@ export const RightPanel = memo(function RightPanel({
             refreshKey={changesRefreshKey}
             sectionFilter={changesFilter}
             onOpenDiff={openDiffPane}
+            returnFocusPath={changesFocusPath}
           />
         ) : activePane === "diff" ? (
           <DiffPane
@@ -998,7 +1001,10 @@ export const RightPanel = memo(function RightPanel({
             workspace={workspace}
             embedded
             wrap={diffWrap}
-            onBack={() => setRightPanelTab(workspaceId, "changes")}
+            onBack={() => {
+              setChangesFocusPath(diffTab?.filePath ?? null);
+              setRightPanelTab(workspaceId, "changes");
+            }}
           />
         ) : activePane === "review" ? (
           <ReviewPanel workspace={workspace} />
