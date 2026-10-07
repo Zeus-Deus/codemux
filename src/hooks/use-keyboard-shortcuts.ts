@@ -18,6 +18,7 @@ import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
 import { stepInterfaceSize } from "@/lib/typography";
+import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
@@ -148,9 +149,11 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     const current = settings.settings.appearance.interface_font_size;
     const step = actionId === "zoomIn" ? "in" : actionId === "zoomOut" ? "out" : "reset";
     const next = stepInterfaceSize(current, step);
-    if (next !== current) {
+    const changed = next !== current;
+    if (changed) {
       void settings.updateSetting("appearance", "interface_font_size", next).catch(console.error);
     }
+    announceInterfaceSize(next, step, changed);
     return true;
   }
 

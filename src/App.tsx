@@ -19,6 +19,7 @@ import { RemoteConnectionBanner } from "@/components/remote/remote-connection-in
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Toaster } from "@/components/ui/sonner";
 import { PrEventWatcher } from "@/components/pull-requests/pr-event-watcher";
+import { InterfaceSizeHud } from "@/components/overlays/interface-size-hud";
 import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { useAppStore } from "@/stores/app-store";
@@ -201,6 +202,9 @@ function App() {
           nothing, and sits above the full-screen destinations so it keeps
           watching from every screen. */}
       <PrEventWatcher />
+      {/* App-level so the size shortcuts answer on Settings and the other
+          full-screen pages too, which replace the shell. */}
+      <InterfaceSizeHud />
       <Toaster />
     </>
   );
