@@ -95,7 +95,9 @@ const ARBITRARY_CODE_PROGRAMS = new Set([
   "npx", "bunx", "pipx", "uvx",
 ]);
 /** Package-manager subcommands that fetch or run an arbitrary package
- *  (`npm exec`, `pnpm dlx`, `yarn dlx`, `bun x`). */
+ *  (`npm exec`, `pnpm dlx`, `yarn dlx`, `bun x`), at any depth. `uv tool
+ *  run`, the long form of `uvx`, is checked separately because `run`
+ *  alone (`npm run build`) is safe. */
 const ARBITRARY_CODE_SUBCOMMANDS = new Set(["exec", "dlx", "x"]);
 /** Characters that would end or nest Claude's `Tool(content)` rule
  *  syntax. */
@@ -139,7 +141,13 @@ export function suggestPermissionRule(
       if (words.length === 3 || !SUBCOMMAND.test(word)) break;
       words.push(word);
     }
-    if (words[1] && ARBITRARY_CODE_SUBCOMMANDS.has(words[1])) return null;
+    const subcommands = words.slice(1);
+    if (
+      subcommands.some((word) => ARBITRARY_CODE_SUBCOMMANDS.has(word)) ||
+      (family === "uv" && subcommands[0] === "tool" && subcommands[1] === "run")
+    ) {
+      return null;
+    }
     return { toolName: "Bash", ruleContent: `${words.join(" ")}:*` };
   }
 

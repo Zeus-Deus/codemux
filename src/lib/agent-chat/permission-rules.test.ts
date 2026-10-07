@@ -144,6 +144,7 @@ describe("suggestPermissionRule", () => {
     expect(bash("cargo check -j 2")).toEqual({ toolName: "Bash", ruleContent: "cargo check:*" });
     expect(bash("ls -la")).toEqual({ toolName: "Bash", ruleContent: "ls:*" });
     expect(bash("cat README.md")).toEqual({ toolName: "Bash", ruleContent: "cat:*" });
+    expect(bash("uv tool list")).toEqual({ toolName: "Bash", ruleContent: "uv tool list:*" });
   });
 
   it("offers no scoped rule for chained, redirected or env-prefixed commands", () => {
@@ -169,6 +170,8 @@ describe("suggestPermissionRule", () => {
     expect(bash("npx -y create-vite")).toBeNull();
     expect(bash("bunx cowsay@latest")).toBeNull();
     expect(bash("uvx ruff check")).toBeNull();
+    expect(bash("uv tool run ruff")).toBeNull();
+    expect(bash("/usr/bin/uv tool run ruff check")).toBeNull();
     expect(bash("npm exec -- tsc")).toBeNull();
     expect(bash("pnpm dlx @scope/pkg")).toBeNull();
     // A program that merely starts with an interpreter's name is fine.
