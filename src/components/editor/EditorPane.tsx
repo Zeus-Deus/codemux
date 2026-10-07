@@ -18,6 +18,7 @@ import { useSyntaxThemeColors } from "@/hooks/use-theme-colors";
 import { MarkdownRendered } from "./MarkdownRendered";
 import { ImageViewer } from "./ImageViewer";
 import { VideoViewer } from "./VideoViewer";
+import { revealSelection } from "./reveal-selection";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { PanelHeader } from "@/components/ui/panel-header";
 import { cn } from "@/lib/utils";
@@ -296,11 +297,14 @@ export function EditorPane({
       view.state.doc.lines,
     );
     const line = view.state.doc.line(lineNumber);
-    const columnOffset = Math.max(0, (revealRequest.column ?? 1) - 1);
-    const position = Math.min(line.to, line.from + columnOffset);
+    const selection = revealSelection(
+      line,
+      revealRequest.column,
+      revealRequest.endColumn,
+    );
     view.dispatch({
-      selection: { anchor: position },
-      effects: EditorView.scrollIntoView(position, { y: "center" }),
+      selection,
+      effects: EditorView.scrollIntoView(selection.anchor, { y: "center" }),
     });
     view.focus();
     clearReveal(tabId, revealRequest.nonce);

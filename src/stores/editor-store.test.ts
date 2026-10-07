@@ -27,6 +27,15 @@ describe("editor store reveal requests", () => {
     expect(tab()?.revealRequest).toEqual({ line: 1, column: 1, nonce: 1 });
   });
 
+  it("carries an end column only when it closes a non-empty range", () => {
+    const { requestReveal } = useEditorStore.getState();
+    requestReveal(TAB, 3, 5, 11);
+    expect(tab()?.revealRequest).toEqual({ line: 3, column: 5, endColumn: 11, nonce: 1 });
+
+    requestReveal(TAB, 3, 5, 5);
+    expect(tab()?.revealRequest).toEqual({ line: 3, column: 5, nonce: 2 });
+  });
+
   it("consumes the applied request so a remount cannot replay it", () => {
     const { requestReveal, clearReveal } = useEditorStore.getState();
     requestReveal(TAB, 42);

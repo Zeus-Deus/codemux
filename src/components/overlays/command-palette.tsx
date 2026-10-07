@@ -107,6 +107,7 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { KeyHint } from "@/components/ui/key-hint";
 
 interface Props {
   open: boolean;
@@ -899,15 +900,15 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       className="flex w-full flex-col overflow-hidden bg-popover text-popover-foreground"
     >
       {/* Header */}
-      <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-border/60 pr-3.5 pl-4">
-        <Search className="size-[15px] shrink-0 text-muted-foreground/70" />
+      <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-hairline pr-3.5 pl-4">
+        <Search className="size-4 shrink-0 text-muted-foreground/70" />
         {commandsOnly && (
-          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
             Commands
           </span>
         )}
         {previewTheme && (
-          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-sm bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
             Themes
           </span>
         )}
@@ -921,7 +922,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
-        <kbd className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
+        <kbd className="flex-none rounded-sm border border-hairline-strong px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
           esc
         </kbd>
       </div>
@@ -1054,12 +1055,12 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       {/* Footer — while a theme is previewing it explains the preview instead
           of the palette, because that is the only moment Esc does something
           other than close. */}
-      <div className="flex h-[34px] flex-none items-center gap-3.5 border-t border-border/60 bg-muted/30 px-3.5">
+      <div className="flex h-[34px] flex-none items-center gap-3.5 border-t border-hairline bg-surface-1 px-3.5">
         {previewTheme ? (
           <>
-            <FooterHint keys="↑↓" label="preview" />
-            <FooterHint keys="↵" label="keep it" />
-            <FooterHint keys="esc" label={`back to ${appliedTheme.label}`} />
+            <KeyHint keys="↑↓" label="preview" />
+            <KeyHint keys="↵" label="keep it" />
+            <KeyHint keys="esc" label={`back to ${appliedTheme.label}`} />
             <span className="flex-1" />
             <span className="font-mono text-caption text-muted-foreground/70">
               {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
@@ -1067,10 +1068,10 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           </>
         ) : (
           <>
-            <FooterHint keys="↑↓" label="navigate" />
-            <FooterHint keys="↵" label="open" />
-            <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
-            <FooterHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
+            <KeyHint keys="↑↓" label="navigate" />
+            <KeyHint keys="↵" label="open" />
+            <KeyHint keys={COMMAND_MODE_PREFIX} label="commands" />
+            <KeyHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
             <span className="flex-1" />
             <span className="font-mono text-caption text-muted-foreground/70 tabular-nums">
               {resultCountLabel(totalShown)}
@@ -1127,7 +1128,7 @@ function PaletteItem({
       value={value}
       onSelect={onSelect}
       className={cn(
-        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 outline-none select-none data-selected:bg-accent",
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-selected:bg-accent",
         className,
       )}
     >
@@ -1362,7 +1363,7 @@ function ThemeStudioItemRow({
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
       <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
-        <Icon className="size-[11px]" />
+        <Icon className="size-3" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body text-muted-foreground">
         {row.label}
@@ -1377,7 +1378,7 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
       <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
-        <Icon className="size-[11px]" />
+        <Icon className="size-3" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
         {row.command.label}
@@ -1424,16 +1425,5 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
       )}
       <EnterBadge />
     </PaletteItem>
-  );
-}
-
-function FooterHint({ keys, label }: { keys: string; label: string }) {
-  return (
-    <span className="flex items-center gap-1.5 text-label text-muted-foreground/70">
-      <kbd className="rounded-sm border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
-        {keys}
-      </kbd>
-      {label}
-    </span>
   );
 }

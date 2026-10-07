@@ -182,53 +182,112 @@ fn git_ignored_set(
 
 // `async fn` so the `rg`/`grep` subprocess runs on the blocking pool instead
 // of the GTK main thread (see note at top of file).
+//
+// `regex` and `case_sensitive` back the dialog's two toggles: the query is a
+// literal unless `regex` is set, and matching ignores case unless
+// `case_sensitive` is set. An invalid pattern comes back as `Err` so the
+// dialog can say so instead of showing an empty result list.
 #[tauri::command]
 pub async fn search_in_files(
     path: String,
     query: String,
+    regex: Option<bool>,
+    case_sensitive: Option<bool>,
     max_results: Option<u32>,
 ) -> Result<Vec<SearchResult>, String> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
 
-    let limit = max_results.unwrap_or(100);
+    let opts = ContentSearchOptions {
+        regex: regex.unwrap_or(false),
+        case_sensitive: case_sensitive.unwrap_or(false),
+        limit: max_results.unwrap_or(100),
+    };
 
     tokio::task::spawn_blocking(move || {
-        // Try ripgrep first
-        if let Ok(results) = search_with_rg(&path, &query, limit) {
-            return Ok(results);
+        // rg still exits with a JSON summary for a missing or unreadable root,
+        // and the summary's searched-file count is unreliable before rg 15, so
+        // a vanished or locked workspace is caught here rather than read from
+        // rg's output.
+        let root_error = |e: std::io::Error| format!("{path}: {e}");
+        if std::fs::metadata(&path).map_err(root_error)?.is_dir() {
+            std::fs::read_dir(&path).map_err(root_error)?;
         }
-
-        // Fall back to grep
-        search_with_grep(&path, &query, limit)
+        // Try ripgrep first; fall back to grep only when rg isn't installed.
+        match search_with_rg(&path, &query, &opts) {
+            Some(result) => result,
+            None => search_with_grep(&path, &query, &opts),
+        }
     })
     .await
     .map_err(|e| format!("search_in_files task join failed: {e}"))?
 }
 
-fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>, String> {
-    let output = Command::new("rg")
-        .args([
-            "--json",
-            "--max-count",
-            "5",
-            "--max-columns",
-            "200",
-            "--smart-case",
-            query,
-            path,
-        ])
+struct ContentSearchOptions {
+    regex: bool,
+    case_sensitive: bool,
+    limit: u32,
+}
+
+/// Byte offset into `text` → UTF-16 offset, the unit the frontend slices
+/// strings and places the editor cursor in. A non-ASCII prefix would
+/// otherwise shift both the highlight and the revealed column.
+fn utf16_offset(text: &str, byte: usize) -> u32 {
+    text.get(..byte.min(text.len()))
+        .map(|prefix| prefix.encode_utf16().count() as u32)
+        .unwrap_or(byte as u32)
+}
+
+/// The useful line of a search tool's error output. rg prints a multi-line
+/// caret diagram for a bad regex and ends with `error: <reason>`.
+fn search_error_message(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("search failed");
+    line.strip_prefix("error: ").unwrap_or(line).to_string()
+}
+
+/// `None` when rg can't be spawned (not installed), so the caller can fall
+/// back to grep. A search rg ran and rejected is a real error.
+fn search_with_rg(
+    path: &str,
+    query: &str,
+    opts: &ContentSearchOptions,
+) -> Option<Result<Vec<SearchResult>, String>> {
+    let mut cmd = Command::new("rg");
+    cmd.args(["--json", "--max-count", "5", "--max-columns", "200"]);
+    if !opts.regex {
+        cmd.arg("--fixed-strings");
+    }
+    cmd.arg(if opts.case_sensitive {
+        "--case-sensitive"
+    } else {
+        "--ignore-case"
+    });
+    let output = cmd
+        .args(["-e", query, "--", path])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!("rg not found: {e}"))?;
+        .ok()?;
+
+    // Exit 2 with nothing on stdout means rg never searched (bad pattern).
+    // Exit 2 alongside output is just an unreadable file among readable ones.
+    if output.status.code() == Some(2) && output.stdout.is_empty() {
+        return Some(Err(search_error_message(&String::from_utf8_lossy(
+            &output.stderr,
+        ))));
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
 
     for line in stdout.lines() {
-        if results.len() >= limit as usize {
+        if results.len() >= opts.limit as usize {
             break;
         }
         // Parse rg JSON output
@@ -251,13 +310,11 @@ fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResul
             .get("line_number")
             .and_then(|n| n.as_u64())
             .unwrap_or(0) as u32;
-        let line_content = data
+        let raw_line = data
             .get("lines")
             .and_then(|l| l.get("text"))
             .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .trim_end()
-            .to_string();
+            .unwrap_or("");
 
         // Extract first submatch offset
         let (match_start, match_end) = data
@@ -265,38 +322,64 @@ fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResul
             .and_then(|s| s.as_array())
             .and_then(|arr| arr.first())
             .map(|m| {
-                let start = m.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as u32;
-                let end = m.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as u32;
-                (start, end)
+                let start = m.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+                let end = m.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
+                (utf16_offset(raw_line, start), utf16_offset(raw_line, end))
             })
             .unwrap_or((0, 0));
 
         results.push(SearchResult {
             file_path,
             line_number,
-            line_content,
+            line_content: raw_line.trim_end().to_string(),
             match_start,
             match_end,
         });
     }
 
-    Ok(results)
+    Some(Ok(results))
 }
 
-fn search_with_grep(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>, String> {
-    let output = Command::new("grep")
-        .args(["-rn", "--include=*", "-i", query, path])
+fn search_with_grep(
+    path: &str,
+    query: &str,
+    opts: &ContentSearchOptions,
+) -> Result<Vec<SearchResult>, String> {
+    // grep only reports the line, so the match position is recomputed with
+    // the same pattern semantics.
+    let pattern = if opts.regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
+    let matcher = regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!opts.case_sensitive)
+        .build()
+        .map_err(|e| search_error_message(&e.to_string()))?;
+
+    let mut cmd = Command::new("grep");
+    cmd.args(["-rnI", if opts.regex { "-E" } else { "-F" }]);
+    if !opts.case_sensitive {
+        cmd.arg("-i");
+    }
+    let output = cmd
+        .args(["-e", query, "--", path])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|e| format!("grep failed: {e}"))?;
 
+    if output.status.code() == Some(2) && output.stdout.is_empty() {
+        return Err(search_error_message(&String::from_utf8_lossy(
+            &output.stderr,
+        )));
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
-    let query_lower = query.to_lowercase();
 
     for line in stdout.lines() {
-        if results.len() >= limit as usize {
+        if results.len() >= opts.limit as usize {
             break;
         }
         // Format: file:line_number:content
@@ -305,10 +388,15 @@ fn search_with_grep(path: &str, query: &str, limit: u32) -> Result<Vec<SearchRes
         let line_number: u32 = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
         let line_content = parts.next().unwrap_or("").trim_end().to_string();
 
-        // Find match position
-        let content_lower = line_content.to_lowercase();
-        let match_start = content_lower.find(&query_lower).unwrap_or(0) as u32;
-        let match_end = match_start + query.len() as u32;
+        let (match_start, match_end) = matcher
+            .find(&line_content)
+            .map(|m| {
+                (
+                    utf16_offset(&line_content, m.start()),
+                    utf16_offset(&line_content, m.end()),
+                )
+            })
+            .unwrap_or((0, 0));
 
         results.push(SearchResult {
             file_path,
@@ -830,7 +918,7 @@ mod tests {
     use super::{
         build_clipboard_image_payload, clipboard_image_extension, encode_rgba_to_png,
         file_exists, grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
-        search_in_files, write_file, MAX_CLIPBOARD_IMAGE_BYTES,
+        search_error_message, search_in_files, write_file, MAX_CLIPBOARD_IMAGE_BYTES,
     };
     use std::fs;
 
@@ -1479,9 +1567,10 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join("other.txt"), "no match in this one\n").unwrap();
 
-        let results = search_in_files(path_str(dir.path()), "needle".to_string(), None)
-            .await
-            .unwrap();
+        let results =
+            search_in_files(path_str(dir.path()), "needle".to_string(), None, None, None)
+                .await
+                .unwrap();
         assert_eq!(results.len(), 1, "exactly one line matches: {results:?}");
         let r = &results[0];
         assert!(
@@ -1491,6 +1580,7 @@ mod tests {
         );
         assert_eq!(r.line_number, 2);
         assert_eq!(r.line_content, "the needle is here");
+        // The fixture is ASCII, so these UTF-16 offsets are also byte offsets.
         assert_eq!(
             &r.line_content[r.match_start as usize..r.match_end as usize],
             "needle",
@@ -1502,10 +1592,122 @@ mod tests {
     async fn search_in_files_empty_query_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "content\n").unwrap();
-        let results = search_in_files(path_str(dir.path()), String::new(), None)
+        let results = search_in_files(path_str(dir.path()), String::new(), None, None, None)
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    /// The dialog's toggles: literal and case-insensitive unless asked.
+    #[tokio::test]
+    async fn search_in_files_honours_regex_and_case_toggles() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "call a.c here\nabc\nNeedle\n").unwrap();
+        let root = path_str(dir.path());
+        let search = |q: &str, regex: bool, case: bool| {
+            search_in_files(root.clone(), q.to_string(), Some(regex), Some(case), None)
+        };
+
+        let literal = search("a.c", false, false).await.unwrap();
+        assert_eq!(literal.len(), 1, "a literal dot matches only itself: {literal:?}");
+        assert_eq!(literal[0].line_number, 1);
+
+        let pattern = search("a.c", true, false).await.unwrap();
+        assert_eq!(pattern.len(), 2, "a regex dot matches any char: {pattern:?}");
+
+        assert_eq!(search("needle", false, false).await.unwrap().len(), 1);
+        assert!(search("needle", false, true).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_in_files_reports_an_invalid_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "(open\n").unwrap();
+        let root = path_str(dir.path());
+
+        let err = search_in_files(root.clone(), "(".to_string(), Some(true), None, None)
+            .await
+            .expect_err("an unclosed group is not a valid regex");
+        assert!(!err.is_empty());
+
+        // The same text as a literal is fine.
+        let hits = search_in_files(root, "(".to_string(), Some(false), None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_in_files_reports_a_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = path_str(&dir.path().join("gone"));
+        search_in_files(missing, "needle".to_string(), None, None, None)
+            .await
+            .expect_err("a vanished workspace is an error, not an empty result");
+    }
+
+    /// A root that exists but can't be listed is an error too, not an empty
+    /// result: rg stats it fine, then fails to enumerate it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_in_files_reports_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locked");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.txt"), "needle\n").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged user reads through mode 000, so there is nothing to test.
+        let privileged = fs::read_dir(&root).is_ok();
+
+        let result =
+            search_in_files(path_str(&root), "needle".to_string(), None, None, None).await;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        if !privileged {
+            result.expect_err("a locked workspace is an error, not an empty result");
+        }
+    }
+
+    /// rg exits 2 here on every version, but only rg 15+ counts the readable
+    /// file in its summary, so the outcome must not depend on that count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_in_files_skips_an_unreadable_file_without_matches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("other.txt"), "no match here\n").unwrap();
+        let locked = dir.path().join("locked.txt");
+        fs::write(&locked, "needle\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let results =
+            search_in_files(path_str(dir.path()), "absent".to_string(), None, None, None)
+                .await
+                .expect("an unreadable file among readable ones is not a failed search");
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    /// Offsets are UTF-16 so the frontend can slice the line and place the
+    /// editor cursor without re-encoding.
+    #[tokio::test]
+    async fn search_in_files_reports_utf16_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "ünïcödé needle\n").unwrap();
+        let results =
+            search_in_files(path_str(dir.path()), "needle".to_string(), None, None, None)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!((results[0].match_start, results[0].match_end), (8, 14));
+    }
+
+    #[test]
+    fn search_error_message_keeps_the_reason_line() {
+        let rg = "regex parse error:\n    (\n    ^\nerror: unclosed group\n";
+        assert_eq!(search_error_message(rg), "unclosed group");
+        assert_eq!(search_error_message(""), "search failed");
     }
 
     /// E2E through the real `fd` (or `find` fallback) subprocess.

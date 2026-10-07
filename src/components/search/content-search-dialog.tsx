@@ -7,14 +7,25 @@ import {
   DIALOG_CRISP_POSITION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
-import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
+import { FileCode, CaseSensitive, Regex } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
+import { useEditorStore } from "@/stores/editor-store";
 import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchInFiles } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { SearchResult } from "@/tauri/types";
+import {
+  MatchHighlight,
+  ResultCapNotice,
+  SearchFooter,
+  SearchQueryInput,
+  pathUnderRoot,
+  staleListClass,
+} from "./search-dialog-parts";
+
+/** Matches asked of the backend per query. Hitting it means there may be more. */
+export const CONTENT_SEARCH_LIMIT = 100;
 
 interface GroupedResults {
   filePath: string;
@@ -30,6 +41,7 @@ export function ContentSearchDialog() {
 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [useRegex, setUseRegex] = useState(false);
@@ -37,12 +49,15 @@ export function ContentSearchDialog() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Bumped per query so a slow response can't overwrite a newer one.
+  const requestRef = useRef(0);
 
   // Reset on open
   useEffect(() => {
     if (open) {
       setQuery("");
       setResults([]);
+      setError(null);
       setSelectedIndex(0);
       setTimeout(() => inputRef.current?.focus(), 0);
     }
@@ -50,20 +65,31 @@ export function ContentSearchDialog() {
 
   // Debounced search
   useEffect(() => {
+    const request = ++requestRef.current;
     if (!open || !cwd || !query.trim()) {
       setResults([]);
+      setError(null);
+      setLoading(false);
       return;
     }
     setLoading(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      searchInFiles(cwd, query.trim(), useRegex, caseSensitive, 100)
+      searchInFiles(cwd, query.trim(), useRegex, caseSensitive, CONTENT_SEARCH_LIMIT)
         .then((res) => {
-          setResults(res);
+          if (request !== requestRef.current) return;
+          setResults(res ?? []);
+          setError(null);
           setSelectedIndex(0);
         })
-        .catch(() => setResults([]))
-        .finally(() => setLoading(false));
+        .catch((err: unknown) => {
+          if (request !== requestRef.current) return;
+          setResults([]);
+          setError(String(err));
+        })
+        .finally(() => {
+          if (request === requestRef.current) setLoading(false);
+        });
     }, 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -84,12 +110,10 @@ export function ContentSearchDialog() {
   }, [results]);
 
   const fileCount = grouped.length;
+  const capped = results.length >= CONTENT_SEARCH_LIMIT;
 
-  // Flat list of all matches for arrow key navigation
-  const flatMatches = useMemo(() => results, [results]);
-
-  const openFile = useCallback(
-    async (filePath: string) => {
+  const openMatch = useCallback(
+    async (match: SearchResult) => {
       // Pull the live workspace at click time via getState so the
       // dialog doesn't subscribe to the workspace ref (which churns on
       // every backend tick).
@@ -99,8 +123,15 @@ export function ContentSearchDialog() {
       );
       if (!ws) return;
       try {
-        const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
-        await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
+        const fullPath = match.file_path.startsWith("/")
+          ? match.file_path
+          : `${cwd}/${match.file_path}`;
+        const tabId = await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
+        // Land on the hit itself, selected, rather than the top of the file.
+        // Offsets are 0-based UTF-16; editor columns are 1-based.
+        useEditorStore
+          .getState()
+          .requestReveal(tabId, match.line_number, match.match_start + 1, match.match_end + 1);
       } catch (err) {
         console.error("Failed to open file:", err);
       }
@@ -110,15 +141,29 @@ export function ContentSearchDialog() {
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Alt+C / Alt+R mirror the editor-style toggles. `code`, not `key`:
+    // Alt changes the produced character on some layouts.
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      if (e.code === "KeyC") {
+        e.preventDefault();
+        setCaseSensitive((v) => !v);
+        return;
+      }
+      if (e.code === "KeyR") {
+        e.preventDefault();
+        setUseRegex((v) => !v);
+        return;
+      }
+    }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelectedIndex((i) => Math.min(i + 1, flatMatches.length - 1));
+      setSelectedIndex((i) => Math.min(i + 1, results.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSelectedIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter" && flatMatches[selectedIndex]) {
+    } else if (e.key === "Enter" && results[selectedIndex]) {
       e.preventDefault();
-      openFile(flatMatches[selectedIndex].file_path);
+      openMatch(results[selectedIndex]);
     }
   };
 
@@ -131,6 +176,7 @@ export function ContentSearchDialog() {
   }, [selectedIndex]);
 
   let matchIndex = 0;
+  const searching = !!query.trim();
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -140,7 +186,7 @@ export function ContentSearchDialog() {
       <DialogContent
         className={cn(
           DIALOG_CRISP_POSITION,
-          "flex max-h-[80vh] flex-col gap-0 p-0",
+          "flex max-h-[80vh] flex-col gap-0 overflow-hidden p-0",
         )}
         showCloseButton={false}
         onKeyDown={handleKeyDown}
@@ -148,52 +194,57 @@ export function ContentSearchDialog() {
         <DialogTitle className="sr-only">Search in Files</DialogTitle>
         <DialogDescription className="sr-only">Search file contents</DialogDescription>
         <div className="p-3 pb-2 space-y-2 shrink-0">
-          <Input
-            ref={inputRef}
+          <SearchQueryInput
+            inputRef={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={setQuery}
             placeholder="Search in files..."
-            className="h-9 text-body"
+            loading={loading}
           />
           <div className="flex items-center gap-1">
-            <Button
-              variant={caseSensitive ? "secondary" : "ghost"}
-              size="icon-xs"
-              title="Case Sensitive"
-              onClick={() => setCaseSensitive(!caseSensitive)}
-              className={caseSensitive ? "bg-primary/20 text-primary" : ""}
+            <SearchToggle
+              label="Match case"
+              shortcut="Alt+C"
+              pressed={caseSensitive}
+              onToggle={() => setCaseSensitive((v) => !v)}
             >
               <CaseSensitive className="size-3.5" />
-            </Button>
-            <Button
-              variant={useRegex ? "secondary" : "ghost"}
-              size="icon-xs"
-              title="Regular Expression"
-              onClick={() => setUseRegex(!useRegex)}
-              className={useRegex ? "bg-primary/20 text-primary" : ""}
+            </SearchToggle>
+            <SearchToggle
+              label="Use regular expression"
+              shortcut="Alt+R"
+              pressed={useRegex}
+              onToggle={() => setUseRegex((v) => !v)}
             >
               <Regex className="size-3.5" />
-            </Button>
+            </SearchToggle>
             {results.length > 0 && (
-              <span className="ml-2 text-label text-muted-foreground">
+              <span className="ml-2 text-label text-muted-foreground tabular-nums">
+                {capped ? "First " : ""}
                 {results.length} result{results.length !== 1 ? "s" : ""} in {fileCount} file{fileCount !== 1 ? "s" : ""}
               </span>
             )}
           </div>
         </div>
 
-        <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto px-1.5 pb-1.5">
-          {!query.trim() && (
+        <div
+          ref={listRef}
+          className={cn(
+            "flex-1 min-h-0 overflow-y-auto px-1.5 pb-1.5",
+            staleListClass(loading),
+          )}
+        >
+          {!searching && (
             <p className="text-label text-muted-foreground text-center py-8">
               Type to search across files
             </p>
           )}
-          {query.trim() && loading && (
-            <div className="flex justify-center py-8">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
-            </div>
+          {searching && !loading && error && (
+            <p role="alert" className="px-4 py-8 text-center text-label text-destructive">
+              {useRegex ? "Invalid regular expression" : "Search failed"}: {error}
+            </p>
           )}
-          {query.trim() && !loading && results.length === 0 && (
+          {searching && !loading && !error && results.length === 0 && (
             <p className="text-label text-muted-foreground text-center py-8">
               No results found
             </p>
@@ -205,20 +256,21 @@ export function ContentSearchDialog() {
                 <button
                   key={`${match.file_path}:${match.line_number}:${idx}`}
                   data-match-index={idx}
-                  className={`flex w-full items-baseline gap-2 rounded-sm px-2 py-0.5 text-left font-mono text-body-sm ${
-                    idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50"
-                  }`}
-                  onClick={() => openFile(match.file_path)}
+                  className={cn(
+                    "flex w-full items-baseline gap-2 rounded-sm px-2 py-0.5 text-left font-mono text-body-sm",
+                    idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50",
+                  )}
+                  onClick={() => openMatch(match)}
                   onMouseEnter={() => setSelectedIndex(idx)}
                 >
                   <span className="shrink-0 w-8 text-right text-muted-foreground/60 tabular-nums">
                     {match.line_number}
                   </span>
                   <span className="min-w-0 truncate">
-                    <HighlightedLine
-                      content={match.line_content}
-                      matchStart={match.match_start}
-                      matchEnd={match.match_end}
+                    <MatchHighlight
+                      text={match.line_content}
+                      range={[match.match_start, match.match_end]}
+                      className="bg-accent-ember/30 text-inherit rounded-sm px-px"
                     />
                   </span>
                 </button>
@@ -227,10 +279,12 @@ export function ContentSearchDialog() {
 
             return (
               <div key={group.filePath} className="mb-1">
-                <div className="flex items-center gap-1.5 px-2 py-1 sticky top-0 bg-card z-10">
+                <div className="flex items-center gap-1.5 px-2 py-1 sticky top-0 bg-popover z-10">
                   <FileCode className="size-3 shrink-0 text-muted-foreground" />
-                  <span className="text-label text-muted-foreground truncate">{group.filePath}</span>
-                  <span className="text-caption text-muted-foreground/50 shrink-0">
+                  <span className="text-label text-muted-foreground truncate">
+                    {pathUnderRoot(cwd, group.filePath)}
+                  </span>
+                  <span className="text-caption text-muted-foreground/50 shrink-0 tabular-nums">
                     ({group.matches.length})
                   </span>
                 </div>
@@ -238,31 +292,47 @@ export function ContentSearchDialog() {
               </div>
             );
           })}
+          {capped && <ResultCapNotice limit={CONTENT_SEARCH_LIMIT} />}
         </div>
+        <SearchFooter
+          hints={[
+            { keys: "↑↓", label: "navigate" },
+            { keys: "↵", label: "open" },
+            { keys: "esc", label: "close" },
+          ]}
+        />
       </DialogContent>
     </Dialog>
   );
 }
 
-function HighlightedLine({
-  content,
-  matchStart,
-  matchEnd,
+/** A query option button that says whether it is on, to sighted users by
+ *  fill and to assistive tech by `aria-pressed`. */
+function SearchToggle({
+  label,
+  shortcut,
+  pressed,
+  onToggle,
+  children,
 }: {
-  content: string;
-  matchStart: number;
-  matchEnd: number;
+  label: string;
+  shortcut: string;
+  pressed: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
 }) {
-  if (matchStart < 0 || matchEnd <= matchStart || matchStart >= content.length) {
-    return <>{content}</>;
-  }
   return (
-    <>
-      {content.substring(0, matchStart)}
-      <mark className="bg-accent-ember/30 text-inherit rounded-sm px-px">
-        {content.substring(matchStart, matchEnd)}
-      </mark>
-      {content.substring(matchEnd)}
-    </>
+    <Button
+      variant={pressed ? "secondary" : "ghost"}
+      size="icon-xs"
+      title={`${label} (${shortcut})`}
+      aria-label={label}
+      aria-keyshortcuts={shortcut}
+      aria-pressed={pressed}
+      onClick={onToggle}
+      className={pressed ? "bg-primary/20 text-primary" : ""}
+    >
+      {children}
+    </Button>
   );
 }
