@@ -4,7 +4,16 @@ import {
   parseKeyCombo,
   matchesKeyCombo,
   isModifierOnly,
+  modEnterLabel,
 } from "./keybind-utils";
+
+describe("modEnterLabel", () => {
+  it("names the Command key only on macOS", () => {
+    expect(modEnterLabel("MacIntel")).toBe("⌘↵");
+    expect(modEnterLabel("Linux x86_64")).toBe("Ctrl+↵");
+    expect(modEnterLabel("Win32")).toBe("Ctrl+↵");
+  });
+});
 
 function fakeEvent(overrides: Partial<KeyboardEvent>): KeyboardEvent {
   return {

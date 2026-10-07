@@ -106,3 +106,14 @@ export function matchesKeyCombo(event: KeyboardEvent, combo: string): boolean {
 export function isModifierOnly(event: KeyboardEvent): boolean {
   return MODIFIER_KEYS.has(event.key);
 }
+
+/**
+ * The "send" chord as a user would type it here: ⌘↵ on macOS, Ctrl+↵
+ * everywhere else. Handlers accept either modifier; this is only the
+ * label, so a Linux user is not taught a key their keyboard lacks.
+ */
+export function modEnterLabel(
+  platform: string = typeof navigator !== "undefined" ? navigator.platform : "",
+): string {
+  return /mac/i.test(platform) ? "⌘↵" : "Ctrl+↵";
+}

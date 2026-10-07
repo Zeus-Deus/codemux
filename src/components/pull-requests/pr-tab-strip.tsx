@@ -11,6 +11,33 @@ import {
   tzMetaNum,
 } from "@/components/workspace/review/review-ui";
 
+/**
+ * Arrow keys walk the open tabs (focus only; Enter or Space switches, so
+ * passing over a tab doesn't mount its whole detail), Delete closes.
+ */
+function onTabKeyDown(
+  event: React.KeyboardEvent<HTMLElement>,
+  select: () => void,
+  close: () => void,
+) {
+  if (event.target !== event.currentTarget) return;
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    select();
+  } else if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    close();
+  } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault();
+    const tabs = Array.from(
+      event.currentTarget.parentElement?.querySelectorAll<HTMLElement>('[role="tab"]') ?? [],
+    );
+    const step = event.key === "ArrowRight" ? 1 : -1;
+    const index = tabs.indexOf(event.currentTarget);
+    tabs[(index + step + tabs.length) % tabs.length]?.focus();
+  }
+}
+
 const DOT_TONE: Record<string, string> = {
   failing: "bg-destructive",
   pending: "bg-status-working",
@@ -60,12 +87,20 @@ export function PrTabStrip({
       className="flex h-[33px] shrink-0 items-center gap-0.5 border-b border-border/40 px-2"
       data-testid="pr-tab-strip"
     >
+      <div role="tablist" aria-label="Open pull requests" className="contents">
       {tabs.map((row) => {
         const key = rowKey(row);
         const active = key === activeKey;
+        const ref = providerRef(resolveProvider(row.providerKind), row.number);
         return (
           <span
             key={key}
+            role="tab"
+            aria-selected={active}
+            aria-label={`${ref} ${row.title}`}
+            title={row.title}
+            tabIndex={active ? 0 : -1}
+            onKeyDown={(event) => onTabKeyDown(event, () => onSelect(row), () => onClose(key))}
             data-testid={`pr-tab-${row.number}`}
             data-active={active}
             onMouseDown={(event) => {
@@ -96,23 +131,25 @@ export function PrTabStrip({
                 active ? "text-foreground" : "text-muted-foreground",
               )}
             >
-              {providerRef(resolveProvider(row.providerKind), row.number)}
+              {ref}
             </span>
             <button
               type="button"
+              tabIndex={-1}
               aria-label={`Close ${row.number}`}
               data-testid={`pr-tab-close-${row.number}`}
               onClick={(event) => {
                 event.stopPropagation();
                 onClose(key);
               }}
-              className="hidden size-3 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground group-hover:flex"
+              className="hidden size-3 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground group-hover:flex group-focus-visible:flex"
             >
               <X className="size-3" />
             </button>
           </span>
         );
       })}
+      </div>
 
       <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
         <PopoverTrigger asChild>

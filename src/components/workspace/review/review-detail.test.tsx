@@ -11,6 +11,7 @@ const mockSubmitPrReview = vi.fn().mockResolvedValue(undefined);
 const mockMergePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockSetPrReady = vi.fn().mockResolvedValue(undefined);
 const mockClosePullRequest = vi.fn().mockResolvedValue(undefined);
+const mockReopenPullRequest = vi.fn().mockResolvedValue(undefined);
 const mockUpdatePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockRequestPrReview = vi.fn().mockResolvedValue(undefined);
 const mockGetCheckLogExcerpt = vi.fn().mockResolvedValue("");
@@ -27,6 +28,7 @@ vi.mock("@/tauri/commands", () => ({
   mergePullRequest: (...a: unknown[]) => mockMergePullRequest(...a),
   setPrReady: (...a: unknown[]) => mockSetPrReady(...a),
   closePullRequest: (...a: unknown[]) => mockClosePullRequest(...a),
+  reopenPullRequest: (...a: unknown[]) => mockReopenPullRequest(...a),
   updatePullRequest: (...a: unknown[]) => mockUpdatePullRequest(...a),
   requestPrReview: (...a: unknown[]) => mockRequestPrReview(...a),
   getCheckLogExcerpt: (...a: unknown[]) => mockGetCheckLogExcerpt(...a),
@@ -66,6 +68,7 @@ vi.mock("@/lib/pr-agent-handoff", () => ({
 }));
 
 import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
+import { toast } from "@/lib/toast";
 import { _resetPrDrafts } from "./pr-drafts";
 import { resolveProvider } from "@/lib/source-control";
 import { ALL_OPERATIONS } from "@/lib/provider-auth";
@@ -445,6 +448,139 @@ describe("merge sheet", () => {
   });
 });
 
+describe("merging over a block", () => {
+  it("names the block in the sheet and asks for Merge anyway", async () => {
+    const user = userEvent.setup();
+    renderDetail({ checks: [check("build", "fail"), check("lint", "fail")] });
+    await flush();
+
+    await user.click(screen.getByTestId("review-primary-action"));
+
+    expect(await screen.findByTestId("merge-blocked-reason")).toHaveTextContent(
+      "2 checks failed — the host may refuse this merge.",
+    );
+    expect(screen.getByTestId("merge-confirm")).toHaveTextContent("Merge anyway");
+  });
+
+  it("keeps a green merge's sheet free of warnings", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+    await flush();
+
+    await user.click(screen.getByTestId("review-primary-action"));
+    await screen.findByTestId("merge-confirm");
+    expect(screen.queryByTestId("merge-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  it("shows the host's refusal in the sheet and keeps it open", async () => {
+    const user = userEvent.setup();
+    mockMergePullRequest.mockRejectedValueOnce("Required status checks have not passed");
+    renderDetail({ checks: [check("build", "fail")] });
+    await flush();
+
+    await user.click(screen.getByTestId("review-primary-action"));
+    await user.click(await screen.findByTestId("merge-confirm"));
+
+    expect(await screen.findByTestId("merge-error")).toHaveTextContent(
+      "Required status checks have not passed",
+    );
+    expect(screen.getByTestId("merge-confirm")).toBeInTheDocument();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("points Merge's description at the sentence that explains it", async () => {
+    renderDetail({ checks: [check("build", "fail")] });
+    await flush();
+
+    const sentence = screen.getByTestId("bar-sentence");
+    expect(sentence.id).not.toBe("");
+    expect(screen.getByTestId("review-primary-action")).toHaveAttribute(
+      "aria-describedby",
+      sentence.id,
+    );
+  });
+});
+
+describe("state changes", () => {
+  it("closes a draft only on the second tap", async () => {
+    const user = userEvent.setup();
+    renderDetail({ pr: makePr({ is_draft: true }) });
+    await flush();
+
+    await user.click(screen.getByTestId("review-close"));
+    expect(mockClosePullRequest).not.toHaveBeenCalled();
+    expect(screen.getByTestId("review-close")).toHaveTextContent("Confirm close");
+
+    await user.click(screen.getByTestId("review-close"));
+    await waitFor(() => expect(mockClosePullRequest).toHaveBeenCalledWith("/repo", 172));
+  });
+
+  it("disarms Close after a few seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      renderDetail({ pr: makePr({ is_draft: true }) });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      act(() => screen.getByTestId("review-close").click());
+      expect(screen.getByTestId("review-close")).toHaveTextContent("Confirm close");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(screen.getByTestId("review-close")).toHaveTextContent("Close");
+      expect(screen.getByTestId("review-close")).not.toHaveTextContent("Confirm");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows Ready for review in flight and sends it once", async () => {
+    const user = userEvent.setup();
+    let release: () => void = () => {};
+    mockSetPrReady.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { release = () => resolve(); }),
+    );
+    renderDetail({ pr: makePr({ is_draft: true }) });
+    await flush();
+
+    const ready = screen.getByTestId("review-primary-action");
+    await user.click(ready);
+    await user.click(ready);
+
+    expect(ready).toHaveTextContent("Marking ready");
+    expect(ready).toBeDisabled();
+    expect(screen.getByTestId("review-close")).toBeDisabled();
+    expect(mockSetPrReady).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(ready).toHaveTextContent("Ready for review"));
+  });
+
+  it("offers Reopen on the author's closed pull request", async () => {
+    const user = userEvent.setup();
+    renderDetail({ pr: makePr({ state: "CLOSED" }) });
+    await flush();
+
+    await user.click(screen.getByTestId("review-reopen"));
+    await waitFor(() => expect(mockReopenPullRequest).toHaveBeenCalledWith("/repo", 172));
+  });
+
+  it("offers no Reopen on a merged pull request or someone else's", async () => {
+    renderDetail({ pr: makePr({ state: "MERGED" }) });
+    await flush();
+    expect(screen.queryByTestId("review-reopen")).not.toBeInTheDocument();
+    cleanup();
+
+    renderDetail({ pr: makePr({ state: "CLOSED", author: "someone-else" }) });
+    await flush();
+    expect(screen.queryByTestId("review-reopen")).not.toBeInTheDocument();
+  });
+});
+
 // ── 4. Drift notices ──
 
 describe("drift notices", () => {
@@ -503,6 +639,76 @@ describe("drift notices", () => {
     expect(notice).toHaveTextContent("2 commits behind, and 3 files modified here");
     expect(screen.queryByRole("button", { name: "Pull" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stash and pull" })).toBeInTheDocument();
+  });
+
+  it("shows Pull in flight and takes no second click", async () => {
+    const user = userEvent.setup();
+    let release: () => void = () => {};
+    mockGitPullChanges.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { release = () => resolve(); }),
+    );
+    renderDetail({ gitBehind: 2 });
+    await flush();
+
+    const pull = screen.getByRole("button", { name: "Pull" });
+    await user.click(pull);
+    await user.click(pull);
+
+    expect(pull).toHaveTextContent("Pulling");
+    expect(pull).toBeDisabled();
+    expect(mockGitPullChanges).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+  });
+
+  it("holds the bar's state changes while a pull is in flight", async () => {
+    const user = userEvent.setup();
+    let release: () => void = () => {};
+    mockGitPullChanges.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { release = () => resolve(); }),
+    );
+    renderDetail({ pr: makePr({ is_draft: true }), gitBehind: 2 });
+    await flush();
+
+    await user.click(screen.getByRole("button", { name: "Pull" }));
+
+    // A click here would be dropped, so the buttons must not look live.
+    const ready = screen.getByTestId("review-primary-action");
+    expect(ready).toBeDisabled();
+    expect(ready).toHaveTextContent("Ready for review");
+    expect(screen.getByTestId("review-close")).toBeDisabled();
+
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(ready).toBeEnabled());
+  });
+
+  it("holds Pull while a state change from the bar is in flight", async () => {
+    const user = userEvent.setup();
+    let release: () => void = () => {};
+    mockSetPrReady.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { release = () => resolve(); }),
+    );
+    renderDetail({ pr: makePr({ is_draft: true }), gitBehind: 2 });
+    await flush();
+
+    await user.click(screen.getByTestId("review-primary-action"));
+
+    // track() would drop this click, so Pull must not look live.
+    const pull = screen.getByRole("button", { name: "Pull" });
+    expect(pull).toBeDisabled();
+    expect(pull).toHaveTextContent("Pull");
+
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(pull).toBeEnabled());
   });
 
   it("shows only the most severe notice", async () => {

@@ -15,6 +15,7 @@ import {
   gitPullChanges,
   gitStashPush,
   mergePullRequest,
+  reopenPullRequest,
   replyToPrThread,
   setPrReady,
   setPrThreadResolved,
@@ -49,7 +50,11 @@ import { ReviewChecks } from "./review-checks";
 import { ReviewReviewers } from "./review-reviewers";
 import { ReviewDescription } from "./review-description";
 import { ReviewThreads } from "./review-threads";
-import { ReviewActionBar, type ActionBarState } from "./review-action-bar";
+import {
+  ReviewActionBar,
+  type ActionBarState,
+  type PendingWork,
+} from "./review-action-bar";
 import { MergeSheet, type MergeRequestPayload } from "./merge-sheet";
 import {
   ReviewDriftNotice,
@@ -80,6 +85,7 @@ import {
   submitBlockedReason,
   useLineDrafts,
 } from "./pr-drafts";
+
 
 /**
  * Head-SHA history, so a force-push can be noticed at all.
@@ -228,6 +234,10 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const [activeTab, setActiveTab] = useState("summary");
   const [mergeSheetOpen, setMergeSheetOpen] = useState(false);
   const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [inFlight, setInFlight] = useState<PendingWork | null>(null);
+  // The state above lags a render behind a double-click; this does not.
+  const inFlightRef = useRef(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [strategy, setStrategy] = useState(() => getMergeStrategy());
@@ -568,6 +578,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const confirmMerge = useCallback(
     async (payload: MergeRequestPayload) => {
       setMerging(true);
+      setMergeError(null);
       try {
         await mergePullRequest(
           cwd,
@@ -581,7 +592,9 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onRefresh();
         toast.success(`Merged #${pr.number}`);
       } catch (err) {
-        toast.error(String(err));
+        // The sheet stays open with the refusal in it, so the fix (or
+        // Cancel) is decided with the reason still on screen.
+        setMergeError(String(err));
       } finally {
         setMerging(false);
       }
@@ -589,25 +602,59 @@ export function ReviewDetail(props: ReviewDetailProps) {
     [cwd, pr.number, onRefresh],
   );
 
-  const markReady = useCallback(async () => {
-    try {
-      await setPrReady(cwd, pr.number, true);
-      onRefresh();
-      toast.success("Marked ready for review");
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, pr.number, onRefresh]);
+  /**
+   * Run one request with its button showing progress.
+   *
+   * A second click while one is in flight is dropped: these requests
+   * (ready, close, pull) are not idempotent from the user's side, and a
+   * duplicate either errors or does the thing twice.
+   */
+  const track = useCallback(
+    async (work: PendingWork, run: () => Promise<void>) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      setInFlight(work);
+      try {
+        await run();
+      } catch (err) {
+        toast.error(String(err));
+      } finally {
+        inFlightRef.current = false;
+        setInFlight(null);
+      }
+    },
+    [],
+  );
 
-  const closePr = useCallback(async () => {
-    try {
-      await closePullRequest(cwd, pr.number);
-      onRefresh();
-      toast.success(`Closed #${pr.number}`);
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, pr.number, onRefresh]);
+  const markReady = useCallback(
+    () =>
+      track("ready", async () => {
+        await setPrReady(cwd, pr.number, true);
+        onRefresh();
+        toast.success("Marked ready for review");
+      }),
+    [track, cwd, pr.number, onRefresh],
+  );
+
+  const closePr = useCallback(
+    () =>
+      track("close", async () => {
+        await closePullRequest(cwd, pr.number);
+        onRefresh();
+        toast.success(`Closed #${pr.number}`);
+      }),
+    [track, cwd, pr.number, onRefresh],
+  );
+
+  const reopenPr = useCallback(
+    () =>
+      track("reopen", async () => {
+        await reopenPullRequest(cwd, pr.number);
+        onRefresh();
+        toast.success(`Reopened #${pr.number}`);
+      }),
+    [track, cwd, pr.number, onRefresh],
+  );
 
   const switchToDefaultBranch = useCallback(async () => {
     if (!workspaceId) return;
@@ -619,26 +666,26 @@ export function ReviewDetail(props: ReviewDetailProps) {
     }
   }, [workspaceId]);
 
-  const pull = useCallback(async () => {
-    try {
-      await gitPullChanges(cwd);
-      onRefresh();
-      toast.success("Pulled");
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, onRefresh]);
+  const pull = useCallback(
+    () =>
+      track("pull", async () => {
+        await gitPullChanges(cwd);
+        onRefresh();
+        toast.success("Pulled");
+      }),
+    [track, cwd, onRefresh],
+  );
 
-  const stashAndPull = useCallback(async () => {
-    try {
-      await gitStashPush(cwd, false);
-      await gitPullChanges(cwd);
-      onRefresh();
-      toast.success("Stashed and pulled");
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, onRefresh]);
+  const stashAndPull = useCallback(
+    () =>
+      track("stash-pull", async () => {
+        await gitStashPush(cwd, false);
+        await gitPullChanges(cwd);
+        onRefresh();
+        toast.success("Stashed and pulled");
+      }),
+    [track, cwd, onRefresh],
+  );
 
   const copyDraft = useCallback(
     (label: string) => {
@@ -877,7 +924,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
             ...(onOpenChanges
               ? [{ label: "Review changes", onClick: onOpenChanges }]
               : []),
-            { label: "Stash and pull", onClick: () => void stashAndPull() },
+            {
+              label: "Stash and pull",
+              onClick: () => void stashAndPull(),
+              busy: inFlight === "stash-pull",
+              busyLabel: "Pulling",
+              // track() drops this click while a bar state change runs.
+              disabled: inFlight != null,
+            },
             ...(onOpenChanges
               ? [
                   {
@@ -901,7 +955,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
           ),
           actions: [
             { label: "What changed", onClick: () => openPrPath("/commits") },
-            { label: "Pull", onClick: () => void pull(), emphasis: "strong" },
+            {
+              label: "Pull",
+              onClick: () => void pull(),
+              emphasis: "strong",
+              busy: inFlight === "pull",
+              busyLabel: "Pulling",
+              disabled: inFlight != null,
+            },
           ],
         });
       }
@@ -980,6 +1041,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     openPrPath,
     pull,
     stashAndPull,
+    inFlight,
     runSubmit,
     lineDrafts,
     unanchoredCount,
@@ -1194,6 +1256,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         canComment={operations.comment}
         canMerge={operations.merge_with_strategies}
         canChangeState={operations.draft_ready_close_reopen}
+        pending={inFlight}
         // A verdict from the bar sends the pending line notes with it.
         //
         // The bar and the submit sheet are two doors onto the same act,
@@ -1207,13 +1270,23 @@ export function ReviewDetail(props: ReviewDetailProps) {
             ? submitWithNotes(event, body)
             : runSubmit(event, body))
         }
-        onOpenMergeSheet={() => setMergeSheetOpen(true)}
+        onOpenMergeSheet={() => {
+          setMergeError(null);
+          setMergeSheetOpen(true);
+        }}
         onPickStrategy={(next) => {
           setStrategy(next);
           setMergeStrategy(next);
         }}
         onReadyForReview={() => void markReady()}
         onClose={() => void closePr()}
+        // Closed, not merged: the one record a state change can undo.
+        // Offered to the author, like Close itself.
+        onReopen={
+          closed && isAuthor && operations.draft_ready_close_reopen
+            ? () => void reopenPr()
+            : undefined
+        }
         onRebase={() => openPrPath("/conflicts")}
         onResolveConflicts={canHandOff ? resolveConflictsWithAgent : undefined}
       />
@@ -1258,6 +1331,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
           prTitle={pr.title}
           headBranch={pr.head_branch}
           merging={merging}
+          blockedReason={blockedReason}
+          error={mergeError}
           onCancel={() => setMergeSheetOpen(false)}
           onConfirm={(payload) => void confirmMerge(payload)}
         />
