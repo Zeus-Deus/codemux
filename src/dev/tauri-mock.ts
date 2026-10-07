@@ -198,6 +198,53 @@ function startStressDeltaDriver(): void {
   }, periodMs);
 }
 
+// ── Changes pane mock state ──
+//
+// The dirty checkout's status, copied so Stage and Unstage in the Changes
+// pane move rows between sections for the session.
+const mockDirtyFiles: typeof MOCK_CREATE_PR_DIRTY = structuredClone(MOCK_CREATE_PR_DIRTY);
+
+function setMockStaged(path: unknown, files: unknown, staged: boolean): void {
+  if (String(path ?? "") !== MOCK_CREATE_PR_PATH || !Array.isArray(files)) return;
+  for (const file of mockDirtyFiles) {
+    if (!files.includes(file.path)) continue;
+    file.is_staged = staged;
+    file.is_unstaged = !staged;
+  }
+}
+
+/** Two hunks and one long line, so hunk navigation and soft wrap have
+ *  something to act on. */
+function mockFileDiff(file: string): string {
+  return [
+    `diff --git a/${file} b/${file}`,
+    `--- a/${file}`,
+    `+++ b/${file}`,
+    "@@ -1,6 +1,8 @@",
+    ' import { useEffect, useRef } from "react";',
+    '-import { subscribe } from "./events";',
+    '+import { openChannel } from "@/lib/agent-chat/channel";',
+    '+import type { ChannelEvent } from "@/lib/agent-chat/channel";',
+    " ",
+    " const RECONNECT_DELAY_MS = 500;",
+    "+const MAX_BUFFERED_EVENTS = 256;",
+    " ",
+    "@@ -40,7 +42,12 @@ export function useChannel(threadId: string) {",
+    "   const queue = useRef<ChannelEvent[]>([]);",
+    "   useEffect(() => {",
+    "-    return subscribe(threadId, (event) => queue.current.push(event));",
+    "+    const channel = openChannel(threadId, { bufferLimit: MAX_BUFFERED_EVENTS, reconnectDelayMs: RECONNECT_DELAY_MS, onOverflow: (dropped) => console.warn(`channel ${threadId} dropped ${dropped} events while the view was hidden`) });",
+    "+    channel.on((event) => {",
+    "+      queue.current.push(event);",
+    "+    });",
+    "+    return () => channel.close();",
+    "   }, [threadId]);",
+    " ",
+    "   return queue;",
+    "",
+  ].join("\n");
+}
+
 // ── Pull request mock state ──
 //
 // The fixture map is the seed; this is the copy the mutators write to,
@@ -5974,7 +6021,11 @@ const handlers: Record<string, Handler> = {
   // from has uncommitted work, because the form's warning row is only
   // reachable when something is actually uncommitted.
   get_git_status: (a) =>
-    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? MOCK_CREATE_PR_DIRTY : [],
+    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? structuredClone(mockDirtyFiles) : [],
+  get_git_diff: (a) =>
+    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? mockFileDiff(String(a.file ?? "")) : "",
+  git_stage_files: (a) => setMockStaged(a.path, a.files, true),
+  git_unstage_files: (a) => setMockStaged(a.path, a.files, false),
   get_merge_state: () => null,
   check_claude_available: () => false,
 
