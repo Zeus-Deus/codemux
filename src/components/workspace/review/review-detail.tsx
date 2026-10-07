@@ -53,7 +53,7 @@ import { ReviewThreads } from "./review-threads";
 import {
   ReviewActionBar,
   type ActionBarState,
-  type PendingStateChange,
+  type PendingWork,
 } from "./review-action-bar";
 import { MergeSheet, type MergeRequestPayload } from "./merge-sheet";
 import {
@@ -86,8 +86,6 @@ import {
   useLineDrafts,
 } from "./pr-drafts";
 
-/** One-shot requests from the bar and the notice slot, one at a time. */
-type PendingWork = PendingStateChange | "pull" | "stash-pull";
 
 /**
  * Head-SHA history, so a force-push can be noticed at all.
@@ -1255,7 +1253,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         canComment={operations.comment}
         canMerge={operations.merge_with_strategies}
         canChangeState={operations.draft_ready_close_reopen}
-        pending={inFlight === "pull" || inFlight === "stash-pull" ? null : inFlight}
+        pending={inFlight}
         // A verdict from the bar sends the pending line notes with it.
         //
         // The bar and the submit sheet are two doors onto the same act,

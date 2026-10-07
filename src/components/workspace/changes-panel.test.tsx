@@ -51,6 +51,11 @@ describe("SmartCommitButton", () => {
     expect(screen.getByRole("button", { name: "Pulling…" })).toBeInTheDocument();
   });
 
+  it("says Popping, not Stashing, while a stash pops", () => {
+    renderButton({ busy: "stash-pop" });
+    expect(screen.getByRole("button", { name: "Popping…" })).toBeInTheDocument();
+  });
+
   it("confirms a finished push on the button", () => {
     renderButton({ justDone: "push", ahead: 0 });
     expect(screen.getByRole("button", { name: "Pushed" })).toBeInTheDocument();

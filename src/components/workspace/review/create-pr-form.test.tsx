@@ -188,6 +188,16 @@ describe("CreatePrForm", () => {
     expect(calls).toEqual([]);
   });
 
+  it("leaves Enter alone while an IME composition is confirming", async () => {
+    renderForm();
+    await waitFor(() => expect(titleField().value).not.toBe(""));
+    titleField().focus();
+
+    fireEvent.keyDown(titleField(), { key: "Enter", isComposing: true });
+
+    expect(document.activeElement).toBe(titleField());
+  });
+
   it("creates on Ctrl+Enter from the title or the description", async () => {
     renderForm();
     await waitFor(() => expect(titleField().value).not.toBe(""));

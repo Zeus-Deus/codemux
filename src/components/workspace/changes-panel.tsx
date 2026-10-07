@@ -310,7 +310,7 @@ export function ChangesPanel({
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
-  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
+  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | "stash-pop" | null>(null);
   const [editing, setEditing] = useState(false);
   const [editedMsg, setEditedMsg] = useState("");
   const [pushAfterCommit, setPushAfterCommit] = useState(false);
@@ -559,7 +559,7 @@ export function ChangesPanel({
 
   const handleStashPop = async () => {
     if (busy) return;
-    setBusy("stash");
+    setBusy("stash-pop");
     try {
       await gitStashPop(cwd);
       toast.success("Popped stash");
@@ -913,6 +913,7 @@ const IN_FLIGHT_LABEL: Partial<Record<string, string>> = {
   amend: "Amending…",
   undo: "Undoing…",
   stash: "Stashing…",
+  "stash-pop": "Popping…",
 };
 
 const DONE_LABEL: Record<RemoteAction, string> = {

@@ -46,6 +46,9 @@ export type ActionBarState =
 
 export type PendingStateChange = "ready" | "close" | "reopen";
 
+/** One-shot requests from the bar and the notice slot, one at a time. */
+export type PendingWork = PendingStateChange | "pull" | "stash-pull";
+
 export interface ActionBarProps {
   state: ActionBarState;
   draftKey: DraftKey;
@@ -65,9 +68,10 @@ export interface ActionBarProps {
   canComment: boolean;
   canMerge: boolean;
   canChangeState: boolean;
-  /** A state change in flight. Its button shows progress; the others
-   *  wait, so a double-click cannot send the request twice. */
-  pending?: PendingStateChange | null;
+  /** A request in flight. A state change's own button shows progress;
+   *  every state button waits while anything is in flight (a pull from
+   *  the notice included), since the click would be dropped anyway. */
+  pending?: PendingWork | null;
   onSubmitReview: (event: string, body: string) => void;
   onOpenMergeSheet: () => void;
   onPickStrategy: (strategy: string) => void;

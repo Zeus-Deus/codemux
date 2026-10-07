@@ -364,7 +364,8 @@ export function CreatePrForm({
             // too much to hang on the key people press out of habit at
             // the end of a line. The send chord does submit.
             onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
+              // Enter that confirms an IME composition is not ours.
+              if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
               event.preventDefault();
               if (event.metaKey || event.ctrlKey) void create(false);
               else bodyRef.current?.focus();
