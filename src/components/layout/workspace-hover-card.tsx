@@ -154,7 +154,7 @@ export function WorkspaceHoverCard({
   // releases it instead, or that hover would be swallowed. Focus handed back
   // to the row by the closing menu still cannot open the card before then.
   // A menu opened from the keyboard has no pointer to track, so the next
-  // pointerenter releases it too, and so does the row losing focus, which is
+  // pointerenter releases it too, and so does focus leaving the row, which is
   // the only release a keyboard-only user can reach.
   // The trigger is `asChild`, typed as an anchor; a callback ref takes the
   // row element as the plain HTMLElement it is.
@@ -217,10 +217,18 @@ export function WorkspaceHoverCard({
           suppressUntilPointerLeave.current = false;
         }}
         onPointerLeave={() => {
-          if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;
-        }}
-        onBlur={() => {
           if (menuOpenRef.current) return;
+          suppressUntilPointerLeave.current = false;
+          // The point is stale once the pointer is off the row; a menu later
+          // opened from the keyboard must not read it as still on the row.
+          lastPointer.current = null;
+        }}
+        onBlur={(event) => {
+          if (menuOpenRef.current) return;
+          // Blur bubbles: focus moving to a nested action is still inside the
+          // row, and the pointer-down that moved it must stay suppressed.
+          const next = event.relatedTarget;
+          if (next instanceof Node && event.currentTarget.contains(next)) return;
           releaseOnPointerEnter.current = false;
           suppressUntilPointerLeave.current = false;
         }}

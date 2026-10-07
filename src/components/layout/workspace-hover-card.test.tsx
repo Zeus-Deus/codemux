@@ -892,6 +892,60 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(card()).not.toBeNull();
   });
 
+  // Focus moving from the row to one of its nested actions blurs the row
+  // too; that must not release the pointer-down suppression, or the focus
+  // landing on the action reopens the card the click just dismissed.
+  it("keeps a click on a nested action suppressed while focus is already in the row", () => {
+    render(
+      <WorkspaceHoverCard
+        workspace={makeWorkspace()}
+        repo={{ name: "myapp", path: "/home/u/projects/myapp" }}
+        status={null}
+      >
+        <div tabIndex={0} data-testid="focus-row">
+          <button type="button">Snooze</button>
+        </div>
+      </WorkspaceHoverCard>,
+    );
+    const row = screen.getByTestId("focus-row");
+    const action = screen.getByText("Snooze");
+    pointerEnter(row);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+
+    fireEvent.pointerDown(row, { pointerType: "mouse" });
+    act(() => row.focus());
+    fireEvent.pointerDown(action, { pointerType: "mouse" });
+    act(() => action.focus());
+    advance(1000);
+    expect(card()).toBeNull();
+  });
+
+  // A row clicked earlier keeps that point; once the pointer has left, a
+  // keyboard-opened menu closing must not read it as the pointer still being
+  // on the row, or the next hover onto the row is swallowed.
+  it("opens on the first hover after a keyboard menu on a row clicked earlier", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    pointerEnter(alpha);
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      clientX: 20,
+      clientY: 110,
+    });
+    pointerLeave(alpha);
+    fireEvent.focus(alpha);
+    setMenuOpen(true);
+    setMenuOpen(false);
+    fireEvent.focus(alpha);
+
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
   it("closes an open card when the menu opens from the keyboard", () => {
     const { alpha, setMenuOpen } = renderMenuRow();
     pointerEnter(alpha);
