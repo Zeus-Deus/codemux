@@ -229,6 +229,27 @@ describe("the embedded diff pane", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
+  it("starts Shift+J at the first file and Shift+K at the last when none is picked", async () => {
+    useDiffStore.setState({ tabs: {} });
+    useDiffStore.getState().initTab(TAB);
+    renderPane();
+    let pane = screen.getByTestId("diff-pane");
+    await waitFor(() => expect(pane).toHaveTextContent("2 files with changes"));
+    fireEvent.keyDown(pane, { key: "J", shiftKey: true });
+    expect(useDiffStore.getState().tabs[TAB].filePath).toBe("src/a.ts");
+    cleanup();
+
+    // A stale index left from an earlier pick must not steer the first step.
+    useDiffStore.setState({ tabs: {} });
+    useDiffStore.getState().initTab(TAB);
+    useDiffStore.getState().setFileIndex(TAB, 1);
+    renderPane();
+    pane = screen.getByTestId("diff-pane");
+    await waitFor(() => expect(pane).toHaveTextContent("2 files with changes"));
+    fireEvent.keyDown(pane, { key: "K", shiftKey: true });
+    expect(useDiffStore.getState().tabs[TAB].filePath).toBe("src/lib/b.ts");
+  });
+
   it("hides a zero count in the header", async () => {
     mockGetGitStatus.mockResolvedValue([status("src/a.ts", 2, 0)]);
     renderPane();

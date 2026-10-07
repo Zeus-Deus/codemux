@@ -248,8 +248,10 @@ export function DiffPane({
 
   const handlePrevFile = useCallback(() => {
     if (!tab || filteredFiles.length === 0) return;
-    const newIdx =
-      (tab.fileIndex - 1 + filteredFiles.length) % filteredFiles.length;
+    // With no file picked yet, Prev starts from the last file.
+    const newIdx = !tab.filePath
+      ? filteredFiles.length - 1
+      : (tab.fileIndex - 1 + filteredFiles.length) % filteredFiles.length;
     const file = filteredFiles[newIdx];
     const staged = tab.section === "staged" ? true : tab.section === "unstaged" ? false : file.is_staged;
     setFile(tabId, file.path, staged);
@@ -258,7 +260,8 @@ export function DiffPane({
 
   const handleNextFile = useCallback(() => {
     if (!tab || filteredFiles.length === 0) return;
-    const newIdx = (tab.fileIndex + 1) % filteredFiles.length;
+    // With no file picked yet, Next starts from the first file.
+    const newIdx = !tab.filePath ? 0 : (tab.fileIndex + 1) % filteredFiles.length;
     const file = filteredFiles[newIdx];
     const staged = tab.section === "staged" ? true : tab.section === "unstaged" ? false : file.is_staged;
     setFile(tabId, file.path, staged);
