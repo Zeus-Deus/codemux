@@ -282,6 +282,7 @@ export function NewProjectScreen() {
               <button
                 type="button"
                 onClick={() => setError(null)}
+                aria-label="Dismiss error"
                 className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
               >
                 <X className="size-3.5" />

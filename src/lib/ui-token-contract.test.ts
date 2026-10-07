@@ -46,16 +46,19 @@ function templateLiterals(contents: string): string[] {
   return withoutComments(contents).match(/`[^`]*`/g) ?? [];
 }
 
-/** Each `<Button …>` element as its opening tag and children. The tag is read
- *  brace- and quote-aware so an `onClick={() => …}` does not end it early. */
+/** Each `<Button …>` or raw `<button …>` element as its opening tag and
+ *  children. The tag is read brace- and quote-aware so an `onClick={() => …}`
+ *  does not end it early; comments are dropped first so an apostrophe in one
+ *  cannot open a phantom quote. */
 function buttonElements(contents: string): { tag: string; children: string }[] {
+  const source = withoutComments(contents);
   const elements: { tag: string; children: string }[] = [];
-  for (const start of contents.matchAll(/<Button\b/g)) {
+  for (const start of source.matchAll(/<([Bb]utton)\b/g)) {
     let depth = 0;
     let quote: string | null = null;
-    let end = start.index + "<Button".length;
-    for (; end < contents.length; end++) {
-      const ch = contents[end];
+    let end = start.index + start[0].length;
+    for (; end < source.length; end++) {
+      const ch = source[end];
       if (quote) {
         if (ch === quote) quote = null;
       } else if (ch === '"' || ch === "'" || ch === "`") quote = ch;
@@ -63,23 +66,28 @@ function buttonElements(contents: string): { tag: string; children: string }[] {
       else if (ch === "}") depth--;
       else if (ch === ">" && depth === 0) break;
     }
-    const tag = contents.slice(start.index, end + 1);
-    const close = tag.endsWith("/>") ? end : contents.indexOf("</Button>", end);
-    elements.push({ tag, children: contents.slice(end + 1, close) });
+    const tag = source.slice(start.index, end + 1);
+    const close = tag.endsWith("/>")
+      ? end
+      : source.indexOf(`</${start[1]}>`, end);
+    elements.push({ tag, children: source.slice(end + 1, close) });
   }
   return elements;
 }
 
-/** Icon-only `<Button>`s with nothing a screen reader can announce: no
- *  aria-label, no title, no spread props that could carry one, and no
- *  sr-only text. A tooltip is not a name — it only describes once open. */
+/** Icon-only buttons with nothing a screen reader can announce: no
+ *  aria-label, no title, no spread props or `asChild` child that could carry
+ *  one, no sr-only text, and no text at all once child elements are stripped
+ *  (an `{expression}` child may render text, so it counts as a name). Any
+ *  size qualifies — an icon-only `size="sm"` is just as unnamed. A tooltip is
+ *  not a name — it only describes once open. */
 function unnamedIconButtons(contents: string): string[] {
   return buttonElements(contents)
     .filter(
       ({ tag, children }) =>
-        /\bsize=(?:"icon|\{[^}]*"icon)/.test(tag) &&
-        !/\baria-label(?:ledby)?=|\btitle=|\{\s*\.\.\./.test(tag) &&
-        !children.includes("sr-only"),
+        !/\baria-label(?:ledby)?=|\btitle=|\basChild\b|\{\s*\.\.\./.test(tag) &&
+        !children.includes("sr-only") &&
+        children.replace(/<\/?[A-Za-z][^<>]*?\/?>/g, "").trim() === "",
     )
     .map(({ tag }) => tag);
 }
@@ -150,8 +158,8 @@ const CATEGORIES: Category[] = [
     budget: 0,
   },
   {
-    label: "icon-only Buttons with no accessible name (add aria-label)",
-    pattern: /^<Button\b/g,
+    label: "icon-only buttons with no accessible name (add aria-label)",
+    pattern: /^<[Bb]utton\b/g,
     scan: unnamedIconButtons,
     budget: 0,
   },
