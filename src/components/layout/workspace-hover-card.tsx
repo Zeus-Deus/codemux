@@ -150,8 +150,9 @@ export function WorkspaceHoverCard({
   // row after the menu closes, so neither focus returning nor the pointer
   // being handed back to the row can pop the card over the dismissed menu.
   // If the pointer is already off the row when the menu closes (an item far
-  // down a long menu), no leave will follow, so release it there instead or
-  // the next real hover onto the row would be swallowed.
+  // down a long menu), no leave will follow, so the next real pointerenter
+  // releases it instead, or that hover would be swallowed. Focus handed back
+  // to the row by the closing menu still cannot open the card before then.
   // The trigger is `asChild`, typed as an anchor; a callback ref takes the
   // row element as the plain HTMLElement it is.
   const triggerRef = useRef<HTMLElement | null>(null);
@@ -159,6 +160,7 @@ export function WorkspaceHoverCard({
     triggerRef.current = node;
   }, []);
   const lastPointer = useRef<{ x: number; y: number } | null>(null);
+  const releaseOnPointerEnter = useRef(false);
   useEffect(() => {
     menuOpenRef.current = menuOpen;
     if (!menuOpen) {
@@ -166,11 +168,12 @@ export function WorkspaceHoverCard({
       const rect = triggerRef.current?.getBoundingClientRect();
       lastPointer.current = null;
       if (point && rect && !rectContains(rect, point)) {
-        suppressUntilPointerLeave.current = false;
+        releaseOnPointerEnter.current = true;
       }
       return;
     }
     suppressUntilPointerLeave.current = true;
+    releaseOnPointerEnter.current = false;
     setCardState((prev) => ({ ...prev, open: false }));
     const track = (event: PointerEvent) => {
       lastPointer.current = { x: event.clientX, y: event.clientY };
@@ -200,8 +203,15 @@ export function WorkspaceHoverCard({
           // Selection must not leave a preview covering the newly opened chat.
           // Capture also catches nested row actions that stop propagation.
           suppressUntilPointerLeave.current = true;
+          releaseOnPointerEnter.current = false;
           lastPointer.current = { x: event.clientX, y: event.clientY };
           setCardState((prev) => ({ ...prev, open: false }));
+        }}
+        // Runs before Radix's own enter handler, so this hover can open.
+        onPointerEnter={() => {
+          if (!releaseOnPointerEnter.current || menuOpenRef.current) return;
+          releaseOnPointerEnter.current = false;
+          suppressUntilPointerLeave.current = false;
         }}
         onPointerLeave={() => {
           if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;

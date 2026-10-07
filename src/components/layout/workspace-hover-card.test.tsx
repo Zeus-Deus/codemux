@@ -807,6 +807,39 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(card()).not.toBeNull();
   });
 
+  // Closing the modal menu hands focus back to the row. With the pointer
+  // elsewhere, that focus must not pop the card beside the row, where no
+  // pointerleave would ever close it again.
+  it("ignores focus returning when the menu closes with the pointer off the row", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      button: 2,
+      clientX: 20,
+      clientY: 110,
+    });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    fireEvent.blur(alpha);
+    act(() => {
+      fireEvent.pointerMove(window, { clientX: 60, clientY: 400 });
+    });
+    setMenuOpen(false);
+
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    // The next real hover onto the row still opens it.
+    fireEvent.blur(alpha);
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
   it("stays suppressed when the menu closes with the pointer still on the row", () => {
     const { alpha, setMenuOpen } = renderMenuRow();
     vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
