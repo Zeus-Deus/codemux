@@ -375,19 +375,27 @@ export function EditorPane({
 
         {/* View mode toggle — markdown files only */}
         {isMd && (
-          <div className="flex items-center rounded-sm border border-border/50 overflow-hidden mr-1">
-            <button
-              className={`px-1.5 py-0.5 text-caption transition-colors ${viewMode === "rendered" ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-              onClick={() => setViewMode("rendered")}
-            >
-              Rendered
-            </button>
-            <button
-              className={`px-1.5 py-0.5 text-caption transition-colors ${viewMode === "raw" ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-              onClick={() => setViewMode("raw")}
-            >
-              Raw
-            </button>
+          <div
+            role="group"
+            aria-label="Markdown view"
+            className="flex items-center rounded-sm border border-border/50 overflow-hidden mr-1"
+          >
+            {(["rendered", "raw"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={viewMode === mode}
+                className={cn(
+                  "px-1.5 py-0.5 text-caption transition-colors duration-100",
+                  viewMode === mode
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() => setViewMode(mode)}
+              >
+                {mode === "rendered" ? "Rendered" : "Raw"}
+              </button>
+            ))}
           </div>
         )}
 

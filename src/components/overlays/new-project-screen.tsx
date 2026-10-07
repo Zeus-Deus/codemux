@@ -180,6 +180,7 @@ export function NewProjectScreen() {
                 onClick={handleBrowse}
                 disabled={loading}
                 className="shrink-0"
+                aria-label="Browse for folder"
               >
                 <FolderOpen className="size-4" />
               </Button>

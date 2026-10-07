@@ -35,6 +35,55 @@ function buttonTags(contents: string): string[] {
   return contents.match(/<Button\b[\s\S]*?>/g) ?? [];
 }
 
+/** Source with block comments and whole-line `//` comments removed, so a
+ *  backtick-quoted class name in prose is not read as a template literal. */
+function withoutComments(contents: string): string {
+  return contents.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
+
+/** Template literals in code: class lists that interpolate a condition. */
+function templateLiterals(contents: string): string[] {
+  return withoutComments(contents).match(/`[^`]*`/g) ?? [];
+}
+
+/** Each `<Button …>` element as its opening tag and children. The tag is read
+ *  brace- and quote-aware so an `onClick={() => …}` does not end it early. */
+function buttonElements(contents: string): { tag: string; children: string }[] {
+  const elements: { tag: string; children: string }[] = [];
+  for (const start of contents.matchAll(/<Button\b/g)) {
+    let depth = 0;
+    let quote: string | null = null;
+    let end = start.index + "<Button".length;
+    for (; end < contents.length; end++) {
+      const ch = contents[end];
+      if (quote) {
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+      else if (ch === "{") depth++;
+      else if (ch === "}") depth--;
+      else if (ch === ">" && depth === 0) break;
+    }
+    const tag = contents.slice(start.index, end + 1);
+    const close = tag.endsWith("/>") ? end : contents.indexOf("</Button>", end);
+    elements.push({ tag, children: contents.slice(end + 1, close) });
+  }
+  return elements;
+}
+
+/** Icon-only `<Button>`s with nothing a screen reader can announce: no
+ *  aria-label, no title, no spread props that could carry one, and no
+ *  sr-only text. A tooltip is not a name — it only describes once open. */
+function unnamedIconButtons(contents: string): string[] {
+  return buttonElements(contents)
+    .filter(
+      ({ tag, children }) =>
+        /\bsize=(?:"icon|\{[^}]*"icon)/.test(tag) &&
+        !/\baria-label(?:ledby)?=|\btitle=|\{\s*\.\.\./.test(tag) &&
+        !children.includes("sr-only"),
+    )
+    .map(({ tag }) => tag);
+}
+
 interface Category {
   /** What the pattern is looking for, in the failure message. */
   label: string;
@@ -91,6 +140,19 @@ const CATEGORIES: Category[] = [
     pattern:
       /"[^"\n]*\btransition-(?:colors|opacity|transform|all|\[)(?![^"\n]*\bduration-)[^"\n]*"/g,
     scan: (contents) => [contents],
+    budget: 0,
+  },
+  {
+    label: "template-literal transitions with no explicit duration",
+    pattern:
+      /\btransition-(?:colors|opacity|transform|all|\[)(?![^`]*\bduration-)/g,
+    scan: templateLiterals,
+    budget: 0,
+  },
+  {
+    label: "icon-only Buttons with no accessible name (add aria-label)",
+    pattern: /^<Button\b/g,
+    scan: unnamedIconButtons,
     budget: 0,
   },
   {

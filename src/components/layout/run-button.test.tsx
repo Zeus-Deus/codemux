@@ -156,13 +156,14 @@ describe("RunButton", () => {
     const { container } = renderRunButton();
     await flushPromises();
     // Original shape: ghost Run/Set Run button + a second, standalone gear
-    // Button (no aria-label — pre-change markup, kept byte-identical).
+    // Button, and no split-caret.
     const buttons = container.querySelectorAll("button");
     expect(buttons).toHaveLength(2);
-    // No split-caret in legacy mode.
-    expect(
-      screen.queryByRole("button", { name: "Configure run command" }),
-    ).toBeNull();
+    // The gear is icon-only, so its name has to come from aria-label: a
+    // tooltip does not name a control.
+    expect(buttons[1]).toHaveAccessibleName(
+      /^(Edit|Configure) run command$/,
+    );
     await userEvent.click(buttons[1]);
     expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
   });
