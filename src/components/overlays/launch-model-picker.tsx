@@ -253,7 +253,7 @@ export function LaunchModelPicker({
           type="button"
           aria-label="Select model"
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground",
+            "inline-flex items-center gap-1.5 rounded-full border border-border bg-surface-2 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-surface-3 hover:text-foreground",
             triggerClassName,
           )}
         >

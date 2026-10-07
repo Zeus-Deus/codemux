@@ -170,7 +170,7 @@ export function SlashCommandPopup({
               data-testid="slash-popup-footer"
               data-tone={footerNote.tone}
               className={cn(
-                "px-3 py-2 text-label border-t border-border/40",
+                "px-3 py-2 text-label border-t border-hairline",
                 footerNote.tone === "error"
                   ? "text-destructive"
                   : "text-muted-foreground/80",
@@ -193,7 +193,7 @@ export function SlashCommandPopup({
       data-testid="slash-command-popup"
       className={cn(
         "absolute bottom-full left-0 right-0 mb-2 z-50",
-        "rounded-lg border border-border/60 bg-popover shadow-md",
+        "rounded-lg border border-hairline bg-popover shadow-md",
         "overflow-hidden",
       )}
       onPointerLeave={() => {
@@ -249,7 +249,7 @@ export function SlashCommandPopup({
         className="text-popover-foreground"
       >
         {list}
-        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="border-t border-border/40 px-3 py-2 text-label text-muted-foreground">
+        {items.find((item) => item.id === highlightedId)?.identity && <div data-testid="slash-item-source" className="border-t border-hairline px-3 py-2 text-label text-muted-foreground">
           {items.find((item) => item.id === highlightedId)?.identity?.label}
         </div>}
       </CommandPrimitive>
@@ -327,7 +327,7 @@ const CommandRows = memo(function CommandRows({ items, onSelect }: Pick<Props, "
                           className={cn(
                             "flex w-3.5 shrink-0 items-center",
                             item.stacked &&
-                              "flex size-7 shrink-0 items-center justify-center rounded-md border border-border/40 bg-muted/35",
+                              "flex size-7 shrink-0 items-center justify-center rounded-md border border-hairline bg-surface-1",
                           )}
                         >
                         <Icon

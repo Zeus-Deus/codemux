@@ -856,7 +856,7 @@ function BranchControl({
       >
         <Command>
           <CommandInput placeholder="Search branches…" className="h-8" />
-          <div className="mx-2 mt-1 mb-1 flex items-center gap-0.5 rounded-md bg-muted/40 p-0.5">
+          <div className="mx-2 mt-1 mb-1 flex items-center gap-0.5 rounded-md bg-surface-1 p-0.5">
             <button
               type="button"
               className={cn(

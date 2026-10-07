@@ -487,7 +487,7 @@ function TitleBarDraftSlots() {
       <div
         data-testid="titlebar-draft-tab"
         // The draft's stand-in for the active tab, so it wears exactly the
-        // active pill: same radius token, same 6% selected fill.
+        // active pill: same radius token, same selected fill.
         className={cn(
           "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-label font-semibold text-foreground",
           BAND_CONTROL_RADIUS,

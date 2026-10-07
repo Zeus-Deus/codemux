@@ -54,7 +54,7 @@ export function ThemeImportSourcePicker({
                 "flex h-9 items-center gap-2.5 rounded-md border px-2.5 text-left transition-colors duration-150",
                 selected
                   ? "border-accent-ember bg-accent-ember/10"
-                  : "border-border/60 bg-muted/30 hover:bg-muted/50",
+                  : "border-hairline bg-surface-1 hover:bg-surface-2",
               )}
             >
               <Icon
@@ -71,7 +71,7 @@ export function ThemeImportSourcePicker({
               >
                 {label}
               </span>
-              {selected && <Check className="size-[11px] flex-none text-accent-ember" />}
+              {selected && <Check className="size-3 flex-none text-accent-ember" />}
             </button>
           );
         })}
