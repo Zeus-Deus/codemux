@@ -225,8 +225,8 @@ function SplitResizeHandle({
       className={cn(
         "group/split absolute z-20 outline-none",
         columns
-          ? "top-1 bottom-1 -right-[6px] w-3 cursor-col-resize"
-          : "left-1 right-1 -bottom-[6px] h-3 cursor-row-resize",
+          ? "top-1 bottom-1 -right-[6.5px] w-3 cursor-col-resize"
+          : "left-1 right-1 -bottom-[6.5px] h-3 cursor-row-resize",
       )}
       onPointerDown={(e) => startResize(e, node, index)}
       onKeyDown={handleKeyDown}
@@ -238,16 +238,18 @@ function SplitResizeHandle({
       }
     >
       {/* The pane borders already draw the seam at rest; this 3px line is
-          the hover, drag and focus state. It stays inside the cell, which
-          clips the other half of the hit area. */}
+          the hover, drag and focus state, centred on the 1px grid gap. The
+          keyboard-focus line is ember, the same "your keys drive this" cue
+          as the active pane's border, so where the two meet it continues
+          that border instead of greying it out. */}
       <span
         aria-hidden
         className={cn(
           "pointer-events-none absolute rounded-full bg-transparent transition-colors duration-100",
-          "group-hover/split:bg-foreground/30 group-focus-visible/split:bg-ring/60 group-data-[dragging=true]/split:bg-foreground/40",
+          "group-hover/split:bg-foreground/30 group-focus-visible/split:bg-accent-ember/60 group-data-[dragging=true]/split:bg-foreground/40",
           columns
-            ? "inset-y-0 left-1/2 w-[3px] -translate-x-full"
-            : "inset-x-0 top-1/2 h-[3px] -translate-y-full",
+            ? "inset-y-0 left-1/2 w-[3px] -translate-x-1/2"
+            : "inset-x-0 top-1/2 h-[3px] -translate-y-1/2",
         )}
       />
     </div>
@@ -382,7 +384,10 @@ function PaneNodeImpl({
     return (
       <div style={gridStyle} data-split-container data-split-pane-id={node.pane_id}>
         {node.children.map((child, i) => (
-          <div key={child.pane_id} className="relative min-w-0 min-h-0 overflow-hidden">
+          // No overflow clip on the cell: the pane shell clips its own
+          // content, and the seam handle must reach past this cell's edge so
+          // its centre, not just its near half, is hit-testable.
+          <div key={child.pane_id} className="relative min-w-0 min-h-0">
             <PaneNode
               node={child}
               activePaneId={activePaneId}
@@ -404,7 +409,13 @@ function PaneNodeImpl({
   // pane has nothing to be confused with and stays chrome-free.
   const paneShell = cn(
     "group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border transition-[border-color] duration-150",
-    !isSurfaceRoot && isActive ? "border-accent-ember/45" : "border-border/30",
+    isSurfaceRoot
+      ? "border-border/30"
+      : isActive
+        ? "border-accent-ember/45"
+        : // The other panes still need an edge, or the seam between two
+          // dark panes disappears into the background.
+          "border-hairline-strong",
   );
 
   const handleActivate = () => {

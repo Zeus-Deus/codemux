@@ -341,9 +341,12 @@ describe("active pane cue", () => {
     expect(shell()).not.toHaveClass("border-border/30");
   });
 
-  it("leaves inactive split panes on the quiet border", () => {
+  // border-border/30 is ~(19,17,16) on a (12,10,9) pane: invisible, so the
+  // seam between two inactive panes vanished.
+  it("gives inactive split panes a visible hairline", () => {
     mount("Terminal", { isSurfaceRoot: false, activePaneId: "p2" });
-    expect(shell()).toHaveClass("border-border/30");
+    expect(shell()).toHaveClass("border-hairline-strong");
+    expect(shell()).not.toHaveClass("border-accent-ember/45");
   });
 
   it("keeps a sole pane chrome-free", () => {
@@ -414,5 +417,13 @@ describe("split resize handle", () => {
     const seam = mountSplit();
     fireEvent.doubleClick(seam);
     expect(resizeSplit).toHaveBeenCalledWith("split-1", [0.5, 0.5]);
+  });
+
+  // A clipping cell cut the 12px handle in half, so the seam's own centre
+  // fell through to the split container and double-click missed it.
+  it("is not clipped by its cell, so the seam centre is hit-testable", () => {
+    const seam = mountSplit();
+    expect(seam.parentElement).not.toHaveClass("overflow-hidden");
+    expect(seam).toHaveClass("-right-[6.5px]", "w-3");
   });
 });
