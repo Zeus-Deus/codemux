@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -38,8 +39,7 @@ pub(crate) fn list_presets_with_availability(
         .presets
         .iter()
         .map(|p| {
-            let commands_available = p.commands.is_empty()
-                || p.commands.iter().all(|c| command_binary_exists(c));
+            let commands_available = preset_commands_available(p);
             let kind = match p.kind {
                 PresetKind::Cli => "terminal",
                 PresetKind::ChatAgent => "chat",
@@ -54,6 +54,42 @@ pub(crate) fn list_presets_with_availability(
             })
         })
         .collect()
+}
+
+/// Whether every binary a preset launches resolves, using the same check
+/// `apply_preset` runs before it opens a tab. A preset with no commands (a
+/// plain shell) has nothing to resolve.
+fn preset_commands_available(preset: &TerminalPreset) -> bool {
+    preset.commands.is_empty() || preset.commands.iter().all(|c| command_binary_exists(c))
+}
+
+/// Install state of each CLI preset's agent binary, keyed by preset id.
+///
+/// The launcher marks presets that would fail with "<binary> is not
+/// installed" before the user picks one. Chat-agent presets are left out:
+/// their readiness comes from the provider health probe instead.
+fn cli_preset_availability(presets: &[TerminalPreset]) -> HashMap<String, bool> {
+    presets
+        .iter()
+        .filter(|p| matches!(p.kind, PresetKind::Cli))
+        .map(|p| (p.id.clone(), preset_commands_available(p)))
+        .collect()
+}
+
+/// Async so the PATH walk (one lookup per preset) stays off the main thread.
+#[tauri::command]
+pub async fn get_preset_availability(
+    presets: State<'_, PresetStoreState>,
+) -> Result<HashMap<String, bool>, String> {
+    let snapshot = presets
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .presets
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || cli_preset_availability(&snapshot))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1565,6 +1601,22 @@ mod tests {
             "preset whose CLI is not on PATH must report \
              commands_available=false so the brain can pre-filter"
         );
+    }
+
+    #[test]
+    fn cli_preset_availability_marks_missing_binaries_and_skips_chat_presets() {
+        let bogus = "codemux-launcher-binary-that-does-not-exist-anywhere";
+        let presets = vec![
+            make_preset("p-git", "git --version", PresetKind::Cli),
+            make_preset("p-missing", &format!("{bogus} --yolo"), PresetKind::Cli),
+            make_preset("p-shell", "", PresetKind::Cli),
+            make_preset("p-chat", "", PresetKind::ChatAgent),
+        ];
+        let availability = cli_preset_availability(&presets);
+        assert_eq!(availability.get("p-git"), Some(&true));
+        assert_eq!(availability.get("p-missing"), Some(&false));
+        assert_eq!(availability.get("p-shell"), Some(&true));
+        assert_eq!(availability.get("p-chat"), None);
     }
 
     #[test]

@@ -1265,6 +1265,11 @@ export const getShellAppearance = () =>
 export const getPresets = () =>
   invoke<PresetStoreSnapshot>("get_presets");
 
+/** Whether each CLI preset's agent binary is installed, keyed by preset id.
+ *  The same PATH check `apply_preset` runs before launching. */
+export const getPresetAvailability = () =>
+  invoke<Record<string, boolean>>("get_preset_availability");
+
 export const createPreset = (params: {
   name: string;
   description: string | null;

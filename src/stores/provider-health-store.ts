@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { create } from "zustand";
 
 import { agentChatProviderHealth } from "@/tauri/commands";
@@ -250,6 +250,54 @@ export function selectVisibleHealthReport(
   if (!slot.report || slot.report.status === "ready") return null;
   if (slot.dismissedKey === healthBannerKey(slot.report)) return null;
   return slot.report;
+}
+
+/** What a provider's report means for someone choosing an agent. A
+ *  `warning` is a probe that could not tell (sessions may still work), so
+ *  it is not treated as broken. */
+export type ProviderReadiness = "ready" | "unverified" | "not_ready" | "not_installed";
+
+export function providerReadiness(report: ProviderHealthReport): ProviderReadiness {
+  if (report.status === "ready") return "ready";
+  if (!report.installed) return "not_installed";
+  return report.status === "warning" ? "unverified" : "not_ready";
+}
+
+export interface ProbedProviderHealth {
+  report: ProviderHealthReport | null;
+  /** True until the first probe settles. A settled probe with no report
+   *  failed at the IPC layer, so its readiness is simply unknown. */
+  pending: boolean;
+}
+
+/** Probe `providers` (TTL-cached) while `active`, and return each one's
+ *  latest report.
+ *
+ *  Only for surfaces where opening them IS the provider intent the store's
+ *  contract asks for: the automation form choosing an agent, and the
+ *  first-run agent strip on Home. Pass a stable `providers` array. */
+export function useProbedProviderHealth(
+  providers: readonly AgentChatProviderKind[],
+  active: boolean,
+): Partial<Record<AgentChatProviderKind, ProbedProviderHealth>> {
+  const refresh = useProviderHealth((s) => s.refresh);
+  const slots = useProviderHealth((s) => s.slots);
+  useEffect(() => {
+    if (!active) return;
+    for (const provider of providers) void refresh(provider);
+  }, [active, providers, refresh]);
+  return useMemo(
+    () =>
+      Object.fromEntries(
+        providers.map((provider) => {
+          const slot = slots[provider];
+          const pending =
+            slot.report === null && (slot.inFlight !== null || slot.fetchedAt === 0);
+          return [provider, { report: slot.report, pending }];
+        }),
+      ),
+    [providers, slots],
+  );
 }
 
 /** Poll an already-known unhealthy provider for recovery on the TTL cadence.

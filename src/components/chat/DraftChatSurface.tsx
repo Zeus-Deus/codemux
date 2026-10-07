@@ -62,7 +62,10 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
-import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
+import {
+  capabilityDefaults,
+  defaultModelId,
+} from "@/lib/agent-chat/capability-defaults";
 import {
   getGithubIssueByPath,
   getGithubPrByPath,
@@ -1047,6 +1050,18 @@ function DraftChatSurfaceInner({
     [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
   );
 
+  const landingAgents = useMemo(
+    () => ({
+      selected: draft.provider,
+      onSelect: (provider: ChatDraft["provider"]) => {
+        if (provider !== draft.provider) {
+          handleProviderModelChange(provider, defaultModelId(provider));
+        }
+      },
+    }),
+    [draft.provider, handleProviderModelChange],
+  );
+
   const handleModelChange = useCallback(
     (next: string) => {
       const nextModel = capabilities?.models.find((item) => item.id === next);
@@ -1250,7 +1265,7 @@ function DraftChatSurfaceInner({
         {pending ? (
           <DraftPendingConversation pending={pending} composer={composerEl} />
         ) : (
-          <ChatHomeLanding composer={composerEl} />
+          <ChatHomeLanding composer={composerEl} agents={landingAgents} />
         )}
       </div>
     </div>

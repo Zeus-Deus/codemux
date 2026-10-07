@@ -182,6 +182,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "get_pr_review_threads"
             | "get_pr_timeline"
             | "get_presets"
+            | "get_preset_availability"
             | "get_project_index_status"
             | "get_project_memory_snapshot"
             | "get_project_scripts"

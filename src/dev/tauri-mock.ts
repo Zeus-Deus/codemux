@@ -2796,6 +2796,16 @@ const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
 
+// `?providerHealth=mixed` seeds a machine with one signed-out and two
+// missing agents, for the first-run agent strip and the automation form.
+if (new URLSearchParams(location.search).get("providerHealth") === "mixed") {
+  Object.assign(mockProviderHealth, {
+    codex: { provider: "codex", status: "error", installed: true, message: "Codex CLI is not authenticated. Run `codex login` and retry.", version: "0.0.0-mock" },
+    cursor: { provider: "cursor", status: "error", installed: false, message: "Cursor Agent CLI (`cursor-agent`) is not installed or not on PATH.", version: null },
+    grok: { provider: "grok", status: "error", installed: false, message: "Grok CLI (`grok`) is not installed or not on PATH.", version: null },
+  } satisfies Partial<Record<MockProviderKind, ProviderHealthReport>>);
+}
+
 /** Inject (or clear, with `null`) a provider health failure, then nudge
  *  the frontend store to re-probe immediately so the chat surfaces'
  *  status banner reflects it without waiting out the TTL. */
@@ -4685,6 +4695,17 @@ const handlers: Record<string, Handler> = {
 
   // ── Presets ──
   get_presets: () => presetState,
+  // Gemini and Copilot play the agents this machine doesn't have, so the
+  // launcher's "not installed" rows show up in dev.
+  get_preset_availability: () =>
+    Object.fromEntries(
+      presetState.presets
+        .filter((p) => p.kind === "cli")
+        .map((p) => [
+          p.id,
+          p.id !== "builtin-gemini" && p.id !== "builtin-copilot",
+        ]),
+    ),
   create_preset: (a) => {
     const id = `custom-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     presetState.presets.push(
@@ -5337,6 +5358,16 @@ const handlers: Record<string, Handler> = {
     if (!pr.review_requests.includes(reviewer)) pr.review_requests.push(reviewer);
     return undefined;
   },
+
+  // ── Automations ──
+  // Empty list, so the Automations page opens on its "create" state
+  // instead of crashing on a null list.
+  automations_list: () => [],
+  automations_runs: () => [],
+  automations_check_repo_access: () => ({
+    ok: true,
+    message: "This host can reach the repository.",
+  }),
 
   // ── Hosts (remote devices) ──
   //
