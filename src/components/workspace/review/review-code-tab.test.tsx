@@ -9,11 +9,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 const mockGetPrReviewDiff = vi.fn();
 const mockSubmitWithComments = vi.fn().mockResolvedValue(undefined);
 const mockAddInlineComment = vi.fn().mockResolvedValue(undefined);
+const mockGetPrReviewThreads = vi.fn().mockResolvedValue([]);
+const mockReadFile = vi.fn();
+const mockWriteFile = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("@/tauri/commands", () => ({
   getPrReviewDiff: (...a: unknown[]) => mockGetPrReviewDiff(...a),
   submitPrReviewWithComments: (...a: unknown[]) => mockSubmitWithComments(...a),
   addPrInlineComment: (...a: unknown[]) => mockAddInlineComment(...a),
+  getPrReviewThreads: (...a: unknown[]) => mockGetPrReviewThreads(...a),
+  readFile: (...a: unknown[]) => mockReadFile(...a),
+  writeFile: (...a: unknown[]) => mockWriteFile(...a),
+  replyToPrThread: vi.fn().mockResolvedValue(undefined),
+  setPrThreadResolved: vi.fn().mockResolvedValue(undefined),
   submitPrReview: vi.fn().mockResolvedValue(undefined),
   mergePullRequest: vi.fn().mockResolvedValue(undefined),
   setPrReady: vi.fn().mockResolvedValue(undefined),
@@ -49,7 +57,7 @@ import { ALL_OPERATIONS } from "@/lib/provider-auth";
 const GITLAB_OPERATIONS = { ...ALL_OPERATIONS, request_changes: false };
 /** GitLab has no line-comment route this build can use yet. */
 const GITLAB_NO_LINE_COMMENTS = { ...GITLAB_OPERATIONS, line_comments: false };
-import type { PullRequestInfo } from "@/tauri/types";
+import type { PrReviewThread, PullRequestInfo } from "@/tauri/types";
 
 // ── Fixture diff ──
 //
@@ -199,6 +207,9 @@ beforeEach(() => {
   mockGetPrReviewDiff.mockReset().mockResolvedValue(DIFF);
   mockSubmitWithComments.mockReset().mockResolvedValue(undefined);
   mockAddInlineComment.mockReset().mockResolvedValue(undefined);
+  mockGetPrReviewThreads.mockReset().mockResolvedValue([]);
+  mockReadFile.mockReset();
+  mockWriteFile.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(cleanup);
@@ -828,5 +839,222 @@ describe("after a force-push", () => {
     expect(banner).toHaveTextContent("as it was when you wrote these notes");
     // Selecting on a superseded diff would anchor to lines that are gone.
     expect(document.querySelector("[data-diff-line]")).toBeNull();
+  });
+});
+
+describe("existing threads in the diff", () => {
+  function codeThread(over: Partial<PrReviewThread> & { body?: string }): PrReviewThread {
+    const { body = "Why three?", ...rest } = over;
+    return {
+      id: "T1",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/a.ts",
+      line: 11,
+      side: "RIGHT",
+      start_line: null,
+      comments: [{ id: "C1", database_id: 1, author: "juliusm", body, created_at: "" }],
+      ...rest,
+    };
+  }
+
+  const threadEl = (id: string) =>
+    document.querySelectorAll<HTMLElement>(`[data-testid="code-thread"][data-thread-id="${id}"]`);
+
+  it("hangs each thread once under its line, on its side, and folds resolved ones", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([
+      codeThread({ id: "T-right" }),
+      codeThread({ id: "T-left", side: "LEFT", body: "Was two on purpose." }),
+      codeThread({
+        id: "T-done",
+        line: 12,
+        is_resolved: true,
+        body: "Settled.",
+      }),
+      // Outdated: no line in this diff, so it stays on Summary.
+      codeThread({ id: "T-gone", line: null, is_outdated: true }),
+    ]);
+    renderDetail();
+    await openCodeTab(user);
+
+    await waitFor(() => expect(threadEl("T-right")).toHaveLength(1));
+    expect(threadEl("T-right")[0]).toHaveTextContent("Why three?");
+    expect(threadEl("T-left")).toHaveLength(1);
+    expect(threadEl("T-left")[0]).toHaveTextContent("Was two on purpose.");
+    expect(threadEl("T-gone")).toHaveLength(0);
+
+    const done = threadEl("T-done")[0];
+    expect(done).toHaveAttribute("data-resolved", "true");
+    expect(done).toHaveTextContent("Resolved · juliusm · 1 comment");
+    expect(done).not.toHaveTextContent("Settled.");
+    await user.click(done);
+    expect(threadEl("T-done")[0]).toHaveTextContent("Settled.");
+  });
+
+  it("applies a suggestion to the checked-out file when its lines still match", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([
+      codeThread({
+        line: 12,
+        start_line: 11,
+        body: "Fold these:\n```suggestion\nconst bc = [3, 4];\n```",
+      }),
+    ]);
+    const before = [
+      ...Array.from({ length: 9 }, (_, i) => `// ${i + 1}`),
+      "const a = 1;",
+      "const b = 3;",
+      "const c = 4;",
+      "const d = 5;",
+      "",
+    ].join("\n");
+    mockReadFile.mockResolvedValue(before);
+    renderDetail();
+    await openCodeTab(user);
+
+    const apply = await screen.findByTestId("apply-suggestion");
+    await user.click(apply);
+    await waitFor(() => expect(mockWriteFile).toHaveBeenCalled());
+    expect(mockReadFile).toHaveBeenCalledWith("/repo/src/a.ts");
+    expect(mockWriteFile).toHaveBeenCalledWith(
+      "/repo/src/a.ts",
+      before.replace("const b = 3;\nconst c = 4;", "const bc = [3, 4];"),
+    );
+  });
+
+  it("offers no Apply where the branch is not checked out", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([
+      codeThread({ body: "```suggestion\nconst b = 30;\n```" }),
+    ]);
+    renderDetail({ checkedOutHere: false });
+    await openCodeTab(user);
+    await screen.findByTestId("comment-suggestion");
+    expect(screen.queryByTestId("apply-suggestion")).not.toBeInTheDocument();
+  });
+
+  it("opens the Code tab on a thread's line from its anchor on Summary", async () => {
+    const user = userEvent.setup();
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail();
+
+    await user.click(await screen.findByTestId("thread-anchor"));
+    await screen.findAllByTestId("code-file");
+    await waitFor(() =>
+      expect(
+        scroll.mock.contexts.some(
+          (el) => (el as HTMLElement).getAttribute?.("data-diff-row") === "RIGHT:11",
+        ),
+      ).toBe(true),
+    );
+    scroll.mockRestore();
+  });
+
+  it("does not replay a handled jump when the Code tab is opened again", async () => {
+    const user = userEvent.setup();
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail();
+
+    const jumpedTo = () =>
+      scroll.mock.contexts.filter(
+        (el) => (el as HTMLElement).getAttribute?.("data-diff-row") === "RIGHT:11",
+      ).length;
+
+    await user.click(await screen.findByTestId("thread-anchor"));
+    await screen.findAllByTestId("code-file");
+    await waitFor(() => expect(jumpedTo()).toBe(1));
+
+    await user.click(screen.getByTestId("review-tab-summary"));
+    await openCodeTab(user);
+    // Give a replayed jump the frame it would scroll on.
+    await new Promise((r) => requestAnimationFrame(() => r(null)));
+    expect(jumpedTo()).toBe(1);
+    scroll.mockRestore();
+  });
+
+  it("lets the file a jump opened be collapsed again", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail();
+
+    await user.click(await screen.findByTestId("thread-anchor"));
+    const chevron = await screen.findByRole("button", { name: "Collapse src/a.ts" });
+    await user.click(chevron);
+    expect(screen.getByRole("button", { name: "Expand src/a.ts" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("lands an old-side thread on an unchanged line in unified, and keeps the row's tint", async () => {
+    const user = userEvent.setup();
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const animate = vi.fn();
+    const proto = HTMLElement.prototype as { animate?: unknown };
+    const hadAnimate = "animate" in proto;
+    const originalAnimate = proto.animate;
+    proto.animate = animate;
+    // Old line 12 is `const d = 5;`, which unified draws once as new 13.
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ side: "LEFT", line: 12 })]);
+    try {
+      renderDetail();
+      await user.click(await screen.findByTestId("thread-anchor"));
+      await screen.findAllByTestId("code-file");
+      await waitFor(() =>
+        expect(
+          scroll.mock.contexts.some(
+            (el) => (el as HTMLElement).getAttribute?.("data-diff-row") === "RIGHT:13",
+          ),
+        ).toBe(true),
+      );
+      expect(animate).toHaveBeenCalledTimes(1);
+      expect(
+        (animate.mock.contexts[0] as HTMLElement).getAttribute("data-diff-row"),
+      ).toBe("RIGHT:13");
+      // Laid over the row, never replacing its diff background.
+      const keyframes = animate.mock.calls[0][0] as Keyframe[];
+      expect(keyframes.every((k) => k.boxShadow && !("backgroundColor" in k))).toBe(true);
+    } finally {
+      if (hadAnimate) proto.animate = originalAnimate;
+      else delete proto.animate;
+      scroll.mockRestore();
+    }
+  });
+
+  it("offers no Reply toggle on a lone comment that cannot be answered", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail({ operations: { ...ALL_OPERATIONS, thread_reply: false } });
+    await openCodeTab(user);
+    await waitFor(() => expect(threadEl("T-right")).toHaveLength(1));
+    expect(screen.queryByTestId("code-thread-toggle-T-right")).not.toBeInTheDocument();
+  });
+
+  it("still says Applied after the thread is unfolded", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([
+      codeThread({ id: "T-right", body: "```suggestion\nconst b = 30;\n```" }),
+    ]);
+    mockReadFile.mockResolvedValue(
+      [...Array.from({ length: 10 }, (_, i) => `// ${i + 1}`), "const b = 3;", ""].join("\n"),
+    );
+    renderDetail();
+    await openCodeTab(user);
+
+    await user.click(await screen.findByTestId("apply-suggestion"));
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-suggestion")).toHaveTextContent("Applied"),
+    );
+    // Unfolding swaps the collapsed comment for the full thread, which
+    // mounts the suggestion afresh.
+    await user.click(screen.getByTestId("code-thread-toggle-T-right"));
+    const again = screen.getByTestId("apply-suggestion");
+    expect(again).toHaveTextContent("Applied");
+    expect(again).toBeDisabled();
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
   });
 });

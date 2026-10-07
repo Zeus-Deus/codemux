@@ -45,6 +45,7 @@ import type {
   GitLogEntry,
   CommitFileEntry,
   CommitSummary,
+  PrDescriptionDraft,
   HandoffPacket,
   LaunchMode,
   ProviderDiagnostic,
@@ -1157,6 +1158,23 @@ export const generateAiCommitMessage = (
   cli: string | null = null,
   model: string | null = null,
 ) => invoke<string>("generate_ai_commit_message", { path, cli, model });
+
+/** Drafts a pull request title and description from the branch's
+ *  commits and diff against `base`, through the utility CLI. */
+export const generateAiPrDescription = (
+  path: string,
+  base: string,
+  template: string | null,
+  cli: string | null = null,
+  model: string | null = null,
+) =>
+  invoke<PrDescriptionDraft>("generate_ai_pr_description", {
+    path,
+    base,
+    template,
+    cli,
+    model,
+  });
 
 export const setAiCommitMessageEnabled = (enabled: boolean) =>
   invoke("set_ai_commit_message_enabled", { enabled });

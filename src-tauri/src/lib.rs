@@ -2609,6 +2609,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::git_clone_repo,
             commands::check_claude_available,
             commands::generate_ai_commit_message,
+            commands::generate_ai_pr_description,
             commands::check_gh_available,
             commands::check_gh_status,
             commands::check_github_repo,

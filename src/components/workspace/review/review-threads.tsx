@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -16,18 +16,23 @@ import type {
   ReviewComment,
 } from "@/tauri/types";
 import type { ReviewThreadTask } from "@/lib/pr-agent-handoff";
+import type { AnchorSide } from "@/lib/pr-anchor";
+import { hasSuggestion } from "@/lib/pr-suggestion";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { CollapsibleSection } from "./collapsible-section";
+import { CommentBody, type SuggestionTarget } from "./review-comment-body";
 import {
   btnCard,
   btnCardXs,
   btnEmberXs,
+  plural,
   tzBody,
   tzEyebrow,
   tzMeta,
   tzMetaNum,
   tzRowTitle,
+  underRowInset,
 } from "./review-ui";
 
 function ReviewStateIcon({ state }: { state: string }) {
@@ -90,19 +95,69 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-/** `src/a.ts:84` — the mono pill a thread is anchored by. */
-function AnchorPill({ path, line }: { path: string | null; line: number | null }) {
+/** Where a thread's suggestions would land, given its anchor. Supplied
+ *  by the detail surface, which owns the diff and the checkout. */
+export type SuggestionResolver = (anchor: {
+  path: string;
+  side: AnchorSide;
+  start: number;
+  end: number;
+}) => SuggestionTarget | null;
+
+/** Opens the Code tab on one line. */
+export type JumpToLine = (path: string, side: AnchorSide, line: number) => void;
+
+/** A thread's side, for payloads that predate it: RIGHT, the new file. */
+export function threadSide(thread: PrReviewThread): AnchorSide {
+  return thread.side === "LEFT" ? "LEFT" : "RIGHT";
+}
+
+const ANCHOR_PILL = "font-mono bg-muted px-1.5 py-px rounded-sm text-muted-foreground truncate";
+
+/**
+ * `src/a.ts:84` — the mono pill a thread is anchored by.
+ *
+ * A link into the Code tab when there is a line to go to: reading a
+ * thread on Summary, the next question is always what it is about.
+ */
+function AnchorPill({
+  path,
+  line,
+  side = "RIGHT",
+  onJump,
+}: {
+  path: string | null;
+  line: number | null;
+  side?: AnchorSide;
+  onJump?: JumpToLine;
+}) {
   if (!path) return null;
+  const label = (
+    <>
+      {path}
+      {line != null && `:${line}`}
+    </>
+  );
+  if (!onJump || line == null) {
+    return <span className={cn(ANCHOR_PILL, tzMeta)}>{label}</span>;
+  }
   return (
-    <span
+    <button
+      type="button"
+      data-testid="thread-anchor"
+      title="Show in Code"
+      onClick={() => onJump(path, side, line)}
       className={cn(
-        "font-mono bg-muted px-1.5 py-px rounded-sm text-muted-foreground truncate",
+        ANCHOR_PILL,
+        // Ember on hover: the muted-on-muted accent fill this had was
+        // close to invisible in dark mode, and the pill gave no sign of
+        // being clickable.
+        "min-w-0 outline-none transition-colors duration-100 hover:bg-accent-ember/15 hover:text-accent-ember focus-visible:ring-2 focus-visible:ring-ring/60",
         tzMeta,
       )}
     >
-      {path}
-      {line != null && `:${line}`}
-    </span>
+      {label}
+    </button>
   );
 }
 
@@ -274,7 +329,13 @@ function ResolveButton({
   );
 }
 
-function ThreadComment({ comment }: { comment: PrThreadComment }) {
+function ThreadComment({
+  comment,
+  target,
+}: {
+  comment: PrThreadComment;
+  target?: SuggestionTarget | null;
+}) {
   return (
     <div className="group/comment space-y-0.5">
       <div className="flex items-center gap-1.5">
@@ -290,19 +351,88 @@ function ThreadComment({ comment }: { comment: PrThreadComment }) {
         <span className="flex-1" />
         <CopyButton text={comment.body} />
       </div>
-      <p className="select-text pr-reading whitespace-pre-wrap break-words pl-7">
-        {comment.body}
-      </p>
+      <CommentBody body={comment.body} target={target} className="pl-7" />
     </div>
   );
 }
 
-interface ThreadProps {
+export interface ThreadProps {
   thread: PrReviewThread;
   resolved: boolean;
   onSendToAgent?: (task: ReviewThreadTask) => Promise<unknown>;
   onReply?: (thread: PrReviewThread, body: string) => Promise<unknown>;
   onSetResolved?: (thread: PrReviewThread, resolved: boolean) => void;
+  suggestionTargetFor?: SuggestionResolver;
+  onJumpToLine?: JumpToLine;
+}
+
+/** Where this thread's suggestions would land, when it has any. */
+function useSuggestionTarget(
+  thread: PrReviewThread,
+  suggestionTargetFor?: SuggestionResolver,
+): SuggestionTarget | null {
+  return useMemo(() => {
+    if (!suggestionTargetFor || !thread.path || thread.line == null) return null;
+    if (!thread.comments.some((c) => hasSuggestion(c.body))) return null;
+    const side = threadSide(thread);
+    // A range that starts on the other side counts its two ends in
+    // different files: there is no one run of lines to show or replace.
+    if (thread.start_side && thread.start_side !== side) return null;
+    return suggestionTargetFor({
+      path: thread.path,
+      side,
+      start: thread.start_line ?? thread.line,
+      end: thread.line,
+    });
+  }, [thread, suggestionTargetFor]);
+}
+
+/** Send to agent and Resolve: what can be done about a thread. */
+function ThreadActions({
+  thread,
+  resolved,
+  onSendToAgent,
+  onSetResolved,
+  leading,
+}: ThreadProps & { leading?: ReactNode }) {
+  const root = thread.comments[0];
+  const last = thread.comments[thread.comments.length - 1] ?? root;
+  const canSend = !!onSendToAgent && !resolved;
+  const canResolve = !!onSetResolved && thread.is_resolvable;
+  if (!leading && !canSend && !canResolve) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 pl-7">
+      {leading}
+      {/* An agent can only act on something still open; a resolved
+          thread is a record, and handing one over would be work with
+          nowhere to land. */}
+      {canSend && (
+        <SendToAgentButton
+          onSend={() =>
+            onSendToAgent({
+              kind: "review-thread",
+              reviewer: last.author,
+              body: last.body,
+              path: thread.path,
+              line: thread.line,
+              verdict: null,
+              // The thread's opening comment is the context the latest
+              // one was written under, when they are not the same.
+              parent:
+                last.id !== root.id ? { author: root.author, body: root.body } : null,
+            })
+          }
+        />
+      )}
+      {canResolve && (
+        <ResolveButton
+          thread={thread}
+          resolved={resolved}
+          onToggle={() => onSetResolved(thread, !resolved)}
+        />
+      )}
+    </div>
+  );
 }
 
 /**
@@ -311,52 +441,17 @@ interface ThreadProps {
  * Resolved threads render this too — behind a header you have to click,
  * because a settled conversation is a record and an open one is work.
  */
-function ThreadBody({
-  thread,
-  resolved,
-  onSendToAgent,
-  onReply,
-  onSetResolved,
-}: ThreadProps) {
-  const root = thread.comments[0];
-  const last = thread.comments[thread.comments.length - 1] ?? root;
+function ThreadBody(props: ThreadProps) {
+  const { thread, onReply, suggestionTargetFor } = props;
+  const target = useSuggestionTarget(thread, suggestionTargetFor);
 
   return (
     <div className="space-y-2">
       {thread.comments.map((comment) => (
-        <ThreadComment key={comment.id} comment={comment} />
+        <ThreadComment key={comment.id} comment={comment} target={target} />
       ))}
 
-      <div className="flex flex-wrap items-center gap-1.5 pl-7">
-        {/* An agent can only act on something still open; a resolved
-            thread is a record, and handing one over would be work with
-            nowhere to land. */}
-        {onSendToAgent && !resolved && (
-          <SendToAgentButton
-            onSend={() =>
-              onSendToAgent({
-                kind: "review-thread",
-                reviewer: last.author,
-                body: last.body,
-                path: thread.path,
-                line: thread.line,
-                verdict: null,
-                // The thread's opening comment is the context the latest
-                // one was written under, when they are not the same.
-                parent:
-                  last.id !== root.id ? { author: root.author, body: root.body } : null,
-              })
-            }
-          />
-        )}
-        {onSetResolved && thread.is_resolvable && (
-          <ResolveButton
-            thread={thread}
-            resolved={resolved}
-            onToggle={() => onSetResolved(thread, !resolved)}
-          />
-        )}
-      </div>
+      <ThreadActions {...props} />
 
       {onReply && (
         <div className="pl-7">
@@ -370,9 +465,19 @@ function ThreadBody({
   );
 }
 
+function OutdatedLabel() {
+  // Muted, not hidden, and never a reason to drop the thread: the lines
+  // moved, the objection did not.
+  return (
+    <span data-testid="thread-outdated" className={cn("text-muted-foreground", tzMeta)}>
+      Outdated
+    </span>
+  );
+}
+
 /** An open thread: anchor, state labels, conversation, actions. */
 function UnresolvedThread(props: ThreadProps) {
-  const { thread } = props;
+  const { thread, onJumpToLine } = props;
   return (
     <div
       data-testid="review-thread"
@@ -380,18 +485,14 @@ function UnresolvedThread(props: ThreadProps) {
       data-resolved="false"
       className="space-y-1.5 rounded-md px-1 py-1"
     >
-      <div className="flex items-center gap-1.5">
-        <AnchorPill path={thread.path} line={thread.line} />
-        {thread.is_outdated && (
-          // Muted, not hidden, and never a reason to drop the thread:
-          // the lines moved, the objection did not.
-          <span
-            data-testid="thread-outdated"
-            className={cn("text-muted-foreground", tzMeta)}
-          >
-            Outdated
-          </span>
-        )}
+      <div className="flex min-w-0 items-center gap-1.5">
+        <AnchorPill
+          path={thread.path}
+          line={thread.line}
+          side={threadSide(thread)}
+          onJump={onJumpToLine}
+        />
+        {thread.is_outdated && <OutdatedLabel />}
       </div>
       <ThreadBody {...props} />
     </div>
@@ -407,7 +508,7 @@ function UnresolvedThread(props: ThreadProps) {
  * deleted.
  */
 function ResolvedThread(props: ThreadProps) {
-  const { thread } = props;
+  const { thread, onJumpToLine } = props;
   const [open, setOpen] = useState(false);
 
   return (
@@ -417,32 +518,35 @@ function ResolvedThread(props: ThreadProps) {
       data-resolved="true"
       className="rounded-md px-1 py-0.5"
     >
-      <button
-        type="button"
-        data-testid={`thread-resolved-header-${thread.id}`}
-        className="flex w-full items-center gap-1.5 rounded-sm px-0.5 py-1 text-left transition-colors duration-150 hover:bg-accent/30"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <ChevronRight
-          className={cn(
-            "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
-            open && "rotate-90",
-          )}
-        />
-        <span className={cn("text-muted-foreground", tzMeta)}>
-          Resolved · {thread.comments.length}{" "}
-          {thread.comments.length === 1 ? "comment" : "comments"}
-        </span>
-        <AnchorPill path={thread.path} line={thread.line} />
-        {thread.is_outdated && (
-          <span
-            data-testid="thread-outdated"
-            className={cn("text-muted-foreground", tzMeta)}
-          >
-            Outdated
+      <div className="flex min-w-0 items-center gap-1.5">
+        <button
+          type="button"
+          data-testid={`thread-resolved-header-${thread.id}`}
+          aria-expanded={open}
+          className="flex shrink-0 items-center gap-1.5 rounded-sm px-0.5 py-1 text-left transition-colors duration-150 hover:bg-accent/30"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <ChevronRight
+            className={cn(
+              "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
+              open && "rotate-90",
+            )}
+          />
+          <span className={cn("text-muted-foreground", tzMeta)}>
+            Resolved · {thread.comments.length}{" "}
+            {thread.comments.length === 1 ? "comment" : "comments"}
           </span>
-        )}
-      </button>
+        </button>
+        {/* Beside the header rather than in it: a link inside a button
+            is two controls pretending to be one. */}
+        <AnchorPill
+          path={thread.path}
+          line={thread.line}
+          side={threadSide(thread)}
+          onJump={onJumpToLine}
+        />
+        {thread.is_outdated && <OutdatedLabel />}
+      </div>
       {open && (
         <div className="pt-1">
           <ThreadBody {...props} />
@@ -452,46 +556,104 @@ function ResolvedThread(props: ThreadProps) {
   );
 }
 
-interface Props {
-  reviews: ReviewComment[];
-  inlineComments: InlineReviewComment[];
-  /**
-   * Real threads, with resolution state. Empty on a host that serves
-   * none, in which case this surface is exactly what it was before them.
-   */
-  threads?: PrReviewThread[];
-  isLoading?: boolean;
-  /** Hands one comment to an agent. Absent ⇒ no handoff drawn. */
-  onSendToAgent?: (task: ReviewThreadTask) => Promise<unknown>;
-  /** Absent ⇒ the host has not declared replies; no composer is drawn. */
-  onReply?: (thread: PrReviewThread, body: string) => Promise<unknown>;
-  /** Absent ⇒ no Resolve button. Rejection rolls the flip back. */
-  onSetResolved?: (thread: PrReviewThread, resolved: boolean) => Promise<unknown>;
+/**
+ * A thread where it was written: under its line in the Code tab.
+ *
+ * Folded to its opening comment, because the diff is what is being read
+ * and a long conversation at full height would push the code it is about
+ * off the screen. A resolved thread folds further, to a one-line chip.
+ */
+export function CodeThread(props: ThreadProps) {
+  const { thread, resolved } = props;
+  const [open, setOpen] = useState(false);
+  const target = useSuggestionTarget(thread, props.suggestionTargetFor);
+  const root = thread.comments[0];
+  const replies = thread.comments.length - 1;
+
+  if (resolved && !open) {
+    return (
+      <div className={cn("my-0.5 font-sans whitespace-normal", underRowInset)}>
+        <button
+          type="button"
+          data-testid="code-thread"
+          data-thread-id={thread.id}
+          data-resolved="true"
+          aria-expanded={false}
+          onClick={() => setOpen(true)}
+          className={cn(
+            "inline-flex h-5 max-w-full items-center gap-1 rounded-sm bg-surface-1 px-1.5 text-muted-foreground transition-colors duration-100 hover:bg-surface-2 hover:text-foreground",
+            tzMeta,
+          )}
+        >
+          <ChevronRight className="size-3 shrink-0" />
+          <span className="truncate">
+            Resolved · {root.author} · {plural(thread.comments.length, "comment")}
+          </span>
+        </button>
+      </div>
+    );
+  }
+
+  // With no replies and no way to write one, opening the thread would
+  // show the same single comment again, so there is nothing to toggle.
+  const canOpen = open || replies > 0 || !!props.onReply;
+  const toggle = canOpen && (
+    <button
+      type="button"
+      data-testid={`code-thread-toggle-${thread.id}`}
+      aria-expanded={open}
+      className={cn(btnCardXs, "text-muted-foreground hover:text-foreground")}
+      onClick={() => setOpen((v) => !v)}
+    >
+      {open
+        ? resolved
+          ? "Fold"
+          : "Hide replies"
+        : replies > 0
+          ? plural(replies, "reply", "replies")
+          : "Reply"}
+    </button>
+  );
+
+  return (
+    <div
+      data-testid="code-thread"
+      data-thread-id={thread.id}
+      data-resolved={resolved ? "true" : "false"}
+      className={cn(
+        "my-1 space-y-2 rounded-md bg-surface-1 px-3 py-2 font-sans whitespace-normal",
+        underRowInset,
+      )}
+    >
+      {thread.is_outdated && <OutdatedLabel />}
+      {open ? (
+        <>
+          <ThreadBody {...props} />
+          <div className="pl-7">{toggle}</div>
+        </>
+      ) : (
+        <>
+          <ThreadComment comment={root} target={target} />
+          <ThreadActions {...props} leading={toggle} />
+        </>
+      )}
+    </div>
+  );
 }
 
-interface GroupedReview {
-  review: ReviewComment;
-  inlineComments: InlineReviewComment[];
-}
-
-export function ReviewThreads({
-  reviews,
-  inlineComments,
-  threads = [],
-  isLoading = false,
-  onSendToAgent,
-  onReply,
-  onSetResolved,
-}: Props) {
-  /**
-   * Optimistic resolution, per thread.
-   *
-   * Resolving is one click with one visible consequence, and waiting a
-   * round trip to see it makes the button feel broken. So the flip is
-   * immediate and the entry is dropped once the host's own answer agrees
-   * with it — which also means a thread someone else resolved in another
-   * window still lands here on the next poll.
-   */
+/**
+ * Resolution, flipped optimistically, per thread.
+ *
+ * Resolving is one click with one visible consequence, and waiting a
+ * round trip to see it makes the button feel broken. So the flip is
+ * immediate and the entry is dropped once the host's own answer agrees
+ * with it — which also means a thread someone else resolved in another
+ * window still lands here on the next poll.
+ */
+export function useOptimisticResolve(
+  threads: PrReviewThread[],
+  onSetResolved?: (thread: PrReviewThread, resolved: boolean) => Promise<unknown>,
+) {
   const [pendingResolve, setPendingResolve] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
@@ -512,23 +674,69 @@ export function ReviewThreads({
     });
   }, [threads]);
 
-  const resolvedOf = (thread: PrReviewThread) =>
-    pendingResolve[thread.id] ?? thread.is_resolved;
+  const resolvedOf = useCallback(
+    (thread: PrReviewThread) => pendingResolve[thread.id] ?? thread.is_resolved,
+    [pendingResolve],
+  );
 
-  const toggleResolved = (thread: PrReviewThread, resolved: boolean) => {
-    if (!onSetResolved) return;
-    setPendingResolve((prev) => ({ ...prev, [thread.id]: resolved }));
-    onSetResolved(thread, resolved).catch((err) => {
-      // Rolled back to what the host actually says, and said out loud —
-      // a flip that quietly undoes itself is worse than one that fails.
-      setPendingResolve((prev) => {
-        const next = { ...prev };
-        delete next[thread.id];
-        return next;
+  const toggleResolved = useMemo(() => {
+    if (!onSetResolved) return undefined;
+    return (thread: PrReviewThread, resolved: boolean) => {
+      setPendingResolve((prev) => ({ ...prev, [thread.id]: resolved }));
+      onSetResolved(thread, resolved).catch((err) => {
+        // Rolled back to what the host actually says, and said out loud —
+        // a flip that quietly undoes itself is worse than one that fails.
+        setPendingResolve((prev) => {
+          const next = { ...prev };
+          delete next[thread.id];
+          return next;
+        });
+        toast.error(String(err));
       });
-      toast.error(String(err));
-    });
-  };
+    };
+  }, [onSetResolved]);
+
+  return { resolvedOf, toggleResolved };
+}
+
+interface Props {
+  reviews: ReviewComment[];
+  inlineComments: InlineReviewComment[];
+  /**
+   * Real threads, with resolution state. Empty on a host that serves
+   * none, in which case this surface is exactly what it was before them.
+   */
+  threads?: PrReviewThread[];
+  isLoading?: boolean;
+  /** Hands one comment to an agent. Absent ⇒ no handoff drawn. */
+  onSendToAgent?: (task: ReviewThreadTask) => Promise<unknown>;
+  /** Absent ⇒ the host has not declared replies; no composer is drawn. */
+  onReply?: (thread: PrReviewThread, body: string) => Promise<unknown>;
+  /** Absent ⇒ no Resolve button. Rejection rolls the flip back. */
+  onSetResolved?: (thread: PrReviewThread, resolved: boolean) => Promise<unknown>;
+  /** Shows suggestions as changes, and applies them when it can. */
+  suggestionTargetFor?: SuggestionResolver;
+  /** Absent ⇒ anchors are labels, not links. */
+  onJumpToLine?: JumpToLine;
+}
+
+interface GroupedReview {
+  review: ReviewComment;
+  inlineComments: InlineReviewComment[];
+}
+
+export function ReviewThreads({
+  reviews,
+  inlineComments,
+  threads = [],
+  isLoading = false,
+  onSendToAgent,
+  onReply,
+  onSetResolved,
+  suggestionTargetFor,
+  onJumpToLine,
+}: Props) {
+  const { resolvedOf, toggleResolved } = useOptimisticResolve(threads, onSetResolved);
 
   /**
    * What the flat lists must no longer draw.
@@ -625,7 +833,9 @@ export function ReviewThreads({
     resolved: resolvedOf(thread),
     onSendToAgent,
     onReply,
-    onSetResolved: onSetResolved ? toggleResolved : undefined,
+    onSetResolved: toggleResolved,
+    suggestionTargetFor,
+    onJumpToLine,
   });
 
   return (
@@ -694,13 +904,7 @@ export function ReviewThreads({
             {g.review.body && (
               <div className="space-y-1 pl-7 pr-1">
                 <div className="group/comment flex items-start gap-1.5">
-                  <p
-                    className={cn(
-                      "select-text pr-reading flex-1 whitespace-pre-wrap break-words",
-                    )}
-                  >
-                    {g.review.body}
-                  </p>
+                  <CommentBody body={g.review.body} className="flex-1" />
                   <CopyButton text={g.review.body} />
                 </div>
                 {/* An inline comment carries its own, better-anchored
@@ -732,13 +936,19 @@ export function ReviewThreads({
                 key={`${g.review.id}-${ic.id}`}
                 className="group/comment ml-7 mr-1 border-l-2 border-border/50 pl-2 space-y-1"
               >
-                <div className="flex items-center gap-1.5">
-                  <AnchorPill path={ic.path} line={ic.line} />
+                <div className="flex min-w-0 items-center gap-1.5">
+                  {/* LEFT only for a comment left on a deletion; RIGHT
+                      for everything else, and for a payload that does
+                      not say. */}
+                  <AnchorPill
+                    path={ic.path}
+                    line={ic.line}
+                    side={ic.side === "LEFT" ? "LEFT" : "RIGHT"}
+                    onJump={onJumpToLine}
+                  />
                   <CopyButton text={ic.body} />
                 </div>
-                <p className="select-text pr-reading whitespace-pre-wrap break-words">
-                  {ic.body}
-                </p>
+                <CommentBody body={ic.body} />
                 {onSendToAgent && (
                   <SendToAgentButton
                     onSend={() =>

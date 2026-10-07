@@ -12,13 +12,13 @@
  * note is a statement about where the words came from, not decoration on
  * a text field.
  *
+ * **Write with agent** goes further when the commits are terse: the
+ * utility agent (the one that writes commit messages) reads the commits,
+ * the diff and the repository's template, and its title and description
+ * land in the two fields. The note then says the agent drafted them.
+ *
  * What isn't here, and why:
  *
- * - **Rewrite with agent.** A handoff opens a thread in another
- *   workspace and returns nothing to this form; there is no path by
- *   which an agent's rewrite could land back in these two fields. A chip
- *   that opened a thread and left the description untouched would be a
- *   lie about what the button does, so it is not drawn.
  * - **+ label.** `create_pull_request` takes no labels at any layer
  *   (path, title, body, base, draft), and neither adapter's create
  *   accepts them. Rather than a chip that collects labels and drops
@@ -26,7 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, Loader2, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Loader2, Sparkles, X } from "lucide-react";
 
 import {
   Select,
@@ -37,6 +37,7 @@ import {
 } from "@/components/ui/select";
 import {
   createPullRequest,
+  generateAiPrDescription,
   getGitBranchInfo,
   getGitStatus,
   gitCommitsAhead,
@@ -57,6 +58,9 @@ import {
 } from "@/lib/pr-draft";
 import type { ProviderPresentation } from "@/lib/source-control";
 import { toast } from "@/lib/toast";
+import { aiTextCliSelection, utilitySelectionFromStores } from "@/lib/utility-agent";
+import { useAppStore } from "@/stores/app-store";
+import { cn } from "@/lib/utils";
 import {
   btnCard,
   btnEmberSolid,
@@ -171,6 +175,19 @@ export function CreatePrForm({
   const [busy, setBusy] = useState<null | "create" | "draft">(null);
   const [error, setError] = useState<string | null>(null);
 
+  /** The agent is writing; the fields are read-only until it answers. */
+  const [writing, setWriting] = useState(false);
+  /** The words in both fields are the agent's, untouched since. */
+  const [agentDrafted, setAgentDrafted] = useState(false);
+  const [showCommits, setShowCommits] = useState(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   const reviewerInputRef = useRef<HTMLInputElement>(null);
 
   // ── What the branch already knows ──
@@ -266,13 +283,47 @@ export function CreatePrForm({
     [title, body, baseBranch, busy, cwd, hasUpstream, reviewers, provider, onCreated],
   );
 
+  // ── Writing with the agent ──
+
+  const writeWithAgent = useCallback(async () => {
+    if (writing) return;
+    setWriting(true);
+    setError(null);
+    // The same CLI choice as commit messages, including the commit-message
+    // override: whoever set one did so because the default CLI does not
+    // work for them, and that holds here too.
+    const { cli, model } = aiTextCliSelection(
+      useAppStore.getState().appState?.config,
+      utilitySelectionFromStores(),
+    );
+    try {
+      const draft = await generateAiPrDescription(cwd, baseBranch, template, cli, model);
+      if (!mounted.current) return;
+      setTitle(draft.title);
+      setBody(draft.body);
+      // Both count as edited: a later base-branch change must not
+      // re-draft from commits over what was asked for.
+      setTitleEdited(true);
+      setBodyEdited(true);
+      setAgentDrafted(true);
+    } catch (err) {
+      if (mounted.current) setError(`The agent couldn't write a description: ${String(err)}`);
+    } finally {
+      if (mounted.current) setWriting(false);
+    }
+  }, [writing, cwd, baseBranch, template]);
+
   const addReviewer = () => {
     const handle = (reviewerDraft ?? "").trim().replace(/^@/, "");
     if (handle && !reviewers.includes(handle)) setReviewers([...reviewers, handle]);
     setReviewerDraft(null);
   };
 
-  const showDraftedNote = !titleEdited && titleSource === "commits";
+  const draftedNote = agentDrafted
+    ? "drafted by agent"
+    : !titleEdited && titleSource === "commits"
+      ? "drafted from your commits"
+      : null;
   const commitCount = commits.length;
 
   return (
@@ -292,9 +343,22 @@ export function CreatePrForm({
             New {provider.noun}
           </span>
           {commitCount > 0 && (
-            <span className={`shrink-0 ${tzMetaNum} text-muted-foreground`}>
+            <button
+              type="button"
+              data-testid="create-pr-commits-toggle"
+              aria-expanded={showCommits}
+              aria-controls="create-pr-commits"
+              onClick={() => setShowCommits((v) => !v)}
+              className={`flex shrink-0 items-center gap-1 rounded-sm px-1 ${tzMetaNum} text-muted-foreground transition-colors duration-100 hover:bg-accent/50 hover:text-foreground`}
+            >
               {plural(commitCount, "commit")}
-            </span>
+              <ChevronRight
+                className={cn(
+                  "size-3 transition-transform duration-150",
+                  showCommits && "rotate-90",
+                )}
+              />
+            </button>
           )}
         </div>
         <div
@@ -329,6 +393,25 @@ export function CreatePrForm({
             </SelectContent>
           </Select>
         </div>
+        {/* What is going in, before anyone describes it. */}
+        {showCommits && commitCount > 0 && (
+          <ol
+            id="create-pr-commits"
+            data-testid="create-pr-commits"
+            className="flex max-h-40 flex-col gap-0.5 overflow-y-auto thin-scrollbar"
+          >
+            {commits.map((commit) => (
+              <li key={commit.short_hash} className={`flex min-w-0 gap-2 ${tzMeta}`}>
+                <span className="shrink-0 font-mono text-muted-foreground">
+                  {commit.short_hash}
+                </span>
+                <span className="min-w-0 truncate text-foreground/85" title={commit.subject}>
+                  {commit.subject}
+                </span>
+              </li>
+            ))}
+          </ol>
+        )}
       </div>
 
       {/* ── Body ── */}
@@ -338,27 +421,30 @@ export function CreatePrForm({
             <label className={`${LABEL} flex-1`} htmlFor="create-pr-title">
               Title
             </label>
-            {showDraftedNote && (
+            {draftedNote && !writing && (
               <span
                 data-testid="create-pr-drafted-note"
                 className={`flex items-center gap-1.5 ${tzMeta} text-accent-ember`}
               >
                 <span className="size-[5px] rounded-full bg-accent-ember" />
-                drafted from your commits
+                {draftedNote}
               </span>
             )}
           </div>
           <input
             id="create-pr-title"
-            className={FIELD}
+            className={cn(FIELD, writing && "text-muted-foreground")}
             value={title}
             placeholder={`${provider.nounTitle} title`}
+            readOnly={writing}
+            aria-busy={writing}
             onChange={(event) => {
               setTitleEdited(true);
+              setAgentDrafted(false);
               setTitle(event.target.value);
             }}
             onKeyDown={(event) => {
-              if (event.key === "Enter") void create(false);
+              if (event.key === "Enter" && !writing) void create(false);
             }}
           />
         </div>
@@ -367,24 +453,57 @@ export function CreatePrForm({
           <label className={LABEL} htmlFor="create-pr-body">
             Description
           </label>
-          <textarea
-            id="create-pr-body"
-            className={`${FIELD} min-h-[126px] resize-y leading-relaxed`}
-            value={body}
-            placeholder="What this changes, and how you checked."
-            onChange={(event) => {
-              setBodyEdited(true);
-              setBody(event.target.value);
-            }}
-          />
-          {template && (
-            <div className="flex items-center gap-1.5">
+          <div className="relative">
+            <textarea
+              id="create-pr-body"
+              className={cn(
+                `${FIELD} min-h-[126px] resize-y leading-relaxed`,
+                writing && "text-transparent",
+              )}
+              value={body}
+              placeholder={writing ? "" : "What this changes, and how you checked."}
+              readOnly={writing}
+              aria-busy={writing}
+              onChange={(event) => {
+                setBodyEdited(true);
+                setAgentDrafted(false);
+                setBody(event.target.value);
+              }}
+            />
+            {writing && (
+              <span
+                data-testid="create-pr-writing"
+                aria-live="polite"
+                className={`shimmer pointer-events-none absolute left-2.5 top-2 ${tzRowTitle}`}
+              >
+                Reading the commits and the diff…
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              className={CHIP}
+              data-testid="create-pr-write-with-agent"
+              disabled={writing || busy != null}
+              onClick={() => void writeWithAgent()}
+            >
+              {writing ? (
+                <Loader2 className="size-3 motion-safe:animate-spin" />
+              ) : (
+                <Sparkles className="size-3" />
+              )}
+              {writing ? "Writing" : "Write with agent"}
+            </button>
+            {template && (
               <button
                 type="button"
                 className={CHIP}
                 data-testid="create-pr-template"
+                disabled={writing}
                 onClick={() => {
                   setBodyEdited(true);
+                  setAgentDrafted(false);
                   setBody((current) =>
                     current.trim() ? `${template.trim()}\n\n${current}` : template,
                   );
@@ -392,8 +511,8 @@ export function CreatePrForm({
               >
                 Use repo template
               </button>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* Reviewers are collected here and requested after the pull
@@ -484,7 +603,7 @@ export function CreatePrForm({
         <button
           type="button"
           className={`${btnCard} min-w-[58px]`}
-          disabled={!title.trim() || busy != null}
+          disabled={!title.trim() || busy != null || writing}
           onClick={() => void create(true)}
         >
           {busy === "draft" ? <Loader2 className="size-3 animate-spin" /> : null}
@@ -494,7 +613,7 @@ export function CreatePrForm({
           type="button"
           className={`${btnEmberSolid} min-w-[68px]`}
           data-testid="create-pr-submit"
-          disabled={!title.trim() || busy != null}
+          disabled={!title.trim() || busy != null || writing}
           onClick={() => void create(false)}
         >
           {busy === "create" ? <Loader2 className="size-3 animate-spin" /> : null}

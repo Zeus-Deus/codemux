@@ -368,6 +368,165 @@ pub async fn generate_commit_message(
         .to_string())
 }
 
+/// A pull request title and description an agent drafted.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PrDescriptionDraft {
+    pub title: String,
+    pub body: String,
+}
+
+/// Budgets for what goes into the prompt. The prompt travels as one argv
+/// entry, which Linux caps at 128 KiB, and past a few thousand lines the
+/// patch stops helping the description anyway: the stat and the commit
+/// messages still name every file and every intent.
+const PR_PROMPT_DIFF_BUDGET: usize = 60_000;
+const PR_PROMPT_STAT_BUDGET: usize = 8_000;
+const PR_PROMPT_LOG_BUDGET: usize = 12_000;
+const PR_PROMPT_TEMPLATE_BUDGET: usize = 8_000;
+
+const PR_DESCRIPTION_SYSTEM_PROMPT: &str = "Write a pull request title and description \
+for the branch described below. Everything you need is in the message; do not run commands.\n\
+Output format: the title alone on the first line (plain text, no prefix, at most 72 \
+characters, conventional-commit style when the commits use it), then one blank line, then \
+the description in GitHub-flavoured Markdown.\n\
+The description starts with the problem in a sentence or two, then how the change solves \
+it. Mention verification only if the commits say how it was checked; never invent it.\n\
+If a template is given, fill in its sections and keep its headings instead of inventing \
+your own structure.\n\
+Return ONLY the title and the description: no preamble, no closing remarks, no code fence \
+around the whole answer.";
+
+/// Cut `text` to at most `max` bytes on a character boundary.
+fn clip(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// The user half of the prompt: commits, stat, patch and template, each
+/// within its budget and labelled when it was cut.
+pub(crate) fn build_pr_description_prompt(
+    change: &crate::git::BranchChangeText,
+    template: Option<&str>,
+) -> String {
+    let section = |label: &str, text: &str, budget: usize| {
+        let (kept, cut) = clip(text.trim(), budget);
+        let note = if cut { "\n[truncated]" } else { "" };
+        format!("## {label}\n{kept}{note}\n\n")
+    };
+    let mut prompt = String::new();
+    if let Some(template) = template.map(str::trim).filter(|t| !t.is_empty()) {
+        prompt.push_str(&section(
+            "Repository PR template",
+            template,
+            PR_PROMPT_TEMPLATE_BUDGET,
+        ));
+    }
+    prompt.push_str(&section("Commits", &change.log, PR_PROMPT_LOG_BUDGET));
+    prompt.push_str(&section("Files changed", &change.stat, PR_PROMPT_STAT_BUDGET));
+    prompt.push_str(&section("Diff", &change.diff, PR_PROMPT_DIFF_BUDGET));
+    prompt
+}
+
+/// Read the agent's answer back into a title and a body.
+///
+/// Forgiving about the ways an agent drifts from the format (a wrapping
+/// fence, a `Title:` label, a Markdown heading on the title) and strict
+/// about the one thing that matters: there has to be a title.
+pub(crate) fn parse_pr_description(output: &str) -> Result<PrDescriptionDraft, String> {
+    let mut text = output.trim();
+    if text.starts_with("```") && text.ends_with("```") && text.len() > 6 {
+        if let Some(open_end) = text.find('\n') {
+            text = text[open_end + 1..text.len() - 3].trim();
+        }
+    }
+
+    let mut lines = text.lines();
+    let title_line = lines
+        .by_ref()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "The agent returned an empty description".to_string())?;
+    let mut title = title_line.trim().trim_start_matches('#').trim();
+    for label in ["**Title:**", "Title:", "title:", "TITLE:"] {
+        if let Some(rest) = title.strip_prefix(label) {
+            title = rest.trim();
+        }
+    }
+    let title = title
+        .trim_matches(|c| c == '"' || c == '`' || c == '*')
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return Err("The agent returned no title".to_string());
+    }
+
+    let mut body_lines: Vec<&str> = lines.collect();
+    while body_lines.first().is_some_and(|line| line.trim().is_empty()) {
+        body_lines.remove(0);
+    }
+    if body_lines.first().is_some_and(|line| {
+        let l = line.trim().trim_matches('*').to_ascii_lowercase();
+        l == "description:" || l == "## description" || l == "description"
+    }) {
+        body_lines.remove(0);
+    }
+    Ok(PrDescriptionDraft {
+        title,
+        body: body_lines.join("\n").trim().to_string(),
+    })
+}
+
+/// Draft a pull request title and description for HEAD against `base`.
+pub async fn generate_pr_description(
+    repo_path: &Path,
+    base: &str,
+    template: Option<&str>,
+    cli: &str,
+    model: Option<&str>,
+) -> Result<PrDescriptionDraft, String> {
+    let change = {
+        let repo = repo_path.to_path_buf();
+        let base = base.to_string();
+        tokio::task::spawn_blocking(move || crate::git::git_branch_change_text(&repo, &base))
+            .await
+            .map_err(|e| format!("Reading the branch failed: {e}"))??
+    };
+    if change.log.trim().is_empty() && change.diff.trim().is_empty() {
+        return Err(format!("This branch has no commits ahead of {base}"));
+    }
+
+    let user_prompt = build_pr_description_prompt(&change, template);
+    let (program, args) =
+        build_resolver_argv(cli, model, PR_DESCRIPTION_SYSTEM_PROMPT, &user_prompt);
+
+    // The same hardened spawn as the commit message: stdin is /dev/null,
+    // the child dies with the future, and a hung CLI times out.
+    let output = match run_resolver_cli(program, &args, repo_path, RESOLVER_TIMEOUT).await {
+        Ok(out) => out,
+        Err(ResolverRunError::Spawn(e)) | Err(ResolverRunError::Io(e)) => {
+            return Err(format!("Failed to run {cli}: {e}"));
+        }
+        Err(ResolverRunError::Timeout) => {
+            return Err(format!(
+                "{cli} did not finish within {}s. Try again, or switch CLI / model.",
+                RESOLVER_TIMEOUT.as_secs()
+            ));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("{cli} failed: {}", stderr.trim()));
+    }
+
+    parse_pr_description(&String::from_utf8_lossy(&output.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +568,58 @@ mod tests {
         // Now merge target into feature -> conflict
         g(&["merge", "--no-edit", "target"]);
         (dir, repo)
+    }
+
+    // ---- PR description ----
+
+    #[test]
+    fn pr_description_reads_title_then_body() {
+        let draft = parse_pr_description(
+            "feat(chat): stream replies\n\nReplies used to arrive whole.\n\n- Streams them.\n",
+        )
+        .unwrap();
+        assert_eq!(draft.title, "feat(chat): stream replies");
+        assert_eq!(draft.body, "Replies used to arrive whole.\n\n- Streams them.");
+    }
+
+    #[test]
+    fn pr_description_forgives_fences_labels_and_headings() {
+        let draft = parse_pr_description(
+            "```markdown\n# Title: \"fix: close the handle\"\n\nDescription:\nThe handle leaked.\n```",
+        )
+        .unwrap();
+        assert_eq!(draft.title, "fix: close the handle");
+        assert_eq!(draft.body, "The handle leaked.");
+
+        let only_title = parse_pr_description("\n\n  chore: bump  \n").unwrap();
+        assert_eq!(only_title.title, "chore: bump");
+        assert_eq!(only_title.body, "");
+    }
+
+    #[test]
+    fn pr_description_without_a_title_is_an_error() {
+        assert!(parse_pr_description("").is_err());
+        assert!(parse_pr_description("   \n\n").is_err());
+        assert!(parse_pr_description("Title:   ").is_err());
+    }
+
+    #[test]
+    fn pr_description_prompt_carries_every_section_within_budget() {
+        let change = crate::git::BranchChangeText {
+            log: "- feat: one".into(),
+            stat: " a.rs | 2 +-".into(),
+            diff: "é".repeat(PR_PROMPT_DIFF_BUDGET),
+        };
+        let prompt = build_pr_description_prompt(&change, Some("## Summary\n"));
+        assert!(prompt.starts_with("## Repository PR template\n## Summary"));
+        assert!(prompt.contains("## Commits\n- feat: one"));
+        assert!(prompt.contains("## Files changed\na.rs | 2 +-"));
+        // Cut on a character boundary, and said so.
+        assert!(prompt.contains("[truncated]"));
+        assert!(prompt.len() < PR_PROMPT_DIFF_BUDGET + 1_000);
+
+        let no_template = build_pr_description_prompt(&change, Some("  "));
+        assert!(!no_template.contains("template"));
     }
 
     #[test]

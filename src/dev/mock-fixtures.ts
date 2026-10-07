@@ -3440,6 +3440,38 @@ export const MOCK_PR_REVIEW_THREADS: Record<number, PrReviewThread[]> = {
         },
       ],
     },
+    {
+      // A bot's review, as bots write them: Markdown and a two-line
+      // suggestion, so the rendered body and the suggestion diff are
+      // both reachable from the mock.
+      id: "PRRT_rail-suggestion",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/components/sidebar/draft-rail.tsx",
+      line: 132,
+      side: "RIGHT",
+      start_line: 131,
+      comments: [
+        {
+          id: "PRRC_8401",
+          database_id: 8401,
+          author: "review-bot",
+          body: [
+            "**Nit:** the comment restates the code. Say *why* the cap exists:",
+            "",
+            "```suggestion",
+            "  // More rows than this and the rail scrolls, hiding the newest draft.",
+            "  const recent = entries.slice(0, MAX_RAIL_ENTRIES);",
+            "```",
+            "",
+            "- keeps `MAX_RAIL_ENTRIES` as the single source",
+            "- see [the rail spec](https://example.com/rail)",
+          ].join("\n"),
+          created_at: minutesAgo(9),
+        },
+      ],
+    },
   ],
   142: [
     {

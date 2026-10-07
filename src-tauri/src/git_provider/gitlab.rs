@@ -891,6 +891,12 @@ pub(crate) fn split_discussions(v: &Value) -> (Vec<ReviewComment>, Vec<InlineRev
                     created_at,
                 });
             } else {
+                // A note on a removed line has only an `old_line`, which
+                // counts in the old file.
+                let (line, side) = match position["new_line"].as_u64() {
+                    Some(n) => (Some(n), "RIGHT"),
+                    None => (position["old_line"].as_u64(), "LEFT"),
+                };
                 inline.push(InlineReviewComment {
                     id,
                     author,
@@ -901,10 +907,8 @@ pub(crate) fn split_discussions(v: &Value) -> (Vec<ReviewComment>, Vec<InlineRev
                         .or_else(|| position["old_path"].as_str())
                         .unwrap_or("")
                         .to_string(),
-                    line: position["new_line"]
-                        .as_u64()
-                        .or_else(|| position["old_line"].as_u64())
-                        .map(|n| n as u32),
+                    line: line.map(|n| n as u32),
+                    side: line.map(|_| side.to_string()),
                     created_at,
                     in_reply_to_id: if index == 0 { None } else { root_id },
                     pull_request_review_id: root_id,
@@ -949,6 +953,7 @@ pub(crate) fn map_discussion_threads(v: &Value) -> Vec<PrReviewThread> {
         let mut all_resolved = true;
         let mut path = None;
         let mut line = None;
+        let mut side = None;
 
         for note in notes {
             if note["system"].as_bool() == Some(true) {
@@ -970,10 +975,14 @@ pub(crate) fn map_discussion_threads(v: &Value) -> Vec<PrReviewThread> {
                     .as_str()
                     .or_else(|| position["old_path"].as_str())
                     .map(|s| s.to_string());
-                line = position["new_line"]
-                    .as_u64()
-                    .or_else(|| position["old_line"].as_u64())
-                    .map(|n| n as u32);
+                // A note on a removed line has only an `old_line`, which
+                // counts in the old file.
+                let (n, s) = match position["new_line"].as_u64() {
+                    Some(n) => (Some(n), "RIGHT"),
+                    None => (position["old_line"].as_u64(), "LEFT"),
+                };
+                line = n.map(|n| n as u32);
+                side = n.map(|_| s.to_string());
             }
             let note_id = note["id"].as_u64();
             comments.push(PrThreadComment {
@@ -996,6 +1005,9 @@ pub(crate) fn map_discussion_threads(v: &Value) -> Vec<PrReviewThread> {
             is_resolvable: resolvable,
             path,
             line,
+            side,
+            start_line: None,
+            start_side: None,
             comments,
         });
     }
@@ -2857,6 +2869,7 @@ gitlab.com
         assert!(threads[0].is_resolvable);
         assert_eq!(threads[0].path.as_deref(), Some("src/watch.rs"));
         assert_eq!(threads[0].line, Some(61));
+        assert_eq!(threads[0].side.as_deref(), Some("RIGHT"));
         assert_eq!(threads[0].comments.len(), 2);
         assert_eq!(threads[0].comments[0].database_id, Some(11));
 
@@ -2896,6 +2909,7 @@ gitlab.com
         assert_eq!(inline.len(), 2);
         assert_eq!(inline[0].path, "a.txt");
         assert_eq!(inline[0].line, Some(2));
+        assert_eq!(inline[0].side.as_deref(), Some("RIGHT"));
     }
 
     #[test]
@@ -2928,6 +2942,29 @@ gitlab.com
         let (_, inline) = split_discussions(&value);
         assert_eq!(inline[0].path, "a.txt");
         assert_eq!(inline[0].line, Some(7));
+        assert_eq!(inline[0].side.as_deref(), Some("LEFT"));
+    }
+
+    /// A thread on a deleted line is numbered in the old file; without
+    /// the side, the Code tab would hang it on whatever new line shares
+    /// that number.
+    #[test]
+    fn a_thread_on_a_removed_line_is_on_the_left_side() {
+        let value = serde_json::json!([{
+            "id": "x",
+            "notes": [{"id": 1, "body": "gone", "system": false,
+                       "resolvable": true, "resolved": false,
+                       "author": {"username": "root"}, "created_at": "t",
+                       "position": {"new_path": null, "old_path": "a.txt",
+                                    "new_line": null, "old_line": 7}}]
+        }]);
+        let threads = map_discussion_threads(&value);
+        assert_eq!(threads[0].line, Some(7));
+        assert_eq!(threads[0].side.as_deref(), Some("LEFT"));
+        // A plain comment has no anchor, so no side either.
+        let plain = map_discussion_threads(&resolvable_discussions_fixture());
+        let plain = plain.iter().find(|t| t.id == "sha-plain").unwrap();
+        assert_eq!(plain.side, None);
     }
 
     #[test]
