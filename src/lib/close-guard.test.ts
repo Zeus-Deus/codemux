@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   terminalForegroundJobs: vi.fn(),
   launchAgentChatPane: vi.fn(),
   undoable: vi.fn(),
+  dismiss: vi.fn(),
   error: vi.fn(),
 }));
 
@@ -20,7 +21,7 @@ vi.mock("@/lib/agent-chat/launch-pane", () => ({
   launchAgentChatPane: mocks.launchAgentChatPane,
 }));
 vi.mock("@/lib/toast", () => ({
-  toast: { undoable: mocks.undoable, error: mocks.error },
+  toast: { undoable: mocks.undoable, dismiss: mocks.dismiss, error: mocks.error },
 }));
 
 import {
@@ -88,6 +89,7 @@ beforeEach(() => {
   mocks.closePane.mockResolvedValue(null);
   mocks.reorderTabs.mockResolvedValue(undefined);
   mocks.terminalForegroundJobs.mockResolvedValue({});
+  mocks.undoable.mockReturnValue("toast-1");
   useCloseGuardStore.setState({ prompt: null });
   resetClosedTabsForTest();
   seed();
@@ -126,6 +128,55 @@ describe("requestCloseTab", () => {
     prompt()!.confirm();
     await done;
     expect(mocks.closeTab).toHaveBeenCalledWith("ws-1", "b");
+  });
+
+  it("waits for the confirmed close to land before resolving", async () => {
+    seed({ "pane-chat": "working" });
+    let land!: () => void;
+    mocks.closeTab.mockReturnValue(new Promise<void>((r) => (land = r)));
+    let resolved = false;
+    const done = requestCloseTab("ws-1", "b").then(() => (resolved = true));
+    await vi.waitFor(() => expect(prompt()).not.toBeNull());
+    prompt()!.confirm();
+    await Promise.resolve();
+    expect(mocks.closeTab).toHaveBeenCalled();
+    expect(resolved).toBe(false);
+    land();
+    await done;
+    expect(resolved).toBe(true);
+  });
+
+  it("names every distinct running job", async () => {
+    const twoTerminals: PaneNodeSnapshot = {
+      kind: "split",
+      pane_id: "split-1",
+      direction: "horizontal",
+      child_sizes: [0.5, 0.5],
+      children: [terminal, { ...terminal, pane_id: "pane-2", session_id: "sess-2" }],
+    };
+    seed();
+    const state = useAppStore.getState().appState!;
+    const ws = state.workspaces[0];
+    useAppStore.setState({
+      appState: {
+        ...state,
+        workspaces: [
+          {
+            ...ws,
+            surfaces: [{ ...ws.surfaces[0], root: twoTerminals }, ws.surfaces[1]],
+          },
+        ],
+      },
+    });
+    mocks.terminalForegroundJobs.mockResolvedValue({
+      "sess-term": "node",
+      "sess-2": "cargo",
+    });
+    void requestCloseTab("ws-1", "a");
+    await vi.waitFor(() => expect(prompt()).not.toBeNull());
+    expect(prompt()!.reason).toBe(
+      "node and cargo are still running. Closing ends them.",
+    );
   });
 
   it("does not ask for a finished agent", async () => {
@@ -201,6 +252,17 @@ describe("reopening a closed chat", () => {
     expect(mocks.reorderTabs).toHaveBeenCalledWith("ws-1", ["a", "new", "c"]);
     // Each close reopens once.
     expect(reopenClosedTab()).toBe(false);
+  });
+
+  it("reopens once when both Undo and Ctrl+Shift+T fire", async () => {
+    await requestCloseTab("ws-1", "b");
+    await vi.waitFor(() => expect(mocks.undoable).toHaveBeenCalled());
+    mocks.launchAgentChatPane.mockResolvedValue("pane-chat");
+
+    expect(reopenClosedTab()).toBe(true);
+    await mocks.undoable.mock.calls[0][0].onUndo();
+    await vi.waitFor(() => expect(mocks.dismiss).toHaveBeenCalledWith("toast-1"));
+    expect(mocks.launchAgentChatPane).toHaveBeenCalledTimes(1);
   });
 
   it("has nothing to reopen after closing a plain terminal", async () => {

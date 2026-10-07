@@ -50,6 +50,8 @@ interface ClosedEntry {
   /** Tab position to restore, when the close removed a whole tab. */
   tabIndex: number | null;
   chats: ClosedChat[];
+  /** The Undo toast, dismissed once the entry is reopened another way. */
+  toastId?: string | number;
 }
 
 const MAX_CLOSED = 10;
@@ -85,8 +87,18 @@ async function closeRisk(
   );
   if (sessionIds.length === 0) return null;
   const jobs = await terminalForegroundJobs(sessionIds).catch(() => ({}));
-  const job = Object.values(jobs)[0];
-  return job ? `${job} is still running. Closing ends it.` : null;
+  return describeJobs([...new Set(Object.values(jobs))]);
+}
+
+/** "node is still running", "node and cargo are still running", or
+ *  "node and 2 others are still running" for a tab of busy terminals. */
+function describeJobs(jobs: string[]): string | null {
+  const [first, second] = jobs;
+  if (!first) return null;
+  const end = "Closing ends them.";
+  if (!second) return `${first} is still running. Closing ends it.`;
+  if (jobs.length === 2) return `${first} and ${second} are still running. ${end}`;
+  return `${first} and ${jobs.length - 1} others are still running. ${end}`;
 }
 
 function rememberChats(
@@ -103,7 +115,7 @@ function rememberChats(
   if (chats.length === 0) return;
   const entry: ClosedEntry = { workspaceId, tabIndex, chats };
   closedStack = [...closedStack, entry].slice(-MAX_CLOSED);
-  toast.undoable({
+  entry.toastId = toast.undoable({
     message: `Closed ${title}`,
     durationMs: 6000,
     onUndo: () => reopen(entry),
@@ -135,7 +147,11 @@ function waitForPaneTab(workspaceId: string, paneId: string): Promise<string | n
 }
 
 async function reopen(entry: ClosedEntry): Promise<void> {
+  // The Undo toast and Ctrl+Shift+T can both reach the same entry; only the
+  // first one reopens it.
+  if (!closedStack.includes(entry)) return;
   closedStack = closedStack.filter((e) => e !== entry);
+  if (entry.toastId !== undefined) toast.dismiss(entry.toastId);
   let firstPaneId: string | null = null;
   for (const chat of entry.chats) {
     const paneId = await launchAgentChatPane(
@@ -170,8 +186,9 @@ export function reopenClosedTab(): boolean {
   return true;
 }
 
-/** Closes at once when nothing live would be lost; otherwise asks and
- *  resolves once the user has answered, so a bulk close asks tab by tab. */
+/** Closes at once when nothing live would be lost; otherwise asks. Resolves
+ *  once the close has landed (or was cancelled), so a bulk close asks and
+ *  closes tab by tab. */
 async function guardedClose(
   title: string,
   panes: Leaf[],
@@ -194,8 +211,8 @@ async function guardedClose(
       if (settled) return;
       settled = true;
       if (useCloseGuardStore.getState().prompt === prompt) store.setPrompt(null);
-      if (confirmed) void run();
-      resolve();
+      if (confirmed) void run().then(resolve);
+      else resolve();
     };
     const prompt: CloseGuardPrompt = {
       title,
