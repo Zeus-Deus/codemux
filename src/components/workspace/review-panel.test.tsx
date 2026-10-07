@@ -581,4 +581,75 @@ describe("provider-aware copy", () => {
     expect(screen.getByText("Bitbucket, read-only")).toBeInTheDocument();
     expect(screen.queryByText(/isn't installed/)).not.toBeInTheDocument();
   });
+
+  /// No remote is not an unsupported host: nothing is hosted yet, and
+  /// local review still works.
+  it("offers local review instead of a dead end when there is no remote", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({
+        kind: "unknown",
+        supported: false,
+        installed: false,
+        authenticated: false,
+        username: null,
+        has_remote: false,
+      }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: null })} />);
+    await flushPromises();
+    expect(screen.getByText("This repository has no remote yet")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review changes" })).toBeInTheDocument();
+    expect(
+      screen.queryByText("No supported source control host for this repository"),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("re-checking after a fix made outside the panel", () => {
+  const signedOut = {
+    kind: "github",
+    supported: true,
+    installed: true,
+    authenticated: false,
+    username: null,
+  };
+
+  it("leaves the signed-out state once \"Check again\" finds a login", async () => {
+    mockCheckProviderAuth.mockResolvedValue(signedOut);
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    expect(screen.getByText("Sign in to GitHub")).toBeInTheDocument();
+
+    mockCheckProviderAuth.mockResolvedValue({ ...signedOut, authenticated: true, username: "test" });
+    await act(async () => {
+      screen.getByRole("button", { name: "Check again" }).click();
+    });
+    await flushPromises();
+    expect(screen.queryByText("Sign in to GitHub")).not.toBeInTheDocument();
+  });
+
+  it("re-probes when the window regains focus", async () => {
+    mockCheckProviderAuth.mockResolvedValue(signedOut);
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    const callsBefore = mockCheckProviderAuth.mock.calls.length;
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await flushPromises();
+    expect(mockCheckProviderAuth.mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+
+  it("does not poll once the host is usable", async () => {
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    const callsBefore = mockCheckProviderAuth.mock.calls.length;
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await flushPromises();
+    expect(mockCheckProviderAuth.mock.calls.length).toBe(callsBefore);
+  });
 });

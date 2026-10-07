@@ -55,6 +55,7 @@ export function PullRequestsView() {
     rows,
     viewerByRoot,
     failures,
+    localOnly,
     roots,
     updatedAt,
     carried,
@@ -298,6 +299,7 @@ export function PullRequestsView() {
             failures={failures}
             rateLimitedUntil={rateLimitedUntil}
             hostCount={roots.length}
+            localOnlyCount={localOnly.length}
             updatedAt={updatedAt}
             carried={carried}
             carriedAt={carriedAt}

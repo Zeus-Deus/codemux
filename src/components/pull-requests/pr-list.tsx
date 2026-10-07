@@ -68,6 +68,8 @@ export interface PrListProps {
   workspaceByBranch: Map<string, string>;
   failures: RootFailure[];
   hostCount: number;
+  /** Repositories with no remote: counted, never queried. */
+  localOnlyCount?: number;
   updatedAt: number | null;
   /** Rows on screen came from the last session's snapshot. */
   carried?: boolean;
@@ -100,6 +102,7 @@ export function PrList({
   workspaceByBranch,
   failures,
   hostCount,
+  localOnlyCount = 0,
   updatedAt,
   carried = false,
   carriedAt = null,
@@ -343,6 +346,8 @@ export function PrList({
           <EmptyList
             hasRows={rows.length > 0}
             hasHosts={hostCount > 0}
+            allLocalOnly={hostCount > 0 && localOnlyCount === hostCount}
+            failures={allRootsFailed ? failures : []}
             isLoading={isLoading}
             unanswered={rateLimitedUntil > 0 && allRootsFailed}
             query={query}
@@ -412,6 +417,12 @@ export function PrList({
       <div className="flex shrink-0 items-center gap-2 border-t border-border/40 px-3 py-1.5">
         <span className={cn("min-w-0 flex-1 truncate text-muted-foreground", tzMetaNum)}>
           {hostCount} {hostCount === 1 ? "repository" : "repositories"}
+          {localOnlyCount > 0 && (
+            <span data-testid="pr-list-local-only">
+              {" · "}
+              {localOnlyCount} local-only
+            </span>
+          )}
           {failures.length > 0 && (
             <>
               {" · "}
@@ -531,13 +542,20 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
   );
 }
 
+/** Host CLI errors that mean "sign in", as opposed to "unreachable".
+ *  Word stems rather than a bare `auth` prefix, so a repository named
+ *  `auth-service` in a not-found error does not read as a sign-in one. */
+const AUTH_ERROR = /\b(?:un|re)?auth(?:enticat|oriz)|log ?in|sign(ed)? ?in|credential|token|\b401\b/i;
+
 /**
- * Five ways to have nothing to show, and each one gets the sentence
- * that fits it plus the thing to do next (rule 05).
+ * Every way to have nothing to show gets the sentence that fits it
+ * plus the thing to do next (rule 05).
  */
 function EmptyList({
   hasRows,
   hasHosts,
+  allLocalOnly,
+  failures,
   isLoading,
   unanswered,
   query,
@@ -545,6 +563,10 @@ function EmptyList({
 }: {
   hasRows: boolean;
   hasHosts: boolean;
+  /** Every open project is a repository with no remote. */
+  allLocalOnly: boolean;
+  /** Set only when every repository that could be asked failed. */
+  failures: RootFailure[];
   isLoading: boolean;
   /** *Every* root refused and the page has stopped asking, so it has no
    *  answer to give — as opposed to having one that happens to be
@@ -605,6 +627,45 @@ function EmptyList({
     );
   }
 
+  if (allLocalOnly) {
+    return (
+      <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-local-only-empty">
+        <p className="text-label text-foreground">No repositories with a remote.</p>
+        <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
+          The projects you have open live only on this machine. Add a remote to one and its
+          pull requests show up here.
+        </p>
+      </div>
+    );
+  }
+
+  // Every repository that could be asked failed, so "no open pull
+  // requests" would be a guess. Say what each one answered instead, and
+  // only point at signing in when that is what the host said.
+  if (failures.length > 0) {
+    const signedOut = failures.some((f) => AUTH_ERROR.test(f.message));
+    return (
+      <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-all-failed">
+        <p className="text-label text-foreground">
+          Couldn&apos;t list pull requests for {failures.length}{" "}
+          {failures.length === 1 ? "repository" : "repositories"}.
+        </p>
+        <ul className={cn("flex flex-col gap-1 leading-relaxed text-muted-foreground", tzBody)}>
+          {failures.map((f) => (
+            <li key={f.root.path} className="break-words">
+              <span className="text-foreground/90">{f.root.name}</span>: {f.message}
+            </li>
+          ))}
+        </ul>
+        {signedOut && (
+          <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
+            Check that the host CLI is signed in under Settings ▸ Source Control.
+          </p>
+        )}
+      </div>
+    );
+  }
+
   // The one place a loading state is still correct: nothing has ever
   // been on this page, so there is nothing to keep instead (rule 02).
   // Saying "no open pull requests" here would be answering a question
@@ -624,8 +685,7 @@ function EmptyList({
     <div className="flex flex-col items-start gap-2 px-3 py-8">
       <p className="text-label text-foreground">No open pull requests.</p>
       <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
-        Nothing is open on the projects you have here. If you expected some, check that
-        the host CLI is signed in under Settings ▸ Source Control.
+        Nothing is open on the repositories that answered.
       </p>
     </div>
   );
