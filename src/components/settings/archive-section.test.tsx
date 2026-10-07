@@ -138,6 +138,36 @@ describe("ArchiveSection — grouping and entry rendering", () => {
     expect(screen.getByText("blog-cleanup")).toBeInTheDocument();
   });
 
+  it("filters entries by title, branch or project, and says when nothing matches", async () => {
+    setArchived([
+      makeEntry({ archive_id: "a-1", project_root: "/home/user/projects/myapp" }),
+      makeEntry({
+        archive_id: "a-2",
+        title: "blog-cleanup",
+        worktree_path: "/home/user/.codemux/worktrees/blog/cleanup",
+        project_root: "/home/user/projects/blog",
+        git_branch: "chore/cleanup",
+      }),
+    ]);
+    render(<ArchiveSection />);
+    const search = screen.getByRole("textbox", { name: "Search archived workspaces" });
+
+    await userEvent.type(search, "CHORE/");
+    expect(screen.getByText("blog-cleanup")).toBeInTheDocument();
+    expect(screen.queryByText("feature-work")).not.toBeInTheDocument();
+    // The emptied project group goes too, not just its rows.
+    expect(screen.queryByText("myapp")).not.toBeInTheDocument();
+
+    await userEvent.clear(search);
+    await userEvent.type(search, "myapp");
+    expect(screen.getByText("feature-work")).toBeInTheDocument();
+    expect(screen.queryByText("blog-cleanup")).not.toBeInTheDocument();
+
+    await userEvent.clear(search);
+    await userEvent.type(search, "nothing like this");
+    expect(screen.getByTestId("archive-no-matches")).toBeInTheDocument();
+  });
+
   it("falls back to the cwd when project_root is null", () => {
     setArchived([
       makeEntry({ project_root: null, cwd: "/home/user/projects/loose-dir" }),

@@ -476,17 +476,23 @@ export function SidebarFooterBar() {
         </DndContext>
         {overflow.length > 0 && (
           <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="More footer destinations"
-                title="More footer destinations"
-                className="size-7 shrink-0 text-muted-foreground"
-              >
-                <MoreHorizontal className="size-4" />
-              </Button>
-            </PopoverTrigger>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="More footer destinations"
+                    className="size-7 shrink-0 text-muted-foreground"
+                  >
+                    <MoreHorizontal className="size-4" />
+                  </Button>
+                </PopoverTrigger>
+              </TooltipTrigger>
+              <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
+                More
+              </TooltipContent>
+            </Tooltip>
             <PopoverContent
               side={collapsed ? "right" : "top"}
               align="start"

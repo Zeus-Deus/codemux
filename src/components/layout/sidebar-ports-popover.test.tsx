@@ -1,6 +1,14 @@
-import { describe, it, expect } from "vitest";
-import { groupPorts } from "./sidebar-ports-popover";
-import type { PortInfoSnapshot, WorkspaceSnapshot } from "@/tauri/types";
+/// <reference types="@testing-library/jest-dom/vitest" />
+import { afterEach, describe, it, expect } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { groupPorts, SidebarPortsPopover } from "./sidebar-ports-popover";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { useAppStore } from "@/stores/app-store";
+import type {
+  AppStateSnapshot,
+  PortInfoSnapshot,
+  WorkspaceSnapshot,
+} from "@/tauri/types";
 
 function port(
   p: Partial<PortInfoSnapshot> & { port: number },
@@ -72,5 +80,47 @@ describe("groupPorts", () => {
 
   it("returns no groups for an empty port list", () => {
     expect(groupPorts([], [])).toEqual([]);
+  });
+});
+
+describe("SidebarPortsPopover", () => {
+  afterEach(() => {
+    cleanup();
+    useAppStore.setState({ appState: null });
+  });
+
+  function renderWithPorts(ports: PortInfoSnapshot[]) {
+    useAppStore.setState({
+      appState: { detected_ports: ports, workspaces: [] } as unknown as AppStateSnapshot,
+    });
+    render(
+      <TooltipProvider>
+        <SidebarPortsPopover />
+      </TooltipProvider>,
+    );
+  }
+
+  it("names the button in its tooltip, not only the count", async () => {
+    renderWithPorts([port({ port: 3000 })]);
+    fireEvent.focus(screen.getByRole("button", { name: "Ports" }));
+    expect((await screen.findAllByText("Ports · 1 active")).length).toBeGreaterThan(0);
+  });
+
+  it("shows a port's full name only when the row truncates it, never as a native title", async () => {
+    renderWithPorts([port({ port: 3000, process_name: "python" })]);
+    fireEvent.click(screen.getByRole("button", { name: "Ports" }));
+
+    const name = await screen.findByTestId("port-name");
+    expect(name).not.toHaveAttribute("title");
+
+    // jsdom lays nothing out, so the name fits: no tooltip.
+    fireEvent.focus(name);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    fireEvent.blur(name);
+
+    Object.defineProperty(name, "scrollWidth", { configurable: true, value: 200 });
+    Object.defineProperty(name, "clientWidth", { configurable: true, value: 80 });
+    fireEvent.focus(name);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("python");
   });
 });

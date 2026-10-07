@@ -422,6 +422,15 @@ describe("footer customization", () => {
     expect(setShowSettingsMock).toHaveBeenCalledWith(true, "session_restore");
   });
 
+  it("labels the overflow button with a Radix tooltip instead of a native title", async () => {
+    useFooterPinsStore.setState({ pins: FOOTER_ACTIONS.map((action) => ({ id: action.id })) });
+    renderFooter(true);
+    const more = screen.getByRole("button", { name: "More footer destinations" });
+    expect(more).not.toHaveAttribute("title");
+    await userEvent.hover(more);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("More");
+  });
+
   it("hides gated pins without deleting their order or offering them in the picker", async () => {
     useFooterPinsStore.setState({ pins: [{ id: "codemux.settings.skills" }, { id: "codemux.ports.open" }] });
     useFeatureFlags.setState({ enableAgentChat: false });
