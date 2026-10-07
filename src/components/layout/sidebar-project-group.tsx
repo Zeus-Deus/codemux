@@ -26,8 +26,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard, Home, Image as ImageIcon } from "lucide-react";
+import { ChevronRight, Plus, Check, FolderOpen, Clipboard, Home, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { PendingWorkspaceRow } from "./pending-workspace-row";
 import {
   dbGetUiState,
   dbSetUiState,
@@ -418,22 +419,11 @@ export function SidebarProjectGroup({
       )}
 
       {!collapsed && pendingWorkspaces.map((pw) => (
-        <div
+        <PendingWorkspaceRow
           key={pw.id}
-          className={cn(
-            "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-body",
-            pw.status === "failed" ? "opacity-60" : "opacity-70 motion-safe:animate-pulse",
-          )}
-        >
-          {pw.status === "creating" ? (
-            <Loader2 className="size-3.5 animate-spin text-muted-foreground shrink-0" />
-          ) : (
-            <AlertCircle className="size-3.5 text-destructive shrink-0" />
-          )}
-          <span className="truncate text-muted-foreground text-label">
-            {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
-          </span>
-        </div>
+          pending={pw}
+          className="gap-2.5 px-3 py-2 pl-[2.75rem]"
+        />
       ))}
     </div>
   );

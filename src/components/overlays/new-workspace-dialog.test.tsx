@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { cleanup, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
-import { NewWorkspaceDialog } from "./new-workspace-dialog";
+import { act, cleanup, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { NewWorkspaceDialog, branchNameError } from "./new-workspace-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -132,6 +132,9 @@ import {
   getDefaultBranch,
   getPresets,
   listChatProviderCapabilities,
+  createWorkspace,
+  applyPreset,
+  listBranchesDetailed,
 } from "@/tauri/commands";
 import {
   _defaultBranchCache,
@@ -272,6 +275,19 @@ beforeEach(() => {
   });
   (checkIsGitRepo as Mock).mockResolvedValue(true);
   (listBranches as Mock).mockResolvedValue([]);
+  (gitFetchPrune as Mock).mockResolvedValue(undefined);
+  (listBranchesDetailed as Mock).mockResolvedValue([]);
+  (getDefaultBranch as Mock).mockResolvedValue("main");
+  (getGitBranchInfo as Mock).mockResolvedValue({
+    branch: "main",
+    ahead: 0,
+    behind: 0,
+  });
+  (createWorktreeWorkspaceResult as Mock).mockResolvedValue({
+    workspaceId: "ws-new",
+    cwd: null,
+    adopted: false,
+  });
   // useDefaultBranch keeps a module-level cache so the same project_root
   // only fetches once per session. Clear it between tests so a previous
   // case's resolved value doesn't pre-populate the next dialog and
@@ -279,7 +295,9 @@ beforeEach(() => {
   _defaultBranchCache.clear();
   _defaultBranchInFlight.clear();
   useUIStore.setState({
+    showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
+    newWorkspaceDraft: null,
     pendingWorkspaces: [],
     lastSelectedAgentId: null,
     lastModelSelections: {},
@@ -326,10 +344,10 @@ describe("NewWorkspaceDialog", () => {
     setAppState("/path/to/project");
     renderDialog(true);
 
-    await waitFor(() => {
-      const hints = screen.getAllByText("Ctrl+Enter to create");
-      expect(hints.length).toBeGreaterThan(0);
-    });
+    const dialog = await screen.findByRole("dialog");
+    const keycap = within(dialog).getByText("Ctrl+Enter");
+    expect(keycap.tagName).toBe("KBD");
+    expect(keycap.parentElement).toHaveTextContent("Ctrl+Enter to create");
   });
 
   it("fetches branches for the project directory", async () => {
@@ -354,8 +372,9 @@ describe("NewWorkspaceDialog", () => {
       </TooltipProvider>,
     );
 
+    // Local + remote listing right away, then again after the fetch lands.
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2);
+      expect(listBranches).toHaveBeenCalledTimes(4);
     });
 
     rerender(
@@ -375,7 +394,7 @@ describe("NewWorkspaceDialog", () => {
     );
 
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2);
+      expect(listBranches).toHaveBeenCalledTimes(4);
     });
   });
 });
@@ -903,21 +922,36 @@ describe("buildPromptWithIssueContext", () => {
 // ── Fetch before branch listing tests ──
 
 describe("Fetch before branch listing", () => {
-  it("calls gitFetchPrune before listing branches", async () => {
+  it("lists local branches without waiting for the network fetch", async () => {
     setAppState("/path/to/project");
     (listBranches as Mock).mockResolvedValue(["main"]);
+    // A fetch that never finishes (slow VPN, offline with a long timeout).
+    (gitFetchPrune as Mock).mockReturnValue(new Promise(() => {}));
 
     renderDialog(true);
 
     await waitFor(() => {
       expect(gitFetchPrune).toHaveBeenCalledWith("/path/to/project");
-    });
-
-    // Branches should still be listed after fetch
-    await waitFor(() => {
       expect(listBranches).toHaveBeenCalledWith("/path/to/project", false);
       expect(listBranches).toHaveBeenCalledWith("/path/to/project", true);
     });
+    expect(listBranches).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-lists branches once the fetch lands", async () => {
+    setAppState("/path/to/project");
+    let finishFetch!: () => void;
+    (gitFetchPrune as Mock).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishFetch = resolve;
+      }),
+    );
+
+    renderDialog(true);
+
+    await waitFor(() => expect(listBranches).toHaveBeenCalledTimes(2));
+    finishFetch();
+    await waitFor(() => expect(listBranches).toHaveBeenCalledTimes(4));
   });
 
   it("still lists branches when fetch fails (no network)", async () => {
@@ -1216,5 +1250,187 @@ describe("Clipboard image paste", () => {
     });
     // Still exactly one chip.
     expect(within(dialog).getAllByText("Pasted image").length).toBe(1);
+  });
+});
+
+// ── Failure recovery, validation, non-git and default-branch routing ──
+
+/** The dialog wired to the store the way the sidebar mounts it, so a
+ *  "Reopen" from a failed create can open it again. */
+function StoreDrivenDialog() {
+  const open = useUIStore((s) => s.showNewWorkspaceDialog);
+  const setOpen = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  return (
+    <TooltipProvider>
+      <NewWorkspaceDialog open={open} onOpenChange={(next) => setOpen(next)} />
+    </TooltipProvider>
+  );
+}
+
+describe("branchNameError", () => {
+  it("accepts empty and ordinary names", () => {
+    expect(branchNameError("")).toBeNull();
+    expect(branchNameError("feature/1234-fix-checkout-race")).toBeNull();
+  });
+
+  it.each([
+    ["my branch", "spaces"],
+    ["fix..it", ".."],
+    ["what?", "~ ^ : ? * ["],
+    ["-leading", "start with -"],
+    ["trailing/", "/"],
+    ["refs.lock", ".lock"],
+    ["feature/.hidden", "start with ."],
+    ["ends.", "end with ."],
+    ["a@{1}", "@{"],
+  ])("rejects %s", (name, reason) => {
+    expect(branchNameError(name)).toContain(reason);
+  });
+});
+
+describe("Failure recovery", () => {
+  it("keeps the draft on a failed create and Reopen restores it", async () => {
+    setAppState("/path/to/project");
+    (createWorktreeWorkspaceResult as Mock).mockRejectedValueOnce(
+      "fatal: '/wt/my-feature' already exists",
+    );
+    useUIStore.setState({ showNewWorkspaceDialog: true });
+    render(<StoreDrivenDialog />);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "A long task prompt" } },
+    );
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: "my-feature" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
+    });
+    const failed = useUIStore.getState().pendingWorkspaces[0];
+    expect(failed.errorMessage).toBe("fatal: '/wt/my-feature' already exists");
+    expect(failed.draft?.prompt).toBe("A long task prompt");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    const [message, opts] = (toast.error as Mock).mock.calls[0];
+    expect(message).toBe(
+      "Couldn't create workspace: fatal: '/wt/my-feature' already exists",
+    );
+    expect(opts.action.label).toBe("Reopen");
+
+    act(() => opts.action.onClick());
+
+    const reopened = await screen.findByRole("dialog");
+    expect(
+      within(reopened).getByPlaceholderText("What do you want to do?"),
+    ).toHaveValue("A long task prompt");
+    expect(within(reopened).getByPlaceholderText("branch name")).toHaveValue(
+      "my-feature",
+    );
+    expect(useUIStore.getState().pendingWorkspaces).toEqual([]);
+  });
+
+  it("blocks submit on an invalid branch name and says why", async () => {
+    setAppState("/path/to/project");
+    const onOpenChange = vi.fn();
+    renderDialog(true, onOpenChange);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: "my feature" },
+    });
+
+    expect(
+      within(dialog).getByText("Branch names can't contain spaces"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: /Create/i })).toBeDisabled();
+
+    fireEvent.keyDown(dialog, { key: "Enter", ctrlKey: true });
+    await act(async () => {});
+
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+  });
+});
+
+describe("Non-git project", () => {
+  it("explains the missing branch picker and creates in the folder itself", async () => {
+    setAppState("/path/to/project");
+    (checkIsGitRepo as Mock).mockResolvedValue(false);
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByText("Not a git repo · runs in the folder");
+    expect(within(dialog).queryByPlaceholderText("branch name")).toBeNull();
+
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Tidy the notes" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(applyPreset).toHaveBeenCalledWith(
+        "ws-new",
+        "builtin-claude",
+        "current_terminal",
+        "Tidy the notes",
+        null,
+      );
+    });
+    expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+    expect(generateBranchName).not.toHaveBeenCalled();
+  });
+});
+
+describe("Detected default branch routing", () => {
+  async function submitBranch(branch: string) {
+    setAppState("/path/to/project");
+    (getDefaultBranch as Mock).mockResolvedValue("trunk");
+    (getGitBranchInfo as Mock).mockResolvedValue({
+      branch: "feature-x",
+      ahead: 0,
+      behind: 0,
+    });
+    (listBranches as Mock).mockResolvedValue(["trunk", "master", "feature-x"]);
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(listBranches).toHaveBeenCalledTimes(4));
+    await within(dialog).findByText("trunk");
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: branch },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+  }
+
+  it("attaches the repo's detected default to the repo root", async () => {
+    await submitBranch("trunk");
+    await waitFor(() => {
+      expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+    });
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+  });
+
+  it("cuts a worktree for master when it is not the default", async () => {
+    await submitBranch("master");
+    await waitFor(() => {
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
+        "/path/to/project",
+        "master",
+        false,
+        "single",
+        null,
+        null,
+        "builtin-claude",
+        null,
+        null,
+      );
+    });
+    expect(createWorkspace).not.toHaveBeenCalled();
   });
 });

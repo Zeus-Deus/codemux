@@ -33,6 +33,8 @@ import {
   Paperclip,
   X,
   CircleDot,
+  FolderOpen,
+  GitBranch,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
@@ -70,7 +72,7 @@ import {
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { pickFiles } from "@/lib/file-dialog";
-import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection } from "@/tauri/types";
+import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection, NewWorkspaceDraft } from "@/tauri/types";
 import { LaunchModelPicker } from "./launch-model-picker";
 import { LaunchReasoningPicker } from "./launch-reasoning-picker";
 import {
@@ -160,6 +162,85 @@ async function applyTypedWorkspaceName(
   });
 }
 
+/** Why `name` would be rejected by `git check-ref-format --branch`, or null
+ *  when it is fine (an empty name is fine: one gets generated). Checked
+ *  before the dialog closes so a typo can't cost the user their prompt. */
+export function branchNameError(name: string): string | null {
+  const branch = name.trim();
+  if (!branch) return null;
+  if (/\s/.test(branch)) return "Branch names can't contain spaces";
+  // eslint-disable-next-line no-control-regex
+  if (/[~^:?*[\\\x00-\x1f\x7f]/.test(branch)) {
+    return "Branch names can't contain ~ ^ : ? * [ or \\";
+  }
+  if (branch.includes("..")) return "Branch names can't contain ..";
+  if (branch === "@" || branch.includes("@{")) {
+    return "Branch names can't be @ or contain @{";
+  }
+  if (branch.startsWith("-")) return "Branch names can't start with -";
+  if (branch.startsWith("/") || branch.endsWith("/") || branch.includes("//")) {
+    return "Branch names can't start or end with / or contain //";
+  }
+  if (branch.endsWith(".")) return "Branch names can't end with .";
+  for (const part of branch.split("/")) {
+    if (part.startsWith(".")) return "No part of a branch name can start with .";
+    if (part.endsWith(".lock")) return "No part of a branch name can end with .lock";
+  }
+  return null;
+}
+
+/** Tauri rejects with a bare string; anything else is an Error or unknown. */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Every create path in the dialog goes through here. The dialog closes
+ *  straight away and a pending sidebar row stands in for the workspace.
+ *  On failure that row keeps the form draft, and both it and the error
+ *  toast offer "Reopen", which brings the dialog back exactly as it was.
+ *
+ *  `create` resolves to the workspace to activate, or null when it has
+ *  already switched somewhere itself. */
+async function runCreate(
+  closeDialog: () => void,
+  displayName: string,
+  draft: NewWorkspaceDraft,
+  create: () => Promise<string | null>,
+): Promise<void> {
+  const ui = useUIStore.getState();
+  closeDialog();
+  const tempId = randomUUID();
+  ui.addPendingWorkspace({
+    id: tempId,
+    name: displayName,
+    projectPath: draft.projectDir,
+    status: "creating",
+    draft,
+  });
+
+  let wsId: string | null;
+  try {
+    wsId = await create();
+  } catch (err) {
+    const message = errorText(err);
+    ui.failPendingWorkspace(tempId, message);
+    toast.error(`Couldn't create workspace: ${message}`, {
+      action: {
+        label: "Reopen",
+        onClick: () => useUIStore.getState().reopenPendingWorkspace(tempId),
+      },
+    });
+    return;
+  }
+
+  ui.removePendingWorkspace(tempId);
+  if (wsId) {
+    await activateWorkspace(wsId).catch((err) => {
+      toast.error(`Couldn't open workspace: ${errorText(err)}`);
+    });
+  }
+}
+
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -173,10 +254,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     (w) => w.workspace_id === activeWorkspaceId,
   );
   const storeProjectDir = useUIStore((s) => s.newWorkspaceProjectDir);
+  const newWorkspaceDraft = useUIStore((s) => s.newWorkspaceDraft);
   const lastSelectedAgentId = useUIStore((s) => s.lastSelectedAgentId);
-  const addPendingWorkspace = useUIStore((s) => s.addPendingWorkspace);
-  const removePendingWorkspace = useUIStore((s) => s.removePendingWorkspace);
-  const failPendingWorkspace = useUIStore((s) => s.failPendingWorkspace);
   const setLastSelectedAgentId = useUIStore((s) => s.setLastSelectedAgentId);
   const setLastModelSelection = useUIStore((s) => s.setLastModelSelection);
 
@@ -242,6 +321,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
   const [detailedBranches, setDetailedBranches] = useState<BranchDetail[]>([]);
   const [branchesLoading, setBranchesLoading] = useState(false);
+  // True while `git fetch` runs in the background after the local listing.
+  const [branchesSyncing, setBranchesSyncing] = useState(false);
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
@@ -252,26 +333,45 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const issuePickerRef = useRef<HTMLDivElement>(null);
   const prPickerRef = useRef<HTMLDivElement>(null);
 
-  // Reset state when dialog opens
+  // Tracks project switches mid-dialog; see the re-arm check below.
+  const prevProjectDirRef = useRef(projectDir);
+
+  // Reset state when the dialog opens, or restore the draft of a failed
+  // create when it was reopened from the pending row or the error toast.
   const prevOpenRef = useRef(false);
-  if (open && !prevOpenRef.current) {
-    const dir = storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
+  const hydratedDraftRef = useRef<NewWorkspaceDraft | null>(null);
+  if (
+    open &&
+    (!prevOpenRef.current ||
+      (newWorkspaceDraft !== null &&
+        newWorkspaceDraft !== hydratedDraftRef.current))
+  ) {
+    const draft = newWorkspaceDraft;
+    hydratedDraftRef.current = draft;
+    const dir =
+      draft?.projectDir ??
+      (storeProjectDir || activeWs?.project_root || activeWs?.cwd || "");
     if (projectDir !== dir) setProjectDir(dir);
-    setWorkspaceName("");
-    setBranchName("");
-    setPrompt("");
-    setSelectedAgentId(lastSelectedAgentId || "builtin-claude");
-    setBaseBranch("main");
-    // Re-allow auto-adoption of the detected default branch on each open.
-    userPickedBaseRef.current = false;
-    setAttachments([]);
-    setLinkedIssue(null);
+    prevProjectDirRef.current = dir;
+    setWorkspaceName(draft?.workspaceName ?? "");
+    setBranchName(draft?.branchName ?? "");
+    setPrompt(draft?.prompt ?? "");
+    setSelectedAgentId(
+      draft?.selectedAgentId ?? (lastSelectedAgentId || "builtin-claude"),
+    );
+    if (draft) setModelSelection(draft.modelSelection);
+    setBaseBranch(draft?.baseBranch ?? "main");
+    // Re-allow auto-adoption of the detected default branch on each open,
+    // but keep a restored draft's base exactly as the user left it.
+    userPickedBaseRef.current = draft !== null;
+    setAttachments(draft?.attachments ?? []);
+    setLinkedIssue(draft?.linkedIssue ?? null);
     setIssuePickerOpen(false);
     setPrPickerOpen(false);
-    setBranchAutoFilled(false);
-    setBranchMode("create_new");
-    setOpenExistingBranch(null);
-    setHostId(null);
+    setBranchAutoFilled(draft?.branchAutoFilled ?? false);
+    setBranchMode(draft?.branchMode ?? "create_new");
+    setOpenExistingBranch(draft?.openExistingBranch ?? null);
+    setHostId(draft?.hostId ?? null);
   }
   prevOpenRef.current = open;
 
@@ -297,7 +397,6 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   // project's default branch wins over a stale pick from the previous
   // project. Tracked separately from the open-reset above because
   // projectDir can change without the dialog closing/reopening.
-  const prevProjectDirRef = useRef(projectDir);
   if (prevProjectDirRef.current !== projectDir) {
     userPickedBaseRef.current = false;
     prevProjectDirRef.current = projectDir;
@@ -313,19 +412,20 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setRemoteBranches([]);
     setDetailedBranches([]);
     setBranchesLoading(true);
+    setBranchesSyncing(false);
     setPrBranches(new Set());
+    setProviderUsable(false);
 
     checkIsGitRepo(projectDir).then((isRepo) => {
       if (cancelled) return;
       setIsGitRepo(isRepo);
       if (!isRepo) { setBranchesLoading(false); return; }
 
-      // Fetch remote refs first so branch list and commits are current.
-      // Fail gracefully — stale local refs are still usable.
-      const fetchDone = gitFetchPrune(projectDir).catch(() => {});
-
-      fetchDone.then(() => {
-        if (cancelled) return;
+      // Only the newest listing may write state, so a slow first listing
+      // can't overwrite the refreshed one that follows the fetch.
+      let listingSeq = 0;
+      const loadBranches = () => {
+        const seq = ++listingSeq;
         return Promise.all([
           listBranches(projectDir, false).catch(() => []),
           listBranches(projectDir, true).catch(() => []),
@@ -337,7 +437,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             behind: 0,
           })),
         ]).then(([local, remote, detailed, wt, info]) => {
-          if (cancelled) return;
+          if (cancelled || seq !== listingSeq) return;
           setLocalBranches(local);
           setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
           setDetailedBranches(detailed);
@@ -345,7 +445,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           setWorktrees(wt);
           setCurrentBranch(info.branch);
         });
-      });
+      };
+
+      // Local refs list instantly. The network fetch runs alongside and
+      // re-lists only when it succeeds, so offline or a slow VPN never
+      // holds the picker on a spinner.
+      void loadBranches();
+      setBranchesSyncing(true);
+      gitFetchPrune(projectDir)
+        .then(
+          () => (cancelled ? undefined : loadBranches()),
+          () => undefined,
+        )
+        .finally(() => {
+          if (!cancelled) setBranchesSyncing(false);
+        });
 
       // Fetch open change requests for branch badges and "+" menu
       // (non-blocking). The gate is the *detected* product's CLI, not
@@ -713,8 +827,44 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setBranchName("");
   }, []);
 
-  const handleSubmit = useCallback(async () => {
-    if (!projectDir) return;
+  // A branch that should attach to the repo root rather than get its own
+  // worktree: the repo's default (as the picker labels it) or whatever the
+  // root has checked out, since git refuses a second checkout of either.
+  const attachesToRoot = (branch: string) =>
+    branch === currentBranch ||
+    (detectedDefaultBranch
+      ? branch === detectedDefaultBranch
+      : branch === "main" || branch === "master");
+
+  // Non-git folders run in the folder itself, so there is no branch to name.
+  const branchError =
+    branchMode === "create_new" && isGitRepo !== false
+      ? branchNameError(branchName)
+      : null;
+  const canSubmit = !!projectDir && !branchError;
+
+  const snapshotDraft = (): NewWorkspaceDraft => ({
+    projectDir,
+    workspaceName,
+    branchName,
+    branchAutoFilled,
+    prompt,
+    attachments,
+    linkedIssue,
+    selectedAgentId,
+    modelSelection,
+    baseBranch,
+    branchMode,
+    openExistingBranch,
+    hostId,
+  });
+  const closeDialog = () => onOpenChange(false);
+
+  const handleSubmit = async () => {
+    if (!projectDir || branchError) return;
+
+    // Snapshot before any await so Reopen restores exactly what was typed.
+    const draft = snapshotDraft();
 
     // Build user prompt with attachments
     let userPrompt = attachments.length > 0
@@ -777,22 +927,24 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       setLastModelSelection(launchFamily, modelSelection);
     }
 
-    // Close dialog immediately (optimistic)
-    onOpenChange(false);
+    // The git probe may still be in flight on a quick submit; a non-git
+    // folder must not fall through to the worktree path.
+    const gitRepo =
+      isGitRepo ?? (await checkIsGitRepo(projectDir).catch(() => true));
 
-    // Generate a temporary ID for the pending workspace
-    const tempId = randomUUID();
     const displayName =
       workspaceName || prompt.slice(0, 40) || openExistingBranch || branchName || "New workspace";
 
-    addPendingWorkspace({
-      id: tempId,
-      name: displayName,
-      projectPath: projectDir,
-      status: "creating",
-    });
+    // Where the workspace lands. Null means an existing workspace already
+    // owns the branch and has been focused instead.
+    type Placed = { wsId: string; agentHandled: boolean; adopted: boolean };
+    const placeWorkspace = async (): Promise<Placed | null> => {
+      // A plain folder: the workspace runs in it directly, no branch.
+      if (!gitRepo) {
+        const wsId = await createWorkspace(projectDir);
+        return { wsId, agentHandled: false, adopted: false };
+      }
 
-    try {
       // Open existing branch mode — skip branch generation
       if (branchMode === "open_existing" && openExistingBranch) {
         const existingWsId = branchWorkspaceMap.get(openExistingBranch);
@@ -803,13 +955,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               : `"${openExistingBranch}" already has a workspace — switched to it.`,
           );
           await activateWorkspaceInteraction(existingWsId);
-          removePendingWorkspace(tempId);
-          return;
+          return null;
         }
 
-        let wsId: string;
-        let agentHandled = false;
-        let adoptedExisting = false;
         // A real orphan is a worktree on disk whose branch we want, that isn't the
         // main repo itself and isn't already owned by an existing Codemux workspace.
         // Both filters are required: the first excludes the primary repo (which appears
@@ -823,78 +971,41 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             !existingWorktreePaths.has(wt.path),
         );
 
-        const isDefaultOpen = openExistingBranch === "main" || openExistingBranch === "master";
         if (orphan) {
-          wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "single");
-        } else if (isDefaultOpen) {
+          const wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "single");
+          return { wsId, agentHandled: false, adopted: false };
+        }
+        if (attachesToRoot(openExistingBranch)) {
           // Open on the default branch always attaches to the real repo root.
           // The sidebar label will reflect actual HEAD via the live refresh loop,
           // so the user sees reality. No phantom worktree is created.
-          wsId = await createWorkspace(projectDir);
-        } else {
-          const created = await createWorktreeWorkspaceResult(
-            projectDir,
-            openExistingBranch,
-            false,
-            "single",
-            null,
-            fullPrompt || null,
-            selectedAgentId,
-            null,
-            launchSelection,
-          );
-          wsId = created.workspaceId;
-          agentHandled = true;
-          // The backend adopted an existing live workspace for this worktree
-          // instead of creating one — the prompt/preset were deliberately
-          // dropped (injecting into an in-flight session is worse). Silence
-          // here would read as "nothing happened" and quietly lose the
-          // typed message, so say so.
-          if (created.adopted) {
-            adoptedExisting = true;
-            toast.info(
-              fullPrompt
-                ? `"${openExistingBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
-                : `"${openExistingBranch}" already has a live workspace — switched to it.`,
-            );
-          }
+          const wsId = await createWorkspace(projectDir);
+          return { wsId, agentHandled: false, adopted: false };
         }
-
-        if (!adoptedExisting) {
-          await applyTypedWorkspaceName(wsId, workspaceName);
-        }
-
-        // Launch agent for paths that don't handle it internally
-        if (!agentHandled && selectedAgentId && fullPrompt) {
-          await applyPreset(
-          wsId,
+        const created = await createWorktreeWorkspaceResult(
+          projectDir,
+          openExistingBranch,
+          false,
+          "single",
+          null,
+          fullPrompt || null,
           selectedAgentId,
-          "current_terminal",
-          fullPrompt,
+          null,
           launchSelection,
         );
+        // The backend adopted an existing live workspace for this worktree
+        // instead of creating one — the prompt/preset were deliberately
+        // dropped (injecting into an in-flight session is worse). Silence
+        // here would read as "nothing happened" and quietly lose the
+        // typed message, so say so.
+        if (created.adopted) {
+          toast.info(
+            fullPrompt
+              ? `"${openExistingBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
+              : `"${openExistingBranch}" already has a live workspace — switched to it.`,
+          );
         }
-
-        const pName = basename(projectDir);
-        dbAddRecentProject(projectDir, pName).catch(console.error);
-        if (linkedIssue) {
-          try {
-            await linkWorkspaceIssue(wsId, linkedIssue.number);
-          } catch (linkErr) {
-            console.error("Failed to link issue:", linkErr);
-            toast.warning("Workspace created but issue linking failed. You can re-link from the workspace.");
-          }
-        }
-        if (hostId !== null) {
-          try {
-            await setWorkspaceHost(wsId, hostId);
-          } catch (hostErr) {
-            console.error("Failed to set workspace host:", hostErr);
-          }
-        }
-        removePendingWorkspace(tempId);
-        await activateWorkspace(wsId);
-        return;
+        return { wsId: created.workspaceId, agentHandled: true, adopted: created.adopted };
       }
 
       // Determine branch name
@@ -929,71 +1040,69 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             : `"${resolvedBranch}" already has a workspace — switched to it.`,
         );
         await activateWorkspaceInteraction(existingWsId);
-        removePendingWorkspace(tempId);
-        return;
+        return null;
       }
 
-      let wsId: string;
-      let agentHandled = false;
-      let adoptedExisting = false;
+      // Existing default (or checked-out) branch: attach to the real repo
+      // root. The sidebar branch label reflects actual HEAD via the live
+      // refresh loop, so the user sees reality instead of a phantom
+      // worktree at ~/.codemux/worktrees/<project>/<branch>. Feature
+      // branches always get a proper worktree.
+      if (!isNewBranch && attachesToRoot(resolvedBranch)) {
+        const wsId = await createWorkspace(projectDir);
+        return { wsId, agentHandled: false, adopted: false };
+      }
 
-      // Existing default branch (main/master): always attach to the real repo
-      // root regardless of what the main repo currently has checked out. The
-      // sidebar branch label reflects actual HEAD via the live refresh loop,
-      // so the user sees reality instead of a phantom worktree at
-      // ~/.codemux/worktrees/<project>/main. Feature branches always get a
-      // proper worktree.
-      const isDefault = resolvedBranch === "main" || resolvedBranch === "master";
-      if (isDefault && !isNewBranch) {
-        wsId = await createWorkspace(projectDir);
-      } else {
-        // Same orphan filter as the open-existing flow above: skip the main
-        // repo entry (which `git worktree list` includes) and any worktree
-        // already owned by another workspace.
-        const orphan = worktrees.find(
-          (wt) =>
-            (wt.branch === resolvedBranch ||
-              wt.branch === `refs/heads/${resolvedBranch}`) &&
-            wt.path !== projectDir &&
-            !existingWorktreePaths.has(wt.path),
+      // Same orphan filter as the open-existing flow above: skip the main
+      // repo entry (which `git worktree list` includes) and any worktree
+      // already owned by another workspace.
+      const orphan = worktrees.find(
+        (wt) =>
+          (wt.branch === resolvedBranch ||
+            wt.branch === `refs/heads/${resolvedBranch}`) &&
+          wt.path !== projectDir &&
+          !existingWorktreePaths.has(wt.path),
+      );
+      if (orphan) {
+        const wsId = await importWorktreeWorkspace(
+          orphan.path,
+          resolvedBranch,
+          "single",
         );
-
-        if (orphan) {
-          wsId = await importWorktreeWorkspace(
-            orphan.path,
-            resolvedBranch,
-            "single",
-          );
-        } else {
-          const created = await createWorktreeWorkspaceResult(
-            projectDir,
-            resolvedBranch,
-            isNewBranch,
-            "single",
-            isNewBranch ? baseBranch || null : null,
-            fullPrompt || null,
-            selectedAgentId,
-            null,
-            launchSelection,
-          );
-          wsId = created.workspaceId;
-          agentHandled = true;
-          // Adopt path: an existing live workspace claims this worktree, so
-          // the backend focused it and dropped the prompt/preset instead of
-          // typing into its in-flight session. Surface that — otherwise the
-          // user's prompt disappears silently.
-          if (created.adopted) {
-            adoptedExisting = true;
-            toast.info(
-              fullPrompt
-                ? `"${resolvedBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
-                : `"${resolvedBranch}" already has a live workspace — switched to it.`,
-            );
-          }
-        }
+        return { wsId, agentHandled: false, adopted: false };
       }
 
-      if (!adoptedExisting) {
+      const created = await createWorktreeWorkspaceResult(
+        projectDir,
+        resolvedBranch,
+        isNewBranch,
+        "single",
+        isNewBranch ? baseBranch || null : null,
+        fullPrompt || null,
+        selectedAgentId,
+        null,
+        launchSelection,
+      );
+      // Adopt path: an existing live workspace claims this worktree, so
+      // the backend focused it and dropped the prompt/preset instead of
+      // typing into its in-flight session. Surface that — otherwise the
+      // user's prompt disappears silently.
+      if (created.adopted) {
+        toast.info(
+          fullPrompt
+            ? `"${resolvedBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
+            : `"${resolvedBranch}" already has a live workspace — switched to it.`,
+        );
+      }
+      return { wsId: created.workspaceId, agentHandled: true, adopted: created.adopted };
+    };
+
+    await runCreate(closeDialog, displayName, draft, async () => {
+      const placed = await placeWorkspace();
+      if (!placed) return null;
+      const { wsId, agentHandled, adopted } = placed;
+
+      if (!adopted) {
         await applyTypedWorkspaceName(wsId, workspaceName);
       }
 
@@ -1009,9 +1118,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       }
 
       // Track as recent project
-      const pName =
-        basename(projectDir);
-      dbAddRecentProject(projectDir, pName).catch(console.error);
+      dbAddRecentProject(projectDir, basename(projectDir)).catch(console.error);
 
       // Link issue to the new workspace
       if (linkedIssue) {
@@ -1035,42 +1142,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
       }
 
-      removePendingWorkspace(tempId);
-      await activateWorkspace(wsId);
-    } catch (err) {
-      toast.error(String(err));
-      failPendingWorkspace(tempId, String(err));
-      // Auto-remove failed entry after 5 seconds
-      setTimeout(() => removePendingWorkspace(tempId), 5000);
-    }
-  }, [
-    projectDir,
-    workspaceName,
-    branchName,
-    prompt,
-    attachments,
-    selectedAgentId,
-    launchFamily,
-    modelSelection,
-    effectiveReasoning,
-    effectiveContext,
-    claudeCaps,
-    setLastModelSelection,
-    baseBranch,
-    allBranches,
-    branchMode,
-    openExistingBranch,
-    hostId,
-    branchWorkspaceMap,
-    worktrees,
-    existingWorktreePaths,
-    currentBranch,
-    linkedIssue,
-    onOpenChange,
-    addPendingWorkspace,
-    removePendingWorkspace,
-    failPendingWorkspace,
-  ]);
+      return wsId;
+    });
+  };
 
   // Close issue picker on click outside it (within the dialog)
   useEffect(() => {
@@ -1120,27 +1194,51 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         </DialogHeader>
 
         <div className="mobile-workspace-dialog-heading"><strong>New workspace</strong><button type="button" onClick={() => onOpenChange(false)}>Cancel</button></div>
-        {/* Top row: workspace name + branch name — nearly invisible inline labels */}
-        <div className="flex gap-3 px-4 pt-3 pb-0.5">
+        {/* Top row: workspace name + branch name as quiet inline fields.
+            A non-git folder has no branch, so that field is omitted. */}
+        <div className="flex items-center gap-3 px-4 pt-3 pb-0.5">
           <Input
             value={workspaceName}
             onChange={(e) => setWorkspaceName(e.target.value)}
             placeholder="Workspace name (optional)"
-            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
+            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/60"
           />
-          {branchMode === "create_new" ? (
-            <Input
-              value={branchName}
-              onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
-              placeholder="branch name"
-              className="h-6 text-label w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
-            />
+          {isGitRepo === false ? null : branchMode === "create_new" ? (
+            <label
+              className="flex h-6 min-w-0 shrink-0 items-center gap-1 text-muted-foreground"
+              title={branchName || undefined}
+            >
+              <GitBranch className="size-3 shrink-0 opacity-60" />
+              <Input
+                value={branchName}
+                onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
+                placeholder="branch name"
+                aria-label="Branch name"
+                aria-invalid={branchError ? true : undefined}
+                aria-describedby={branchError ? "new-workspace-branch-error" : undefined}
+                // Monospace, so `ch` sizes the field to its content and an
+                // issue-derived name shows in full up to the cap.
+                style={{ width: `${Math.max(branchName.length, 11) + 1}ch` }}
+                className="h-6 max-w-[260px] text-label border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 aria-invalid:ring-0 aria-invalid:text-destructive font-mono text-muted-foreground placeholder:text-muted-foreground/60"
+              />
+            </label>
           ) : (
-            <span className="h-6 text-label text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
+            <span
+              className="h-6 text-label text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[260px]"
+              title={openExistingBranch ?? undefined}
+            >
               on {openExistingBranch}
             </span>
           )}
         </div>
+        {branchError && (
+          <p
+            id="new-workspace-branch-error"
+            className="px-4 text-right text-caption text-destructive"
+          >
+            {branchError}
+          </p>
+        )}
 
         {/* Center: prompt textarea with embedded controls */}
         <div className="relative px-3 pt-2 pb-3">
@@ -1391,9 +1489,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label="Create"
-                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+                      className={cn(
+                        "inline-flex size-8 items-center justify-center rounded-full border transition-colors duration-100 disabled:pointer-events-none disabled:opacity-50",
+                        canSubmit
+                          ? "border-transparent bg-foreground text-background hover:bg-foreground/90"
+                          : "border-border bg-muted text-muted-foreground",
+                      )}
                       onClick={handleSubmit}
-                      disabled={!projectDir}
+                      disabled={!canSubmit}
                     >
                       <ArrowUp className="size-4" />
                     </button>
@@ -1456,8 +1559,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             onChange={(path) => setProjectDir(path)}
           />
 
-          {/* Base branch picker */}
-          {isGitRepo !== false && (
+          {/* Base branch picker. A plain folder has no branches, so say
+              why the pill is missing and where the workspace will run. */}
+          {isGitRepo === false ? (
+            <span
+              className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground"
+              title="This folder isn't a git repository, so no branch or worktree is created. The agent works in the folder directly."
+            >
+              <FolderOpen className="size-3 shrink-0" />
+              <span className="truncate">Not a git repo · runs in the folder</span>
+            </span>
+          ) : (
             <BranchPicker
               baseBranch={openExistingBranch || baseBranch}
               branches={detailedBranches}
@@ -1467,6 +1579,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               currentBranch={currentBranch}
               defaultBranchName={detectedDefaultBranch}
               loading={branchesLoading}
+              syncing={branchesSyncing}
               onSelectBase={(branch) => {
                 userPickedBaseRef.current = true;
                 setBaseBranch(branch);
@@ -1474,36 +1587,43 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 setOpenExistingBranch(null);
               }}
               onOpenWorkspace={(wsId) => {
-                onOpenChange(false);
-                activateWorkspaceInteraction(wsId).catch(console.error);
+                closeDialog();
+                activateWorkspaceInteraction(wsId).catch((err) => {
+                  toast.error(`Couldn't open workspace: ${errorText(err)}`);
+                });
               }}
               onImportWorktree={(path, branch) => {
-                onOpenChange(false);
-                importWorktreeWorkspace(path, branch, "single")
-                  .then((wsId) => activateWorkspace(wsId))
-                  .catch(console.error);
+                void runCreate(closeDialog, branch, snapshotDraft(), () =>
+                  importWorktreeWorkspace(path, branch, "single"),
+                );
               }}
               onCreateOnCurrent={() => {
-                onOpenChange(false);
-                createWorkspace(projectDir)
-                  .then(async (wsId) => {
+                void runCreate(
+                  closeDialog,
+                  workspaceName || currentBranch || basename(projectDir),
+                  snapshotDraft(),
+                  async () => {
+                    const wsId = await createWorkspace(projectDir);
                     // Same contract as the main create paths: honour a
                     // typed name before the workspace becomes visible.
                     // Nothing else ever names this one — it cuts no
                     // branch — so without this it keeps the backend
                     // default (the directory's name) forever.
                     await applyTypedWorkspaceName(wsId, workspaceName);
-                    await activateWorkspace(wsId);
-                  })
-                  .catch(console.error);
+                    return wsId;
+                  },
+                );
               }}
               onOpenExisting={handleOpenExisting}
               isOpenMode={branchMode === "open_existing"}
             />
           )}
 
-          <span className="ml-auto text-caption text-muted-foreground/40 select-none">
-            Ctrl+Enter to create
+          <span className="ml-auto flex shrink-0 items-center gap-1 text-caption text-muted-foreground select-none">
+            <kbd className="rounded-sm bg-surface-2 px-1 font-mono text-micro text-foreground/80">
+              Ctrl+Enter
+            </kbd>{" "}
+            to create
           </span>
         </div>
 

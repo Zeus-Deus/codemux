@@ -21,6 +21,7 @@ import {
   ChevronDown,
   CornerDownRight,
   Loader2,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BranchDetail, WorktreeInfo } from "@/tauri/types";
@@ -51,6 +52,8 @@ interface BranchPickerProps {
   baseBranch: string;
   branches: BranchDetail[];
   loading: boolean;
+  /** Local refs are listed; a background `git fetch` may still add rows. */
+  syncing?: boolean;
   onSelectBase: (branch: string) => void;
   /** When workspace-aware callbacks are omitted, the picker runs in base-only selection mode */
   worktrees?: WorktreeInfo[];
@@ -77,6 +80,7 @@ export function BranchPicker({
   baseBranch,
   branches,
   loading,
+  syncing = false,
   onSelectBase,
   worktrees = [],
   branchWorkspaceMap = EMPTY_BRANCH_MAP,
@@ -213,6 +217,7 @@ export function BranchPicker({
         <button
           type="button"
           className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
+          title={baseBranch}
         >
           {isOpenMode ? <CornerDownRight className="size-3" /> : <GitBranch className="size-3" />}
           <span className="max-w-[120px] truncate">{baseBranch}</span>
@@ -269,6 +274,15 @@ export function BranchPicker({
               Worktrees{" "}
               <span className="text-caption opacity-60 tabular-nums">{worktreeCount}</span>
             </button>
+            {syncing && !loading && (
+              <span
+                className="flex shrink-0 items-center gap-1 px-1.5 text-caption text-muted-foreground"
+                title="Fetching from origin. New remote branches appear when it finishes."
+              >
+                <RefreshCw className="size-3 motion-safe:animate-spin" />
+                Syncing
+              </span>
+            )}
           </div>}
 
           <CommandList
@@ -384,9 +398,11 @@ export function BranchPicker({
                             </Badge>
                           )}
 
-                          {/* Timestamp — visible at rest, hidden on hover to make room for actions */}
+                          {/* Timestamp — visible at rest, swapped for the
+                              actions on hover and on the keyboard-selected
+                              row, so arrowing shows what Enter will do. */}
                           {!alwaysShowActions && (
-                            <span className="text-label text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden">
+                            <span className="text-label text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden group-data-[selected=true]/row:hidden">
                               {formatRelativeTime(branch.last_commit_unix)}
                             </span>
                           )}
@@ -394,7 +410,9 @@ export function BranchPicker({
                           {/* Action buttons */}
                           <span className={cn(
                             "items-center gap-1 shrink-0",
-                            alwaysShowActions ? "flex" : "hidden group-hover/row:flex",
+                            alwaysShowActions
+                              ? "flex"
+                              : "hidden group-hover/row:flex group-data-[selected=true]/row:flex",
                           )}>
                             <button
                               type="button"

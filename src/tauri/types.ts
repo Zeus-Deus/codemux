@@ -613,12 +613,34 @@ export interface WorktreeInfo {
   is_bare: boolean;
 }
 
+/** Everything the user typed into the New Workspace dialog. Kept on the
+ *  pending row so a failed create can reopen the dialog with the prompt,
+ *  attachments and linked issue intact instead of losing them. */
+export interface NewWorkspaceDraft {
+  projectDir: string;
+  workspaceName: string;
+  branchName: string;
+  branchAutoFilled: boolean;
+  prompt: string;
+  attachments: string[];
+  linkedIssue: GitHubIssue | null;
+  selectedAgentId: string | null;
+  modelSelection: ModelSelection;
+  baseBranch: string;
+  branchMode: "create_new" | "open_existing";
+  openExistingBranch: string | null;
+  hostId: number | null;
+}
+
 export interface PendingWorkspace {
   id: string;
   name: string;
   projectPath: string;
   status: "creating" | "failed";
   errorMessage?: string;
+  /** Present when the row came from the New Workspace dialog. A failed
+   *  row with a draft stays until the user reopens or dismisses it. */
+  draft?: NewWorkspaceDraft;
 }
 
 export interface PullRequestInfo {
