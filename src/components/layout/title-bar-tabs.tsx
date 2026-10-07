@@ -115,6 +115,29 @@ function useOverflowEdges(scroller: HTMLElement | null, contentKey: string) {
   return edges;
 }
 
+/** Re-reveals the active pill whenever the strip changes width. Activation
+ *  alone is not enough: a panel or sidebar growing, or the window shrinking,
+ *  narrows the strip after the fact and can push the selected tab out. */
+function useKeepActiveTabInView(
+  scroller: HTMLElement | null,
+  activeTabId: string | null,
+) {
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  useEffect(() => {
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      const id = activeTabIdRef.current;
+      if (!id) return;
+      Array.from(scroller.querySelectorAll<HTMLElement>("[data-tab-id]"))
+        .find((el) => el.dataset.tabId === id)
+        ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [scroller]);
+}
+
 function edgeFadeMask(start: boolean, end: boolean): string | undefined {
   if (!start && !end) return undefined;
   const from = start ? `transparent, black ${EDGE_FADE_PX}px` : "black";
@@ -187,11 +210,14 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   // past it is the only hint that more tabs exist.
   const edges = useOverflowEdges(scroller, tabIds.join("\n"));
   const mask = edgeFadeMask(edges.start, edges.end);
+  useKeepActiveTabInView(scroller, workspace.active_tab_id);
 
   return (
     <div
       ref={setScrollerNode}
-      className="no-scrollbar relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
+      // `scroll-px-4` matches EDGE_FADE_PX so a pill scrolled into view
+      // stops clear of the fade instead of losing its close button to it.
+      className="no-scrollbar relative flex min-w-0 scroll-px-4 items-center gap-[2px] overflow-x-auto"
       data-testid="titlebar-tabs-scroll"
       data-overflow-start={edges.start ? "" : undefined}
       data-overflow-end={edges.end ? "" : undefined}

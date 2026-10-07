@@ -450,4 +450,45 @@ describe("TitleBarTabs overflow", () => {
     expect(scrolled).toHaveLength(1);
     expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-c");
   });
+
+  // A panel or sidebar growing narrows the strip after activation, which
+  // used to leave the selected pill clipped or pushed out of view.
+  it("re-reveals the active tab when the strip changes width", () => {
+    const scrolled: Element[] = [];
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      value(this: Element) {
+        scrolled.push(this);
+      },
+      configurable: true,
+    });
+    const callbacks: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      const ws = makeThreeTabWorkspace();
+      const view = render(<TitleBarTabs workspace={ws} />);
+      view.rerender(<TitleBarTabs workspace={{ ...ws, active_tab_id: "tab-b" }} />);
+      scrolled.length = 0;
+
+      act(() => {
+        for (const cb of callbacks) cb([], {} as ResizeObserver);
+      });
+      expect(scrolled).toHaveLength(1);
+      expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-b");
+    } finally {
+      globalThis.ResizeObserver = Original;
+    }
+  });
+
+  it("keeps a revealed tab clear of the edge fade", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    expect(screen.getByTestId("titlebar-tabs-scroll")).toHaveClass("scroll-px-4");
+  });
 });
