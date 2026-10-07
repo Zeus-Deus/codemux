@@ -66,6 +66,10 @@ fn main_window_focused<R: Runtime>(app: &AppHandle<R>) -> bool {
 /// Tell the user about an agent in `target`, unless its workspace is muted or
 /// they are already looking at it. The native popup and the sound follow the
 /// synced notification settings; clicking the popup opens the agent's pane.
+///
+/// Must stay callable from async context: chat agents reach this from their
+/// event bridge, a tokio task, so nothing here may block on a runtime (see
+/// [`show_desktop_notification`]).
 pub fn notify_agent<R: Runtime>(
     app: &AppHandle<R>,
     notice: AgentNotice,
@@ -120,7 +124,24 @@ fn agent_payload(notice: AgentNotice, target: &NotificationTarget) -> Notificati
     }
 }
 
+/// Raise the native popup on a dedicated OS thread. On Linux notify-rust's
+/// `show()` drives D-Bus through `zbus::block_on`, which with zbus's `tokio`
+/// feature enabled (pulled in by the dialog plugin's xdg portal) enters a
+/// tokio runtime's `block_on` and panics with "Cannot start a runtime from
+/// within a runtime" when called from a tokio worker. Chat agents notify from
+/// their async event bridge, so a panic there would kill the bridge and stop
+/// every later event from that provider. A plain thread also keeps
+/// `wait_for_action` from blocking the caller.
 fn show_desktop_notification<R: Runtime>(app: &AppHandle<R>, payload: &NotificationPayload) {
+    let app = app.clone();
+    let payload = payload.clone();
+    std::thread::spawn(move || show_desktop_notification_blocking(&app, &payload));
+}
+
+fn show_desktop_notification_blocking<R: Runtime>(
+    app: &AppHandle<R>,
+    payload: &NotificationPayload,
+) {
     let mut notification = notify_rust::Notification::new();
     notification.summary(&payload.title).body(&payload.body);
 
@@ -152,25 +173,22 @@ fn show_desktop_notification<R: Runtime>(app: &AppHandle<R>, payload: &Notificat
 
     // On Linux, wait for the user to click the notification (the libnotify
     // "default" action mako fires on left-click), then focus the app and
-    // open the agent's pane. On other platforms `wait_for_action` is a no-op
-    // or unavailable, so the notify-rust click handler is the only path; we
-    // still spawn a thread so the caller doesn't block.
+    // open the agent's pane. This already runs on its own thread, so the wait
+    // does not block the caller. On other platforms `wait_for_action` is a
+    // no-op or unavailable, so the notify-rust click handler is the only path.
     #[cfg(target_os = "linux")]
-    {
-        let app_clone = app.clone();
-        let target = NotificationActivatePayload {
-            workspace_id: payload.workspace_id.clone(),
-            pane_id: payload.pane_id.clone(),
-        };
-        std::thread::spawn(move || {
-            handle.wait_for_action(|action| {
-                if action == "default" {
-                    focus_app(&app_clone);
-                    let _ = app_clone.emit(NOTIFICATION_ACTIVATE_EVENT, target);
-                }
-            });
-        });
-    }
+    handle.wait_for_action(|action| {
+        if action == "default" {
+            focus_app(app);
+            let _ = app.emit(
+                NOTIFICATION_ACTIVATE_EVENT,
+                NotificationActivatePayload {
+                    workspace_id: payload.workspace_id.clone(),
+                    pane_id: payload.pane_id.clone(),
+                },
+            );
+        }
+    });
 
     #[cfg(not(target_os = "linux"))]
     {

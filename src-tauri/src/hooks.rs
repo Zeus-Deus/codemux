@@ -171,7 +171,9 @@ fn handle_lifecycle_event<R: Runtime>(app: &AppHandle<R>, session_id: &str, stat
     // already see the pane, or when the workspace is muted (right-click → Mute
     // notifications) — useful when a pane runs a process that spawns agent
     // subprocesses of its own, whose lifecycle hooks would otherwise pop
-    // notifications for this pane.
+    // notifications for this pane. Terminal agents notify only on Review:
+    // PreToolUse also maps to Permission, so notifying there would fire on
+    // every tool call. Chat agents report approvals precisely and notify then.
     if status == PaneStatus::Review {
         if let Some(target) = state.notification_target_for_session(session_id) {
             crate::notifications::notify_agent(

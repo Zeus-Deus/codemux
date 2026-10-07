@@ -2296,7 +2296,7 @@ export function SettingsView() {
             <div className="space-y-1">
               <SettingRow
                 label="Notification sounds"
-                description="Play a sound when an agent finishes or needs attention."
+                description="Play a sound when an agent finishes, or when a chat agent needs your approval or an answer."
               >
                 <Switch
                   aria-label="Notification sounds"
@@ -2309,7 +2309,7 @@ export function SettingsView() {
               <Separator />
               <SettingRow
                 label="Desktop notifications"
-                description="Show a system notification when an agent finishes or needs your input. Click it to open the agent."
+                description="Show a system notification when an agent finishes, or when a chat agent needs your approval or an answer. Click it to open the agent."
               >
                 <Switch
                   aria-label="Desktop notifications"
