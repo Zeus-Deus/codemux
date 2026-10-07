@@ -2,6 +2,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { toast } from "sonner";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const scheme = vi.hoisted(() => ({ current: "light" as "light" | "dark" }));
 vi.mock("@/hooks/use-app-theme", () => ({
@@ -40,5 +42,26 @@ describe("Toaster", () => {
   it("follows a dark theme", async () => {
     scheme.current = "dark";
     expect(await renderedTheme()).toBe("dark");
+  });
+});
+
+describe("undo bar CSS", () => {
+  // The drain rule uses the `animation` shorthand, which resets
+  // animation-play-state to running. The pause rule only wins on hover if
+  // it carries every qualifier of the drain rule and more.
+  it("pauses with a selector that out-ranks the drain rule", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/globals.css"), "utf8").replace(
+      /\/\*[\s\S]*?\*\//g,
+      "",
+    );
+    const selectorBefore = (declaration: string) =>
+      css.match(new RegExp(`([^{}]+)\\{[^{}]*${declaration}`))?.[1].trim() ?? "";
+    const tokens = (selector: string) => selector.match(/\[[^\]]+\]|\.[\w-]+/g) ?? [];
+    const drain = tokens(selectorBefore("animation: cm-toast-undo-drain"));
+    const pause = tokens(selectorBefore("animation-play-state: paused"));
+    expect(drain.length).toBeGreaterThan(0);
+    expect(pause).toEqual(expect.arrayContaining(drain));
+    expect(pause).toContain('[data-expanded="true"]');
+    expect(pause.length).toBeGreaterThan(drain.length);
   });
 });

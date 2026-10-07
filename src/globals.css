@@ -593,7 +593,9 @@ body.pane-resizing iframe {
     background-size: 0% 2px;
     animation: cm-toast-undo-drain var(--toast-undo-duration, 10s) linear;
   }
-  [data-sonner-toaster] .cn-toast-undo[data-sonner-toast][data-expanded="true"]:not([data-swipe-out="true"]) {
+  /* Same selector as the drain rule plus [data-expanded]: the `animation`
+   * shorthand above resets play-state to running, so this must out-rank it. */
+  [data-sonner-toaster] .cn-toast-undo[data-sonner-toast][data-styled="true"][data-type="success"][data-expanded="true"]:not([data-swipe-out="true"]) {
     animation-play-state: paused;
   }
 }
