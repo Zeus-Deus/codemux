@@ -564,6 +564,44 @@ body.pane-resizing iframe {
     }
 }
 
+/* Toasts. Sonner injects its stylesheet unlayered at runtime and hard-codes
+ * greys for the description and close button per light/dark, so these sit
+ * outside any layer and out-rank its selectors to keep toasts on the theme's
+ * own tokens. */
+[data-sonner-toaster] [data-sonner-toast][data-styled="true"] [data-description] {
+  color: var(--muted-foreground);
+}
+[data-sonner-toaster] .cn-toast[data-sonner-toast][data-styled="true"] [data-close-button] {
+  background: var(--popover);
+  border-color: var(--border);
+  color: var(--muted-foreground);
+}
+[data-sonner-toaster] .cn-toast[data-sonner-toast][data-styled="true"]:hover [data-close-button]:hover {
+  background: var(--accent);
+  border-color: var(--border);
+  color: var(--popover-foreground);
+}
+/* Undo window: an ember bar along the bottom edge drains over the toast's
+ * lifetime and pauses while the stack is hovered, as Sonner's timer does.
+ * A background layer rather than a pseudo-element: Sonner owns both. The
+ * swipe-out guard leaves Sonner's own dismiss animation alone. */
+@media (prefers-reduced-motion: no-preference) {
+  [data-sonner-toaster] .cn-toast-undo[data-sonner-toast][data-styled="true"][data-type="success"]:not([data-swipe-out="true"]) {
+    background-image: linear-gradient(var(--accent-ember), var(--accent-ember));
+    background-repeat: no-repeat;
+    background-position: left bottom;
+    background-size: 0% 2px;
+    animation: cm-toast-undo-drain var(--toast-undo-duration, 10s) linear;
+  }
+  [data-sonner-toaster] .cn-toast-undo[data-sonner-toast][data-expanded="true"]:not([data-swipe-out="true"]) {
+    animation-play-state: paused;
+  }
+}
+@keyframes cm-toast-undo-drain {
+  from { background-size: 100% 2px; }
+  to { background-size: 0% 2px; }
+}
+
 /* Typography settings use named surfaces rather than trying to globally
  * rewrite every compact UI label. This keeps chrome rhythm stable while
  * conversation and developer text remain independently readable. */

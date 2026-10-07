@@ -1,10 +1,14 @@
 import { Toaster as Sonner, type ToasterProps } from "sonner"
+import { useAppTheme } from "@/hooks/use-app-theme"
 import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
 
 const Toaster = ({ ...props }: ToasterProps) => {
+  // Sonner's own stylesheet keys description, close and cancel colours off
+  // this, so it has to follow the active theme rather than assume dark.
+  const scheme = useAppTheme().theme.scheme
   return (
     <Sonner
-      theme="dark"
+      theme={scheme}
       className="toaster group"
       position="bottom-right"
       icons={{
@@ -29,6 +33,8 @@ const Toaster = ({ ...props }: ToasterProps) => {
           "--normal-bg": "var(--popover)",
           "--normal-text": "var(--popover-foreground)",
           "--normal-border": "var(--border)",
+          "--normal-bg-hover": "var(--accent)",
+          "--normal-border-hover": "var(--border)",
           "--border-radius": "var(--radius)",
         } as React.CSSProperties
       }
