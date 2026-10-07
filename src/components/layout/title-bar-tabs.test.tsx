@@ -401,3 +401,53 @@ describe("TitleBarTabs", () => {
     expect(mocks.activateTab).toHaveBeenCalledWith("ws-1", "tab-term");
   });
 });
+
+// Overflowing tabs used to vanish past the island's edge with nothing to
+// say they exist, and a tab activated by shortcut could stay clipped.
+describe("TitleBarTabs overflow", () => {
+  afterEach(() => {
+    cleanup();
+    delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+
+  it("fades whichever edge has tabs scrolled past it", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const scroller = screen.getByTestId("titlebar-tabs-scroll");
+    expect(scroller).not.toHaveAttribute("data-overflow-start");
+    expect(scroller).not.toHaveAttribute("data-overflow-end");
+
+    Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    Object.defineProperty(scroller, "scrollLeft", { value: 0, writable: true, configurable: true });
+    fireEvent.scroll(scroller);
+    expect(scroller).not.toHaveAttribute("data-overflow-start");
+    expect(scroller).toHaveAttribute("data-overflow-end");
+
+    scroller.scrollLeft = 200;
+    fireEvent.scroll(scroller);
+    expect(scroller).toHaveAttribute("data-overflow-start");
+    expect(scroller).toHaveAttribute("data-overflow-end");
+
+    scroller.scrollLeft = 400;
+    fireEvent.scroll(scroller);
+    expect(scroller).toHaveAttribute("data-overflow-start");
+    expect(scroller).not.toHaveAttribute("data-overflow-end");
+  });
+
+  it("scrolls a tab activated from outside the strip into view", () => {
+    const scrolled: Element[] = [];
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      value(this: Element) {
+        scrolled.push(this);
+      },
+      configurable: true,
+    });
+    const ws = makeThreeTabWorkspace();
+    const view = render(<TitleBarTabs workspace={ws} />);
+    scrolled.length = 0;
+
+    view.rerender(<TitleBarTabs workspace={{ ...ws, active_tab_id: "tab-c" }} />);
+    expect(scrolled).toHaveLength(1);
+    expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-c");
+  });
+});
