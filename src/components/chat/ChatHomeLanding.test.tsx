@@ -142,7 +142,9 @@ describe("ChatHomeLanding", () => {
       render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
       fireEvent.click(await screen.findByRole("button", { name: /parser/ }));
       await vi.waitFor(() =>
-        expect(toastErrorMock).toHaveBeenCalledWith("parser is no longer at /work/parser."),
+        expect(toastErrorMock).toHaveBeenCalledWith(
+          "Couldn't open parser at /work/parser: No such file or directory",
+        ),
       );
       expect(openProjectAtPathMock).not.toHaveBeenCalled();
       expect(onProjectOpened).not.toHaveBeenCalled();

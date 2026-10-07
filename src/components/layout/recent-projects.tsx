@@ -69,7 +69,7 @@ export function RecentProjectList({
   className?: string;
 }) {
   const [openingPath, setOpeningPath] = useState<string | null>(null);
-  // Rows whose folder turned out to be gone; hidden for this visit.
+  // Rows whose folder turned out to be gone or unreadable; hidden for this visit.
   const [missingPaths, setMissingPaths] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -84,8 +84,11 @@ export function RecentProjectList({
       // folder moved or deleted since would become a dead workspace.
       try {
         await listDirectory(project.path);
-      } catch {
-        toast.error(`${project.name} is no longer at ${project.path}.`);
+      } catch (err) {
+        // Gone, unreadable or no longer a folder: the reason tells them which.
+        toast.error(
+          `Couldn't open ${project.name} at ${project.path}: ${describeError(err)}`,
+        );
         setMissingPaths((prev) => new Set(prev).add(project.path));
         return;
       }
