@@ -83,6 +83,15 @@ const OPEN_DELAY_MS = 150;
  *  outright the moment another one opens (`registerOpenHoverCard`). */
 const CLOSE_DELAY_MS = 100;
 
+function rectContains(rect: DOMRect, point: { x: number; y: number }) {
+  return (
+    point.x >= rect.left &&
+    point.x <= rect.right &&
+    point.y >= rect.top &&
+    point.y <= rect.bottom
+  );
+}
+
 // `shortenPath`, `STATUS_LABEL`, and the status tone classes are shared with
 // the command palette — see `@/lib/shorten-path` and `@/lib/pane-status`.
 
@@ -140,11 +149,34 @@ export function WorkspaceHoverCard({
   // suppression; hold it from the menu opening until the pointer leaves the
   // row after the menu closes, so neither focus returning nor the pointer
   // being handed back to the row can pop the card over the dismissed menu.
+  // If the pointer is already off the row when the menu closes (an item far
+  // down a long menu), no leave will follow, so release it there instead or
+  // the next real hover onto the row would be swallowed.
+  // The trigger is `asChild`, typed as an anchor; a callback ref takes the
+  // row element as the plain HTMLElement it is.
+  const triggerRef = useRef<HTMLElement | null>(null);
+  const setTriggerNode = useCallback((node: HTMLElement | null) => {
+    triggerRef.current = node;
+  }, []);
+  const lastPointer = useRef<{ x: number; y: number } | null>(null);
   useEffect(() => {
     menuOpenRef.current = menuOpen;
-    if (!menuOpen) return;
+    if (!menuOpen) {
+      const point = lastPointer.current;
+      const rect = triggerRef.current?.getBoundingClientRect();
+      lastPointer.current = null;
+      if (point && rect && !rectContains(rect, point)) {
+        suppressUntilPointerLeave.current = false;
+      }
+      return;
+    }
     suppressUntilPointerLeave.current = true;
     setCardState((prev) => ({ ...prev, open: false }));
+    const track = (event: PointerEvent) => {
+      lastPointer.current = { x: event.clientX, y: event.clientY };
+    };
+    window.addEventListener("pointermove", track, { capture: true, passive: true });
+    return () => window.removeEventListener("pointermove", track, { capture: true });
   }, [menuOpen]);
 
   useEffect(() => {
@@ -163,10 +195,12 @@ export function WorkspaceHoverCard({
     >
       <HoverCardTrigger
         asChild
-        onPointerDownCapture={() => {
+        ref={setTriggerNode}
+        onPointerDownCapture={(event) => {
           // Selection must not leave a preview covering the newly opened chat.
           // Capture also catches nested row actions that stop propagation.
           suppressUntilPointerLeave.current = true;
+          lastPointer.current = { x: event.clientX, y: event.clientY };
           setCardState((prev) => ({ ...prev, open: false }));
         }}
         onPointerLeave={() => {

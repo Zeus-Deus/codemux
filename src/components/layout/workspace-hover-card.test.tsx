@@ -780,6 +780,54 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(card()).not.toBeNull();
   });
 
+  // The menu can close with the pointer far from the row (an item low in a
+  // long menu). No pointerleave follows then, so the suppression must not
+  // outlive the menu or the next real hover onto the row is swallowed.
+  it("opens on the next hover when the menu closes with the pointer off the row", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    pointerEnter(alpha);
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      button: 2,
+      clientX: 20,
+      clientY: 110,
+    });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    act(() => {
+      fireEvent.pointerMove(window, { clientX: 60, clientY: 400 });
+    });
+    setMenuOpen(false);
+
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  it("stays suppressed when the menu closes with the pointer still on the row", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    pointerEnter(alpha);
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      button: 2,
+      clientX: 20,
+      clientY: 110,
+    });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    setMenuOpen(false);
+
+    pointerEnter(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+  });
+
   it("closes an open card when the menu opens from the keyboard", () => {
     const { alpha, setMenuOpen } = renderMenuRow();
     pointerEnter(alpha);
