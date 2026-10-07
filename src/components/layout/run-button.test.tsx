@@ -6,11 +6,15 @@ import userEvent from "@testing-library/user-event";
 const mockGetProjectScripts = vi.fn();
 const mockGetWorkspaceConfig = vi.fn();
 const mockRunProjectDevCommand = vi.fn().mockResolvedValue(undefined);
+const mockSetProjectScripts = vi.fn().mockResolvedValue(undefined);
+const mockDetectRunCandidates = vi.fn();
 
 vi.mock("@/tauri/commands", () => ({
   getProjectScripts: (...args: unknown[]) => mockGetProjectScripts(...args),
   getWorkspaceConfig: (...args: unknown[]) => mockGetWorkspaceConfig(...args),
   runProjectDevCommand: (...args: unknown[]) => mockRunProjectDevCommand(...args),
+  setProjectScripts: (...args: unknown[]) => mockSetProjectScripts(...args),
+  detectRunCandidates: (...args: unknown[]) => mockDetectRunCandidates(...args),
 }));
 
 const mockSetShowSettings = vi.fn();
@@ -74,6 +78,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockGetProjectScripts.mockResolvedValue(null);
   mockGetWorkspaceConfig.mockResolvedValue(null);
+  mockSetProjectScripts.mockResolvedValue(undefined);
+  mockDetectRunCandidates.mockResolvedValue([
+    { command: "pnpm run dev", source: "package.json" },
+    { command: "cargo run", source: "Cargo.toml" },
+  ]);
   mockShowSettings = false;
   mockActiveWorkspace = {
     workspace_id: "ws-1",
@@ -192,11 +201,15 @@ describe("RunButton", () => {
 // GUI-chrome shape (`variant="split"`, passed only by title-bar.tsx).
 // The legacy default above stays byte-identical for the flag-off PresetBar.
 describe("RunButton — split variant", () => {
-  it('main segment shows "Set Run" and opens configure when unconfigured', async () => {
+  it('main segment shows "Set Run" and opens the popover with detected commands', async () => {
     renderSplitRunButton();
     await flushPromises();
     await userEvent.click(screen.getByText("Set Run"));
-    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+    expect(await screen.findByText("pnpm run dev")).toBeInTheDocument();
+    expect(screen.getByText("Cargo.toml")).toBeInTheDocument();
+    expect(mockDetectRunCandidates).toHaveBeenCalledWith("/home/user/myapp");
+    // Stays in the workspace instead of jumping to full-screen Settings.
+    expect(mockSetShowSettings).not.toHaveBeenCalled();
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
@@ -212,16 +225,7 @@ describe("RunButton — split variant", () => {
     expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
   });
 
-  it("caret segment opens configure regardless of configured state", async () => {
-    renderSplitRunButton();
-    await flushPromises();
-    await userEvent.click(
-      screen.getByRole("button", { name: "Configure run command" }),
-    );
-    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
-  });
-
-  it("caret segment opens configure even when a run command is set", async () => {
+  it("caret segment opens the popover even when a run command is set", async () => {
     mockGetProjectScripts.mockResolvedValue({
       setup: [],
       teardown: [],
@@ -232,9 +236,105 @@ describe("RunButton — split variant", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Configure run command" }),
     );
-    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+    // The field starts from the current command so it can be edited.
+    expect(await screen.findByLabelText("Run command")).toHaveValue("npm run dev");
+    expect(mockSetShowSettings).not.toHaveBeenCalled();
     // Caret never runs the command — only the main segment does.
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
+  });
+
+  it("picking a detected command saves it, keeps other scripts and runs it", async () => {
+    mockGetProjectScripts.mockResolvedValue({
+      setup: ["pnpm install"],
+      teardown: [],
+      run: null,
+      worktree_includes: [".env"],
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(await screen.findByRole("button", { name: /pnpm run dev/ }));
+    expect(mockSetProjectScripts).toHaveBeenCalledWith("/home/user/myapp", {
+      setup: ["pnpm install"],
+      teardown: [],
+      worktree_includes: [".env"],
+      run: "pnpm run dev",
+    });
+    expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
+    await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
+    expect(screen.queryByLabelText("Run command")).toBeNull();
+  });
+
+  it("a typed command is saved and run on Enter", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.type(await screen.findByLabelText("Run command"), "just serve{Enter}");
+    expect(mockSetProjectScripts).toHaveBeenCalledWith(
+      "/home/user/myapp",
+      expect.objectContaining({ run: "just serve" }),
+    );
+    expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
+  });
+
+  it("keeps the popover open and shows the error when saving fails", async () => {
+    mockSetProjectScripts.mockRejectedValue("database is locked");
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(await screen.findByRole("button", { name: /cargo run/ }));
+    expect(await screen.findByText("database is locked")).toBeInTheDocument();
+    expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
+  });
+
+  it("More settings opens Settings > Projects", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(await screen.findByText("More settings…"));
+    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+  });
+
+  it("points at the config file instead of offering commands it would override", async () => {
+    mockGetWorkspaceConfig.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+    });
+    mockGetProjectScripts.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: "db-cmd",
+      worktree_includes: [],
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    // The backend ignores DB scripts once a config file exists.
+    await userEvent.click(screen.getByText("Set Run"));
+    expect(await screen.findByText(".codemux/config.json")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Run command")).toBeNull();
+    expect(mockDetectRunCandidates).not.toHaveBeenCalled();
+  });
+
+  it("re-reads the run command when the active project changes", async () => {
+    mockGetProjectScripts.mockImplementation(async (path: string) => ({
+      setup: [],
+      teardown: [],
+      run: path === "/home/user/myapp" ? "npm run dev" : null,
+      worktree_includes: [],
+    }));
+    const { rerender } = renderSplitRunButton();
+    await flushPromises();
+    expect(screen.getByText("Run")).toBeInTheDocument();
+    mockActiveWorkspace = { workspace_id: "ws-2", project_root: "/home/user/other" };
+    rerender(
+      <TooltipProvider>
+        <RunButton workspaceId="ws-2" variant="split" />
+      </TooltipProvider>,
+    );
+    await flushPromises();
+    expect(screen.getByText("Set Run")).toBeInTheDocument();
   });
 
   it("has no inline keyboard-shortcut badge in the DOM", async () => {

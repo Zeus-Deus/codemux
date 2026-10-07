@@ -1,5 +1,5 @@
 import type { AgentChatSessionRecord, LocalChatSession } from "@/tauri/commands";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import type { AgentChatProviderKind, ProjectScripts } from "@/tauri/types";
 /**
  * Dev-only Tauri runtime shim.
  *
@@ -3310,6 +3310,9 @@ function emitWebRemoteState(): void {
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
 
+/** Per-project scripts saved through `set_project_scripts`, keyed by path. */
+const mockProjectScripts = new Map<string, ProjectScripts>();
+
 /** In-memory staging store for `agent_chat_stage_image` (keyed by the
  *  fake absolute path returned to the frontend). Serves `agent_chat_read_image`
  *  so the IPC-read image fallback works end-to-end in `npm run dev`. */
@@ -5843,18 +5846,29 @@ const handlers: Record<string, Handler> = {
   // ── Workspace config / scripts (sidebar setup banner, default-branch
   //    cache) ──
   get_default_branch: () => "main",
-  get_workspace_config: () => ({
-    setup: [],
-    teardown: [],
-    run: null,
-    worktree_includes: [],
-  }),
-  get_project_scripts: () => ({
-    setup: [],
-    teardown: [],
-    run: null,
-    worktree_includes: [],
-  }),
+  // No mock project has a `.codemux/config.json`; like the backend, that
+  // reads as null, so the DB scripts below are the effective config.
+  get_workspace_config: () => null,
+  get_project_scripts: (a) =>
+    mockProjectScripts.get(a.path as string) ?? {
+      setup: [],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+    },
+  // Kept in memory so the titlebar Run button flips from "Set Run" to
+  // "Run" after a command is picked in its popover.
+  set_project_scripts: (a) => {
+    mockProjectScripts.set(a.path as string, a.scripts as ProjectScripts);
+    return null;
+  },
+  detect_run_candidates: () => [
+    { command: "npm run dev", source: "package.json" },
+    { command: "npm run start", source: "package.json" },
+    { command: "npm run tauri:dev", source: "package.json" },
+    { command: "cargo run", source: "Cargo.toml" },
+  ],
+  run_project_dev_command: () => null,
 
   // ── Terminal (the body is out of scope per issue #40, but the mount
   //    MUST NOT crash). `get_terminal_status` is the load-bearing one:

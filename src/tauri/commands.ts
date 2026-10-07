@@ -76,6 +76,7 @@ import type {
   WorktreeInfo,
   ProjectScripts,
   DetectedSetup,
+  RunCandidate,
   WebRemoteStatus,
   WebRemoteEndpoint,
   WebRemoteSessionView,
@@ -684,6 +685,9 @@ export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
 
 export const detectPackageManager = (projectPath: string) =>
   invoke<DetectedSetup[]>("detect_package_manager", { projectPath });
+
+export const detectRunCandidates = (projectPath: string) =>
+  invoke<RunCandidate[]>("detect_run_candidates", { projectPath });
 
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });
