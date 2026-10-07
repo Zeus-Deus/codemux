@@ -724,6 +724,30 @@ describe("PrList — local-only and unreachable repositories", () => {
     );
   });
 
+  it("does not read a repository named after auth as a sign-in problem", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("GraphQL: Could not resolve to a Repository with the name 'acme/auth-service'.")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+    expect(screen.getByTestId("pr-list-all-failed")).not.toHaveTextContent("signed in");
+  });
+
+  it("reads an authentication failure as a sign-in problem", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("remote: Unauthorized. Requires authentication.")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+    expect(screen.getByTestId("pr-list-all-failed")).toHaveTextContent(
+      "Check that the host CLI is signed in",
+    );
+  });
+
   it("counts repositories without a remote apart from unreachable ones", () => {
     renderList({ rows: [], hostCount: 3, localOnlyCount: 1 });
     expect(screen.getByTestId("pr-list-local-only")).toHaveTextContent("1 local-only");

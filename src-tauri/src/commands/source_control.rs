@@ -282,8 +282,12 @@ pub async fn check_provider_auth(path: String) -> ProviderAuthStatus {
 }
 
 fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
-    let detected = git_provider::detect_provider(repo_path);
-    let has_remote = !git_provider::has_no_remote(repo_path);
+    // One probe for both answers: a failed probe is not cached, so asking
+    // twice would repeat the slow path. Only a clean answer with no remote
+    // is local-only; a failure keeps `has_remote` and renders as unknown.
+    let probed = git_provider::try_detect_provider(repo_path);
+    let has_remote = !matches!(&probed, Ok(detected) if detected.remote_name.is_none());
+    let detected = probed.unwrap_or_else(|_| git_provider::DetectedProvider::unknown());
     // Strict resolution, matching `check_github_repo`: only a positively
     // identified, implemented product gets a real adapter, so the two
     // gates cannot disagree about whether a checkout is servable.

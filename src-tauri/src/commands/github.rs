@@ -163,6 +163,12 @@ pub async fn create_pull_request(
 #[tauri::command]
 pub async fn list_pull_requests(path: String, state: String) -> Result<Vec<PullRequestInfo>, String> {
     tokio::task::spawn_blocking(move || {
+        // Same answer as `list_prs_overview`: nothing to list. Checked here
+        // rather than left to the caller, which may ask before the overview
+        // has said the checkout is local-only.
+        if git_provider::has_no_remote(Path::new(&path)) {
+            return Ok(Vec::new());
+        }
         provider_for(&path, Operation::ListRead)?.list_pull_requests(Path::new(&path), &state)
     })
     .await
@@ -959,5 +965,25 @@ mod tests {
         assert_eq!(verdict_operation("comment"), Operation::Comment);
         // Anything unrecognised is the least privileged of the three.
         assert_eq!(verdict_operation(""), Operation::Comment);
+    }
+
+    /// A checkout without a remote answers both lists with nothing,
+    /// without handing the path to a host CLI.
+    #[tokio::test]
+    async fn a_checkout_without_a_remote_lists_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+        assert!(init.status.success());
+        let path = dir.path().display().to_string();
+
+        let history = list_pull_requests(path.clone(), "all".into()).await.unwrap();
+        assert!(history.is_empty());
+        let overview = list_prs_overview(path).await.unwrap();
+        assert!(overview.local_only && overview.items.is_empty());
+        git_provider::invalidate_detection_cache(Some(dir.path()));
     }
 }

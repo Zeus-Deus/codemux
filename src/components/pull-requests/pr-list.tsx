@@ -542,8 +542,10 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
   );
 }
 
-/** Host CLI errors that mean "sign in", as opposed to "unreachable". */
-const AUTH_ERROR = /\bauth|log ?in|sign(ed)? ?in|credential|token|\b401\b/i;
+/** Host CLI errors that mean "sign in", as opposed to "unreachable".
+ *  Word stems rather than a bare `auth` prefix, so a repository named
+ *  `auth-service` in a not-found error does not read as a sign-in one. */
+const AUTH_ERROR = /\b(?:un|re)?auth(?:enticat|oriz)|log ?in|sign(ed)? ?in|credential|token|\b401\b/i;
 
 /**
  * Every way to have nothing to show gets the sentence that fits it
