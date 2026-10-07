@@ -20,7 +20,7 @@ import {
   ResultCapNotice,
   SearchFooter,
   SearchQueryInput,
-  relativeToRoot,
+  pathUnderRoot,
   staleListClass,
 } from "./search-dialog-parts";
 
@@ -282,7 +282,7 @@ export function ContentSearchDialog() {
                 <div className="flex items-center gap-1.5 px-2 py-1 sticky top-0 bg-popover z-10">
                   <FileCode className="size-3 shrink-0 text-muted-foreground" />
                   <span className="text-label text-muted-foreground truncate">
-                    {relativeToRoot(cwd, group.filePath)}
+                    {pathUnderRoot(cwd, group.filePath)}
                   </span>
                   <span className="text-caption text-muted-foreground/50 shrink-0 tabular-nums">
                     ({group.matches.length})

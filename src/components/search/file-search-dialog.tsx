@@ -22,7 +22,7 @@ import {
   SearchFooter,
   SearchQueryInput,
   findMatchRange,
-  relativeToRoot,
+  pathUnderRoot,
   staleListClass,
 } from "./search-dialog-parts";
 
@@ -57,7 +57,7 @@ function openEditorPaths(cwd: string): string[] {
     .filter((t) => t.kind === "editor")
     .map((t) => editor.getTab(t.tab_id)?.filePath)
     .filter((p): p is string => !!p)
-    .map((p) => relativeToRoot(cwd, p));
+    .map((p) => pathUnderRoot(cwd, p));
   return [...new Set(paths)].slice(0, SUGGESTION_LIMIT);
 }
 

@@ -72,7 +72,7 @@ export function ResultCapNotice({ limit }: { limit: number }) {
 }
 
 /** `path` relative to the workspace root, for display. */
-export function relativeToRoot(root: string, path: string): string {
+export function pathUnderRoot(root: string, path: string): string {
   const prefix = root.endsWith("/") ? root : `${root}/`;
   return root && path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }

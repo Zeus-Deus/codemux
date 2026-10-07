@@ -267,16 +267,12 @@ fn search_with_rg(
         .output()
         .ok()?;
 
-    // Exit 2 with nothing on stdout means rg never searched (bad pattern,
-    // missing path). Exit 2 alongside output is just an unreadable file.
-    if output.status.code() == Some(2) && output.stdout.is_empty() {
-        return Some(Err(search_error_message(&String::from_utf8_lossy(
-            &output.stderr,
-        ))));
-    }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
+    // Files rg actually opened, from its closing `summary` message. A missing
+    // root still prints a summary, so empty stdout alone can't tell us rg
+    // never searched.
+    let mut searched_files = 0;
 
     for line in stdout.lines() {
         if results.len() >= opts.limit as usize {
@@ -286,8 +282,16 @@ fn search_with_rg(
         let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if val.get("type").and_then(|t| t.as_str()) != Some("match") {
-            continue;
+        match val.get("type").and_then(|t| t.as_str()) {
+            Some("match") => {}
+            Some("summary") => {
+                searched_files = val
+                    .pointer("/data/stats/searches")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                continue;
+            }
+            _ => continue,
         }
         let Some(data) = val.get("data") else {
             continue;
@@ -327,6 +331,15 @@ fn search_with_rg(
             match_start,
             match_end,
         });
+    }
+
+    // Exit 2 without a single file searched means rg never ran the search
+    // (bad pattern, missing path). Exit 2 after searching is just an
+    // unreadable file among readable ones.
+    if output.status.code() == Some(2) && results.is_empty() && searched_files == 0 {
+        return Some(Err(search_error_message(&String::from_utf8_lossy(
+            &output.stderr,
+        ))));
     }
 
     Some(Ok(results))
@@ -1572,6 +1585,7 @@ mod tests {
         );
         assert_eq!(r.line_number, 2);
         assert_eq!(r.line_content, "the needle is here");
+        // The fixture is ASCII, so these UTF-16 offsets are also byte offsets.
         assert_eq!(
             &r.line_content[r.match_start as usize..r.match_end as usize],
             "needle",
@@ -1626,6 +1640,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_in_files_reports_a_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = path_str(&dir.path().join("gone"));
+        search_in_files(missing, "needle".to_string(), None, None, None)
+            .await
+            .expect_err("a vanished workspace is an error, not an empty result");
     }
 
     /// Offsets are UTF-16 so the frontend can slice the line and place the
