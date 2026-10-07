@@ -23,6 +23,7 @@ import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
 import { BootSplash } from "./boot-splash";
+import { cn } from "@/lib/utils";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { markStartup } from "@/lib/perf/interaction-trace";
@@ -98,6 +99,9 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
   const agentChatEnabled = useFeatureFlags((s) => s.enableAgentChat);
   const flagsLoaded = useFeatureFlags((s) => s.loaded);
+  // The shell fades in over the boot splash once, on the overlay tier; later
+  // remounts (closing Settings and the like) appear without it.
+  const [bootFadeDone, setBootFadeDone] = useState(false);
   const showSettings = useUIStore((s) => s.showSettings);
   const showAutomations = useUIStore((s) => s.showAutomations);
   const showDevices = useUIStore((s) => s.showDevices);
@@ -303,7 +307,15 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   }
 
   return (
-    <div className="relative flex h-screen max-h-screen flex-col overflow-hidden">
+    <div
+      className={cn(
+        "relative flex h-screen max-h-screen flex-col overflow-hidden",
+        !bootFadeDone && "motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-250",
+      )}
+      onAnimationEnd={(e) => {
+        if (e.target === e.currentTarget) setBootFadeDone(true);
+      }}
+    >
       <TitleBar
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((o) => !o)}

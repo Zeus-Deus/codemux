@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 // ── Mutable mock state ──
 let hasWorkspacesFlag = false;
@@ -290,6 +290,27 @@ describe("AppShell rendering gates", () => {
     view.rerender(<AppShell />);
     expect(view.getByTestId("workspace-main")).toBeInTheDocument();
     expect(view.queryByRole("status", { name: "Loading Codemux" })).toBeNull();
+  });
+
+  it("fades the shell in over the splash once, not on later remounts", () => {
+    hasWorkspacesFlag = true;
+    const view = render(<AppShell />);
+    const shell = () => view.getByTestId("title-bar").parentElement!;
+    expect(shell()).toHaveClass("motion-safe:animate-in");
+
+    // A child's animation ending must not cut the shell's own fade short.
+    fireEvent.animationEnd(view.getByTestId("workspace-main"));
+    expect(shell()).toHaveClass("motion-safe:animate-in");
+
+    fireEvent.animationEnd(shell());
+    expect(shell()).not.toHaveClass("motion-safe:animate-in");
+
+    // Settings replaces the whole tree; coming back must not fade again.
+    showSettingsFlag = true;
+    view.rerender(<AppShell />);
+    showSettingsFlag = false;
+    view.rerender(<AppShell />);
+    expect(shell()).not.toHaveClass("motion-safe:animate-in");
   });
 
   it("keeps the boot splash up until feature flags have loaded", () => {

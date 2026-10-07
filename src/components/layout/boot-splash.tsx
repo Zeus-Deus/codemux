@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { WindowChrome } from "@/components/layout/window-chrome";
 import wordmark from "@/assets/codemux-wordmark.svg";
 
@@ -13,10 +14,16 @@ const PULSE_MS = 2000;
  * Each stage mounts its own copy, which would restart the pulse. A negative
  * delay pinned to the page clock keeps every copy on the same phase, so the
  * wordmark never jumps back to full opacity at a hand-off.
+ *
+ * The phase is read once per mount. The shell re-renders the same splash as
+ * app state, settings and flags arrive, and a delay that changed on each of
+ * those renders would be applied retroactively by the browser, making the
+ * pulse jump exactly at the hand-offs it is meant to smooth.
  */
 export function BootSplash() {
-  const phase =
-    typeof performance === "undefined" ? 0 : performance.now() % PULSE_MS;
+  const [phase] = useState(() =>
+    typeof performance === "undefined" ? 0 : performance.now() % PULSE_MS,
+  );
   return (
     <div
       className="relative flex h-screen w-screen items-center justify-center bg-background"
