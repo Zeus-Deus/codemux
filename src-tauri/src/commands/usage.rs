@@ -71,8 +71,12 @@ impl PlanQuotaStore {
             return;
         };
         let entry = map.entry(provider.to_string()).or_default();
+        // Rows already updated by this call. Codex can report both of its
+        // windows under one key (label-less `other`); each must update its
+        // own row, in order, rather than both landing on the first.
+        let mut updated = Vec::new();
         for window in windows {
-            merge_window(&mut entry.windows, window);
+            updated.push(merge_window(&mut entry.windows, window, &updated));
         }
         if plan_label.is_some() {
             entry.plan_label = plan_label;
@@ -167,12 +171,23 @@ fn same_window(existing: &PlanUsageWindow, incoming: &PlanUsageWindow) -> bool {
     }
 }
 
-/// Put `incoming` in place of the window it updates, or add it.
-fn merge_window(windows: &mut Vec<PlanUsageWindow>, incoming: PlanUsageWindow) {
-    let Some(existing) = windows.iter_mut().find(|w| same_window(w, &incoming)) else {
+/// Put `incoming` in place of the window it updates, or add it. Rows in
+/// `skip` were already updated by the same report and are not matched again.
+/// Returns the index of the row `incoming` landed in.
+fn merge_window(
+    windows: &mut Vec<PlanUsageWindow>,
+    incoming: PlanUsageWindow,
+    skip: &[usize],
+) -> usize {
+    let found = windows
+        .iter()
+        .enumerate()
+        .position(|(i, w)| !skip.contains(&i) && same_window(w, &incoming));
+    let Some(index) = found else {
         windows.push(incoming);
-        return;
+        return windows.len() - 1;
     };
+    let existing = &mut windows[index];
     // The streamed overage window only says overage is in use; its 0% is a
     // placeholder, not a reading, so it must not erase a real one.
     if incoming.kind == PlanWindowKind::Overage
@@ -181,7 +196,7 @@ fn merge_window(windows: &mut Vec<PlanUsageWindow>, incoming: PlanUsageWindow) {
         if incoming.resets_at_ms.is_some() {
             existing.resets_at_ms = incoming.resets_at_ms;
         }
-        return;
+        return index;
     }
     // Keep the direct read's display name and length when a streamed update
     // names the same window more tersely.
@@ -195,6 +210,7 @@ fn merge_window(windows: &mut Vec<PlanUsageWindow>, incoming: PlanUsageWindow) {
         window_mins: incoming.window_mins.or(existing.window_mins),
         ..incoming
     };
+    index
 }
 
 /// A window counts as exhausted at or above this percentage. Slightly below
@@ -1654,6 +1670,18 @@ mod tests {
         assert_eq!(windows.len(), 3);
         assert_eq!(windows[0].used_pct, 35.0);
         assert_eq!(windows[1].used_pct, 72.0);
+    }
+
+    /// Codex without window lengths reports both windows as label-less
+    /// `other`; each report must update both rows, each with its own value.
+    #[test]
+    fn repeated_keys_in_one_report_update_their_own_rows() {
+        let store = PlanQuotaStore::default();
+        let two = |a, b| vec![window(PlanWindowKind::Other, a), window(PlanWindowKind::Other, b)];
+        store.record("codex", two(10.0, 20.0), None, None, 1);
+        store.record("codex", two(15.0, 25.0), None, None, 2);
+        let pcts: Vec<f64> = store.snapshot()["codex"].windows.iter().map(|w| w.used_pct).collect();
+        assert_eq!(pcts, vec![15.0, 25.0]);
     }
 
     #[test]
