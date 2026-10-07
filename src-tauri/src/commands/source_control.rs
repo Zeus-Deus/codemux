@@ -121,6 +121,10 @@ pub struct ProviderAuthStatus {
     /// once per checkout — and a control whose right to exist arrives one
     /// round trip after the control does is a control that flickers.
     pub operations: OperationCapabilities,
+    /// False only when git positively answered that this checkout has no
+    /// remote. That is its own state rather than an unsupported host:
+    /// the fix is adding a remote, not switching products.
+    pub has_remote: bool,
 }
 
 impl ProviderAuthStatus {
@@ -134,6 +138,8 @@ impl ProviderAuthStatus {
             authenticated: false,
             username: None,
             operations: OperationCapabilities::default(),
+            // Nothing is known, so nothing is claimed about remotes.
+            has_remote: true,
         }
     }
 }
@@ -277,6 +283,7 @@ pub async fn check_provider_auth(path: String) -> ProviderAuthStatus {
 
 fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
     let detected = git_provider::detect_provider(repo_path);
+    let has_remote = !git_provider::has_no_remote(repo_path);
     // Strict resolution, matching `check_github_repo`: only a positively
     // identified, implemented product gets a real adapter, so the two
     // gates cannot disagree about whether a checkout is servable.
@@ -295,6 +302,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             authenticated: false,
             username: None,
             operations,
+            has_remote,
         };
     }
 
@@ -311,6 +319,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             authenticated: false,
             username: None,
             operations,
+            has_remote,
         },
         GhStatus::NotAuthenticated => ProviderAuthStatus {
             kind,
@@ -319,6 +328,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             authenticated: false,
             username: None,
             operations,
+            has_remote,
         },
         GhStatus::Authenticated { username } => ProviderAuthStatus {
             kind,
@@ -327,6 +337,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             authenticated: true,
             username: Some(username).filter(|u| !u.trim().is_empty()),
             operations,
+            has_remote,
         },
     }
 }

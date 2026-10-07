@@ -215,6 +215,11 @@ pub struct PrsOverview {
     /// one. `None` ⇒ the page can still list, but cannot group.
     pub viewer: Option<String>,
     pub items: Vec<PrOverviewItem>,
+    /// The checkout has no remote, so there was nothing to ask. An answer
+    /// rather than a failure: the page counts it apart from repositories
+    /// it could not reach.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

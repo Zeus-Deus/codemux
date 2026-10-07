@@ -535,6 +535,32 @@ describe("usePrOverview — failure shape", () => {
     expect(result.current.allRootsFailed).toBe(false);
     expect(result.current.rows).toHaveLength(1);
   });
+
+  it("counts a repository with no remote as local-only, not unreachable", async () => {
+    setRoots(ROOT, OTHER);
+    mockListPrsOverview.mockImplementation((path: string) =>
+      path === ROOT
+        ? Promise.reject("could not resolve host")
+        : Promise.resolve({ viewer: null, items: [], local_only: true }),
+    );
+
+    const { result, rerender } = renderHook(
+      ({ filter }: { filter: "open" | "all" }) => usePrOverview(true, filter),
+      { wrapper: wrapper(), initialProps: { filter: "open" } },
+    );
+
+    await waitFor(() => expect(result.current.failures).toHaveLength(1));
+    await waitFor(() => expect(result.current.localOnly).toHaveLength(1));
+    expect(result.current.localOnly[0].path).toBe(OTHER);
+    // The only repository that could be asked failed, so everything did.
+    expect(result.current.allRootsFailed).toBe(true);
+    expect(result.current.refreshFailed).toBe(true);
+
+    // Nothing to list there, so the history list is not asked either.
+    rerender({ filter: "all" });
+    await waitFor(() => expect(mockListPullRequests).toHaveBeenCalledWith(ROOT, "all"));
+    expect(mockListPullRequests).not.toHaveBeenCalledWith(OTHER, expect.anything());
+  });
 });
 
 // ── Cadence ──────────────────────────────────────────────────────────

@@ -687,3 +687,54 @@ describe("PrList — nothing to show, and why", () => {
     expect(strip).not.toHaveTextContent("showing the list from");
   });
 });
+
+describe("PrList — local-only and unreachable repositories", () => {
+  const failure = (message: string) => ({
+    root: { path: ROOT, providerKind: null, name: "codemux" },
+    message,
+  });
+
+  it("names what each repository answered when every one of them failed", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("could not resolve host: code.example.com")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+
+    expect(screen.queryByText("No open pull requests.")).not.toBeInTheDocument();
+    const empty = screen.getByTestId("pr-list-all-failed");
+    expect(empty).toHaveTextContent("Couldn't list pull requests for 1 repository.");
+    expect(empty).toHaveTextContent("codemux: could not resolve host: code.example.com");
+    // A network failure is not a sign-in problem.
+    expect(empty).not.toHaveTextContent("signed in");
+  });
+
+  it("points at signing in only when the host said so", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("To get started with GitHub CLI, please run: gh auth login")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+    expect(screen.getByTestId("pr-list-all-failed")).toHaveTextContent(
+      "Check that the host CLI is signed in",
+    );
+  });
+
+  it("counts repositories without a remote apart from unreachable ones", () => {
+    renderList({ rows: [], hostCount: 3, localOnlyCount: 1 });
+    expect(screen.getByTestId("pr-list-local-only")).toHaveTextContent("1 local-only");
+    expect(screen.queryByTestId("pr-list-failures")).not.toBeInTheDocument();
+    expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
+  });
+
+  it("says so when no open project has a remote", () => {
+    renderList({ rows: [], hostCount: 1, localOnlyCount: 1 });
+    expect(screen.getByTestId("pr-list-local-only-empty")).toHaveTextContent(
+      "No repositories with a remote.",
+    );
+  });
+});

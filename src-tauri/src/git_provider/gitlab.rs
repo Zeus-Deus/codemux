@@ -1397,6 +1397,7 @@ impl SourceControlProvider for GitLabProvider {
         Ok(PrsOverview {
             viewer,
             items: rows.iter().map(parse_overview_mr_json).collect(),
+            local_only: false,
         })
     }
 

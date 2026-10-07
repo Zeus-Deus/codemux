@@ -227,9 +227,18 @@ pub async fn list_incoming_prs(
 /// screen before the host has finished computing them.
 #[tauri::command]
 pub async fn list_prs_overview(path: String) -> Result<crate::github::PrsOverview, String> {
-    tokio::task::spawn_blocking(move || provider_for(&path, Operation::ListRead)?.pull_requests_overview(Path::new(&path)))
-        .await
-        .map_err(|e| format!("list_prs_overview task join failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        if git_provider::has_no_remote(Path::new(&path)) {
+            return Ok(crate::github::PrsOverview {
+                viewer: None,
+                items: Vec::new(),
+                local_only: true,
+            });
+        }
+        provider_for(&path, Operation::ListRead)?.pull_requests_overview(Path::new(&path))
+    })
+    .await
+    .map_err(|e| format!("list_prs_overview task join failed: {e}"))?
 }
 
 /// Explicit refresh clears successful responses without lifting a host pause.

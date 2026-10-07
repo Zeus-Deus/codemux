@@ -405,6 +405,42 @@ let prStatsOutage = false;
  */
 let prBudgetSpent = false;
 
+/** Console switches for the review gate; they survive a reload because
+ *  the frontend caches a usable auth verdict for a minute. See
+ *  `__codemuxMockNoRemote` and `__codemuxMockSignedOut` at the bottom. */
+function storedFlag(key: string): boolean {
+  try {
+    return localStorage.getItem(`codemux:dev:${key}`) === "1";
+  } catch {
+    return false;
+  }
+}
+function storeFlag(key: string, on: boolean): void {
+  try {
+    if (on) localStorage.setItem(`codemux:dev:${key}`, "1");
+    else localStorage.removeItem(`codemux:dev:${key}`);
+  } catch {
+    // Dev-only convenience; the session value still applies.
+  }
+}
+/** personal-site behaves like a repository with no remote. */
+let mockNoRemote = storedFlag("no-remote");
+/** Every supported host's CLI reports signed out. */
+let mockSignedOut = storedFlag("signed-out");
+
+/** The checkout or root at `path` belongs to the project the no-remote
+ *  knob strips the remote from. */
+function mockLacksRemote(path: string): boolean {
+  if (!mockNoRemote) return false;
+  const siteRoot = appState.workspaces.find((w) => w.workspace_id === "ws-site-main")?.project_root;
+  if (!siteRoot) return false;
+  return appState.workspaces.some(
+    (w) =>
+      w.project_root === siteRoot &&
+      (w.cwd === path || w.worktree_path === path || w.project_root === path),
+  );
+}
+
 /** Verbatim what `gh pr list` prints when the GraphQL budget is gone. */
 const RATE_LIMIT_REFUSAL =
   "GraphQL: API rate limit already exceeded for user ID 100132710.";
@@ -4788,16 +4824,30 @@ const handlers: Record<string, Handler> = {
   // GitLab copy path rather than falling through to GitHub's.
   check_provider_auth: (a) => {
     const path = a.path as string;
+    if (mockLacksRemote(path)) {
+      return {
+        kind: "unknown",
+        supported: false,
+        installed: false,
+        authenticated: false,
+        username: null,
+        operations: NO_MOCK_OPERATIONS,
+        has_remote: false,
+      };
+    }
     const workspace = appState.workspaces.find(
       (w) => w.cwd === path || w.project_root === path,
     );
     const kind = workspace?.provider_kind ?? "github";
+    const supported = kind === "github" || kind === "gitlab";
+    const signedOut = supported && mockSignedOut;
     return {
       kind,
-      supported: kind === "github" || kind === "gitlab",
+      supported,
       installed: true,
-      authenticated: true,
-      username: kind === "gitlab" ? "mock-glab" : "mock-dev",
+      authenticated: !signedOut,
+      has_remote: true,
+      username: signedOut ? null : kind === "gitlab" ? "mock-glab" : "mock-dev",
       // Standing in for the adapters' own declarations — see
       // `git_provider/provider.rs`. GitLab is missing exactly one
       // operation, and Bitbucket declares nothing at all, so both the
@@ -4922,6 +4972,9 @@ const handlers: Record<string, Handler> = {
   // anything.
   list_prs_overview: async (a) => {
     const path = String(a.path ?? "");
+    // Answered before any refusal, like the real command: no remote means
+    // nothing to ask, not a failure.
+    if (mockLacksRemote(path)) return { viewer: null, items: [], local_only: true };
     if (path === MOCK_UNREACHABLE_ROOT) {
       return Promise.reject(
         "could not resolve host: git.scratchpad.example.com",
@@ -7045,6 +7098,32 @@ function kickPrOverview(): void {
   PR_LIST_DELAY_MS = Math.max(0, ms);
   localStorage.setItem("codemux:dev:pr-list-delay", String(PR_LIST_DELAY_MS));
   return `the listing now takes ${PR_LIST_DELAY_MS}ms (across reloads)`;
+};
+
+// Dev affordances for the review gate. Both survive a reload; set them,
+// reload, then open the Review tab.
+//
+//   __codemuxMockNoRemote()        // personal-site has no remote
+//   __codemuxMockSignedOut()       // gh/glab report signed out
+//   __codemuxMockSignedOut(false)  // signed back in; the open pane notices
+(
+  window as unknown as { __codemuxMockNoRemote: (on?: boolean) => string }
+).__codemuxMockNoRemote = (on = true) => {
+  mockNoRemote = on;
+  storeFlag("no-remote", on);
+  kickPrOverview();
+  return on
+    ? "personal-site now has no remote (across reloads)"
+    : "personal-site has its remote back";
+};
+(
+  window as unknown as { __codemuxMockSignedOut: (on?: boolean) => string }
+).__codemuxMockSignedOut = (on = true) => {
+  mockSignedOut = on;
+  storeFlag("signed-out", on);
+  return on
+    ? "host CLIs now report signed out (across reloads)"
+    : "host CLIs signed in again — an open Review pane picks it up";
 };
 
 export {};
