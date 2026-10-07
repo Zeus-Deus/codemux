@@ -12,8 +12,7 @@ afterEach(() => {
 });
 
 function wordmarkDelay(): string {
-  const img = screen.getByRole("status").querySelector("img");
-  return img?.style.animationDelay ?? "";
+  return screen.getByTestId("boot-wordmark").style.animationDelay;
 }
 
 it("keeps the pulse phase fixed while the same splash re-renders", () => {
@@ -31,4 +30,23 @@ it("joins the running pulse when a later stage mounts its own copy", () => {
   vi.spyOn(performance, "now").mockReturnValue(5150);
   render(<BootSplash />);
   expect(wordmarkDelay()).toBe("-1150ms");
+});
+
+it("paints the wordmark in the theme colour at the static splash's size", () => {
+  render(<BootSplash />);
+  const wordmark = screen.getByTestId("boot-wordmark");
+  // An <img> of the asset would keep its baked-in light fill on light themes.
+  expect(wordmark.tagName.toLowerCase()).toBe("svg");
+  expect(wordmark).toHaveClass("text-foreground");
+  const fills = [...wordmark.querySelectorAll("[fill]")].map((el) =>
+    el.getAttribute("fill"),
+  );
+  expect(fills.length).toBeGreaterThan(0);
+  expect(new Set(fills)).toEqual(new Set(["currentColor"]));
+  expect(wordmark.querySelectorAll("path")).toHaveLength(7);
+  // Same box and viewBox as #splash in index.html, so the crossfade between
+  // the two does not resize the logo.
+  expect(wordmark.getAttribute("width")).toBe("320");
+  expect(wordmark.getAttribute("height")).toBe("69");
+  expect(wordmark.getAttribute("viewBox")).toBe("78 18 204 44");
 });
