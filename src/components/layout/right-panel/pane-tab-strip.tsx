@@ -74,6 +74,7 @@ import { useHorizontalWheelScroll } from "@/lib/wheel";
 import type { RightPanelTab } from "@/stores/ui-store";
 
 import { TabDropIndicator } from "../tab-drop-indicator";
+import { middleClickCloseProps } from "../tab-strip-actions";
 import { PaneActionButton } from "./pane-actions";
 import { isAddonPane, PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
@@ -150,18 +151,7 @@ function DeckTabChip({
       {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
-      // Middle-click closes, as in every browser and editor tab strip. The
-      // mousedown is cancelled too: on an overflowing strip a middle
-      // button-press would otherwise also engage the webview's autoscroll
-      // on its way to the close.
-      onMouseDown={(event) => {
-        if (event.button === 1) event.preventDefault();
-      }}
-      onAuxClick={(event) => {
-        if (event.button !== 1) return;
-        event.preventDefault();
-        onClose();
-      }}
+      {...middleClickCloseProps(onClose)}
       className={cn(
         // No border, no shadow, no ring — the fill is the whole signal.
         "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",

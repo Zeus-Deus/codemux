@@ -6115,6 +6115,67 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
+  // Both replace the workspace object rather than mutating it, so the
+  // store's structural sharing sees the change.
+  rename_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws?.tabs.some((t) => t.tab_id === a.tabId)) {
+      throw new Error(`No tab found for ${a.tabId}`);
+    }
+    const next: WorkspaceSnapshot = {
+      ...ws,
+      tabs: ws.tabs.map((t) => (t.tab_id === a.tabId ? { ...t, title: String(a.title) } : t)),
+    };
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((w) => (w === ws ? next : w)),
+    };
+    emitAppState();
+    return undefined;
+  },
+  close_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws) throw new Error(`No workspace found for ${a.workspaceId}`);
+    const idx = ws.tabs.findIndex((t) => t.tab_id === a.tabId);
+    if (idx < 0) throw new Error(`No tab found for ${a.tabId}`);
+    const closed = ws.tabs[idx];
+    const tabs = ws.tabs.filter((t) => t !== closed);
+    // Like the backend, drop the terminal and browser sessions the tab owned.
+    const removedSessions = new Set<string>();
+    const removedBrowsers = new Set<string>(closed.browser_id ? [closed.browser_id] : []);
+    for (const surface of ws.surfaces) {
+      if (surface.surface_id !== closed.surface_id) continue;
+      for (const node of leafPaneNodes(surface.root)) {
+        if (node.kind === "terminal") removedSessions.add(node.session_id);
+        if (node.kind === "browser") removedBrowsers.add(node.browser_id);
+      }
+    }
+    const next: WorkspaceSnapshot = {
+      ...ws,
+      tabs,
+      surfaces: ws.surfaces.filter((s) => s.surface_id !== closed.surface_id),
+    };
+    // Same successor rule as the backend: the next tab, else the previous.
+    if (ws.active_tab_id === closed.tab_id) {
+      const successor = tabs[Math.min(idx, tabs.length - 1)];
+      next.active_tab_id = successor?.tab_id ?? "";
+      next.active_surface_id = successor
+        ? (successor.surface_id ?? ws.active_surface_id)
+        : "";
+    }
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((w) => (w === ws ? next : w)),
+      terminal_sessions: appState.terminal_sessions.filter(
+        (s) => !removedSessions.has(s.session_id),
+      ),
+      browser_sessions: appState.browser_sessions.filter(
+        (b) => !removedBrowsers.has(b.browser_id),
+      ),
+    };
+    emitAppState();
+    return undefined;
+  },
   /**
    * A real extra terminal tab, so an agent handoff is visible in dev.
    *

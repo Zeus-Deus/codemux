@@ -41,6 +41,13 @@ import type {
 } from "@/tauri/types";
 
 import { TabDropIndicator } from "./tab-drop-indicator";
+import {
+  EditorDirtyDot,
+  TabContextMenu,
+  TabTitleInput,
+  middleClickCloseProps,
+  useTabRename,
+} from "./tab-strip-actions";
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -91,8 +98,9 @@ interface TitleBarTabsProps {
  * compact pill; the active chat tab grows a chevron that opens the shared
  * session-history dropdown. Live subagent status no longer rides an
  * inline pill here — it lives in the `ComposerStrip` docked above
- * the composer. Tabs stay backend-owned — activation/close/reorder go through
- * the existing commands. Reorder is a pointer-driven drag (see
+ * the composer. Tabs stay backend-owned — activation/close/reorder/rename go
+ * through the existing commands, and the right-click menu, middle-click close
+ * and inline rename are shared with the legacy `TabBar`. Reorder is a pointer-driven drag (see
  * `@/lib/tab-reorder`) rather than the legacy TabBar's HTML5 DnD.
  */
 export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
@@ -223,46 +231,74 @@ function TitleBarTab({
       activateTab(workspace.workspace_id, tab.tab_id).catch(console.error);
     }
   };
-  const handleClose = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const rename = useTabRename();
+  const close = () => {
     closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
   };
+  const handleClose = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    close();
+  };
+  const icon = (
+    <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
+  );
 
   return (
-    <div
-      {...reorderProps}
-      className={cn(
-        PILL_BASE,
-        isActive ? PILL_ACTIVE : PILL_INACTIVE,
-        isDragging && "opacity-40",
-      )}
+    <TabContextMenu
+      workspace={workspace}
+      tabId={tab.tab_id}
+      onRename={rename.start}
     >
-      <button
-        type="button"
-        className="flex min-w-0 items-center gap-1.5"
-        onClick={handleActivate}
-        title={tab.title}
-      >
-        <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
-        <span className="max-w-[130px] truncate">{tab.title}</span>
-        {status && <StatusIndicator status={status} />}
-      </button>
-      <button
-        type="button"
-        data-no-drag
-        onClick={handleClose}
-        aria-label="Close tab"
-        title="Close tab"
+      <div
+        {...reorderProps}
+        {...middleClickCloseProps(close)}
         className={cn(
-          CLOSE_BTN,
-          isActive
-            ? "opacity-70"
-            : "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100",
+          PILL_BASE,
+          isActive ? PILL_ACTIVE : PILL_INACTIVE,
+          isDragging && "opacity-40",
         )}
       >
-        <X className="size-3" />
-      </button>
-    </div>
+        {rename.renaming ? (
+          <div className="flex min-w-0 items-center gap-1.5">
+            {icon}
+            <TabTitleInput
+              workspaceId={workspace.workspace_id}
+              tabId={tab.tab_id}
+              title={tab.title}
+              onDone={rename.stop}
+            />
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="flex min-w-0 items-center gap-1.5"
+            onClick={handleActivate}
+            onDoubleClick={rename.start}
+            title={tab.title}
+          >
+            {icon}
+            <span className="max-w-[130px] truncate">{tab.title}</span>
+            {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
+            {status && <StatusIndicator status={status} />}
+          </button>
+        )}
+        <button
+          type="button"
+          data-no-drag
+          onClick={handleClose}
+          aria-label="Close tab"
+          title="Close tab"
+          className={cn(
+            CLOSE_BTN,
+            isActive
+              ? "opacity-70"
+              : "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100",
+          )}
+        >
+          <X className="size-3" />
+        </button>
+      </div>
+    </TabContextMenu>
   );
 }
 
@@ -292,54 +328,80 @@ function ActiveChatTab({
     workspaceId,
     cwd,
   });
-  const handleClose = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const rename = useTabRename();
+  const close = () => {
     closeTab(workspaceId, tab.tab_id).catch(console.error);
   };
+  const handleClose = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    close();
+  };
+  const icon = (
+    <span className="shrink-0 opacity-90">
+      <MessageSquare className="size-3" />
+    </span>
+  );
 
+  // Rename is reached from the context menu only: a click on the label
+  // already opens the session-history dropdown.
   return (
-    <>
+    <TabContextMenu
+      workspace={workspace}
+      tabId={tab.tab_id}
+      onRename={rename.start}
+    >
       <div
         {...reorderProps}
+        {...middleClickCloseProps(close)}
         className={cn(PILL_BASE, PILL_ACTIVE, isDragging && "opacity-40")}
       >
-        <DropdownMenu open={open} onOpenChange={setOpen}>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              className="flex min-w-0 items-center gap-1.5"
+        {rename.renaming ? (
+          <div className="flex min-w-0 items-center gap-1.5">
+            {icon}
+            <TabTitleInput
+              workspaceId={workspaceId}
+              tabId={tab.tab_id}
               title={tab.title}
-              data-testid="titlebar-chat-tab-trigger"
-            >
-              <span className="shrink-0 opacity-90">
-                <MessageSquare className="size-3" />
-              </span>
-              <span className="max-w-[130px] truncate">{tab.title}</span>
-              {status && <StatusIndicator status={status} />}
-              <ChevronDown
-                className={cn(
-                  "size-3 shrink-0 opacity-60 transition-transform duration-150",
-                  open && "rotate-180",
-                )}
-              />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align="start"
-            className="max-h-[400px] w-72 overflow-y-auto"
-            data-testid="titlebar-chat-history"
-          >
-            <SessionHistoryList
-              sessions={sessions}
-              loading={loading}
-              activeThreadId={pane.thread_id}
-              onSelect={handleSelect}
-              onNewChat={handleNewChat}
-              onDelete={handleDelete}
-              closeMenu={() => setOpen(false)}
+              onDone={rename.stop}
             />
-          </DropdownMenuContent>
-        </DropdownMenu>
+          </div>
+        ) : (
+          <DropdownMenu open={open} onOpenChange={setOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="flex min-w-0 items-center gap-1.5"
+                title={tab.title}
+                data-testid="titlebar-chat-tab-trigger"
+              >
+                {icon}
+                <span className="max-w-[130px] truncate">{tab.title}</span>
+                {status && <StatusIndicator status={status} />}
+                <ChevronDown
+                  className={cn(
+                    "size-3 shrink-0 opacity-60 transition-transform duration-150",
+                    open && "rotate-180",
+                  )}
+                />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="max-h-[400px] w-72 overflow-y-auto"
+              data-testid="titlebar-chat-history"
+            >
+              <SessionHistoryList
+                sessions={sessions}
+                loading={loading}
+                activeThreadId={pane.thread_id}
+                onSelect={handleSelect}
+                onNewChat={handleNewChat}
+                onDelete={handleDelete}
+                closeMenu={() => setOpen(false)}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         <button
           type="button"
           data-no-drag
@@ -351,6 +413,6 @@ function ActiveChatTab({
           <X className="size-3" />
         </button>
       </div>
-    </>
+    </TabContextMenu>
   );
 }
