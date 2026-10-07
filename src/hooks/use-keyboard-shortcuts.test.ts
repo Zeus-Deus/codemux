@@ -144,6 +144,19 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
     expect(handled).toBe(false);
   });
 
+  it("leaves Settings open when a dialog inside it already handled the Escape", () => {
+    useUIStore.setState({ showSettings: true });
+    const consumed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    consumed.preventDefault();
+
+    expect(dispatch("closeOverlay", consumed)).toBe(false);
+    expect(useUIStore.getState().showSettings).toBe(true);
+
+    // A plain Escape still closes it.
+    expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(true);
+    expect(useUIStore.getState().showSettings).toBe(false);
+  });
+
   it("returns false for an unknown actionId", () => {
     // Sanity check — dispatch should not swallow unrelated actions even when
     // state that closeOverlay cares about is set.

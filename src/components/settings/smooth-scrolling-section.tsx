@@ -14,7 +14,7 @@ import { Switch } from "@/components/ui/switch";
 import { applySmoothScrolling } from "@/hooks/use-smooth-scrolling";
 import { isLinuxWebKitGtk } from "@/lib/webkit";
 import { selectSmoothScrolling, useSettingsStore } from "@/stores/settings-store";
-import { Eyebrow } from "@/components/ui/eyebrow";
+import { SettingRow, SubsectionHeader } from "./settings-primitives";
 
 export function SmoothScrollingSection() {
   const enabled = useSettingsStore(selectSmoothScrolling);
@@ -32,37 +32,18 @@ export function SmoothScrollingSection() {
 
   return (
     <section className="mt-10 first:mt-0">
-      <div className="mb-3 flex items-end justify-between gap-4">
-        <div className="min-w-0">
-          <Eyebrow>
-            Scrolling
-          </Eyebrow>
-          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
-            How the mouse wheel moves content in this webview.
-          </p>
-        </div>
-      </div>
+      <SubsectionHeader
+        title="Scrolling"
+        description="How the mouse wheel moves content in this webview."
+      />
       <div className="space-y-1">
-        <div className="flex items-center justify-between gap-8 py-4">
-          <div className="space-y-1 min-w-0">
-            <p className="text-body-lg font-semibold leading-tight text-foreground">
-              Smooth scrolling
-            </p>
-            <p className="text-body-sm text-muted-foreground/80 leading-relaxed">
-              Animate mouse-wheel scrolling instead of jumping straight to the
-              new position. Off by default: with a high-resolution or free-spin
-              wheel the animation falls behind, so scrolling faster makes the
-              page move slower. Applies immediately.
-            </p>
-          </div>
-          <div className="shrink-0">
-            <Switch
-              checked={enabled}
-              onCheckedChange={handleToggle}
-              aria-label="Toggle smooth scrolling"
-            />
-          </div>
-        </div>
+        <SettingRow
+          label="Smooth scrolling"
+          description="Animate mouse-wheel scrolling instead of jumping straight to the new position. Off by default: with a high-resolution or free-spin wheel the animation falls behind, so scrolling faster makes the page move slower. Applies immediately."
+          scope="device"
+        >
+          <Switch checked={enabled} onCheckedChange={handleToggle} />
+        </SettingRow>
       </div>
     </section>
   );

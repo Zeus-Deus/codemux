@@ -48,8 +48,9 @@ describe("synced-settings-store", () => {
       settings: DEFAULT_SETTINGS,
       isLoading: true,
       isSyncing: false,
+      syncIssue: null,
     });
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   describe("initial state", () => {
@@ -150,6 +151,37 @@ describe("synced-settings-store", () => {
       expect(state.settings.appearance.theme).toBe("dark");
       expect(state.isSyncing).toBe(false);
       expect(mockUpdateSetting).toHaveBeenCalledWith("appearance", "theme", "dark");
+      expect(state.syncIssue).toBeNull();
+    });
+
+    it("falls back to a full write that keeps the edit locally when the single-field write fails", async () => {
+      mockUpdateSetting.mockRejectedValue("Network error: offline");
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => settings);
+
+      await useSyncedSettingsStore.getState().updateSetting("terminal", "cursor_style", "block");
+
+      // The full write carries the edit the user made, not the old value.
+      expect(mockUpdateSyncedSettings).toHaveBeenCalledTimes(1);
+      expect(mockUpdateSyncedSettings.mock.calls[0][0].terminal.cursor_style).toBe("block");
+      const state = useSyncedSettingsStore.getState();
+      expect(state.settings.terminal.cursor_style).toBe("block");
+      expect(state.syncIssue).toBe("saved-locally");
+      expect(state.isSyncing).toBe(false);
+    });
+
+    it("reports a write that could not be saved anywhere, and clears it on the next success", async () => {
+      mockUpdateSetting.mockRejectedValueOnce("API error: 500");
+      mockUpdateSyncedSettings.mockRejectedValueOnce("API error: 500");
+
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+
+      mockUpdateSetting.mockResolvedValueOnce({
+        ...DEFAULT_SETTINGS,
+        git: { default_base_branch: "dev" },
+      });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
     });
   });
 

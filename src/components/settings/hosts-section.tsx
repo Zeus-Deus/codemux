@@ -32,6 +32,7 @@ import {
 } from "@/tauri/commands";
 import { useHostsStore } from "@/stores/hosts-store";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 
 /**
  * Settings → Hosts (Step 2 of cloud-push).
@@ -92,6 +93,7 @@ const DEVICE_KINDS: Array<{
 ];
 
 export function HostsSection() {
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const [hosts, setHosts] = useState<HostView[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -214,9 +216,12 @@ export function HostsSection() {
   }, []);
 
   const handleDelete = useCallback(async (host: HostView) => {
-    const confirmed = window.confirm(
-      `Remove "${host.name}" from your devices? Your SSH config and keys are not affected.`,
-    );
+    const confirmed = await confirm({
+      title: `Remove "${host.name}"?`,
+      description: "It leaves your devices list. Your SSH config and keys are not affected.",
+      confirmLabel: "Remove device",
+      destructive: true,
+    });
     if (!confirmed) return;
     try {
       await hostsDelete(host.id);
@@ -233,7 +238,7 @@ export function HostsSection() {
     } catch (err) {
       setError(typeof err === "string" ? err : String(err));
     }
-  }, [selectedId]);
+  }, [selectedId, confirm]);
 
   const handleTestConnection = useCallback(async (host: HostView) => {
     setTestingId(host.id);
@@ -264,14 +269,16 @@ export function HostsSection() {
         localStorage.getItem("codemux.hosts.autoInstallRemote") === "1";
       const consented =
         autoInstall ||
-        window.confirm(
-          `Install codemux-remote on ${host.name}?\n\n` +
-            `Codemux Remote is a small helper (~8 MB) that runs in your ` +
-            `user account on the host and lets your laptop run agents ` +
-            `there. No root access required. Source: github.com/Zeus-Deus/codemux\n\n` +
-            `Tip: enable "Always install automatically" in Settings → Hosts ` +
-            `to skip this prompt on new hosts.`,
-        );
+        (await confirm({
+          title: `Install codemux-remote on ${host.name}?`,
+          description:
+            "Codemux Remote is a small helper (~8 MB) that runs in your " +
+            "user account on the host and lets your laptop run agents " +
+            "there. No root access required. Source: github.com/Zeus-Deus/codemux. " +
+            'Turn on "Always install codemux-remote automatically" in Settings → Devices ' +
+            "to skip this prompt on new hosts.",
+          confirmLabel: "Install",
+        }));
       if (!consented) return;
       setInstallingId(host.id);
       try {
@@ -299,7 +306,7 @@ export function HostsSection() {
         setInstallingId(null);
       }
     },
-    [],
+    [confirm],
   );
 
   // Force a fresh codemux-remote onto the host and restart its daemon.
@@ -742,6 +749,7 @@ export function HostsSection() {
           </div>
         )}
       </div>
+      {confirmDialog}
     </div>
   );
 }

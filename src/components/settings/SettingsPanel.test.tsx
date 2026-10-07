@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, within, cleanup } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from "vitest";
+import { render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -19,6 +19,15 @@ let requestedSection: string | null = null;
 let navigationVersion = 0;
 const mockSignOut = vi.fn();
 const mockSettingsSet = vi.fn();
+const mockToastError = vi.fn();
+let mockWorkspaces: Array<Record<string, unknown>> = [
+  { workspace_id: "ws-1", project_root: "/tmp/proj" },
+];
+let mockActiveWorkspaceId: string | null = "ws-1";
+
+vi.mock("@/lib/toast", () => ({
+  toast: { error: (...args: unknown[]) => mockToastError(...args) },
+}));
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -44,8 +53,8 @@ vi.mock("@/stores/app-store", async (importOriginal) => ({
           ai_resolver_model: null,
           ai_resolver_strategy: "smart_merge",
         },
-        active_workspace_id: "ws-1",
-        workspaces: [{ workspace_id: "ws-1", project_root: "/tmp/proj" }],
+        active_workspace_id: mockActiveWorkspaceId,
+        workspaces: mockWorkspaces,
       },
     }),
 }));
@@ -111,10 +120,13 @@ vi.mock("@/stores/synced-settings-store", () => ({
         notifications: { sound_enabled: true, desktop_enabled: true },
       },
       updateSetting: vi.fn(),
+      isSyncing: false,
+      syncIssue: null,
     }),
   selectTerminalCursorStyle: () => "bar",
   selectDefaultEditor: () => "",
   selectDefaultBaseBranch: () => "main",
+  selectBrowserDefaultViewport: () => null,
   selectNotificationSoundEnabled: () => true,
   selectDesktopNotificationsEnabled: () => true,
 }));
@@ -137,6 +149,10 @@ vi.mock("@/tauri/commands", () => ({
   setPresetBarVisible: vi.fn().mockResolvedValue(undefined),
   deletePreset: vi.fn().mockResolvedValue(undefined),
   updatePreset: vi.fn().mockResolvedValue(undefined),
+  hasCodemuxinclude: vi.fn().mockResolvedValue(false),
+  getBrowserDataSize: vi.fn().mockResolvedValue(2048),
+  clearBrowserCookies: vi.fn().mockResolvedValue(undefined),
+  clearAllBrowserData: vi.fn().mockResolvedValue(undefined),
   // Usage section — needed so switching to it renders rather than
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
@@ -461,10 +477,8 @@ describe("SettingsPanel — Appearance Agents section", () => {
   it("renders the Sidebar subsection and toggling Show git stats writes sidebar.show_git_stats", () => {
     openAppearance();
     expect(screen.getAllByText("Show git stats").length).toBeGreaterThan(0);
-    const row = screen
-      .getAllByText("Show git stats")[0]
-      .closest("div")!.parentElement!;
-    const toggle = within(row).getByRole("switch");
+    // The row's label names its switch.
+    const [toggle] = screen.getAllByRole("switch", { name: "Show git stats" });
     fireEvent.click(toggle);
     expect(mockSettingsSet).toHaveBeenCalledWith(
       "sidebar.show_git_stats",
@@ -484,10 +498,9 @@ describe("SettingsPanel — Appearance Agents section", () => {
 
   it("toggling Match the orb to the activity writes agents.orb_match_activity", () => {
     openAppearance();
-    const row = screen
-      .getAllByText("Match the orb to the activity")[0]
-      .closest("div")!.parentElement!;
-    fireEvent.click(within(row).getByRole("switch"));
+    fireEvent.click(
+      screen.getAllByRole("switch", { name: "Match the orb to the activity" })[0],
+    );
     expect(mockSettingsSet).toHaveBeenCalledWith(
       "agents.orb_match_activity",
       "false",
@@ -565,5 +578,224 @@ describe("Settings footer navigation", () => {
     expect(view.getByRole("button", { name: "Unpin from footer" })).toBeInTheDocument();
     view.unmount();
     requestedSection = null;
+  });
+});
+
+describe("Settings destructive actions", () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    requestedSection = null;
+  });
+
+  const customPreset = {
+    id: "p-1",
+    name: "Review bot",
+    description: null,
+    commands: ["claude"],
+    working_directory: null,
+    launch_mode: "new_tab",
+    icon: "claude",
+    pinned: false,
+    is_builtin: false,
+    auto_run_on_workspace: false,
+    auto_run_on_new_tab: false,
+    kind: "cli",
+    launch_config: null,
+  };
+
+  it("asks before deleting a preset from the list, and only deletes on confirm", async () => {
+    vi.mocked(commands.getPresets).mockResolvedValueOnce({
+      presets: [customPreset],
+      bar_visible: true,
+      default_preset_id: null,
+    } as never);
+    requestedSection = "presets";
+    render(<SettingsView />);
+
+    const remove = await screen.findByRole("button", { name: "Delete preset Review bot" });
+    fireEvent.click(remove);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent('Delete "Review bot"?');
+    expect(commands.deletePreset).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(commands.deletePreset).not.toHaveBeenCalled();
+
+    fireEvent.click(remove);
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Delete preset" }),
+    );
+    await waitFor(() => expect(commands.deletePreset).toHaveBeenCalledWith("p-1"));
+  });
+
+  it("opens a preset's editor from the keyboard", async () => {
+    vi.mocked(commands.getPresets).mockResolvedValueOnce({
+      presets: [customPreset],
+      bar_visible: true,
+      default_preset_id: null,
+    } as never);
+    requestedSection = "presets";
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("button", { name: "Edit Review bot" });
+    expect(row.tagName).toBe("BUTTON");
+    fireEvent.click(row);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("clears browser data through the app's dialog, not window.confirm", async () => {
+    const nativeConfirm = vi.spyOn(window, "confirm");
+    requestedSection = "browser";
+    render(<SettingsView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear all data" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Clear all browser data?");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Clear all data" }));
+
+    await waitFor(() => expect(commands.clearAllBrowserData).toHaveBeenCalled());
+    expect(nativeConfirm).not.toHaveBeenCalled();
+    expect(await screen.findByRole("status")).toHaveTextContent("All browser data cleared.");
+    nativeConfirm.mockRestore();
+  });
+
+  it("shows a failed clear as an error, not a success", async () => {
+    vi.mocked(commands.clearBrowserCookies).mockRejectedValueOnce("profile locked");
+    requestedSection = "browser";
+    render(<SettingsView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear cookies" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Clear cookies" }),
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Couldn't clear cookies: profile locked");
+    expect(alert.querySelector(".bg-destructive")).not.toBeNull();
+  });
+});
+
+describe("Settings → Projects", () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    requestedSection = "projects";
+  });
+  afterEach(() => {
+    requestedSection = null;
+    mockWorkspaces = [{ workspace_id: "ws-1", project_root: "/tmp/proj" }];
+    mockActiveWorkspaceId = "ws-1";
+  });
+
+  it("offers to open a project instead of editable fields when there is none", () => {
+    mockWorkspaces = [];
+    mockActiveWorkspaceId = null;
+    render(<SettingsView />);
+
+    expect(screen.getByText("Open a project to configure its lifecycle scripts.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Open project/ })).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("e.g. npm install")).toBeNull();
+  });
+
+  it("edits another project without switching workspaces", async () => {
+    mockWorkspaces = [
+      { workspace_id: "ws-1", project_root: "/tmp/proj" },
+      { workspace_id: "ws-2", project_root: "/tmp/other" },
+    ];
+    render(<SettingsView />);
+
+    // Defaults to the active workspace's project.
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalledWith("/tmp/proj"));
+    const picker = screen.getByRole("combobox", { name: "Project" });
+    expect(picker).toHaveTextContent("proj");
+
+    // Radix Select reaches for pointer capture and scrolling jsdom lacks.
+    Element.prototype.hasPointerCapture ??= () => false;
+    Element.prototype.scrollIntoView ??= () => {};
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.keyDown(await screen.findByRole("option", { name: "other" }), { key: "Enter" });
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalledWith("/tmp/other"));
+    expect(screen.getByRole("combobox", { name: "Project" })).toHaveTextContent("other");
+  });
+
+  it("saves on blur only when something changed, then says so", async () => {
+    render(<SettingsView />);
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalled());
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+
+    fireEvent.change(setup, { target: { value: "npm ci" } });
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).toHaveBeenCalledWith("/tmp/proj", {
+      setup: ["npm ci"],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+    });
+    // Every field carries a hidden note; only the one just saved shows.
+    const visibleNotes = () =>
+      screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"));
+    await waitFor(() => expect(visibleNotes()).toHaveLength(1));
+    expect(visibleNotes()[0].closest(".space-y-2")).toContainElement(setup);
+  });
+
+  it("reports a failed save and keeps the edit dirty", async () => {
+    vi.mocked(commands.setProjectScripts).mockRejectedValueOnce("read-only");
+    render(<SettingsView />);
+    await waitFor(() => expect(commands.getProjectScripts).toHaveBeenCalled());
+    const run = screen.getByPlaceholderText("e.g. npm run dev");
+
+    fireEvent.change(run, { target: { value: "npm run dev" } });
+    fireEvent.blur(run);
+    await waitFor(() => expect(mockToastError).toHaveBeenCalled());
+    expect(mockToastError.mock.calls[0][0]).toBe("Couldn't save proj's scripts");
+
+    // Still dirty: the next blur tries again.
+    fireEvent.blur(run);
+    expect(commands.setProjectScripts).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Settings rows", () => {
+  beforeEach(() => {
+    cleanup();
+    requestedSection = "appearance";
+  });
+  afterEach(() => {
+    requestedSection = null;
+  });
+
+  it("marks settings that stay on this device", () => {
+    render(<SettingsView />);
+    const density = screen.getByRole("group", { name: "Density" });
+    expect(density).toHaveAccessibleDescription(/Only on this device/);
+    // Resource monitor syncs with the account, so it carries no mark.
+    expect(
+      screen.getByRole("switch", { name: "Resource monitor" }),
+    ).not.toHaveAccessibleDescription(/Only on this device/);
+  });
+
+  it("marks the Agent page's machine-local settings", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: true });
+    requestedSection = "agent";
+    render(<SettingsView />);
+    for (const name of [
+      "Auto-configure MCP for workspaces",
+      "Resume automatically after usage limits reset",
+    ]) {
+      expect(screen.getByRole("switch", { name })).toHaveAccessibleDescription(
+        /Only on this device/,
+      );
+    }
+    // Checkpoints sync with the account, so they carry no mark.
+    expect(
+      screen.getByRole("switch", { name: "Per-turn revert checkpoints" }),
+    ).not.toHaveAccessibleDescription(/Only on this device/);
   });
 });

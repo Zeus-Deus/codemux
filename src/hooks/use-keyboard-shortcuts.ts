@@ -82,12 +82,16 @@ export function useKeyboardShortcuts() {
  * event; the command palette calls it without one, so a palette row and its
  * shortcut always execute the exact same code path.
  */
-export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
+export function dispatch(actionId: string, e?: KeyboardEvent): boolean {
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
   // ── Close overlay (Escape) — conditional ──
   if (actionId === "closeOverlay") {
+    // A dialog, sheet or popover already took this Escape (Radix marks it
+    // handled). Closing the page behind it as well would, say, cancel a
+    // confirm in Settings and throw you out of Settings in one press.
+    if (e?.defaultPrevented) return false;
     // Onboarding is a full-view replacement, not a modal — prioritize it over
     // dismissible overlays so Escape always provides an escape hatch.
     if (ui.onboardingProjectDir) {

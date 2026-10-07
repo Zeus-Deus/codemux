@@ -65,6 +65,7 @@ import type {
 } from "@/tauri/types";
 
 import { useQrSvg } from "./use-qr-svg";
+import { SectionHeader } from "./settings-primitives";
 import {
   approvedSessions,
   BIND_SCOPE_OPTIONS,
@@ -1577,16 +1578,20 @@ export function RemoteAccessSection() {
     <div className="space-y-8 [contain:inline-size]">
       {/* Header + kill switch */}
       <div className="space-y-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <MonitorSmartphone className="size-4 text-accent-ember" />
-              <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
-                Remote Access
-              </h2>
-            </div>
-            <p className="mt-1.5 max-w-prose text-body-lg leading-relaxed text-muted-foreground/80">
-              {enabled ? (
+        <SectionHeader
+          title="Remote Access"
+          icon={<MonitorSmartphone className="size-4 text-accent-ember" />}
+          action={
+            <Switch
+              checked={enabled}
+              onCheckedChange={handleToggle}
+              disabled={togglePending}
+              aria-label="Toggle remote access"
+              className="mt-1.5"
+            />
+          }
+          description={
+            enabled ? (
                 <>
                   {machineName ? (
                     <>
@@ -1601,17 +1606,9 @@ export function RemoteAccessSection() {
                 </>
               ) : (
                 "Open this desktop in a browser on your phone or another computer, and drive the same projects, sessions, and agents from there."
-              )}
-            </p>
-          </div>
-          <Switch
-            checked={enabled}
-            onCheckedChange={handleToggle}
-            disabled={togglePending}
-            aria-label="Toggle remote access"
-            className="mt-1.5"
-          />
-        </div>
+              )
+          }
+        />
 
         {/* Exposure — what this configuration actually opens. */}
         <div className="flex items-start gap-2.5 rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3">

@@ -35,10 +35,16 @@ const DEFAULT_SETTINGS: UserSettings = {
   browser: { default_viewport: null },
 };
 
+/** How the last write went when it did not reach your account:
+ *  `saved-locally` is on this machine and syncs on the next refresh;
+ *  `failed` was not saved anywhere. `null` once a write succeeds. */
+export type SyncIssue = "saved-locally" | "failed";
+
 export interface SyncedSettingsState {
   settings: UserSettings;
   isLoading: boolean;
   isSyncing: boolean;
+  syncIssue: SyncIssue | null;
 }
 
 interface SyncedSettingsActions {
@@ -126,10 +132,15 @@ function finishWrite(
   }
 }
 
-export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
+function sameSession(token: SettingsOperationToken): boolean {
+  return token.sessionGeneration === _sessionGen;
+}
+
+export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) => ({
   settings: DEFAULT_SETTINGS,
   isLoading: true,
   isSyncing: false,
+  syncIssue: null,
 
   loadSettings: async () => {
     const sessionGeneration = _sessionGen;
@@ -150,9 +161,11 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
     try {
       const saved = await updateSyncedSettings(settings);
       if (isCurrent(token)) set({ settings: saved });
+      if (sameSession(token)) set({ syncIssue: null });
     } catch {
-      // Keep the optimistic value. The backend owns offline persistence and
-      // the next explicit refresh will reconcile it.
+      // Keep the optimistic value. A full write already saves locally when
+      // the server is unreachable, so an error here was not saved at all.
+      if (sameSession(token)) set({ syncIssue: "failed" });
     } finally {
       finishWrite(token, set);
     }
@@ -188,9 +201,18 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
           updateSyncedSettings(corrected).catch(() => {});
         }
       }
+      if (sameSession(token)) set({ syncIssue: null });
     } catch {
-      // Keep the optimistic value. The backend owns offline persistence and
-      // the next explicit refresh will reconcile it.
+      // A single-field write has no offline path in the backend: it fails
+      // without touching the local cache, so the edit would vanish on the
+      // next refresh. A full write does save locally and syncs later, so
+      // fall back to it with everything the user currently sees.
+      try {
+        await updateSyncedSettings(get().settings);
+        if (sameSession(token)) set({ syncIssue: "saved-locally" });
+      } catch {
+        if (sameSession(token)) set({ syncIssue: "failed" });
+      }
     } finally {
       finishWrite(token, set);
     }
@@ -202,9 +224,11 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
     try {
       const saved = await resetSyncedSettings();
       if (isCurrent(token)) set({ settings: saved });
+      if (sameSession(token)) set({ syncIssue: null });
     } catch {
       // Keep the optimistic defaults. The backend owns offline persistence and
       // the next explicit refresh will reconcile them.
+      if (sameSession(token)) set({ syncIssue: "failed" });
     } finally {
       finishWrite(token, set);
     }
@@ -257,7 +281,7 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
     _settingsGen += 1;
     _inflightWrites.clear();
     _inflightRemoteReconciles.clear();
-    set({ settings, isLoading: false, isSyncing: false });
+    set({ settings, isLoading: false, isSyncing: false, syncIssue: null });
   },
 }));
 
