@@ -34,7 +34,9 @@ describe("openNotificationTarget", () => {
   });
 
   it("opens the workspace, then the agent's pane", async () => {
-    await openNotificationTarget({ workspace_id: "ws-1", pane_id: "pane-7" });
+    expect(
+      await openNotificationTarget({ workspace_id: "ws-1", pane_id: "pane-7" }),
+    ).toBe(true);
 
     expect(activateWorkspaceInteraction).toHaveBeenCalledWith("ws-1");
     expect(activatePane).toHaveBeenCalledWith("pane-7");
@@ -46,7 +48,9 @@ describe("openNotificationTarget", () => {
 
   it("says so instead of switching when the workspace has closed", async () => {
     workspaces = [];
-    await openNotificationTarget({ workspace_id: "ws-1", pane_id: "pane-7" });
+    expect(
+      await openNotificationTarget({ workspace_id: "ws-1", pane_id: "pane-7" }),
+    ).toBe(false);
 
     expect(activateWorkspaceInteraction).not.toHaveBeenCalled();
     expect(toastInfo).toHaveBeenCalledWith("This workspace is no longer open.");
@@ -54,7 +58,9 @@ describe("openNotificationTarget", () => {
 
   it("reports a failed switch", async () => {
     activateWorkspaceInteraction.mockRejectedValue(new Error("boom"));
-    await openNotificationTarget({ workspace_id: "ws-1", pane_id: "pane-7" });
+    expect(
+      await openNotificationTarget({ workspace_id: "ws-1", pane_id: "pane-7" }),
+    ).toBe(false);
 
     expect(activatePane).not.toHaveBeenCalled();
     expect(toastError).toHaveBeenCalledWith("Could not open the agent", {
