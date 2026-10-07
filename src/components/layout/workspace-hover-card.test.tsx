@@ -765,12 +765,16 @@ describe("WorkspaceHoverCard — hover timing", () => {
     advance(1000);
     expect(card()).toBeNull();
 
+    // Closing hands the pointer and focus back to the row; neither may pop
+    // the card over the menu that was just dismissed.
     setMenuOpen(false);
+    pointerEnter(alpha);
     fireEvent.blur(alpha);
     fireEvent.focus(alpha);
     advance(1000);
     expect(card()).toBeNull();
 
+    pointerLeave(alpha);
     pointerEnter(alpha);
     advance(OPEN_DELAY_MS);
     expect(card()).not.toBeNull();

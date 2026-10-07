@@ -137,8 +137,9 @@ export function WorkspaceHoverCard({
   }, []);
 
   // The modal menu makes the row lose the pointer, which would clear the
-  // suppression; hold it from the menu opening until the pointer next
-  // crosses the row's edge, so focus returning on close cannot pop the card.
+  // suppression; hold it from the menu opening until the pointer leaves the
+  // row after the menu closes, so neither focus returning nor the pointer
+  // being handed back to the row can pop the card over the dismissed menu.
   useEffect(() => {
     menuOpenRef.current = menuOpen;
     if (!menuOpen) return;
@@ -167,9 +168,6 @@ export function WorkspaceHoverCard({
           // Capture also catches nested row actions that stop propagation.
           suppressUntilPointerLeave.current = true;
           setCardState((prev) => ({ ...prev, open: false }));
-        }}
-        onPointerEnter={() => {
-          if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;
         }}
         onPointerLeave={() => {
           if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;
