@@ -472,6 +472,29 @@ pub struct PlanUsageWindow {
     /// Provider-supplied name, kept for `Other` windows and tooltips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Length of the window in minutes, when known. Lets the UI place the
+    /// "even spending" mark: how far into the window the clock is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_mins: Option<i64>,
+}
+
+/// Minutes in the rolling five-hour window.
+pub const FIVE_HOUR_WINDOW_MINS: i64 = 5 * 60;
+/// Minutes in a weekly window.
+pub const SEVEN_DAY_WINDOW_MINS: i64 = 7 * 24 * 60;
+
+impl PlanWindowKind {
+    /// The window length a kind implies, for providers that report the kind
+    /// but not the duration.
+    pub fn implied_window_mins(self) -> Option<i64> {
+        match self {
+            Self::FiveHour => Some(FIVE_HOUR_WINDOW_MINS),
+            Self::SevenDay | Self::SevenDayOpus | Self::SevenDaySonnet => {
+                Some(SEVEN_DAY_WINDOW_MINS)
+            }
+            Self::Overage | Self::Other => None,
+        }
+    }
 }
 
 /// The canonical event stream produced by every provider.

@@ -1546,7 +1546,7 @@ fn is_recoverable_resume_error(err_msg: &str) -> bool {
 /// The wire values are lowercase tags (`"pro"`, `"plus"`); the dashboard
 /// wants something a human recognizes. Unknown tags are title-cased and
 /// passed through rather than dropped, so a new plan still shows a name.
-fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
+pub(crate) fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
     let plan = plan_type?.trim();
     if plan.is_empty() {
         return None;

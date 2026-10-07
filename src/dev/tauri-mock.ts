@@ -79,6 +79,9 @@ import {
   mockWebRemoteEndpoints,
   mockUsageSummary,
   mockUsageExportCsv,
+  mockUsageQuota,
+  mockUsagePriceOverrides,
+  mockSetUsagePriceOverride,
   mockWebRemotePairing,
   mockWebRemoteSessions,
   richChatTurnEnvelopes,
@@ -3487,6 +3490,26 @@ const handlers: Record<string, Handler> = {
     rows_updated: 0,
     reimported: false,
   }),
+  // Plan limits as a direct read would report them: Claude and Codex
+  // answer, after a short delay like the real CLI spawn.
+  usage_refresh_quota: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const now = Date.now();
+    return {
+      quota: mockUsageQuota(now),
+      statuses: [
+        { provider: "claude", outcome: "ok" },
+        { provider: "codex", outcome: "ok" },
+      ],
+      refreshed_at_ms: now,
+    };
+  },
+  usage_price_overrides: () => mockUsagePriceOverrides(),
+  usage_set_price_override: (args: Args) =>
+    mockSetUsagePriceOverride(
+      String(args.model ?? ""),
+      (args.price as Parameters<typeof mockSetUsagePriceOverride>[1]) ?? null,
+    ),
 
   skills_sync_now: () => ({
     pushedCount: 0,

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::agent_provider::{PlanAuthMode, PlanUsageWindow};
+use crate::agent_provider::{PlanAuthMode, PlanUsageWindow, PlanWindowKind};
 use crate::database::{DatabaseStore, UsageLedgerRow};
 
 /// Live plan-quota readings, keyed by provider.
@@ -54,6 +54,11 @@ impl PlanQuotaStore {
     ///
     /// Within a field the newest value wins — an empty `windows` list is
     /// treated as "nothing to say", not as "no quota".
+    ///
+    /// Windows merge one by one rather than replacing the list: Claude's
+    /// streamed `rate_limit_event` names a single window, and replacing the
+    /// list with it would drop every other window a direct read (see
+    /// [`replace_windows`](Self::replace_windows)) established.
     pub fn record(
         &self,
         provider: &str,
@@ -66,9 +71,39 @@ impl PlanQuotaStore {
             return;
         };
         let entry = map.entry(provider.to_string()).or_default();
-        if !windows.is_empty() {
-            entry.windows = windows;
+        // Rows already updated by this call. Codex can report both of its
+        // windows under one key (label-less `other`); each must update its
+        // own row, in order, rather than both landing on the first.
+        let mut updated = Vec::new();
+        for window in windows {
+            updated.push(merge_window(&mut entry.windows, window, &updated));
         }
+        if plan_label.is_some() {
+            entry.plan_label = plan_label;
+        }
+        if auth_mode.is_some() {
+            entry.auth_mode = auth_mode;
+        }
+        entry.received_at_ms = received_at_ms;
+    }
+
+    /// Record a direct limits read (see `usage_quota`). Unlike
+    /// [`record`](Self::record), the windows replace the previous ones even
+    /// when empty: a read that found no limits means none apply now, and a
+    /// stale bar from an earlier session would claim otherwise.
+    pub fn replace_windows(
+        &self,
+        provider: &str,
+        windows: Vec<PlanUsageWindow>,
+        plan_label: Option<String>,
+        auth_mode: Option<PlanAuthMode>,
+        received_at_ms: i64,
+    ) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        let entry = map.entry(provider.to_string()).or_default();
+        entry.windows = windows;
         if plan_label.is_some() {
             entry.plan_label = plan_label;
         }
@@ -108,6 +143,74 @@ impl PlanQuotaStore {
         let map = self.inner.lock().ok()?;
         earliest_exhausted_reset(&map.get(provider)?.windows, now_ms)
     }
+}
+
+/// The streamed name for the weekly bucket of the model included in overage.
+/// A direct read names the same bucket by the model's display name instead.
+const OVERAGE_INCLUDED_EVENT_LABEL: &str = "seven_day_overage_included";
+/// Label prefix the direct read gives model-scoped weekly windows.
+const MODEL_SCOPED_WEEKLY_PREFIX: &str = "Weekly · ";
+/// Label of the streamed overage window, which carries no utilization.
+const STREAMED_OVERAGE_LABEL: &str = "overage";
+
+/// Whether `incoming` is a new reading of the window `existing` describes.
+fn same_window(existing: &PlanUsageWindow, incoming: &PlanUsageWindow) -> bool {
+    match incoming.kind {
+        // An account has a single overage bucket, however it is named.
+        PlanWindowKind::Overage => existing.kind == PlanWindowKind::Overage,
+        PlanWindowKind::Other
+            if incoming.label.as_deref() == Some(OVERAGE_INCLUDED_EVENT_LABEL) =>
+        {
+            existing.kind == PlanWindowKind::Other
+                && existing.label.as_deref().is_some_and(|label| {
+                    label == OVERAGE_INCLUDED_EVENT_LABEL
+                        || label.starts_with(MODEL_SCOPED_WEEKLY_PREFIX)
+                })
+        }
+        _ => existing.kind == incoming.kind && existing.label == incoming.label,
+    }
+}
+
+/// Put `incoming` in place of the window it updates, or add it. Rows in
+/// `skip` were already updated by the same report and are not matched again.
+/// Returns the index of the row `incoming` landed in.
+fn merge_window(
+    windows: &mut Vec<PlanUsageWindow>,
+    incoming: PlanUsageWindow,
+    skip: &[usize],
+) -> usize {
+    let found = windows
+        .iter()
+        .enumerate()
+        .position(|(i, w)| !skip.contains(&i) && same_window(w, &incoming));
+    let Some(index) = found else {
+        windows.push(incoming);
+        return windows.len() - 1;
+    };
+    let existing = &mut windows[index];
+    // The streamed overage window only says overage is in use; its 0% is a
+    // placeholder, not a reading, so it must not erase a real one.
+    if incoming.kind == PlanWindowKind::Overage
+        && incoming.label.as_deref() == Some(STREAMED_OVERAGE_LABEL)
+    {
+        if incoming.resets_at_ms.is_some() {
+            existing.resets_at_ms = incoming.resets_at_ms;
+        }
+        return index;
+    }
+    // Keep the direct read's display name and length when a streamed update
+    // names the same window more tersely.
+    let label = if incoming.label.as_deref() == Some(OVERAGE_INCLUDED_EVENT_LABEL) {
+        existing.label.take()
+    } else {
+        incoming.label
+    };
+    *existing = PlanUsageWindow {
+        label,
+        window_mins: incoming.window_mins.or(existing.window_mins),
+        ..incoming
+    };
+    index
 }
 
 /// A window counts as exhausted at or above this percentage. Slightly below
@@ -224,6 +327,9 @@ pub struct CostConfidence {
     pub provider_reported_share: f64,
     /// Share of total cost priced from the static table, 0–1.
     pub table_priced_share: f64,
+    /// Share of total cost priced from user overrides, 0–1.
+    #[serde(default)]
+    pub override_priced_share: f64,
     /// Share of **tokens** from rows with no price at all, 0–1.
     ///
     /// Tokens rather than cost on purpose: an unpriced row contributes
@@ -231,6 +337,74 @@ pub struct CostConfidence {
     /// the thing this row exists to surface.
     pub unpriced_token_share: f64,
     pub cache_savings_usd: f64,
+}
+
+/// Cost split by the kind of token that incurred it.
+///
+/// Rows priced from known rates (the static table or a user override) split
+/// exactly along those rates. A provider-reported cost is split with the
+/// table's rates as weights when the model is known; otherwise it has no
+/// rates to split by and lands in `unsplit`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CategoryCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub unsplit: f64,
+}
+
+impl CategoryCost {
+    fn add(&mut self, other: &CategoryCost) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.unsplit += other.unsplit;
+    }
+}
+
+/// A per-model price the user entered, USD per million tokens. Overrides
+/// win over both the static table and provider-reported costs, so a model
+/// the table does not know can be priced, and a stale rate corrected.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PriceOverride {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl PriceOverride {
+    fn is_valid(&self) -> bool {
+        [self.input, self.output, self.cache_read, self.cache_write]
+            .iter()
+            .all(|rate| rate.is_finite() && *rate >= 0.0)
+    }
+
+    fn from_rates(rates: crate::agent_provider::pricing::ModelRates) -> Self {
+        Self {
+            input: rates.input,
+            output: rates.output,
+            cache_read: rates.cache_read,
+            cache_write: rates.cache_write,
+        }
+    }
+
+    fn cost_usd(&self, row: &UsageLedgerRow) -> f64 {
+        let [input, output, cache_read, cache_write] = self.category_weights(row);
+        (input + output + cache_read + cache_write) / 1_000_000.0
+    }
+
+    /// Per-category `tokens × rate`, before the per-million scale.
+    fn category_weights(&self, row: &UsageLedgerRow) -> [f64; 4] {
+        [
+            row.input_tokens as f64 * self.input,
+            row.output_tokens as f64 * self.output,
+            row.cache_read_tokens as f64 * self.cache_read,
+            row.cache_write_tokens as f64 * self.cache_write,
+        ]
+    }
 }
 
 /// One row of the flat, cross-provider model breakdown.
@@ -246,6 +420,24 @@ pub struct FlatModelUsage {
     /// True when any of this model's cost came from the provider's own
     /// catalogue rather than the static table.
     pub provider_reported: bool,
+    /// True when a user price override priced this model.
+    pub price_overridden: bool,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// Informational subset of `output_tokens`.
+    pub reasoning_tokens: i64,
+    /// Tokens from rows with no price at all.
+    pub unpriced_tokens: i64,
+    pub session_count: i64,
+    pub category_cost: CategoryCost,
+    /// The rates this model is priced at (override, else static table), so
+    /// the UI can show them and prefill the price editor.
+    pub rates: Option<PriceOverride>,
+    /// This model's slice of every summary bucket, index-aligned with
+    /// [`UsageSummary::buckets`], for the model's own trend chart.
+    pub buckets: Vec<BucketSlice>,
 }
 
 /// Everything one Settings → Usage render needs.
@@ -260,6 +452,8 @@ pub struct UsageSummary {
     pub providers: Vec<ProviderUsage>,
     pub totals: UsageTotals,
     pub composition: UsageComposition,
+    /// The period's cost split by token kind.
+    pub category_cost: CategoryCost,
     pub confidence: CostConfidence,
     /// Flat cross-provider model breakdown, most expensive first.
     pub models: Vec<FlatModelUsage>,
@@ -342,6 +536,20 @@ fn summarize(
     tz_offset_minutes: i32,
     quota: HashMap<String, ProviderQuota>,
 ) -> UsageSummary {
+    summarize_priced(rows, period, now_ms, tz_offset_minutes, quota, &HashMap::new())
+}
+
+/// [`summarize`] with the user's price overrides, which `rows` must already
+/// carry (see [`apply_price_overrides`]); here they only supply the rates
+/// that split costs by type.
+fn summarize_priced(
+    rows: &[UsageLedgerRow],
+    period: Period,
+    now_ms: i64,
+    tz_offset_minutes: i32,
+    quota: HashMap<String, ProviderQuota>,
+    overrides: &HashMap<String, PriceOverride>,
+) -> UsageSummary {
     let bucket_ms = period.bucket_ms();
     let count = period.bucket_count();
     let offset_ms = tz_offset_minutes as i64 * 60_000;
@@ -383,7 +591,9 @@ fn summarize(
     let mut composition = UsageComposition::default();
     let mut provider_cost = 0.0_f64;
     let mut table_cost = 0.0_f64;
+    let mut override_cost = 0.0_f64;
     let mut unpriced_tokens: i64 = 0;
+    let mut category_cost = CategoryCost::default();
 
     for row in rows {
         if row.created_at < start_ms || row.created_at >= end_ms {
@@ -393,6 +603,8 @@ fn summarize(
         let cost = row.cost_usd.unwrap_or(0.0);
 
         let index = ((row.created_at - start_ms).div_euclid(bucket_ms)) as usize;
+        let split = split_cost(row, cost, overrides);
+        category_cost.add(&split);
         if let Some(bucket) = buckets.get_mut(index) {
             let slice = bucket.providers.entry(row.provider.clone()).or_default();
             slice.tokens += tokens;
@@ -425,10 +637,28 @@ fn summarize(
             .or_default();
         flat.tokens += tokens;
         flat.cost += cost;
+        flat.input += row.input_tokens;
+        flat.output += row.output_tokens;
+        flat.cache_read += row.cache_read_tokens;
+        flat.cache_write += row.cache_write_tokens;
+        flat.reasoning += row.reasoning_tokens;
+        flat.threads.insert(row.thread_id.clone());
+        flat.category_cost.add(&split);
+        if flat.buckets.is_empty() {
+            flat.buckets = vec![BucketSlice::default(); count as usize];
+        }
+        if let Some(slice) = flat.buckets.get_mut(index) {
+            slice.tokens += tokens;
+            slice.cost_usd += cost;
+        }
         if row.cost_usd.is_some() {
             flat.priced = true;
+        } else {
+            flat.unpriced_tokens += tokens;
         }
-        if row.cost_source.as_deref() == Some("provider") {
+        if row.cost_source.as_deref() == Some("override") {
+            flat.price_overridden = true;
+        } else if row.cost_source.as_deref() == Some("provider") {
             flat.provider_reported = true;
         } else if row.cost_source.as_deref() == Some("table") {
             flat.table_observed_input += row.observed_input();
@@ -448,6 +678,7 @@ fn summarize(
         match row.cost_source.as_deref() {
             Some("provider") => provider_cost += cost,
             Some("table") => table_cost += cost,
+            Some("override") => override_cost += cost,
             _ => unpriced_tokens += tokens,
         }
 
@@ -512,8 +743,13 @@ fn summarize(
         0.0
     };
 
-    let total_cost = provider_cost + table_cost;
+    let total_cost = provider_cost + table_cost + override_cost;
     let confidence = CostConfidence {
+        override_priced_share: if total_cost > 0.0 {
+            override_cost / total_cost
+        } else {
+            0.0
+        },
         provider_reported_share: if total_cost > 0.0 {
             provider_cost / total_cost
         } else {
@@ -537,13 +773,27 @@ fn summarize(
     // through the middle of the table.
     let mut models: Vec<FlatModelUsage> = flat_acc
         .into_iter()
-        .map(|((provider, model), acc)| FlatModelUsage {
-            provider,
-            model,
-            tokens: acc.tokens,
-            cost_usd: acc.cost,
-            priced: acc.priced,
-            provider_reported: acc.provider_reported,
+        .map(|((provider, model), acc)| {
+            let rates = model_rates(&model, overrides);
+            FlatModelUsage {
+                provider,
+                model,
+                tokens: acc.tokens,
+                cost_usd: acc.cost,
+                priced: acc.priced,
+                provider_reported: acc.provider_reported,
+                price_overridden: acc.price_overridden,
+                input_tokens: acc.input,
+                output_tokens: acc.output,
+                cache_read_tokens: acc.cache_read,
+                cache_write_tokens: acc.cache_write,
+                reasoning_tokens: acc.reasoning,
+                unpriced_tokens: acc.unpriced_tokens,
+                session_count: acc.threads.len() as i64,
+                category_cost: acc.category_cost,
+                rates,
+                buckets: acc.buckets,
+            }
         })
         .collect();
     models.sort_by(|a, b| {
@@ -566,10 +816,89 @@ fn summarize(
         providers,
         totals,
         composition,
+        category_cost,
         confidence,
         models,
         quota,
         synced_at_ms: now_ms,
+    }
+}
+
+/// The rates a model is priced at: the user's override, else the table's.
+fn model_rates(model: &str, overrides: &HashMap<String, PriceOverride>) -> Option<PriceOverride> {
+    overrides
+        .get(model.trim())
+        .copied()
+        .or_else(|| crate::agent_provider::pricing::lookup(model).map(PriceOverride::from_rates))
+}
+
+/// Split one row's cost across token kinds. See [`CategoryCost`].
+///
+/// The split is proportional to `tokens × rate` and always sums to the
+/// row's recorded cost, so the categories reconcile with every other total
+/// on the page even where the recorded figure includes something the rates
+/// cannot see (a 1-hour cache-write premium, a provider's own pricing).
+fn split_cost(
+    row: &UsageLedgerRow,
+    cost: f64,
+    overrides: &HashMap<String, PriceOverride>,
+) -> CategoryCost {
+    if cost <= 0.0 {
+        return CategoryCost::default();
+    }
+    let rates = row.model.as_deref().and_then(|model| model_rates(model, overrides));
+    let Some(rates) = rates else {
+        return CategoryCost {
+            unsplit: cost,
+            ..CategoryCost::default()
+        };
+    };
+    let weights = rates.category_weights(row);
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return CategoryCost {
+            unsplit: cost,
+            ..CategoryCost::default()
+        };
+    }
+    let part = |weight: f64| cost * weight / total;
+    CategoryCost {
+        input: part(weights[0]),
+        output: part(weights[1]),
+        cache_read: part(weights[2]),
+        cache_write: part(weights[3]),
+        unsplit: 0.0,
+    }
+}
+
+/// Settings key holding the user's per-model price overrides as JSON.
+const PRICE_OVERRIDES_KEY: &str = "usage.price_overrides";
+
+/// Serializes read-modify-write of the overrides map. Tauri runs commands
+/// concurrently, so a Remove and an Edit in quick succession could otherwise
+/// both read the old map and one would overwrite the other's change.
+static PRICE_OVERRIDES_LOCK: Mutex<()> = Mutex::new(());
+
+fn load_price_overrides(db: &DatabaseStore) -> HashMap<String, PriceOverride> {
+    db.get_setting(PRICE_OVERRIDES_KEY)
+        .and_then(|raw| serde_json::from_str::<HashMap<String, PriceOverride>>(&raw).ok())
+        .map(|map| map.into_iter().filter(|(_, price)| price.is_valid()).collect())
+        .unwrap_or_default()
+}
+
+/// Re-price rows whose model has a user override. Ledger rows freeze their
+/// cost at import time, so overrides apply on read and never rewrite the
+/// cache: removing an override restores the original figures.
+fn apply_price_overrides(rows: &mut [UsageLedgerRow], overrides: &HashMap<String, PriceOverride>) {
+    if overrides.is_empty() {
+        return;
+    }
+    for row in rows {
+        let Some(price) = row.model.as_deref().and_then(|m| overrides.get(m.trim())) else {
+            continue;
+        };
+        row.cost_usd = Some(price.cost_usd(row));
+        row.cost_source = Some("override".to_string());
     }
 }
 
@@ -598,6 +927,16 @@ struct ModelAcc {
 struct FlatAcc {
     tokens: i64,
     cost: f64,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+    unpriced_tokens: i64,
+    threads: HashSet<String>,
+    category_cost: CategoryCost,
+    buckets: Vec<BucketSlice>,
+    price_overridden: bool,
     /// Savings only compare rows priced by the same static table.
     table_observed_input: i64,
     table_output: i64,
@@ -715,8 +1054,53 @@ pub async fn usage_summary(
     // because the local-time alignment can shift the window by up to a
     // full bucket in either direction.
     let since = now - (period.bucket_count() + 2) * period.bucket_ms();
-    let rows = db.usage_rows_since(since)?;
-    Ok(summarize(&rows, period, now, tz_offset_minutes, quota.snapshot()))
+    let mut rows = db.usage_rows_since(since)?;
+    let overrides = load_price_overrides(&db);
+    apply_price_overrides(&mut rows, &overrides);
+    Ok(summarize_priced(
+        &rows,
+        period,
+        now,
+        tz_offset_minutes,
+        quota.snapshot(),
+        &overrides,
+    ))
+}
+
+/// The user's per-model price overrides.
+#[tauri::command]
+pub async fn usage_price_overrides(
+    db: State<'_, DatabaseStore>,
+) -> Result<HashMap<String, PriceOverride>, String> {
+    Ok(load_price_overrides(&db))
+}
+
+/// Set (or, with `price: None`, remove) one model's price override.
+/// Returns every override after the change.
+#[tauri::command]
+pub async fn usage_set_price_override(
+    model: String,
+    price: Option<PriceOverride>,
+    db: State<'_, DatabaseStore>,
+) -> Result<HashMap<String, PriceOverride>, String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("model must not be empty".into());
+    }
+    let _guard = PRICE_OVERRIDES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut overrides = load_price_overrides(&db);
+    match price {
+        Some(price) if price.is_valid() => {
+            overrides.insert(model, price);
+        }
+        Some(_) => return Err("prices must be non-negative numbers".into()),
+        None => {
+            overrides.remove(&model);
+        }
+    }
+    let raw = serde_json::to_string(&overrides).map_err(|e| e.to_string())?;
+    db.set_setting(PRICE_OVERRIDES_KEY, &raw)?;
+    Ok(overrides)
 }
 
 /// Clamp a client-supplied timezone offset to the range real zones use.
@@ -743,7 +1127,9 @@ pub async fn usage_export_csv(
     let tz_offset_minutes = sanitize_tz_offset(tz_offset_minutes);
     let now = now_ms();
     let since = now - (period.bucket_count() + 2) * period.bucket_ms();
-    let rows = db.usage_rows_since(since)?;
+    let mut rows = db.usage_rows_since(since)?;
+    // The export carries the same prices the page shows.
+    apply_price_overrides(&mut rows, &load_price_overrides(&db));
     // The CSV is a history export; live quota levels have no place in it.
     Ok(to_csv(&rows, period, now, tz_offset_minutes))
 }
@@ -857,6 +1243,86 @@ mod tests {
     /// arithmetic in the timezone tests below reads directly (UTC hour 0
     /// → hour 2 at UTC+2, hour 19 the previous day at UTC-5).
     const NOW: i64 = 1_799_971_200_000;
+
+    // ── cost by type, per-model detail, price overrides ──
+
+    #[test]
+    fn table_priced_cost_splits_along_the_rates_and_reconciles() {
+        // claude-opus-4-5: $5 in / $25 out / $0.50 read / $6.25 write.
+        let r = row(NOW - 1_000, "claude", "claude-opus-4-5", [1_000_000, 1_000_000, 0, 0], 30.0);
+        let s = summarize(&[r], Period::Today, NOW, 0, HashMap::new());
+        let c = &s.category_cost;
+        assert!((c.input - 5.0).abs() < 1e-9);
+        assert!((c.output - 25.0).abs() < 1e-9);
+        assert_eq!(c.unsplit, 0.0);
+        assert!((c.input + c.output + c.cache_read + c.cache_write - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_model_cost_is_unsplit() {
+        let mut r = row(NOW - 1_000, "opencode", "some/unknown-model", [10, 10, 0, 0], 1.5);
+        r.cost_source = Some("provider".into());
+        let s = summarize(&[r], Period::Today, NOW, 0, HashMap::new());
+        assert_eq!(s.category_cost.unsplit, 1.5);
+        assert_eq!(s.category_cost.input, 0.0);
+    }
+
+    #[test]
+    fn flat_models_carry_token_split_sessions_rates_and_a_trend() {
+        let mut a = row(NOW - 1_000, "claude", "claude-opus-4-5", [100, 50, 400, 25], 1.0);
+        a.reasoning_tokens = 10;
+        let mut b = row(NOW - 3 * HOUR_MS, "claude", "claude-opus-4-5", [100, 50, 0, 0], 2.0);
+        b.thread_id = "t2".into();
+        let s = summarize(&[a, b], Period::Today, NOW, 0, HashMap::new());
+        let m = &s.models[0];
+        assert_eq!(
+            (m.input_tokens, m.output_tokens, m.cache_read_tokens, m.cache_write_tokens),
+            (200, 100, 400, 25)
+        );
+        assert_eq!(m.reasoning_tokens, 10);
+        assert_eq!(m.session_count, 2);
+        assert_eq!(m.unpriced_tokens, 0);
+        assert_eq!(m.rates.map(|r| r.input), Some(5.0));
+        assert_eq!(m.buckets.len(), s.buckets.len());
+        assert_eq!(m.buckets.iter().map(|b| b.tokens).sum::<i64>(), m.tokens);
+        // NOW is a bucket boundary, so NOW - 1s lands in the second-newest bucket.
+        assert!((m.buckets[22].cost_usd - 1.0).abs() < 1e-9);
+        assert!((m.buckets[20].cost_usd - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_override_reprices_unpriced_and_table_rows() {
+        let mut unpriced = row(NOW - 1_000, "opencode", "openrouter/kimi-k2", [1_000_000, 1_000_000, 0, 0], 0.0);
+        unpriced.cost_usd = None;
+        unpriced.cost_source = None;
+        let table = row(NOW - 1_000, "claude", "claude-opus-4-5", [1_000_000, 0, 0, 0], 5.0);
+        let mut rows = vec![unpriced, table];
+        let overrides = HashMap::from([(
+            "openrouter/kimi-k2".to_string(),
+            PriceOverride { input: 1.0, output: 3.0, cache_read: 0.1, cache_write: 0.0 },
+        )]);
+        apply_price_overrides(&mut rows, &overrides);
+        assert_eq!(rows[0].cost_usd, Some(4.0));
+        assert_eq!(rows[0].cost_source.as_deref(), Some("override"));
+        // A model without an override keeps its frozen table price.
+        assert_eq!(rows[1].cost_usd, Some(5.0));
+
+        let s = summarize_priced(&rows, Period::Today, NOW, 0, HashMap::new(), &overrides);
+        let kimi = s.models.iter().find(|m| m.model == "openrouter/kimi-k2").unwrap();
+        assert!(kimi.priced && kimi.price_overridden);
+        assert_eq!(kimi.unpriced_tokens, 0);
+        assert!((kimi.category_cost.output - 3.0).abs() < 1e-9);
+        assert!((s.confidence.override_priced_share - 4.0 / 9.0).abs() < 1e-9);
+        assert_eq!(s.confidence.unpriced_token_share, 0.0);
+    }
+
+    #[test]
+    fn invalid_price_overrides_are_rejected() {
+        let negative = PriceOverride { input: -1.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 };
+        let nan = PriceOverride { input: f64::NAN, output: 0.0, cache_read: 0.0, cache_write: 0.0 };
+        assert!(!negative.is_valid());
+        assert!(!nan.is_valid());
+    }
 
     #[test]
     fn buckets_are_hourly_for_today_and_daily_otherwise() {
@@ -1141,6 +1607,7 @@ mod tests {
             used_pct: pct,
             resets_at_ms: None,
             label: None,
+            window_mins: None,
         }
     }
 
@@ -1164,15 +1631,107 @@ mod tests {
         assert_eq!(codex.received_at_ms, 200);
     }
 
-    /// Within a field the newest wins — a snapshot is a level, not a sum.
+    /// Within a window the newest wins — a snapshot is a level, not a sum.
     #[test]
-    fn store_replaces_windows_wholesale_on_a_fresh_reading() {
+    fn store_replaces_a_window_with_its_fresh_reading() {
         let store = PlanQuotaStore::default();
         store.record("claude", vec![window(PlanWindowKind::FiveHour, 10.0)], None, None, 1);
         store.record("claude", vec![window(PlanWindowKind::FiveHour, 55.0)], None, None, 2);
         let snap = store.snapshot();
         assert_eq!(snap["claude"].windows.len(), 1);
         assert_eq!(snap["claude"].windows[0].used_pct, 55.0);
+    }
+
+    fn labelled(kind: PlanWindowKind, pct: f64, label: &str) -> PlanUsageWindow {
+        PlanUsageWindow {
+            label: Some(label.into()),
+            ..window(kind, pct)
+        }
+    }
+
+    /// Claude streams one window per event; it must update that window and
+    /// keep the others a direct read established.
+    #[test]
+    fn a_single_window_update_keeps_the_other_windows() {
+        let store = PlanQuotaStore::default();
+        store.replace_windows(
+            "claude",
+            vec![
+                labelled(PlanWindowKind::FiveHour, 10.0, "five_hour"),
+                labelled(PlanWindowKind::SevenDay, 72.0, "seven_day"),
+                labelled(PlanWindowKind::Other, 0.0, "Weekly · Fable"),
+            ],
+            None,
+            None,
+            1,
+        );
+        store.record("claude", vec![labelled(PlanWindowKind::FiveHour, 35.0, "five_hour")], None, None, 2);
+        let windows = &store.snapshot()["claude"].windows;
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].used_pct, 35.0);
+        assert_eq!(windows[1].used_pct, 72.0);
+    }
+
+    /// Codex without window lengths reports both windows as label-less
+    /// `other`; each report must update both rows, each with its own value.
+    #[test]
+    fn repeated_keys_in_one_report_update_their_own_rows() {
+        let store = PlanQuotaStore::default();
+        let two = |a, b| vec![window(PlanWindowKind::Other, a), window(PlanWindowKind::Other, b)];
+        store.record("codex", two(10.0, 20.0), None, None, 1);
+        store.record("codex", two(15.0, 25.0), None, None, 2);
+        let pcts: Vec<f64> = store.snapshot()["codex"].windows.iter().map(|w| w.used_pct).collect();
+        assert_eq!(pcts, vec![15.0, 25.0]);
+    }
+
+    #[test]
+    fn a_streamed_overage_included_window_updates_the_model_scoped_row() {
+        let store = PlanQuotaStore::default();
+        store.replace_windows(
+            "claude",
+            vec![labelled(PlanWindowKind::Other, 0.0, "Weekly · Fable")],
+            None,
+            None,
+            1,
+        );
+        store.record(
+            "claude",
+            vec![labelled(PlanWindowKind::Other, 12.0, "seven_day_overage_included")],
+            None,
+            None,
+            2,
+        );
+        let windows = &store.snapshot()["claude"].windows;
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, 12.0);
+        assert_eq!(windows[0].label.as_deref(), Some("Weekly · Fable"));
+    }
+
+    #[test]
+    fn the_streamed_overage_placeholder_keeps_a_real_reading() {
+        let store = PlanQuotaStore::default();
+        store.replace_windows(
+            "claude",
+            vec![labelled(PlanWindowKind::Overage, 40.0, "Extra usage")],
+            None,
+            None,
+            1,
+        );
+        store.record(
+            "claude",
+            vec![PlanUsageWindow {
+                resets_at_ms: Some(9_000),
+                ..labelled(PlanWindowKind::Overage, 0.0, "overage")
+            }],
+            None,
+            None,
+            2,
+        );
+        let windows = &store.snapshot()["claude"].windows;
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, 40.0);
+        assert_eq!(windows[0].resets_at_ms, Some(9_000));
+        assert_eq!(windows[0].label.as_deref(), Some("Extra usage"));
     }
 
     #[test]
@@ -1182,6 +1741,7 @@ mod tests {
             used_pct: pct,
             resets_at_ms: reset,
             label: Some(label.into()),
+            window_mins: None,
         };
         let now = 1_000;
         let windows = vec![

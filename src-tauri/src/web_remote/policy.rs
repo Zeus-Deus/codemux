@@ -255,6 +255,12 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "undock_browser_from_right_panel"
             | "update_workspace_cwd"
             | "usage_summary"
+            // Usage → Limits and model prices. Reading limits runs the same
+            // Claude/Codex CLIs paired clients already drive through agents;
+            // a model price only changes how this host displays cost.
+            | "usage_refresh_quota"
+            | "usage_price_overrides"
+            | "usage_set_price_override"
             | "validate_resume"
             | "workspaces_adoption_preview"
             | "workspaces_sync_list"
@@ -282,6 +288,18 @@ mod tests {
         }
         for cmd in ["hermes_auth", "hermes_get_credentials", "hermes_future_command"] {
             assert!(!allowed(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn usage_page_commands_are_explicitly_allowed() {
+        for cmd in [
+            "usage_summary",
+            "usage_refresh_quota",
+            "usage_price_overrides",
+            "usage_set_price_override",
+        ] {
+            assert!(allowed(cmd), "{cmd}");
         }
     }
 

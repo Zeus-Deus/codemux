@@ -13,6 +13,7 @@ import {
   formatMessage,
   isRequest,
   parseLine,
+  RPC_CLI_UNSUPPORTED,
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
   RPC_METHOD_NOT_FOUND,
@@ -26,6 +27,7 @@ import {
   InvalidParamsError,
   type MethodHandler,
 } from "./methods/index.ts";
+import { CliUnsupportedError } from "./methods/get-usage.ts";
 import { setMcpBridgeWriter } from "./mcp-bridge.ts";
 import { dispatchResponse } from "./upstream-rpc.ts";
 import type { EventEmitter } from "./session.ts";
@@ -75,6 +77,14 @@ function writeError(id: JsonRpcId, err: unknown): void {
         code: RPC_INVALID_PARAMS,
         message: err.message,
       },
+    });
+    return;
+  }
+  if (err instanceof CliUnsupportedError) {
+    writeMessage({
+      jsonrpc: "2.0",
+      id,
+      error: { code: RPC_CLI_UNSUPPORTED, message: err.message },
     });
     return;
   }
