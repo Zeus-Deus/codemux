@@ -59,7 +59,7 @@ function snapshotToUi(s: SkillsSyncStateSnapshot | null): SyncStatusUI | null {
       return {
         state: "idle",
         lastSyncAt:
-          s.lastSyncAtMillis !== null ? new Date(s.lastSyncAtMillis) : null,
+          s.lastSyncAtMillis != null ? new Date(s.lastSyncAtMillis) : null,
         startedAt: null,
         lastError: null,
         errorAt: null,

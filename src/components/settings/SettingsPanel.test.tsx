@@ -19,6 +19,7 @@ let requestedSection: string | null = null;
 let navigationVersion = 0;
 const mockSignOut = vi.fn();
 const mockSettingsSet = vi.fn();
+const mockUpdateSyncedSetting = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -109,14 +110,16 @@ vi.mock("@/stores/synced-settings-store", () => ({
         git: { default_base_branch: "main" },
         keyboard: { shortcuts: {} },
         notifications: { sound_enabled: true, desktop_enabled: true },
+        session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
       },
-      updateSetting: vi.fn(),
+      updateSetting: mockUpdateSyncedSetting,
     }),
   selectTerminalCursorStyle: () => "bar",
   selectDefaultEditor: () => "",
   selectDefaultBaseBranch: () => "main",
   selectNotificationSoundEnabled: () => true,
   selectDesktopNotificationsEnabled: () => true,
+  selectKeyboardShortcuts: () => ({}),
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -137,6 +140,7 @@ vi.mock("@/tauri/commands", () => ({
   setPresetBarVisible: vi.fn().mockResolvedValue(undefined),
   deletePreset: vi.fn().mockResolvedValue(undefined),
   updatePreset: vi.fn().mockResolvedValue(undefined),
+  listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
   // Usage section — needed so switching to it renders rather than
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
@@ -553,6 +557,133 @@ describe("Settings footer navigation", () => {
     expect(view.queryByRole("button", { name: "Skills" })).toBeNull();
     view.unmount();
     useFeatureFlags.setState({ enableAgentChat: true });
+  });
+
+  it("renders the Hermes setup card once on the Agent page", () => {
+    requestedSection = "agent";
+    const view = render(<SettingsView />);
+    expect(view.getAllByRole("region", { name: "Hermes setup" })).toHaveLength(1);
+    view.unmount();
+  });
+
+  it("opens each section at the top rather than the previous page's offset", () => {
+    const view = render(<SettingsView />);
+    const viewport = () =>
+      view.container.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement;
+    viewport().scrollTop = 600;
+    fireEvent.click(view.getByRole("button", { name: "Terminal" }));
+    expect(viewport().scrollTop).toBe(0);
+    view.unmount();
+  });
+
+  it("lets the nav column scroll on its own on short windows", () => {
+    const view = render(<SettingsView />);
+    const nav = view.container.querySelector("nav") as HTMLElement;
+    expect(nav).toHaveClass("overflow-y-auto");
+    view.unmount();
+  });
+
+  it("saves the default base branch once on commit and refuses an empty one", () => {
+    requestedSection = "git";
+    const view = render(<SettingsView />);
+    const input = view.getByRole("textbox", { name: "Default base branch" });
+    fireEvent.change(input, { target: { value: "dev" } });
+    fireEvent.change(input, { target: { value: "develop" } });
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.blur(input);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith("git", "default_base_branch", "develop");
+
+    mockUpdateSyncedSetting.mockClear();
+    fireEvent.change(input, { target: { value: "   " } });
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    fireEvent.blur(input);
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+    // The mocked store still holds "main", so the field snaps back to it.
+    expect(input).toHaveValue("main");
+    expect(input).not.toHaveAttribute("aria-invalid");
+    view.unmount();
+  });
+
+  it("saves a preset name typed just before Escape closes the editor", async () => {
+    vi.mocked(commands.getPresets).mockResolvedValueOnce({
+      presets: [{
+        id: "p1",
+        name: "Git Pull",
+        description: null,
+        commands: ["git pull"],
+        working_directory: null,
+        launch_mode: "new_tab",
+        icon: null,
+        pinned: true,
+        is_builtin: false,
+        auto_run_on_workspace: false,
+        auto_run_on_new_tab: false,
+        kind: "cli",
+        launch_config: null,
+      }],
+      bar_visible: true,
+      default_preset_id: null,
+    });
+    requestedSection = "presets";
+    const view = render(<SettingsView />);
+    fireEvent.click(await view.findByText("Git Pull"));
+    const name = await screen.findByPlaceholderText("e.g. Git Pull");
+    fireEvent.change(name, { target: { value: "Git Pull --rebase" } });
+    expect(commands.updatePreset).not.toHaveBeenCalled();
+    fireEvent.keyDown(name, { key: "Escape" });
+    expect(commands.updatePreset).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "p1", name: "Git Pull --rebase" }),
+    );
+    view.unmount();
+  });
+
+  it("shows session-restore slider values beside the control", () => {
+    requestedSection = "session_restore";
+    const view = render(<SettingsView />);
+    expect(view.getByText("10,000 lines")).toBeInTheDocument();
+    expect(view.getByText("100 MB")).toBeInTheDocument();
+    expect(view.queryByText(/agent sessions/)).toBeNull();
+    view.unmount();
+  });
+
+  it("saves a scrollback slider once when the drag ends, not on every tick", () => {
+    requestedSection = "session_restore";
+    mockUpdateSyncedSetting.mockClear();
+    const view = render(<SettingsView />);
+    const [lines] = view.getAllByRole("slider");
+    // jsdom has no layout: give the track a 360px width so pointer
+    // positions map onto the 1,000–50,000 range.
+    const track = lines.closest('[data-slot="slider"]') as HTMLElement;
+    track.getBoundingClientRect = () =>
+      ({ left: 0, right: 360, width: 360, top: 0, bottom: 10, height: 10, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    track.setPointerCapture = () => {};
+    track.releasePointerCapture = () => {};
+    track.hasPointerCapture = () => true;
+
+    fireEvent.pointerDown(track, { clientX: 72, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(track, { clientX: 144, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 180, pointerId: 1 });
+    expect(view.getByText("26,000 lines")).toBeInTheDocument();
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(track, { clientX: 180, pointerId: 1 });
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith("session_restore", "scrollback_lines", 26000);
+    view.unmount();
+  });
+
+  it("returns to the top when a deep link reopens the current section", () => {
+    requestedSection = "terminal";
+    const view = render(<SettingsView />);
+    const viewport = () =>
+      view.container.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement;
+    viewport().scrollTop = 400;
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+    expect(viewport().scrollTop).toBe(0);
+    view.unmount();
   });
 
   it("pins the current Settings page from its header", async () => {

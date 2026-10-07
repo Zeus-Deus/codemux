@@ -6,6 +6,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { toast } from "@/lib/toast";
 import {
   btnCard,
@@ -29,6 +30,9 @@ import {
   setReviewDraft,
   type DraftKey,
 } from "./pr-drafts";
+
+// The handler accepts Ctrl or Cmd; show whichever this platform calls it.
+const SUBMIT_HINT = formatKeyCombo("Ctrl+Enter");
 
 /**
  * Which bar the PR earns. Reviewer is the fallback: if we can't tell
@@ -351,7 +355,7 @@ function ReviewerBar({
             tzBody,
           )}
         >
-          Leave a review… <span className={cn("font-mono", tzMeta)}>⌘↵</span>
+          Leave a review… <span className={cn("font-mono", tzMeta)}>{SUBMIT_HINT}</span>
         </button>
       )}
       <div className="flex items-center gap-2">

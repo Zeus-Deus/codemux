@@ -129,7 +129,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
 
   return (
     <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-lg border-t border-border/70 bg-background/50 px-3.5">
-      <span className="font-mono text-caption text-muted-foreground/70">
+      <span className="min-w-0 truncate font-mono text-caption text-muted-foreground/70">
         Codemux {version ? `v${version}` : ""}
       </span>
       <span className="flex-1" />
@@ -145,14 +145,14 @@ function AppMenuFooter({ version }: { version: string | null }) {
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single
             // `brightness-125` washes the label out to nothing on white.
-            "flex items-center gap-1.5 rounded-sm px-1 text-label transition-colors duration-150 hover:brightness-90 dark:hover:brightness-125",
+            "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-sm px-1 text-label transition-colors duration-150 hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >
           {status}
         </button>
       ) : (
-        <span className={cn("flex items-center gap-1.5 text-label", tone)}>
+        <span className={cn("flex shrink-0 items-center gap-1.5 whitespace-nowrap text-label", tone)}>
           {status}
         </span>
       )}
@@ -199,7 +199,7 @@ function AppMenu({
       </Tooltip>
       {/* Bottom padding is zero so the version/update strip can sit flush in
           the container's bottom corners. */}
-      <DropdownMenuContent side="top" align="start" className="w-[252px] pb-0">
+      <DropdownMenuContent side="top" align="start" className="w-auto min-w-[252px] max-w-[320px] pb-0">
         <DropdownMenuItem
           className={MENU_ROW}
           onClick={() => setShowSettings(true)}
