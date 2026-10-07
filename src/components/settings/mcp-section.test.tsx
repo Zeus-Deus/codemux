@@ -35,6 +35,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { McpSection } from "./mcp-section";
 import { listMcpServers } from "@/tauri/commands";
+import { useMcpStore } from "@/stores/mcp-store";
 
 const listMcpServersMock = listMcpServers as unknown as ReturnType<typeof vi.fn>;
 
@@ -300,27 +301,53 @@ describe("McpSection", () => {
     });
   });
 
-  it("tells the user when stopping a server fails", async () => {
-    const { stopMcpServerCmd } = (await import(
-      "@/tauri/commands"
-    )) as unknown as Record<string, ReturnType<typeof vi.fn>>;
-    stopMcpServerCmd.mockRejectedValueOnce(new Error("process busy"));
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+  it.each([
+    { verb: "start", command: "startMcpServerCmd", testId: "toggle" },
+    { verb: "stop", command: "stopMcpServerCmd", testId: "toggle" },
+    { verb: "restart", command: "restartMcpServerCmd", testId: "restart" },
+  ] as const)(
+    "tells the user when trying to $verb a server fails",
+    async ({ verb, command, testId }) => {
+      const commands = (await import(
+        "@/tauri/commands"
+      )) as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      commands[command].mockRejectedValueOnce(new Error("process busy"));
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      mockToastError.mockClear();
+      // Start fires when re-enabling a disabled row; restart only renders
+      // for an errored row.
+      useMcpStore.setState({ disabledIds: verb === "start" ? ["id-fail"] : [] });
+      if (verb === "restart") {
+        commands.getMcpRuntimeStatus.mockResolvedValueOnce([
+          {
+            id: "id-fail",
+            name: "flaky",
+            status: { kind: "errored", message: "crashed" },
+            toolsCount: 0,
+            errorMessage: "crashed",
+            stderrTail: null,
+            startedAtMs: null,
+          },
+        ]);
+      }
 
-    listMcpServersMock.mockResolvedValueOnce([
-      makeServer({ id: "id-fail", name: "flaky", sources: ["claudeUser"] }),
-    ]);
+      listMcpServersMock.mockResolvedValueOnce([
+        makeServer({ id: "id-fail", name: "flaky", sources: ["claudeUser"] }),
+      ]);
 
-    render(<McpSection projectRoot={null} />);
+      render(<McpSection projectRoot={null} />);
 
-    fireEvent.click(await screen.findByTestId("mcp-row-id-fail-toggle"));
+      fireEvent.click(await screen.findByTestId(`mcp-row-id-fail-${testId}`));
 
-    await waitFor(() => {
-      expect(mockToastError).toHaveBeenCalledWith("Couldn't stop flaky", {
-        description: "process busy",
+      await waitFor(() => {
+        expect(mockToastError).toHaveBeenCalledWith(`Couldn't ${verb} flaky`, {
+          description: "process busy",
+        });
       });
-    });
-  });
+      expect(mockToastError).toHaveBeenCalledTimes(1);
+      useMcpStore.setState({ disabledIds: [] });
+    },
+  );
 
   it("reveals View tools on keyboard focus and touch, not only hover", async () => {
     listMcpServersMock.mockResolvedValueOnce([

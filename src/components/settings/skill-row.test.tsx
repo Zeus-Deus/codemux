@@ -64,6 +64,13 @@ describe("SkillRow", () => {
     expect(screen.getByText("Does demo things.")).toBeInTheDocument();
   });
 
+  it("reveals the View action on keyboard focus and touch, not only hover", () => {
+    renderRow();
+    const actions = screen.getByRole("button", { name: /View/ }).parentElement!;
+    expect(actions.className).toContain("focus-within:opacity-100");
+    expect(actions.className).toContain("pointer-coarse:opacity-100");
+  });
+
   it("hides the description block when none is set", () => {
     renderRow({ skill: makeSkill({ description: null }) });
     expect(screen.getByText("demo-skill")).toBeInTheDocument();
