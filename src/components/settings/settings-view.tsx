@@ -342,6 +342,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
 function BaseBranchInput({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
+  const empty = !draft.trim();
   const commit = () => {
     const next = draft.trim();
     if (!next) {
@@ -354,6 +355,9 @@ function BaseBranchInput({ value, onCommit }: { value: string; onCommit: (v: str
   return (
     <Input
       aria-label="Default base branch"
+      // Flags a blank draft while typing; leaving the field restores the saved branch.
+      aria-invalid={empty || undefined}
+      title={empty ? "A base branch is required" : undefined}
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
@@ -2547,12 +2551,13 @@ export function SettingsView() {
         </nav>
 
         {/* Content */}
-        {/* Keyed by section: each page opens at its top instead of the
-            previous page's scroll offset, and fades in rather than cutting. */}
-        <ScrollArea key={activeSection} className="flex-1 bg-card">
+        {/* Keyed by section and navigation: each page (including a deep link
+            back to the current one) opens at its top instead of the previous
+            scroll offset, and eases in rather than cutting. */}
+        <ScrollArea key={`${activeSection}:${settingsNavigationVersion}`} className="flex-1 bg-card">
           <div
             className={cn(
-              "animate-in fade-in-0 duration-150 motion-reduce:animate-none",
+              "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",
               mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
               WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",
             )}

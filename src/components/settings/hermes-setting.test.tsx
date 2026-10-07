@@ -31,6 +31,7 @@ describe("HermesSetting", () => {
     expect(invoke).not.toHaveBeenCalledWith("hermes_disconnect", expect.anything());
 
     const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByRole("heading", { name: "Disconnect coding?" })).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Disconnect" }));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("hermes_disconnect", { profile }),

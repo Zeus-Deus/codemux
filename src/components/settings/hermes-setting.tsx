@@ -60,8 +60,10 @@ export function HermesSetting() {
     setBusy(key);
     void action().catch(e => setStatus(String(e))).finally(() => setBusy(null));
   };
-  // Disconnecting can cut off background learning, so it asks first.
-  const [pendingDisconnect, setPendingDisconnect] = useState<HermesProfile | null>(null);
+  // Disconnecting can cut off background learning, so it asks first. The
+  // target outlives the open flag so the title keeps its name while closing.
+  const [disconnectOpen, setDisconnectOpen] = useState(false);
+  const [disconnectTarget, setDisconnectTarget] = useState<HermesProfile | null>(null);
   const spinner = <Loader2 className="size-3.5 motion-safe:animate-spin" aria-hidden />;
   return <section className="space-y-3 rounded-lg border border-border p-4" aria-label="Hermes setup">
     <h3 className="text-body font-medium">Hermes · experimental ACP integration</h3>
@@ -80,17 +82,17 @@ export function HermesSetting() {
       await useHermes.getState().refresh(p);
       const slot = useHermes.getState().catalogs[hermesProfileKey(p)];
       setStatus(slot.error ?? slot.value?.message ?? `${p.id}: ${slot.value?.state ?? "unknown"}. External authentication and compressed-history recovery are not certified.`);
-    })}>{busy === hermesProfileKey(p) && spinner}Check runtime</Button><Button type="button" variant="ghost" size="xs" disabled={busy !== null} onClick={() => setPendingDisconnect(p)}>Disconnect</Button></div>)}
-    <AlertDialog open={pendingDisconnect !== null} onOpenChange={open => { if (!open) setPendingDisconnect(null); }}>
+    })}>{busy === hermesProfileKey(p) && spinner}Check runtime</Button><Button type="button" variant="ghost" size="xs" disabled={busy !== null} onClick={() => { setDisconnectTarget(p); setDisconnectOpen(true); }}>Disconnect</Button></div>)}
+    <AlertDialog open={disconnectOpen} onOpenChange={setDisconnectOpen}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Disconnect {pendingDisconnect?.id}?</AlertDialogTitle>
+          <AlertDialogTitle>Disconnect {disconnectTarget?.id}?</AlertDialogTitle>
           <AlertDialogDescription>Codemux stops its Hermes session for this profile. Background learning may not finish; worktrees are kept.</AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={() => {
-            const profile = pendingDisconnect;
+          <AlertDialogAction variant="destructive" onClick={() => {
+            const profile = disconnectTarget;
             if (!profile) return;
             run(hermesProfileKey(profile), async () => {
               await invoke("hermes_disconnect", { profile });

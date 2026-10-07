@@ -140,6 +140,7 @@ vi.mock("@/tauri/commands", () => ({
   setPresetBarVisible: vi.fn().mockResolvedValue(undefined),
   deletePreset: vi.fn().mockResolvedValue(undefined),
   updatePreset: vi.fn().mockResolvedValue(undefined),
+  listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
   // Usage section — needed so switching to it renders rather than
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
@@ -596,10 +597,12 @@ describe("Settings footer navigation", () => {
 
     mockUpdateSyncedSetting.mockClear();
     fireEvent.change(input, { target: { value: "   " } });
+    expect(input).toHaveAttribute("aria-invalid", "true");
     fireEvent.blur(input);
     expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
     // The mocked store still holds "main", so the field snaps back to it.
     expect(input).toHaveValue("main");
+    expect(input).not.toHaveAttribute("aria-invalid");
     view.unmount();
   });
 
@@ -642,6 +645,44 @@ describe("Settings footer navigation", () => {
     expect(view.getByText("10,000 lines")).toBeInTheDocument();
     expect(view.getByText("100 MB")).toBeInTheDocument();
     expect(view.queryByText(/agent sessions/)).toBeNull();
+    view.unmount();
+  });
+
+  it("saves a scrollback slider once when the drag ends, not on every tick", () => {
+    requestedSection = "session_restore";
+    mockUpdateSyncedSetting.mockClear();
+    const view = render(<SettingsView />);
+    const [lines] = view.getAllByRole("slider");
+    // jsdom has no layout: give the track a 360px width so pointer
+    // positions map onto the 1,000–50,000 range.
+    const track = lines.closest('[data-slot="slider"]') as HTMLElement;
+    track.getBoundingClientRect = () =>
+      ({ left: 0, right: 360, width: 360, top: 0, bottom: 10, height: 10, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    track.setPointerCapture = () => {};
+    track.releasePointerCapture = () => {};
+    track.hasPointerCapture = () => true;
+
+    fireEvent.pointerDown(track, { clientX: 72, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(track, { clientX: 144, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 180, pointerId: 1 });
+    expect(view.getByText("26,000 lines")).toBeInTheDocument();
+    expect(mockUpdateSyncedSetting).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(track, { clientX: 180, pointerId: 1 });
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith("session_restore", "scrollback_lines", 26000);
+    view.unmount();
+  });
+
+  it("returns to the top when a deep link reopens the current section", () => {
+    requestedSection = "terminal";
+    const view = render(<SettingsView />);
+    const viewport = () =>
+      view.container.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement;
+    viewport().scrollTop = 400;
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+    expect(viewport().scrollTop).toBe(0);
     view.unmount();
   });
 
