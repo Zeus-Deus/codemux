@@ -86,15 +86,18 @@ export function LoginScreen() {
   let body: ReactNode;
   if (oauthPending) {
     body = (
-      <div role="status" className="flex w-full flex-col items-center text-center">
+      <div className="flex w-full flex-col items-center text-center">
         <Loader2 className="size-4 text-muted-foreground mb-4 motion-safe:animate-spin" />
-        <h2 className="text-body font-medium text-foreground mb-2">
-          Waiting for GitHub
-        </h2>
-        <p className="text-label text-muted-foreground mb-6">
-          Finish signing in in your browser. Codemux continues as soon as
-          GitHub sends you back.
-        </p>
+        {/* Only the message is live; the actions below stay out of it. */}
+        <div role="status" className="mb-6">
+          <h2 className="text-body font-medium text-foreground mb-2">
+            Waiting for GitHub
+          </h2>
+          <p className="text-label text-muted-foreground">
+            Finish signing in in your browser. Codemux continues as soon as
+            GitHub sends you back.
+          </p>
+        </div>
         <Button
           variant="outline"
           size="lg"
@@ -352,14 +355,18 @@ function PasswordInput(props: Omit<ComponentProps<typeof Input>, "type">) {
   const [visible, setVisible] = useState(false);
   return (
     <div className="relative">
-      <Input {...props} type={visible ? "text" : "password"} className="pr-9" />
+      {/* block: an inline input leaves a baseline gap that makes the wrapper
+          taller than the field and pushes the toggle off-center. */}
+      <Input {...props} type={visible ? "text" : "password"} className="block pr-9" />
       <button
         type="button"
         aria-label={visible ? "Hide password" : "Show password"}
         aria-pressed={visible}
         disabled={props.disabled}
         onClick={() => setVisible((v) => !v)}
-        className="absolute inset-y-0 right-0 flex w-9 items-center justify-center rounded-md text-muted-foreground transition-colors duration-100 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+        // Centered rather than inset-y-0 so the 44px mobile touch target
+        // stays on the field's midline.
+        className="absolute right-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors duration-100 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
       >
         {visible ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
       </button>

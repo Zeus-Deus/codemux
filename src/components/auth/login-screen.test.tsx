@@ -55,6 +55,10 @@ describe("LoginScreen", () => {
 
     expect(screen.getByText("Waiting for GitHub")).toBeInTheDocument();
     expect(screen.queryByPlaceholderText("Email")).not.toBeInTheDocument();
+    // The live region announces the message, not the action labels.
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("Waiting for GitHub");
+    expect(status).not.toHaveTextContent(/reopen browser|cancel/i);
 
     fireEvent.click(screen.getByRole("button", { name: /reopen browser/i }));
     expect(startOAuthFlow).toHaveBeenCalledTimes(1);

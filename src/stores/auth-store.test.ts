@@ -15,6 +15,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import {
+  OAUTH_CALLBACK_GRACE_MS,
   OAUTH_TIMEOUT_ERROR,
   OAUTH_TIMEOUT_MS,
   useAuthStore,
@@ -513,7 +514,7 @@ describe("GitHub OAuth flow", () => {
   });
 
   afterEach(() => {
-    useAuthStore.getState().cancelOAuthFlow();
+    useAuthStore.getState().finishOAuthFlow();
     vi.useRealTimers();
   });
 
@@ -531,6 +532,20 @@ describe("GitHub OAuth flow", () => {
     // A cancelled flow's timer must not resurface an error later.
     vi.advanceTimersByTime(OAUTH_TIMEOUT_MS);
     expect(useAuthStore.getState().error).toBeNull();
+  });
+
+  it("keeps expecting the callback after Cancel until the backend deadline passes", async () => {
+    vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+
+    await useAuthStore.getState().startOAuthFlow();
+    useAuthStore.getState().cancelOAuthFlow();
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(true);
+
+    vi.advanceTimersByTime(OAUTH_TIMEOUT_MS + OAUTH_CALLBACK_GRACE_MS - 1);
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(true);
+
+    vi.advanceTimersByTime(1);
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(false);
   });
 
   it("gives up with an error once the callback can no longer arrive", async () => {
