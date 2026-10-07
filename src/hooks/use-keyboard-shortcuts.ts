@@ -14,6 +14,7 @@ import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
@@ -173,11 +174,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       return true;
     }
     if (flags.enableLazyWorkspaceCreation) {
-      const store = useChatDraftStore.getState();
-      // `lockedToHome` mirrors the sidebar button: a home-directory chat that
-      // won't be redirected to whatever project is active in the sidebar.
-      const draft = store.getOrCreateHomeDraft({ lockedToHome: true });
-      store.setActiveDraft(draft.draftId);
+      startNewHomeAgent();
       return true;
     }
     ui.setShowNewWorkspaceDialog(true);

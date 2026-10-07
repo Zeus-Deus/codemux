@@ -11,6 +11,7 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { cn } from "@/lib/utils";
+import { Empty, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { toast } from "@/lib/toast";
 import { formatBytes } from "@/lib/format-bytes";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-seconds";
@@ -579,13 +580,13 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
 
 function EmptyDevices() {
   return (
-    <div className="px-6 py-8 text-center">
-      <p className="text-body font-semibold text-foreground">No devices yet</p>
-      <p className="mx-auto mt-1.5 max-w-[420px] text-body-sm leading-relaxed text-muted-foreground/80">
+    <Empty className="px-6">
+      <EmptyTitle>No devices yet</EmptyTitle>
+      <EmptyDescription>
         Add a device — your home desktop, an always-on box, or a cloud server
         — then push work to it from any workspace's menu.
-      </p>
-    </div>
+      </EmptyDescription>
+    </Empty>
   );
 }
 

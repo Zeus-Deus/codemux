@@ -4,7 +4,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Search as SearchIcon, SquarePen } from "lucide-react";
@@ -28,15 +28,7 @@ export function useNewAgentAction() {
       return;
     }
     if (enableLazyWorkspaceCreation) {
-      const store = useChatDraftStore.getState();
-      // `lockedToHome: true` opts the resulting draft out of
-      // `DraftChatSurface`'s mount-time auto-seed and submit-time
-      // salvage, both of which would otherwise redirect the draft to
-      // whatever project workspace happens to be active in the
-      // sidebar. The tooltip on this button promises "New chat in
-      // home directory", so we honour that literally.
-      const draft = store.getOrCreateHomeDraft({ lockedToHome: true });
-      store.setActiveDraft(draft.draftId);
+      startNewHomeAgent();
       return;
     }
     setShowNewWorkspaceDialog(true);

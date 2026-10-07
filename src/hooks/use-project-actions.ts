@@ -46,7 +46,17 @@ interface OpenProjectResult {
 export async function openProjectFlow(): Promise<OpenProjectResult> {
   const folder = await pickFolder("Open project");
   if (!folder) return { success: false };
+  return openProjectAtPath(folder);
+}
 
+/**
+ * Open a known folder as a project — the second half of `openProjectFlow`,
+ * shared with the recent-projects list so reopening a project Codemux has
+ * seen before skips the OS folder picker.
+ */
+export async function openProjectAtPath(
+  folder: string,
+): Promise<OpenProjectResult> {
   const name = basename(folder);
 
   // Non-git folders are accepted as-is — same as every other add path

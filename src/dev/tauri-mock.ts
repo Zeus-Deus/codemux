@@ -146,6 +146,11 @@ const sessionImportFixture = new URLSearchParams(window.location.search).get("fi
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
 }
+const MOCK_RECENT_PROJECTS = [
+  { path: `${MOCK_HOME_DIR}/code/parser`, name: "parser", last_opened_at: "2026-10-05T09:12:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/api-gateway`, name: "api-gateway", last_opened_at: "2026-09-29T11:05:00Z" },
+];
 const mockLocalSessions: LocalChatSession[] = [
   { source_id: "claude:synthetic-parser", provider: "claude", title: "Fix the parser edge case", cwd: "/demo/parser", last_active_at: "2026-09-29T10:00:00Z", message_count: 2, already_imported: false },
   { source_id: "codex:synthetic-tests", provider: "codex", title: "Review the parser tests", cwd: "/demo/parser", last_active_at: "2026-09-28T14:00:00Z", message_count: 2, already_imported: false },
@@ -1036,8 +1041,10 @@ const FEATURE_FLAGS: FeatureFlags = {
   // Scope row below the composer) is a primary dev-iteration surface —
   // "New thread"/"New agent" render the draft composer with the
   // location · checkout · from-branch controls instead of eagerly
-  // creating a workspace.
-  enable_lazy_workspace_creation: true,
+  // creating a workspace. `?lazy=0` turns it off to reach the legacy
+  // full-screen Open Project page (with `?fixture=session-import`).
+  enable_lazy_workspace_creation:
+    new URLSearchParams(location.search).get("lazy") !== "0",
 };
 
 const SYNCED_SETTINGS: UserSettings = {
@@ -3613,8 +3620,36 @@ const handlers: Record<string, Handler> = {
   db_set_setting: () => undefined,
   db_get_setting: () => null,
   db_delete_setting: () => undefined,
-  db_get_recent_projects: () => [],
+  // A few folders "opened before", so the zero-project landings (try
+  // `?fixture=session-import`) and the project picker have recents to show.
+  db_get_recent_projects: (a) =>
+    MOCK_RECENT_PROJECTS.slice(0, typeof a.limit === "number" ? a.limit : undefined),
   db_add_recent_project: () => undefined,
+  // Opening a project (folder picker or a recent row) adds a main-checkout
+  // workspace for that folder and returns its id, like the backend.
+  create_empty_workspace: (a) => {
+    const cwd = String(a.cwd ?? "");
+    const existing = appState.workspaces.find((w) => w.cwd === cwd);
+    if (existing) return existing.workspace_id;
+    const id = `ws-opened-${appState.workspaces.length + 1}`;
+    const workspace = buildRestoredWorkspace({
+      archive_id: id,
+      workspace_id: id,
+      title: cwd.split("/").pop() || cwd,
+      cwd,
+      project_root: cwd,
+      project_uid: null,
+      workspace_kind: "main",
+      worktree_path: null,
+      git_branch: "main",
+      is_git: true,
+      protected: true,
+      archived_at: 0,
+    });
+    appState = { ...appState, workspaces: [...appState.workspaces, workspace] };
+    emitAppState();
+    return id;
+  },
 
   // ── File dialogs ──
   // Default: resolve as a cancel (null / empty) like the previous
@@ -3651,6 +3686,8 @@ const handlers: Record<string, Handler> = {
     // and the generic listing would hand the form a stack of unrelated
     // `.md` files to mistake for one.
     if (path.includes("merge_request_templates")) return [];
+    // The seeded recent projects must probe as folders so a recent row opens.
+    if (MOCK_RECENT_PROJECTS.some((p) => p.path === path)) return [];
     return mockListDirectory(path, Boolean(a.showHidden));
   },
 

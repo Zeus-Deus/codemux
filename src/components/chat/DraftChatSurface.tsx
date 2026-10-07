@@ -81,6 +81,8 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { FullAccessNotice } from "./FullAccessNotice";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
@@ -128,6 +130,24 @@ export function DraftChatSurface() {
       focusOnMount={focusDraftId === draft.draftId}
       onBackgroundStarted={setFocusDraftId}
     />
+  );
+}
+
+/**
+ * A single 300ms ring around the composer card, for a "New agent" press that
+ * lands on the draft already on screen. Run through the Web Animations API so
+ * it never fights the classes the Composer owns, and skipped under reduced
+ * motion (the caret moving into the composer is feedback enough there).
+ */
+function pulseComposerCard(card: HTMLElement): void {
+  if (typeof card.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  card.animate(
+    [
+      { outline: "2px solid color-mix(in oklab, var(--ring) 60%, transparent)", outlineOffset: "2px" },
+      { outline: "2px solid transparent", outlineOffset: "2px" },
+    ],
+    { duration: 300, easing: "ease-out" },
   );
 }
 
@@ -1237,8 +1257,37 @@ function DraftChatSurfaceInner({
   // h-7 band so the draft doesn't look "naked" next to a real pane.
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
+  // "New agent" asked for this draft's composer. Consumed once, after the
+  // composer has mounted (child effects run first), so a repeat press on the
+  // draft already on screen still moves the caret into it, and the card
+  // pulses once so the press is visible even though the page is unchanged.
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const composerFocusRequest = useDraftComposerFocusStore((s) => s.request);
+  useEffect(() => {
+    if (composerFocusRequest?.draftId !== draft.draftId) return;
+    useDraftComposerFocusStore.getState().clear();
+    const card = surfaceRef.current?.querySelector<HTMLElement>(
+      '[data-testid="composer-wrapper"]',
+    );
+    card
+      ?.querySelector<HTMLTextAreaElement>("textarea")
+      ?.focus({ preventScroll: true });
+    if (card) pulseComposerCard(card);
+  }, [composerFocusRequest, draft.draftId]);
+
+  // Opening a project from the empty home points this draft at it, the same
+  // as picking it in the location control below the composer.
+  const handleProjectOpened = useCallback(
+    (projectPath: string) =>
+      updateDraftTarget(draft.draftId, { kind: "project", projectPath }),
+    [draft.draftId, updateDraftTarget],
+  );
+
   return (
-    <div className="relative flex h-full w-full flex-col bg-background">
+    <div
+      ref={surfaceRef}
+      className="relative flex h-full w-full flex-col bg-background"
+    >
       {!enableAgentChat && <DraftSurfaceHeader />}
       {/* Provider runtime health (probe-backed, TTL-cached): tell the
           user the selected provider can't run BEFORE they compose and
@@ -1250,7 +1299,16 @@ function DraftChatSurfaceInner({
         {pending ? (
           <DraftPendingConversation pending={pending} composer={composerEl} />
         ) : (
-          <ChatHomeLanding composer={composerEl} />
+          <ChatHomeLanding
+            composer={composerEl}
+            notice={
+              <FullAccessNotice
+                permissionMode={draft.permissionMode}
+                permissionModes={permissionModes}
+              />
+            }
+            onProjectOpened={handleProjectOpened}
+          />
         )}
       </div>
     </div>
