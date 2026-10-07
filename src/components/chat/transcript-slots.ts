@@ -31,7 +31,13 @@ export interface TurnFoldBody {
 }
 
 export type SlotBody =
-  | { kind: "item"; item: ChatViewItem }
+  | {
+      kind: "item";
+      item: ChatViewItem;
+      /** Belongs to the turn still running, so a `running` call on it really
+       *  is executing. Absent for a settled turn. */
+      turnLive?: boolean;
+    }
   | {
       kind: "activity";
       items: WorkEntry[];
@@ -423,7 +429,11 @@ export function buildTranscriptSlots(
       continue;
     }
     flush();
-    bodies.push({ kind: "item", item });
+    bodies.push(
+      entry.turnLive
+        ? { kind: "item", item, turnLive: true }
+        : { kind: "item", item },
+    );
   }
   flush();
 
@@ -479,7 +489,9 @@ function slotsEquivalent(a: TranscriptSlot, b: TranscriptSlot): boolean {
 }
 
 function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
-  if (a.kind === "item" && b.kind === "item") return a.item === b.item;
+  if (a.kind === "item" && b.kind === "item") {
+    return a.item === b.item && a.turnLive === b.turnLive;
+  }
   if (a.kind === "turn_fold" && b.kind === "turn_fold") {
     return (
       a.turnId === b.turnId &&

@@ -496,6 +496,24 @@ describe("agent-chat reducer", () => {
     );
     expect(tool?.started_at).toBe(1_000);
     expect(tool?.approved_at).toBe(121_000);
+
+    // A second window re-delivers the same answer later; the call has been
+    // running since the first one.
+    t = 300_000;
+    state = applyEvent(
+      state,
+      {
+        type: "request_resolved",
+        thread_id: "t1",
+        request_id: "req-gated",
+        decision: { decision: "allow" },
+      },
+      clock,
+    );
+    const again = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    expect(again?.approved_at).toBe(121_000);
   });
 
   it("keeps a resolved request resolved when a duplicate respond fails", () => {

@@ -1976,8 +1976,10 @@ function applyEventInner(
         };
         messages = replaceItem(messages, found.index, next);
         // The gated call only starts executing now; stamp it so its timer
-        // does not include the time the request waited for an answer.
-        const toolMatch = found.item.tool_use_id
+        // does not include the time the request waited for an answer. A
+        // re-delivered resolution (a second window) keeps the first stamp.
+        const toolMatch =
+          found.item.resolution.state !== "resolved" && found.item.tool_use_id
           ? findToolCallByUseId(messages, found.item.tool_use_id)
           : null;
         if (toolMatch && toolMatch.item.status === "running") {

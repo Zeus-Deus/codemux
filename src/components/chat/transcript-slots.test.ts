@@ -200,6 +200,19 @@ describe("buildTranscriptSlots — activity grouping", () => {
       [true, true],
     ]);
   });
+
+  it("marks a standalone card live only while its turn runs", () => {
+    const gated = tool(1, { status: "running", approval_request_id: "req-1" });
+    const cardLive = (streaming: boolean) =>
+      buildTranscriptSlots([userMsg(0), gated], streaming).map((slot) =>
+        slot.body.kind === "item" && slot.body.item.id === "tc-1"
+          ? slot.body.turnLive === true
+          : null,
+      );
+    expect(cardLive(true)).toEqual([null, true]);
+    // Rehydrated or crashed: nothing settled the call, but it is not running.
+    expect(cardLive(false)).toEqual([null, false]);
+  });
 });
 
 describe("buildTranscriptSlots — non-rendering rows", () => {

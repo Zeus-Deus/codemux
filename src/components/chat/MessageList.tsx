@@ -1733,6 +1733,7 @@ function transcriptSlotType(slot: TranscriptSlot): string {
 
 function ItemRow({
   item,
+  turnLive = false,
   approval,
   subagentName,
   onRespondToRequest,
@@ -1750,6 +1751,8 @@ function ItemRow({
   referencePaths,
 }: {
   item: ChatViewItem;
+  /** The item's turn is still running; gates a tool card's live timer. */
+  turnLive?: boolean;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
@@ -1832,6 +1835,7 @@ function ItemRow({
   }
 
   return renderAssistantBody(item, {
+    turnLive,
     approval,
     subagentName,
     workspaceId,
@@ -1847,6 +1851,7 @@ function ItemRow({
 function renderAssistantBody(
   item: Exclude<ChatViewItem, { kind: "user_message" }>,
   handlers: {
+    turnLive: boolean;
     approval: PermissionRequestItem | null;
     subagentName: string | null;
     workspaceId?: string | null;
@@ -1897,6 +1902,7 @@ function renderAssistantBody(
       ) : (
         <ToolCallCard
           item={item}
+          turnLive={handlers.turnLive}
           approval={handlers.approval}
           onDecide={handlers.handleDecide}
         />
@@ -2153,6 +2159,7 @@ function SlotRow({
       ) : (
         <ItemRowMemo
           item={slot.body.item}
+          turnLive={slot.body.turnLive}
           approval={approval}
           subagentName={subagentName}
           onRespondToRequest={onRespondToRequest}

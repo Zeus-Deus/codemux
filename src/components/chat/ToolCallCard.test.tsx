@@ -304,6 +304,7 @@ describe("ToolCallCard", () => {
       render(
         <ToolCallCard
           item={makeTool({ started_at: 10_000 })}
+          turnLive
           approval={null}
           onDecide={() => {}}
         />,
@@ -317,6 +318,20 @@ describe("ToolCallCard", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does not tick a call left running in a settled transcript", () => {
+    // Allowed, then the app quit before the call reported back.
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-1", started_at: 10_000 })}
+        approval={makePendingApproval({
+          resolution: { state: "resolved", decision: { decision: "allow" } },
+        })}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("step-elapsed")).toBeNull();
   });
 
   it("times an approval-gated call from its approval, not its request", () => {

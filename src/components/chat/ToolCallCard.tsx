@@ -40,6 +40,10 @@ import { categoryTint, toolCategory, toolIcon } from "./tool-visuals";
 
 interface Props {
   item: ToolCallItem;
+  /** The call's turn is still running, so a `running` call really is. A
+   *  settled transcript can hold a call that never reported back (crash,
+   *  quit); its start time is no longer meaningful, so no timer counts. */
+  turnLive?: boolean;
   /** Resolved from the slice by matching `item.approval_request_id`
    *  against the thread's permission requests. `null` when the tool
    *  call is not gated (bypassPermissions mode) or the request event
@@ -66,6 +70,7 @@ interface Props {
  */
 export const ToolCallCard = memo(function ToolCallCard({
   item,
+  turnLive = false,
   approval,
   onDecide,
 }: Props) {
@@ -162,7 +167,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         <ToolCallStatus item={item} />
         {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
       </span>
-      {isExecuting ? (
+      {isExecuting && turnLive ? (
         <StepElapsed step={timed} className={ELAPSED_CLASS} />
       ) : duration != null && (isSuccess || isError) ? (
         <span className={ELAPSED_CLASS}>{formatActivityDuration(duration)}</span>
