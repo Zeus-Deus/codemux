@@ -127,6 +127,7 @@ vi.mock("./ChatTranscript", async (importOriginal) => {
     onEnterSubagent,
     onCancelQueued,
     onSendQueuedNow,
+    onRevertTurn,
   }: {
     messages: unknown[];
     streaming?: boolean;
@@ -138,6 +139,7 @@ vi.mock("./ChatTranscript", async (importOriginal) => {
     onEnterSubagent?: (subagentId: string) => void;
     onCancelQueued?: (queuedId: string, text: string) => void;
     onSendQueuedNow?: (queuedId: string) => void;
+    onRevertTurn?: (turnIndex: number) => void;
   }) => (
     <div
       data-testid="transcript"
@@ -178,6 +180,10 @@ vi.mock("./ChatTranscript", async (importOriginal) => {
       <button
         data-testid="send-queued-now"
         onClick={() => onSendQueuedNow?.("q-1")}
+      />
+      <button
+        data-testid="revert-turn"
+        onClick={() => onRevertTurn?.(1)}
       />
     </div>
   );
@@ -502,6 +508,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatListSessions: vi.fn().mockResolvedValue([]),
   agentChatListTurnCheckpoints: vi.fn().mockResolvedValue([]),
   agentChatRevertTurnCheckpoint: vi.fn().mockResolvedValue([]),
+  agentChatUndoTurnRevert: vi.fn().mockResolvedValue(undefined),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatCancelQueuedTurn: vi.fn().mockResolvedValue(true),
   agentChatResumeAfterUsageLimit: vi.fn().mockResolvedValue(undefined),
@@ -1348,6 +1355,92 @@ describe("AgentChatPane usage-limit row", () => {
         "thread-x",
       ),
     );
+  });
+});
+
+describe("AgentChatPane turn revert", () => {
+  const checkpoint = {
+    thread_id: "thread-x",
+    workspace_id: "ws-home",
+    repo_path: "/home/user",
+    turn_index: 1,
+    client_nonce: "nonce-1",
+    transcript_cutoff_id: 0,
+    ref_name: "refs/codemux/turn-checkpoints/thread-x/1",
+    snapshot_commit: "snap",
+    head_commit: "head",
+    branch: "main",
+    created_at: "",
+  };
+
+  beforeEach(async () => {
+    currentMessages = [
+      {
+        kind: "user_message",
+        id: "m1",
+        seq: 0,
+        text: "Rename the helper",
+        clientNonce: "nonce-1",
+      },
+    ];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    setInputDraftMock.mockClear();
+    const {
+      agentChatListMessagesTail,
+      agentChatListTurnCheckpoints,
+      agentChatRevertTurnCheckpoint,
+      agentChatUndoTurnRevert,
+    } = await import("@/tauri/commands");
+    vi.mocked(agentChatListTurnCheckpoints).mockResolvedValue([checkpoint]);
+    vi.mocked(agentChatListMessagesTail).mockResolvedValueOnce({
+      rows: [],
+      total_rows: 0,
+      complete: true,
+    } as never);
+    vi.mocked(agentChatRevertTurnCheckpoint).mockClear().mockResolvedValue([]);
+    vi.mocked(agentChatUndoTurnRevert).mockClear().mockResolvedValue(undefined);
+  });
+
+  afterEach(async () => {
+    const { agentChatListTurnCheckpoints } = await import("@/tauri/commands");
+    vi.mocked(agentChatListTurnCheckpoints).mockResolvedValue([]);
+    vi.mocked(toast.success).mockRestore?.();
+  });
+
+  it("hands the reverted prompt back to the composer and offers to restore the files", async () => {
+    const success = vi.spyOn(toast, "success");
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const { agentChatRevertTurnCheckpoint, agentChatUndoTurnRevert } =
+      await import("@/tauri/commands");
+    // The checkpoint list loads after mount; until then there is nothing to
+    // revert to.
+    await waitFor(() => {
+      fireEvent.click(container.querySelector('[data-testid="revert-turn"]')!);
+      expect(document.querySelector('[data-testid="revert-turn-confirm"]')).not.toBeNull();
+    });
+    expect(document.body.textContent).toContain("Revert this turn?");
+    expect(document.body.textContent).toContain("Your prompt goes back into the composer");
+
+    fireEvent.click(document.querySelector('[data-testid="revert-turn-confirm"]')!);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatRevertTurnCheckpoint)).toHaveBeenCalledWith("thread-x", 1);
+    });
+    await waitFor(() => {
+      expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "Rename the helper");
+    });
+
+    const reverted = success.mock.calls.find(([message]) => message === "Turn reverted");
+    expect(reverted?.[1]?.description).toBe("Prompt restored to the composer.");
+    const action = reverted?.[1]?.action as
+      | { label: string; onClick: () => void }
+      | undefined;
+    expect(action?.label).toBe("Restore files");
+    action?.onClick();
+    await waitFor(() => {
+      expect(vi.mocked(agentChatUndoTurnRevert)).toHaveBeenCalledWith("thread-x");
+    });
   });
 });
 

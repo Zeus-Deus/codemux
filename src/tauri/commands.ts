@@ -2267,6 +2267,12 @@ export const agentChatRevertTurnCheckpoint = (
     { threadId, turnIndex },
   );
 
+/** Bring back the workspace files the last turn revert replaced, from its
+ *  safety snapshot. The conversation stays rewound. Refused once a newer turn
+ *  has started. */
+export const agentChatUndoTurnRevert = (threadId: string) =>
+  invoke<void>("agent_chat_undo_turn_revert", { threadId });
+
 /**
  * Register a per-thread `Channel` that receives every live
  * `AgentChatEventPayload` for `threadId` — including the
