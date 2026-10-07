@@ -3686,6 +3686,8 @@ const handlers: Record<string, Handler> = {
     // and the generic listing would hand the form a stack of unrelated
     // `.md` files to mistake for one.
     if (path.includes("merge_request_templates")) return [];
+    // The seeded recent projects must probe as folders so a recent row opens.
+    if (MOCK_RECENT_PROJECTS.some((p) => p.path === path)) return [];
     return mockListDirectory(path, Boolean(a.showHidden));
   },
 

@@ -2,8 +2,9 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock, toastErrorMock } = vi.hoisted(() => ({
+const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock } = vi.hoisted(() => ({
   openProjectMock: vi.fn(),
+  listDirectoryMock: vi.fn(),
   openCloneDialogMock: vi.fn(),
   openProjectAtPathMock: vi.fn(),
   recentProjectsMock: vi.fn(),
@@ -17,6 +18,7 @@ vi.mock("@/hooks/use-project-actions", () => ({
 vi.mock("@/tauri/commands", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/tauri/commands")>()),
   dbGetRecentProjects: recentProjectsMock,
+  listDirectory: listDirectoryMock,
   dbGetUiState: vi.fn().mockResolvedValue(null),
 }));
 
@@ -37,6 +39,7 @@ beforeEach(() => {
   openCloneDialogMock.mockReset();
   openProjectAtPathMock.mockReset().mockResolvedValue({ success: true, path: "/work/parser", name: "parser" });
   recentProjectsMock.mockReset().mockResolvedValue([]);
+  listDirectoryMock.mockReset().mockResolvedValue([]);
 });
 describe("ChatHomeLanding", () => {
   it("offers opt-in import only for first-run local enabled profiles", () => {
@@ -124,6 +127,28 @@ describe("ChatHomeLanding", () => {
       await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/parser"));
       expect(openProjectAtPathMock).toHaveBeenCalledWith("/work/parser");
       expect(openProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses a recent project whose folder is gone and drops its row", async () => {
+      recentProjectsMock.mockResolvedValue([
+        { path: "/work/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" },
+        { path: "/work/docs", name: "docs", last_opened_at: "2026-09-30T10:00:00Z" },
+      ]);
+      listDirectoryMock.mockImplementation(async (path: string) => {
+        if (path === "/work/parser") throw new Error("No such file or directory");
+        return [];
+      });
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      fireEvent.click(await screen.findByRole("button", { name: /parser/ }));
+      await vi.waitFor(() =>
+        expect(toastErrorMock).toHaveBeenCalledWith("parser is no longer at /work/parser."),
+      );
+      expect(openProjectAtPathMock).not.toHaveBeenCalled();
+      expect(onProjectOpened).not.toHaveBeenCalled();
+      const list = screen.getByRole("region", { name: "Recent projects" });
+      expect(list).not.toHaveTextContent("parser");
+      expect(list).toHaveTextContent("docs");
     });
 
     it("says so when opening the picked folder fails", async () => {

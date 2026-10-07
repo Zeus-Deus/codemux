@@ -65,6 +65,13 @@ vi.mock("@/tauri/commands", () => ({
   MCP_CODEMUX_SELF_ID: "codemux-self",
 }));
 
+// The empty home's "Open project" button; resolved per test.
+const { openProjectMock } = vi.hoisted(() => ({ openProjectMock: vi.fn() }));
+vi.mock("@/hooks/use-project-actions", () => ({
+  useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: vi.fn() }),
+  openProjectAtPath: vi.fn(),
+}));
+
 vi.mock("@/lib/agent-chat/materialize", () => ({
   materializeAndSend: vi.fn(),
 }));
@@ -196,6 +203,7 @@ import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import type { AppStateSnapshot } from "@/tauri/types";
 
 afterEach(() => cleanup());
 
@@ -767,6 +775,21 @@ describe("DraftChatSurface", () => {
       } finally {
         HTMLElement.prototype.animate = original;
       }
+    });
+
+    it("points the home draft at a project opened from the empty home", async () => {
+      openProjectMock.mockResolvedValueOnce({ success: true, path: "/work/api", name: "api" });
+      useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { getByRole } = renderSurface();
+      fireEvent.click(getByRole("button", { name: /Open project/ }));
+      await vi.waitFor(() =>
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]?.target).toEqual({
+          kind: "project",
+          projectPath: "/work/api",
+        }),
+      );
     });
 
     it("leaves a focus request for another draft alone", () => {

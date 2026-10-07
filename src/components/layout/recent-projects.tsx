@@ -6,7 +6,7 @@ import { shortenPath } from "@/lib/shorten-path";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useHomeDir } from "@/stores/app-store";
-import { dbGetRecentProjects } from "@/tauri/commands";
+import { dbGetRecentProjects, listDirectory } from "@/tauri/commands";
 import { useProjectAppearance } from "./use-project-appearance";
 
 export interface RecentProject {
@@ -69,12 +69,26 @@ export function RecentProjectList({
   className?: string;
 }) {
   const [openingPath, setOpeningPath] = useState<string | null>(null);
-  if (projects.length === 0) return null;
+  // Rows whose folder turned out to be gone; hidden for this visit.
+  const [missingPaths, setMissingPaths] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const visible = projects.filter((project) => !missingPaths.has(project.path));
+  if (visible.length === 0) return null;
 
   const open = async (project: RecentProject) => {
     if (openingPath) return;
     setOpeningPath(project.path);
     try {
+      // Recents are never re-validated and the backend accepts any cwd, so a
+      // folder moved or deleted since would become a dead workspace.
+      try {
+        await listDirectory(project.path);
+      } catch {
+        toast.error(`${project.name} is no longer at ${project.path}.`);
+        setMissingPaths((prev) => new Set(prev).add(project.path));
+        return;
+      }
       const result = await openProjectAtPath(project.path);
       if (result.success) onOpened?.(project.path);
     } catch (err) {
@@ -91,7 +105,7 @@ export function RecentProjectList({
     >
       <Eyebrow className="px-2">Recent</Eyebrow>
       <ul className="flex flex-col">
-        {projects.map((project) => (
+        {visible.map((project) => (
           <li key={project.path}>
             <RecentProjectRow
               project={project}
