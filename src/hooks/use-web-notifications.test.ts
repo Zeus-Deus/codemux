@@ -1,6 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
-import { chooseNotificationDelivery } from "./use-web-notifications";
+const { toastInfo } = vi.hoisted(() => ({ toastInfo: vi.fn() }));
+const openNotificationTarget = vi.fn();
+vi.mock("@/lib/toast", () => ({ toast: { info: toastInfo } }));
+vi.mock("@/lib/open-notification-target", () => ({
+  openNotificationTarget: (target: unknown) => openNotificationTarget(target),
+}));
+
+import { chooseNotificationDelivery, showToast } from "./use-web-notifications";
 
 describe("chooseNotificationDelivery", () => {
   it("uses a toast when the Web Notifications API is unavailable", () => {
@@ -62,5 +69,25 @@ describe("chooseNotificationDelivery", () => {
         pageHidden: true,
       }),
     ).toBe("toast");
+  });
+});
+
+describe("showToast", () => {
+  it("offers an Open action that goes to the agent's pane", () => {
+    const payload = {
+      title: "Agent finished — My Project",
+      body: "Codemux is waiting for your review.",
+      workspace_title: "My Project",
+      workspace_id: "ws-1",
+      pane_id: "pane-7",
+    };
+    showToast(payload);
+
+    const [title, opts] = toastInfo.mock.calls[0];
+    expect(title).toBe(payload.title);
+    expect(opts.description).toBe(payload.body);
+    expect(opts.action.label).toBe("Open");
+    opts.action.onClick();
+    expect(openNotificationTarget).toHaveBeenCalledWith(payload);
   });
 });

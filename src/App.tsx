@@ -12,6 +12,7 @@ import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
 import { useTerminalCwdPoll } from "@/hooks/use-terminal-cwd-poll";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
 import { useWebNotifications } from "@/hooks/use-web-notifications";
+import { useNotificationActivate } from "@/hooks/use-notification-activate";
 import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
 import { useRendererModeInit } from "@/hooks/use-renderer-mode";
 import { AppShell } from "@/components/layout/app-shell";
@@ -152,6 +153,8 @@ function App() {
   // Web remote client only: bridge backend `notification` events into the
   // browser (Web Notifications API with a toast fallback). No-op on desktop.
   useWebNotifications();
+  // Desktop only: clicking a native agent notification opens that agent.
+  useNotificationActivate();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;

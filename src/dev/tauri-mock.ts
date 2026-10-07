@@ -6226,6 +6226,21 @@ const handlers: Record<string, Handler> = {
   touch_workspace: (a) => {
     if (!findWorkspace(a.workspaceId)) throw new Error(`No workspace found for ${a.workspaceId}`);
   },
+  activate_pane: (a) => {
+    const paneId = String(a.paneId ?? "");
+    for (const workspace of appState.workspaces) {
+      const surface = workspace.surfaces.find((s) => leafPaneIds(s.root).includes(paneId));
+      if (!surface) continue;
+      workspace.active_surface_id = surface.surface_id;
+      surface.active_pane_id = paneId;
+      const tab = workspace.tabs.find((t) => t.surface_id === surface.surface_id);
+      if (tab) workspace.active_tab_id = tab.tab_id;
+      appState = { ...appState };
+      emitAppState();
+      return undefined;
+    }
+    return undefined;
+  },
   activate_workspace: (a) => {
     const target = findWorkspace(a.workspaceId);
     if (!target) return undefined;
@@ -6815,25 +6830,57 @@ const internals: TauriInternals = {
   providerRuntimeCommands: providerRuntimeCommandCount,
 });
 
-// Dev affordance: fire a backend-style global `notification` event from the
-// browser console to exercise the web-remote notification bridge
-// (`useWebNotifications`). Enable the remote flag first so the hook is live:
+// Dev affordances for agent notifications.
+//
+// `__codemuxMockNotify` fires a backend-style global `notification` event to
+// exercise the web-remote bridge (`useWebNotifications`). Enable the remote
+// flag first so the hook is live; the toast's Open button goes to the pane:
 //   window.__CODEMUX_REMOTE__ = true
-//   __codemuxMockNotify("Agent finished — Demo", "Ready for review", "Demo")
+//   __codemuxMockNotify("Agent finished — agent-chat-demo", undefined, "ws-codemux-chat")
+//
+// `__codemuxMockNotificationClick` stands in for clicking a native desktop
+// notification (`useNotificationActivate`):
+//   __codemuxMockNotificationClick("ws-codemux-chat")
+function firstPaneOf(workspaceId: string): string {
+  const workspace = findWorkspace(workspaceId);
+  const surface = workspace?.surfaces.find((s) => s.surface_id === workspace.active_surface_id)
+    ?? workspace?.surfaces[0];
+  return surface ? leafPaneIds(surface.root)[0] ?? "" : "";
+}
+
 (
   window as unknown as {
     __codemuxMockNotify: (
       title: string,
       body?: string,
-      workspaceTitle?: string,
+      workspaceId?: string,
+      paneId?: string,
     ) => void;
   }
 ).__codemuxMockNotify = (
   title,
   body = "Codemux is waiting for your review.",
-  workspaceTitle = "Demo",
+  workspaceId = "ws-codemux-chat",
+  paneId = firstPaneOf(workspaceId),
 ) => {
-  emitEvent("notification", { title, body, workspace_title: workspaceTitle });
+  emitEvent("notification", {
+    title,
+    body,
+    workspace_title: findWorkspace(workspaceId)?.title ?? "Demo",
+    workspace_id: workspaceId,
+    pane_id: paneId,
+  });
+};
+
+(
+  window as unknown as {
+    __codemuxMockNotificationClick: (workspaceId?: string, paneId?: string) => void;
+  }
+).__codemuxMockNotificationClick = (
+  workspaceId = "ws-codemux-chat",
+  paneId = firstPaneOf(workspaceId),
+) => {
+  emitEvent("notification-activate", { workspace_id: workspaceId, pane_id: paneId });
 };
 
 // Dev affordance: rewrite a PR's branch under you.

@@ -2414,7 +2414,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::resize_split,
             commands::resize_active_pane,
             commands::notify_attention,
-            commands::set_notification_sound_enabled,
             commands::set_ai_commit_message_enabled,
             commands::set_ai_commit_message_cli,
             commands::set_ai_commit_message_model,

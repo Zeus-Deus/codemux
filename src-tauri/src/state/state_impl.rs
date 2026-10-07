@@ -780,6 +780,8 @@ pub struct CodemuxConfigSnapshot {
     pub default_shell: Option<String>,
     pub theme_source: String,
     pub linux_first: bool,
+    /// Unused. The synced `notifications.sound_enabled` setting decides;
+    /// kept because older peers still require it in synced snapshots.
     pub notification_sound_enabled: bool,
     #[serde(default = "default_true")]
     pub ai_commit_message_enabled: bool,
@@ -1249,10 +1251,6 @@ impl AppStateStore {
         snapshot.workspaces.clear();
         snapshot.terminal_sessions.clear();
         snapshot.active_workspace_id = WorkspaceId(String::new());
-    }
-
-    pub fn set_notification_sound_enabled(&self, enabled: bool) {
-        self.inner.lock().unwrap().config.notification_sound_enabled = enabled;
     }
 
     pub fn set_ai_commit_message_enabled(&self, enabled: bool) {
@@ -3012,19 +3010,6 @@ impl AppStateStore {
         }
         workspace.pinned_at = pinned_at;
         Ok(true)
-    }
-
-    /// Whether the workspace containing `session_id` has notifications muted.
-    /// Used by the hook handler to suppress the completion popup.
-    pub fn is_session_workspace_muted(&self, session_id: &str) -> bool {
-        let snapshot = self.inner.lock().unwrap();
-        snapshot.workspaces.iter().any(|ws| {
-            ws.notifications_muted
-                && ws
-                    .surfaces
-                    .iter()
-                    .any(|s| find_terminal_pane_id(&s.root, session_id).is_some())
-        })
     }
 
     /// Returns true when at least one field actually moved. The periodic
@@ -4998,6 +4983,33 @@ impl AppStateStore {
         })
     }
 
+    /// Where an agent notification for a terminal session should lead.
+    pub fn notification_target_for_session(&self, session_id: &str) -> Option<NotificationTarget> {
+        self.notification_target(|root| find_terminal_pane_id(root, session_id))
+    }
+
+    /// Where an agent notification for a chat thread should lead.
+    pub fn notification_target_for_thread(&self, thread_id: &str) -> Option<NotificationTarget> {
+        self.notification_target(|root| find_agent_chat_pane_id(root, thread_id))
+    }
+
+    fn notification_target(
+        &self,
+        find_pane: impl Fn(&PaneNodeSnapshot) -> Option<PaneId>,
+    ) -> Option<NotificationTarget> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().find_map(|ws| {
+            let pane_id = ws.surfaces.iter().find_map(|s| find_pane(&s.root))?;
+            Some(NotificationTarget {
+                workspace_id: ws.workspace_id.0.clone(),
+                workspace_title: ws.title.clone(),
+                pane_id: pane_id.0,
+                muted: ws.notifications_muted,
+                in_active_workspace: ws.workspace_id == snapshot.active_workspace_id,
+            })
+        })
+    }
+
     /// Clear working/permission status for a session (on terminal exit).
     pub fn clear_transient_pane_status_by_session(&self, session_id: &str) {
         let mut snapshot = self.inner.lock().unwrap();
@@ -6388,6 +6400,17 @@ fn collect_pane_ids_from_node(node: &PaneNodeSnapshot) -> Vec<String> {
             children.iter().flat_map(collect_pane_ids_from_node).collect()
         }
     }
+}
+
+/// The pane an agent notification is about, plus the workspace facts that
+/// decide whether to raise it and where clicking it should go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationTarget {
+    pub workspace_id: String,
+    pub workspace_title: String,
+    pub pane_id: String,
+    pub muted: bool,
+    pub in_active_workspace: bool,
 }
 
 pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -> Option<PaneId> {
@@ -7801,23 +7824,29 @@ mod tests {
             other => panic!("Single layout should have a terminal root, got {other:?}"),
         };
 
+        let muted = |session_id: &str| {
+            store
+                .notification_target_for_session(session_id)
+                .map(|target| target.muted)
+        };
+
         // Default: not muted — the hook handler would NOT suppress.
         assert!(!workspace.notifications_muted);
-        assert!(!store.is_session_workspace_muted(&session_id));
+        assert_eq!(muted(&session_id), Some(false));
 
         // Mute: both the snapshot flag and the session lookup flip.
         assert!(store.set_workspace_muted(&workspace_id.0, true));
-        assert!(store.is_session_workspace_muted(&session_id));
+        assert_eq!(muted(&session_id), Some(true));
         assert!(
             workspace_by_id(&store.snapshot(), &workspace_id).notifications_muted
         );
 
-        // Muting is scoped: an unknown session is never reported muted.
-        assert!(!store.is_session_workspace_muted("session-does-not-exist"));
+        // Muting is scoped: an unknown session has no target at all.
+        assert_eq!(muted("session-does-not-exist"), None);
 
         // Unmute: back to the un-suppressed state.
         assert!(store.set_workspace_muted(&workspace_id.0, false));
-        assert!(!store.is_session_workspace_muted(&session_id));
+        assert_eq!(muted(&session_id), Some(false));
 
         // Unknown workspace id: the mutator reports "not found".
         assert!(!store.set_workspace_muted("workspace-does-not-exist", true));
@@ -10538,6 +10567,32 @@ mod tests {
         store.activate_workspace(&other_ws.0);
         assert!(!store.is_thread_pane_in_active_workspace("thread-active"));
         assert!(store.is_thread_pane_in_active_workspace("thread-other"));
+    }
+
+    #[test]
+    fn notification_target_for_thread_names_its_workspace_and_pane() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane.0, Some("thread-a".into()));
+        let title = workspace_by_id(&store.snapshot(), &ws_id).title.clone();
+
+        assert_eq!(
+            store.notification_target_for_thread("thread-a"),
+            Some(NotificationTarget {
+                workspace_id: ws_id.0.clone(),
+                workspace_title: title,
+                pane_id: pane.0.clone(),
+                muted: false,
+                in_active_workspace: true,
+            })
+        );
+        assert_eq!(store.notification_target_for_thread("thread-b"), None);
+
+        store.set_workspace_muted(&ws_id.0, true);
+        assert!(store.notification_target_for_thread("thread-a").unwrap().muted);
     }
 
     #[test]
