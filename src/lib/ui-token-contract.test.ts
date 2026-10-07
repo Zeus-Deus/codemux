@@ -112,6 +112,12 @@ const CATEGORIES: Category[] = [
       "icons: two device glyphs, two goal glyphs, the context meter's two " +
       "arcs and the usage chart's five strokes",
   },
+  {
+    label: "raw errors as toast titles (use toast.failure(title, err))",
+    pattern: /toast\.error\(\s*(?:String\(|`[^`]*\$\{String\()/g,
+    scan: (contents) => [contents],
+    budget: 0,
+  },
 ];
 
 function sourceFiles(directory: string): string[] {

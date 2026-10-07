@@ -52,7 +52,7 @@ export function InterfaceSection() {
       window.setTimeout(() => setDiagnosticsCopied(false), 1_400);
       toast.success("Performance diagnostics copied");
     } catch (error) {
-      toast.error(`Couldn't collect performance diagnostics: ${String(error)}`);
+      toast.failure(`Couldn't collect performance diagnostics`, error);
     } finally {
       setCopyingDiagnostics(false);
     }
@@ -76,15 +76,13 @@ export function InterfaceSection() {
       window.setTimeout(() => {
         void invoke<void>("quit_app").catch((err) => {
           console.error("[interface-section] quit_app failed:", err);
-          toast.error(
-            `Couldn't close Codemux automatically — please quit and reopen manually: ${String(err)}`,
-          );
+          toast.failure("Couldn't close Codemux automatically. Quit and reopen it.", err);
           setPending(false);
         });
       }, 600);
     } catch (err) {
       console.error("[interface-section] toggle failed:", err);
-      toast.error(`Failed to update the interface setting: ${String(err)}`);
+      toast.failure("Couldn't update the interface setting", err);
       setPending(false);
     }
   };

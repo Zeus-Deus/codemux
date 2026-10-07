@@ -45,7 +45,7 @@ export function ReviewReviewers({ pr, cwd, canRequestReview, onRequested }: Prop
     } catch (err) {
       // The name stays in the field — a typo is worth correcting, not
       // retyping.
-      toast.error(String(err));
+      toast.failure(`Couldn't request a review from ${name}`, err);
     } finally {
       setSubmitting(false);
     }

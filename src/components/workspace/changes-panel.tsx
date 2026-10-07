@@ -141,7 +141,7 @@ function FileRow({
       else await gitStageFiles(cwd, [file.path]);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(staged ? "Couldn't unstage the file" : "Couldn't stage the file", err);
     }
   };
 
@@ -159,7 +159,7 @@ function FileRow({
       await gitDiscardFile(cwd, file.path);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't discard the changes", err);
     }
     setConfirmDiscard(false);
   };

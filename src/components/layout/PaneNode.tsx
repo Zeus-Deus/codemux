@@ -18,6 +18,7 @@ import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { reportFailure } from "@/lib/toast";
 
 const TerminalPane = React.lazy(() =>
   import("@/components/terminal/TerminalPane").then((module) => ({
@@ -303,11 +304,11 @@ function PaneNodeImpl({
   };
 
   const handleSplit = (direction: "horizontal" | "vertical") => {
-    splitPane(node.pane_id, direction).catch(console.error);
+    splitPane(node.pane_id, direction).catch(reportFailure("Couldn't split the pane"));
   };
 
   const handleClose = () => {
-    closePane(node.pane_id).catch(console.error);
+    closePane(node.pane_id).catch(reportFailure("Couldn't close the pane"));
   };
 
   if (node.kind === "terminal") {

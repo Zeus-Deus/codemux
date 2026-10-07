@@ -19,7 +19,8 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 const mockToastError = vi.fn();
 vi.mock("@/lib/toast", () => ({
   toast: {
-    error: (...a: unknown[]) => mockToastError(...a),
+    error: vi.fn(),
+    failure: (...a: unknown[]) => mockToastError(...a),
     success: vi.fn(),
     info: vi.fn(),
     warning: vi.fn(),
@@ -149,7 +150,8 @@ describe("ReviewChecks — Fix with agent", () => {
     await flush();
 
     expect(mockToastError).toHaveBeenCalledWith(
-      expect.stringContaining("claude is not installed"),
+      "Couldn't hand the check to an agent",
+      new Error("claude is not installed"),
     );
     expect(screen.getByTestId(`fix-with-agent-${FAILING.name}`)).not.toBeDisabled();
   });

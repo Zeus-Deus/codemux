@@ -1073,7 +1073,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] toggle failed:", err);
-        toast.error(`Couldn't ${next ? "enable" : "disable"} remote access: ${String(err)}`);
+        toast.failure(`Couldn't ${next ? "enable" : "disable"} remote access`, err);
       } finally {
         setTogglePending(false);
       }
@@ -1107,7 +1107,7 @@ export function RemoteAccessSection() {
       } catch (err) {
         console.error("[remote-access] retry failed:", err);
         if (what === "server") {
-          toast.error(`Still couldn't start the server: ${String(err)}`);
+          toast.failure("Still couldn't start the server", err);
         } else {
           // The rejection is about the listener; registration was retried
           // regardless and reports back through the live status.
@@ -1148,7 +1148,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set port failed:", err);
           setPortDraft(String(status?.port ?? nextPort));
           setRebindPhase(null);
-          toast.error(`Couldn't change the port: ${String(err)}`);
+          toast.failure("Couldn't change the port", err);
         }
       } finally {
         setPortPending(false);
@@ -1167,7 +1167,7 @@ export function RemoteAccessSection() {
       reportLanOutcome(result, `Port set to ${result.port}.`);
     } catch (err) {
       console.error("[remote-access] set port failed:", err);
-      toast.error(`Couldn't change the port: ${String(err)}`);
+      toast.failure("Couldn't change the port", err);
     } finally {
       setPortPending(false);
     }
@@ -1205,7 +1205,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set scope failed:", err);
           setScopeOverride(null);
           setRebindPhase(null);
-          toast.error(`Couldn't change where the server is visible: ${String(err)}`);
+          toast.failure("Couldn't change where the server is visible", err);
         }
       } finally {
         setScopePending(false);
@@ -1247,7 +1247,7 @@ export function RemoteAccessSection() {
         console.error("[remote-access] set scope failed:", err);
         // The backend keeps the previous, working scope on failure and the
         // status it broadcasts reflects that, so the control snaps back.
-        toast.error(`Couldn't change where the server is visible: ${String(err)}`);
+        toast.failure("Couldn't change where the server is visible", err);
       } finally {
         setScopePending(false);
       }
@@ -1270,7 +1270,7 @@ export function RemoteAccessSection() {
         else toast.success("Stopped listening on your network.");
       } catch (err) {
         console.error("[remote-access] set LAN listener failed:", err);
-        toast.error(`Couldn't change network access: ${String(err)}`);
+        toast.failure("Couldn't change network access", err);
       } finally {
         setLanPending(false);
       }
@@ -1302,7 +1302,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set approval failed:", err);
-        toast.error(`Couldn't change approval mode: ${String(err)}`);
+        toast.failure("Couldn't change approval mode", err);
       } finally {
         setApprovalPending(false);
       }
@@ -1323,7 +1323,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set account mode failed:", err);
-        toast.error(`Couldn't change account sign-in: ${String(err)}`);
+        toast.failure("Couldn't change account sign-in", err);
       } finally {
         setAccountModePending(false);
       }
@@ -1348,7 +1348,7 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set trust-account failed:", err);
-        toast.error(`Couldn't change account approval: ${String(err)}`);
+        toast.failure("Couldn't change account approval", err);
       } finally {
         setTrustAccountPending(false);
       }
@@ -1373,7 +1373,7 @@ export function RemoteAccessSection() {
         }
       } catch (err) {
         console.error("[remote-access] set relay mode failed:", err);
-        toast.error(`Couldn't change from-anywhere access: ${String(err)}`);
+        toast.failure("Couldn't change from-anywhere access", err);
       } finally {
         setRelayModePending(false);
       }
@@ -1408,7 +1408,7 @@ export function RemoteAccessSection() {
       setPairing(await webRemoteCreatePairing());
     } catch (err) {
       console.error("[remote-access] create pairing failed:", err);
-      toast.error(`Couldn't create a pairing link: ${String(err)}`);
+      toast.failure("Couldn't create a pairing link", err);
     } finally {
       setPairingPending(false);
     }
@@ -1421,7 +1421,7 @@ export function RemoteAccessSection() {
         applyStatus(await webRemoteApproveSession(id), { detectPending: false });
         toast.success("Device approved.");
       } catch (err) {
-        toast.error(`Couldn't approve the device: ${String(err)}`);
+        toast.failure("Couldn't approve the device", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1436,7 +1436,7 @@ export function RemoteAccessSection() {
         applyStatus(await webRemoteRejectSession(id), { detectPending: false });
         toast.success("Request rejected.");
       } catch (err) {
-        toast.error(`Couldn't reject the device: ${String(err)}`);
+        toast.failure("Couldn't reject the device", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1451,7 +1451,7 @@ export function RemoteAccessSection() {
         applyStatus(await webRemoteRevokeSession(id), { detectPending: false });
         toast.success("Device revoked — its access is now blocked.");
       } catch (err) {
-        toast.error(`Couldn't revoke the device: ${String(err)}`);
+        toast.failure("Couldn't revoke the device", err);
       } finally {
         setSessionBusy(null);
       }
@@ -1469,7 +1469,7 @@ export function RemoteAccessSection() {
       if (last) applyStatus(last, { detectPending: false });
       toast.success("Revoked every device.");
     } catch (err) {
-      toast.error(`Couldn't revoke every device: ${String(err)}`);
+      toast.failure("Couldn't revoke every device", err);
     } finally {
       setRevokingAll(false);
     }

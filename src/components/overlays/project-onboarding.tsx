@@ -53,6 +53,7 @@ import {
 import type { WorktreeInfo, DetectedSetup, BranchDetail } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { toast, errorMessage } from "@/lib/toast";
 
 type Step = "workspace" | "setup";
 type SetupMode = "checklist" | "custom";
@@ -280,7 +281,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         await activateWorkspace(wsId);
         onComplete();
       } catch (err) {
-        failPendingWorkspace(tempId, String(err));
+        // Onboarding replaces the whole view, so the failed sidebar row is
+        // easy to miss; the toast is what the user actually sees.
+        toast.failure("Couldn't create the workspace", err);
+        failPendingWorkspace(tempId, errorMessage(err));
         setTimeout(() => removePendingWorkspace(tempId), 5000);
         setIsCreating(false);
       }

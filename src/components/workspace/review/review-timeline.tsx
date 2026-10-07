@@ -458,7 +458,7 @@ export function ReviewTimeline({ entries, loading, staleAgeMs }: ReviewTimelineP
     } catch (err) {
       // The workspace may have been closed since the run — say so rather
       // than failing silently on a button that looks like it worked.
-      toast.error(`Couldn't open that thread — ${String(err)}`);
+      toast.failure("Couldn't open that thread", err);
     } finally {
       setOpening(null);
     }

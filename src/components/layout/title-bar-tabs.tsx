@@ -41,6 +41,7 @@ import type {
 } from "@/tauri/types";
 
 import { TabDropIndicator } from "./tab-drop-indicator";
+import { reportFailure } from "@/lib/toast";
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -220,12 +221,12 @@ function TitleBarTab({
 }: TitleBarTabProps) {
   const handleActivate = () => {
     if (!isActive) {
-      activateTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+      activateTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't switch tabs"));
     }
   };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+    closeTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
 
   return (
@@ -294,7 +295,7 @@ function ActiveChatTab({
   });
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeTab(workspaceId, tab.tab_id).catch(console.error);
+    closeTab(workspaceId, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
 
   return (

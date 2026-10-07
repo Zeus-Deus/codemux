@@ -112,7 +112,7 @@ export function ReviewDescription({
       toast.success("Description updated");
     } catch (err) {
       // Failure keeps the draft exactly as typed.
-      toast.error(String(err));
+      toast.failure("Couldn't update the description", err);
     } finally {
       setSaving(false);
     }

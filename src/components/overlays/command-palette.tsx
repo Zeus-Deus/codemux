@@ -107,6 +107,7 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { toast, reportFailure } from "@/lib/toast";
 
 interface Props {
   open: boolean;
@@ -198,14 +199,14 @@ const COMMANDS: PaletteCommand[] = [
     label: "Focus next pane",
     icon: LayoutGrid,
     requiresWorkspace: true,
-    run: () => void cyclePane(1).catch(console.error),
+    run: () => void cyclePane(1).catch(reportFailure("Couldn't focus the next pane")),
   },
   {
     id: "focus-prev-pane",
     label: "Focus previous pane",
     icon: LayoutGrid,
     requiresWorkspace: true,
-    run: () => void cyclePane(-1).catch(console.error),
+    run: () => void cyclePane(-1).catch(reportFailure("Couldn't focus the previous pane")),
   },
   {
     id: "open-browser",
@@ -214,7 +215,7 @@ const COMMANDS: PaletteCommand[] = [
     keywords: "web preview localhost",
     requiresWorkspace: true,
     run: ({ activePaneId }) => {
-      if (activePaneId) void createBrowserPane(activePaneId).catch(console.error);
+      if (activePaneId) void createBrowserPane(activePaneId).catch(reportFailure("Couldn't open a browser pane"));
     },
   },
 
@@ -228,7 +229,7 @@ const COMMANDS: PaletteCommand[] = [
     run: () =>
       void getPresets()
         .then((s) => setPresetBarVisible(!s.bar_visible))
-        .catch(console.error),
+        .catch(reportFailure("Couldn't toggle the preset bar")),
   },
   { id: "shortcuts", label: "Keyboard shortcuts", icon: Keyboard, actionId: "showShortcuts", keywords: "keybinds bindings" },
   {
@@ -258,7 +259,7 @@ const COMMANDS: PaletteCommand[] = [
     // reload the desktop's; its browser tab is the interface there.
     run: () => {
       if (isRemoteClient()) window.location.reload();
-      else void reloadInterface().catch(console.error);
+      else void reloadInterface().catch(reportFailure("Couldn't reload the interface"));
     },
   },
   {
@@ -267,7 +268,11 @@ const COMMANDS: PaletteCommand[] = [
     icon: RefreshCw,
     requiresWorkspace: true,
     run: ({ workspace }) => {
-      if (workspace) void regenerateMcpConfig(workspace.workspace_id).catch(console.error);
+      if (!workspace) return;
+      // Nothing on screen changes when this works, so say that it did.
+      void regenerateMcpConfig(workspace.workspace_id)
+        .then(() => toast.success("MCP config regenerated"))
+        .catch(reportFailure("Couldn't regenerate the MCP config"));
     },
   },
 ];
