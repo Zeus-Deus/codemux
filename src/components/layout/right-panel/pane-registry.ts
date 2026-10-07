@@ -140,16 +140,3 @@ export function isCorePane(id: RightPanelTab): id is RightPanelCorePane {
 export function baseName(filePath: string): string {
   return filePath.split(/[/\\]/).filter(Boolean).pop() ?? filePath;
 }
-
-/**
- * A file path relative to the workspace root, for the pane-bar
- * breadcrumb. Falls back to the bare basename when the file lives
- * outside the workspace (an absolute path would blow out a 240px column).
- */
-export function relativeToRoot(filePath: string, root: string): string {
-  const normalizedRoot = root.replace(/[/\\]+$/, "");
-  if (normalizedRoot && filePath.startsWith(`${normalizedRoot}/`)) {
-    return filePath.slice(normalizedRoot.length + 1);
-  }
-  return baseName(filePath);
-}

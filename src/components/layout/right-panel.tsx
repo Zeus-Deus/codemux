@@ -130,7 +130,6 @@ import {
   docPanePath,
   isCorePane,
   paneMeta,
-  relativeToRoot,
 } from "./right-panel/pane-registry";
 import { PaneTabStrip, type DeckTab } from "./right-panel/pane-tab-strip";
 import { SubagentsPane } from "./right-panel/subagents-pane";
@@ -232,7 +231,6 @@ export const RightPanel = memo(function RightPanel({
 }: Props) {
   const mobile = useMobileLayout();
   const workspaceId = workspace.workspace_id;
-  const cwd = workspace.worktree_path ?? workspace.cwd;
 
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
@@ -513,6 +511,11 @@ export const RightPanel = memo(function RightPanel({
   const diffSetFile = useDiffStore((s) => s.setFile);
   const diffSetLayout = useDiffStore((s) => s.setLayout);
   const diffTab = useDiffStore((s) => s.tabs[diffTabId]);
+  // A side panel is narrow, so a long line wraps by default; the pane
+  // bar turns it off when sideways scrolling reads better.
+  const [diffWrap, setDiffWrap] = useState(true);
+  // Escape from the diff hands focus back to the Changes row it came from.
+  const [changesFocusPath, setChangesFocusPath] = useState<string | null>(null);
 
   /** Hand the panel's diff to a full main-area tab, which has the room
    *  for hunk/file navigation and focus mode. */
@@ -862,6 +865,14 @@ export const RightPanel = memo(function RightPanel({
                 )
               }
             />
+            {diffTab?.layout !== "split" && (
+              <PaneActionButton
+                label={diffWrap ? "Disable soft wrap" : "Soft wrap"}
+                icon={WrapText}
+                active={diffWrap}
+                onClick={() => setDiffWrap((w) => !w)}
+              />
+            )}
             <PaneActionButton
               label="Open in a tab"
               icon={ExternalLink}
@@ -907,11 +918,6 @@ export const RightPanel = memo(function RightPanel({
       deletions: workspace.git_deletions,
     },
     review: { prNumber: workspace.pr_number, state: workspace.pr_state },
-    diff: {
-      filePath: diffTab?.filePath
-        ? relativeToRoot(diffTab.filePath, cwd)
-        : null,
-    },
     browser: browserOpen
       ? {
           docked: browserDocked,
@@ -987,9 +993,19 @@ export const RightPanel = memo(function RightPanel({
             refreshKey={changesRefreshKey}
             sectionFilter={changesFilter}
             onOpenDiff={openDiffPane}
+            returnFocusPath={changesFocusPath}
           />
         ) : activePane === "diff" ? (
-          <DiffPane tabId={diffTabId} workspace={workspace} embedded />
+          <DiffPane
+            tabId={diffTabId}
+            workspace={workspace}
+            embedded
+            wrap={diffWrap}
+            onBack={() => {
+              setChangesFocusPath(diffTab?.filePath ?? null);
+              setRightPanelTab(workspaceId, "changes");
+            }}
+          />
         ) : activePane === "review" ? (
           <ReviewPanel workspace={workspace} />
         ) : activePane === "browser" ? (
