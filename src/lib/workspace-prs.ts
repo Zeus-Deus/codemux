@@ -255,17 +255,16 @@ export function stackGroups(prs: readonly WorkspacePrRef[]): WorkspacePrRef[][] 
       cursor = parent;
     }
   };
-  const groups: WorkspacePrRef[][] = [];
-  let currentRoot: number | null = null;
+  // Bucketed by root rather than split on runs of `stackOrder`: its cycle
+  // fallback can interleave two cycles, which would cut one stack in two.
+  const groups = new Map<number, WorkspacePrRef[]>();
   for (const pr of stackOrder(prs)) {
     const root = rootOf(pr);
-    if (root !== currentRoot) {
-      groups.push([]);
-      currentRoot = root;
-    }
-    groups[groups.length - 1].push(pr);
+    const group = groups.get(root);
+    if (group) group.push(pr);
+    else groups.set(root, [pr]);
   }
-  return groups;
+  return [...groups.values()];
 }
 
 /** Is the whole set one stack of two or more PRs? */

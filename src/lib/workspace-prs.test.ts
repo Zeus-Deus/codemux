@@ -333,6 +333,20 @@ describe("stackGroups", () => {
     expect(stackGroups([b, a])).toHaveLength(1);
   });
 
+  it("keeps a PR with the cycle it builds on when another cycle arrives between them", () => {
+    const prs = [
+      pr(9, "OPEN", "h9", "h5"),
+      pr(6, "OPEN", "h6", "h8"),
+      pr(5, "OPEN", "h5", "h7"),
+      pr(7, "OPEN", "h7", "h5"),
+      pr(8, "OPEN", "h8", "h6"),
+    ];
+    const groups = stackGroups(prs).map((g) => g.map((p) => p.number).sort());
+    expect(groups).toHaveLength(2);
+    expect(groups).toContainEqual([5, 7, 9]);
+    expect(groups).toContainEqual([6, 8]);
+  });
+
   it("does not call a single PR a stack", () => {
     expect(isSingleStack([pr(1, "OPEN")])).toBe(false);
   });
