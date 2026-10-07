@@ -23,6 +23,7 @@ beforeEach(() => {
     rightPanelTabs: {},
     rightPanelLastTabs: {},
     sidebarWidth: 288,
+    sidebarOpen: true,
     rightPanelWidth: 320,
     rightPanelMaximized: false,
     showNewWorkspaceDialog: false,
@@ -160,6 +161,16 @@ describe("ui-store — onboarding state", () => {
       const persisted = JSON.parse(raw!);
       // Zustand persist format: { state: {...}, version: N }
       expect(persisted.state.hasSeenOnboarding).toBe(true);
+    });
+
+    // The rail-or-expanded choice is half of one preference with the width;
+    // forgetting it made rail users collapse the sidebar on every launch.
+    it("persists the sidebar's collapsed state alongside its width", () => {
+      useUIStore.getState().setSidebarOpen(false);
+
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.sidebarOpen).toBe(false);
+      expect(persisted.state.sidebarWidth).toBe(288);
     });
 
     it("does NOT persist onboardingProjectDir (session-only)", () => {

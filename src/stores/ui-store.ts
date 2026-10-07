@@ -88,6 +88,10 @@ interface UIStore {
    *  rather than in `SidebarProvider` because full-screen pages (Settings,
    *  Automations, …) unmount the provider. Clamped by the provider. */
   sidebarWidth: number;
+  /** Left sidebar expanded (true) or collapsed to the icon rail. Persisted
+   *  next to its width so the two halves of one preference survive a
+   *  restart together. */
+  sidebarOpen: boolean;
   rightPanelWidth: number;
   /** Measured width of the row the panel shares with the workspace content
    *  (`workspace-main.tsx` owns the measurement). Runtime-only, never
@@ -231,6 +235,7 @@ interface UIStore {
     order: readonly RightPanelTab[],
   ) => void;
   setSidebarWidth: (width: number) => void;
+  setSidebarOpen: (open: boolean) => void;
   setRightPanelWidth: (width: number) => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
@@ -297,6 +302,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
+      sidebarOpen: true,
       rightPanelWidth: 320,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
@@ -542,6 +548,8 @@ export const useUIStore = create<UIStore>()(
 
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
 
+      setSidebarOpen: (open) => set({ sidebarOpen: open }),
+
       setRightPanelRowWidth: (width) =>
         set((state) =>
           state.rightPanelRowWidth === width
@@ -702,6 +710,7 @@ export const useUIStore = create<UIStore>()(
         rightPanelPanes: state.rightPanelPanes,
         rightPanelDismissedPanes: state.rightPanelDismissedPanes,
         sidebarWidth: state.sidebarWidth,
+        sidebarOpen: state.sidebarOpen,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
