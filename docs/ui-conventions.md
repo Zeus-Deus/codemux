@@ -123,7 +123,9 @@ durations ended up in one window. Name the properties that transition rather
 than using `transition-all`, and gate anything that loops on `motion-safe:`.
 
 Dialogs enter at `duration-250` and leave at `data-closed:duration-150`, so
-dismissing one never lags the keypress. An overlay rendered behind a store
+dismissing one never lags the keypress. Centered dialogs zoom; dialogs
+anchored near the top (the command palette, the search overlays) drop in from
+above with `DIALOG_TOP_ANCHORED_MOTION`. An overlay rendered behind a store
 flag stays mounted after its first open (`useMountedOnceOpen`); unmounting it
 on close cuts its exit animation off.
 

@@ -277,7 +277,7 @@ export function BranchPicker({
           >
             {loading ? (
               <div className="flex items-center justify-center py-8 text-label text-muted-foreground">
-                <Spinner className="mr-2 size-3.5" />
+                <Spinner className="mr-2 size-3.5" aria-hidden />
                 Loading branches...
               </div>
             ) : (

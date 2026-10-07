@@ -330,7 +330,7 @@ export function HostsSection() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
-        <Spinner className="mr-2 size-4" />
+        <Spinner className="mr-2 size-4" aria-hidden />
         Loading hosts…
       </div>
     );

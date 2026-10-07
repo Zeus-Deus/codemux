@@ -103,7 +103,7 @@ export function DevicesSection() {
   if (!loaded) {
     return (
       <div className="flex h-full items-center justify-center text-body text-muted-foreground">
-        <Spinner className="mr-2 size-4" />
+        <Spinner className="mr-2 size-4" aria-hidden />
         Loading devices…
       </div>
     );
@@ -417,9 +417,9 @@ function ProjectCluster({
             className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:opacity-60"
           >
             {pulling ? (
-              <Spinner className="size-[9px]" aria-hidden />
+              <Spinner className="size-3" aria-hidden />
             ) : (
-              <ArrowDownToLine className="size-[9px]" aria-hidden />
+              <ArrowDownToLine className="size-3" aria-hidden />
             )}
             Pull project
           </button>

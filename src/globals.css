@@ -394,6 +394,8 @@
  * does when GTK's gtk-enable-animations is off, which most users never touch.
  * Everything collapses to its end state instead of being removed, so
  * animationend/transitionend still fire and Radix overlays still unmount.
+ * Delays are left alone on purpose: some are logic, not motion (BrowserPane
+ * holds its "Reconnecting" chip back 400ms so a brief blip never flashes it).
  * Spinners are the exception: a frozen spinner reads as a hung app, so they
  * swap rotation for a slow opacity breath. */
 @keyframes cm-spinner-breathe {

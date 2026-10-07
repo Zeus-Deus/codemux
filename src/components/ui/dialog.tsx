@@ -70,6 +70,16 @@ function DialogOverlay({
 export const DIALOG_CRISP_POSITION =
   "inset-x-0 top-24 mx-auto translate-x-0 translate-y-0"
 
+/**
+ * Motion for dialogs anchored near the top of the window (the command
+ * palette and the search overlays): they drop in from above and lift away,
+ * instead of the centered dialog's zoom, which reads as growing out of the
+ * middle of the screen. The `!` cancels the default zoom, whose variable
+ * would otherwise win or lose on stylesheet order.
+ */
+export const DIALOG_TOP_ANCHORED_MOTION =
+  "data-open:zoom-in-100! data-closed:zoom-out-100! data-open:slide-in-from-top-2 data-closed:slide-out-to-top-2"
+
 function DialogContent({
   className,
   children,

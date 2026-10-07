@@ -97,6 +97,7 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 vi.mock("@/lib/addons/platform", () => ({ executeAddon: vi.fn() }));
 
 import { CommandPalette } from "./command-palette";
+import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import { useSidebarInboxStore, __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
@@ -523,6 +524,12 @@ describe("command palette — conversation search", () => {
     expect(dialog).toHaveClass("in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]!");
     expect(dialog).toHaveClass("in-[[data-mobile]]:p-0!");
     expect(document.querySelector("[cmdk-list]")).toHaveClass("max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))]");
+  });
+
+  it("drops in from the top it is anchored to instead of zooming from the middle", () => {
+    renderPalette();
+    const dialog = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')!;
+    for (const cls of DIALOG_TOP_ANCHORED_MOTION.split(" ")) expect(dialog).toHaveClass(cls);
   });
 
   it("reserves the result viewport even for a single match", async () => {
