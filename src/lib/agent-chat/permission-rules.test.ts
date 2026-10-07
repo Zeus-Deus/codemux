@@ -188,6 +188,12 @@ describe("suggestPermissionRule", () => {
     expect(bash("poetry run bash scripts/x.sh")).toBeNull();
     expect(bash("go run example.com/tool@latest")).toBeNull();
     expect(bash("go run main.go")).toBeNull();
+    // A bare `poetry` or `go` rule would allow their `run` too.
+    expect(bash("poetry --version")).toBeNull();
+    expect(bash("poetry -C app run pytest")).toBeNull();
+    expect(bash("go")).toBeNull();
+    expect(bash("go -C sub run example.com/tool@latest")).toBeNull();
+    expect(bash("go build ./...")).toEqual({ toolName: "Bash", ruleContent: "go build:*" });
     // Run-anything verbs are refused at any depth, even under other programs.
     expect(bash("docker compose exec web sh")).toBeNull();
     // A program that merely starts with an interpreter's name is fine.

@@ -107,7 +107,9 @@ const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "uv"]);
 /** Programs whose `run` takes any command or remote package rather than a
  *  project script (`uv run --with httpx python`, `poetry run bash`,
  *  `go run example.com/tool@latest`). Their rule must name a command after
- *  `run`, and not a shell or interpreter. */
+ *  `run`, and not a shell or interpreter. A bare rule (`poetry --version`,
+ *  `go -C sub run …`) would allow `run` too, so they also need at least one
+ *  subcommand word. */
 const COMMAND_RUNNERS = new Set(["uv", "poetry", "go"]);
 /** Characters that would end or nest Claude's `Tool(content)` rule
  *  syntax. */
@@ -154,7 +156,8 @@ export function suggestPermissionRule(
     const subcommands = words.slice(1);
     if (
       subcommands.some((word) => ARBITRARY_CODE_SUBCOMMANDS.has(word)) ||
-      (PACKAGE_MANAGERS.has(family) && subcommands.length === 0) ||
+      ((PACKAGE_MANAGERS.has(family) || COMMAND_RUNNERS.has(family)) &&
+        subcommands.length === 0) ||
       // A bare `Bash(uv tool:*)`, derived when a flag follows `tool`
       // (`uv tool --quiet run ruff`), would allow `uv tool run` too.
       (family === "uv" &&
