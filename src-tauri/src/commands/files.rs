@@ -206,10 +206,14 @@ pub async fn search_in_files(
     };
 
     tokio::task::spawn_blocking(move || {
-        // rg still exits with a JSON summary for a missing root, and the
-        // summary's searched-file count is unreliable before rg 15, so a
-        // vanished workspace is caught here rather than read from rg's output.
-        std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?;
+        // rg still exits with a JSON summary for a missing or unreadable root,
+        // and the summary's searched-file count is unreliable before rg 15, so
+        // a vanished or locked workspace is caught here rather than read from
+        // rg's output.
+        let root_error = |e: std::io::Error| format!("{path}: {e}");
+        if std::fs::metadata(&path).map_err(root_error)?.is_dir() {
+            std::fs::read_dir(&path).map_err(root_error)?;
+        }
         // Try ripgrep first; fall back to grep only when rg isn't installed.
         match search_with_rg(&path, &query, &opts) {
             Some(result) => result,
@@ -1640,6 +1644,29 @@ mod tests {
         search_in_files(missing, "needle".to_string(), None, None, None)
             .await
             .expect_err("a vanished workspace is an error, not an empty result");
+    }
+
+    /// A root that exists but can't be listed is an error too, not an empty
+    /// result: rg stats it fine, then fails to enumerate it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_in_files_reports_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locked");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.txt"), "needle\n").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged user reads through mode 000, so there is nothing to test.
+        let privileged = fs::read_dir(&root).is_ok();
+
+        let result =
+            search_in_files(path_str(&root), "needle".to_string(), None, None, None).await;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        if !privileged {
+            result.expect_err("a locked workspace is an error, not an empty result");
+        }
     }
 
     /// rg exits 2 here on every version, but only rg 15+ counts the readable
