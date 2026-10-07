@@ -324,6 +324,15 @@ interface ThemeStudioRow {
 }
 
 export function CommandPalette({ open, onOpenChange }: Props) {
+  // The content stays mounted while it animates out, and reopening during
+  // that exit reuses it. A fresh body per open keeps the last query from
+  // coming back.
+  const [openCount, setOpenCount] = useState(0);
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (open) setOpenCount((count) => count + 1);
+  }
   return (
     <CommandDialog
       open={open}
@@ -339,7 +348,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
     >
       {/* Radix unmounts dialog content while closed, so the body's stores,
           clock, and avatar loads cost nothing until the palette opens. */}
-      <PaletteBody onOpenChange={onOpenChange} />
+      <PaletteBody key={openCount} onOpenChange={onOpenChange} />
     </CommandDialog>
   );
 }
