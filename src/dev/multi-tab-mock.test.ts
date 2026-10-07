@@ -66,3 +66,23 @@ it.each([true, false])("selects a reused chat within its workspace with select:%
   expect(target.surfaces.find((s) => s.surface_id === surface.surface_id)!.active_pane_id).toBe(pane.pane_id);
   expect(target.surfaces).toHaveLength(workspace.surfaces.length);
 });
+
+it("renames and closes a tab so the title-bar tab menu works in dev", async () => {
+  const before = await invoke("get_app_state") as AppStateSnapshot;
+  const workspace = before.workspaces.find((w) => w.workspace_id === "ws-codemux-chat")!;
+  const [first, second] = workspace.tabs;
+  await invoke("activate_tab", { workspaceId: workspace.workspace_id, tabId: first.tab_id });
+
+  await invoke("rename_tab", { workspaceId: workspace.workspace_id, tabId: second.tab_id, title: "Renamed" });
+  const renamed = (await invoke("get_app_state") as AppStateSnapshot).workspaces
+    .find((w) => w.workspace_id === workspace.workspace_id)!;
+  expect(renamed.tabs[1].title).toBe("Renamed");
+
+  await invoke("close_tab", { workspaceId: workspace.workspace_id, tabId: first.tab_id });
+  const closed = (await invoke("get_app_state") as AppStateSnapshot).workspaces
+    .find((w) => w.workspace_id === workspace.workspace_id)!;
+  expect(closed.tabs.map((t) => t.tab_id)).toEqual([second.tab_id]);
+  expect(closed.active_tab_id).toBe(second.tab_id);
+  expect(closed.active_surface_id).toBe(second.surface_id);
+  expect(closed.surfaces.some((s) => s.surface_id === first.surface_id)).toBe(false);
+});

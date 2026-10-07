@@ -6115,6 +6115,50 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
+  // Both replace the workspace object rather than mutating it, so the
+  // store's structural sharing sees the change.
+  rename_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws?.tabs.some((t) => t.tab_id === a.tabId)) {
+      throw new Error(`No tab found for ${a.tabId}`);
+    }
+    const next: WorkspaceSnapshot = {
+      ...ws,
+      tabs: ws.tabs.map((t) => (t.tab_id === a.tabId ? { ...t, title: String(a.title) } : t)),
+    };
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((w) => (w === ws ? next : w)),
+    };
+    emitAppState();
+    return undefined;
+  },
+  close_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    const idx = ws?.tabs.findIndex((t) => t.tab_id === a.tabId) ?? -1;
+    if (!ws || idx < 0) throw new Error(`No tab found for ${a.tabId}`);
+    const closed = ws.tabs[idx];
+    const tabs = ws.tabs.filter((t) => t !== closed);
+    const next: WorkspaceSnapshot = {
+      ...ws,
+      tabs,
+      surfaces: ws.surfaces.filter((s) => s.surface_id !== closed.surface_id),
+    };
+    // Same successor rule as the backend: the next tab, else the previous.
+    if (ws.active_tab_id === closed.tab_id) {
+      const successor = tabs[Math.min(idx, tabs.length - 1)];
+      next.active_tab_id = successor?.tab_id ?? "";
+      next.active_surface_id = successor
+        ? (successor.surface_id ?? ws.active_surface_id)
+        : "";
+    }
+    appState = {
+      ...appState,
+      workspaces: appState.workspaces.map((w) => (w === ws ? next : w)),
+    };
+    emitAppState();
+    return undefined;
+  },
   /**
    * A real extra terminal tab, so an agent handoff is visible in dev.
    *

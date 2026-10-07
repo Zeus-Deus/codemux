@@ -21,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   activateTab: vi.fn().mockResolvedValue(undefined),
   closeTab: vi.fn().mockResolvedValue(undefined),
   reorderTabs: vi.fn().mockResolvedValue(undefined),
+  renameTab: vi.fn().mockResolvedValue(undefined),
+  splitPane: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -29,6 +31,8 @@ vi.mock("@/tauri/commands", () => ({
   activateTab: (...a: unknown[]) => mocks.activateTab(...a),
   closeTab: (...a: unknown[]) => mocks.closeTab(...a),
   reorderTabs: (...a: unknown[]) => mocks.reorderTabs(...a),
+  renameTab: (...a: unknown[]) => mocks.renameTab(...a),
+  splitPane: (...a: unknown[]) => mocks.splitPane(...a),
   // Resume/new-chat SDK calls — unused in these tests but imported by the
   // shared session-actions hook.
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
@@ -40,6 +44,7 @@ vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }));
 
+import { useEditorStore } from "@/stores/editor-store";
 import { TitleBarTabs } from "./title-bar-tabs";
 
 function makeSession(
@@ -121,6 +126,8 @@ beforeEach(() => {
   mocks.activateTab.mockClear();
   mocks.closeTab.mockClear();
   mocks.reorderTabs.mockClear();
+  mocks.renameTab.mockClear();
+  mocks.splitPane.mockClear();
 });
 
 // Stubs a tab pill's on-screen box so `useTabReorder`'s midpoint math
@@ -399,5 +406,98 @@ describe("TitleBarTabs", () => {
       fireEvent.click(screen.getByText("zsh"));
     });
     expect(mocks.activateTab).toHaveBeenCalledWith("ws-1", "tab-term");
+  });
+});
+
+describe("TitleBarTabs tab actions", () => {
+  const pillFor = (title: string) =>
+    screen.getByText(title).closest("[data-tab-id]") as HTMLElement;
+
+  it("closes a tab on middle-click", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const pill = pillFor("term-b");
+    const down = new MouseEvent("mousedown", {
+      button: 1,
+      bubbles: true,
+      cancelable: true,
+    });
+    pill.dispatchEvent(down);
+    // Cancelled so the webview's middle-button autoscroll never engages.
+    expect(down.defaultPrevented).toBe(true);
+    fireEvent(pill, new MouseEvent("auxclick", { button: 1, bubbles: true }));
+    expect(mocks.closeTab).toHaveBeenCalledWith("ws-1", "tab-b");
+    expect(mocks.activateTab).not.toHaveBeenCalled();
+  });
+
+  it("offers the shared context menu and closes the other tabs from it", async () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.contextMenu(pillFor("term-b"));
+    expect(await screen.findByText("Close tabs to the right")).toBeInTheDocument();
+    expect(screen.getByText("Split right")).toBeInTheDocument();
+    expect(screen.getByText("Rename tab")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Close other tabs"));
+    await waitFor(() => expect(mocks.closeTab).toHaveBeenCalledTimes(2));
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(1, "ws-1", "tab-a");
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(2, "ws-1", "tab-c");
+  });
+
+  it("closes the tabs to the right, rightmost first", async () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.contextMenu(pillFor("term-a"));
+    fireEvent.click(await screen.findByText("Close tabs to the right"));
+    await waitFor(() => expect(mocks.closeTab).toHaveBeenCalledTimes(2));
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(1, "ws-1", "tab-c");
+    expect(mocks.closeTab).toHaveBeenNthCalledWith(2, "ws-1", "tab-b");
+  });
+
+  it("renames inline from the context menu and commits on Enter", async () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.contextMenu(pillFor("term-b"));
+    fireEvent.click(await screen.findByText("Rename tab"));
+
+    const input = await screen.findByLabelText("Tab name");
+    expect(input).toHaveValue("term-b");
+    await waitFor(() => expect(input).toHaveFocus());
+    fireEvent.change(input, { target: { value: "  server  " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(mocks.renameTab).toHaveBeenCalledTimes(1);
+    expect(mocks.renameTab).toHaveBeenCalledWith("ws-1", "tab-b", "server");
+    expect(screen.queryByLabelText("Tab name")).not.toBeInTheDocument();
+  });
+
+  it("renames on double-click and cancels on Escape", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-a"));
+
+    const input = screen.getByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "discarded" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(mocks.renameTab).not.toHaveBeenCalled();
+    expect(screen.getByText("term-a")).toBeInTheDocument();
+  });
+
+  it("marks an editor tab with unsaved changes", () => {
+    const ws = makeThreeTabWorkspace();
+    ws.tabs[1] = { ...ws.tabs[1], kind: "editor", title: "main.rs" };
+    render(<TitleBarTabs workspace={ws} />);
+    expect(screen.queryByLabelText("Unsaved changes")).not.toBeInTheDocument();
+
+    act(() => useEditorStore.getState().setDirty("tab-b", true));
+    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
+    act(() => useEditorStore.getState().setDirty("tab-b", false));
+  });
+
+  it("gives the active chat tab the same context menu", async () => {
+    mocks.listSessions.mockResolvedValue([]);
+    render(<TitleBarTabs workspace={makeWorkspace(chatPane("thread-1"))} />);
+    fireEvent.contextMenu(pillFor("Agent Chat"));
+    fireEvent.click(await screen.findByText("Rename tab"));
+    const input = await screen.findByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "Review bot" } });
+    fireEvent.blur(input);
+    expect(mocks.renameTab).toHaveBeenCalledWith("ws-1", "tab-chat", "Review bot");
   });
 });
