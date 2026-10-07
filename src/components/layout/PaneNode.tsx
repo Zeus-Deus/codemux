@@ -297,6 +297,13 @@ function PaneNodeImpl({
   }
 
   const isActive = node.pane_id === activePaneId;
+  // In a split, near-identical panes make it easy to type into the wrong
+  // one, so the pane that takes keystrokes carries an accent border. A sole
+  // pane has nothing to be confused with and stays chrome-free.
+  const paneShell = cn(
+    "group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border transition-[border-color] duration-150",
+    !isSurfaceRoot && isActive ? "border-accent-ember/45" : "border-border/30",
+  );
 
   const handleActivate = () => {
     if (!isActive) activatePane(node.pane_id).catch(console.error);
@@ -317,7 +324,7 @@ function PaneNodeImpl({
 
     return (
       <div
-        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className={paneShell}
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
         onPointerDown={handleActivate}
@@ -411,7 +418,7 @@ function PaneNodeImpl({
     if (!enableAgentChat) {
       return (
         <div
-          className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+          className={paneShell}
           data-pane-drop-id={node.pane_id}
           onPointerDown={handleActivate}
         >
@@ -427,7 +434,7 @@ function PaneNodeImpl({
     const hideChatHeader = enableAgentChat && isSurfaceRoot;
     return (
       <div
-        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className={paneShell}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
@@ -465,7 +472,7 @@ function PaneNodeImpl({
   if (node.kind === "browser") {
     return (
       <div
-        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className={paneShell}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >

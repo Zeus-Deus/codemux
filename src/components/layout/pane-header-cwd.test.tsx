@@ -328,3 +328,26 @@ describe("terminal pane header background browser", () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// In a split the old focus cue was a 3-5% fill change on a small chip, so it
+// was easy to type into the wrong one of two near-identical terminals.
+describe("active pane cue", () => {
+  const shell = () => document.querySelector('[data-pane-drop-id="p1"]');
+
+  it("borders the active pane of a split in the accent", () => {
+    mount("Terminal", { isSurfaceRoot: false, activePaneId: "p1" });
+    expect(shell()).toHaveClass("border-accent-ember/45");
+    expect(shell()).not.toHaveClass("border-border/30");
+  });
+
+  it("leaves inactive split panes on the quiet border", () => {
+    mount("Terminal", { isSurfaceRoot: false, activePaneId: "p2" });
+    expect(shell()).toHaveClass("border-border/30");
+  });
+
+  it("keeps a sole pane chrome-free", () => {
+    mount("Terminal", { isSurfaceRoot: true, activePaneId: "p1" });
+    expect(shell()).toHaveClass("border-border/30");
+    expect(shell()).not.toHaveClass("border-accent-ember/45");
+  });
+});
