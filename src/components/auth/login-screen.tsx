@@ -3,6 +3,7 @@ import { Github, Loader2, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { WindowChrome } from "@/components/layout/window-chrome";
+import { BootSplash } from "@/components/layout/boot-splash";
 import { useAuthStore } from "@/stores/auth-store";
 import { forgotPassword } from "@/tauri/commands";
 
@@ -24,17 +25,9 @@ export function LoginScreen() {
   const [resetSent, setResetSent] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
 
-  // Startup loading state — pulsing logo
-  if (isLoading) {
-    return (
-      <div className="relative flex h-screen w-screen items-center justify-center bg-background">
-        <WindowChrome />
-        <div className="text-xl font-semibold text-foreground motion-safe:animate-pulse opacity-80">
-          codemux
-        </div>
-      </div>
-    );
-  }
+  // Startup: the same splash AppShell shows while it loads, so the
+  // auth-check → shell hand-off does not change what is on screen.
+  if (isLoading) return <BootSplash />;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

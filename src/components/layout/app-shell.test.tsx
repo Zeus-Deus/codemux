@@ -5,6 +5,8 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 // ── Mutable mock state ──
 let hasWorkspacesFlag = false;
 let enableLazyFlag = false;
+let enableAgentChatFlag = false;
+let flagsLoadedFlag = true;
 let activeDraftId: string | null = null;
 let appStateReady = true;
 let settingsLoaded = true;
@@ -60,6 +62,7 @@ vi.mock("./workspace-main", () => ({
 vi.mock("@/components/browser/BrowserPeekOverlay", () => ({
   BrowserPeekOverlay: () => <div data-testid="browser-peek-overlay" />,
 }));
+vi.mock("./window-chrome", () => ({ WindowChrome: () => null }));
 vi.mock("./empty-state", () => ({
   EmptyState: () => <div data-testid="empty-state" />,
 }));
@@ -123,9 +126,9 @@ vi.mock("@/stores/chat-draft-store", () => ({
 vi.mock("@/stores/feature-flags", () => ({
   useFeatureFlags: vi.fn((selector: (s: unknown) => unknown) =>
     selector({
-      enableAgentChat: false,
+      enableAgentChat: enableAgentChatFlag,
       enableLazyWorkspaceCreation: enableLazyFlag,
-      loaded: true,
+      loaded: flagsLoadedFlag,
     }),
   ),
 }));
@@ -209,6 +212,8 @@ afterEach(() => {
 function resetMockState() {
   hasWorkspacesFlag = false;
   enableLazyFlag = false;
+  enableAgentChatFlag = false;
+  flagsLoadedFlag = true;
   activeDraftId = null;
   appStateReady = true;
   settingsLoaded = true;
@@ -270,6 +275,43 @@ describe("AppShell rendering gates", () => {
     expect(queryByTestId("empty-state")).toBeNull();
     expect(getByTestId("app-sidebar")).toBeInTheDocument();
     expect(getByTestId("title-bar")).toBeInTheDocument();
+  });
+
+  it("shows the boot splash, not EmptyState, while the lazy Home draft is pending", () => {
+    hasWorkspacesFlag = false;
+    enableLazyFlag = true;
+    enableAgentChatFlag = true;
+    activeDraftId = null;
+    const view = render(<AppShell />);
+    expect(view.getByRole("status", { name: "Loading Codemux" })).toBeInTheDocument();
+    expect(view.queryByTestId("empty-state")).toBeNull();
+
+    activeDraftId = "d-1";
+    view.rerender(<AppShell />);
+    expect(view.getByTestId("workspace-main")).toBeInTheDocument();
+    expect(view.queryByRole("status", { name: "Loading Codemux" })).toBeNull();
+  });
+
+  it("keeps the boot splash up until feature flags have loaded", () => {
+    hasWorkspacesFlag = false;
+    flagsLoadedFlag = false;
+    const { getByRole, queryByTestId } = render(<AppShell />);
+    expect(getByRole("status", { name: "Loading Codemux" })).toBeInTheDocument();
+    expect(queryByTestId("empty-state")).toBeNull();
+  });
+
+  it("shows EmptyState when lazy creation is on but agent chat is off", () => {
+    hasWorkspacesFlag = false;
+    enableLazyFlag = true;
+    enableAgentChatFlag = false;
+    const { getByTestId } = render(<AppShell />);
+    expect(getByTestId("empty-state")).toBeInTheDocument();
+  });
+
+  it("uses the boot splash while app state and settings load", () => {
+    appStateReady = false;
+    const { getByRole } = render(<AppShell />);
+    expect(getByRole("status", { name: "Loading Codemux" })).toBeInTheDocument();
   });
 
   it("renders WorkspaceMain when workspaces exist regardless of the lazy flag", () => {
