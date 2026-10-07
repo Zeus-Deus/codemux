@@ -35,6 +35,8 @@ export function TerminalFindBar({ search, focusToken, onClose }: Props) {
   const [regex, setRegex] = useState(false);
   const [invalid, setInvalid] = useState(false);
   const [results, setResults] = useState<{ index: number; count: number } | null>(null);
+  // The case/regex mode of the last search sent to the addon. See run().
+  const lastModeRef = useRef<{ caseSensitive: boolean; regex: boolean } | null>(null);
 
   useEffect(() => {
     const input = inputRef.current;
@@ -53,10 +55,20 @@ export function TerminalFindBar({ search, focusToken, onClose }: Props) {
     (direction: "next" | "previous", incremental: boolean) => {
       if (!query) {
         search.clearDecorations();
+        lastModeRef.current = null;
         setResults(null);
         setInvalid(false);
         return;
       }
+      // @xterm/addon-search 0.16 stores the new options before checking
+      // whether they changed, so toggling case or regex with the same query
+      // never re-highlights or recounts. Clearing drops its cached term, which
+      // forces a fresh highlight pass.
+      const lastMode = lastModeRef.current;
+      if (lastMode && (lastMode.caseSensitive !== caseSensitive || lastMode.regex !== regex)) {
+        search.clearDecorations();
+      }
+      lastModeRef.current = { caseSensitive, regex };
       const options: ISearchOptions = {
         caseSensitive,
         regex,
@@ -83,11 +95,17 @@ export function TerminalFindBar({ search, focusToken, onClose }: Props) {
     run("next", true);
   }, [run]);
 
-  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+  const onInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter") {
       event.preventDefault();
       run(event.shiftKey ? "previous" : "next", false);
-    } else if (event.key === "Escape") {
+    }
+  };
+
+  // On the bar rather than the input, so Escape still closes it after a
+  // toggle or arrow button took focus.
+  const onBarKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
       onClose();
@@ -106,13 +124,14 @@ export function TerminalFindBar({ search, focusToken, onClose }: Props) {
     <div
       role="search"
       aria-label="Find in terminal"
+      onKeyDown={onBarKeyDown}
       className="absolute right-3 top-2 z-10 flex items-center gap-1 rounded-md border border-border bg-popover py-1 pl-2 pr-1 text-popover-foreground shadow-md has-[input:focus]:ring-2 has-[input:focus]:ring-ring/60 motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-top-1 motion-safe:duration-150"
     >
       <input
         ref={inputRef}
         value={query}
         onChange={(event) => setQuery(event.target.value)}
-        onKeyDown={onKeyDown}
+        onKeyDown={onInputKeyDown}
         placeholder="Find"
         aria-label="Find in terminal"
         aria-invalid={invalid || undefined}

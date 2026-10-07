@@ -68,6 +68,44 @@ describe("TerminalFindBar", () => {
     expect(view.getByText("Invalid pattern")).toBeTruthy();
   });
 
+  it("clears the addon's cached search when case or regex changes with the same query", () => {
+    const { search } = fakeSearch();
+    const view = render(<TerminalFindBar search={search} focusToken={1} onClose={() => {}} />);
+    fireEvent.change(view.getByRole("textbox", { name: "Find in terminal" }), {
+      target: { value: "ERROR" },
+    });
+    // Mounting with an empty query clears once; only later clears matter here.
+    search.clearDecorations.mockClear();
+
+    fireEvent.click(view.getByRole("button", { name: "Match case" }));
+    // The clear must precede the re-run, or the addon keeps the old highlights.
+    expect(search.clearDecorations).toHaveBeenCalledTimes(1);
+    expect(search.clearDecorations).toHaveBeenCalledWith();
+    const findOrder = search.findNext.mock.invocationCallOrder;
+    expect(search.clearDecorations.mock.invocationCallOrder[0]).toBeLessThan(
+      findOrder[findOrder.length - 1],
+    );
+    expect(search.findNext).toHaveBeenLastCalledWith("ERROR", expect.objectContaining({ caseSensitive: true }));
+
+    fireEvent.click(view.getByRole("button", { name: "Use regular expression" }));
+    expect(search.clearDecorations).toHaveBeenCalledTimes(2);
+    expect(search.findNext).toHaveBeenLastCalledWith("ERROR", expect.objectContaining({ regex: true }));
+
+    // Stepping through matches keeps the cached term.
+    fireEvent.click(view.getByRole("button", { name: "Next match" }));
+    expect(search.clearDecorations).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes on Escape after focus moved to a toggle", () => {
+    const { search } = fakeSearch();
+    const onClose = vi.fn();
+    const view = render(<TerminalFindBar search={search} focusToken={1} onClose={onClose} />);
+    const toggle = view.getByRole("button", { name: "Match case" });
+    toggle.focus();
+    fireEvent.keyDown(toggle, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("shows no results for a query that matches nothing", () => {
     const { search, emit } = fakeSearch();
     const view = render(<TerminalFindBar search={search} focusToken={1} onClose={() => {}} />);
