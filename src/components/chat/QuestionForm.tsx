@@ -319,11 +319,12 @@ export function QuestionForm({
   const nextDisabled = !currentAnswered;
 
   // Esc anywhere in the form skips the prompt, unless it would throw away
-  // text the user is typing into "Something else".
+  // text typed into any question's "Something else". Decided from form
+  // state, not the focused element: choice rows are native inputs whose
+  // value is the option label, and focus may sit outside the text field.
   const handleSkipKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!onSkip || e.key !== "Escape" || e.defaultPrevented) return;
-    const target = e.target;
-    if (target instanceof HTMLInputElement && target.value.trim()) return;
+    if (Object.values(otherText).some((text) => text.trim())) return;
     e.preventDefault();
     onSkip();
   };

@@ -911,6 +911,23 @@ describe("ComposerPendingInputPanel", () => {
       expect(onSkip).toHaveBeenCalledTimes(2);
     });
 
+    it("skips on Esc from a focused choice input", () => {
+      const onSkip = vi.fn();
+      render(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={onSkip}
+        />,
+      );
+      // The native radio covering the row carries the option label as its
+      // value; that must not read as typed text.
+      fireEvent.keyDown(screen.getByRole("radio", { name: /React/ }), {
+        key: "Escape",
+      });
+      expect(onSkip).toHaveBeenCalledTimes(1);
+    });
+
     it("keeps typed free text: Esc there does not skip", () => {
       const onSkip = vi.fn();
       render(
@@ -923,6 +940,10 @@ describe("ComposerPendingInputPanel", () => {
       const free = screen.getByPlaceholderText("Something else…");
       fireEvent.change(free, { target: { value: "neither" } });
       fireEvent.keyDown(free, { key: "Escape" });
+      // Focus elsewhere in the form must not discard the text either.
+      fireEvent.keyDown(screen.getByRole("radio", { name: /React/ }), {
+        key: "Escape",
+      });
       expect(onSkip).not.toHaveBeenCalled();
     });
   });

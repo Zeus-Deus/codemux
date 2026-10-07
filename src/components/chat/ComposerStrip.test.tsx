@@ -14,6 +14,7 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
   SubagentRunItem,
+  WorkflowRunItem,
   SubagentView,
   UsageLimitState,
 } from "@/lib/agent-chat/types";
@@ -850,6 +851,35 @@ describe("ComposerStrip — pending approval", () => {
     expect(screen.queryByTestId("composer-strip-approval-allow")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Review" }));
     expect(h.onJump).toHaveBeenCalledWith("req-item-p1");
+  });
+
+  it("sends a workflow gate to its card", () => {
+    const h = handlers();
+    const workflow: WorkflowRunItem = {
+      kind: "workflow_run",
+      id: "wf-item-1",
+      seq: 3,
+      workflowId: "wf-1",
+      status: "running",
+      name: "deploy",
+      description: null,
+      script: null,
+      plannedPhases: [],
+      phases: [],
+      resultText: null,
+      totalTokens: null,
+      agentCount: null,
+      startedAt: 0,
+      durationMs: null,
+      approvalRequestId: "w1",
+    };
+    const occupant = approvalOccupant([request("w1"), workflow], h);
+    render(<ComposerStrip occupants={[occupant]} />);
+    expect(screen.getByText("Workflow · deploy")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-strip-approval-allow")).toBeNull();
+    expect(screen.queryByTestId("composer-strip-approval-deny")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(h.onJump).toHaveBeenCalledWith("wf-item-1");
   });
 
   it("ignores AskUserQuestion prompts and settled requests", () => {

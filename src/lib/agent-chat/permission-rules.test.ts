@@ -165,6 +165,12 @@ describe("suggestPermissionRule", () => {
     expect(bash("env npm test")).toBeNull();
     expect(bash("xargs rm")).toBeNull();
     expect(bash("timeout 10 cargo test")).toBeNull();
+    // Package runners fetch and run any package, flags first or not.
+    expect(bash("npx -y create-vite")).toBeNull();
+    expect(bash("bunx cowsay@latest")).toBeNull();
+    expect(bash("uvx ruff check")).toBeNull();
+    expect(bash("npm exec -- tsc")).toBeNull();
+    expect(bash("pnpm dlx @scope/pkg")).toBeNull();
     // A program that merely starts with an interpreter's name is fine.
     expect(bash("shellcheck x.sh")).toEqual({ toolName: "Bash", ruleContent: "shellcheck:*" });
   });

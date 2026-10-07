@@ -91,7 +91,12 @@ const ARBITRARY_CODE_PROGRAMS = new Set([
   "stdbuf", "setsid", "chroot", "unshare", "flock",
   "python", "python2", "python3", "node", "deno", "bun", "ruby", "perl",
   "php", "lua", "osascript", "pwsh", "powershell", "awk", "gawk",
+  // Package runners fetch and execute any package.
+  "npx", "bunx", "pipx", "uvx",
 ]);
+/** Package-manager subcommands that fetch or run an arbitrary package
+ *  (`npm exec`, `pnpm dlx`, `yarn dlx`, `bun x`). */
+const ARBITRARY_CODE_SUBCOMMANDS = new Set(["exec", "dlx", "x"]);
 /** Characters that would end or nest Claude's `Tool(content)` rule
  *  syntax. */
 const RULE_DELIMITERS = /[()]/;
@@ -134,6 +139,7 @@ export function suggestPermissionRule(
       if (words.length === 3 || !SUBCOMMAND.test(word)) break;
       words.push(word);
     }
+    if (words[1] && ARBITRARY_CODE_SUBCOMMANDS.has(words[1])) return null;
     return { toolName: "Bash", ruleContent: `${words.join(" ")}:*` };
   }
 
