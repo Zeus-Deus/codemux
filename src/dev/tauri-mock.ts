@@ -5022,6 +5022,21 @@ const handlers: Record<string, Handler> = {
 
   /** The commits the form drafts a title and a description from. */
   git_commits_ahead: (a) => MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [],
+  // A beat of latency so the form's "writing" state is visible.
+  generate_ai_pr_description: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const commits = MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [];
+    return {
+      title: "feat(chat): stream replies through one channel",
+      body: [
+        "Replies arrived only once the whole turn had finished, so long answers sat blank for seconds.",
+        "",
+        "This streams each reply through a single channel as it is produced.",
+        "",
+        ...commits.map((c) => `- ${c.subject}`),
+      ].join("\n"),
+    };
+  },
 
   /**
    * Create, for real as far as the rest of the mock is concerned.

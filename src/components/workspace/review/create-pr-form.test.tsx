@@ -27,6 +27,11 @@ const createPullRequest = vi.hoisted(() =>
     return Promise.resolve({ ...(result as PullRequestInfo), title, body });
   }),
 );
+const generateAiPrDescription = vi.hoisted(() =>
+  vi.fn((..._args: unknown[]) =>
+    Promise.resolve({ title: "feat(chat): one channel", body: "Replies arrived whole." }),
+  ),
+);
 const requestPrReview = vi.hoisted(() =>
   vi.fn((_p: string, _n: number, reviewer: string) => {
     calls.push(`reviewer:${reviewer}`);
@@ -38,6 +43,7 @@ vi.mock("@/tauri/commands", () => ({
   gitPushChanges,
   createPullRequest,
   requestPrReview,
+  generateAiPrDescription,
   gitCommitsAhead: vi.fn(() => Promise.resolve(commits.current)),
   getGitStatus: vi.fn(() => Promise.resolve(dirty.current)),
   getGitBranchInfo: vi.fn(() =>
@@ -49,6 +55,10 @@ vi.mock("@/tauri/commands", () => ({
     const found = templates.current[path];
     return found ? Promise.resolve(found) : Promise.reject("ENOENT");
   }),
+}));
+
+vi.mock("@/lib/utility-agent", () => ({
+  utilitySelectionFromStores: () => ({ provider: "codex", model: "gpt-mini", effort: null }),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -224,6 +234,68 @@ describe("CreatePrForm", () => {
     createResult.current = PR;
     fireEvent.click(submit);
     await waitFor(() => expect(onCreated).toHaveBeenCalled());
+  });
+
+  it("writes the title and description with the agent, and says so", async () => {
+    templates.current = {
+      "/home/dev/projects/codemux/.github/PULL_REQUEST_TEMPLATE.md": "## What changed\n",
+    };
+    let answer!: (draft: { title: string; body: string }) => void;
+    generateAiPrDescription.mockImplementationOnce(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    renderForm();
+    await screen.findByTestId("create-pr-template");
+
+    fireEvent.click(screen.getByTestId("create-pr-write-with-agent"));
+    // Read-only while the agent writes, so nothing typed is overwritten.
+    expect(await screen.findByTestId("create-pr-writing")).toBeInTheDocument();
+    expect(bodyField().readOnly).toBe(true);
+    answer({ title: "feat(chat): one channel", body: "Replies arrived whole." });
+
+    await waitFor(() => expect(titleField().value).toBe("feat(chat): one channel"));
+    expect(bodyField().value).toBe("Replies arrived whole.");
+    expect(bodyField().readOnly).toBe(false);
+    expect(screen.getByTestId("create-pr-drafted-note")).toHaveTextContent("drafted by agent");
+    expect(generateAiPrDescription).toHaveBeenCalledWith(
+      "/home/dev/wt/chat",
+      "main",
+      "## What changed\n",
+      "codex",
+      "gpt-mini",
+    );
+
+    // Editing makes the words the author's again.
+    fireEvent.change(bodyField(), { target: { value: "Mine now." } });
+    expect(screen.queryByTestId("create-pr-drafted-note")).not.toBeInTheDocument();
+  });
+
+  it("keeps the fields as they were when the agent fails", async () => {
+    generateAiPrDescription.mockImplementationOnce(() => Promise.reject("claude failed: quota"));
+    renderForm();
+    await waitFor(() => expect(titleField().value).toBe("feat(chat): stream replies"));
+
+    fireEvent.click(screen.getByTestId("create-pr-write-with-agent"));
+
+    const error = await screen.findByTestId("create-pr-error");
+    expect(error).toHaveTextContent("claude failed: quota");
+    expect(titleField().value).toBe("feat(chat): stream replies");
+    expect(screen.getByTestId("create-pr-drafted-note")).toHaveTextContent(
+      "drafted from your commits",
+    );
+  });
+
+  it("lists the commits going in when the count is opened", async () => {
+    renderForm();
+    const toggle = await screen.findByTestId("create-pr-commits-toggle");
+    expect(screen.queryByTestId("create-pr-commits")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+
+    const list = screen.getByTestId("create-pr-commits");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(list).toHaveTextContent("feat(chat): stream replies without buffering");
+    expect(list).toHaveTextContent("feat(chat): stream replies over one channel");
   });
 
   it("warns about uncommitted work and offers the Changes pane", async () => {
