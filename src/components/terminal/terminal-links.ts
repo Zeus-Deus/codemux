@@ -1,5 +1,7 @@
 import type { IBufferLine, IBufferRange, Terminal } from "@xterm/xterm";
 
+import { isAbsolute, normalizePath } from "@/lib/agent-chat/file-links";
+
 /** A link found in one logical (unwrapped) terminal line. Offsets are
  *  UTF-16 indices into that line's text, end exclusive. */
 export type TerminalLinkMatch =
@@ -18,9 +20,10 @@ const URL_RE = /\bhttps?:\/\/[^\s"'`<>]+/g;
 // A path needs either a directory separator or a line suffix: a bare
 // `name.ext` with neither is far more often prose ("Node.js", "e.g.") than a
 // file. Extensions start with a letter so version numbers never match.
-// Suffixes: `:12`, `:12:5` (most tools) and `(12,5)` (tsc).
+// Suffixes: `:12`, `:12:5` (most tools) and `(12,5)` (tsc). Windows output
+// uses `\` separators and a drive prefix (`C:\src\main.rs:12`).
 const FILE_RE =
-  /(?<![\w.~/@+-])((?:\.{1,2}\/|\/)?(?:[\w.@+-]+\/)*[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\))?/g;
+  /(?<![\w.~/@+-])((?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/)?(?:[\w.@+-]+[\\/])*[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\))?/g;
 
 /** Punctuation that ends a sentence rather than a URL. */
 const URL_TRAILING = /[.,;:!?'")\]}>]+$/;
@@ -53,7 +56,7 @@ export function findTerminalLinks(text: string): TerminalLinkMatch[] {
     const path = m[1];
     const line = m[2] ?? m[4];
     const column = m[3] ?? m[5];
-    if (!line && !path.includes("/")) continue;
+    if (!line && !/[\\/]/.test(path)) continue;
     links.push({
       kind: "file",
       start: m.index,
@@ -69,16 +72,9 @@ export function findTerminalLinks(text: string): TerminalLinkMatch[] {
 /** Resolve a path printed in a terminal against the pane's working directory.
  *  Returns null for a relative path when the directory is unknown. */
 export function resolveTerminalPath(path: string, cwd: string | null | undefined): string | null {
-  const absolute = path.startsWith("/");
+  const absolute = isAbsolute(path);
   if (!absolute && !cwd) return null;
-  const parts = (absolute ? path : `${cwd}/${path}`).split("/");
-  const out: string[] = [];
-  for (const part of parts) {
-    if (!part || part === ".") continue;
-    if (part === "..") out.pop();
-    else out.push(part);
-  }
-  return `/${out.join("/")}`;
+  return normalizePath(absolute ? path : `${cwd}/${path}`);
 }
 
 /** The loopback hosts a dev server prints. These open inside Codemux. */

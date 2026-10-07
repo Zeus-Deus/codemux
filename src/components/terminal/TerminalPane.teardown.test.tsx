@@ -564,6 +564,35 @@ describe("TerminalPane exited shell", () => {
     expect(h.terminals).toHaveLength(1);
   });
 
+  it("hands focus to Restart from the terminal but not from the find bar", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
+    h.sessionState = "exited";
+
+    // Focus sits in xterm's textarea when the shell exits.
+    const fromTerminal = renderPane("sess-a");
+    const overlay = fromTerminal.container.querySelector(".terminal-overlay")!;
+    const xtermInput = overlay.previousElementSibling!.appendChild(
+      document.createElement("textarea"),
+    );
+    xtermInput.focus();
+    await act(async () => {});
+    expect(document.activeElement).toBe(
+      fromTerminal.getByRole("button", { name: "Restart shell" }),
+    );
+    cleanup();
+
+    // Focus sits in a sibling of the terminal inside the pane, where the
+    // find bar renders: the user is typing a query and keeps focus.
+    const fromFind = renderPane("sess-a");
+    const shell = fromFind.container.querySelector(".terminal-overlay")!.parentElement!;
+    const findInput = shell.appendChild(document.createElement("input"));
+    findInput.focus();
+    await act(async () => {});
+    expect(fromFind.getByRole("heading", { name: "Process exited" })).toBeTruthy();
+    expect(document.activeElement).toBe(findInput);
+  });
+
   it("treats a runtime-less read for a session that never exited as starting", async () => {
     schedulerHarness();
     h.status = { state: "exited", message: "Session is no longer running", exit_code: null };

@@ -313,9 +313,15 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     if (restartLabel) {
       restartLabel.textContent = view.actions === "retry" ? "Retry" : "Restart shell";
     }
-    // Hand focus to Restart only when it was in this pane (the user typed
-    // `exit` here), so Enter restarts without stealing focus from elsewhere.
-    if (view.actions !== "none" && restart && shellRef.current?.contains(document.activeElement)) {
+    // Hand focus to Restart only when it was in this terminal or its card
+    // (the user typed `exit` here), so Enter restarts without stealing focus
+    // from elsewhere — including this pane's find bar.
+    const active = document.activeElement;
+    if (
+      view.actions !== "none" &&
+      restart &&
+      (containerRef.current?.contains(active) || el.contains(active))
+    ) {
       restart.focus();
     }
   }, []);

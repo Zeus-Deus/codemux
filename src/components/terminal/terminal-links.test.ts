@@ -48,6 +48,18 @@ describe("findTerminalLinks", () => {
     ]);
   });
 
+  it("reads Windows paths with backslashes and drive letters", () => {
+    expect(findTerminalLinks("error at C:\\repo\\src\\main.rs:12:3")).toMatchObject([
+      { kind: "file", start: 9, path: "C:\\repo\\src\\main.rs", line: 12, column: 3 },
+    ]);
+    expect(findTerminalLinks("C:/repo/src/main.ts(4,2)")).toMatchObject([
+      { kind: "file", start: 0, path: "C:/repo/src/main.ts", line: 4, column: 2 },
+    ]);
+    expect(findTerminalLinks("see src\\lib\\a.ts")).toMatchObject([
+      { kind: "file", path: "src\\lib\\a.ts" },
+    ]);
+  });
+
   it("does not report a path inside a URL as a file", () => {
     expect(findTerminalLinks("https://example.com/docs/a.html:3").map((l) => l.kind)).toEqual([
       "url",
@@ -63,6 +75,11 @@ describe("resolveTerminalPath", () => {
   it("keeps absolute paths and refuses relative ones without a cwd", () => {
     expect(resolveTerminalPath("/etc/hosts", null)).toBe("/etc/hosts");
     expect(resolveTerminalPath("src/a.ts", null)).toBeNull();
+  });
+
+  it("keeps Windows drives and normalises backslashes", () => {
+    expect(resolveTerminalPath("C:\\repo\\src\\main.rs", null)).toBe("C:/repo/src/main.rs");
+    expect(resolveTerminalPath("src\\..\\lib\\a.ts", "C:\\repo")).toBe("C:/repo/lib/a.ts");
   });
 });
 
