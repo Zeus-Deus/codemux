@@ -241,15 +241,17 @@ function SplitResizeHandle({
           the hover, drag and focus state, centred on the 1px grid gap. The
           keyboard-focus line is ember, the same "your keys drive this" cue
           as the active pane's border, so where the two meet it continues
-          that border instead of greying it out. */}
+          that border instead of greying it out. The handle is inset 4px at
+          each end; the line overhangs by the same 4px so it runs the full
+          seam and meets the pane borders without a notch. */}
       <span
         aria-hidden
         className={cn(
           "pointer-events-none absolute rounded-full bg-transparent transition-colors duration-100",
           "group-hover/split:bg-foreground/30 group-focus-visible/split:bg-accent-ember/60 group-data-[dragging=true]/split:bg-foreground/40",
           columns
-            ? "inset-y-0 left-1/2 w-[3px] -translate-x-1/2"
-            : "inset-x-0 top-1/2 h-[3px] -translate-y-1/2",
+            ? "-inset-y-1 left-1/2 w-[3px] -translate-x-1/2"
+            : "-inset-x-1 top-1/2 h-[3px] -translate-y-1/2",
         )}
       />
     </div>
