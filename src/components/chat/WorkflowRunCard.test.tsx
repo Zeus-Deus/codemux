@@ -192,6 +192,56 @@ describe("WorkflowRunCard — pending_approval", () => {
     expect(screen.getByText("Deny")).toBeDisabled();
     expect(screen.getByText("Submitting decision…")).toBeInTheDocument();
   });
+
+  it("shows the pressed button in flight, then works again after a failed send", () => {
+    const onDecide = vi.fn();
+    const view = render(
+      <WorkflowRunCard
+        item={workflowItem()}
+        approval={pendingRequest()}
+        onDecide={onDecide}
+      />,
+    );
+    fireEvent.click(screen.getByText("Run once"));
+    expect(screen.getByText("Starting…")).toBeDisabled();
+    expect(screen.getByText("Deny")).toBeDisabled();
+    view.rerender(
+      <WorkflowRunCard
+        item={workflowItem()}
+        approval={pendingRequest({
+          resolution: { state: "responding", decision: { decision: "allow" } },
+        })}
+        onDecide={onDecide}
+      />,
+    );
+    // The send failed: the request is pending again.
+    view.rerender(
+      <WorkflowRunCard
+        item={workflowItem()}
+        approval={pendingRequest()}
+        onDecide={onDecide}
+      />,
+    );
+    expect(screen.getByText("Run once")).not.toBeDisabled();
+    fireEvent.click(screen.getByText("Run once"));
+    expect(onDecide).toHaveBeenCalledTimes(2);
+  });
+
+  it("states the cost from the script, not a made-up agent count", () => {
+    render(
+      <WorkflowRunCard
+        item={workflowItem()}
+        approval={pendingRequest()}
+        onDecide={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Runs agents in parallel across 2 phases · higher token use than a normal turn.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/16 agents/)).toBeNull();
+  });
 });
 
 describe("WorkflowRunCard — running", () => {

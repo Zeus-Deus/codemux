@@ -1,10 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { ChevronLeft, Pause, Square } from "lucide-react";
+import { ChevronLeft, Square } from "lucide-react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { agentChatInterruptTurn } from "@/tauri/commands";
+import { WORKFLOW_DENIED_MESSAGE } from "@/components/chat/WorkflowRunCard";
+import { toast } from "@/lib/toast";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { agentChatInterruptTurn, agentChatRespondToRequest } from "@/tauri/commands";
+import type { ApprovalDecision } from "@/tauri/events";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 import { formatCompactTokens } from "@/components/chat/WorkflowRunCard";
 import { TickingText } from "@/components/chat/TickingText";
@@ -89,6 +92,30 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
     agentChatInterruptTurn("claude", threadId, null).catch(console.error);
   };
 
+  // A run waiting on approval can be answered here as well as from its
+  // card in the thread; both go through the same request.
+  const approvalRequestId =
+    run.status === "pending_approval" ? run.approvalRequestId : null;
+  const [sending, setSending] = useState<"allow" | "deny" | null>(null);
+  useEffect(() => setSending(null), [approvalRequestId]);
+  const respond = (choice: "allow" | "deny") => {
+    if (!threadId || !approvalRequestId || sending) return;
+    const decision: ApprovalDecision =
+      choice === "allow"
+        ? { decision: "allow" }
+        : { decision: "deny", message: WORKFLOW_DENIED_MESSAGE };
+    const store = useAgentChatStore.getState();
+    setSending(choice);
+    store.markRequestResponding(threadId, approvalRequestId, decision);
+    agentChatRespondToRequest("claude", threadId, approvalRequestId, decision).catch(
+      (err: unknown) => {
+        useAgentChatStore.getState().markRequestPending(threadId, approvalRequestId);
+        setSending(null);
+        toast.error(`Failed to send decision: ${err}`);
+      },
+    );
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-background" data-testid="orchestration-panel">
       <div className="shrink-0 border-b border-border/60 px-3.5 py-3">
@@ -131,31 +158,41 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
               }
             />
             <div className="ml-auto flex gap-1.5">
-              <Tooltip>
-                <TooltipTrigger asChild>
+              {approvalRequestId && threadId ? (
+                <>
                   <Button
-                    variant="outline"
-                    size="icon-sm"
-                    disabled
-                    aria-label="Pause"
-                    data-testid="workflow-pause"
+                    variant="ghost"
+                    size="sm"
+                    disabled={sending !== null}
+                    data-testid="workflow-deny"
+                    onClick={() => respond("deny")}
+                    className="text-muted-foreground hover:text-foreground"
                   >
-                    <Pause fill="currentColor" aria-hidden />
+                    {sending === "deny" ? "Denying…" : "Deny"}
                   </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Pausing isn't supported yet.</TooltipContent>
-              </Tooltip>
-              <Button
-                variant="outline"
-                size="icon-sm"
-                disabled={!running || !threadId}
-                aria-label="Stop workflow"
-                data-testid="workflow-stop"
-                onClick={handleStop}
-                className="border-status-attention/35 bg-status-attention/10 text-status-attention hover:bg-status-attention/20"
-              >
-                <Square fill="currentColor" aria-hidden />
-              </Button>
+                  <Button
+                    size="sm"
+                    disabled={sending !== null}
+                    data-testid="workflow-approve"
+                    onClick={() => respond("allow")}
+                    className="bg-foreground text-background hover:bg-foreground/90"
+                  >
+                    {sending === "allow" ? "Starting…" : "Run once"}
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="icon-sm"
+                  disabled={!running || !threadId}
+                  aria-label="Stop workflow"
+                  data-testid="workflow-stop"
+                  onClick={handleStop}
+                  className="border-status-attention/35 bg-status-attention/10 text-status-attention hover:bg-status-attention/20"
+                >
+                  <Square fill="currentColor" aria-hidden />
+                </Button>
+              )}
             </div>
           </div>
         )}
