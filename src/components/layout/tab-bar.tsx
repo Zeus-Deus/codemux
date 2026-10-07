@@ -18,7 +18,6 @@ import { Plus, X, Terminal, Globe, GitCompare, PanelRight, FileCode } from "luci
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   activateTab,
-  closeTab,
   createTab,
   createBrowserPane,
   reorderTabs,
@@ -28,6 +27,7 @@ import {
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, TabKind, ActivePaneStatus, PaneStatus, PaneNodeSnapshot } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import { requestCloseTab } from "@/lib/close-guard";
 import { useEditorStore } from "@/stores/editor-store";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
@@ -97,7 +97,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
 
   const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
-    closeTab(workspace.workspace_id, tabId).catch(console.error);
+    void requestCloseTab(workspace.workspace_id, tabId);
   };
 
   const handleCreateTab = () => {
@@ -206,7 +206,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
   const handleCloseOtherTabs = async (keepTabId: string) => {
     for (const tab of workspace.tabs) {
       if (tab.tab_id !== keepTabId) {
-        await closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+        await requestCloseTab(workspace.workspace_id, tab.tab_id);
       }
     }
   };
@@ -214,7 +214,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
   const handleCloseTabsToRight = async (tabId: string) => {
     const idx = workspace.tabs.findIndex((t) => t.tab_id === tabId);
     for (let i = workspace.tabs.length - 1; i > idx; i--) {
-      await closeTab(workspace.workspace_id, workspace.tabs[i].tab_id).catch(console.error);
+      await requestCloseTab(workspace.workspace_id, workspace.tabs[i].tab_id);
     }
   };
 
@@ -314,7 +314,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
                 </ContextMenuTrigger>
                 <ContextMenuContent>
                   <ContextMenuItem
-                    onClick={() => closeTab(workspace.workspace_id, tab.tab_id).catch(console.error)}
+                    onClick={() => void requestCloseTab(workspace.workspace_id, tab.tab_id)}
                   >
                     Close tab
                   </ContextMenuItem>

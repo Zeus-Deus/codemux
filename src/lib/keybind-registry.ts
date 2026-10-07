@@ -79,7 +79,10 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
 
   // ── Tabs ──
   { id: "newTab", label: "New terminal tab", category: "tabs", defaultKeys: "Ctrl+T" },
-  { id: "closeTab", label: "Close tab", category: "tabs", defaultKeys: "Ctrl+W" },
+  // `non-terminal`: Ctrl+W is delete-word in every shell, so a focused pty
+  // keeps it; the rest of the app still closes the tab on it.
+  { id: "closeTab", label: "Close tab", category: "tabs", defaultKeys: "Ctrl+W", when: "non-terminal" },
+  { id: "reopenClosedTab", label: "Reopen closed chat", category: "tabs", defaultKeys: "Ctrl+Shift+T", description: "Bring back the last agent chat you closed, with its transcript" },
   { id: "switchTab1", label: "Switch to tab 1", category: "tabs", defaultKeys: "Ctrl+1" },
   { id: "switchTab2", label: "Switch to tab 2", category: "tabs", defaultKeys: "Ctrl+2" },
   { id: "switchTab3", label: "Switch to tab 3", category: "tabs", defaultKeys: "Ctrl+3" },

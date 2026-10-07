@@ -30,6 +30,7 @@ import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import { useRemotePathPickerStore } from "@/components/remote/remote-path-picker-store";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { useCloseGuardStore } from "@/lib/close-guard";
 import { useActiveWorkspacePersistenceErrors } from "@/hooks/use-active-workspace-persistence-errors";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { usePostPaintPendingSessionRefresh } from "@/hooks/use-post-paint-session-refresh";
@@ -50,6 +51,12 @@ const RenameWorkspaceDialog = lazy(() =>
   })),
 );
 
+const CloseGuardDialog = lazy(() =>
+  import("@/components/overlays/close-guard-dialog").then((module) => ({
+    default: module.CloseGuardDialog,
+  })),
+);
+
 function App() {
   useAddonPlatform();
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -58,6 +65,7 @@ function App() {
   const renameWorkspaceId = useUIStore((s) => s.renameWorkspaceId);
   const themeStudioRequest = useUIStore((s) => s.themeStudio);
   const remotePathRequest = useRemotePathPickerStore((s) => s.request);
+  const closeGuardPrompt = useCloseGuardStore((s) => s.prompt);
   const postPaintStartupBegan = useRef(false);
 
   // Paint from the local auth/settings cache first. AppShell explicitly tells
@@ -179,6 +187,15 @@ function App() {
           presentation="overlay"
         >
           <ThemeStudio />
+        </LazyBoundary>
+      )}
+      {closeGuardPrompt && (
+        <LazyBoundary
+          label="close confirmation"
+          className="fixed inset-0 z-50 h-screen"
+          presentation="overlay"
+        >
+          <CloseGuardDialog />
         </LazyBoundary>
       )}
       <UpdateToast />

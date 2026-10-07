@@ -261,19 +261,10 @@ fn shell_is_foreground(shell_pid: u32) -> bool {
         Ok(s) => s,
         Err(_) => return true, // Process gone — treat as exited
     };
-    // /proc/PID/stat: PID (comm) state ppid pgrp session tty_nr tpgid ...
-    let after_comm = match stat.rfind(')') {
-        Some(idx) if idx + 2 < stat.len() => &stat[idx + 2..],
-        _ => return false,
-    };
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr [5]=tpgid
-    if fields.len() < 6 {
-        return false;
-    }
-    let pgrp: i32 = fields[2].parse().unwrap_or(0);
-    let tpgid: i32 = fields[5].parse().unwrap_or(-1);
-    tpgid == pgrp
+    matches!(
+        crate::terminal::parse_stat_pgrp_tpgid(&stat),
+        Some((pgrp, tpgid)) if tpgid == pgrp
+    )
 }
 
 #[cfg(not(target_os = "linux"))]

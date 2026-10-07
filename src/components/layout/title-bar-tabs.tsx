@@ -30,7 +30,8 @@ import { cn } from "@/lib/utils";
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { useAppStore } from "@/stores/app-store";
-import { activateTab, closeTab, reorderTabs } from "@/tauri/commands";
+import { requestCloseTab } from "@/lib/close-guard";
+import { activateTab, reorderTabs } from "@/tauri/commands";
 import type {
   ActivePaneStatus,
   PaneNodeSnapshot,
@@ -225,7 +226,7 @@ function TitleBarTab({
   };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+    void requestCloseTab(workspace.workspace_id, tab.tab_id);
   };
 
   return (
@@ -294,7 +295,7 @@ function ActiveChatTab({
   });
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeTab(workspaceId, tab.tab_id).catch(console.error);
+    void requestCloseTab(workspaceId, tab.tab_id);
   };
 
   return (

@@ -515,6 +515,21 @@ function emitAppStateDelta(delta: AppStateDelta): void {
   emitEvent("app-state-delta", payload);
 }
 
+/** Replace a workspace with an updated copy. The renderer shares structure
+ *  with the snapshot it already holds, so mutating that object in place would
+ *  leave the next emit looking unchanged. */
+function replaceWorkspace(
+  workspaceId: string,
+  update: (ws: WorkspaceSnapshot) => Partial<WorkspaceSnapshot>,
+): void {
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((w) =>
+      w.workspace_id === workspaceId ? { ...w, ...update(w) } : w,
+    ),
+  };
+}
+
 /** Every leaf pane id under `node`, in tree order. */
 function leafPaneIds(node: PaneNodeSnapshot): string[] {
   if (node.kind !== "split") return [node.pane_id];
@@ -938,6 +953,13 @@ let floodCounter = 0;
  *
  *   window.__codemuxTerminalMock.emitOsc7("/home/zeus/proj/src-tauri")
  */
+/** Per-session overrides for `terminal_foreground_jobs` (null = idle). */
+const mockForegroundJobs = new Map<string, string | null>();
+
+function setForegroundJob(sessionId: string, job: string | null): void {
+  mockForegroundJobs.set(sessionId, job);
+}
+
 function emitOsc7(cwd: string, sessionId?: string): void {
   // `ESC ] 7 ; file://<host>/<path> BEL` — the form vte, fish, and
   // kitty's shell integration all emit.
@@ -2898,12 +2920,14 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       flood: typeof floodTerminals;
       emitSerializeBuffers: typeof emitSerializeBuffers;
       emitOsc7: typeof emitOsc7;
+      setForegroundJob: typeof setForegroundJob;
     };
   }
 ).__codemuxTerminalMock = {
   flood: floodTerminals,
   emitSerializeBuffers,
   emitOsc7,
+  setForegroundJob,
 };
 
 // CLI-drivable triggers: the browser is driven by `codemux browser
@@ -5907,6 +5931,30 @@ const handlers: Record<string, Handler> = {
     }
     return out;
   },
+  // Twin of `terminal_foreground_jobs`. There is no shell here, so the
+  // port-detection workspace's terminal plays a running dev server and every
+  // other session sits at its prompt. Override per session with
+  // `window.__codemuxTerminalMock.setForegroundJob(sessionId, "cargo" | null)`.
+  terminal_foreground_jobs: (a) => {
+    const out: Record<string, string> = {};
+    const ports = findWorkspace("ws-codemux-ports");
+    const portsSessions = new Set(
+      (ports?.surfaces ?? []).flatMap((surface) =>
+        leafPaneNodes(surface.root).flatMap((node) =>
+          node.kind === "terminal" ? [node.session_id] : [],
+        ),
+      ),
+    );
+    for (const id of (a.sessionIds as string[]) ?? []) {
+      const job = mockForegroundJobs.has(id)
+        ? mockForegroundJobs.get(id)
+        : portsSessions.has(id)
+          ? "node"
+          : null;
+      if (job) out[id] = job;
+    }
+    return out;
+  },
   clear_agent_status: () => undefined,
 
   // ── Terminal scrollback (issue #128) — faithful two-store twin of
@@ -6115,6 +6163,54 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
+  // Mirrors `state.close_tab`: drop the tab and its surface, then select the
+  // tab that slid into its slot (or the previous one when it was last).
+  close_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    const index = ws?.tabs.findIndex((t) => t.tab_id === a.tabId) ?? -1;
+    if (!ws || index < 0) throw new Error(`No tab found for ${a.tabId}`);
+    const tab = ws.tabs[index];
+    const tabs = ws.tabs.filter((t) => t !== tab);
+    const surface = ws.surfaces.find((s) => s.surface_id === tab.surface_id);
+    const next = tabs[Math.min(index, tabs.length - 1)];
+    const wasActive = ws.active_tab_id === tab.tab_id;
+    replaceWorkspace(ws.workspace_id, () => ({
+      tabs,
+      surfaces: ws.surfaces.filter((s) => s !== surface),
+      ...(wasActive && {
+        active_tab_id: next?.tab_id ?? "",
+        active_surface_id: next?.surface_id ?? "",
+      }),
+    }));
+    if (surface) {
+      const sessions = new Set(
+        leafPaneNodes(surface.root).flatMap((node) =>
+          node.kind === "terminal" ? [node.session_id] : [],
+        ),
+      );
+      const paneStatuses = { ...appState.pane_statuses };
+      for (const id of leafPaneIds(surface.root)) delete paneStatuses[id];
+      appState = {
+        ...appState,
+        pane_statuses: paneStatuses,
+        terminal_sessions: appState.terminal_sessions.filter(
+          (session) => !sessions.has(session.session_id),
+        ),
+      };
+    }
+    emitAppState();
+    return undefined;
+  },
+  reorder_tabs: (a) => {
+    const order = (a.tabIds as string[]) ?? [];
+    replaceWorkspace(a.workspaceId as string, (ws) => ({
+      tabs: [...ws.tabs].sort(
+        (x, y) => order.indexOf(x.tab_id) - order.indexOf(y.tab_id),
+      ),
+    }));
+    emitAppState();
+    return undefined;
+  },
   /**
    * A real extra terminal tab, so an agent handoff is visible in dev.
    *
@@ -6198,6 +6294,50 @@ const handlers: Record<string, Handler> = {
           }
         }
       }
+    }
+    // `NewTab` gets its own tab, as in the backend (reopening a closed chat
+    // lands here with the chat's old thread id).
+    if (ws && a.launchMode === "new_tab") {
+      const n = ++mockTabSeq;
+      const paneId = `pane-mock-chat-${n}`;
+      const surfaceId = `surface-mock-chat-${n}`;
+      const tabId = `tab-mock-chat-${n}`;
+      replaceWorkspace(ws.workspace_id, () => ({
+        surfaces: [
+          ...ws.surfaces,
+          {
+            surface_id: surfaceId,
+            title: "Agent Chat",
+            active_pane_id: paneId,
+            root: {
+              kind: "agent_chat",
+              pane_id: paneId,
+              title: "Agent Chat",
+              thread_id: threadId,
+              provider: (a.provider as AgentChatProviderKind | null) ?? null,
+              cwd: (a.cwd as string | null) ?? null,
+            },
+          },
+        ],
+        tabs: [
+          ...ws.tabs,
+          {
+            tab_id: tabId,
+            kind: "terminal",
+            title: "Agent Chat",
+            surface_id: surfaceId,
+            browser_id: null,
+            icon: null,
+          },
+        ],
+        active_tab_id: tabId,
+        active_surface_id: surfaceId,
+      }));
+      if (a.select !== false) {
+        appState = { ...appState, active_workspace_id: ws.workspace_id };
+      }
+      emitAppState();
+      return paneId;
     }
     // The deferred worktree workspace already carries a fresh
     // agent_chat pane (empty thread); bind the session to it. Falls
