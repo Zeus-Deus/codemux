@@ -509,6 +509,37 @@ pub fn apply_preset<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Open a terminal tab in `workspace_id` that runs `provider`'s login
+/// command, so a signed-out agent can be fixed without leaving Codemux.
+///
+/// The command comes from a fixed per-provider table rather than from the
+/// caller: this only ever starts an interactive sign-in.
+#[tauri::command]
+pub fn open_provider_login_terminal<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    pty_state: State<'_, PtyState>,
+    workspace_id: String,
+    provider: crate::agent_provider::ProviderKind,
+) -> Result<(), String> {
+    let command = crate::agent_provider::health::provider_login_command(provider)
+        .ok_or_else(|| format!("{provider:?} has no sign-in command"))?;
+    let (tab_id, session_id) = state.create_tab(&workspace_id, crate::state::TabKind::Terminal)?;
+    let _ = state.rename_tab(&workspace_id, &tab_id, "Sign in".into());
+    if let Some(session_id) = session_id {
+        terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
+        state.update_terminal_session_command(&session_id.0, command.to_string());
+        write_command_when_ready(
+            pty_state.sessions.clone(),
+            session_id.0,
+            command.to_string(),
+            120,
+        );
+    }
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
 /// Get the active terminal session ID for a specific workspace.
 fn active_session_for_workspace(state: &AppStateStore, workspace_id: &str) -> Option<String> {
     let snapshot = state.snapshot();

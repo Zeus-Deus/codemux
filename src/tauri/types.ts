@@ -960,6 +960,9 @@ export interface ProviderHealthReport {
   installed: boolean;
   message: string | null;
   version: string | null;
+  /** Set only when the CLI is installed but signed out: the command that
+   *  signs it in. Optional because older backends omit it. */
+  login_command?: string | null;
 }
 
 // ── Chat-side provider capabilities ───────────────────────────────────

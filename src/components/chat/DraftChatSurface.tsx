@@ -84,7 +84,10 @@ import { ChatHomeLanding } from "./ChatHomeLanding";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
-import { useProviderHealth } from "@/stores/provider-health-store";
+import {
+  healthBlocksSend,
+  useProviderHealth,
+} from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
 import type { ActivePillMode } from "./pickers/ModePill";
@@ -329,6 +332,23 @@ function DraftChatSurfaceInner({
   // ref pattern.
   const sendInFlightRef = useRef(false);
 
+  // The composer error a readiness block left behind. It describes the
+  // provider, not the message, so it clears itself once the provider
+  // recovers (Sign in, Re-check, or the focus re-probe) instead of
+  // lingering until the next send.
+  const readinessErrorRef = useRef<string | null>(null);
+  const providerBlocksSend = useProviderHealth((s) =>
+    healthBlocksSend(s.slots[draft.provider].report),
+  );
+  useEffect(() => {
+    const blockedWith = readinessErrorRef.current;
+    if (providerBlocksSend || blockedWith === null) return;
+    readinessErrorRef.current = null;
+    if (draft.lastSendError === blockedWith) {
+      useChatDraftStore.getState().clearSendError(draft.draftId);
+    }
+  }, [providerBlocksSend, draft.draftId, draft.lastSendError]);
+
   // Instant-feedback state (Bug 2 fix): once the user submits, we render
   // the just-sent conversation (their bubble + a phase status line) in
   // place of the landing, so the composer never sits dead for the
@@ -475,7 +495,7 @@ function DraftChatSurfaceInner({
       setPending({
         text,
         images: imageDisplaySources,
-        phase: worktreeProjectPath ? "creating-worktree" : "creating-workspace",
+        phase: "checking-provider",
       });
     }
     updateDraftInput(finalDraft.draftId, "");
@@ -505,6 +525,38 @@ function DraftChatSurfaceInner({
     };
 
     void (async () => {
+      // Readiness first: a signed-out or missing CLI can never answer, so
+      // creating a worktree and workspace for it only leaves debris behind.
+      // The draft keeps its text and attachments; the banner carries the fix.
+      const blocked = await useProviderHealth
+        .getState()
+        .ensureReady(finalDraft.provider);
+      if (blocked) {
+        const reason = (blocked.message ?? "The agent isn't available").replace(
+          /\.$/,
+          "",
+        );
+        if (background) {
+          reportFailure(reason);
+          return;
+        }
+        setPending(null);
+        updateDraftInput(finalDraft.draftId, text);
+        readinessErrorRef.current = reason;
+        state.markSendFailed(finalDraft.draftId, reason);
+        sendInFlightRef.current = false;
+        return;
+      }
+      setPending((p) =>
+        p
+          ? {
+              ...p,
+              phase: worktreeProjectPath
+                ? "creating-worktree"
+                : "creating-workspace",
+            }
+          : p,
+      );
       // A conversation in another tab can advance while this draft is open.
       // Refresh every staged handoff at the last responsible moment so the
       // first provider turn receives the newest visible progress.
@@ -1244,7 +1296,10 @@ function DraftChatSurfaceInner({
           user the selected provider can't run BEFORE they compose and
           send a first message into a session that will never start.
           Renders as a floating top overlay; needs `relative` above. */}
-      <ProviderStatusNotice provider={draft.provider} />
+      <ProviderStatusNotice
+        provider={draft.provider}
+        workspaceId={sessionWorkspaceId}
+      />
       <ProviderUpdateNotice provider={draft.provider} threadId={draft.threadId} remote={providerUpdatesRemote} />
       <div className="flex-1 min-h-0 overflow-hidden">
         {pending ? (
@@ -1261,10 +1316,11 @@ function DraftChatSurfaceInner({
 interface DraftPendingState {
   text: string;
   images: UserMessageImage[];
-  phase: MaterializePhase;
+  phase: MaterializePhase | "checking-provider";
 }
 
-const PHASE_LABEL: Record<MaterializePhase, string> = {
+const PHASE_LABEL: Record<DraftPendingState["phase"], string> = {
+  "checking-provider": "Checking the agent…",
   "creating-worktree": "Creating worktree…",
   "creating-workspace": "Setting up workspace…",
   "starting-session": "Starting session…",

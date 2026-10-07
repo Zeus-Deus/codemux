@@ -48,6 +48,24 @@ pub struct ProviderHealthReport {
     pub message: Option<String>,
     /// CLI version when a probe surfaced one. Best-effort.
     pub version: Option<String>,
+    /// Set only when the CLI is installed but signed out: the command that
+    /// signs it in. Its presence is what tells the UI to offer "Sign in"
+    /// and to hold a first send instead of creating a workspace for it.
+    #[serde(default)]
+    pub login_command: Option<String>,
+}
+
+/// The interactive command that signs `provider`'s CLI in. `None` when the
+/// provider has no single login command (Hermes profiles own their auth).
+pub fn provider_login_command(provider: ProviderKind) -> Option<&'static str> {
+    match provider {
+        ProviderKind::Claude => Some("claude auth login"),
+        ProviderKind::Codex => Some("codex login"),
+        ProviderKind::Cursor => Some("cursor-agent login"),
+        ProviderKind::Grok => Some("grok login --device-auth"),
+        ProviderKind::OpenCode => Some("opencode auth login"),
+        ProviderKind::Hermes => None,
+    }
 }
 
 impl ProviderHealthReport {
@@ -58,6 +76,7 @@ impl ProviderHealthReport {
             installed: true,
             message: None,
             version,
+            login_command: None,
         }
     }
 
@@ -68,6 +87,16 @@ impl ProviderHealthReport {
             installed,
             message: Some(message),
             version: None,
+            login_command: None,
+        }
+    }
+
+    /// Installed but signed out: an error that carries the login command.
+    fn signed_out(provider: ProviderKind, version: Option<String>, message: String) -> Self {
+        Self {
+            version,
+            login_command: provider_login_command(provider).map(str::to_owned),
+            ..Self::error(provider, true, message)
         }
     }
 
@@ -78,6 +107,7 @@ impl ProviderHealthReport {
             installed: true,
             message: Some(message),
             version,
+            login_command: None,
         }
     }
 }
@@ -123,7 +153,27 @@ async fn check_claude_health() -> ProviderHealthReport {
         );
     }
     let auth = claude::auth::probe_authenticated(&sidecar, None).await;
-    claude_report_from_auth(auth, installed.version)
+    let report = claude_report_from_auth(auth, installed.version);
+    if installed.unresponsive {
+        return claude_unresponsive_report(report);
+    }
+    report
+}
+
+/// `claude --version` timed out or failed on a binary that exists. A
+/// conclusive auth answer still wins; an inconclusive one says what was
+/// actually observed instead of claiming the CLI is missing. Pure;
+/// unit-tested.
+fn claude_unresponsive_report(auth_report: ProviderHealthReport) -> ProviderHealthReport {
+    if auth_report.status != ProviderHealthStatus::Warning {
+        return auth_report;
+    }
+    ProviderHealthReport::warning(
+        ProviderKind::Claude,
+        None,
+        "Claude Code CLI (`claude`) did not respond to a version check. Sessions may still work."
+            .into(),
+    )
 }
 
 /// Map a failed install probe (the sidecar itself would not run) onto a
@@ -152,11 +202,13 @@ fn claude_report_from_auth(
         Ok(claude::auth::AuthStatus::Authenticated) => {
             ProviderHealthReport::ready(ProviderKind::Claude, version)
         }
-        Ok(claude::auth::AuthStatus::Unauthenticated { message }) => {
-            let mut report = ProviderHealthReport::error(ProviderKind::Claude, true, message);
-            report.version = version;
-            report
-        }
+        // The probe's wording names a retired command; the report carries
+        // the current one in `login_command`.
+        Ok(claude::auth::AuthStatus::Unauthenticated { .. }) => ProviderHealthReport::signed_out(
+            ProviderKind::Claude,
+            version,
+            "Claude Code isn't signed in.".into(),
+        ),
         // Inconclusive output / probe failure after a confirmed install:
         // advisory only — sessions may still work (e.g. API-key auth the
         // probe can't see), so don't block with a red banner.
@@ -230,9 +282,7 @@ fn codex_report_from_auth(
             ProviderHealthReport::ready(ProviderKind::Codex, version)
         }
         Ok(codex::auth::AuthStatus::Unauthenticated { message }) => {
-            let mut report = ProviderHealthReport::error(ProviderKind::Codex, true, message);
-            report.version = version;
-            report
+            ProviderHealthReport::signed_out(ProviderKind::Codex, version, message)
         }
         Ok(codex::auth::AuthStatus::Unknown { .. }) => ProviderHealthReport::warning(
             ProviderKind::Codex,
@@ -307,14 +357,12 @@ async fn check_cursor_health() -> ProviderHealthReport {
                 String::from_utf8_lossy(&output.stderr)
             );
             if crate::agent_provider::cursor::capabilities::looks_unauthenticated(&detail) {
-                let mut report = ProviderHealthReport::error(
+                ProviderHealthReport::signed_out(
                     ProviderKind::Cursor,
-                    true,
+                    version,
                     "Cursor Agent is not authenticated. Run `cursor-agent login` and try again."
                         .into(),
-                );
-                report.version = version;
-                report
+                )
             } else {
                 ProviderHealthReport::warning(
                     ProviderKind::Cursor,
@@ -359,23 +407,19 @@ fn grok_report_from_probe(
         Ok(probe) if probe.authenticated => {
             ProviderHealthReport::ready(ProviderKind::Grok, probe.version)
         }
-        Ok(probe) => {
-            let mut report = ProviderHealthReport::error(
-                ProviderKind::Grok,
-                true,
-                "Grok CLI is not authenticated. Run `grok login --device-auth` or set `XAI_API_KEY`, then try again."
-                    .into(),
-            );
-            report.version = probe.version;
-            report
-        }
+        Ok(probe) => ProviderHealthReport::signed_out(
+            ProviderKind::Grok,
+            probe.version,
+            "Grok CLI is not authenticated. Run `grok login --device-auth` or set `XAI_API_KEY`, then try again."
+                .into(),
+        ),
         Err(grok::capabilities::HarvestError::NotInstalled { hint }) => {
             ProviderHealthReport::error(ProviderKind::Grok, false, hint)
         }
         Err(grok::capabilities::HarvestError::NotAuthenticated { hint }) => {
-            ProviderHealthReport::error(
+            ProviderHealthReport::signed_out(
                 ProviderKind::Grok,
-                true,
+                None,
                 format!("Grok CLI is not authenticated. {hint}"),
             )
         }
@@ -455,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_unauthenticated_maps_to_error_with_probe_message() {
+    fn claude_unauthenticated_maps_to_signed_out_error() {
         let report = claude_report_from_auth(
             Ok(claude::auth::AuthStatus::Unauthenticated {
                 message: "Run `claude login`.".into(),
@@ -464,8 +508,53 @@ mod tests {
         );
         assert_eq!(report.status, ProviderHealthStatus::Error);
         assert!(report.installed);
-        assert_eq!(report.message.as_deref(), Some("Run `claude login`."));
+        assert_eq!(report.message.as_deref(), Some("Claude Code isn't signed in."));
+        assert_eq!(report.login_command.as_deref(), Some("claude auth login"));
         assert_eq!(report.version.as_deref(), Some("2.1.0"));
+    }
+
+    #[test]
+    fn claude_unresponsive_cli_with_inconclusive_auth_is_a_warning_not_missing() {
+        let auth = claude_report_from_auth(
+            Err(ProviderError::Timeout {
+                operation: "probe-authenticated".into(),
+                elapsed_ms: 10_000,
+            }),
+            None,
+        );
+        let report = claude_unresponsive_report(auth);
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.installed);
+        let message = report.message.as_deref().unwrap();
+        assert!(message.contains("did not respond"));
+        assert!(!message.contains("not installed"));
+    }
+
+    #[test]
+    fn claude_unresponsive_cli_keeps_a_conclusive_auth_answer() {
+        let signed_out = claude_unresponsive_report(claude_report_from_auth(
+            Ok(claude::auth::AuthStatus::Unauthenticated { message: String::new() }),
+            None,
+        ));
+        assert_eq!(signed_out.status, ProviderHealthStatus::Error);
+        assert!(signed_out.login_command.is_some());
+        let ready = claude_unresponsive_report(claude_report_from_auth(
+            Ok(claude::auth::AuthStatus::Authenticated),
+            None,
+        ));
+        assert_eq!(ready.status, ProviderHealthStatus::Ready);
+    }
+
+    #[test]
+    fn only_signed_out_reports_carry_a_login_command() {
+        let missing = claude_probe_failure_report(&ProviderError::NotInstalled {
+            provider: ProviderKind::Claude,
+            hint: "sidecar binary not found".into(),
+        });
+        assert!(missing.login_command.is_none());
+        let ready = claude_report_from_auth(Ok(claude::auth::AuthStatus::Authenticated), None);
+        assert!(ready.login_command.is_none());
+        assert!(provider_login_command(ProviderKind::Hermes).is_none());
     }
 
     #[test]
@@ -499,6 +588,7 @@ mod tests {
         );
         assert_eq!(report.status, ProviderHealthStatus::Error);
         assert_eq!(report.message.as_deref(), Some("Run `codex login`."));
+        assert_eq!(report.login_command.as_deref(), Some("codex login"));
     }
 
     #[test]

@@ -1125,6 +1125,21 @@ describe("agent-chat reducer", () => {
     }
   });
 
+  it("runtime_warning marks a signed-out Claude run with a sign-in notice", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "assistant error: authentication_failed",
+      original_payload: null,
+    });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      kind: "runtime_notice",
+      message: "Claude Code isn't signed in.",
+      signIn: "claude",
+    });
+  });
+
   it("runtime_warning debug noise still appends nothing", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = createEmptyThreadState();

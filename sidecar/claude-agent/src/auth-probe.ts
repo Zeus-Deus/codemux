@@ -32,6 +32,11 @@ export interface ProbeInstalledResult {
   installed: boolean;
   /** CLI-reported version string, when available. */
   version?: string;
+  /** The binary exists but `--version` timed out, exited non-zero or
+   *  could not be executed. A cold machine or a slow update check can do
+   *  this to a working install, so callers treat it as an advisory
+   *  rather than as "not installed". */
+  unresponsive?: boolean;
 }
 
 /** Outcome of `probeAuthenticated`. */
@@ -84,9 +89,20 @@ function runBinary(binary: string, args: string[]): Promise<SpawnOutcome> {
 export async function probeInstalled(
   binary: string,
 ): Promise<ProbeInstalledResult> {
-  const result = await runBinary(binary, ["--version"]);
-  if (result.timedOut || result.error || result.exitCode !== 0) {
+  return classifyInstallOutcome(await runBinary(binary, ["--version"]));
+}
+
+/** Only a missing binary means "not installed"; every other failure
+ *  proves something is there. Split out so it is pure and testable. */
+export function classifyInstallOutcome(
+  result: Pick<SpawnOutcome, "stdout" | "exitCode" | "error" | "timedOut">,
+): ProbeInstalledResult {
+  const error = result.error;
+  if (error && "code" in error && error.code === "ENOENT") {
     return { installed: false };
+  }
+  if (result.timedOut || result.error || result.exitCode !== 0) {
+    return { installed: true, unresponsive: true };
   }
   const trimmed = result.stdout.trim();
   if (trimmed === "") {

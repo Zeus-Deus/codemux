@@ -4032,7 +4032,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       {/* Provider runtime health (probe-backed, TTL-cached): a dead CLI
           used to fail silently into a perpetual "Working…" spinner.
           Renders as a floating top overlay; needs `relative` above. */}
-      {conversationWritable && <ProviderStatusNotice provider={provider} />}
+      {conversationWritable && (
+        <ProviderStatusNotice provider={provider} workspaceId={paneWorkspaceId} />
+      )}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />

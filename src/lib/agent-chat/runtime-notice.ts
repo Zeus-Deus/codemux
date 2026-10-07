@@ -17,6 +17,16 @@ const ASSISTANT_ERROR_PREFIX = "assistant error: ";
 /** The assistant error a usage-limit stop reports. */
 const RATE_LIMIT_REASON = "rate_limit";
 
+/** The assistant error a signed-out Claude CLI reports. */
+const SIGNED_OUT_WARNING = ASSISTANT_ERROR_PREFIX + "authentication_failed";
+
+/** The provider whose signed-out CLI a `runtime_warning` reports, if any.
+ *  Only Claude's SDK names this error; other providers fail at session
+ *  start, where the health banner already covers them. */
+export function signedOutProviderFromWarning(message: string): "claude" | null {
+  return message === SIGNED_OUT_WARNING ? "claude" : null;
+}
+
 /** Contract prefix the Claude adapter stamps on the warning it emits when
  *  the sidecar couldn't resume a stale session and transparently rebuilt a
  *  fresh one. The remainder is the ready-to-render notice text. */
@@ -40,6 +50,9 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  *   `usage_limit_reached` instead) → a notice only when
  *   `rate_limit_info.status === "rejected"` (the provider actually
  *   stopped the run); an informational rate-limit tick is null.
+ * - `"assistant error: authentication_failed"` → a plain "isn't signed
+ *   in" sentence (the row carries a Sign in action; see
+ *   `signedOutProviderFromWarning`).
  * - `"assistant error: <reason>"` → `"Provider error: <reason>"` (the
  *   SDK's enumerated assistant errors, e.g. overloaded). `rate_limit` is
  *   null: a usage-limit stop arrives as `usage_limit_reached`, which owns
@@ -57,6 +70,7 @@ export function runtimeNoticeFromWarning(
       ? "Usage limit reached — the provider stopped the run."
       : null;
   }
+  if (message === SIGNED_OUT_WARNING) return "Claude Code isn't signed in.";
   if (message.startsWith(ASSISTANT_ERROR_PREFIX)) {
     const reason = message.slice(ASSISTANT_ERROR_PREFIX.length);
     if (reason === RATE_LIMIT_REASON) return null;

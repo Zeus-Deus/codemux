@@ -22,9 +22,17 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
-  // Provider health is probed only on picker intent or send failure. Keep any
-  // explicit failure-path probe pending so no banner state churns mid-test.
-  agentChatProviderHealth: vi.fn(() => new Promise(() => {})),
+  // A send checks provider readiness before creating anything; report a
+  // healthy provider so the submit flow proceeds unless a test says not.
+  agentChatProviderHealth: vi.fn().mockResolvedValue({
+    provider: "claude",
+    status: "ready",
+    installed: true,
+    message: null,
+    version: "test",
+  }),
+  openProviderLoginTerminal: vi.fn().mockResolvedValue(undefined),
+  getOrCreateHomeWorkspace: vi.fn().mockResolvedValue("ws-home"),
   // MCP warmup fired on the draft surface mount; no-op in tests. Image
   // staging commands are imported by the image-staging helper but only
   // invoked when a test stages an image (none here).
@@ -187,7 +195,15 @@ import { DraftChatSurface } from "./DraftChatSurface";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { toast } from "@/lib/toast";
-import { agentChatGetSessionContext, listSkills, listChatSlashCommands, type Skill } from "@/tauri/commands";
+import {
+  agentChatGetSessionContext,
+  agentChatProviderHealth,
+  listSkills,
+  listChatSlashCommands,
+  openProviderLoginTerminal,
+  type Skill,
+} from "@/tauri/commands";
+import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
 import { useSkillsStore } from "@/stores/skills-store";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -210,6 +226,16 @@ function resetStores() {
     disabledIds: [], inventoryCache: {}, inFlightContexts: {}, activeContextKey: null,
     includePlugins: true, cacheGeneration: 0 });
   useProviderCommandsStore.getState().invalidate();
+  useProviderHealth.setState({
+    slots: {
+      claude: emptyHealthSlot(),
+      codex: emptyHealthSlot(),
+      cursor: emptyHealthSlot(),
+      grok: emptyHealthSlot(),
+      hermes: emptyHealthSlot(),
+      opencode: emptyHealthSlot(),
+    },
+  });
   vi.mocked(listSkills).mockReset().mockResolvedValue({ skills: [], errors: [] });
   vi.mocked(listChatSlashCommands).mockClear();
   // homeDir is normally hydrated at App mount; seed it here so the
@@ -713,6 +739,52 @@ describe("DraftChatSurface", () => {
       expect(useChatDraftStore.getState().activeDraftId).toBe(nextId);
       expect(nextTextarea).toHaveValue("next task");
       expect(document.activeElement).toBe(nextTextarea);
+    });
+
+    it("holds a send to a signed-out agent without creating anything", async () => {
+      const signedOut = {
+        provider: "claude" as const,
+        status: "error" as const,
+        installed: true,
+        message: "Claude Code isn't signed in.",
+        version: "2.1.0",
+        login_command: "claude auth login",
+      };
+      vi.mocked(agentChatProviderHealth).mockResolvedValueOnce(signedOut);
+      const draft = seedProjectDraft("fix the login page");
+      const { container, findByTestId, getByRole } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+
+      await vi.waitFor(() =>
+        expect(container).toHaveTextContent(
+          "Send failed: Claude Code isn't signed in. Press Enter to retry.",
+        ),
+      );
+      const notice = await findByTestId("provider-status-notice");
+      expect(notice).toHaveTextContent("Claude Code isn't signed in.");
+      expect(materializeAndSend).not.toHaveBeenCalled();
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(container.querySelector("textarea")).toHaveValue("fix the login page");
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].promoting).toBe(false);
+
+      // No workspace is in view, so the sign-in terminal opens in Home.
+      fireEvent.click(getByRole("button", { name: "Sign in" }));
+      await vi.waitFor(() =>
+        expect(openProviderLoginTerminal).toHaveBeenCalledWith("ws-home", "claude"),
+      );
+
+      // The cached failure is re-probed on the next send, so signing in is
+      // enough: a stale answer never blocks the retry.
+      vi.mocked(agentChatProviderHealth).mockResolvedValueOnce({
+        ...signedOut,
+        status: "ready",
+        message: null,
+        login_command: null,
+      });
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({ success: false, error: "stop here" });
+      act(() => useChatDraftStore.getState().setActiveDraft(draft.draftId));
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
     });
 
     it("consumes background focus before a later visit to the same draft", () => {

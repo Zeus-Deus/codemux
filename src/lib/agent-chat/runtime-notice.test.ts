@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { runtimeNoticeFromWarning } from "./runtime-notice";
+import {
+  runtimeNoticeFromWarning,
+  signedOutProviderFromWarning,
+} from "./runtime-notice";
 
 describe("runtimeNoticeFromWarning", () => {
   it("still promotes a legacy rejected rate-limit event row", () => {
@@ -41,6 +44,17 @@ describe("runtimeNoticeFromWarning", () => {
     expect(
       runtimeNoticeFromWarning("assistant error: overloaded_error", {}),
     ).toBe("Provider error: overloaded_error");
+  });
+
+  it("turns a signed-out assistant error into one plain sentence", () => {
+    const warning = "assistant error: authentication_failed";
+    expect(runtimeNoticeFromWarning(warning, null)).toBe(
+      "Claude Code isn't signed in.",
+    );
+    expect(signedOutProviderFromWarning(warning)).toBe("claude");
+    expect(
+      signedOutProviderFromWarning("assistant error: overloaded_error"),
+    ).toBeNull();
   });
 
   it("leaves a rate_limit assistant error to the usage-limit record", () => {

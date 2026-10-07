@@ -278,6 +278,9 @@ pub struct ProbeInstalledResponse {
     pub installed: bool,
     #[serde(default)]
     pub version: Option<String>,
+    /// Installed, but `claude --version` timed out or failed.
+    #[serde(default)]
+    pub unresponsive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -2839,6 +2839,31 @@ function sessionErrorMockRun(
   });
 }
 
+/** Signed-out QA: the turn a signed-out Claude CLI produces. The SDK
+ *  reports `authentication_failed` on the assistant message, which the
+ *  transcript renders as the "isn't signed in" card with its actions. */
+function signedOutMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
+  const turnId = `signed-out-turn-${Date.now()}`;
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: turnId },
+  });
+  emitChatEvent(threadId, {
+    type: "runtime_warning",
+    thread_id: threadId,
+    message: "assistant error: authentication_failed",
+    original_payload: null,
+  });
+  emitChatEvent(threadId, {
+    type: "turn_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    status: { kind: "success" },
+    usage: null,
+  });
+}
+
 /** Dead-run detection QA (issue #154): settle a live turn with a synthetic
  *  `child_exited` error — exactly what the provider watchdogs emit when a
  *  sidecar/server dies mid-turn. Drives the "Run interrupted" divider and
@@ -2875,6 +2900,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       streamRunStalled: typeof streamMockRunStalled;
       interruptRun: typeof interruptMockRun;
       sessionError: typeof sessionErrorMockRun;
+      signedOut: typeof signedOutMockRun;
       setProviderHealth: typeof setMockProviderHealth;
     };
   }
@@ -2887,6 +2913,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
   sessionError: sessionErrorMockRun,
+  signedOut: signedOutMockRun,
   setProviderHealth: setMockProviderHealth,
 };
 
@@ -4347,6 +4374,18 @@ const handlers: Record<string, Handler> = {
     await new Promise(resolve => setTimeout(resolve, 1800));
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
+  },
+  // Opens the sign-in terminal tab like the backend, then treats the
+  // sign-in as done: the next probe (Re-check, window focus, or a send)
+  // reports ready, which is the recovery path QA needs to see.
+  open_provider_login_terminal: (a) => {
+    const tabId = handlers.create_tab({ workspaceId: a.workspaceId, kind: "terminal" });
+    const ws = findWorkspace(a.workspaceId);
+    const tab = ws?.tabs.find((t) => t.tab_id === tabId);
+    if (tab) tab.title = "Sign in";
+    delete mockProviderHealth[String(a.provider) as MockProviderKind];
+    emitAppState();
+    return undefined;
   },
   agent_chat_provider_health: (a) => {
     const provider = String(a.provider) as MockProviderKind;
@@ -6098,6 +6137,25 @@ const handlers: Record<string, Handler> = {
     ws.base_branch = a.newBranch ? String(a.base ?? "main") : null;
     // The host has created it when invoke resolves; only delivery of the
     // snapshot is asynchronous. Follow-up rename/activate must find it.
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    setTimeout(() => emitAppState(), 0);
+    return ws.workspace_id;
+  },
+  // Reuses the Home workspace or adds one rooted at the mock home dir, so
+  // flows that open something "in Home" (the provider sign-in terminal)
+  // work in `npm run dev`.
+  get_or_create_home_workspace: () => {
+    const existing = appState.workspaces.find((w) => w.workspace_type === "home");
+    if (existing) return existing.workspace_id;
+    const ws: WorkspaceSnapshot = {
+      ...buildWorktreeWorkspace(MOCK_HOME_DIR, "main"),
+      title: "Home",
+      workspace_type: "home",
+      cwd: MOCK_HOME_DIR,
+      worktree_path: null,
+      project_root: MOCK_HOME_DIR,
+      workspace_kind: null,
+    };
     appState = { ...appState, workspaces: [...appState.workspaces, ws] };
     setTimeout(() => emitAppState(), 0);
     return ws.workspace_id;

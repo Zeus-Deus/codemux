@@ -25,6 +25,7 @@ vi.mock("@/tauri/commands", () => ({
 import {
   emptyHealthSlot,
   healthBannerKey,
+  healthBlocksSend,
   selectVisibleHealthReport,
   useProviderHealth,
 } from "./provider-health-store";
@@ -296,5 +297,54 @@ describe("provider-health-store", () => {
         ?.message,
     ).toBe("Claude CLI is not authenticated.");
     warn.mockRestore();
+  });
+  it("blocks a send only for a missing or signed-out CLI", () => {
+    expect(healthBlocksSend(null)).toBe(false);
+    expect(healthBlocksSend(report("ready"))).toBe(false);
+    expect(healthBlocksSend(report("warning", "Version check timed out."))).toBe(false);
+    // Installed but failing to run: the session gets to explain itself.
+    expect(
+      healthBlocksSend({ ...report("error", "failed to run"), installed: true }),
+    ).toBe(false);
+    expect(healthBlocksSend(report("error", "not installed"))).toBe(true);
+    expect(
+      healthBlocksSend({
+        ...report("error", "Claude Code isn't signed in."),
+        installed: true,
+        login_command: "claude auth login",
+      }),
+    ).toBe(true);
+  });
+
+  it("ensureReady re-probes a cached block and passes once signed in", async () => {
+    const signedOut: ProviderHealthReport = {
+      ...report("error", "Claude Code isn't signed in."),
+      installed: true,
+      login_command: "claude auth login",
+    };
+    seed(signedOut);
+    useProviderHealth.getState().dismiss("claude");
+    mockProbe.mockResolvedValueOnce(signedOut);
+
+    // Still signed out: the report comes back and the banner is shown
+    // again even though the user had dismissed it.
+    expect(await useProviderHealth.getState().ensureReady("claude")).toEqual(
+      signedOut,
+    );
+    expect(
+      selectVisibleHealthReport(useProviderHealth.getState(), "claude"),
+    ).toEqual(signedOut);
+
+    // A fresh cached block is still re-probed, so a sign-in finished a
+    // moment ago is never refused on stale facts.
+    mockProbe.mockResolvedValueOnce(report("ready"));
+    expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
+    expect(mockProbe).toHaveBeenCalledTimes(2);
+  });
+
+  it("ensureReady reuses a fresh healthy answer without probing", async () => {
+    seed(report("ready"));
+    expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
+    expect(mockProbe).not.toHaveBeenCalled();
   });
 });

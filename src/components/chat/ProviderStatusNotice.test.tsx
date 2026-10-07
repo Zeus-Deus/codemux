@@ -16,8 +16,15 @@ import { ProviderStatusNotice } from "./ProviderStatusNotice";
 const mockProbe = vi.fn(
   (_provider: string) => new Promise<ProviderHealthReport>(() => {}),
 );
+const mockOpenLogin = vi.fn((_workspaceId: string, _provider: string) =>
+  Promise.resolve(),
+);
 vi.mock("@/tauri/commands", () => ({
   agentChatProviderHealth: (provider: string) => mockProbe(provider),
+  openProviderLoginTerminal: (workspaceId: string, provider: string) =>
+    mockOpenLogin(workspaceId, provider),
+  getOrCreateHomeWorkspace: () => Promise.resolve("ws-home"),
+  activateWorkspace: () => Promise.resolve(),
 }));
 
 // Mirrors the store's own refresh() semantics: a ready report clears
@@ -44,6 +51,7 @@ function seedReport(report: ProviderHealthReport) {
 
 function resetStore() {
   mockProbe.mockClear();
+  mockOpenLogin.mockClear();
   act(() => {
     useProviderHealth.setState({
       slots: {
@@ -199,5 +207,69 @@ describe("ProviderStatusNotice", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+  it("offers Sign in only for a signed-out CLI and opens it in the workspace", async () => {
+    render(<ProviderStatusNotice provider="claude" workspaceId="ws-1" />);
+    seedReport({
+      provider: "claude",
+      status: "error",
+      installed: false,
+      message: "Claude Code CLI (`claude`) is not installed or not on PATH.",
+      version: null,
+    });
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+
+    seedReport({
+      provider: "claude",
+      status: "error",
+      installed: true,
+      message: "Claude Code isn't signed in.",
+      version: "2.1.0",
+      login_command: "claude auth login",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await vi.waitFor(() =>
+      expect(mockOpenLogin).toHaveBeenCalledWith("ws-1", "claude"),
+    );
+  });
+
+  it("Re-check forces a probe even while the report is fresh", () => {
+    render(<ProviderStatusNotice provider="codex" />);
+    seedReport({
+      provider: "codex",
+      status: "error",
+      installed: true,
+      message: "Run `codex login`.",
+      version: null,
+      login_command: "codex login",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Re-check Codex" }));
+    expect(mockProbe).toHaveBeenCalledWith("codex");
+  });
+
+  it("re-checks a known failure when a surface mounts", () => {
+    // Coming back from the sign-in terminal remounts the chat; the old
+    // failure is re-checked instead of shown until the next poll.
+    act(() => {
+      useProviderHealth.setState((state) => ({
+        slots: {
+          ...state.slots,
+          claude: {
+            ...state.slots.claude,
+            report: {
+              provider: "claude",
+              status: "error",
+              installed: true,
+              message: "Claude Code isn't signed in.",
+              version: null,
+              login_command: "claude auth login",
+            },
+            fetchedAt: Date.now() - 60_000,
+          },
+        },
+      }));
+    });
+    render(<ProviderStatusNotice provider="claude" />);
+    expect(mockProbe).toHaveBeenCalledWith("claude");
   });
 });

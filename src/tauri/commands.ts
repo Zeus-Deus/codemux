@@ -381,6 +381,13 @@ export const listChatProviderCapabilities = (
 export const agentChatProviderHealth = (provider: AgentChatProviderKind) =>
   invoke<ProviderHealthReport>("agent_chat_provider_health", { provider });
 
+/** Open a terminal tab in `workspaceId` running `provider`'s sign-in
+ *  command. The backend picks the command; callers only name the provider. */
+export const openProviderLoginTerminal = (
+  workspaceId: string,
+  provider: AgentChatProviderKind,
+) => invoke("open_provider_login_terminal", { workspaceId, provider });
+
 /** Gemini launch-time model list. Backend serves a live harvest when
  *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either
  *  way it returns quickly; failure inside the live path is caught by
