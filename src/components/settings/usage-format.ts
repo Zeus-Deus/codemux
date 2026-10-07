@@ -2,7 +2,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 
 /** A lookup that ignores inherited keys. Provider ids come from the ledger,
  *  and a plain index would answer "constructor" with a function. */
-function own<T>(table: Record<string, T>, key: string): T | undefined {
+export function own<T>(table: Record<string, T>, key: string): T | undefined {
   return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
 }
 

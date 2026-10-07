@@ -963,6 +963,28 @@ describe("model details and prices", () => {
     );
   });
 
+  it("opens a fresh price editor for a model named like an Object key", async () => {
+    vi.mocked(usageSummary).mockResolvedValue(
+      summary({
+        models: [
+          flatModel({
+            provider: "opencode",
+            model: "constructor",
+            tokens: 1_000,
+            priced: false,
+            unpriced_tokens: 1_000,
+          }),
+        ],
+      }),
+    );
+    render(<UsageSection />, { wrapper: TooltipProvider });
+    await userEvent.click(await screen.findByRole("button", { name: "Open constructor details" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Set price" }));
+    expect(await screen.findByText("Set model price")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use default price" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Input")).toHaveValue("");
+  });
+
   it("lists custom prices and removes one", async () => {
     vi.mocked(usagePriceOverrides).mockResolvedValue({
       "openrouter/kimi-k2": { input: 0.6, output: 2.5, cache_read: 0, cache_write: 0 },

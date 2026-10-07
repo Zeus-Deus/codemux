@@ -41,6 +41,7 @@ import {
   formatPercent,
   formatTokens,
   isKnownProvider,
+  own,
   seriesColor,
   seriesFill,
   seriesLabel,
@@ -505,7 +506,7 @@ export function UsageSection() {
             setSelectedModelKey(null);
             setPriceEditor({
               model: model.model,
-              rates: overrides[model.model] ?? model.rates,
+              rates: own(overrides, model.model) ?? model.rates,
             });
           }}
         />
@@ -521,7 +522,7 @@ export function UsageSection() {
           }}
           onEdit={(model) => {
             setPricesOpen(false);
-            setPriceEditor({ model, rates: overrides[model] ?? null });
+            setPriceEditor({ model, rates: own(overrides, model) ?? null });
           }}
         />
       )}
@@ -529,7 +530,9 @@ export function UsageSection() {
         <PriceEditorDialog
           model={priceEditor.model}
           initialRates={priceEditor.rates}
-          hasOverride={priceEditor.model !== null && priceEditor.model in overrides}
+          hasOverride={
+            priceEditor.model !== null && own(overrides, priceEditor.model) !== undefined
+          }
           onClose={() => setPriceEditor(null)}
           onSaved={onPricesChanged}
         />
