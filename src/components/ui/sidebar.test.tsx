@@ -79,3 +79,50 @@ describe("desktop sidebar toggle", () => {
     expect(sidebar).toHaveAttribute("data-state", "expanded")
   })
 })
+
+// The rail used to be pointer-only: no focus, no value, no way back to the
+// default after an over-drag short of dragging precisely.
+describe("sidebar rail keyboard and reset", () => {
+  function renderRail() {
+    const { container } = render(
+      <SidebarProvider>
+        <Sidebar collapsible="icon"><SidebarRail /></Sidebar>
+      </SidebarProvider>
+    )
+    const wrapper = container.querySelector<HTMLElement>('[data-slot="sidebar-wrapper"]')!
+    const rail = screen.getByRole("separator", { name: "Resize sidebar" })
+    return { rail, width: () => wrapper.style.getPropertyValue("--sidebar-width") }
+  }
+
+  it("is focusable and reports its width", () => {
+    const { rail } = renderRail()
+    expect(rail).toHaveAttribute("tabindex", "0")
+    expect(rail).toHaveAttribute("aria-valuenow", "288")
+    expect(rail).toHaveAttribute("aria-valuemin", "180")
+    expect(rail).toHaveAttribute("aria-valuemax", "400")
+  })
+
+  it("resizes with the arrow keys, further with Shift", () => {
+    const { rail, width } = renderRail()
+    fireEvent.keyDown(rail, { key: "ArrowRight" })
+    expect(width()).toBe("304px")
+    fireEvent.keyDown(rail, { key: "ArrowLeft", shiftKey: true })
+    expect(width()).toBe("240px")
+    expect(rail).toHaveAttribute("aria-valuenow", "240")
+  })
+
+  it("jumps to the bounds with Home and End", () => {
+    const { rail, width } = renderRail()
+    fireEvent.keyDown(rail, { key: "End" })
+    expect(width()).toBe("400px")
+    fireEvent.keyDown(rail, { key: "Home" })
+    expect(width()).toBe("180px")
+  })
+
+  it("resets to the default width on double-click", () => {
+    const { rail, width } = renderRail()
+    fireEvent.keyDown(rail, { key: "End" })
+    fireEvent.doubleClick(rail)
+    expect(width()).toBe("288px")
+  })
+})

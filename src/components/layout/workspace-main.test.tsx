@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
 import type { TasksSnapshot } from "@/tauri/events";
@@ -20,6 +20,7 @@ const state = {
   rightPanelTabs: {} as Record<string, string | null>,
   rightPanelMaximized: false,
   rowWidths: [] as number[],
+  panelWidths: [] as number[],
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
@@ -106,9 +107,11 @@ vi.mock("@/stores/ui-store", () => ({
         rightPanelWidth: 320,
         rightPanelRowWidth: 0,
         rightPanelMaximized: state.rightPanelMaximized,
+        setRightPanelWidth: (width: number) => state.panelWidths.push(width),
       }),
     ),
     {
+      getInitialState: () => ({ rightPanelWidth: 320 }),
       getState: () => ({
         setRightPanelWidth: vi.fn(),
         setRightPanelRowWidth: (width: number) => state.rowWidths.push(width),
@@ -123,6 +126,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { WorkspaceMain } from "./workspace-main";
+import { dbSetUiState } from "@/tauri/commands";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -183,6 +187,7 @@ beforeEach(() => {
   state.rightPanelTabs = {};
   state.rightPanelMaximized = false;
   state.rowWidths = [];
+  state.panelWidths = [];
 });
 
 afterEach(cleanup);
@@ -513,5 +518,38 @@ describe("WorkspaceMain content row measurement", () => {
       );
     });
     expect(state.rowWidths[state.rowWidths.length - 1]).toBe(1200);
+  });
+});
+
+// The seam was pointer-only and could not be reset after an over-drag.
+describe("WorkspaceMain right panel resizer keyboard and reset", () => {
+  it("is focusable and reports the panel width", () => {
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByRole } = render(<WorkspaceMain />);
+    const seam = getByRole("separator", { name: "Resize right panel" });
+    expect(seam).toHaveAttribute("tabindex", "0");
+    expect(seam).toHaveAttribute("aria-valuenow", "320");
+    expect(seam).toHaveAttribute("aria-valuemin", "360");
+  });
+
+  it("grows the panel when the seam moves left and persists it", () => {
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByRole } = render(<WorkspaceMain />);
+    const seam = getByRole("separator", { name: "Resize right panel" });
+    fireEvent.keyDown(seam, { key: "ArrowLeft", shiftKey: true });
+    expect(state.panelWidths).toEqual([384]);
+    expect(dbSetUiState).toHaveBeenCalledWith("right_panel_width", "384");
+
+    fireEvent.keyDown(seam, { key: "ArrowRight" });
+    // 320 - 16 is under the floor, so it clamps to the minimum.
+    expect(state.panelWidths[1]).toBe(360);
+  });
+
+  it("resets to the default width on double-click", () => {
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByRole } = render(<WorkspaceMain />);
+    fireEvent.doubleClick(getByRole("separator", { name: "Resize right panel" }));
+    // The default sits under today's floor, so it renders at the floor.
+    expect(state.panelWidths).toEqual([360]);
   });
 });

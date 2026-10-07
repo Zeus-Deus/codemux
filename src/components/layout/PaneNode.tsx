@@ -13,6 +13,7 @@ import {
 } from "@/stores/app-store";
 import { useTerminalCwd } from "@/stores/terminal-cwd-store";
 import { formatCwdHint } from "@/lib/terminal-cwd";
+import { resizeKeyAction } from "@/lib/resize-keys";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
@@ -143,6 +144,114 @@ function startResize(
 
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
+}
+
+/** Smallest share either side of a split seam may shrink to. */
+const MIN_SPLIT_FRACTION = 0.05;
+
+/**
+ * Keyboard and double-click control for a split seam. Arrows move the seam
+ * by a pixel step converted to the split's ratio; Home/End push it to either
+ * end; double-click evens out every child of the split.
+ */
+function SplitResizeHandle({
+  node,
+  index,
+}: {
+  node: PaneNodeSnapshot & { kind: "split" };
+  index: number;
+}) {
+  const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
+  const columns = node.direction === "horizontal";
+  // A seam between columns is a vertical line.
+  const orientation = columns ? "vertical" : "horizontal";
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const action = resizeKeyAction(e, orientation);
+    if (!action) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const container = e.currentTarget.closest<HTMLElement>(
+      "[data-split-container]",
+    );
+    if (!container) return;
+    // Read the layout from the grid itself, as a drag leaves it: repeated
+    // presses land before the backend echoes the previous step back.
+    const template = columns
+      ? container.style.gridTemplateColumns
+      : container.style.gridTemplateRows;
+    const parsed = template.split(" ").map((v) => Number.parseFloat(v));
+    const current =
+      parsed.length === sizes.length && parsed.every(Number.isFinite)
+        ? normalizeChildSizes(parsed, parsed.length)
+        : sizes;
+    const pair = current[index] + current[index + 1];
+    const rect = container.getBoundingClientRect();
+    const axisSize = columns ? rect.width : rect.height;
+    const target =
+      action.kind === "min"
+        ? 0
+        : action.kind === "max"
+          ? pair
+          : axisSize > 0
+            ? current[index] + action.px / axisSize
+            : current[index];
+    const first = Math.max(
+      MIN_SPLIT_FRACTION,
+      Math.min(pair - MIN_SPLIT_FRACTION, target),
+    );
+    const next = [...current];
+    next[index] = first;
+    next[index + 1] = pair - first;
+    const nextTemplate = next.map((s) => `${s}fr`).join(" ");
+    if (columns) container.style.gridTemplateColumns = nextTemplate;
+    else container.style.gridTemplateRows = nextTemplate;
+    resizeSplit(node.pane_id, next).catch(console.error);
+  };
+
+  let before = 0;
+  for (let i = 0; i <= index; i++) before += sizes[i];
+
+  return (
+    <div
+      role="separator"
+      tabIndex={0}
+      aria-orientation={orientation}
+      aria-label="Resize split"
+      aria-valuenow={Math.round(before * 100)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      data-testid="split-resize-handle"
+      className={cn(
+        "group/split absolute z-20 outline-none",
+        columns
+          ? "top-1 bottom-1 -right-[6px] w-3 cursor-col-resize"
+          : "left-1 right-1 -bottom-[6px] h-3 cursor-row-resize",
+      )}
+      onPointerDown={(e) => startResize(e, node, index)}
+      onKeyDown={handleKeyDown}
+      onDoubleClick={() =>
+        resizeSplit(
+          node.pane_id,
+          node.children.map(() => 1 / node.children.length),
+        ).catch(console.error)
+      }
+    >
+      {/* The pane borders already draw the seam at rest; this 3px line is
+          the hover, drag and focus state. It stays inside the cell, which
+          clips the other half of the hit area. */}
+      <span
+        aria-hidden
+        className={cn(
+          "pointer-events-none absolute rounded-full bg-transparent transition-colors duration-100",
+          "group-hover/split:bg-foreground/30 group-focus-visible/split:bg-ring/60 group-data-[dragging=true]/split:bg-foreground/40",
+          columns
+            ? "inset-y-0 left-1/2 w-[3px] -translate-x-full"
+            : "inset-x-0 top-1/2 h-[3px] -translate-y-full",
+        )}
+      />
+    </div>
+  );
 }
 
 // ── Drag-to-swap logic (ported from old PaneNode.svelte) ──
@@ -281,14 +390,7 @@ function PaneNodeImpl({
               workspaceId={workspaceId}
             />
             {i < node.children.length - 1 && (
-              <div
-                className={`absolute z-20 opacity-0 hover:opacity-100 data-[dragging=true]:opacity-100 transition-opacity duration-100 ${
-                  node.direction === "horizontal"
-                    ? "top-1 bottom-1 -right-[6px] w-3 cursor-col-resize"
-                    : "left-1 right-1 -bottom-[6px] h-3 cursor-row-resize"
-                } bg-foreground/20 hover:bg-foreground/30 data-[dragging=true]:bg-foreground/30 rounded-full`}
-                onPointerDown={(e) => startResize(e, node as PaneNodeSnapshot & { kind: "split" }, i)}
-              />
+              <SplitResizeHandle node={node} index={i} />
             )}
           </div>
         ))}

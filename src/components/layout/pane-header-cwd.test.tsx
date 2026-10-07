@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { memo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type {
@@ -36,6 +36,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { PaneNode } from "./PaneNode";
+import { resizeSplit } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -349,5 +350,69 @@ describe("active pane cue", () => {
     mount("Terminal", { isSurfaceRoot: true, activePaneId: "p1" });
     expect(shell()).toHaveClass("border-border/30");
     expect(shell()).not.toHaveClass("border-accent-ember/45");
+  });
+});
+
+// Split seams were invisible, unfocusable divs with no way back to an even
+// layout short of dragging precisely.
+describe("split resize handle", () => {
+  function mountSplit() {
+    vi.mocked(resizeSplit).mockClear();
+    vi.mocked(resizeSplit).mockResolvedValue(undefined as never);
+    const split: PaneNodeSnapshot = {
+      kind: "split",
+      pane_id: "split-1",
+      direction: "horizontal",
+      child_sizes: [0.5, 0.5],
+      children: [termPane("Left"), { ...termPane("Right"), pane_id: "p2", session_id: "s2" }],
+    } as PaneNodeSnapshot;
+    act(() => {
+      useAppStore.setState({ appState: makeAppState(split), homeDir: "/home/zeus" });
+    });
+    render(<PaneNode node={split} activePaneId="p1" visible={true} />);
+    const container = document.querySelector("[data-split-container]")!;
+    Object.defineProperty(container, "getBoundingClientRect", {
+      value: () => ({ width: 1000, height: 600 }) as DOMRect,
+      configurable: true,
+    });
+    return screen.getByRole("separator", { name: "Resize split" });
+  }
+
+  it("is a focusable vertical separator between columns", () => {
+    const seam = mountSplit();
+    expect(seam).toHaveAttribute("tabindex", "0");
+    expect(seam).toHaveAttribute("aria-orientation", "vertical");
+    expect(seam).toHaveAttribute("aria-valuenow", "50");
+  });
+
+  it("moves the seam by a pixel step converted to the split ratio", () => {
+    const seam = mountSplit();
+    fireEvent.keyDown(seam, { key: "ArrowRight", shiftKey: true });
+    const [, sizes] = vi.mocked(resizeSplit).mock.calls[0];
+    expect(sizes[0]).toBeCloseTo(0.564);
+    expect(sizes[1]).toBeCloseTo(0.436);
+  });
+
+  it("keeps stepping when presses land before the backend echoes the last one", () => {
+    const seam = mountSplit();
+    fireEvent.keyDown(seam, { key: "ArrowRight", shiftKey: true });
+    fireEvent.keyDown(seam, { key: "ArrowRight", shiftKey: true });
+    const calls = vi.mocked(resizeSplit).mock.calls;
+    expect(calls[1][1][0]).toBeCloseTo(0.628);
+  });
+
+  it("pushes the seam to either end with Home and End", () => {
+    const seam = mountSplit();
+    fireEvent.keyDown(seam, { key: "Home" });
+    fireEvent.keyDown(seam, { key: "End" });
+    const calls = vi.mocked(resizeSplit).mock.calls;
+    expect(calls[0][1][0]).toBeCloseTo(0.05);
+    expect(calls[1][1][0]).toBeCloseTo(0.95);
+  });
+
+  it("evens out the split on double-click", () => {
+    const seam = mountSplit();
+    fireEvent.doubleClick(seam);
+    expect(resizeSplit).toHaveBeenCalledWith("split-1", [0.5, 0.5]);
   });
 });
