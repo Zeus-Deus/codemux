@@ -88,6 +88,7 @@ import {
 } from "@/tauri/commands";
 import { ensureEditorsDetected } from "@/stores/editor-discovery-store";
 import { toast } from "@/lib/toast";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import {
   findRunningAgent,
   stopRunningAgent,
@@ -277,10 +278,13 @@ const WORKSPACE_COMMANDS: PaletteCommand[] = ([
     run: ({ workspace }) => {
       const branch = workspace?.git_branch;
       if (!branch) return;
-      navigator.clipboard
-        .writeText(branch)
-        .then(() => toast.success("Copied branch name", { description: branch }))
-        .catch(console.error);
+      // copyToClipboard falls back to execCommand where navigator.clipboard is
+      // missing (the remote web client on a plain-HTTP origin).
+      void copyToClipboard(branch).then((ok) =>
+        ok
+          ? toast.success("Copied branch name", { description: branch })
+          : toast.error(COPY_FAILED_MESSAGE),
+      );
     },
   },
   {
