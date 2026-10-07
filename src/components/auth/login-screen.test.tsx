@@ -20,6 +20,7 @@ import {
   LoginScreen,
   MIN_PASSWORD_LENGTH,
   RESEND_COOLDOWN_SECONDS,
+  RESEND_RATE_LIMIT_COOLDOWN_SECONDS,
 } from "./login-screen";
 import { useAuthStore } from "@/stores/auth-store";
 import { resendVerificationEmail } from "@/tauri/commands";
@@ -112,13 +113,26 @@ describe("LoginScreen", () => {
     );
     expect(await screen.findByText(/check your inbox and spam/i)).toBeVisible();
     expect(
-      screen.getByRole("button", {
-        name: `Resend email in ${RESEND_COOLDOWN_SECONDS}s`,
-      }),
+      screen.getByRole("button", { name: /resend email in \d+s/i }),
     ).toBeDisabled();
   });
 
   it("shows the resend error instead of claiming success", async () => {
+    vi.mocked(resendVerificationEmail).mockRejectedValue(
+      "Couldn't resend the verification email",
+    );
+    useAuthStore.setState({ error: "Email not verified" });
+    render(<LoginScreen />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resend email" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't resend the verification email",
+    );
+    expect(screen.getByRole("button", { name: "Resend email" })).toBeEnabled();
+  });
+
+  it("holds Resend for the rate-limit window after a 429", async () => {
     vi.mocked(resendVerificationEmail).mockRejectedValue(
       "Too many requests. Wait a minute, then try again.",
     );
@@ -130,7 +144,14 @@ describe("LoginScreen", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Too many requests",
     );
-    expect(screen.getByRole("button", { name: "Resend email" })).toBeEnabled();
+    const button = screen.getByRole("button", {
+      name: /resend email in \d+s/i,
+    });
+    expect(button).toBeDisabled();
+    // Longer than the success cooldown, matching "wait a minute" in the copy.
+    const seconds = Number(button.textContent?.match(/(\d+)s/)?.[1]);
+    expect(seconds).toBeGreaterThan(RESEND_COOLDOWN_SECONDS);
+    expect(seconds).toBeLessThanOrEqual(RESEND_RATE_LIMIT_COOLDOWN_SECONDS);
   });
 
   it("holds Resend for a cooldown right after sign-up sent the first email", async () => {

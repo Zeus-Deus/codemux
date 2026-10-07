@@ -11,6 +11,10 @@ import wordmark from "@/assets/codemux-wordmark.svg";
 type View = "signin" | "signup" | "forgot-password" | "verify-email";
 
 export const RESEND_COOLDOWN_SECONDS = 30;
+// The rate-limit error tells the user to wait a minute, so hold Resend that long.
+export const RESEND_RATE_LIMIT_COOLDOWN_SECONDS = 60;
+// Prefix of `resend_verification_error` for HTTP 429 in commands/auth.rs.
+const RATE_LIMIT_ERROR_PREFIX = "Too many requests";
 export const MIN_PASSWORD_LENGTH = 8;
 
 const linkButtonClass =
@@ -395,8 +399,12 @@ function useResendVerification(email: string) {
       setStatus("sent");
       setCooldown(RESEND_COOLDOWN_SECONDS);
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       setStatus("error");
-      setError(err instanceof Error ? err.message : String(err));
+      setError(message);
+      if (message.startsWith(RATE_LIMIT_ERROR_PREFIX)) {
+        setCooldown(RESEND_RATE_LIMIT_COOLDOWN_SECONDS);
+      }
     }
   };
 
