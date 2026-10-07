@@ -25,7 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { groupEditors } from "@/lib/editor-groups";
-import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import { resolveRightPanelWidth } from "@/lib/right-panel-width";
 import {
   RIGHT_PANEL_RESIZER_REACH,
   panelClusterRight,
@@ -534,11 +534,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // The *rendered* width, not the stored one: the panel's stored width can
   // exceed what fits in the current window (see `right-panel-width.ts`), and
   // the band has to stop at the panel's real edge.
-  const rightPanelWidth = useUIStore((s) => {
-    const stored = s.rightPanelWidth ?? 320;
-    const row = s.rightPanelRowWidth ?? 0;
-    return row > 0 ? clampRightPanelWidth(stored, row) : stored;
-  });
+  const rightPanelWidth = useUIStore((s) =>
+    resolveRightPanelWidth(s.rightPanelWidth, s.rightPanelRowWidth ?? 0),
+  );
   const activeWorkspacePanelOpen = useUIStore((s) =>
     activeWorkspaceId
       ? (s.rightPanelTabs[activeWorkspaceId] ?? null) !== null

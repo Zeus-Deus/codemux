@@ -33,12 +33,15 @@
  * Tabs reorder by drag, same gesture as the titlebar tabs.
  *
  * **Narrow panels.** In the titlebar band the row shares its width with the
- * fixed top-right cluster and the native window buttons, which together take
- * ~174px. At the panel's default width that left too little room for even
- * one labelled tab. So when the tabs can't fit beside the band's fixed
- * content, the row stacks: the band keeps the drag surface and the active
- * pane's actions, and the tabs get their own full-width row directly below it.
-  */
+ * fixed top-right cluster and the native window buttons (~174px). The row
+ * never wraps: the tabs keep their single line and simply scroll. It used to
+ * stack the tabs into a second row whenever they didn't all fit, which made
+ * the whole header jump by a row mid-drag and left a near-empty band above.
+ *
+ * **Close affordance.** A tab's leading icon doubles as its close button and
+ * turns into an `×` on hover, so closing never covers the label's tail.
+ * Right-click offers the bulk closes the main tab bar has.
+ */
 import {
   memo,
   useCallback,
@@ -58,6 +61,13 @@ import {
 } from "lucide-react";
 
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -102,7 +112,6 @@ function DeckTabChip({
   tab,
   active,
   dragging,
-  onBackground,
   reorderProps,
   onSelect,
   onClose,
@@ -110,10 +119,6 @@ function DeckTabChip({
   tab: DeckTab;
   active: boolean;
   dragging: boolean;
-  /** The row is painted on the panel's `bg-background` rather than
-   *  `bg-card`, so the close affordance's mask can match it. See its
-   *  `bg-*` below. */
-  onBackground: boolean;
   reorderProps: PillReorderHandlers;
   onSelect: () => void;
   onClose: () => void;
@@ -164,7 +169,7 @@ function DeckTabChip({
       }}
       className={cn(
         // No border, no shadow, no ring — the fill is the whole signal.
-        "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",
+        "group/tab relative flex h-[26px] shrink-0 items-center rounded-md pl-[5px]",
         "transition-colors duration-100",
         active
           ? "bg-surface-3 font-semibold text-foreground"
@@ -174,6 +179,19 @@ function DeckTabChip({
     >
       <button
         type="button"
+        data-no-drag
+        aria-label={`Close ${tab.label}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+        className="group/close flex size-[18px] shrink-0 items-center justify-center rounded-sm hover:bg-surface-3"
+      >
+        <Icon className="size-[13px] group-hover/tab:hidden group-focus-visible/close:hidden" />
+        <X className="hidden size-[12px] group-hover/tab:block group-focus-visible/close:block" />
+      </button>
+      <button
+        type="button"
         onClick={onSelect}
         aria-pressed={active}
         aria-label={
@@ -181,57 +199,17 @@ function DeckTabChip({
         }
         // The full name on hover, for labels the cap below truncates.
         title={tab.attribution ? `${tab.label} — ${tab.attribution}` : tab.label}
-        className={cn(
-          "flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[9px] text-body-sm",
-          // Room for the close affordance only where it is always shown.
-          // On inactive tabs it appears on hover, over the label's tail.
-          active ? "pr-[20px]" : "pr-[9px]",
-        )}
+        className="flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[5px] pr-[9px] text-body-sm"
       >
-        <Icon className="size-[13px] shrink-0" />
         <span className="max-w-[140px] truncate">{tab.label}</span>
         {badge}
       </button>
-      <button
-          type="button"
-          data-no-drag
-          aria-label={`Close ${tab.label}`}
-          onClick={(event) => {
-            event.stopPropagation();
-            onClose();
-          }}
-          className={cn(
-            // Overlays the tab's right edge rather than taking a layout
-            // slot, so revealing it on hover doesn't shove the row around.
-            "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-sm transition-opacity duration-150",
-            "hover:bg-surface-3 focus-visible:opacity-100",
-            active
-              ? "opacity-50 hover:opacity-100"
-              : // Opaque on purpose: it masks the label it sits on top of,
-                // so it has to match whatever the row is painted on.
-                cn(
-                  "opacity-0 group-hover/tab:opacity-70",
-                  onBackground ? "bg-background" : "bg-card",
-                ),
-          )}
-        >
-          <X className="size-[10px]" />
-        </button>
     </div>
   );
 }
 
 /** Width of the edge fade that marks clipped tabs. */
 const EDGE_FADE_PX = 16;
-/** The drag gap's `min-w-4`: the part of it that can never be lent back to
- *  the tabs. */
-const DRAG_GAP_MIN_PX = 16;
-/** The row's `px-[7px]`. */
-const ROW_PADDING_PX = 7;
-/** The row's `gap-[2px]`. */
-const ROW_GAP_PX = 2;
-/** The `+` button: `size-[24px]` plus its `ml-[3px]`. */
-const ADD_BUTTON_PX = 27;
 
 /** Tracks which edges of the tab scroller have tabs hidden behind them. */
 function useEdgeFade(
@@ -270,66 +248,6 @@ function useEdgeFade(
   return edges;
 }
 
-/**
- * Whether the titlebar row has to stack its tabs below the band.
- *
- * Every input is independent of the layout it chooses: the tabs never
- * shrink, so their natural width is the same in either layout, and so are
- * the header's width and the actions' width. The answer can't flip-flop
- * as a result of applying it.
- */
-function useStackedTabs(
-  enabled: boolean,
-  reserve: number,
-  headerRef: React.RefObject<HTMLDivElement | null>,
-  contentRef: React.RefObject<HTMLDivElement | null>,
-  actionsRef: React.RefObject<HTMLDivElement | null>,
-  layoutKey: string,
-): boolean {
-  const [stacked, setStacked] = useState(false);
-
-  const measure = useCallback(() => {
-    const header = headerRef.current;
-    const content = contentRef.current;
-    // A header with no width hasn't been laid out (a hidden panel), so
-    // there is nothing to decide yet.
-    if (!enabled || !header || !content || header.clientWidth === 0) {
-      setStacked(false);
-      return;
-    }
-    const actions = actionsRef.current?.offsetWidth ?? 0;
-    const fixed =
-      ROW_PADDING_PX +
-      reserve +
-      ADD_BUTTON_PX +
-      DRAG_GAP_MIN_PX +
-      actions +
-      ROW_GAP_PX * (actions > 0 ? 3 : 2);
-    const room = header.clientWidth - fixed;
-    setStacked(content.scrollWidth > room);
-  }, [actionsRef, contentRef, enabled, headerRef, reserve]);
-
-  useLayoutEffect(() => {
-    measure();
-  }, [measure, layoutKey]);
-
-  useEffect(() => {
-    if (!enabled || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    for (const node of [
-      headerRef.current,
-      contentRef.current,
-      actionsRef.current,
-    ]) {
-      if (node) observer.observe(node);
-    }
-    return () => observer.disconnect();
-    // The actions node remounts when the layout flips; re-observe it.
-  }, [actionsRef, contentRef, enabled, headerRef, measure, stacked, layoutKey]);
-
-  return stacked;
-}
-
 function edgeMask(edges: { start: boolean; end: boolean }): string | undefined {
   if (!edges.start && !edges.end) return undefined;
   const from = edges.start ? `transparent, black ${EDGE_FADE_PX}px` : "black";
@@ -344,6 +262,9 @@ export interface PaneTabStripProps {
   activeTab: RightPanelTab | null;
   onSelect: (id: RightPanelTab) => void;
   onClose: (id: RightPanelTab) => void;
+  /** Close several tabs at once (the tab context menu). `focus` is the tab
+   *  to land on if the active one is among them; `null` for the picker. */
+  onCloseMany: (ids: RightPanelTab[], focus: RightPanelTab | null) => void;
   /** Drag-to-reorder landed: the strip's full new order. */
   onReorder: (ids: RightPanelTab[]) => void;
   /**
@@ -381,6 +302,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   activeTab,
   onSelect,
   onClose,
+  onCloseMany,
   onReorder,
   actions,
   surfaces,
@@ -413,28 +335,9 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     },
     [attachWheelScroll, containerRef],
   );
-  const headerRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const actionsRef = useRef<HTMLDivElement>(null);
-  const layoutKey = `${tabIds.join("|")}#${activeTab ?? ""}`;
-  const stacked = useStackedTabs(
-    inTitlebar,
-    reserve,
-    headerRef,
-    contentRef,
-    actionsRef,
-    layoutKey,
-  );
   const edges = useEdgeFade(containerRef, contentRef);
   const mask = edgeMask(edges);
-
-  // Switching layouts remounts nothing in the scroller, but its width
-  // changes, so the active tab may have been pushed out of view.
-  useEffect(() => {
-    containerRef.current
-      ?.querySelector<HTMLElement>('[data-tab-id][data-state="active"]')
-      ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-  }, [stacked, containerRef]);
 
   const tabRun = (
     <>
@@ -453,17 +356,49 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           data-testid="right-panel-tabs-content"
           className="flex w-max shrink-0 items-center gap-[2px]"
         >
-          {tabs.map((tab) => (
-            <DeckTabChip
-              key={tab.id}
-              tab={tab}
-              active={tab.id === activeTab}
-              dragging={dragTabId === tab.id}
-              onBackground={inTitlebar}
-              reorderProps={getPillProps(tab.id)}
-              onSelect={() => onSelect(tab.id)}
-              onClose={() => onClose(tab.id)}
-            />
+          {tabs.map((tab, index) => (
+            <ContextMenu key={tab.id}>
+              {/* A wrapper, so the chip's own pointer handlers (reorder)
+                  don't have to be merged with the menu trigger's. */}
+              <ContextMenuTrigger asChild>
+                <div className="flex shrink-0">
+                  <DeckTabChip
+                    tab={tab}
+                    active={tab.id === activeTab}
+                    dragging={dragTabId === tab.id}
+                    reorderProps={getPillProps(tab.id)}
+                    onSelect={() => onSelect(tab.id)}
+                    onClose={() => onClose(tab.id)}
+                  />
+                </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent>
+                <ContextMenuItem onClick={() => onClose(tab.id)}>
+                  Close tab
+                </ContextMenuItem>
+                <ContextMenuItem
+                  disabled={tabs.length <= 1}
+                  onClick={() =>
+                    onCloseMany(
+                      tabIds.filter((id) => id !== tab.id),
+                      tab.id,
+                    )
+                  }
+                >
+                  Close other tabs
+                </ContextMenuItem>
+                <ContextMenuItem
+                  disabled={index >= tabs.length - 1}
+                  onClick={() => onCloseMany(tabIds.slice(index + 1), tab.id)}
+                >
+                  Close tabs to the right
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem onClick={() => onCloseMany(tabIds, null)}>
+                  Close all tabs
+                </ContextMenuItem>
+              </ContextMenuContent>
+            </ContextMenu>
           ))}
         </div>
         {dragTabId && dropIndicatorLeft !== null && (
@@ -549,10 +484,10 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   // drag layer stops at the panel's left edge so it can't swallow these
   // controls. Desktop only: `data-tauri-drag-region` does nothing in a
   // browser, and the bare spacer has no children to shadow.
-  const dragGap = (inBand: boolean) => (
+  const dragGap = (
     <div
       data-testid="right-panel-drag-gap"
-      data-tauri-drag-region={inBand && !remoteClient ? true : undefined}
+      data-tauri-drag-region={inTitlebar && !remoteClient ? true : undefined}
       className="min-w-4 flex-1 self-stretch"
     />
   );
@@ -562,7 +497,6 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   // right padding clears.
   const paneActions = actions != null && (
     <div
-      ref={actionsRef}
       data-testid="right-panel-pane-actions"
       className="flex shrink-0 items-center gap-[2px]"
     >
@@ -570,36 +504,8 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     </div>
   );
 
-  const bandStyle = inTitlebar ? { paddingRight: `${reserve}px` } : undefined;
-
-  if (stacked) {
-    return (
-      <div
-        ref={headerRef}
-        data-testid="right-panel-tabs-header"
-        data-in-titlebar="true"
-        data-stacked="true"
-        className={cn("flex shrink-0 flex-col", className)}
-      >
-        <PanelHeader
-          variant="floating"
-          className="gap-[2px] px-[7px]"
-          style={bandStyle}
-        >
-          {dragGap(true)}
-          {paneActions}
-        </PanelHeader>
-        <PanelHeader variant="inline" className="gap-[2px] px-[7px]">
-          {tabRun}
-          {dragGap(false)}
-        </PanelHeader>
-      </div>
-    );
-  }
-
   return (
     <PanelHeader
-      ref={headerRef}
       variant={inTitlebar ? "floating" : "inline"}
       data-testid="right-panel-tabs-header"
       data-in-titlebar={inTitlebar ? "true" : undefined}
@@ -620,10 +526,10 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         inTitlebar ? "bg-transparent" : "bg-card",
         className,
       )}
-      style={bandStyle}
+      style={inTitlebar ? { paddingRight: `${reserve}px` } : undefined}
     >
       {tabRun}
-      {dragGap(inTitlebar)}
+      {dragGap}
       {paneActions}
       {!inTitlebar && (
         <>

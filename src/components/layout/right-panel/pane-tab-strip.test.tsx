@@ -31,21 +31,24 @@ function renderStrip(
   const onClose = vi.fn();
   const onReorder = vi.fn();
   const utils = render(
-    <PaneTabStrip
-      tabs={TABS}
-      activeTab="files"
-      onSelect={onSelect}
-      onClose={onClose}
-      onReorder={onReorder}
-      surfaces={[]}
-      onOpenFile={() => {}}
-      openFileKeys=""
-      inTitlebar
-      onToggleExpand={() => {}}
-      expanded={false}
-      onCollapsePanel={() => {}}
-      {...overrides}
-    />,
+    <TooltipProvider>
+      <PaneTabStrip
+        tabs={TABS}
+        activeTab="files"
+        onSelect={onSelect}
+        onClose={onClose}
+        onCloseMany={() => {}}
+        onReorder={onReorder}
+        surfaces={[]}
+        onOpenFile={() => {}}
+        openFileKeys=""
+        inTitlebar
+        onToggleExpand={() => {}}
+        expanded={false}
+        onCollapsePanel={() => {}}
+        {...overrides}
+      />
+    </TooltipProvider>,
   );
   const chip = (id: string) =>
     utils.container.querySelector(
@@ -292,61 +295,38 @@ describe("PaneTabStrip — overflow", () => {
     }
   });
 
-  it("stacks the tabs below the band when they can't fit beside it", () => {
-    // A 360px panel: 174px of the band belongs to the fixed cluster and the
-    // window buttons, which leaves far less than 300px of tabs need.
-    const restore = stubLayout({ header: 360, tabs: 300, scroller: 300 });
+  // The row used to drop its tabs into a second row whenever they didn't all
+  // fit beside the titlebar cluster, so the header jumped mid-drag. Narrow
+  // or not, it stays one row and the tabs scroll.
+  it.each([
+    ["narrow", true, 360],
+    ["wide", true, 900],
+    ["legacy chrome", false, 200],
+  ])("keeps one row in a %s panel", (_name, inTitlebar, header) => {
+    const restore = stubLayout({ header, tabs: 300, scroller: 100 });
     try {
-      renderStrip({ actions: <button type="button">act</button> });
-      const header = screen.getByTestId("right-panel-tabs-header");
-      expect(header).toHaveAttribute("data-stacked", "true");
-      // The tabs, the pane actions and the `+` are all still there.
-      expect(screen.getByText("Files")).toBeInTheDocument();
-      expect(screen.getByText("act")).toBeInTheDocument();
-      expect(screen.getByTestId("right-panel-add-pane")).toBeInTheDocument();
+      renderStrip({ inTitlebar, actions: <button type="button">act</button> });
+      const row = screen.getByTestId("right-panel-tabs-header");
+      expect(row).not.toHaveAttribute("data-stacked");
+      // The tabs, the pane actions and the `+` all share that row.
+      for (const node of [
+        screen.getByTestId("right-panel-tabs-scroll"),
+        screen.getByText("act"),
+        screen.getByTestId("right-panel-add-pane"),
+      ]) {
+        expect(row).toContainElement(node);
+      }
     } finally {
       restore();
     }
   });
 
-  it("keeps one row in a wide panel", () => {
-    const restore = stubLayout({ header: 900, tabs: 300, scroller: 300 });
-    try {
-      renderStrip({ actions: <button type="button">act</button> });
-      expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveAttribute(
-        "data-stacked",
-      );
-    } finally {
-      restore();
-    }
-  });
-
-  it("never stacks outside the titlebar band", () => {
-    const restore = stubLayout({ header: 200, tabs: 300, scroller: 100 });
-    try {
-      render(
-        <TooltipProvider>
-          <PaneTabStrip
-            tabs={TABS}
-            activeTab="files"
-            onSelect={() => {}}
-            onClose={() => {}}
-            onReorder={() => {}}
-            surfaces={[]}
-            onOpenFile={() => {}}
-            openFileKeys=""
-            inTitlebar={false}
-            onToggleExpand={() => {}}
-            expanded={false}
-            onCollapsePanel={() => {}}
-          />
-        </TooltipProvider>,
-      );
-      expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveAttribute(
-        "data-stacked",
-      );
-    } finally {
-      restore();
-    }
+  it("puts the close affordance at the start of the tab, before the label", () => {
+    renderStrip();
+    const close = screen.getByLabelText("Close Changes");
+    const label = screen.getByText("Changes");
+    expect(
+      close.compareDocumentPosition(label) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });
