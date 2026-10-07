@@ -191,6 +191,7 @@ import { agentChatGetSessionContext, listSkills, listChatSlashCommands, type Ski
 import { useSkillsStore } from "@/stores/skills-store";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -732,6 +733,29 @@ describe("DraftChatSurface", () => {
       expect(container.querySelector("textarea")).toHaveValue("");
       expect(document.activeElement).toBe(outside);
       outside.remove();
+    });
+
+    it("focuses the composer when New agent asks for the draft already on screen", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      const textarea = container.querySelector("textarea")!;
+      expect(document.activeElement).not.toBe(textarea);
+
+      act(() => useDraftComposerFocusStore.getState().requestFocus(draft.draftId));
+      expect(document.activeElement).toBe(textarea);
+      // Consumed: a later visit must not steal focus again.
+      expect(useDraftComposerFocusStore.getState().request).toBeNull();
+    });
+
+    it("leaves a focus request for another draft alone", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      act(() => useDraftComposerFocusStore.getState().requestFocus("other-draft"));
+      expect(document.activeElement).not.toBe(container.querySelector("textarea"));
+      expect(useDraftComposerFocusStore.getState().request?.draftId).toBe("other-draft");
+      act(() => useDraftComposerFocusStore.getState().clear());
     });
 
     it("keeps a failed background prompt recoverable without interrupting the next draft", async () => {

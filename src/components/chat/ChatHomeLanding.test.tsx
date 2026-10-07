@@ -1,6 +1,23 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+
+const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock } = vi.hoisted(() => ({
+  openProjectMock: vi.fn(),
+  openCloneDialogMock: vi.fn(),
+  openProjectAtPathMock: vi.fn(),
+  recentProjectsMock: vi.fn(),
+}));
+vi.mock("@/hooks/use-project-actions", () => ({
+  useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: openCloneDialogMock }),
+  openProjectAtPath: openProjectAtPathMock,
+}));
+vi.mock("@/tauri/commands", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/tauri/commands")>()),
+  dbGetRecentProjects: recentProjectsMock,
+  dbGetUiState: vi.fn().mockResolvedValue(null),
+}));
+
 import { ChatHomeLanding } from "./ChatHomeLanding";
 
 import { useAppStore } from "@/stores/app-store";
@@ -13,6 +30,10 @@ beforeEach(() => {
   useFeatureFlags.setState({ enableAgentChat: true });
   useUIStore.setState({ showLocalSessionImport: false, localSessionImportOfferDismissed: false });
   delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+  openProjectMock.mockReset().mockResolvedValue({ success: false });
+  openCloneDialogMock.mockReset();
+  openProjectAtPathMock.mockReset().mockResolvedValue({ success: true, path: "/work/parser", name: "parser" });
+  recentProjectsMock.mockReset().mockResolvedValue([]);
 });
 describe("ChatHomeLanding", () => {
   it("offers opt-in import only for first-run local enabled profiles", () => {
@@ -72,6 +93,54 @@ describe("ChatHomeLanding", () => {
     );
     const root = container.firstElementChild as HTMLElement;
     expect(root.className).toContain("items-center");
-    expect(root.className).toContain("justify-center");
+    // Vertical centring via auto margins, so a short pane scrolls instead
+    // of clipping the headline.
+    expect(root.className).toContain("overflow-y-auto");
+    expect((root.firstElementChild as HTMLElement).className).toContain("my-auto");
+  });
+
+  describe("with no project open", () => {
+    it("offers Open project and Clone repository under the composer", async () => {
+      openProjectMock.mockResolvedValue({ success: true, path: "/work/api", name: "api" });
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/api"));
+      fireEvent.click(screen.getByRole("button", { name: "Clone repository" }));
+      expect(openCloneDialogMock).toHaveBeenCalledOnce();
+    });
+
+    it("reopens a recent project without the folder picker", async () => {
+      recentProjectsMock.mockResolvedValue([
+        { path: "/work/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" },
+      ]);
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      const row = await screen.findByRole("button", { name: /parser/ });
+      fireEvent.click(row);
+      await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/parser"));
+      expect(openProjectAtPathMock).toHaveBeenCalledWith("/work/parser");
+      expect(openProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("hides the project actions once a workspace exists", () => {
+      useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
+      render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.queryByRole("button", { name: /Open project/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Clone repository" })).toBeNull();
+      expect(recentProjectsMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it("renders the notice slot above the composer", () => {
+    const { container } = render(
+      <ChatHomeLanding
+        composer={<div data-testid="composer-slot" />}
+        notice={<div data-testid="notice-slot" />}
+      />,
+    );
+    const notice = container.querySelector('[data-testid="notice-slot"]')!;
+    const composer = container.querySelector('[data-testid="composer-slot"]')!;
+    expect(notice.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
