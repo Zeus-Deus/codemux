@@ -308,14 +308,14 @@ export function formatActivityDuration(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
-interface EditCounts {
+export interface EditCounts {
   added: number;
   removed: number;
 }
 
 /** Added / removed line counts for an Edit-family tool, reusing the same
  *  LCS diff the inline DiffView renders. `null` when no diff-able input. */
-function editCounts(item: ToolCallItem): EditCounts | null {
+export function editCounts(item: ToolCallItem): EditCounts | null {
   const input = isRecord(item.input) ? item.input : null;
   if (!input) return null;
   let oldText: string;
