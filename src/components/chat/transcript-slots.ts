@@ -10,6 +10,11 @@ import type {
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
+import {
+  summarizeTurnChanges,
+  turnChangesEqual,
+  type TurnChangeSummary,
+} from "./turn-changes";
 
 /** A mechanical step rendered through the compact work log. */
 export type ActivityStep = ReasoningItem | ToolCallItem;
@@ -24,6 +29,8 @@ export interface TurnFoldBody {
   expanded: boolean;
   hiddenCount: number;
   failedCount: number;
+  /** Files the turn's edit calls wrote; absent when it wrote none. */
+  changes?: TurnChangeSummary;
 }
 
 export type SlotBody =
@@ -294,6 +301,8 @@ function buildPresentationEntries(
       hiddenCount: hidden.length,
       failedCount: hidden.filter(itemFailed).length,
     };
+    const changes = summarizeTurnChanges(segment.items);
+    if (changes) body.changes = changes;
     let foldInserted = false;
 
     for (const item of segment.items) {
@@ -452,7 +461,8 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.label === b.label &&
       a.expanded === b.expanded &&
       a.hiddenCount === b.hiddenCount &&
-      a.failedCount === b.failedCount
+      a.failedCount === b.failedCount &&
+      turnChangesEqual(a.changes, b.changes)
     );
   }
   if (a.kind === "activity" && b.kind === "activity") {

@@ -261,6 +261,29 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     }
   });
 
+  it("carries the turn's changed files on the fold, and none for a read-only turn", () => {
+    const readOnly = buildTranscriptSlots(settledTurn())[1].body;
+    expect(readOnly.kind === "turn_fold" && readOnly.changes).toBeUndefined();
+
+    const edited = buildTranscriptSlots([
+      userMsg(0, "fix it", 1_000),
+      tool(1, {
+        tool_name: "Edit",
+        input: { file_path: "/repo/a.ts", old_string: "a", new_string: "b" },
+      }),
+      assistantMsg(2, "Fixed."),
+      turnEnd(3, 2_000),
+    ])[1].body;
+    expect(edited.kind).toBe("turn_fold");
+    if (edited.kind === "turn_fold") {
+      expect(edited.changes).toEqual({
+        files: [{ path: "/repo/a.ts", added: 1, removed: 1 }],
+        added: 1,
+        removed: 1,
+      });
+    }
+  });
+
   it("restores the original work chronologically when the fold is expanded", () => {
     const slots = buildTranscriptSlots(settledTurn(), false, new Set(["t1"]));
 

@@ -308,14 +308,14 @@ export function formatActivityDuration(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
-interface EditCounts {
+export interface EditCounts {
   added: number;
   removed: number;
 }
 
 /** Added / removed line counts for an Edit-family tool, reusing the same
  *  LCS diff the inline DiffView renders. `null` when no diff-able input. */
-function editCounts(item: ToolCallItem): EditCounts | null {
+export function editCounts(item: ToolCallItem): EditCounts | null {
   const input = isRecord(item.input) ? item.input : null;
   if (!input) return null;
   let oldText: string;
@@ -342,6 +342,15 @@ function editCounts(item: ToolCallItem): EditCounts | null {
       if (olds.length === 0 && news.length === 0) return null;
       oldText = olds.join("\n");
       newText = news.join("\n");
+      break;
+    }
+    case "NotebookEdit": {
+      // Only the new cell source is in the input, so this counts what was
+      // written, like Write; a cell delete carries none and stays unknown.
+      const source = strOrNull(input.new_source);
+      if (source == null) return null;
+      oldText = "";
+      newText = source;
       break;
     }
     default: {

@@ -4646,6 +4646,14 @@ const handlers: Record<string, Handler> = {
     });
     return [];
   },
+  // The mock has no workspace files; restoring them leaves the rewound
+  // transcript as it is, like the real command.
+  agent_chat_undo_turn_revert: (a) => {
+    if (a.threadId !== MOCK_CHAT_THREAD_ID || mockChatRevertCutoff === null) {
+      throw new Error("There is no revert to undo for this chat.");
+    }
+    return undefined;
+  },
   grep_count_pattern: () => 0,
 
   // Clipboard-image paste fallback (agent-chat composer). The real

@@ -1917,6 +1917,111 @@ async fn turn_revert_restores_workspace_provider_and_transcript_together() {
     );
 }
 
+/// The undo's whole safety rule: once a newer turn has checkpointed, restoring
+/// the pre-revert files would clobber that turn's work, so the undo refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_turn_revert_refuses_after_a_newer_turn() {
+    use codemux_lib::agent_provider::AgentProvider;
+    use codemux_lib::commands::agent_chat::{
+        agent_chat_revert_turn_checkpoint, agent_chat_undo_turn_revert,
+    };
+    use codemux_lib::database::AgentChatTurnCheckpointRecord;
+
+    const THREAD: &str = "thread-undo-refused";
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("code.txt"), "v1").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(THREAD, "ws-1", Some(&repo.to_string_lossy()), "codex")
+        .unwrap();
+    let capture = |db: &DatabaseStore, index: i64, nonce: &str| {
+        let ref_name = codemux_lib::git::turn_checkpoint_ref_name(THREAD, index);
+        let snapshot = codemux_lib::git::git_checkpoint_create(
+            &repo,
+            &ref_name,
+            &format!("before turn {index}"),
+        )
+        .unwrap()
+        .unwrap();
+        db.upsert_agent_chat_turn_checkpoint(&AgentChatTurnCheckpointRecord {
+            thread_id: THREAD.into(),
+            workspace_id: "ws-1".into(),
+            repo_path: repo.to_string_lossy().to_string(),
+            turn_index: index,
+            client_nonce: Some(nonce.into()),
+            transcript_cutoff_id: db.agent_chat_transcript_cutoff(THREAD).unwrap(),
+            ref_name: snapshot.ref_name,
+            snapshot_commit: snapshot.snapshot_commit,
+            head_commit: snapshot.head_commit,
+            branch: snapshot.branch,
+            created_at: String::new(),
+        })
+        .unwrap()
+    };
+
+    capture(&db, 1, "nonce-1");
+    db.append_agent_chat_message(THREAD, r#"{"type":"user_message","text":"first"}"#)
+        .unwrap();
+    db.append_agent_chat_message(THREAD, r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v2").unwrap();
+    capture(&db, 2, "nonce-2");
+    db.append_agent_chat_message(THREAD, r#"{"type":"user_message","text":"second"}"#)
+        .unwrap();
+    db.append_agent_chat_message(THREAD, r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v3").unwrap();
+
+    let mock = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+    mock.start_session(start_input(THREAD)).await.unwrap();
+    let registry = ProviderRegistry::new();
+    registry.set_codex(mock.clone()).await;
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    app.manage(test_observability(true));
+    app.manage(AppStateStore::default());
+    app.manage(registry);
+    let handle = app.handle().clone();
+
+    agent_chat_revert_turn_checkpoint(handle.clone(), THREAD.into(), 2)
+        .await
+        .expect("revert succeeds");
+    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "v2");
+
+    // A newer turn starts from the reverted state and writes its own work.
+    let db = handle.state::<DatabaseStore>();
+    capture(&db, 2, "nonce-newer");
+    std::fs::write(repo.join("code.txt"), "newer turn's work").unwrap();
+
+    let error = agent_chat_undo_turn_revert(handle.clone(), THREAD.into())
+        .await
+        .expect_err("undo after a newer turn is refused");
+    assert!(error.contains("newer turn"), "unexpected error: {error}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+        "newer turn's work"
+    );
+    // The refusal is final: the stale undo entry is dropped.
+    let error = agent_chat_undo_turn_revert(handle.clone(), THREAD.into())
+        .await
+        .expect_err("no undo remains");
+    assert!(error.contains("no revert to undo"), "unexpected error: {error}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_provider_rollback_compensates_workspace_and_keeps_local_history() {
     use codemux_lib::agent_provider::AgentProvider;

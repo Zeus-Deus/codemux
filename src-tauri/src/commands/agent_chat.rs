@@ -1321,6 +1321,24 @@ fn turn_checkpoint_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// for a freshly-minted replacement.
 fn forget_turn_checkpoint_lock(thread_id: &str) {
     turn_checkpoint_locks().lock().unwrap().remove(thread_id);
+    revert_undos().lock().unwrap().remove(thread_id);
+}
+
+/// The safety snapshot a successful turn revert took of the workspace, kept so
+/// the user can bring those files back right after reverting. The provider
+/// conversation rewind is durable, so only the files can be restored.
+#[derive(Clone)]
+struct TurnRevertUndo {
+    repo_path: String,
+    safety: crate::git::GitCheckpoint,
+    /// Checkpoints left after the revert. Any later turn changes this list,
+    /// and restoring files under a newer turn would clobber its work.
+    remaining_turns: Vec<i64>,
+}
+
+fn revert_undos() -> &'static Mutex<HashMap<String, TurnRevertUndo>> {
+    static UNDOS: OnceLock<Mutex<HashMap<String, TurnRevertUndo>>> = OnceLock::new();
+    UNDOS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn prepare_turn_checkpoint_blocking(
@@ -1643,6 +1661,19 @@ fn restore_turn_checkpoint_workspace_blocking(
     Ok(safety)
 }
 
+/// Put the workspace back to the safety snapshot a turn revert took. The
+/// current (reverted) state is snapshotted first, so this is itself undoable
+/// through the same pre-restore ref.
+fn restore_reverted_files_blocking(thread_id: &str, undo: &TurnRevertUndo) -> Result<(), String> {
+    crate::git::git_checkpoint_restore(
+        std::path::Path::new(&undo.repo_path),
+        &undo.safety.snapshot_commit,
+        &undo.safety.head_commit,
+        undo.safety.branch.as_deref(),
+        &crate::git::pre_restore_ref_name(thread_id),
+    )
+}
+
 fn compensate_failed_provider_rollback(
     target: &AgentChatTurnCheckpointRecord,
     safety: &crate::git::GitCheckpoint,
@@ -1821,6 +1852,17 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         db.list_agent_chat_turn_checkpoints(&thread_id)
     };
+    revert_undos().lock().unwrap().insert(
+        thread_id.clone(),
+        TurnRevertUndo {
+            repo_path: target.repo_path.clone(),
+            safety,
+            remaining_turns: remaining_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.turn_index)
+                .collect(),
+        },
+    );
     let payload = AgentChatTurnCheckpointRevertedEventPayload {
         thread_id: ThreadId(thread_id),
         turn_index,
@@ -1832,6 +1874,53 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         eprintln!("[codemux::agent_chat] failed to emit turn revert: {error}");
     }
     Ok(remaining_checkpoints)
+}
+
+/// Restore the workspace files a turn revert replaced. Only offered right
+/// after the revert: once another turn has started, its work would be lost.
+#[tauri::command]
+pub async fn agent_chat_undo_turn_revert<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let _timeline_guard = turn_checkpoint_lock_for(&thread_id).lock_owned().await;
+    let undo = revert_undos()
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .cloned()
+        .ok_or_else(|| "There is no revert to undo for this chat.".to_string())?;
+    let (session, current_turns) = {
+        let db: State<'_, DatabaseStore> = app.state();
+        let session = db
+            .get_agent_chat_session(&thread_id)
+            .ok_or_else(|| "Chat session not found.".to_string())?;
+        let turns: Vec<i64> = db
+            .list_agent_chat_turn_checkpoints(&thread_id)
+            .iter()
+            .map(|checkpoint| checkpoint.turn_index)
+            .collect();
+        (session, turns)
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let provider = lookup_provider(&registry, stored_provider_kind(&session.provider)?).await?;
+    if current_turns != undo.remaining_turns
+        || provider.turn_active(&ThreadId(thread_id.clone())).await
+    {
+        revert_undos().lock().unwrap().remove(&thread_id);
+        return Err(
+            "A newer turn has started since the revert, so those files can no longer be restored safely."
+                .to_string(),
+        );
+    }
+    let restore_thread = thread_id.clone();
+    tokio::task::spawn_blocking(move || restore_reverted_files_blocking(&restore_thread, &undo))
+        .await
+        .map_err(|error| format!("file restore task failed: {error}"))??;
+    revert_undos().lock().unwrap().remove(&thread_id);
+    Ok(())
 }
 
 // ── Backend auto-resume ──────────────────────────────────────────────
@@ -7511,6 +7600,64 @@ mod tests {
                 .unwrap();
             assert!(!status.success(), "{ref_name} should be deleted");
         }
+    }
+
+    #[test]
+    fn undo_turn_revert_brings_back_the_reverted_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("code.txt"), "before turn").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        let thread_id = "undo-thread";
+        let ref_name = crate::git::turn_checkpoint_ref_name(thread_id, 1);
+        let baseline = crate::git::git_checkpoint_create(repo, &ref_name, "turn 1")
+            .unwrap()
+            .unwrap();
+        // The turn's work: an edit and a new file.
+        std::fs::write(repo.join("code.txt"), "after turn").unwrap();
+        std::fs::write(repo.join("new.txt"), "created by turn").unwrap();
+
+        let target = AgentChatTurnCheckpointRecord {
+            thread_id: thread_id.to_string(),
+            workspace_id: "ws".to_string(),
+            repo_path: repo.to_string_lossy().to_string(),
+            turn_index: 1,
+            client_nonce: None,
+            transcript_cutoff_id: 0,
+            ref_name,
+            snapshot_commit: baseline.snapshot_commit,
+            head_commit: baseline.head_commit,
+            branch: baseline.branch,
+            created_at: String::new(),
+        };
+        let safety = restore_turn_checkpoint_workspace_blocking(&target).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "before turn");
+        assert!(!repo.join("new.txt").exists());
+
+        let undo = TurnRevertUndo {
+            repo_path: target.repo_path.clone(),
+            safety,
+            remaining_turns: Vec::new(),
+        };
+        restore_reverted_files_blocking(thread_id, &undo).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "after turn");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("new.txt")).unwrap(),
+            "created by turn"
+        );
     }
 
     #[test]

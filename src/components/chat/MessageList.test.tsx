@@ -604,6 +604,46 @@ describe("MessageList activity blocks", () => {
     fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
     expect(screen.getByText("I’ll inspect the implementation first.")).toBeInTheDocument();
     expect(screen.getByText("src/components/chat/MessageList.tsx")).toBeInTheDocument();
+    // A read-only turn has nothing to review.
+    expect(screen.queryByTestId("turn-changes-chip")).toBeNull();
+  });
+
+  it("closes a turn that edited files with a changed-files summary", () => {
+    renderList([
+      { kind: "user_message", id: "user-edit", seq: 0, text: "Fix it", created_at: 1_000 },
+      {
+        kind: "tool_call",
+        id: "edit-1",
+        seq: 1,
+        turn_id: "turn-edit",
+        tool_use_id: "edit-use-1",
+        tool_name: "Edit",
+        input: { file_path: "/repo/a.ts", old_string: "a", new_string: "b\nc" },
+        status: "done",
+        result_content: null,
+        approval_request_id: null,
+      },
+      {
+        kind: "assistant_message",
+        id: "final-edit",
+        seq: 2,
+        turn_id: "turn-edit",
+        text: "Fixed.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-edit",
+        seq: 3,
+        turn_id: "turn-edit",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ]);
+
+    expect(screen.getByTestId("turn-changes-chip")).toHaveTextContent(
+      "1 file changed+2 −1",
+    );
   });
 
   it("shows only the newest completed tool call until earlier work is requested", () => {

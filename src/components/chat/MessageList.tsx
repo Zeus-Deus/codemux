@@ -47,6 +47,7 @@ import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
+import { TurnChangesChip } from "./TurnChangesChip";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
@@ -61,6 +62,7 @@ import {
 import { CHAT_COLUMN } from "./chat-column";
 import { isReadingBack } from "./composer-overlay";
 import { useTranscriptTopInset } from "./transcript-top-inset";
+import type { TurnChangeSummary } from "./turn-changes";
 import {
   subscribeTranscriptFade,
   transcriptFadeEnabled,
@@ -1951,17 +1953,23 @@ function TurnFoldRow({
   label,
   expanded,
   failedCount,
+  changes,
+  workspaceId,
+  cwd,
   onToggleTurnFold,
 }: {
   turnId: string;
   label: string;
   expanded: boolean;
   failedCount: number;
+  changes?: TurnChangeSummary;
+  workspaceId?: string | null;
+  cwd?: string | null;
   onToggleTurnFold: (turnId: string) => void;
 }) {
   const Icon = expanded ? ChevronDown : ChevronRight;
   return (
-    <div className="border-b border-border/60 pb-2 pt-1">
+    <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
       <button
         type="button"
         aria-expanded={expanded}
@@ -1976,6 +1984,9 @@ function TurnFoldRow({
         ) : null}
         <Icon className="size-3.5" aria-hidden />
       </button>
+      {changes ? (
+        <TurnChangesChip changes={changes} workspaceId={workspaceId} cwd={cwd} />
+      ) : null}
     </div>
   );
 }
@@ -2064,6 +2075,9 @@ function SlotRow({
           label={slot.body.label}
           expanded={slot.body.expanded}
           failedCount={slot.body.failedCount}
+          changes={slot.body.changes}
+          workspaceId={workspaceId}
+          cwd={cwd}
           onToggleTurnFold={onToggleTurnFold}
         />
       ) : (
