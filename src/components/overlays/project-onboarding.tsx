@@ -20,6 +20,12 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   GitBranch,
   ChevronRight,
   ChevronLeft,
@@ -41,7 +47,7 @@ import {
   getDefaultBranch,
   generateBranchName,
   generateRandomBranchName,
-  createWorktreeWorkspace,
+  createWorktreeWorkspaceResult,
   importWorktreeWorkspace,
   activateWorkspace,
   closeWorkspace,
@@ -50,9 +56,16 @@ import {
   dbAddRecentProject,
   getPresets,
 } from "@/tauri/commands";
-import type { WorktreeInfo, DetectedSetup, BranchDetail } from "@/tauri/types";
+import type {
+  WorktreeInfo,
+  DetectedSetup,
+  BranchDetail,
+  TerminalPreset,
+} from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
+import { toast } from "@/lib/toast";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { PresetIcon } from "@/components/icons/preset-icon";
 
 type Step = "workspace" | "setup";
 type SetupMode = "checklist" | "custom";
@@ -82,8 +95,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const [teardownOpen, setTeardownOpen] = useState(false);
 
   // ── Agent state ──
+  const [agents, setAgents] = useState<TerminalPreset[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const lastSelectedAgentId = useUIStore((s) => s.lastSelectedAgentId);
+  const setLastSelectedAgentId = useUIStore((s) => s.setLastSelectedAgentId);
   const addPendingWorkspace = useUIStore((s) => s.addPendingWorkspace);
   const removePendingWorkspace = useUIStore((s) => s.removePendingWorkspace);
   const failPendingWorkspace = useUIStore((s) => s.failPendingWorkspace);
@@ -94,9 +108,22 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [showImportConfirm, setShowImportConfirm] = useState(false);
+  const [importProgress, setImportProgress] = useState<{ current: number; total: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Which way the last step change went, so the entering step slides in
+  // from the side the user is moving toward.
+  const [stepDirection, setStepDirection] = useState<"forward" | "back">("forward");
 
   const taskInputRef = useRef<HTMLInputElement>(null);
+  const setupStepRef = useRef<HTMLDivElement>(null);
   const branchGenTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Workspace a previous Create attempt already made. If opening it failed,
+  // a retry only reopens it: creating again would hit "branch already exists".
+  const [createdWorkspaceId, setCreatedWorkspaceId] = useState<string | null>(null);
+  // The created workspace landing in the app store usually auto-dismisses
+  // this wizard (WorkspaceMain) before a failed open is reported, so late
+  // failures must not rely on inline state alone.
+  const mounted = useRef(true);
 
   // ── External worktrees (not the main repo, not bare, not detached) ──
   const externalWorktrees = useMemo(
@@ -129,25 +156,51 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       setWorktrees(wt);
       setBaseBranch(defBranch);
       setActions(detected.map((d) => ({ ...d, checked: d.enabled })));
-      const pinned = presetSnap.presets.filter((p) => p.pinned);
-      setSelectedAgentId(lastSelectedAgentId || pinned.find((p) => p.id === "builtin-claude")?.id || pinned[0]?.id || null);
+      // Same agent list as NewWorkspaceDialog: pinned CLI presets only.
+      const cliAgents = presetSnap.presets.filter((p) => p.pinned && p.kind === "cli");
+      // Read once rather than subscribing: picking an agent below updates
+      // the store, and that must not re-run this whole mount load.
+      const last = useUIStore.getState().lastSelectedAgentId;
+      setAgents(cliAgents);
+      setSelectedAgentId(
+        cliAgents.find((p) => p.id === last)?.id ??
+          cliAgents.find((p) => p.id === "builtin-claude")?.id ??
+          cliAgents[0]?.id ??
+          null,
+      );
     });
 
     return () => {
       cancelled = true;
     };
-  }, [projectDir, lastSelectedAgentId]);
+  }, [projectDir]);
 
-  // ── Auto-focus task input ──
+  // ── Focus handoff on step change ──
+  // The control that moved the user (Continue / Back) unmounts with its
+  // step, so focus would otherwise fall to <body>.
   useEffect(() => {
-    if (step === "workspace") {
-      setTimeout(() => taskInputRef.current?.focus(), 100);
-    }
+    const timer = setTimeout(() => {
+      if (step === "workspace") {
+        taskInputRef.current?.focus();
+      } else {
+        setupStepRef.current
+          ?.querySelector<HTMLElement>("button, textarea")
+          ?.focus();
+      }
+    }, 100);
+    return () => clearTimeout(timer);
   }, [step]);
+
+  const selectedAgent = useMemo(
+    () => agents.find((p) => p.id === selectedAgentId) ?? null,
+    [agents, selectedAgentId],
+  );
 
   // ── Clear debounce timer on unmount to avoid post-unmount setState ──
   useEffect(() => {
+    mounted.current = true;
     return () => {
+      mounted.current = false;
       if (branchGenTimeout.current) clearTimeout(branchGenTimeout.current);
     };
   }, []);
@@ -186,7 +239,13 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   // ── Step 1 → Step 2 ──
   const handleContinue = () => {
     if (!task.trim()) return;
+    setStepDirection("forward");
     setStep("setup");
+  };
+
+  const handleBack = () => {
+    setStepDirection("back");
+    setStep("workspace");
   };
 
   // ── Toggle action in checklist ──
@@ -221,11 +280,24 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       .filter(Boolean);
   };
 
+  // Retire the temporary root workspace only once the real one is open.
+  // Closing it first unmounts this wizard, so a failed create used to drop
+  // the user on the empty state with no error and no project.
+  const finishCreate = useCallback(
+    async (workspaceId: string) => {
+      await activateWorkspace(workspaceId);
+      await closeWorkspace(tempWorkspaceId, false).catch(() => {});
+      onComplete();
+    },
+    [tempWorkspaceId, onComplete],
+  );
+
   // ── Create workspace ──
   const handleCreateWorkspace = useCallback(
     async (saveScripts: boolean) => {
-      if (isCreating) return;
+      if (isCreating || importProgress !== null) return;
       setIsCreating(true);
+      setError(null);
 
       const tempId = randomUUID();
       const displayName = task.slice(0, 40) || "New workspace";
@@ -237,7 +309,14 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         status: "creating",
       });
 
+      let createdId = createdWorkspaceId;
       try {
+        if (createdId) {
+          removePendingWorkspace(tempId);
+          await finishCreate(createdId);
+          return;
+        }
+
         // Save scripts if requested
         if (saveScripts) {
           const setup = collectSetupCommands();
@@ -260,44 +339,59 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             : await generateRandomBranchName(projectDir);
         }
 
-        // Close the temporary empty workspace before creating the real one
-        await closeWorkspace(tempWorkspaceId, false).catch(() => {});
-
-        const wsId = await createWorktreeWorkspace(
+        // The task is the agent's first prompt, so the workspace opens with
+        // the agent already working on what the user just described.
+        const prompt = selectedAgentId ? task.trim() || null : null;
+        const created = await createWorktreeWorkspaceResult(
           projectDir,
           branch,
           true, // new branch
           "single",
           baseBranch || null,
-          null, // no initial prompt — task is only for branch naming
-          null, // no agent preset — workspace opens empty
+          prompt,
+          selectedAgentId,
         );
+        // The backend reused a live workspace for this worktree and dropped
+        // the prompt rather than type into a running session; say so.
+        if (created.adopted && prompt) {
+          toast.info(`"${branch}" already has a live workspace — switched to it. Your task wasn't sent.`);
+        }
 
         const pName = basename(projectDir);
         dbAddRecentProject(projectDir, pName).catch(console.error);
 
         removePendingWorkspace(tempId);
-        await activateWorkspace(wsId);
-        onComplete();
+        createdId = created.workspaceId;
+        setCreatedWorkspaceId(createdId);
+        await finishCreate(createdId);
       } catch (err) {
-        failPendingWorkspace(tempId, String(err));
-        setTimeout(() => removePendingWorkspace(tempId), 5000);
+        if (createdId) {
+          removePendingWorkspace(tempId);
+          const message = `The workspace was created but couldn't be opened: ${String(err)}`;
+          if (mounted.current) setError(message);
+          else toast.error(message);
+        } else {
+          failPendingWorkspace(tempId, String(err));
+          setTimeout(() => removePendingWorkspace(tempId), 5000);
+          setError(`Couldn't create the workspace: ${String(err)}`);
+        }
         setIsCreating(false);
       }
     },
     [
       isCreating,
+      importProgress,
+      createdWorkspaceId,
+      finishCreate,
       task,
       generatedBranch,
       baseBranch,
       selectedAgentId,
       projectDir,
-      tempWorkspaceId,
       setupMode,
       actions,
       setupContent,
       teardownContent,
-      onComplete,
       addPendingWorkspace,
       removePendingWorkspace,
       failPendingWorkspace,
@@ -307,33 +401,100 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   // ── Import all external worktrees ──
   const handleImportAll = async () => {
     setShowImportConfirm(false);
-    // Close the temporary empty workspace
-    await closeWorkspace(tempWorkspaceId, false).catch(() => {});
-    let lastWsId: string | null = null;
-    for (const wt of externalWorktrees) {
-      if (!wt.branch) continue;
-      const branch = wt.branch.replace(/^refs\/heads\//, "");
+    if (isCreating || importProgress !== null) return;
+    setError(null);
+    const targets = externalWorktrees.flatMap((wt) =>
+      wt.branch
+        ? [{ path: wt.path, branch: wt.branch.replace(/^refs\/heads\//, "") }]
+        : [],
+    );
+    const imported: string[] = [];
+    const failed: { branch: string; error: string }[] = [];
+    for (const [index, wt] of targets.entries()) {
+      setImportProgress({ current: index + 1, total: targets.length });
       try {
-        lastWsId = await importWorktreeWorkspace(wt.path, branch, "single");
+        imported.push(await importWorktreeWorkspace(wt.path, wt.branch, "single"));
       } catch (err) {
         console.error("Failed to import worktree:", wt.path, err);
+        failed.push({ branch: wt.branch, error: String(err) });
       }
     }
-    if (lastWsId) await activateWorkspace(lastWsId);
+    setImportProgress(null);
+
+    // Nothing imported: keep the temporary workspace (and this wizard) so
+    // the project stays open and the user can see what went wrong.
+    if (imported.length === 0) {
+      setError(
+        failed.length > 0
+          ? `Couldn't import any worktrees: ${failed[0].error}`
+          : "No worktrees to import.",
+      );
+      return;
+    }
+
+    if (failed.length > 0) {
+      toast.warning(`${imported.length} imported, ${failed.length} failed`, {
+        description: `Not imported: ${failed.map((f) => f.branch).join(", ")}`,
+      });
+    }
+    // The wizard is usually gone by now (the imports dismiss it), so a
+    // failed open is reported as a toast rather than inline.
+    await activateWorkspace(imported[imported.length - 1]).catch((err) => {
+      toast.error(`Imported, but couldn't open the workspace: ${String(err)}`);
+    });
+    await closeWorkspace(tempWorkspaceId, false).catch(() => {});
     const pName = basename(projectDir);
     dbAddRecentProject(projectDir, pName).catch(console.error);
     onComplete();
   };
 
   // ── Key handling ──
+  // Bound to the Step 1 text inputs only: on the step wrapper it also caught
+  // Enter from the agent menu and branch picker, which bubble through React
+  // portals, and advanced the step instead of picking the item.
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (step === "workspace") handleContinue();
+      handleContinue();
     }
   };
 
   const projectName = basename(projectDir) || "project";
+  const stepIndex = step === "workspace" ? 0 : 1;
+  // motion-safe: reduced-motion users get the instant swap.
+  const stepEnterClass = cn(
+    "motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150",
+    stepDirection === "forward"
+      ? "motion-safe:slide-in-from-right-2"
+      : "motion-safe:slide-in-from-left-2",
+  );
+  // Create and Import all each retire the temporary workspace and finish
+  // the wizard, so only one of them may run at a time.
+  const busy = isCreating || importProgress !== null;
+  // After a create whose open failed, the button only reopens that
+  // workspace: task, agent and branch edits no longer apply to it.
+  const createLabel = createdWorkspaceId
+    ? "Open workspace"
+    : selectedAgent
+      ? `Create & start ${selectedAgent.name}`
+      : "Create workspace";
+
+  const errorAlert = error && (
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/20 bg-destructive/10 px-4 py-3"
+    >
+      <span className="flex-1 text-body text-destructive break-words">{error}</span>
+      <button
+        type="button"
+        onClick={() => setError(null)}
+        aria-label="Dismiss error"
+        className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-100"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
 
   return (
     <div className="relative flex-1 h-full flex flex-col overflow-hidden bg-background">
@@ -385,10 +546,13 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             <Button
               variant="outline"
               size="sm"
-              className="shrink-0"
+              className="shrink-0 tabular-nums"
               onClick={() => setShowImportConfirm(true)}
+              disabled={busy}
             >
-              Import all
+              {importProgress
+                ? `Importing ${importProgress.current} / ${importProgress.total}…`
+                : "Import all"}
             </Button>
           </div>
         </div>
@@ -400,10 +564,23 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           <div className="w-full max-w-3xl space-y-6">
             {/* ── Header ── */}
             <div className="space-y-1.5">
-              <Eyebrow>
-                Step {step === "workspace" ? 1 : 2} of 2
-              </Eyebrow>
-              <h1 className="text-2xl font-semibold text-foreground">
+              <div className="flex items-center gap-3">
+                <div className="flex gap-1" aria-hidden="true">
+                  {(["workspace", "setup"] as const).map((segment, index) => (
+                    <span
+                      key={segment}
+                      data-testid="onboarding-step-segment"
+                      data-active={index <= stepIndex || undefined}
+                      className={cn(
+                        "h-0.5 w-8 rounded-sm transition-colors duration-150",
+                        index <= stepIndex ? "bg-foreground" : "bg-surface-3",
+                      )}
+                    />
+                  ))}
+                </div>
+                <Eyebrow>Step {stepIndex + 1} of 2</Eyebrow>
+              </div>
+              <h1 className="text-2xl font-medium tracking-tight text-foreground">
                 {step === "workspace" && "Create your first workspace"}
                 {step === "setup" && "Setup script"}
               </h1>
@@ -417,7 +594,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
 
             {/* ── Step 1: Workspace ── */}
             {step === "workspace" && (
-              <div className="space-y-4" onKeyDown={handleKeyDown}>
+              <div
+                key="workspace"
+                className={cn("space-y-4", stepEnterClass)}
+              >
                 <div className="space-y-2">
                   <Label htmlFor="onboarding-task">Task</Label>
                   <Input
@@ -426,6 +606,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     className="h-11"
                     value={task}
                     onChange={(e) => handleTaskChange(e.target.value)}
+                    onKeyDown={handleKeyDown}
                     placeholder="e.g. Add dark mode, Fix checkout bug"
                   />
                 </div>
@@ -438,6 +619,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       type="text"
                       value={generatedBranch}
                       onChange={(e) => handleBranchChange(e.target.value)}
+                      onKeyDown={handleKeyDown}
                       placeholder="branch-name"
                       className="flex-1 min-w-0 bg-transparent font-mono text-body text-muted-foreground placeholder:text-muted-foreground/40 outline-none"
                     />
@@ -451,8 +633,50 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   </div>
                 </div>
 
-                {/* Continue button */}
-                <div className="flex justify-end">
+                {errorAlert}
+
+                {/* Agent that starts on the task, then Continue */}
+                <div className="flex items-center justify-between gap-3">
+                  {agents.length > 0 ? (
+                    <div className="flex items-center gap-2 text-label text-muted-foreground">
+                      <span>Agent</span>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            aria-label={`Agent: ${selectedAgent?.name ?? "none"}`}
+                            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-1 px-2.5 py-1 text-label text-foreground transition-colors duration-100 hover:bg-surface-2"
+                          >
+                            {selectedAgent && (
+                              <PresetIcon icon={selectedAgent.icon} className="size-3.5" />
+                            )}
+                            {selectedAgent?.name ?? "Choose agent"}
+                            <ChevronDown className="size-3 opacity-40" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="w-[200px]">
+                          {agents.map((p) => (
+                            <DropdownMenuItem
+                              key={p.id}
+                              onClick={() => {
+                                setSelectedAgentId(p.id);
+                                setLastSelectedAgentId(p.id);
+                              }}
+                              className="text-label gap-2"
+                            >
+                              <PresetIcon icon={p.icon} className="size-3.5" />
+                              <span className="flex-1">{p.name}</span>
+                              {selectedAgentId === p.id && (
+                                <Check className="size-3.5 text-primary" />
+                              )}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  ) : (
+                    <span />
+                  )}
                   <Button
                     onClick={handleContinue}
                     disabled={!task.trim()}
@@ -467,17 +691,24 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
 
             {/* ── Step 2: Setup ── */}
             {step === "setup" && (
-              <div className="space-y-4">
+              <div
+                key="setup"
+                ref={setupStepRef}
+                className={cn("space-y-4", stepEnterClass)}
+              >
                 {/* Mode A: Checklist */}
                 {setupMode === "checklist" && actions.length > 0 && (
                   <div className="space-y-3">
+                    {/* Rows use an inset ring: this list's overflow-hidden
+                        clips the global focus outline, and the first row
+                        takes focus when the step opens. */}
                     <div className="overflow-hidden rounded-lg border bg-card/40 divide-y divide-border/60">
                       {actions.map((action) => (
                         <button
                           key={action.id}
                           type="button"
                           onClick={() => toggleAction(action.id)}
-                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer"
+                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
                         >
                           <div
                             className={cn(
@@ -530,7 +761,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                         variant="ghost"
                         size="sm"
                         onClick={() => handleCreateWorkspace(false)}
-                        disabled={isCreating}
+                        disabled={busy}
                       >
                         Skip
                       </Button>
@@ -596,11 +827,14 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   </CollapsibleContent>
                 </Collapsible>
 
+                {errorAlert}
+
                 {/* Buttons */}
                 <div className="flex justify-between">
                   <Button
                     variant="outline"
-                    onClick={() => setStep("workspace")}
+                    onClick={handleBack}
+                    disabled={busy}
                   >
                     <ChevronLeft className="size-4" />
                     Back
@@ -609,16 +843,16 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     <Button
                       variant="outline"
                       onClick={() => handleCreateWorkspace(false)}
-                      disabled={isCreating}
+                      disabled={busy}
                     >
                       Skip for now
                     </Button>
                     <Button
                       onClick={() => handleCreateWorkspace(true)}
-                      disabled={isCreating}
+                      disabled={busy}
                       className="bg-foreground text-background hover:bg-foreground/90"
                     >
-                      {isCreating ? "Creating..." : "Create workspace"}
+                      {isCreating ? "Creating…" : createLabel}
                       <ChevronRight className="size-4" />
                     </Button>
                   </div>

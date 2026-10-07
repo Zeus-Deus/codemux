@@ -6047,6 +6047,13 @@ const handlers: Record<string, Handler> = {
     return targetDir;
   },
 
+  // Project onboarding's setup checklist. The default `null` fallback
+  // threw inside the wizard's mount load, so the agent picker never filled.
+  detect_package_manager: () => [
+    { id: "npm-install", label: "Install dependencies (npm)", command: "npm install", enabled: true },
+    { id: "copy-env", label: "Copy .env from root", command: "cp \"$CODEMUX_ROOT_PATH/.env\" .env", enabled: false },
+  ],
+
   // ── Deferred worktree first-send (Thread Scope) ──
   //
   // Faithfully reproduces the async race the fix targets: the new
