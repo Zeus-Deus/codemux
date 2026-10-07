@@ -499,6 +499,34 @@ describe("RightPanel deck", () => {
     expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("changes");
   });
 
+  it("closes the tabs to the right from a tab's context menu", async () => {
+    const user = userEvent.setup();
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files", "changes", "review"] },
+    });
+    renderDeck({ activeTab: "review" });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Files" }));
+    await user.click(
+      await screen.findByRole("menuitem", { name: "Close tabs to the right" }),
+    );
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual(["files"]);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("files");
+  });
+
+  it("offers no tabs to the right of the last tab, and closes just that one", async () => {
+    const user = userEvent.setup();
+    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "changes"] } });
+    renderDeck({ activeTab: "files" });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Changes" }));
+    expect(
+      await screen.findByRole("menuitem", { name: "Close tabs to the right" }),
+    ).toHaveAttribute("data-disabled");
+    await user.click(screen.getByRole("menuitem", { name: "Close tab" }));
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual(["files"]);
+  });
+
   it("closes every tab from the context menu and lands on the picker", async () => {
     const user = userEvent.setup();
     useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "changes"] } });

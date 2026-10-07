@@ -155,11 +155,18 @@ function RightPanelResizer() {
  * rather than assumed: the left sidebar is its own resizable region outside
  * this row, and reading `window.innerWidth` instead would let a wide
  * sidebar and a wide panel between them squeeze the content to nothing.
+ *
+ * A callback ref, not an effect on a ref object: `WorkspaceMain` returns
+ * early (onboarding, no workspace, a chat draft) before the row exists, and
+ * a mount-time effect never saw the row that rendered later — the width
+ * stayed 0 and the panel was never clamped to the window.
  */
-function useContentRowWidth(ref: React.RefObject<HTMLDivElement | null>): number {
+function useContentRowWidth(): [number, (el: HTMLDivElement | null) => void] {
   const [width, setWidth] = useState(0);
-  useEffect(() => {
-    const el = ref.current;
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: HTMLDivElement | null) => {
+    observerRef.current?.disconnect();
+    observerRef.current = null;
     if (!el || typeof ResizeObserver === "undefined") return;
     setWidth(el.getBoundingClientRect().width);
     const observer = new ResizeObserver((entries) => {
@@ -167,14 +174,13 @@ function useContentRowWidth(ref: React.RefObject<HTMLDivElement | null>): number
       if (typeof next === "number") setWidth(next);
     });
     observer.observe(el);
-    return () => observer.disconnect();
-  }, [ref]);
-  return width;
+    observerRef.current = observer;
+  }, []);
+  return [width, ref];
 }
 
 export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
-  const contentRowRef = useRef<HTMLDivElement>(null);
-  const contentRowWidth = useContentRowWidth(contentRowRef);
+  const [contentRowWidth, contentRowRef] = useContentRowWidth();
   const storedRightPanelWidth = useUIStore((s) => s.rightPanelWidth);
   const rightPanelMaximized = useUIStore((s) => s.rightPanelMaximized);
   // Publish the measurement, not a conclusion drawn from it: the title bar

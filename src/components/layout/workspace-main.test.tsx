@@ -19,6 +19,7 @@ const state = {
   tasks: null as TasksSnapshot | null,
   rightPanelTabs: {} as Record<string, string | null>,
   rightPanelMaximized: false,
+  setRightPanelRowWidth: vi.fn(),
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
@@ -110,7 +111,7 @@ vi.mock("@/stores/ui-store", () => ({
     {
       getState: () => ({
         setRightPanelWidth: vi.fn(),
-        setRightPanelRowWidth: vi.fn(),
+        setRightPanelRowWidth: state.setRightPanelRowWidth,
       }),
     },
   ),
@@ -469,5 +470,39 @@ describe("WorkspaceMain right-panel full expand", () => {
     state.rightPanelMaximized = true;
     const { getByTestId } = render(<WorkspaceMain />);
     expect(getByTestId("workspace-content-column")).toHaveClass("flex-1");
+  });
+});
+
+describe("WorkspaceMain content row measurement", () => {
+  // The panel is clamped against this row. WorkspaceMain renders nothing
+  // until a workspace exists, so the row mounts *after* the first render —
+  // and has to be measured then, not only on mount.
+  it("measures the row when it mounts after the first render", () => {
+    const observed: Element[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(el: Element) {
+          observed.push(el);
+        }
+        disconnect() {}
+      },
+    );
+    const rect = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({ width: 990 } as DOMRect);
+    try {
+      state.workspace = null;
+      const view = render(<WorkspaceMain />);
+      expect(observed).toHaveLength(0);
+
+      state.workspace = makeWorkspace();
+      view.rerender(<WorkspaceMain />);
+      expect(observed).toHaveLength(1);
+      expect(state.setRightPanelRowWidth).toHaveBeenLastCalledWith(990);
+    } finally {
+      rect.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 });
