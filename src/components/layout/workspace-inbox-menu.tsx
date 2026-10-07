@@ -11,6 +11,7 @@ import { ConfirmPushDialog } from "@/components/overlays/confirm-push-dialog";
 import { ProjectImageDialog } from "@/components/overlays/project-image-dialog";
 import { ProjectAppearanceMenu } from "./project-appearance-menu";
 import { useProjectAppearance } from "./use-project-appearance";
+import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
 import { useProjectAppearanceStore } from "@/stores/project-appearance-store";
 import {
   archiveWorkspace,
@@ -159,28 +160,30 @@ export function WorkspaceInboxMenu({
 
   return (
     <>
-      <ContextMenu onOpenChange={setContextMenuOpen}>
-        <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-        {contextMenuOpen && (
-          <WorkspaceContextMenuItems
-            workspace={workspace}
-            project={repo}
-            settleAction={settleAction}
-            snoozeAction={snoozeAction}
-            unreadAction={unreadAction}
-            projectMenu={
-              <ProjectAppearanceMenu
-                projectName={repo.name}
-                projectPath={repo.path}
-                onRequestImageDialog={() => setShowImageDialog(true)}
-              />
-            }
-            onArchiveRequest={() => void handleArchiveOrClose()}
-            onDeleteRequest={() => setShowDeleteDialog(true)}
-            onRequestPushConfirm={(host) => setPendingPushHost(host)}
-          />
-        )}
-      </ContextMenu>
+      <WorkspaceMenuOpenContext.Provider value={contextMenuOpen}>
+        <ContextMenu onOpenChange={setContextMenuOpen}>
+          <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+          {contextMenuOpen && (
+            <WorkspaceContextMenuItems
+              workspace={workspace}
+              project={repo}
+              settleAction={settleAction}
+              snoozeAction={snoozeAction}
+              unreadAction={unreadAction}
+              projectMenu={
+                <ProjectAppearanceMenu
+                  projectName={repo.name}
+                  projectPath={repo.path}
+                  onRequestImageDialog={() => setShowImageDialog(true)}
+                />
+              }
+              onArchiveRequest={() => void handleArchiveOrClose()}
+              onDeleteRequest={() => setShowDeleteDialog(true)}
+              onRequestPushConfirm={(host) => setPendingPushHost(host)}
+            />
+          )}
+        </ContextMenu>
+      </WorkspaceMenuOpenContext.Provider>
 
       {/* Sits outside the ContextMenu subtree: selecting the menu item
           unmounts the menu, which would tear the dialog down with it. */}

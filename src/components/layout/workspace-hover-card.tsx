@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Terminal } from "lucide-react";
 import {
   HoverCard,
@@ -40,6 +47,7 @@ import {
   useHoverCardGroupActive,
 } from "@/lib/hover-card-group";
 import { useProjectAppearance } from "./use-project-appearance";
+import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
 import { cn } from "@/lib/utils";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
@@ -97,6 +105,8 @@ export function WorkspaceHoverCard({
 }: Props) {
   const groupActive = useHoverCardGroupActive();
   const suppressUntilPointerLeave = useRef(false);
+  const menuOpen = useContext(WorkspaceMenuOpenContext);
+  const menuOpenRef = useRef(menuOpen);
   // `instant` is captured when the card opens, not read live, and it governs
   // BOTH ends of the card's motion (see `data-instant` in
   // `@/components/ui/hover-card`). A card that DID wait its delay animates in
@@ -110,7 +120,9 @@ export function WorkspaceHoverCard({
   });
 
   const handleOpenChange = useCallback((next: boolean) => {
-    if (next && suppressUntilPointerLeave.current) return;
+    if (next && (suppressUntilPointerLeave.current || menuOpenRef.current)) {
+      return;
+    }
     // Read the store directly rather than closing over `groupActive`: this
     // fires from Radix's own timer, and the answer must be the phase as it
     // stands right now, before this card joins it below. Read OUTSIDE the
@@ -124,6 +136,16 @@ export function WorkspaceHoverCard({
     }));
   }, []);
 
+  // The modal menu makes the row lose the pointer, which would clear the
+  // suppression; hold it from the menu opening until the pointer next
+  // crosses the row's edge, so focus returning on close cannot pop the card.
+  useEffect(() => {
+    menuOpenRef.current = menuOpen;
+    if (!menuOpen) return;
+    suppressUntilPointerLeave.current = true;
+    setCardState((prev) => ({ ...prev, open: false }));
+  }, [menuOpen]);
+
   useEffect(() => {
     if (!open) return;
     return registerOpenHoverCard(() =>
@@ -133,7 +155,7 @@ export function WorkspaceHoverCard({
 
   return (
     <HoverCard
-      open={open}
+      open={open && !menuOpen}
       onOpenChange={handleOpenChange}
       openDelay={groupActive ? 0 : OPEN_DELAY_MS}
       closeDelay={CLOSE_DELAY_MS}
@@ -146,8 +168,11 @@ export function WorkspaceHoverCard({
           suppressUntilPointerLeave.current = true;
           setCardState((prev) => ({ ...prev, open: false }));
         }}
+        onPointerEnter={() => {
+          if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;
+        }}
         onPointerLeave={() => {
-          suppressUntilPointerLeave.current = false;
+          if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;
         }}
       >
         {children}
