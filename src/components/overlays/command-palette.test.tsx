@@ -780,3 +780,42 @@ describe("command palette — reload interface", () => {
     expect(mocks.backend.reloadInterface).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("command palette — across opens", () => {
+  // jsdom has no CSS animations, so Radix would unmount the content the
+  // instant it closes and every reopen would remount the body regardless.
+  // Reporting an exit animation on `data-state="closed"` keeps the content
+  // mounted until `animationend`, as it is in the app.
+  beforeEach(() => {
+    const realGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+      const styles = realGetComputedStyle(el, pseudo);
+      return new Proxy(styles, {
+        get(target, prop) {
+          if (prop === "animationName") {
+            const state = (el as Element).getAttribute("data-state");
+            return state === "closed" ? "exit" : state === "open" ? "enter" : "none";
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reopens with an empty query while the last open is still animating out", () => {
+    const onOpenChange = vi.fn();
+    const view = render(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "ember" } });
+    expect(screen.getByRole("combobox")).toHaveValue("ember");
+
+    view.rerender(withClient(<CommandPalette open={false} onOpenChange={onOpenChange} />));
+    // Still mounted for the exit animation, with the old query in place.
+    expect(screen.getByRole("dialog", { hidden: true })).toHaveAttribute("data-state", "closed");
+    expect(screen.getByRole("combobox", { hidden: true })).toHaveValue("ember");
+
+    view.rerender(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
+    expect(screen.getByRole("combobox")).toHaveValue("");
+  });
+});
