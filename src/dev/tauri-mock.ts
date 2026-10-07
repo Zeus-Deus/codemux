@@ -1317,6 +1317,65 @@ function seedPendingAskQuestion(threadId: string): void {
   }, 600);
 }
 
+// ── Pending tool approval seed (`?approval=1`) ──────────────────────
+//
+// Like `?askq=1`, a pending approval has to arrive as a live event:
+// replay expires orphan requests. Seeds a running turn parked on a Bash
+// approval so the approval card, its "Allow always" rules and the
+// composer strip's "Needs approval" row can be inspected.
+
+const MOCK_APPROVAL_REQUEST_ID = "seed-approval-pending";
+let approvalSeeded = false;
+
+function approvalSeedEnabled(): boolean {
+  try {
+    return new URLSearchParams(location.search).get("approval") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function seedPendingApproval(threadId: string): void {
+  if (approvalSeeded || !approvalSeedEnabled()) return;
+  if (threadId !== MOCK_CHAT_THREAD_ID) return;
+  approvalSeeded = true;
+  const turnId = "seed-approval-turn";
+  const toolUseId = "seed-approval-tool";
+  setTimeout(() => {
+    emitChatEvent(threadId, {
+      type: "session_state_changed",
+      thread_id: threadId,
+      status: { status: "running", active_turn: turnId },
+    });
+    emitChatEvent(threadId, {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "Bash",
+        tool_use_id: toolUseId,
+        input: {
+          command: "npm run test -- src/lib/settings",
+          description: "Run the settings tests",
+        },
+      },
+    });
+    emitChatEvent(threadId, {
+      type: "request_opened",
+      thread_id: threadId,
+      turn_id: turnId,
+      request_id: MOCK_APPROVAL_REQUEST_ID,
+      request_kind: "command",
+      payload: {
+        tool_name: "Bash",
+        tool_input: { command: "npm run test -- src/lib/settings" },
+      },
+      tool_use_id: toolUseId,
+    });
+  }, 600);
+}
+
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
   label: "Mock Sonnet",
@@ -4671,6 +4730,7 @@ const handlers: Record<string, Handler> = {
       nextIndex: 0,
     });
     seedPendingAskQuestion(threadId);
+    seedPendingApproval(threadId);
     seedAsyncQuestion(threadId);
     return generation;
   },

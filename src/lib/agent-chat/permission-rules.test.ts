@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 
-import { buildPermissionUpdate } from "./permission-rules";
+import {
+  buildPermissionUpdate,
+  formatPermissionRule,
+  suggestPermissionRule,
+} from "./permission-rules";
 
 describe("buildPermissionUpdate", () => {
   it("returns undefined for the 'once' scope (single-shot allow)", () => {
@@ -16,6 +20,19 @@ describe("buildPermissionUpdate", () => {
         rules: [{ toolName: "Bash" }],
         behavior: "allow",
         destination: "localSettings",
+      },
+    ]);
+  });
+
+  it("'session' scope keeps the rule for the provider session only", () => {
+    expect(
+      buildPermissionUpdate("session", { toolName: "Bash", ruleContent: "npm test:*" }),
+    ).toEqual([
+      {
+        type: "addRules",
+        rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+        behavior: "allow",
+        destination: "session",
       },
     ]);
   });
@@ -69,7 +86,7 @@ describe("buildPermissionUpdate", () => {
     // contract — the helper must NOT silently target user-wide
     // settings on an unrecognized scope.
     expect(
-      buildPermissionUpdate("session" as unknown as "once", { toolName: "Bash" }),
+      buildPermissionUpdate("bogus" as unknown as "once", { toolName: "Bash" }),
     ).toBeUndefined();
     expect(
       buildPermissionUpdate("" as unknown as "once", { toolName: "Bash" }),
@@ -102,5 +119,68 @@ describe("buildPermissionUpdate", () => {
       (update as Array<{ rules: Array<{ toolName: string }> }>)[0].rules[0]
         .toolName,
     ).toBe("Bash(git status)");
+  });
+});
+
+describe("formatPermissionRule", () => {
+  it("prints the rule the way settings store it", () => {
+    expect(formatPermissionRule({ toolName: "Bash" })).toBe("Bash");
+    expect(
+      formatPermissionRule({ toolName: "Bash", ruleContent: "git status:*" }),
+    ).toBe("Bash(git status:*)");
+  });
+});
+
+describe("suggestPermissionRule", () => {
+  const bash = (command: string) =>
+    suggestPermissionRule("Bash", { command });
+
+  it("scopes a Bash command to its program and subcommands", () => {
+    expect(bash("git status")).toEqual({ toolName: "Bash", ruleContent: "git status:*" });
+    expect(bash("npm run build --watch")).toEqual({
+      toolName: "Bash",
+      ruleContent: "npm run build:*",
+    });
+    expect(bash("cargo check -j 2")).toEqual({ toolName: "Bash", ruleContent: "cargo check:*" });
+    expect(bash("ls -la")).toEqual({ toolName: "Bash", ruleContent: "ls:*" });
+    expect(bash("cat README.md")).toEqual({ toolName: "Bash", ruleContent: "cat:*" });
+  });
+
+  it("offers no scoped rule for chained, redirected or env-prefixed commands", () => {
+    expect(bash("cd src && rm -rf build")).toBeNull();
+    expect(bash("ls | head")).toBeNull();
+    expect(bash("echo hi > out.txt")).toBeNull();
+    expect(bash("echo $(whoami)")).toBeNull();
+    expect(bash("FOO=1 npm test")).toBeNull();
+    expect(bash("   ")).toBeNull();
+  });
+
+  it("scopes file tools to the file's directory, using Edit rules for every editor", () => {
+    expect(suggestPermissionRule("Edit", { file_path: "/repo/src/a.ts" })).toEqual({
+      toolName: "Edit",
+      ruleContent: "//repo/src/**",
+    });
+    expect(suggestPermissionRule("Write", { file_path: "/repo/b.ts" })).toEqual({
+      toolName: "Edit",
+      ruleContent: "//repo/**",
+    });
+    expect(suggestPermissionRule("Read", { file_path: "/etc/hosts" })).toEqual({
+      toolName: "Read",
+      ruleContent: "//etc/**",
+    });
+    expect(suggestPermissionRule("Edit", { file_path: "relative/a.ts" })).toBeNull();
+    expect(suggestPermissionRule("Edit", { file_path: "/a.ts" })).toBeNull();
+  });
+
+  it("scopes WebFetch to the URL's domain", () => {
+    expect(
+      suggestPermissionRule("WebFetch", { url: "https://docs.rs/serde/latest" }),
+    ).toEqual({ toolName: "WebFetch", ruleContent: "domain:docs.rs" });
+    expect(suggestPermissionRule("WebFetch", { url: "not a url" })).toBeNull();
+  });
+
+  it("returns null for tools without a narrower rule", () => {
+    expect(suggestPermissionRule("Glob", { pattern: "**/*.ts" })).toBeNull();
+    expect(suggestPermissionRule("Bash", null)).toBeNull();
   });
 });

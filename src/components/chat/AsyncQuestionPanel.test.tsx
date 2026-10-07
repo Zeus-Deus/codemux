@@ -7,7 +7,11 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
+import {
+  AsyncQuestionPanel,
+  AsyncQuestionRecord,
+  AsyncQuestionThreadContext,
+} from "./AsyncQuestionPanel";
 import type { AsyncQuestionItem } from "@/lib/agent-chat/types";
 import { agentChatAnswerQuestion } from "@/tauri/commands";
 vi.mock("@/tauri/commands", () => ({ agentChatAnswerQuestion: vi.fn() }));
@@ -117,5 +121,46 @@ describe("async question panel", () => {
     expect(agentChatAnswerQuestion).toHaveBeenCalledWith("thread", "q1", {
       action: "reconcile",
     });
+  });
+  it("labels questions neutrally instead of calling every one a clarification", () => {
+    render(<AsyncQuestionPanel threadId="thread" items={[item()]} working />);
+    expect(screen.getByText("Question")).toBeInTheDocument();
+    expect(screen.queryByText("Clarification")).toBeNull();
+  });
+  it("leaves nothing above the composer once every question is dismissed", () => {
+    const q = item();
+    q.resolution = { status: "dismissed" };
+    const { container } = render(
+      <AsyncQuestionPanel threadId="thread" items={[q]} working />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("async question transcript record", () => {
+  const dismissed = () => {
+    const q = item();
+    q.resolution = { status: "dismissed" };
+    return q;
+  };
+  it("reopens a dismissed question from the transcript", async () => {
+    vi.mocked(agentChatAnswerQuestion).mockResolvedValue({ status: "pending" });
+    render(
+      <AsyncQuestionThreadContext.Provider value="thread">
+        <AsyncQuestionRecord item={dismissed()} />
+      </AsyncQuestionThreadContext.Provider>,
+    );
+    expect(screen.getByText("Which storage?")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    await waitFor(() =>
+      expect(agentChatAnswerQuestion).toHaveBeenCalledWith("thread", "q1", {
+        action: "reopen",
+      }),
+    );
+  });
+  it("offers no Reopen in a read-only transcript", () => {
+    render(<AsyncQuestionRecord item={dismissed()} />);
+    expect(screen.getByText("Dismissed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reopen" })).toBeNull();
   });
 });

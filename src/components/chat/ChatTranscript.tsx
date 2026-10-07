@@ -13,6 +13,7 @@ import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store
 import { TranscriptCacheMount } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
 import { MessageList } from "./MessageList";
+import { AsyncQuestionThreadContext } from "./AsyncQuestionPanel";
 import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
@@ -152,6 +153,7 @@ export const ChatTranscript = memo(function ChatTranscript({
 
   const list = (
     <ChatMarkdownPassiveContext.Provider value={passive}>
+      <AsyncQuestionThreadContext.Provider value={passive ? null : (threadKey ?? null)}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -182,6 +184,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+      </AsyncQuestionThreadContext.Provider>
     </ChatMarkdownPassiveContext.Provider>
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The

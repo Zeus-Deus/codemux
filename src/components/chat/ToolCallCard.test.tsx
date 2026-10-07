@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/toast", () => ({
@@ -93,7 +93,7 @@ describe("ToolCallCard", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
-  it("'Allow always' dropdown shows two persistent scopes", async () => {
+  it("'Allow always' names each rule exactly, the scoped rule before the any-input one", async () => {
     const user = userEvent.setup();
     render(
       <ToolCallCard
@@ -103,15 +103,26 @@ describe("ToolCallCard", () => {
       />,
     );
     await user.click(screen.getByText("Allow always"));
-    expect(
-      await screen.findByRole("menuitem", { name: /For this project/ }),
-    ).toBeInTheDocument();
-    expect(
-      await screen.findByRole("menuitem", { name: /For all projects/ }),
-    ).toBeInTheDocument();
+    const groups = await screen.findAllByRole("group");
+    expect(groups.map((g) => g.getAttribute("aria-label"))).toEqual([
+      "Bash(ls:*)",
+      "Bash",
+    ]);
+    expect(within(groups[1]).getByText("any command")).toBeInTheDocument();
+    for (const group of groups) {
+      expect(
+        within(group)
+          .getAllByRole("menuitem")
+          .map((item) => item.textContent),
+      ).toEqual([
+        "For this sessionnot saved",
+        "For this project.claude/settings.local.json",
+        "For all projects~/.claude/settings.json",
+      ]);
+    }
   });
 
-  it("'For this project' adds an addRules entry to localSettings + fires a project toast", async () => {
+  it("the scoped rule's 'For this project' writes that rule to localSettings", async () => {
     const user = userEvent.setup();
     const onDecide = vi.fn();
     render(
@@ -122,57 +133,157 @@ describe("ToolCallCard", () => {
       />,
     );
     await user.click(screen.getByText("Allow always"));
+    const [scoped] = await screen.findAllByRole("group");
     await user.click(
-      await screen.findByRole("menuitem", { name: /For this project/ }),
+      within(scoped).getByRole("menuitem", { name: /For this project/ }),
     );
     expect(onDecide).toHaveBeenCalledWith({
       decision: "allow",
       updated_permissions: [
         {
           type: "addRules",
-          rules: [{ toolName: "Bash" }],
+          rules: [{ toolName: "Bash", ruleContent: "ls:*" }],
           behavior: "allow",
           destination: "localSettings",
         },
       ],
     });
     expect(toast.success).toHaveBeenCalledWith(
-      "Allowing Bash for this project",
+      "Allowing Bash(ls:*) for this project",
       { description: "Rule saved to .claude/settings.local.json" },
     );
   });
 
-  it("'For all projects' adds an addRules entry to userSettings + fires a user toast", async () => {
+  it("'For this session' keeps the rule in the session only", async () => {
     const user = userEvent.setup();
     const onDecide = vi.fn();
     render(
       <ToolCallCard
-        item={makeTool({ approval_request_id: "req-1", tool_name: "Read" })}
-        approval={makePendingApproval({
-          payload: { tool_name: "Read", tool_input: { path: "/etc/hosts" } },
-        })}
+        item={makeTool({ approval_request_id: "req-1" })}
+        approval={makePendingApproval()}
         onDecide={onDecide}
       />,
     );
     await user.click(screen.getByText("Allow always"));
+    const [scoped] = await screen.findAllByRole("group");
     await user.click(
-      await screen.findByRole("menuitem", { name: /For all projects/ }),
+      within(scoped).getByRole("menuitem", { name: /For this session/ }),
     );
     expect(onDecide).toHaveBeenCalledWith({
       decision: "allow",
       updated_permissions: [
         {
           type: "addRules",
-          rules: [{ toolName: "Read" }],
+          rules: [{ toolName: "Bash", ruleContent: "ls:*" }],
+          behavior: "allow",
+          destination: "session",
+        },
+      ],
+    });
+  });
+
+  it("a tool with no narrower rule offers only the any-input rule, saved to userSettings", async () => {
+    const user = userEvent.setup();
+    const onDecide = vi.fn();
+    render(
+      <ToolCallCard
+        item={makeTool({
+          approval_request_id: "req-1",
+          tool_name: "Glob",
+          input: { pattern: "**/*.ts" },
+        })}
+        approval={makePendingApproval({
+          payload: { tool_name: "Glob", tool_input: { pattern: "**/*.ts" } },
+        })}
+        onDecide={onDecide}
+      />,
+    );
+    await user.click(screen.getByText("Allow always"));
+    const groups = await screen.findAllByRole("group");
+    expect(groups).toHaveLength(1);
+    await user.click(
+      within(groups[0]).getByRole("menuitem", { name: /For all projects/ }),
+    );
+    expect(onDecide).toHaveBeenCalledWith({
+      decision: "allow",
+      updated_permissions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Glob" }],
           behavior: "allow",
           destination: "userSettings",
         },
       ],
     });
     expect(toast.success).toHaveBeenCalledWith(
-      "Allowing Read for all projects",
+      "Allowing Glob for all projects",
       { description: "Rule saved to ~/.claude/settings.json" },
     );
+  });
+
+  it("a pending card stands out from finished cards", () => {
+    const { container } = render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-1" })}
+        approval={makePendingApproval()}
+        onDecide={vi.fn()}
+      />,
+    );
+    const card = container.firstElementChild as HTMLElement;
+    expect(card).toHaveAttribute("data-approval-pending", "true");
+    expect(card.className).toContain("ring-status-working/40");
+  });
+
+  it("focuses Allow when nothing else has focus, once per request", () => {
+    const first = render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-focus" })}
+        approval={makePendingApproval({ request_id: "req-focus" })}
+        onDecide={vi.fn()}
+      />,
+    );
+    expect(document.activeElement).toBe(screen.getByText("Allow"));
+    first.unmount();
+    // A virtualized remount of the same request leaves focus alone.
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-focus" })}
+        approval={makePendingApproval({ request_id: "req-focus" })}
+        onDecide={vi.fn()}
+      />,
+    );
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("never takes focus from a focused composer", () => {
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-typing" })}
+        approval={makePendingApproval({ request_id: "req-typing" })}
+        onDecide={vi.fn()}
+      />,
+    );
+    expect(document.activeElement).toBe(composer);
+    composer.remove();
+  });
+
+  it("A opens the Allow-always menu and D starts a denial", async () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-keys" })}
+        approval={makePendingApproval({ request_id: "req-keys" })}
+        onDecide={vi.fn()}
+      />,
+    );
+    const allow = screen.getByText("Allow");
+    fireEvent.keyDown(allow, { key: "a" });
+    expect(await screen.findAllByRole("group")).toHaveLength(2);
+    fireEvent.keyDown(document.activeElement ?? allow, { key: "Escape" });
+    fireEvent.keyDown(screen.getByText("Allow"), { key: "d" });
+    expect(screen.getByPlaceholderText("Reason (optional)")).toHaveFocus();
   });
 
   it("Deny reveals the reason textarea and Confirm deny ships the reason", () => {
@@ -358,7 +469,8 @@ describe("ToolCallCard", () => {
       />,
     );
     await user.click(screen.getByText("Allow always"));
-    const item = await screen.findByRole("menuitem", {
+    const [scoped] = await screen.findAllByRole("group");
+    const item = within(scoped).getByRole("menuitem", {
       name: /For this project/,
     });
     // Two onSelect-equivalent fires; only the first should reach

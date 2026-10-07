@@ -31,12 +31,13 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Which occupant leads the collapsed strip. Lower wins. */
 export const STRIP_PRIORITY = {
-  error: 0,
-  usage: 1,
-  monitoring: 2,
-  running: 3,
-  finished: 4,
-  queued: 5,
+  approval: 0,
+  error: 1,
+  usage: 2,
+  monitoring: 3,
+  running: 4,
+  finished: 5,
+  queued: 6,
 } as const;
 
 export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
@@ -207,10 +208,13 @@ export function ComposerStrip({
   const all = occupants
     .filter((o): o is StripOccupant => !!o && o.rows.length > 0)
     .sort((a, b) => STRIP_PRIORITY[a.kind] - STRIP_PRIORITY[b.kind]);
-  // A usage-limit stop is a decision, not background activity, so a goal
-  // never folds it into `+n`: it takes its own row above the goal.
-  const pinned = goal ? all.filter((o) => o.kind === "usage") : [];
-  const present = goal ? all.filter((o) => o.kind !== "usage") : all;
+  // A pending approval or a usage-limit stop is a decision, not background
+  // activity, so a goal never folds it into `+n`: it takes its own row
+  // above the goal.
+  const isDecision = (o: StripOccupant) =>
+    o.kind === "approval" || o.kind === "usage";
+  const pinned = goal ? all.filter(isDecision) : [];
+  const present = goal ? all.filter((o) => !isDecision(o)) : all;
   const rows = present.flatMap((occupant) =>
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
@@ -394,6 +398,8 @@ function occupantSummary(present: StripOccupant[]): string | null {
         return "session error";
       case "usage":
         return "usage limit";
+      case "approval":
+        return `${n} approval${n === 1 ? "" : "s"} needed`;
     }
   });
   return parts.length > 0 ? parts.join(" · ") : null;

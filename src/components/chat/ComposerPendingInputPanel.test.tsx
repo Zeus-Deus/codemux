@@ -818,4 +818,112 @@ describe("ComposerPendingInputPanel", () => {
     );
     expect(screen.getByTestId("aq-option-1-1")).toHaveAttribute("data-state");
   });
+
+  describe("document-level shortcuts stay in their pane", () => {
+    function renderInPane(onSubmit = vi.fn()) {
+      return render(
+        <>
+          <button type="button">Sidebar row</button>
+          <div data-agent-chat-pane="">
+            <div data-testid="transcript" tabIndex={-1}>
+              transcript
+            </div>
+            <div role="treeitem" tabIndex={0}>
+              tree row
+            </div>
+            <ComposerPendingInputPanel item={makeAskItem()} onSubmit={onSubmit} />
+          </div>
+          <div data-agent-chat-pane="">
+            <div data-testid="other-pane" tabIndex={-1}>
+              other pane
+            </div>
+          </div>
+        </>,
+      );
+    }
+    const send = () => screen.getByText("Send") as HTMLButtonElement;
+
+    it("ignores keys aimed at a focused control elsewhere in the app", () => {
+      renderInPane();
+      fireEvent.keyDown(screen.getByText("Sidebar row"), { key: "2" });
+      fireEvent.keyDown(screen.getByRole("treeitem"), { key: "2" });
+      expect(send()).toBeDisabled();
+    });
+
+    it("ignores keys from another pane", () => {
+      renderInPane();
+      fireEvent.keyDown(screen.getByTestId("other-pane"), { key: "2" });
+      expect(send()).toBeDisabled();
+    });
+
+    it("lets Enter on a focused button do its own job", () => {
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      renderInPane(onSubmit);
+      fireEvent.keyDown(screen.getByTestId("transcript"), { key: "1" });
+      expect(send()).not.toBeDisabled();
+      fireEvent.keyDown(screen.getByText("Sidebar row"), { key: "Enter" });
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it("drives the form from a passive spot inside its own pane", () => {
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+      renderInPane(onSubmit);
+      fireEvent.keyDown(screen.getByTestId("transcript"), { key: "2" });
+      fireEvent.keyDown(screen.getByTestId("transcript"), { key: "Enter" });
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          answers: { "Which framework should we use?": "Vue" },
+        }),
+      );
+    });
+  });
+
+  describe("Skip", () => {
+    it("is offered only when the pane can skip", () => {
+      const { rerender } = render(
+        <ComposerPendingInputPanel item={makeAskItem()} onSubmit={vi.fn()} />,
+      );
+      expect(screen.queryByTestId("aq-skip")).toBeNull();
+      rerender(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={vi.fn()}
+        />,
+      );
+      expect(screen.getByTestId("aq-skip")).toHaveTextContent(
+        "Skip · answer in chat",
+      );
+      expect(screen.getByTestId("aq-hints")).toHaveTextContent("Esc skip");
+    });
+
+    it("skips on click and on Esc inside the form", () => {
+      const onSkip = vi.fn();
+      render(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={onSkip}
+        />,
+      );
+      fireEvent.click(screen.getByTestId("aq-skip"));
+      fireEvent.keyDown(screen.getByText("React"), { key: "Escape" });
+      expect(onSkip).toHaveBeenCalledTimes(2);
+    });
+
+    it("keeps typed free text: Esc there does not skip", () => {
+      const onSkip = vi.fn();
+      render(
+        <ComposerPendingInputPanel
+          item={makeAskItem()}
+          onSubmit={vi.fn()}
+          onSkip={onSkip}
+        />,
+      );
+      const free = screen.getByPlaceholderText("Something else…");
+      fireEvent.change(free, { target: { value: "neither" } });
+      fireEvent.keyDown(free, { key: "Escape" });
+      expect(onSkip).not.toHaveBeenCalled();
+    });
+  });
 });

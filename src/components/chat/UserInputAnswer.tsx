@@ -33,7 +33,15 @@ export const UserInputAnswer = memo(function UserInputAnswer({
   // or a future decision shape we don't parse) — fall back to the
   // original muted marker so the row is never blank.
   if (lines.length === 0) {
-    return <div className="py-0.5 text-label text-muted-foreground">Answered</div>;
+    // A denied prompt is one the user skipped to answer in the chat.
+    const skipped =
+      item.resolution.state === "resolved" &&
+      item.resolution.decision.decision === "deny";
+    return (
+      <div className="py-0.5 text-label text-muted-foreground">
+        {skipped ? "Skipped" : "Answered"}
+      </div>
+    );
   }
 
   // With a single question the value speaks for itself; with several,
