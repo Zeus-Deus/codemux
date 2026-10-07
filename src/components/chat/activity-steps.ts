@@ -344,6 +344,15 @@ export function editCounts(item: ToolCallItem): EditCounts | null {
       newText = news.join("\n");
       break;
     }
+    case "NotebookEdit": {
+      // Only the new cell source is in the input, so this counts what was
+      // written, like Write; a cell delete carries none and stays unknown.
+      const source = strOrNull(input.new_source);
+      if (source == null) return null;
+      oldText = "";
+      newText = source;
+      break;
+    }
     default: {
       const o = strOrNull(input.old_string);
       const nw = strOrNull(input.new_string);

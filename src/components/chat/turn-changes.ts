@@ -1,4 +1,5 @@
 import type { ChatViewItem, ToolCallItem } from "@/lib/agent-chat/types";
+import { parseDiff } from "@/lib/diff-parser";
 
 import { editCounts, type EditCounts } from "./activity-steps";
 
@@ -58,14 +59,14 @@ function codexFileEdits(input: Record<string, unknown>): FileEdit[] {
       edits.push({ path, added: 0, removed: lineCount(diff) });
       continue;
     }
-    let added = 0;
-    let removed = 0;
-    for (const line of diff.split("\n")) {
-      if (line.startsWith("+++") || line.startsWith("---")) continue;
-      if (line.startsWith("+")) added += 1;
-      else if (line.startsWith("-")) removed += 1;
-    }
-    edits.push({ path, added, removed });
+    // The shared parser only treats `---`/`+++` as file headers before the
+    // first hunk; inside one they are content (a deleted `-- note` line).
+    const rows = parseDiff(diff);
+    edits.push({
+      path,
+      added: rows.filter((row) => row.type === "add").length,
+      removed: rows.filter((row) => row.type === "del").length,
+    });
   }
   return edits;
 }

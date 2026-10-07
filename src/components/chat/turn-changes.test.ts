@@ -90,6 +90,37 @@ describe("summarizeTurnChanges", () => {
     ]);
   });
 
+  it("counts in-hunk lines that look like file headers", () => {
+    const summary = summarizeTurnChanges([
+      tool("fileChange", {
+        type: "fileChange",
+        changes: [
+          {
+            path: "/repo/schema.sql",
+            kind: { type: "update", move_path: null },
+            diff: "--- a/schema.sql\n+++ b/schema.sql\n@@ -1,2 +1,2 @@\n--- note\n+++ added\n keep\n",
+          },
+        ],
+      }),
+    ]);
+    expect(summary?.files).toEqual([
+      { path: "/repo/schema.sql", added: 1, removed: 1 },
+    ]);
+  });
+
+  it("counts a notebook cell's new source", () => {
+    const summary = summarizeTurnChanges([
+      tool("NotebookEdit", {
+        notebook_path: "/repo/analysis.ipynb",
+        cell_id: "cell-1",
+        new_source: "import pandas\ndf = load()",
+      }),
+    ]);
+    expect(summary?.files).toEqual([
+      { path: "/repo/analysis.ipynb", added: 2, removed: 0 },
+    ]);
+  });
+
   it("compares summaries by value so unchanged folds keep their slot", () => {
     const edit = () =>
       tool("Edit", { file_path: "/a", old_string: "a", new_string: "b" });

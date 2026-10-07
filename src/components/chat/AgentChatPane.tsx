@@ -2309,14 +2309,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         ? await captureRevertedPrompt(revertedMessage)
         : null;
       await agentChatRevertTurnCheckpoint(threadId, target.turn_index);
-      await refreshAfterTurnRevert({
-        thread_id: threadId,
-        turn_index: target.turn_index,
-        transcript_cutoff_id: target.transcript_cutoff_id,
-        remaining_checkpoints: turnCheckpoints.filter(
-          (checkpoint) => checkpoint.turn_index < target.turn_index,
-        ),
-      });
+      // The revert has landed: a failed transcript refresh must not report it
+      // as failed or skip the prompt hand-back and the undo below.
+      try {
+        await refreshAfterTurnRevert({
+          thread_id: threadId,
+          turn_index: target.turn_index,
+          transcript_cutoff_id: target.transcript_cutoff_id,
+          remaining_checkpoints: turnCheckpoints.filter(
+            (checkpoint) => checkpoint.turn_index < target.turn_index,
+          ),
+        });
+      } catch (error) {
+        console.warn("[agent-chat] failed to refresh reverted transcript:", error);
+      }
       setRevertTarget(null);
       // The usual reason to revert is to rephrase, so the prompt comes back
       // ready to edit rather than vanishing with the turn.

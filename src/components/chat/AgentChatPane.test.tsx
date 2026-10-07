@@ -1442,6 +1442,33 @@ describe("AgentChatPane turn revert", () => {
       expect(vi.mocked(agentChatUndoTurnRevert)).toHaveBeenCalledWith("thread-x");
     });
   });
+
+  it("keeps the prompt and the undo when the transcript refresh fails", async () => {
+    const success = vi.spyOn(toast, "success");
+    const error = vi.spyOn(toast, "error");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const { agentChatListMessagesAfter } = await import("@/tauri/commands");
+    await waitFor(() => {
+      fireEvent.click(container.querySelector('[data-testid="revert-turn"]')!);
+      expect(document.querySelector('[data-testid="revert-turn-confirm"]')).not.toBeNull();
+    });
+    vi.mocked(agentChatListMessagesAfter).mockRejectedValueOnce(new Error("ipc down"));
+
+    fireEvent.click(document.querySelector('[data-testid="revert-turn-confirm"]')!);
+    await waitFor(() => {
+      expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "Rename the helper");
+    });
+    const reverted = success.mock.calls.find(([message]) => message === "Turn reverted");
+    expect((reverted?.[1]?.action as { label: string } | undefined)?.label).toBe(
+      "Restore files",
+    );
+    expect(error.mock.calls.some(([message]) => message === "Could not revert turn")).toBe(
+      false,
+    );
+    error.mockRestore();
+    warn.mockRestore();
+  });
 });
 
 describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
