@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -114,6 +115,22 @@ function fileName(path: string): string {
   return i >= 0 ? path.slice(i + 1) : path;
 }
 
+/** Move focus to the row `step` places away in the list; false at an end. */
+function focusSiblingRow(row: HTMLElement, step: 1 | -1): boolean {
+  const list = row.closest("[data-changes-list]");
+  if (!list) return false;
+  const rows = Array.from(list.querySelectorAll<HTMLElement>("[data-file-row]"));
+  const next = rows[rows.indexOf(row) + step];
+  next?.focus();
+  return !!next;
+}
+
+/** Hand focus on before a keyboard action moves or removes this row, so
+ *  the next key lands on the next file instead of on nothing. */
+function handFocusOn(row: HTMLElement) {
+  if (!focusSiblingRow(row, 1)) focusSiblingRow(row, -1);
+}
+
 // ── FileRow ──
 
 function FileRow({
@@ -130,12 +147,19 @@ function FileRow({
   onOpenDiff: (filePath: string, staged: boolean) => void;
 }) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const meta = STATUS_META[file.status] ?? STATUS_META.modified;
   const name = fileName(file.path);
   const dir = file.path.length > name.length ? file.path.slice(0, -name.length - 1) : "";
 
-  const handleStageToggle = async (e: React.MouseEvent) => {
-    e.stopPropagation();
+  useEffect(
+    () => () => {
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    },
+    [],
+  );
+
+  const toggleStage = async () => {
     try {
       if (staged) await gitUnstageFiles(cwd, [file.path]);
       else await gitStageFiles(cwd, [file.path]);
@@ -148,11 +172,11 @@ function FileRow({
   // Two-tap discard so a stray hover-click can't blow away uncommitted
   // work. The 3s timeout reverts the row to its idle state if the user
   // doesn't follow through.
-  const handleDiscard = async (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const discard = async () => {
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
     if (!confirmDiscard) {
       setConfirmDiscard(true);
-      setTimeout(() => setConfirmDiscard(false), 3000);
+      confirmTimer.current = setTimeout(() => setConfirmDiscard(false), 3000);
       return;
     }
     try {
@@ -164,20 +188,50 @@ function FileRow({
     setConfirmDiscard(false);
   };
 
+  // Keys act on the row itself only: on its buttons, Enter and Space
+  // must stay those buttons' own.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey || e.altKey) return;
+    const row = e.currentTarget;
+    switch (e.key) {
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        onOpenDiff(file.path, staged);
+        return;
+      case "ArrowDown":
+      case "ArrowUp":
+        e.preventDefault();
+        focusSiblingRow(row, e.key === "ArrowDown" ? 1 : -1);
+        return;
+      case "s":
+        e.preventDefault();
+        handFocusOn(row);
+        void toggleStage();
+        return;
+      case "Delete":
+      case "Backspace":
+        e.preventDefault();
+        if (confirmDiscard) handFocusOn(row);
+        void discard();
+        return;
+    }
+  };
+
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <div
           role="button"
           tabIndex={0}
+          data-file-row
+          data-confirm-discard={confirmDiscard ? "true" : undefined}
           onClick={() => onOpenDiff(file.path, staged)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              onOpenDiff(file.path, staged);
-            }
-          }}
-          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors duration-150"
+          onKeyDown={handleKeyDown}
+          className={cn(
+            "group/file relative flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm transition-colors duration-150",
+            confirmDiscard ? "bg-danger/10" : "hover:bg-muted/40",
+          )}
         >
           <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
             {meta.icon}
@@ -189,18 +243,22 @@ function FileRow({
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity duration-150">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 group-focus-within/file:opacity-0 transition-opacity duration-150">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
           )}
-          <span className="shrink-0 hidden group-hover/file:flex items-center gap-0.5 ml-auto absolute right-1">
+          <span className="shrink-0 hidden group-hover/file:flex group-focus-within/file:flex items-center gap-0.5 ml-auto absolute right-1">
             <Button
               variant="ghost"
               size="icon-xs"
               className={cn("size-5", confirmDiscard ? "text-danger" : "text-muted-foreground hover:text-foreground")}
-              onClick={handleDiscard}
-              title={confirmDiscard ? "Click again to discard" : "Discard changes"}
+              onClick={(e) => {
+                e.stopPropagation();
+                void discard();
+              }}
+              aria-label={confirmDiscard ? "Confirm discard" : "Discard changes"}
+              title={confirmDiscard ? "Click again to discard" : "Discard changes (Delete)"}
             >
               <Trash2 className="size-3" />
             </Button>
@@ -208,8 +266,12 @@ function FileRow({
               variant="ghost"
               size="icon-xs"
               className="size-5 text-muted-foreground hover:text-foreground"
-              onClick={handleStageToggle}
-              title={staged ? "Unstage" : "Stage"}
+              onClick={(e) => {
+                e.stopPropagation();
+                void toggleStage();
+              }}
+              aria-label={staged ? "Unstage" : "Stage"}
+              title={staged ? "Unstage (S)" : "Stage (S)"}
             >
               {staged ? <Minus className="size-3" /> : <Plus className="size-3" />}
             </Button>
@@ -225,6 +287,11 @@ function FileRow({
 
 // ── FileSection (Staged / Changed grouping) ──
 
+const BULK_ACTIONS = {
+  stage: { label: "Stage all", icon: Plus },
+  unstage: { label: "Unstage all", icon: Minus },
+} as const;
+
 function FileSection({
   label,
   files,
@@ -232,6 +299,7 @@ function FileSection({
   cwd,
   onRefresh,
   onOpenDiff,
+  bulkAction,
 }: {
   label: string;
   files: GitFileStatus[];
@@ -239,14 +307,42 @@ function FileSection({
   cwd: string;
   onRefresh: () => void;
   onOpenDiff: (filePath: string, staged: boolean) => void;
+  /** The section-wide counterpart of the rows' own +/− button. */
+  bulkAction?: keyof typeof BULK_ACTIONS;
 }) {
   if (files.length === 0) return null;
+  const bulk = bulkAction ? BULK_ACTIONS[bulkAction] : null;
+  const runBulk = async () => {
+    if (!bulkAction) return;
+    const paths = files.map((f) => f.path);
+    try {
+      if (bulkAction === "stage") await gitStageFiles(cwd, paths);
+      else await gitUnstageFiles(cwd, paths);
+      onRefresh();
+    } catch (err) {
+      toast.error(String(err));
+    }
+  };
   return (
-    <div className="mb-2">
-      <Eyebrow className="flex items-center px-2.5 h-5">
-        <span>{label}</span>
-        <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
-      </Eyebrow>
+    <div className="group/section mb-2">
+      <div className="flex h-5 items-center pr-1">
+        <Eyebrow className="flex flex-1 items-center px-2.5">
+          <span>{label}</span>
+          <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
+        </Eyebrow>
+        {bulk && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="size-5 text-muted-foreground opacity-0 transition-opacity duration-100 group-hover/section:opacity-100 hover:text-foreground focus-visible:opacity-100"
+            onClick={() => void runBulk()}
+            aria-label={bulk.label}
+            title={bulk.label}
+          >
+            <bulk.icon className="size-3" />
+          </Button>
+        )}
+      </div>
       <div className="flex flex-col">
         {files.map((file) => (
           <FileRow
@@ -308,6 +404,10 @@ export function ChangesPanel({
   const queryClient = useQueryClient();
 
   const [files, setFiles] = useState<GitFileStatus[]>([]);
+  // Which checkout the status above belongs to. Until the first read for
+  // this one lands, an empty list means "not read yet", not "clean".
+  const [loadedCwd, setLoadedCwd] = useState<string | null>(null);
+  const loaded = loadedCwd === cwd;
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
   const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
@@ -352,6 +452,7 @@ export function ChangesPanel({
       // previous objects when nothing moved makes the idle tick a React
       // bail-out instead of a full panel re-render.
       setFiles((prev) => keepIfUnchanged(prev, s));
+      setLoadedCwd(cwd);
       if (info) setBranchInfo((prev) => keepIfUnchanged(prev, info));
       setMergeState((prev) => keepIfUnchanged(prev, merge));
     });
@@ -688,7 +789,21 @@ export function ChangesPanel({
 
       <ScrollArea className="flex-1 min-h-0">
         <div className="py-1">
-          {totalChanges === 0 ? (
+          {!loaded && !showNoGit ? (
+            <div
+              data-testid="changes-loading"
+              aria-busy="true"
+              aria-label="Loading changes"
+              className="flex flex-col px-2.5"
+            >
+              {["w-3/4", "w-1/2", "w-2/3"].map((width) => (
+                <div key={width} className="flex h-6 items-center gap-1.5">
+                  <Skeleton className="size-3 rounded-sm" />
+                  <Skeleton className={cn("h-2.5 rounded-sm", width)} />
+                </div>
+              ))}
+            </div>
+          ) : totalChanges === 0 ? (
             showNoGit ? (
               <div className="flex flex-col items-center justify-center px-4 py-10 gap-2 text-center text-muted-foreground/70">
                 <GitBranch className="size-4 opacity-50" />
@@ -715,7 +830,7 @@ export function ChangesPanel({
               </div>
             )
           ) : (
-            <>
+            <div data-changes-list className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150">
               {(sectionFilter === "all" || sectionFilter === "staged") && (
                 <FileSection
                   label="Staged"
@@ -724,6 +839,7 @@ export function ChangesPanel({
                   cwd={cwd}
                   onRefresh={refresh}
                   onOpenDiff={openDiff}
+                  bulkAction="unstage"
                 />
               )}
               {(sectionFilter === "all" || sectionFilter === "unstaged") && (
@@ -734,6 +850,7 @@ export function ChangesPanel({
                   cwd={cwd}
                   onRefresh={refresh}
                   onOpenDiff={openDiff}
+                  bulkAction="stage"
                 />
               )}
               {(sectionFilter === "all" || sectionFilter === "conflicts") && (
@@ -746,7 +863,7 @@ export function ChangesPanel({
                   onOpenDiff={openDiff}
                 />
               )}
-            </>
+            </div>
           )}
         </div>
       </ScrollArea>
@@ -846,6 +963,7 @@ export function ChangesPanel({
 
         {!showPreview && !showEditor && (
           <SmartCommitButton
+            loading={!loaded}
             hasChanges={totalChanges > 0}
             staged={staged.length}
             isGenerating={isGenerating ?? false}
@@ -878,6 +996,7 @@ export function ChangesPanel({
 // clean and even. Dropdown always exposes every action so power users
 // aren't trapped by the heuristic.
 function SmartCommitButton({
+  loading,
   hasChanges,
   staged,
   isGenerating,
@@ -896,6 +1015,8 @@ function SmartCommitButton({
   ahead,
   behind,
 }: {
+  /** Status not read yet: no action is the right one until it is. */
+  loading: boolean;
   hasChanges: boolean;
   staged: number;
   isGenerating: boolean;
@@ -915,6 +1036,14 @@ function SmartCommitButton({
   behind: number;
 }) {
   const primary = (() => {
+    if (loading) {
+      return {
+        label: "Checking changes…",
+        icon: <Loader2 className="size-3 motion-safe:animate-spin" />,
+        action: () => {},
+        disabled: true,
+      };
+    }
     if (isMerging) return null;
     if (hasChanges) {
       return {
@@ -977,7 +1106,7 @@ function SmartCommitButton({
             variant="ghost"
             className={cn("rounded-l-none border-l-0", fillCls)}
             aria-label="More actions"
-            disabled={busy !== null}
+            disabled={loading || busy !== null}
           >
             <ChevronDown className="size-3.5" />
           </Button>
