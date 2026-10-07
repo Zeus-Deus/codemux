@@ -196,8 +196,9 @@ interface UIStore {
    *  open on what is running now, so this is never persisted. */
   subagentsHistoryOpen: boolean;
   /** Subagent ids whose failure card the user has waved off. Failures hold
-   *  the pane until acknowledged; the acknowledgement itself is per-session
-   *  (the run is over next launch), so this is transient too. */
+   *  the pane until acknowledged, and the cards are rebuilt from persisted
+   *  chat history, so the acknowledgement is persisted too (newest
+   *  `MAX_DISMISSED_SUBAGENTS` kept) or every restart would re-raise them. */
   dismissedSubagentAttention: string[];
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
@@ -288,6 +289,10 @@ interface UIStore {
   setSubagentsHistoryOpen: (open: boolean) => void;
   dismissSubagentAttention: (id: string) => void;
 }
+
+/** Only the latest wave's failures can raise a card, so a short memory of
+ *  dismissals is enough and keeps the persisted list from growing forever. */
+const MAX_DISMISSED_SUBAGENTS = 200;
 
 export const useUIStore = create<UIStore>()(
   persist(
@@ -690,7 +695,12 @@ export const useUIStore = create<UIStore>()(
         set((s) =>
           s.dismissedSubagentAttention.includes(id)
             ? s
-            : { dismissedSubagentAttention: [...s.dismissedSubagentAttention, id] },
+            : {
+                dismissedSubagentAttention: [
+                  ...s.dismissedSubagentAttention,
+                  id,
+                ].slice(-MAX_DISMISSED_SUBAGENTS),
+              },
         ),
     }),
     {
@@ -706,6 +716,7 @@ export const useUIStore = create<UIStore>()(
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
+        dismissedSubagentAttention: state.dismissedSubagentAttention,
       }),
       // v0 → v1: the right-panel tab id `"pr"` was renamed to `"review"`
       // when the panel itself was renamed (Phase 3). Rewrite any persisted
