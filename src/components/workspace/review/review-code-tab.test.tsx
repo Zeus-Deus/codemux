@@ -952,4 +952,109 @@ describe("existing threads in the diff", () => {
     );
     scroll.mockRestore();
   });
+
+  it("does not replay a handled jump when the Code tab is opened again", async () => {
+    const user = userEvent.setup();
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail();
+
+    const jumpedTo = () =>
+      scroll.mock.contexts.filter(
+        (el) => (el as HTMLElement).getAttribute?.("data-diff-row") === "RIGHT:11",
+      ).length;
+
+    await user.click(await screen.findByTestId("thread-anchor"));
+    await screen.findAllByTestId("code-file");
+    await waitFor(() => expect(jumpedTo()).toBe(1));
+
+    await user.click(screen.getByTestId("review-tab-summary"));
+    await openCodeTab(user);
+    // Give a replayed jump the frame it would scroll on.
+    await new Promise((r) => requestAnimationFrame(() => r(null)));
+    expect(jumpedTo()).toBe(1);
+    scroll.mockRestore();
+  });
+
+  it("lets the file a jump opened be collapsed again", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail();
+
+    await user.click(await screen.findByTestId("thread-anchor"));
+    const chevron = await screen.findByRole("button", { name: "Collapse src/a.ts" });
+    await user.click(chevron);
+    expect(screen.getByRole("button", { name: "Expand src/a.ts" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("lands an old-side thread on an unchanged line in unified, and keeps the row's tint", async () => {
+    const user = userEvent.setup();
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const animate = vi.fn();
+    const proto = HTMLElement.prototype as { animate?: unknown };
+    const hadAnimate = "animate" in proto;
+    const originalAnimate = proto.animate;
+    proto.animate = animate;
+    // Old line 12 is `const d = 5;`, which unified draws once as new 13.
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ side: "LEFT", line: 12 })]);
+    try {
+      renderDetail();
+      await user.click(await screen.findByTestId("thread-anchor"));
+      await screen.findAllByTestId("code-file");
+      await waitFor(() =>
+        expect(
+          scroll.mock.contexts.some(
+            (el) => (el as HTMLElement).getAttribute?.("data-diff-row") === "RIGHT:13",
+          ),
+        ).toBe(true),
+      );
+      expect(animate).toHaveBeenCalledTimes(1);
+      expect(
+        (animate.mock.contexts[0] as HTMLElement).getAttribute("data-diff-row"),
+      ).toBe("RIGHT:13");
+      // Laid over the row, never replacing its diff background.
+      const keyframes = animate.mock.calls[0][0] as Keyframe[];
+      expect(keyframes.every((k) => k.boxShadow && !("backgroundColor" in k))).toBe(true);
+    } finally {
+      if (hadAnimate) proto.animate = originalAnimate;
+      else delete proto.animate;
+      scroll.mockRestore();
+    }
+  });
+
+  it("offers no Reply toggle on a lone comment that cannot be answered", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([codeThread({ id: "T-right" })]);
+    renderDetail({ operations: { ...ALL_OPERATIONS, thread_reply: false } });
+    await openCodeTab(user);
+    await waitFor(() => expect(threadEl("T-right")).toHaveLength(1));
+    expect(screen.queryByTestId("code-thread-toggle-T-right")).not.toBeInTheDocument();
+  });
+
+  it("still says Applied after the thread is unfolded", async () => {
+    const user = userEvent.setup();
+    mockGetPrReviewThreads.mockResolvedValue([
+      codeThread({ id: "T-right", body: "```suggestion\nconst b = 30;\n```" }),
+    ]);
+    mockReadFile.mockResolvedValue(
+      [...Array.from({ length: 10 }, (_, i) => `// ${i + 1}`), "const b = 3;", ""].join("\n"),
+    );
+    renderDetail();
+    await openCodeTab(user);
+
+    await user.click(await screen.findByTestId("apply-suggestion"));
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-suggestion")).toHaveTextContent("Applied"),
+    );
+    // Unfolding swaps the collapsed comment for the full thread, which
+    // mounts the suggestion afresh.
+    await user.click(screen.getByTestId("code-thread-toggle-T-right"));
+    const again = screen.getByTestId("apply-suggestion");
+    expect(again).toHaveTextContent("Applied");
+    expect(again).toBeDisabled();
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+  });
 });

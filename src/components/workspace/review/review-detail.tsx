@@ -341,24 +341,32 @@ export function ReviewDetail(props: ReviewDetailProps) {
   // is still shown, and the thread's Send to agent still hands it over.
   const anchorIndex = useMemo(() => indexDiffRows(diffText), [diffText]);
   const canApplySuggestions = checkedOutHere && !readOnly;
+  // Kept up here, not in the suggestion block: folding a thread in Code
+  // remounts its comments, and a block that forgot it was applied would
+  // offer Apply again, then fail the match check on the second click.
+  const appliedSuggestions = useRef(new Set<string>());
   const suggestionTargetFor = useCallback<SuggestionResolver>(
     ({ path, side, start, end }) => {
       const original = originalLines(anchorIndex, path, side, start, end);
       const applicable = canApplySuggestions && side === "RIGHT" && original != null;
+      const appliedKey = (replacement: string[]) =>
+        [cwd, pr.number, path, start, end, replacement.join("\n")].join("\u0000");
       return {
         start,
         original,
+        isApplied: (replacement) => appliedSuggestions.current.has(appliedKey(replacement)),
         onApply: applicable
           ? async (replacement: string[]) => {
               const file = joinPath(cwd, path);
               const text = await readFile(file);
               await writeFile(file, applySuggestion(text, start, end, original, replacement));
+              appliedSuggestions.current.add(appliedKey(replacement));
               toast.success(`Applied to ${path}`);
             }
           : undefined,
       };
     },
-    [anchorIndex, canApplySuggestions, cwd],
+    [anchorIndex, canApplySuggestions, cwd, pr.number],
   );
 
   const unanchoredCount = lineDrafts.filter((d) => d.status === "unanchored").length;
@@ -474,6 +482,13 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const jumpToLine = useCallback<JumpToLine>((path, side, line) => {
     setActiveTab("code");
     setCodeIntent({ kind: "focus", path, side, line, nonce: Date.now() });
+  }, []);
+
+  // Dropped once the Code tab has acted on it: that tab remounts on
+  // every visit (and per PR), and a kept intent would replay the old
+  // jump each time.
+  const clearCodeIntent = useCallback((nonce: number) => {
+    setCodeIntent((current) => (current?.nonce === nonce ? null : current));
   }, []);
 
   // ── Check arithmetic, shared by the bar sentence and the rail ──
@@ -1164,6 +1179,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
           canCommentNow={operations.line_comments && !readOnly}
           onPosted={onRefresh}
           intent={codeIntent}
+          onIntentHandled={clearCodeIntent}
           threads={threads}
           onSendToAgent={canHandOff ? sendThreadToAgent : undefined}
           onReply={operations.thread_reply && !readOnly ? replyToThread : undefined}

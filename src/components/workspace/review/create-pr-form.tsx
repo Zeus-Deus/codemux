@@ -58,7 +58,8 @@ import {
 } from "@/lib/pr-draft";
 import type { ProviderPresentation } from "@/lib/source-control";
 import { toast } from "@/lib/toast";
-import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { aiTextCliSelection, utilitySelectionFromStores } from "@/lib/utility-agent";
+import { useAppStore } from "@/stores/app-store";
 import { cn } from "@/lib/utils";
 import {
   btnCard,
@@ -288,17 +289,15 @@ export function CreatePrForm({
     if (writing) return;
     setWriting(true);
     setError(null);
-    // The same provider choice as commit messages: the utility agent, and
-    // its model only when one is set for that provider.
-    const utility = utilitySelectionFromStores();
+    // The same CLI choice as commit messages, including the commit-message
+    // override: whoever set one did so because the default CLI does not
+    // work for them, and that holds here too.
+    const { cli, model } = aiTextCliSelection(
+      useAppStore.getState().appState?.config,
+      utilitySelectionFromStores(),
+    );
     try {
-      const draft = await generateAiPrDescription(
-        cwd,
-        baseBranch,
-        template,
-        utility?.provider ?? null,
-        utility?.model ?? null,
-      );
+      const draft = await generateAiPrDescription(cwd, baseBranch, template, cli, model);
       if (!mounted.current) return;
       setTitle(draft.title);
       setBody(draft.body);

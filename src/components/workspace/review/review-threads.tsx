@@ -32,6 +32,7 @@ import {
   tzMeta,
   tzMetaNum,
   tzRowTitle,
+  underRowInset,
 } from "./review-ui";
 
 function ReviewStateIcon({ state }: { state: string }) {
@@ -148,7 +149,10 @@ function AnchorPill({
       onClick={() => onJump(path, side, line)}
       className={cn(
         ANCHOR_PILL,
-        "min-w-0 transition-colors duration-100 hover:bg-accent/60 hover:text-foreground",
+        // Ember on hover: the muted-on-muted accent fill this had was
+        // close to invisible in dark mode, and the pill gave no sign of
+        // being clickable.
+        "min-w-0 outline-none transition-colors duration-100 hover:bg-accent-ember/15 hover:text-accent-ember focus-visible:ring-2 focus-visible:ring-ring/60",
         tzMeta,
       )}
     >
@@ -564,7 +568,7 @@ export function CodeThread(props: ThreadProps) {
 
   if (resolved && !open) {
     return (
-      <div className="my-0.5 ml-[72px] mr-3 font-sans whitespace-normal">
+      <div className={cn("my-0.5 font-sans whitespace-normal", underRowInset)}>
         <button
           type="button"
           data-testid="code-thread"
@@ -586,7 +590,10 @@ export function CodeThread(props: ThreadProps) {
     );
   }
 
-  const toggle = (
+  // With no replies and no way to write one, opening the thread would
+  // show the same single comment again, so there is nothing to toggle.
+  const canOpen = open || replies > 0 || !!props.onReply;
+  const toggle = canOpen && (
     <button
       type="button"
       data-testid={`code-thread-toggle-${thread.id}`}
@@ -609,7 +616,10 @@ export function CodeThread(props: ThreadProps) {
       data-testid="code-thread"
       data-thread-id={thread.id}
       data-resolved={resolved ? "true" : "false"}
-      className="my-1 ml-[72px] mr-3 space-y-2 rounded-md bg-surface-1 px-3 py-2 font-sans whitespace-normal"
+      className={cn(
+        "my-1 space-y-2 rounded-md bg-surface-1 px-3 py-2 font-sans whitespace-normal",
+        underRowInset,
+      )}
     >
       {thread.is_outdated && <OutdatedLabel />}
       {open ? (

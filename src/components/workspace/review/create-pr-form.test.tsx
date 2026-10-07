@@ -57,7 +57,8 @@ vi.mock("@/tauri/commands", () => ({
   }),
 }));
 
-vi.mock("@/lib/utility-agent", () => ({
+vi.mock("@/lib/utility-agent", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/utility-agent")>()),
   utilitySelectionFromStores: () => ({ provider: "codex", model: "gpt-mini", effort: null }),
 }));
 

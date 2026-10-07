@@ -18,6 +18,9 @@ export interface SuggestionTarget {
   /** Absent ⇒ no Apply button: the branch is not checked out here, or
    *  the original lines are unknown. */
   onApply?: (replacement: string[]) => Promise<unknown>;
+  /** Whether this replacement was already applied in this session, so a
+   *  remounted block shows Applied instead of offering it again. */
+  isApplied?: (replacement: string[]) => boolean;
 }
 
 /**
@@ -61,7 +64,9 @@ function SuggestionBlock({
   lines: string[];
   target: SuggestionTarget | null;
 }) {
-  const [state, setState] = useState<"idle" | "applying" | "applied">("idle");
+  const [state, setState] = useState<"idle" | "applying" | "applied">(() =>
+    target?.isApplied?.(lines) ? "applied" : "idle",
+  );
 
   const diffLines = useMemo(() => {
     const start = target?.start ?? null;

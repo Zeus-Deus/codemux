@@ -16,7 +16,15 @@ import {
   useOptimisticResolve,
   type SuggestionResolver,
 } from "./review-threads";
-import { btnCard, tzBody, tzBodyLg, tzEyebrow, tzMeta, tzMetaNum } from "./review-ui";
+import {
+  btnCard,
+  tzBody,
+  tzBodyLg,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
+  underRowInset,
+} from "./review-ui";
 import {
   addLineDraft,
   getDiffSnapshot,
@@ -68,6 +76,12 @@ interface Props {
   onPosted: () => void;
   intent: CodeTabIntent | null;
   /**
+   * Called with an intent's nonce once it has been acted on, so the
+   * owner can drop it. This tab unmounts whenever another tab is shown,
+   * and a pending intent would otherwise replay on every return here.
+   */
+  onIntentHandled?: (nonce: number) => void;
+  /**
    * The conversation already on this diff, drawn under the lines it is
    * about so nobody repeats a point a reviewer or a bot already made.
    */
@@ -88,17 +102,47 @@ function threadKey(path: string, side: DiffRowSide, line: number): string {
  * A brief ember wash on a row someone was sent to, so the eye lands on
  * it after the scroll. Skipped under reduced motion, where the scroll
  * alone is the signal.
+ *
+ * Painted as a full-size inset shadow, which sits over the row's own
+ * background instead of replacing it: animating `backgroundColor` wiped
+ * the green or red diff tint for the length of the flash. The wash holds
+ * for the first part so it is still there when a smooth scroll lands.
  */
+const FLASH_WASH = "inset 0 0 0 100vmax color-mix(in oklch, var(--accent-ember) 25%, transparent)";
+const FLASH_CLEAR = "inset 0 0 0 100vmax transparent";
+
 function flashRow(el: HTMLElement) {
   if (typeof el.animate !== "function") return;
   if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
   el.animate(
     [
-      { backgroundColor: "color-mix(in oklch, var(--accent-ember) 20%, transparent)" },
-      { backgroundColor: "transparent" },
+      { boxShadow: FLASH_WASH, offset: 0 },
+      { boxShadow: FLASH_WASH, offset: 0.4 },
+      { boxShadow: FLASH_CLEAR, offset: 1 },
     ],
-    { duration: 600, easing: "ease-out" },
+    { duration: 900, easing: "ease-out" },
   );
+}
+
+/**
+ * The row a focus lands on. Unified layout draws an unchanged line once,
+ * addressed by its new number, so a thread written on the old side of it
+ * has no `LEFT:<old>` row; it is found through the parsed file instead.
+ */
+function findFocusRow(
+  fileEl: HTMLElement,
+  lines: DiffLine[] | undefined,
+  side: DiffRowSide,
+  line: number,
+): HTMLElement | null {
+  const direct = fileEl.querySelector<HTMLElement>(`[data-diff-row="${side}:${line}"]`);
+  if (direct || side !== "LEFT" || !lines) return direct;
+  const context = lines.find(
+    (l) => l.type === "context" && l.oldLine === line && l.newLine != null,
+  );
+  return context
+    ? fileEl.querySelector<HTMLElement>(`[data-diff-row="RIGHT:${context.newLine}"]`)
+    : null;
 }
 
 function scrollBehavior(): ScrollBehavior {
@@ -126,6 +170,7 @@ export function ReviewCodeTab({
   canCommentNow,
   onPosted,
   intent,
+  onIntentHandled,
   threads = NO_THREADS,
   onSendToAgent,
   onReply,
@@ -179,10 +224,14 @@ export function ReviewCodeTab({
   const repinPath = repinId ? (drafts.find((d) => d.id === repinId)?.path ?? null) : null;
 
   // ── Intents from the drift notice ──
+  // The ref only guards against handling one intent twice in this mount
+  // (the effect reruns as drafts change); the owner clearing it is what
+  // stops a remount from treating it as new.
   const handledNonce = useRef(0);
   useEffect(() => {
     if (!intent || intent.nonce === handledNonce.current) return;
     handledNonce.current = intent.nonce;
+    onIntentHandled?.(intent.nonce);
     if (intent.kind === "focus") {
       setOldDiffOid(null);
       setFocus({
@@ -207,7 +256,7 @@ export function ReviewCodeTab({
       setRepinId(first.id);
       scrollToFile(first.path);
     }
-  }, [intent, drafts, draftKey]);
+  }, [intent, drafts, draftKey, onIntentHandled]);
 
   const scrollToFile = (path: string) => {
     // Deferred a frame: the file may only expand as a result of the
@@ -237,9 +286,8 @@ export function ReviewCodeTab({
       const file = rootRef.current?.querySelector<HTMLElement>(
         `[data-file-path="${CSS.escape(focus.path)}"]`,
       );
-      const row = file?.querySelector<HTMLElement>(
-        `[data-diff-row="${focus.side}:${focus.line}"]`,
-      );
+      const lines = files.find((f) => f.path === focus.path)?.lines;
+      const row = file ? findFocusRow(file, lines, focus.side, focus.line) : null;
       // A file too large to render by default has no rows yet; its
       // header is the nearest honest place to land.
       (row ?? file)?.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
@@ -600,7 +648,7 @@ export function ReviewCodeTab({
     // from the header to the action bar, and a diff with its own
     // scrollbar inside it turns "keep reading" into "find the right
     // scrollbar first".
-    <div ref={rootRef} className="flex flex-1 flex-col">
+    <div ref={rootRef} className="@container flex flex-1 flex-col">
       <div className="flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
         <span className={cn("flex-1 text-muted-foreground", tzMetaNum)}>
           {files.length === 1 ? "1 file" : `${files.length} files`} changed
@@ -739,6 +787,10 @@ export function ReviewCodeTab({
                 if (focus?.path === file.path) setFocus(null);
                 toggleFileViewed(draftKey, file.path);
               }}
+              // So is folding it by hand.
+              onCollapse={() => {
+                if (focus?.path === file.path) setFocus(null);
+              }}
               // Reading a stale snapshot is reading, not reviewing:
               // notes written there would anchor to lines that are gone.
               selection={showingOld ? undefined : selectionFor(file)}
@@ -778,7 +830,7 @@ function PendingNote({
     <div
       data-testid="pending-note"
       data-note-status={note.status}
-      className="my-1 ml-[72px] mr-3 rounded-lg bg-accent-ember/10 px-3 py-2"
+      className={cn("my-1 rounded-lg bg-accent-ember/10 px-3 py-2", underRowInset)}
     >
       <div className="flex items-center gap-2">
         <span className={cn("font-mono text-accent-ember", tzMeta)}>

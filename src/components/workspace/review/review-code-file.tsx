@@ -26,6 +26,9 @@ interface Props {
   pendingNotes: number;
   /** Force the body open (the re-anchor flow scrolls here). */
   forceOpen?: boolean;
+  /** The header's chevron folded the file; lets the owner stop forcing
+   *  it open. */
+  onCollapse?: () => void;
 }
 
 /**
@@ -44,6 +47,7 @@ export function ReviewCodeFile({
   selection,
   pendingNotes,
   forceOpen = false,
+  onCollapse,
 }: Props) {
   const [manuallyCollapsed, setManuallyCollapsed] = useState(false);
   // Numbers, not vibes: a 2,000-line file is opened on request, not by
@@ -76,7 +80,17 @@ export function ReviewCodeFile({
           type="button"
           aria-label={collapsed ? `Expand ${file.path}` : `Collapse ${file.path}`}
           aria-expanded={!collapsed}
-          onClick={() => setManuallyCollapsed((c) => !c)}
+          // Set from what is shown, not toggled: a file held open by
+          // `forceOpen` can already be marked collapsed underneath, and a
+          // toggle would then unfold it while the label says Collapse.
+          onClick={() => {
+            if (collapsed) {
+              setManuallyCollapsed(false);
+              return;
+            }
+            setManuallyCollapsed(true);
+            onCollapse?.();
+          }}
           className="shrink-0 text-muted-foreground hover:text-foreground"
         >
           {collapsed ? (

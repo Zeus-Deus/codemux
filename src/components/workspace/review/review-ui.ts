@@ -42,6 +42,15 @@ export const tzPageTitle = "text-[1.0625rem]";
 /** Check-log excerpts — mono, quieter than the diff it explains. */
 export const tzLog = "text-body-sm";
 
+/**
+ * The side margins of a card drawn under a diff row (a thread, a pending
+ * note, the composer). It starts at the code column, past the 72px
+ * gutter; in a narrow Code tab that indent would leave a suggestion diff
+ * a sliver of width, so below `@md` the card takes it back. Needs the
+ * `@container` the Code tab root sets.
+ */
+export const underRowInset = "ml-3 mr-3 @md:ml-[72px]";
+
 /*
  * Deliberately no token for the diff body.
  *
