@@ -24,6 +24,11 @@ vi.mock("@/tauri/commands", async (importActual) => {
   };
 });
 
+const { mockToastError } = vi.hoisted(() => ({ mockToastError: vi.fn() }));
+vi.mock("@/lib/toast", () => ({
+  toast: { error: mockToastError, success: vi.fn(), info: vi.fn() },
+}));
+
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
@@ -293,6 +298,40 @@ describe("McpSection", () => {
     await waitFor(() => {
       expect(stopMcpServerCmd).toHaveBeenCalledWith("id-toggle");
     });
+  });
+
+  it("tells the user when stopping a server fails", async () => {
+    const { stopMcpServerCmd } = (await import(
+      "@/tauri/commands"
+    )) as unknown as Record<string, ReturnType<typeof vi.fn>>;
+    stopMcpServerCmd.mockRejectedValueOnce(new Error("process busy"));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    listMcpServersMock.mockResolvedValueOnce([
+      makeServer({ id: "id-fail", name: "flaky", sources: ["claudeUser"] }),
+    ]);
+
+    render(<McpSection projectRoot={null} />);
+
+    fireEvent.click(await screen.findByTestId("mcp-row-id-fail-toggle"));
+
+    await waitFor(() => {
+      expect(mockToastError).toHaveBeenCalledWith("Couldn't stop flaky", {
+        description: "process busy",
+      });
+    });
+  });
+
+  it("reveals View tools on keyboard focus and touch, not only hover", async () => {
+    listMcpServersMock.mockResolvedValueOnce([
+      makeServer({ id: "id-view", name: "viewable", sources: ["claudeUser"] }),
+    ]);
+
+    render(<McpSection projectRoot={null} />);
+
+    const view = await screen.findByTestId("mcp-row-id-view-view");
+    expect(view.className).toContain("group-focus-within:opacity-100");
+    expect(view.className).toContain("pointer-coarse:opacity-100");
   });
 
   it("does NOT show a disambiguator when a name appears only once", async () => {
