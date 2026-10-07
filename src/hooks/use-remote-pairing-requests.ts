@@ -16,6 +16,13 @@ import type { WebRemoteSessionView, WebRemoteStatus } from "@/tauri/types";
 
 const toastId = (sessionId: string) => `remote-pairing-${sessionId}`;
 
+/** "Linux · Chrome" → "Chrome on Linux": prose wraps cleanly in a narrow
+ *  toast, where a "·" list leaves a dangling separator at the line end. */
+function platformPhrase(platform: string): string {
+  const [os, browser] = platform.split(" · ");
+  return browser ? `${browser} on ${os}` : os;
+}
+
 function askToApprove(session: WebRemoteSessionView): void {
   const device = describeDevice(session.name, session.user_agent);
   const how =
@@ -26,7 +33,7 @@ function askToApprove(session: WebRemoteSessionView): void {
     id: toastId(session.id),
     // The browser waits until someone answers, so the question stays up.
     duration: Infinity,
-    description: device.platform ? `${how} · ${device.platform}` : how,
+    description: device.platform ? `${platformPhrase(device.platform)}. ${how}.` : `${how}.`,
     action: {
       label: "Approve",
       onClick: () => {
@@ -65,6 +72,9 @@ export function useRemotePairingRequests(): void {
     // Null until the first snapshot, so requests from before launch are seen
     // as known rather than new.
     let previous: WebRemoteSessionView[] | null = null;
+    // Events that beat the first snapshot, replayed once it lands so a
+    // request that arrives during startup is still announced.
+    let early: WebRemoteStatus[] = [];
     const asked = new Set<string>();
 
     const apply = (status: WebRemoteStatus, announce: boolean) => {
@@ -84,14 +94,18 @@ export function useRemotePairingRequests(): void {
       previous = status.sessions;
     };
 
-    webRemoteStatus()
-      .then((status) => {
-        if (!disposed && !previous) apply(status, false);
-      })
-      .catch(() => {
-        previous ??= [];
-      });
-    onWebRemoteStateChanged((status) => apply(status, true))
+    const seed = (status: WebRemoteStatus | null) => {
+      if (disposed || previous) return;
+      if (status) apply(status, false);
+      else previous = [];
+      for (const event of early) apply(event, true);
+      early = [];
+    };
+    webRemoteStatus().then(seed, () => seed(null));
+    onWebRemoteStateChanged((status) => {
+      if (previous) apply(status, true);
+      else early.push(status);
+    })
       .then((fn) => {
         if (disposed) fn();
         else unlisten = fn;

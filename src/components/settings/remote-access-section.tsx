@@ -1392,9 +1392,9 @@ export function RemoteAccessSection() {
       setSessionBusy(id);
       try {
         setStatus(await webRemoteApproveSession(id));
-        toast.success("Device approved.");
+        toast.success("Browser approved.");
       } catch (err) {
-        toast.error(`Couldn't approve the device: ${String(err)}`);
+        toast.error(`Couldn't approve the browser: ${String(err)}`);
       } finally {
         setSessionBusy(null);
       }
@@ -1409,7 +1409,7 @@ export function RemoteAccessSection() {
         setStatus(await webRemoteRejectSession(id));
         toast.success("Request rejected.");
       } catch (err) {
-        toast.error(`Couldn't reject the device: ${String(err)}`);
+        toast.error(`Couldn't reject the browser: ${String(err)}`);
       } finally {
         setSessionBusy(null);
       }
@@ -1422,9 +1422,9 @@ export function RemoteAccessSection() {
       setSessionBusy(id);
       try {
         setStatus(await webRemoteRevokeSession(id));
-        toast.success("Device revoked — its access is now blocked.");
+        toast.success("Browser revoked. Its access is now blocked.");
       } catch (err) {
-        toast.error(`Couldn't revoke the device: ${String(err)}`);
+        toast.error(`Couldn't revoke the browser: ${String(err)}`);
       } finally {
         setSessionBusy(null);
       }
@@ -1442,7 +1442,7 @@ export function RemoteAccessSection() {
       if (last) setStatus(last);
       toast.success("Revoked every browser.");
     } catch (err) {
-      toast.error(`Couldn't revoke every device: ${String(err)}`);
+      toast.error(`Couldn't revoke every browser: ${String(err)}`);
     } finally {
       setRevokingAll(false);
     }
@@ -1453,7 +1453,7 @@ export function RemoteAccessSection() {
   const accountApprovalRow = (
     <SettingRow
       title="Approve browsers that sign in with your account"
-      detail="A new browser on your account waits under Devices until you approve it. Applies to both ways in."
+      detail="A new browser on your account waits under Paired browsers until you approve it. Applies to both ways in."
       checked={!trustAccountBrowsers}
       onCheckedChange={handleToggleAccountApproval}
       disabled={trustAccountPending}
@@ -1839,8 +1839,8 @@ export function RemoteAccessSection() {
 
               <div className="border-t border-border/60 pt-4">
                 <SettingRow
-                  title="Approve devices that use a pairing link"
-                  detail="A device that opens a valid pairing link waits under Devices until you approve it. When off, the link connects right away."
+                  title="Approve browsers that use a pairing link"
+                  detail="A browser that opens a valid pairing link waits under Paired browsers until you approve it. When off, the link connects right away."
                   checked={requireApproval}
                   onCheckedChange={handleToggleApproval}
                   disabled={approvalPending}

@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -38,9 +39,17 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 import { HostsSection } from "./hosts-section";
-import { hostsList, hostsReinstallRemote, hostsStatusList } from "@/tauri/commands";
+import {
+  hostsList,
+  hostsReinstallRemote,
+  hostsStatusList,
+  hostsTestConnection,
+} from "@/tauri/commands";
 import { toast } from "@/lib/toast";
-import { __resetHostStatusStoreForTests } from "@/stores/host-status-store";
+import {
+  __resetHostStatusStoreForTests,
+  useHostStatusStore,
+} from "@/stores/host-status-store";
 
 const hostsListMock = hostsList as unknown as ReturnType<typeof vi.fn>;
 const hostsReinstallRemoteMock =
@@ -101,6 +110,36 @@ describe("HostsSection — status dots", () => {
         "Unreachable",
       ]);
     });
+  });
+});
+
+describe("HostsSection — Test vs live status", () => {
+  it("shows a Test result until the poller reports again", async () => {
+    const row = (reachable: boolean) => ({
+      host_id: 1,
+      probed: true,
+      reachable,
+      last_seen_at: null,
+      last_error: null,
+      disk_bytes: null,
+      remote_control_serving: false,
+    });
+    hostsListMock.mockResolvedValue([makeHost({ id: 1, name: "homelab" })]);
+    vi.mocked(hostsStatusList).mockResolvedValue([row(true)]);
+    vi.mocked(hostsTestConnection).mockResolvedValue({
+      ok: false,
+      message: "connection timed out",
+    });
+    const dotTitle = () => screen.getByTestId("host-status-dot").getAttribute("title");
+
+    render(<HostsSection />);
+    await waitFor(() => expect(dotTitle()).toBe("Online"));
+
+    fireEvent.click(await screen.findByRole("button", { name: /test now/i }));
+    await waitFor(() => expect(dotTitle()).toBe("Unreachable"));
+
+    act(() => useHostStatusStore.getState().applyAll([row(true)]));
+    await waitFor(() => expect(dotTitle()).toBe("Online"));
   });
 });
 

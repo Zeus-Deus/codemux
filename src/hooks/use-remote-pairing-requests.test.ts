@@ -119,6 +119,44 @@ describe("useRemotePairingRequests", () => {
     expect(toast.dismiss).toHaveBeenCalledWith(opts.id);
   });
 
+  it("says what is asking in plain words", async () => {
+    await mounted();
+    events.cb?.(
+      status([
+        sess({
+          id: "new",
+          name: "iPhone",
+          approved: false,
+          user_agent:
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        }),
+      ]),
+    );
+    const [, opts] = firstQuestion();
+    expect((opts as ToastOpts & { description: string }).description).toBe(
+      "Chrome on Linux. Used a pairing link.",
+    );
+  });
+
+  it("announces a request that arrives before the first snapshot", async () => {
+    let seed: (s: WebRemoteStatus) => void = () => {};
+    cmds.webRemoteStatus.mockReturnValue(
+      new Promise<WebRemoteStatus>((resolve) => {
+        seed = resolve;
+      }),
+    );
+    renderHook(() => useRemotePairingRequests());
+    await waitFor(() => expect(events.cb).not.toBeNull());
+
+    events.cb?.(status([sess({ id: "new", name: "iPhone", approved: false })]));
+    expect(toast.info).not.toHaveBeenCalled();
+
+    seed(status([]));
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith("iPhone wants to connect", expect.anything()),
+    );
+  });
+
   it("does nothing in a remote browser, which cannot approve others", async () => {
     (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
     renderHook(() => useRemotePairingRequests());

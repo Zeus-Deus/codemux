@@ -120,8 +120,15 @@ export function HostsSection() {
   );
   const [testingId, setTestingId] = useState<number | null>(null);
   // The background poller's view, so the list shows who is online without a
-  // Test press. An explicit Test result is newer, so it takes precedence.
+  // Test press. A Test result wins only until the poller reports again, so the
+  // dot always shows the newest observation.
   const liveStatuses = useHostStatuses();
+  const [testIsNewer, setTestIsNewer] = useState<ReadonlySet<number>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    setTestIsNewer((prev) => (prev.size === 0 ? prev : new Set()));
+  }, [liveStatuses]);
   const [installingId, setInstallingId] = useState<number | null>(null);
   const [reinstallingId, setReinstallingId] = useState<number | null>(null);
 
@@ -253,6 +260,7 @@ export function HostsSection() {
         },
       }));
     } finally {
+      setTestIsNewer((prev) => new Set(prev).add(host.id));
       setTestingId(null);
     }
   }, []);
@@ -364,8 +372,9 @@ export function HostsSection() {
           {hosts.map((host) => {
             const tested = testResults[host.id];
             const live = liveStatuses[host.id];
-            const isOnline = tested ? tested.ok : live?.reachable === true;
-            const checked = tested !== undefined || live?.probed === true;
+            const useTest = tested !== undefined && (testIsNewer.has(host.id) || !live);
+            const isOnline = useTest ? tested.ok : live?.reachable === true;
+            const checked = useTest || live?.probed === true;
             return (
               <li key={host.id}>
                 <button

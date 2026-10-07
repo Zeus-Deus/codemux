@@ -362,6 +362,11 @@ export function ConnectScreen(props: {
  *  Matches the hosted relay's approval deadline. */
 export const APPROVAL_TIMEOUT_MS = 5 * 60_000;
 
+/** How long a reconnect with a stored session may take before the page offers
+ *  a way out. A stored session can still be waiting for approval (the tab was
+ *  reloaded or discarded mid-wait), and the transport keeps polling quietly. */
+export const CONNECT_GRACE_MS = 3_000;
+
 export function ConnectingView(props: {
   host: string;
   waiting: boolean;
@@ -395,7 +400,7 @@ export function ConnectingView(props: {
           }}
         >
           {props.waiting
-            ? `Approve this browser on the desktop app to finish connecting to ${props.host}. The request expires after ${APPROVAL_TIMEOUT_MS / 60_000} minutes.`
+            ? `Approve this browser on the desktop app to finish connecting to ${props.host}. This page stops waiting after ${APPROVAL_TIMEOUT_MS / 60_000} minutes.`
             : `Reaching ${props.host}…`}
         </div>
         <button type="button" style={switchLinkStyle} onClick={props.onCancel}>
@@ -419,7 +424,7 @@ export function pairingNotice(
     return "Nobody approved this browser in time. Pair again, and approve the request on the desktop when it appears.";
   }
   return wasWaiting
-    ? "The desktop declined this browser. Ask for a new pairing link to try again."
+    ? "The desktop declined this browser. Connect again and ask for it to be approved on the desktop."
     : "This browser is no longer paired. Pair again to continue.";
 }
 
@@ -513,8 +518,9 @@ export async function bootstrapRemote(): Promise<void> {
     });
 
     let approvalTimer: number | undefined;
+    let graceTimer: number | undefined;
     const outcome = await new Promise<ConnectOutcome>((resolve) => {
-      if (waiting || cameFromPairing) {
+      const showConnecting = () =>
         overlay.render(
           <ConnectingView
             host={host}
@@ -522,7 +528,10 @@ export async function bootstrapRemote(): Promise<void> {
             onCancel={() => resolve("cancelled")}
           />,
         );
-      }
+      if (waiting || cameFromPairing) showConnecting();
+      // A stored session usually reconnects at once behind the splash; only
+      // offer Cancel when it doesn't.
+      else graceTimer = window.setTimeout(showConnecting, CONNECT_GRACE_MS);
       if (waiting) {
         approvalTimer = window.setTimeout(
           () => resolve("timed-out"),
@@ -535,6 +544,7 @@ export async function bootstrapRemote(): Promise<void> {
       );
     });
     window.clearTimeout(approvalTimer);
+    window.clearTimeout(graceTimer);
     if (outcome === "connected") break;
 
     // Declined, revoked, timed out or cancelled: drop the session and
