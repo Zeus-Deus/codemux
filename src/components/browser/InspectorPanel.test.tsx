@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 
 import type { ElementInfo } from "./inspector";
 import { InspectorPanel } from "./InspectorPanel";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const element: ElementInfo = {
   tag: "button",
@@ -17,10 +18,12 @@ const element: ElementInfo = {
 
 afterEach(() => cleanup());
 
+const renderPanel = (ui: React.ReactElement) => render(<TooltipProvider>{ui}</TooltipProvider>);
+
 describe("InspectorPanel", () => {
   it("sends the element to the named agent", async () => {
     const onTellAgent = vi.fn();
-    render(
+    renderPanel(
       <InspectorPanel
         element={element}
         agentTargetTitle="Claude"
@@ -29,13 +32,13 @@ describe("InspectorPanel", () => {
       />,
     );
     const send = screen.getByRole("button", { name: "Send to agent" });
-    expect(send.parentElement).toHaveAttribute("title", "Send to agent (Claude)");
+    expect(send).toHaveTextContent("Send to agent");
     await userEvent.click(send);
     expect(onTellAgent).toHaveBeenCalledWith(element);
   });
 
   it("disables sending when the workspace has no agent", () => {
-    render(
+    renderPanel(
       <InspectorPanel
         element={element}
         agentTargetTitle={null}
@@ -45,6 +48,7 @@ describe("InspectorPanel", () => {
     );
     const send = screen.getByRole("button", { name: "Send to agent" });
     expect(send).toBeDisabled();
-    expect(send.parentElement).toHaveAttribute("title", "No agent in this workspace");
+    // The reason is readable without hovering: the disabled button points at it.
+    expect(send).toHaveAccessibleDescription("No agent in this workspace");
   });
 });

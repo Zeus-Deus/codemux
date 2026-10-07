@@ -227,7 +227,7 @@ export function BrowserToolbar({
           aria-invalid={error ? true : undefined}
           aria-describedby={error ? errorId : undefined}
           list={portSuggestions.length > 0 ? portsListId : undefined}
-          className="h-6 flex-1 text-label bg-background border-none px-2 aria-invalid:ring-1"
+          className="h-6 flex-1 text-label bg-background border-none px-2 aria-invalid:ring-1 [&::-webkit-calendar-picker-indicator]:hidden"
         />
         {portSuggestions.length > 0 && (
           <datalist id={portsListId}>

@@ -1136,7 +1136,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           tabIndex={0}
           aria-label="Browser page"
           // The canvas takes every key, so focus has to show on it.
-          className="absolute inset-0 w-full h-full outline-none focus:outline-solid focus:outline-1 focus:-outline-offset-1 focus:outline-ring/60"
+          className="absolute inset-0 w-full h-full outline-none focus:outline-solid focus:outline-2 focus:-outline-offset-2 focus:outline-ring"
           onPointerDown={handlePointerDown}
           onPointerUp={handlePointerUp}
           onPointerMove={handlePointerMove}

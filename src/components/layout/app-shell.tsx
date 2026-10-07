@@ -104,6 +104,12 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const fileSearchOpen = useUIStore((s) => s.showFileSearch);
   const contentSearchOpen = useUIStore((s) => s.showContentSearch);
   const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null);
+  // Once opened, the peek stays mounted so it can play its own exit animation;
+  // it renders nothing while closed.
+  const [browserPeekMounted, setBrowserPeekMounted] = useState(false);
+  useEffect(() => {
+    if (browserPeekOpen) setBrowserPeekMounted(true);
+  }, [browserPeekOpen]);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   // Width lives in the persisted UI store: the full-screen pages below
@@ -322,7 +328,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
               inside this `relative` SidebarInset, so it floats over
               WorkspaceMain without resizing it. Renders nothing unless
               GUI chrome applies and the peek is explicitly opened. */}
-          {browserPeekOpen && (
+          {(browserPeekOpen || browserPeekMounted) && (
             <LazyBoundary
               label="browser peek"
               className="absolute right-3.5 top-3.5 z-30 h-[300px] w-[440px] rounded-lg border border-border"

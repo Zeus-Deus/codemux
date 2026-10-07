@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Copy, Check, MessageSquarePlus, X } from "lucide-react";
 import type { ElementInfo } from "./inspector";
 
@@ -14,6 +15,7 @@ interface Props {
 
 export function InspectorPanel({ element, agentTargetTitle, onDismiss, onTellAgent }: Props) {
   const [copied, setCopied] = useState(false);
+  const noAgentId = useId();
 
   const copySelector = async () => {
     await navigator.clipboard.writeText(element.selector);
@@ -54,18 +56,30 @@ export function InspectorPanel({ element, agentTargetTitle, onDismiss, onTellAge
         >
           {copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
         </Button>
-        {/* The wrapper carries the tooltip: a disabled button gets no hover. */}
-        <span title={sendTitle} className="inline-flex">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Send to agent"
-            disabled={!agentTargetTitle}
-            onClick={() => onTellAgent(element)}
-          >
-            <MessageSquarePlus className="size-3" />
-          </Button>
-        </span>
+        {/* The wrapper is the tooltip trigger: a disabled button gets no hover,
+            and the reason it is disabled must still be readable. */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex" tabIndex={agentTargetTitle ? undefined : 0}>
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-describedby={agentTargetTitle ? undefined : noAgentId}
+                disabled={!agentTargetTitle}
+                onClick={() => onTellAgent(element)}
+              >
+                <MessageSquarePlus className="size-3" aria-hidden />
+                Send to agent
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{sendTitle}</TooltipContent>
+        </Tooltip>
+        {!agentTargetTitle && (
+          <span id={noAgentId} className="sr-only">
+            {sendTitle}
+          </span>
+        )}
         <Button
           variant="ghost"
           size="icon-xs"
