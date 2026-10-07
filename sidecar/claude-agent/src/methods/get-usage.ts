@@ -35,6 +35,22 @@ function hasControlRequest(handle: unknown): handle is ControlRequester {
   );
 }
 
+/** The deployed CLI rejected the control request because it does not know
+ *  the subtype. Reported with its own JSON-RPC code so the caller can tell
+ *  an outdated CLI from a failed read without parsing message text. */
+export class CliUnsupportedError extends Error {
+  override readonly name = "CliUnsupportedError";
+}
+
+/** The CLI's own rejection of a control request it does not implement. */
+export function isUnsupportedSubtypeRejection(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.startsWith("Unsupported control request subtype") ||
+    message.includes("get_usage is not supported")
+  );
+}
+
 /** Yields nothing until aborted, so the CLI initializes but never runs a turn. */
 function emptyPromptStream(
   signal: AbortSignal,
@@ -71,10 +87,18 @@ export async function getUsage(input: GetUsageInput): Promise<unknown> {
     }
     // `skip_behaviors` skips the CLI's scan of the last week of
     // transcripts; a usage meter only needs the plan windows.
-    const reply = await handle.request({
-      subtype: "get_usage",
-      skip_behaviors: true,
-    });
+    let reply: { response?: unknown };
+    try {
+      reply = await handle.request({
+        subtype: "get_usage",
+        skip_behaviors: true,
+      });
+    } catch (err) {
+      if (isUnsupportedSubtypeRejection(err)) {
+        throw new CliUnsupportedError(err instanceof Error ? err.message : String(err));
+      }
+      throw err;
+    }
     return reply.response ?? null;
   } finally {
     controller.abort();

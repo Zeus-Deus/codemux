@@ -27,6 +27,10 @@ use crate::agent_provider::{
 use crate::commands::usage::{PlanQuotaStore, ProviderQuota};
 use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 
+/// The sidecar's JSON-RPC error code for a control request the deployed
+/// Claude CLI does not implement (`RPC_CLI_UNSUPPORTED` in its `rpc.ts`).
+const SIDECAR_CLI_UNSUPPORTED: i64 = -32001;
+
 /// Upper bound on one provider read, spawn included. A probe that hangs must
 /// not hold the refresh button forever.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
@@ -205,13 +209,13 @@ async fn probe_claude() -> Result<QuotaReading, ProbeError> {
         .await;
     let _ = child.shutdown().await;
     let response = response.map_err(|e| {
-        let message = e.to_string();
-        // A CLI that predates `get_usage` refuses the subtype; that is a
-        // version gap, not a broken install.
-        if message.contains("get_usage") || message.contains("Unsupported") {
+        // A CLI that predates `get_usage` refuses the subtype; the sidecar
+        // reports exactly that with its own code. It is a version gap, not a
+        // broken install. Everything else is a real failure.
+        if matches!(&e, RpcChildError::RpcError(rpc) if rpc.code == SIDECAR_CLI_UNSUPPORTED) {
             ProbeError::Unavailable("Update Claude Code to read plan limits.".into())
         } else {
-            ProbeError::Failed(message)
+            ProbeError::Failed(e.to_string())
         }
     })?;
     Ok(claude_reading_from_get_usage(&response))

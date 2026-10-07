@@ -276,11 +276,13 @@ function ProviderLimits({
 
       {windows.length > 0 && (
         <div className="grid grid-cols-[minmax(0,9.5rem)_4.75rem_minmax(0,1fr)_1rem_7.5rem] items-center gap-x-4 gap-y-1.5 rounded-lg border border-border/60 bg-muted/30 px-4 py-3">
-          {windows.map((window) => {
+          {windows.map((window, index) => {
             const pace = paceOf(window, now);
             const resetsIn = formatResetsIn(window, now);
             return (
-              <div key={`${window.kind}:${window.label ?? ""}`} className="contents">
+              // Kind and label alone can repeat: Codex reports both of its
+              // windows as label-less "other" when it omits their length.
+              <div key={`${window.kind}:${window.label ?? ""}:${index}`} className="contents">
                 <span className="truncate text-label text-muted-foreground">
                   {limitWindowLabel(window)}
                 </span>

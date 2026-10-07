@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::agent_provider::{PlanAuthMode, PlanUsageWindow};
+use crate::agent_provider::{PlanAuthMode, PlanUsageWindow, PlanWindowKind};
 use crate::database::{DatabaseStore, UsageLedgerRow};
 
 /// Live plan-quota readings, keyed by provider.
@@ -54,6 +54,11 @@ impl PlanQuotaStore {
     ///
     /// Within a field the newest value wins — an empty `windows` list is
     /// treated as "nothing to say", not as "no quota".
+    ///
+    /// Windows merge one by one rather than replacing the list: Claude's
+    /// streamed `rate_limit_event` names a single window, and replacing the
+    /// list with it would drop every other window a direct read (see
+    /// [`replace_windows`](Self::replace_windows)) established.
     pub fn record(
         &self,
         provider: &str,
@@ -66,8 +71,8 @@ impl PlanQuotaStore {
             return;
         };
         let entry = map.entry(provider.to_string()).or_default();
-        if !windows.is_empty() {
-            entry.windows = windows;
+        for window in windows {
+            merge_window(&mut entry.windows, window);
         }
         if plan_label.is_some() {
             entry.plan_label = plan_label;
@@ -134,6 +139,62 @@ impl PlanQuotaStore {
         let map = self.inner.lock().ok()?;
         earliest_exhausted_reset(&map.get(provider)?.windows, now_ms)
     }
+}
+
+/// The streamed name for the weekly bucket of the model included in overage.
+/// A direct read names the same bucket by the model's display name instead.
+const OVERAGE_INCLUDED_EVENT_LABEL: &str = "seven_day_overage_included";
+/// Label prefix the direct read gives model-scoped weekly windows.
+const MODEL_SCOPED_WEEKLY_PREFIX: &str = "Weekly · ";
+/// Label of the streamed overage window, which carries no utilization.
+const STREAMED_OVERAGE_LABEL: &str = "overage";
+
+/// Whether `incoming` is a new reading of the window `existing` describes.
+fn same_window(existing: &PlanUsageWindow, incoming: &PlanUsageWindow) -> bool {
+    match incoming.kind {
+        // An account has a single overage bucket, however it is named.
+        PlanWindowKind::Overage => existing.kind == PlanWindowKind::Overage,
+        PlanWindowKind::Other
+            if incoming.label.as_deref() == Some(OVERAGE_INCLUDED_EVENT_LABEL) =>
+        {
+            existing.kind == PlanWindowKind::Other
+                && existing.label.as_deref().is_some_and(|label| {
+                    label == OVERAGE_INCLUDED_EVENT_LABEL
+                        || label.starts_with(MODEL_SCOPED_WEEKLY_PREFIX)
+                })
+        }
+        _ => existing.kind == incoming.kind && existing.label == incoming.label,
+    }
+}
+
+/// Put `incoming` in place of the window it updates, or add it.
+fn merge_window(windows: &mut Vec<PlanUsageWindow>, incoming: PlanUsageWindow) {
+    let Some(existing) = windows.iter_mut().find(|w| same_window(w, &incoming)) else {
+        windows.push(incoming);
+        return;
+    };
+    // The streamed overage window only says overage is in use; its 0% is a
+    // placeholder, not a reading, so it must not erase a real one.
+    if incoming.kind == PlanWindowKind::Overage
+        && incoming.label.as_deref() == Some(STREAMED_OVERAGE_LABEL)
+    {
+        if incoming.resets_at_ms.is_some() {
+            existing.resets_at_ms = incoming.resets_at_ms;
+        }
+        return;
+    }
+    // Keep the direct read's display name and length when a streamed update
+    // names the same window more tersely.
+    let label = if incoming.label.as_deref() == Some(OVERAGE_INCLUDED_EVENT_LABEL) {
+        existing.label.take()
+    } else {
+        incoming.label
+    };
+    *existing = PlanUsageWindow {
+        label,
+        window_mins: incoming.window_mins.or(existing.window_mins),
+        ..incoming
+    };
 }
 
 /// A window counts as exhausted at or above this percentage. Slightly below
@@ -1554,15 +1615,95 @@ mod tests {
         assert_eq!(codex.received_at_ms, 200);
     }
 
-    /// Within a field the newest wins — a snapshot is a level, not a sum.
+    /// Within a window the newest wins — a snapshot is a level, not a sum.
     #[test]
-    fn store_replaces_windows_wholesale_on_a_fresh_reading() {
+    fn store_replaces_a_window_with_its_fresh_reading() {
         let store = PlanQuotaStore::default();
         store.record("claude", vec![window(PlanWindowKind::FiveHour, 10.0)], None, None, 1);
         store.record("claude", vec![window(PlanWindowKind::FiveHour, 55.0)], None, None, 2);
         let snap = store.snapshot();
         assert_eq!(snap["claude"].windows.len(), 1);
         assert_eq!(snap["claude"].windows[0].used_pct, 55.0);
+    }
+
+    fn labelled(kind: PlanWindowKind, pct: f64, label: &str) -> PlanUsageWindow {
+        PlanUsageWindow {
+            label: Some(label.into()),
+            ..window(kind, pct)
+        }
+    }
+
+    /// Claude streams one window per event; it must update that window and
+    /// keep the others a direct read established.
+    #[test]
+    fn a_single_window_update_keeps_the_other_windows() {
+        let store = PlanQuotaStore::default();
+        store.replace_windows(
+            "claude",
+            vec![
+                labelled(PlanWindowKind::FiveHour, 10.0, "five_hour"),
+                labelled(PlanWindowKind::SevenDay, 72.0, "seven_day"),
+                labelled(PlanWindowKind::Other, 0.0, "Weekly · Fable"),
+            ],
+            None,
+            None,
+            1,
+        );
+        store.record("claude", vec![labelled(PlanWindowKind::FiveHour, 35.0, "five_hour")], None, None, 2);
+        let windows = &store.snapshot()["claude"].windows;
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].used_pct, 35.0);
+        assert_eq!(windows[1].used_pct, 72.0);
+    }
+
+    #[test]
+    fn a_streamed_overage_included_window_updates_the_model_scoped_row() {
+        let store = PlanQuotaStore::default();
+        store.replace_windows(
+            "claude",
+            vec![labelled(PlanWindowKind::Other, 0.0, "Weekly · Fable")],
+            None,
+            None,
+            1,
+        );
+        store.record(
+            "claude",
+            vec![labelled(PlanWindowKind::Other, 12.0, "seven_day_overage_included")],
+            None,
+            None,
+            2,
+        );
+        let windows = &store.snapshot()["claude"].windows;
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, 12.0);
+        assert_eq!(windows[0].label.as_deref(), Some("Weekly · Fable"));
+    }
+
+    #[test]
+    fn the_streamed_overage_placeholder_keeps_a_real_reading() {
+        let store = PlanQuotaStore::default();
+        store.replace_windows(
+            "claude",
+            vec![labelled(PlanWindowKind::Overage, 40.0, "Extra usage")],
+            None,
+            None,
+            1,
+        );
+        store.record(
+            "claude",
+            vec![PlanUsageWindow {
+                resets_at_ms: Some(9_000),
+                ..labelled(PlanWindowKind::Overage, 0.0, "overage")
+            }],
+            None,
+            None,
+            2,
+        );
+        let windows = &store.snapshot()["claude"].windows;
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, 40.0);
+        assert_eq!(windows[0].resets_at_ms, Some(9_000));
+        assert_eq!(windows[0].label.as_deref(), Some("Extra usage"));
     }
 
     #[test]
