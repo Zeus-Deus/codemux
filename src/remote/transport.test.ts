@@ -232,6 +232,21 @@ describe("reconnect", () => {
     await expect(transport.connect()).rejects.toBeTruthy();
     expect(rec.unauthorized).toBe(1);
   });
+
+  it("ignores a 401 ticket that lands after close()", async () => {
+    let answer: (res: Response) => void = () => {};
+    const fetchImpl = (() =>
+      new Promise<Response>((resolve) => {
+        answer = resolve;
+      })) as unknown as typeof fetch;
+    const { transport, rec } = newTransport({ fetchImpl });
+    void transport.connect().catch(() => {});
+    await flushMicrotasks();
+    transport.close();
+    answer(new Response(null, { status: 401 }));
+    await flushMicrotasks();
+    expect(rec.unauthorized).toBe(0);
+  });
 });
 
 describe("compression negotiation", () => {
