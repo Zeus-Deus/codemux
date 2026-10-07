@@ -20,6 +20,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     hostsList: vi.fn(),
+    hostsStatusList: vi.fn(() => Promise.resolve([])),
     hostsReinstallRemote: vi.fn(),
     hostsTestConnection: vi.fn(),
   };
@@ -37,8 +38,9 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 import { HostsSection } from "./hosts-section";
-import { hostsList, hostsReinstallRemote } from "@/tauri/commands";
+import { hostsList, hostsReinstallRemote, hostsStatusList } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
+import { __resetHostStatusStoreForTests } from "@/stores/host-status-store";
 
 const hostsListMock = hostsList as unknown as ReturnType<typeof vi.fn>;
 const hostsReinstallRemoteMock =
@@ -60,6 +62,46 @@ function makeHost(overrides: Partial<HostView> = {}): HostView {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  __resetHostStatusStoreForTests();
+});
+
+describe("HostsSection — status dots", () => {
+  it("shows the poller's live status without pressing Test", async () => {
+    hostsListMock.mockResolvedValue([
+      makeHost({ id: 1, name: "homelab" }),
+      makeHost({ id: 2, name: "pandora" }),
+    ]);
+    vi.mocked(hostsStatusList).mockResolvedValue([
+      {
+        host_id: 1,
+        probed: true,
+        reachable: true,
+        last_seen_at: "2026-01-01T00:00:00Z",
+        last_error: null,
+        disk_bytes: null,
+        remote_control_serving: false,
+      },
+      {
+        host_id: 2,
+        probed: true,
+        reachable: false,
+        last_seen_at: null,
+        last_error: "unreachable: connection timed out",
+        disk_bytes: null,
+        remote_control_serving: false,
+      },
+    ]);
+
+    render(<HostsSection />);
+
+    await waitFor(() => {
+      const dots = screen.getAllByTestId("host-status-dot");
+      expect(dots.map((d) => d.getAttribute("title"))).toEqual([
+        "Online",
+        "Unreachable",
+      ]);
+    });
+  });
 });
 
 describe("HostsSection — Reinstall agent", () => {
