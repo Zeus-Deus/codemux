@@ -779,4 +779,23 @@ describe("Settings rows", () => {
       screen.getByRole("switch", { name: "Resource monitor" }),
     ).not.toHaveAccessibleDescription(/Only on this device/);
   });
+
+  it("marks the Agent page's machine-local settings", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: true });
+    requestedSection = "agent";
+    render(<SettingsView />);
+    for (const name of [
+      "Auto-configure MCP for workspaces",
+      "Resume automatically after usage limits reset",
+    ]) {
+      expect(screen.getByRole("switch", { name })).toHaveAccessibleDescription(
+        /Only on this device/,
+      );
+    }
+    // Checkpoints sync with the account, so they carry no mark.
+    expect(
+      screen.getByRole("switch", { name: "Per-turn revert checkpoints" }),
+    ).not.toHaveAccessibleDescription(/Only on this device/);
+  });
 });

@@ -2134,6 +2134,7 @@ export function SettingsView() {
               <SettingRow
                 label="Utility agent"
                 description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
+                scope="device"
               >
                 <UtilityAgentSetting />
               </SettingRow>
@@ -2145,6 +2146,7 @@ export function SettingsView() {
               <SettingRow
                 label="Default Hermes profile"
                 description="New Hermes chats start with this profile. Automatic uses the only installed profile; a profile you pick in a project's chat is remembered for that project."
+                scope="device"
               >
                 <HermesDefaultProfileSetting />
               </SettingRow>
@@ -2155,6 +2157,7 @@ export function SettingsView() {
               <SettingRow
                 label="Auto-configure MCP for workspaces"
                 description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
+                scope="device"
               >
                 <Switch
                   checked={autoMcpConfig}
@@ -2183,6 +2186,7 @@ export function SettingsView() {
                   <SettingRow
                     label="Resume automatically after usage limits reset"
                     description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
+                    scope="device"
                   >
                     <Switch
                       checked={autoResumeUsageLimit}
