@@ -207,6 +207,20 @@ pub async fn detect_run_candidates(project_path: String) -> Result<Vec<RunCandid
         .map_err(|e| e.to_string())?
 }
 
+/// Largest manifest read when detecting run commands. Real package.json,
+/// Makefile and justfile files are far smaller.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Read a manifest only when it is a regular file within the size cap, so a
+/// huge file, FIFO or symlink to a device cannot stall detection.
+fn read_manifest(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 fn detect_run_candidates_blocking(root: &Path) -> Result<Vec<RunCandidate>, String> {
     if !root.is_dir() {
         return Err(format!("Not a directory: {}", root.display()));
@@ -231,8 +245,9 @@ fn detect_run_candidates_blocking(root: &Path) -> Result<Vec<RunCandidate>, Stri
         ("GNUmakefile", "make"),
         ("justfile", "just"),
         ("Justfile", "just"),
+        (".justfile", "just"),
     ] {
-        if let Ok(text) = std::fs::read_to_string(root.join(file)) {
+        if let Some(text) = read_manifest(&root.join(file)) {
             for target in run_targets(&text) {
                 push(format!("{tool} {target}"), file);
             }
@@ -240,8 +255,8 @@ fn detect_run_candidates_blocking(root: &Path) -> Result<Vec<RunCandidate>, Stri
     }
     // A virtual workspace manifest has no [package], and a bare `cargo run`
     // there fails until a default member is chosen.
-    if std::fs::read_to_string(root.join("Cargo.toml"))
-        .is_ok_and(|t| t.lines().any(|l| l.trim() == "[package]"))
+    if read_manifest(&root.join("Cargo.toml"))
+        .is_some_and(|t| t.lines().any(|l| l.trim_start().starts_with("[package]")))
     {
         push("cargo run".into(), "Cargo.toml");
     }
@@ -268,7 +283,7 @@ fn detect_run_candidates_blocking(root: &Path) -> Result<Vec<RunCandidate>, Stri
 /// package.json scripts that look like they start the app: the well-known
 /// names first, then variants such as `dev:web` or `tauri:dev`.
 fn package_json_run_scripts(root: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
+    let Some(text) = read_manifest(&root.join("package.json")) else {
         return Vec::new();
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -543,6 +558,29 @@ mod tests {
             "[workspace]\nmembers = [\"a\"]\n",
         )
         .unwrap();
+        assert!(run_candidates(&dir).is_empty());
+    }
+
+    #[test]
+    fn run_candidates_read_hidden_justfile_and_commented_cargo_header() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".justfile"), "serve:\n    ./app\n").unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package] # the app\nname = \"app\"\n",
+        )
+        .unwrap();
+        assert_eq!(run_candidates(&dir), ["just serve", "cargo run"]);
+    }
+
+    #[test]
+    fn run_candidates_skip_oversized_and_non_file_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = "dev:\n\t./app\n".to_string();
+        big.push_str(&"#".repeat(MAX_MANIFEST_BYTES as usize));
+        fs::write(dir.path().join("Makefile"), big).unwrap();
+        // A directory named like a manifest is not read either.
+        fs::create_dir(dir.path().join("justfile")).unwrap();
         assert!(run_candidates(&dir).is_empty());
     }
 

@@ -349,6 +349,25 @@ describe("RunButton — split variant", () => {
     ).not.toHaveFocus();
   });
 
+  it("returns focus to the caret after a keyboard pick", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    const caret = screen.getByRole("button", { name: "Configure run command" });
+    await userEvent.click(caret);
+    await screen.findByRole("button", { name: /cargo run/ });
+    await flushPromises();
+    // From the field, Shift+Tab reaches the last detected command.
+    await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(screen.getByRole("button", { name: /cargo run/ })).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
+    expect(mockSetProjectScripts).toHaveBeenCalledWith(
+      "/home/user/myapp",
+      expect.objectContaining({ run: "cargo run" }),
+    );
+    await waitFor(() => expect(caret).toHaveFocus());
+  });
+
   it("More settings opens Settings > Projects", async () => {
     renderSplitRunButton();
     await flushPromises();
