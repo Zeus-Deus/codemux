@@ -94,8 +94,8 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "switchTab7", label: "Switch to tab 7", category: "tabs", defaultKeys: "Ctrl+7" },
   { id: "switchTab8", label: "Switch to tab 8", category: "tabs", defaultKeys: "Ctrl+8" },
   { id: "switchTab9", label: "Switch to tab 9", category: "tabs", defaultKeys: "Ctrl+9" },
-  // Ctrl+PageDown/PageUp rather than Ctrl+Tab: the kitty keyboard protocol
-  // forwards Ctrl+Tab to the terminal, so it can't be claimed reliably.
+  // Ctrl+PageDown/PageUp, the browser and editor convention, rather than
+  // Ctrl+Tab, which stays with the programs running in a terminal.
   { id: "nextTab", label: "Next tab", category: "tabs", defaultKeys: "Ctrl+PageDown" },
   { id: "prevTab", label: "Previous tab", category: "tabs", defaultKeys: "Ctrl+PageUp" },
 

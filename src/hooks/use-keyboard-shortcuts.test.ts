@@ -417,14 +417,16 @@ describe("use-keyboard-shortcuts dispatch — tabs and panes", () => {
     ],
   };
 
-  function seed(opts: { activeTab?: string; activePane?: string; root?: unknown } = {}) {
+  function seed(
+    opts: { activeTab?: string; activePane?: string; root?: unknown; tabs?: string[] } = {},
+  ) {
     useAppStore.setState({
       appState: {
         active_workspace_id: "ws-1",
         workspaces: [
           {
             workspace_id: "ws-1",
-            tabs: [{ tab_id: "t-1" }, { tab_id: "t-2" }, { tab_id: "t-3" }],
+            tabs: (opts.tabs ?? ["t-1", "t-2", "t-3"]).map((tab_id) => ({ tab_id })),
             active_tab_id: opts.activeTab ?? "t-1",
             active_surface_id: "s-1",
             surfaces: [
@@ -456,6 +458,14 @@ describe("use-keyboard-shortcuts dispatch — tabs and panes", () => {
     expect(activateTab).toHaveBeenLastCalledWith("ws-1", "t-3");
   });
 
+  it("leaves the tab keys alone with a single tab", () => {
+    seed({ tabs: ["t-1"] });
+    vi.mocked(activateTab).mockClear();
+    expect(dispatch("nextTab", FAKE_EVENT)).toBe(false);
+    expect(dispatch("prevTab", FAKE_EVENT)).toBe(false);
+    expect(activateTab).not.toHaveBeenCalled();
+  });
+
   it("toggles a zoom on the active pane of a split", () => {
     seed({ activePane: "p-right" });
     dispatch("togglePaneZoom", FAKE_EVENT);
@@ -464,20 +474,55 @@ describe("use-keyboard-shortcuts dispatch — tabs and panes", () => {
     expect(usePaneZoomStore.getState().zoomedPaneBySurface).toEqual({});
   });
 
-  it("does not zoom a lone pane", () => {
+  it("does not zoom a lone pane, and leaves the key unclaimed", () => {
     seed({ activePane: "p-only", root: { kind: "terminal", pane_id: "p-only" } });
-    expect(dispatch("togglePaneZoom", FAKE_EVENT)).toBe(true);
+    expect(dispatch("togglePaneZoom", FAKE_EVENT)).toBe(false);
     expect(usePaneZoomStore.getState().zoomedPaneBySurface).toEqual({});
   });
 
+  const place = (id: string, left: number, right: number) => {
+    const el = document.createElement("div");
+    el.dataset.paneDropId = id;
+    el.getBoundingClientRect = () =>
+      ({ left, right, top: 0, bottom: 100, width: right - left, height: 100 }) as DOMRect;
+    document.body.appendChild(el);
+    return el;
+  };
+
+  it("moves keyboard focus into a chat pane's composer", () => {
+    const left = place("p-left", 0, 100);
+    const right = place("p-right", 101, 200);
+    const terminalInput = document.createElement("textarea");
+    left.appendChild(terminalInput);
+    const composer = document.createElement("textarea");
+    composer.setAttribute("data-composer-input", "");
+    right.appendChild(composer);
+    terminalInput.focus();
+    seed({ activePane: "p-left" });
+
+    dispatch("focusPaneRight", FAKE_EVENT);
+
+    expect(activatePane).toHaveBeenLastCalledWith("p-right");
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it("drops focus left in the pane being left when the target has no composer", () => {
+    const left = place("p-left", 0, 100);
+    place("p-right", 101, 200);
+    const composer = document.createElement("textarea");
+    composer.setAttribute("data-composer-input", "");
+    left.appendChild(composer);
+    composer.focus();
+    seed({ activePane: "p-left" });
+
+    dispatch("focusPaneRight", FAKE_EVENT);
+
+    // The target terminal focuses itself once active; until then, typing
+    // must not keep landing in the chat that was left.
+    expect(document.activeElement).toBe(document.body);
+  });
+
   it("focuses the pane on screen in the pressed direction", () => {
-    const place = (id: string, left: number, right: number) => {
-      const el = document.createElement("div");
-      el.dataset.paneDropId = id;
-      el.getBoundingClientRect = () =>
-        ({ left, right, top: 0, bottom: 100, width: right - left, height: 100 }) as DOMRect;
-      document.body.appendChild(el);
-    };
     place("p-left", 0, 100);
     place("p-right", 101, 200);
     seed({ activePane: "p-left" });

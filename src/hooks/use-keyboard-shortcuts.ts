@@ -27,6 +27,7 @@ import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
 import { jumpToNextNeedsYou } from "@/lib/needs-you";
 import {
   findPaneInDirection,
+  focusPaneContent,
   leafPaneIds,
   measurePaneRects,
   type PaneDirection,
@@ -333,12 +334,12 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // Next / previous tab, wrapping at either end
   if (actionId === "nextTab" || actionId === "prevTab") {
-    if (ws.tabs.length > 1) {
-      const at = ws.tabs.findIndex((t) => t.tab_id === ws.active_tab_id);
-      const step = actionId === "nextTab" ? 1 : -1;
-      const next = ws.tabs[(at + step + ws.tabs.length) % ws.tabs.length];
-      activateTab(ws.workspace_id, next.tab_id).catch(console.error);
-    }
+    // A single tab has nowhere to go: leave the key to whatever has focus.
+    if (ws.tabs.length < 2) return false;
+    const at = ws.tabs.findIndex((t) => t.tab_id === ws.active_tab_id);
+    const step = actionId === "nextTab" ? 1 : -1;
+    const next = ws.tabs[(at + step + ws.tabs.length) % ws.tabs.length];
+    activateTab(ws.workspace_id, next.tab_id).catch(console.error);
     return true;
   }
 
@@ -369,7 +370,9 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
         .filter(([id]) => id !== activePaneId)
         .map(([id, rect]) => ({ id, rect }));
       const target = findPaneInDirection(active, candidates, direction);
-      if (target) activatePane(target).catch(console.error);
+      if (!target) return;
+      activatePane(target).catch(console.error);
+      focusPaneContent(target);
     };
     // A zoom hides the neighbours, so leave it first (as tmux does) and
     // measure once the split has painted again.
@@ -384,10 +387,10 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   if (actionId === "togglePaneZoom") {
-    // A lone pane already fills the surface; there is nothing to zoom.
-    if (surface && activePaneId && surface.root.kind === "split") {
-      usePaneZoomStore.getState().toggle(surface.surface_id, activePaneId);
-    }
+    // A lone pane already fills the surface; there is nothing to zoom, so the
+    // key stays with whatever has focus.
+    if (!surface || !activePaneId || surface.root.kind !== "split") return false;
+    usePaneZoomStore.getState().toggle(surface.surface_id, activePaneId);
     return true;
   }
 

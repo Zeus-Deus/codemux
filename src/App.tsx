@@ -2,6 +2,7 @@ import { useAddonPlatform } from "@/lib/addons/platform";
 import { lazy, useCallback, useEffect, useRef } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+import { useWorkspaceStatusTracking } from "@/hooks/use-workspace-status-tracking";
 import { useAsyncQuestionAttention } from "@/hooks/use-async-question-attention";
 import { useAuthEvents } from "@/hooks/use-auth-events";
 import { useTunnelStatusEvents } from "@/hooks/use-tunnel-status-events";
@@ -131,6 +132,9 @@ function App() {
   // Only initialize app state and shortcuts when authenticated
   useAppStateInit(!isAuthenticated);
   useKeyboardShortcuts();
+  // Ctrl+Shift+J ranks blocked workspaces by how long they have waited, so
+  // their status marks must keep updating while the sidebar is collapsed.
+  useWorkspaceStatusTracking();
   useScrollbackSerializer();
   useFeatureFlagsInit();
   useEnsureDraftWhenEmpty();

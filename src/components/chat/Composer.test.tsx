@@ -195,7 +195,7 @@ describe("Composer", () => {
       const { container } = renderComposer({ streaming: true });
       expect(container.querySelector('button[aria-label="Stop"]')).toHaveAttribute(
         "title",
-        "Stop (Escape)",
+        "Stop (Esc)",
       );
     });
   });

@@ -181,8 +181,10 @@ describe("BrowserPeekOverlay", () => {
     setAppState([makeSession()]);
     useBrowserPeekStore.getState().open("ws-1");
     renderOverlay();
-    fireEvent.keyDown(window, { key: "Escape" });
+    const notCancelled = fireEvent.keyDown(window, { key: "Escape" });
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
+    // Claimed, so the chat composer's Escape-to-stop leaves the run alone.
+    expect(notCancelled).toBe(false);
   });
 
   // Promote docks the session into the right-panel deck rather than

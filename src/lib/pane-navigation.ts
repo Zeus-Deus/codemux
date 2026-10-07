@@ -89,3 +89,25 @@ export function measurePaneRects(ids: readonly string[]): Map<string, PaneRect> 
   }
   return rects;
 }
+
+/**
+ * Carry keyboard focus into a pane the keyboard just moved to. Terminal and
+ * browser panes focus themselves once they become the active pane; a chat pane
+ * does not, so this puts the caret in its composer. For any other pane, focus
+ * left in the pane being left (a terminal, another chat's composer) is dropped,
+ * so keystrokes stop landing there before the new pane takes over.
+ */
+export function focusPaneContent(paneId: string): void {
+  let shell: HTMLElement | null = null;
+  for (const el of document.querySelectorAll<HTMLElement>("[data-pane-drop-id]")) {
+    if (el.dataset.paneDropId === paneId) shell = el;
+  }
+  if (!shell) return;
+  const composer = shell.querySelector<HTMLElement>("[data-composer-input]");
+  if (composer) {
+    composer.focus({ preventScroll: true });
+    return;
+  }
+  const focused = document.activeElement;
+  if (focused instanceof HTMLElement && !shell.contains(focused)) focused.blur();
+}

@@ -3500,6 +3500,7 @@ export function Composer({
                 </div>
                 <textarea
                   ref={textareaRef}
+                  data-composer-input
                   value={draft}
                   readOnly={readOnly}
                   onChange={readOnly ? undefined : handleTextareaChange}
