@@ -176,6 +176,9 @@ describe("suggestPermissionRule", () => {
     expect(bash("pnpm dlx @scope/pkg")).toBeNull();
     expect(bash("npm --prefix app exec cowsay")).toBeNull();
     expect(bash("uv --directory app tool run ruff")).toBeNull();
+    expect(bash("uv tool --quiet run ruff")).toBeNull();
+    expect(bash("uv tool --directory app run ruff")).toBeNull();
+    expect(bash("uv tool")).toBeNull();
     expect(bash("yarn")).toBeNull();
     // A program that merely starts with an interpreter's name is fine.
     expect(bash("shellcheck x.sh")).toEqual({ toolName: "Bash", ruleContent: "shellcheck:*" });

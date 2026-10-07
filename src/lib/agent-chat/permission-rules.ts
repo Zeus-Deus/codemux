@@ -149,7 +149,11 @@ export function suggestPermissionRule(
     if (
       subcommands.some((word) => ARBITRARY_CODE_SUBCOMMANDS.has(word)) ||
       (PACKAGE_MANAGERS.has(family) && subcommands.length === 0) ||
-      (family === "uv" && subcommands[0] === "tool" && subcommands[1] === "run")
+      // A bare `Bash(uv tool:*)`, derived when a flag follows `tool`
+      // (`uv tool --quiet run ruff`), would allow `uv tool run` too.
+      (family === "uv" &&
+        subcommands[0] === "tool" &&
+        (subcommands.length < 2 || subcommands[1] === "run"))
     ) {
       return null;
     }
