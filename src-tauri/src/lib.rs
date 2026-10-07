@@ -2682,6 +2682,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::signin_email,
             commands::signup_email,
             commands::forgot_password,
+            commands::resend_verification_email,
             commands::check_auth,
             commands::bootstrap_session,
             commands::refresh_session,

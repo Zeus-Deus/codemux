@@ -24,7 +24,10 @@ export function useAuthEvents() {
   // Handle auth-state-changed events from the Rust backend
   const handleAuthEvent = useCallback(
     (payload: AuthStatePayload) => {
-      const oauthWasPending = useAuthStore.getState().isSigningIn;
+      // Not `oauthPending`: a callback the user finished after Cancel or the
+      // UI timeout must still be bootstrapped.
+      const oauthCallbackExpected =
+        useAuthStore.getState().oauthCallbackExpected;
       if (payload.authenticated && payload.user) {
         if (useAuthStore.getState().user?.id !== payload.user.id) {
           useSyncedSettingsStore
@@ -42,12 +45,12 @@ export function useAuthEvents() {
         // lookup times out. Re-read local state so it becomes
         // `pending-verification`; App will retry verification only after the
         // login frame has painted. Definitive sign-out events skip this path.
-        if (oauthWasPending) {
+        if (oauthCallbackExpected) {
           void useAuthStore.getState().bootstrapSession();
         }
       }
-      // Also clear the signing-in state since the flow completed
-      useAuthStore.setState({ isSigningIn: false });
+      // The flow completed either way, so stop waiting on it.
+      useAuthStore.getState().finishOAuthFlow();
     },
     [setUser],
   );

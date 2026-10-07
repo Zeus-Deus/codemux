@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock the Tauri commands before importing the store
 vi.mock("@/tauri/commands", () => ({
@@ -14,10 +14,16 @@ vi.mock("@/tauri/commands", () => ({
   agentChatProviderHealth: vi.fn(),
 }));
 
-import { useAuthStore } from "./auth-store";
+import {
+  OAUTH_CALLBACK_GRACE_MS,
+  OAUTH_TIMEOUT_ERROR,
+  OAUTH_TIMEOUT_MS,
+  useAuthStore,
+} from "./auth-store";
 import {
   bootstrapSession,
   refreshSession,
+  startOauthFlow,
   signinEmail,
   signupEmail,
   signOut,
@@ -498,5 +504,91 @@ describe("auth store", () => {
     expect(
       localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY),
     ).not.toBeNull();
+  });
+});
+
+describe("GitHub OAuth flow", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    useAuthStore.setState({ isLoading: false, oauthPending: false });
+  });
+
+  afterEach(() => {
+    useAuthStore.getState().finishOAuthFlow();
+    vi.useRealTimers();
+  });
+
+  it("stays pending while the browser is open and can be cancelled", async () => {
+    vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+
+    await useAuthStore.getState().startOAuthFlow();
+    expect(useAuthStore.getState().oauthPending).toBe(true);
+    // A pending browser flow does not lock out email sign-in.
+    expect(useAuthStore.getState().isSigningIn).toBe(false);
+
+    useAuthStore.getState().cancelOAuthFlow();
+    expect(useAuthStore.getState().oauthPending).toBe(false);
+
+    // A cancelled flow's timer must not resurface an error later.
+    vi.advanceTimersByTime(OAUTH_TIMEOUT_MS);
+    expect(useAuthStore.getState().error).toBeNull();
+  });
+
+  it("keeps expecting the callback after Cancel until the backend deadline passes", async () => {
+    vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+
+    await useAuthStore.getState().startOAuthFlow();
+    useAuthStore.getState().cancelOAuthFlow();
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(true);
+
+    vi.advanceTimersByTime(OAUTH_TIMEOUT_MS + OAUTH_CALLBACK_GRACE_MS - 1);
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(true);
+
+    vi.advanceTimersByTime(1);
+    expect(useAuthStore.getState().oauthCallbackExpected).toBe(false);
+  });
+
+  it("gives up with an error once the callback can no longer arrive", async () => {
+    vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+
+    await useAuthStore.getState().startOAuthFlow();
+    vi.advanceTimersByTime(OAUTH_TIMEOUT_MS - 1);
+    expect(useAuthStore.getState().oauthPending).toBe(true);
+
+    vi.advanceTimersByTime(1);
+    expect(useAuthStore.getState().oauthPending).toBe(false);
+    expect(useAuthStore.getState().error).toBe(OAUTH_TIMEOUT_ERROR);
+  });
+
+  it("reopening the browser restarts the timeout window", async () => {
+    vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+
+    await useAuthStore.getState().startOAuthFlow();
+    vi.advanceTimersByTime(OAUTH_TIMEOUT_MS - 1000);
+    await useAuthStore.getState().startOAuthFlow();
+    vi.advanceTimersByTime(2000);
+
+    expect(useAuthStore.getState().oauthPending).toBe(true);
+    expect(useAuthStore.getState().error).toBeNull();
+  });
+
+  it("ends the pending state when the browser cannot be opened", async () => {
+    vi.mocked(startOauthFlow).mockRejectedValue("Failed to open browser: nope");
+
+    await useAuthStore.getState().startOAuthFlow();
+
+    expect(useAuthStore.getState().oauthPending).toBe(false);
+    expect(useAuthStore.getState().error).toBe("Failed to open browser: nope");
+  });
+
+  it("a completed sign-in clears the pending flow and its timeout", async () => {
+    vi.mocked(startOauthFlow).mockResolvedValue(undefined);
+
+    await useAuthStore.getState().startOAuthFlow();
+    useAuthStore.getState().setUser(mockUser);
+
+    expect(useAuthStore.getState().oauthPending).toBe(false);
+    vi.advanceTimersByTime(OAUTH_TIMEOUT_MS);
+    expect(useAuthStore.getState().error).toBeNull();
   });
 });

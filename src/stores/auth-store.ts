@@ -63,11 +63,40 @@ function invalidateInFlightSessionRefresh(): void {
   refreshSessionInFlight = null;
 }
 
+/** Matches the backend callback server's 5-minute deadline: past it no
+ *  browser callback can land, so waiting longer would strand the login
+ *  screen on a flow that can no longer finish. */
+export const OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
+export const OAUTH_TIMEOUT_ERROR = "GitHub sign-in timed out. Try again.";
+/** How long past `OAUTH_TIMEOUT_MS` a callback can still land. The backend
+ *  only checks its deadline between 5s accept polls and verifies the token
+ *  after accepting, so its event can trail the UI timeout. */
+export const OAUTH_CALLBACK_GRACE_MS = 60 * 1000;
+
+let oauthTimeout: ReturnType<typeof setTimeout> | null = null;
+let oauthCallbackTimeout: ReturnType<typeof setTimeout> | null = null;
+
+function clearOAuthTimeout(): void {
+  if (oauthTimeout !== null) clearTimeout(oauthTimeout);
+  oauthTimeout = null;
+}
+
+function clearOAuthCallbackTimeout(): void {
+  if (oauthCallbackTimeout !== null) clearTimeout(oauthCallbackTimeout);
+  oauthCallbackTimeout = null;
+}
+
 interface AuthStore {
   user: AuthUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   isSigningIn: boolean;
+  /** The login screen is waiting on a browser GitHub sign-in. */
+  oauthPending: boolean;
+  /** A launched GitHub sign-in can still call back. Unlike `oauthPending`,
+   *  Cancel and the UI timeout leave this set, so a callback the user
+   *  finishes anyway is still bootstrapped into the session. */
+  oauthCallbackExpected: boolean;
   error: string | null;
   sessionStatus: AuthSessionStatus;
 
@@ -83,6 +112,11 @@ interface AuthStore {
   bootstrapSession: () => Promise<void>;
   refreshSession: () => Promise<void>;
   startOAuthFlow: () => Promise<void>;
+  /** Stop waiting for the browser. A callback that still arrives later
+   *  signs in normally. */
+  cancelOAuthFlow: () => void;
+  /** The callback's auth-state-changed event arrived; stop tracking it. */
+  finishOAuthFlow: () => void;
   signInEmail: (email: string, password: string) => Promise<void>;
   signUpEmail: (
     email: string,
@@ -101,6 +135,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   isAuthenticated: false,
   isLoading: true,
   isSigningIn: false,
+  oauthPending: false,
+  oauthCallbackExpected: false,
   error: null,
   sessionStatus: "signed-out",
   syncAvailable: false,
@@ -204,17 +240,48 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   startOAuthFlow: async () => {
-    set({ isSigningIn: true, error: null });
+    clearOAuthTimeout();
+    clearOAuthCallbackTimeout();
+    set({ oauthPending: true, oauthCallbackExpected: true, error: null });
     try {
       await startOauthFlowCmd();
-      // Don't set isSigningIn=false here — the OAuth callback
-      // will trigger an auth-state-changed event which updates the store
+      // Stay pending: the callback's auth-state-changed event ends the flow.
+      // Both windows start here, once the backend's callback server is up.
+      clearOAuthTimeout();
+      clearOAuthCallbackTimeout();
+      oauthCallbackTimeout = setTimeout(() => {
+        oauthCallbackTimeout = null;
+        set({ oauthCallbackExpected: false });
+      }, OAUTH_TIMEOUT_MS + OAUTH_CALLBACK_GRACE_MS);
+      if (!get().oauthPending) return;
+      oauthTimeout = setTimeout(() => {
+        oauthTimeout = null;
+        if (get().oauthPending) {
+          set({ oauthPending: false, error: OAUTH_TIMEOUT_ERROR });
+        }
+      }, OAUTH_TIMEOUT_MS);
     } catch (err) {
       set({
-        isSigningIn: false,
+        oauthPending: false,
+        oauthCallbackExpected: false,
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  },
+
+  cancelOAuthFlow: () => {
+    clearOAuthTimeout();
+    set({ oauthPending: false, error: null });
+  },
+
+  finishOAuthFlow: () => {
+    clearOAuthTimeout();
+    clearOAuthCallbackTimeout();
+    set({
+      isSigningIn: false,
+      oauthPending: false,
+      oauthCallbackExpected: false,
+    });
   },
 
   signInEmail: async (email, password) => {
@@ -265,12 +332,16 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       // Ignore errors — clear local state regardless
     }
     invalidateInFlightSessionRefresh();
+    clearOAuthTimeout();
+    clearOAuthCallbackTimeout();
     resetProviderScopedStateOnIdentityChange(get().user, null);
     useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
     set({
       user: null,
       isAuthenticated: false,
       isSigningIn: false,
+      oauthPending: false,
+      oauthCallbackExpected: false,
       syncAvailable: false,
       authMethod: null,
       sessionStatus: "signed-out",
@@ -283,7 +354,16 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     }
     resetProviderScopedStateOnIdentityChange(get().user, user);
     if (user) {
-      set({ user, isAuthenticated: true, isSigningIn: false, sessionStatus: "local" });
+      clearOAuthTimeout();
+      clearOAuthCallbackTimeout();
+      set({
+        user,
+        isAuthenticated: true,
+        isSigningIn: false,
+        oauthPending: false,
+        oauthCallbackExpected: false,
+        sessionStatus: "local",
+      });
     } else {
       set({ user: null, isAuthenticated: false, sessionStatus: "signed-out" });
     }
