@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import {
   ContextMenu,
@@ -148,14 +149,23 @@ export function TabTitleInput({
   // that blur from committing a second time (or after an Escape).
   const settledRef = useRef(false);
 
-  const finish = (commit: boolean) => {
+  const finish = (commit: boolean, refocusFrom?: HTMLElement) => {
     if (settledRef.current) return;
     settledRef.current = true;
     const next = value.trim();
     if (commit && next && next !== title) {
       renameTab(workspaceId, tabId, next).catch(console.error);
     }
-    onDone();
+    if (!refocusFrom) {
+      onDone();
+      return;
+    }
+    // A keyboard finish hands focus back to the tab's label, which replaces
+    // this input on the same tab element; otherwise focus falls to <body>
+    // and a keyboard-started rename loses the user's place.
+    const tab = refocusFrom.closest<HTMLElement>("[data-tab-id]");
+    flushSync(onDone);
+    tab?.querySelector<HTMLElement>("button")?.focus();
   };
 
   return (
@@ -171,12 +181,15 @@ export function TabTitleInput({
       onKeyDown={(e) => {
         // Keep the strip's and the app's shortcuts out of the edit.
         e.stopPropagation();
+        // Enter/Escape during IME composition confirm or cancel the
+        // composition, not the rename.
+        if (e.nativeEvent.isComposing) return;
         if (e.key === "Enter") {
           e.preventDefault();
-          finish(true);
+          finish(true, e.currentTarget);
         } else if (e.key === "Escape") {
           e.preventDefault();
-          finish(false);
+          finish(false, e.currentTarget);
         }
       }}
       className={cn(

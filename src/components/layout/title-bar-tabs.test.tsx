@@ -500,4 +500,57 @@ describe("TitleBarTabs tab actions", () => {
     fireEvent.blur(input);
     expect(mocks.renameTab).toHaveBeenCalledWith("ws-1", "tab-chat", "Review bot");
   });
+
+  it("returns focus to the tab's label after a keyboard rename", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-b"));
+    fireEvent.keyDown(screen.getByLabelText("Tab name"), { key: "Escape" });
+    expect(screen.getByTitle("term-b")).toHaveFocus();
+  });
+
+  it("leaves Enter and Escape to an IME composition", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-a"));
+    const input = screen.getByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "にほ" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Escape", isComposing: true });
+    expect(mocks.renameTab).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Tab name")).toBeInTheDocument();
+  });
+
+  it("ignores a whitespace-only rename", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    fireEvent.doubleClick(screen.getByText("term-a"));
+    const input = screen.getByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "   " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.renameTab).not.toHaveBeenCalled();
+    expect(screen.getByText("term-a")).toBeInTheDocument();
+  });
+
+  it("splits the active pane and disables the close items for a lone tab", async () => {
+    const root: PaneNodeSnapshot = {
+      kind: "terminal",
+      pane_id: "pane-term",
+      session_id: "sess-1",
+      title: "zsh",
+    };
+    render(<TitleBarTabs workspace={makeWorkspace(root)} />);
+    const pill = pillFor("Agent Chat");
+
+    fireEvent.contextMenu(pill);
+    expect(
+      (await screen.findByText("Close other tabs")).closest("[role=menuitem]"),
+    ).toHaveAttribute("data-disabled");
+    expect(
+      screen.getByText("Close tabs to the right").closest("[role=menuitem]"),
+    ).toHaveAttribute("data-disabled");
+    fireEvent.click(screen.getByText("Split right"));
+    expect(mocks.splitPane).toHaveBeenLastCalledWith("pane-term", "horizontal");
+
+    fireEvent.contextMenu(pill);
+    fireEvent.click(await screen.findByText("Split down"));
+    expect(mocks.splitPane).toHaveBeenLastCalledWith("pane-term", "vertical");
+  });
 });
