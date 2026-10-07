@@ -553,9 +553,26 @@ describe("TitleBar GUI chrome — fixed panel cluster", () => {
     state.rightPanelRowWidth = 900;
     const { getByTestId } = renderBar();
     expect(getByTestId("titlebar-floating-band")).toHaveClass("hidden");
-    // The drag layer stops at the panel's left edge — which, maximized, is
-    // the whole measured content row.
-    expect(getByTestId("titlebar-drag-layer").style.right).toBe("900px");
+    // Maximized, the panel starts where the sidebar ends, so the drag layer
+    // covers only the sidebar gap.
+    const layer = getByTestId("titlebar-drag-layer");
+    expect(layer.style.width).toBe("256px");
+    expect(layer.style.right).toBe("");
+  });
+
+  // Regression: the row measurement can stay 0 when the workspace first
+  // mounted without a content row. The layer used to fall back to
+  // `right: <stored panel width>` and cover the maximized panel's tab row,
+  // `+` included.
+  it("keeps the drag layer off a maximized panel before the row is measured", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    state.rightPanelMaximized = true;
+    state.rightPanelRowWidth = 0;
+    const { getByTestId } = renderBar();
+    const layer = getByTestId("titlebar-drag-layer");
+    expect(layer.style.width).toBe("256px");
+    expect(layer.style.right).toBe("");
   });
 
   it("opens the panel to the picker rather than forcing Files open", () => {

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
 import type { TasksSnapshot } from "@/tauri/events";
@@ -19,6 +19,7 @@ const state = {
   tasks: null as TasksSnapshot | null,
   rightPanelTabs: {} as Record<string, string | null>,
   rightPanelMaximized: false,
+  rowWidths: [] as number[],
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
@@ -110,7 +111,7 @@ vi.mock("@/stores/ui-store", () => ({
     {
       getState: () => ({
         setRightPanelWidth: vi.fn(),
-        setRightPanelRowWidth: vi.fn(),
+        setRightPanelRowWidth: (width: number) => state.rowWidths.push(width),
       }),
     },
   ),
@@ -181,6 +182,7 @@ beforeEach(() => {
   state.tasks = null;
   state.rightPanelTabs = {};
   state.rightPanelMaximized = false;
+  state.rowWidths = [];
 });
 
 afterEach(cleanup);
@@ -469,5 +471,47 @@ describe("WorkspaceMain right-panel full expand", () => {
     state.rightPanelMaximized = true;
     const { getByTestId } = render(<WorkspaceMain />);
     expect(getByTestId("workspace-content-column")).toHaveClass("flex-1");
+  });
+});
+
+describe("WorkspaceMain content row measurement", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Regression: the observer attached in an effect keyed on a stable ref
+  // object. A first mount through an early return (no workspace yet) left
+  // the ref null, and the effect never re-ran once the row appeared, so the
+  // published row width stayed 0 for the session.
+  it("starts measuring once the row mounts after an early return", () => {
+    const observers: { cb: ResizeObserverCallback; el: Element | null }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        entry: { cb: ResizeObserverCallback; el: Element | null };
+        constructor(cb: ResizeObserverCallback) {
+          this.entry = { cb, el: null };
+          observers.push(this.entry);
+        }
+        observe(el: Element) {
+          this.entry.el = el;
+        }
+        disconnect() {}
+      },
+    );
+    state.workspace = null;
+    const view = render(<WorkspaceMain />);
+    expect(observers).toHaveLength(0);
+
+    state.workspace = makeWorkspace();
+    view.rerender(<WorkspaceMain />);
+    expect(observers).toHaveLength(1);
+    expect(observers[0].el).toHaveClass("flex", "flex-1");
+
+    act(() => {
+      observers[0].cb(
+        [{ contentRect: { width: 1200 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+    });
+    expect(state.rowWidths[state.rowWidths.length - 1]).toBe(1200);
   });
 });
