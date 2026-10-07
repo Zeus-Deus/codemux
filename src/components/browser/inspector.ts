@@ -169,7 +169,9 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]+/g;
  * space: the result is one inert line that a terminal never submits.
  */
 export function buildTellAgentPrompt(element: ElementInfo, pageUrl: string): string {
-  const text = element.text.replace(/\s+/g, " ").trim().slice(0, 60);
+  // Truncate by code point: slicing UTF-16 units can split a surrogate
+  // pair, and a lone surrogate fails JSON deserialization on the Rust side.
+  const text = Array.from(element.text.replace(/\s+/g, " ").trim()).slice(0, 60).join("");
   const desc = `<${element.tag}>${text ? ` "${text}"` : ""}`;
   const where = pageUrl && pageUrl !== "about:blank" ? ` at ${pageUrl}` : "";
   const prompt = `In the browser${where}, the element \`${element.selector}\` (${desc}): `;

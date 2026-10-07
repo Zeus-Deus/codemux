@@ -3,6 +3,7 @@ import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { Button } from "@/components/ui/button";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
@@ -600,16 +601,14 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     setRetryNonce((n) => n + 1);
   };
 
-  const copyErrorDetails = () => {
+  const copyErrorDetails = async () => {
     const details = [
       `Browser session: ${effectiveSessionId}`,
       `Status: ${status}`,
       `Error: ${errorMsg ?? "Connection failed"}`,
     ].join("\n");
-    navigator.clipboard
-      .writeText(details)
-      .then(() => toast.success("Copied error details"))
-      .catch(() => toast.error("Couldn't copy to the clipboard"));
+    if (await copyToClipboard(details)) toast.success("Copied error details");
+    else toast.error(COPY_FAILED_MESSAGE);
   };
 
   // Toolbar viewport presets. A preset pins the viewport (the frame is
