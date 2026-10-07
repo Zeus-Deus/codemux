@@ -3,7 +3,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
 import { HermesDefaultProfileSetting, HermesSetting } from "./hermes-setting";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
 import { Button } from "@/components/ui/button";
@@ -159,7 +159,15 @@ import { ArchiveSection } from "./archive-section";
 import { InterfaceSection } from "./interface-section";
 import { HostsSection } from "./hosts-section";
 import { SourceControlSection } from "./source-control-section";
-import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
+import {
+  SectionHeader,
+  SegmentedControl,
+  SettingRow,
+  SubsectionHeader,
+} from "./settings-primitives";
+import { AboutSection } from "./about-section";
+import { SettingsNavSearch, revealSettingsAnchor } from "./settings-search";
+import type { SettingsSearchResult } from "@/lib/settings-search";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
@@ -170,33 +178,6 @@ import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Eyebrow } from "@/components/ui/eyebrow";
-
-function SettingRow({ label, description, children }: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-8 py-4">
-      <div className="min-w-0 space-y-1">
-        <p className="text-body-lg leading-tight font-semibold text-foreground">{label}</p>
-        {description && (
-          <p className="text-body-sm leading-relaxed text-muted-foreground/80">{description}</p>
-        )}
-      </div>
-      <div className="shrink-0">{children}</div>
-    </div>
-  );
-}
-
-function SectionHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="mb-7">
-      <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">{title}</h2>
-      <p className="text-body-lg text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
-    </div>
-  );
-}
 
 
 /** Section break — adds breathing room between subsections inside a
@@ -1251,9 +1232,6 @@ export function SettingsView() {
   const signOut = useAuthStore((s) => s.signOut);
   const syncedSettings = useSyncedSettingsStore((s) => s.settings);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
-  const liveRadius = typeof document === "undefined"
-    ? "0.625rem"
-    : getComputedStyle(document.documentElement).getPropertyValue("--radius").trim() || "0.625rem";
 
   const activeWorkspace = useAppStore((s) => {
     const st = s.appState;
@@ -1271,6 +1249,51 @@ export function SettingsView() {
     if (settingsSection !== null) setActiveSection(settingsSection);
   }, [settingsSection, settingsNavigationVersion]);
   const sectionAvailable = isSettingsSectionAvailable(activeSection, enableAgentChat);
+
+  // Settings search: a result opens its page, then lights the row it named.
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [revealRequest, setRevealRequest] = useState<{ anchor: string | null } | null>(null);
+  const navigateToSearchResult = useCallback((result: SettingsSearchResult) => {
+    setActiveSection(result.section);
+    setRevealRequest({ anchor: result.anchor });
+  }, []);
+  useEffect(() => {
+    if (!revealRequest) return;
+    // After paint, so the destination page is the one being searched.
+    const frame = requestAnimationFrame(() => {
+      const root = contentRef.current;
+      if (!root) return;
+      if (revealRequest.anchor && revealSettingsAnchor(root, revealRequest.anchor)) return;
+      root.scrollIntoView?.({ block: "start" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [revealRequest]);
+
+  // Ctrl+F anywhere, or "/" outside a text field, jumps to the search field.
+  const commandPaletteOpenRef = useRef(commandPaletteOpen);
+  commandPaletteOpenRef.current = commandPaletteOpen;
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const input = searchInputRef.current;
+      if (!input || e.defaultPrevented || commandPaletteOpenRef.current) return;
+      const target = e.target instanceof HTMLElement ? e.target : null;
+      if (target?.closest('[role="dialog"], [role="alertdialog"]')) return;
+      const editing =
+        !!target &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+      const find =
+        (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f";
+      const slash = e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !editing;
+      if (!find && !slash) return;
+      e.preventDefault();
+      input.focus();
+      input.select();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const editors = useDetectedEditors();
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
@@ -1534,10 +1557,6 @@ export function SettingsView() {
             />
             <TypographySettings />
             <div className="mt-10 space-y-1">
-              <SettingRow label="Border radius" description="Fixed across themes so a palette can't change the geometry.">
-                <span className="font-mono text-body-sm text-muted-foreground">{liveRadius}</span>
-              </SettingRow>
-              <Separator />
               <SettingRow
                 label="Resource monitor"
                 description="Show the CPU/memory monitor icon in the title bar."
@@ -2088,6 +2107,9 @@ export function SettingsView() {
       case "interface":
         return <InterfaceSection />;
 
+      case "about":
+        return <AboutSection />;
+
       case "usage":
         // Same defensive guard as Permissions below: the nav row is
         // hidden when the Agent Chat GUI is off, but a stale URL hash
@@ -2429,32 +2451,42 @@ export function SettingsView() {
             dividers) so the nav reads as one continuous list. Mono
             group captions echo the design system's metadata voice. */}
         {mobile && <select aria-label="Settings section" className="mobile-pane-picker" value={activeSection} onChange={e => setActiveSection(e.target.value as Section)}>{navGroups.map(group => <optgroup key={group.label} label={group.label}>{group.items.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</optgroup>)}</select>}
-        <nav className={cn("w-60 shrink-0 border-r border-border bg-background py-4", mobile && "hidden")}>
-          <div className="space-y-5">
-            {navGroups.map((group) => (
-              <div key={group.label}>
-                <Eyebrow className="px-4 pb-1.5">
-                  {group.label}
-                </Eyebrow>
-                <div className="space-y-px px-3">
-                  {group.items.map((item) => (
-                    <SettingsNavItem
-                      key={item.id}
-                      icon={item.icon}
-                      label={item.label}
-                      active={activeSection === item.id}
-                      onClick={() => setActiveSection(item.id)}
-                    />
-                  ))}
-                </div>
+        {!mobile && (
+          <nav className="flex w-60 shrink-0 flex-col border-r border-border bg-background pt-4">
+            <SettingsNavSearch
+              agentChatEnabled={enableAgentChat}
+              activeSection={activeSection}
+              inputRef={searchInputRef}
+              onNavigate={navigateToSearchResult}
+            >
+              <div className="space-y-5">
+                {navGroups.map((group) => (
+                  <div key={group.label}>
+                    <Eyebrow className="px-4 pb-1.5">
+                      {group.label}
+                    </Eyebrow>
+                    <div className="space-y-px px-3">
+                      {group.items.map((item) => (
+                        <SettingsNavItem
+                          key={item.id}
+                          icon={item.icon}
+                          label={item.label}
+                          active={activeSection === item.id}
+                          onClick={() => setActiveSection(item.id)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        </nav>
+            </SettingsNavSearch>
+          </nav>
+        )}
 
         {/* Content */}
         <ScrollArea className="flex-1 bg-card">
           <div
+            ref={contentRef}
             className={cn(
               mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
               WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",

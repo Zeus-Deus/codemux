@@ -1146,7 +1146,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     });
   const selectWorkspace = async (id, name) => {
     await shortcut("k");
-    await type('[role="combobox"]', name);
+    await type('[role="dialog"] [role="combobox"]', name);
     await click(`[role="option"][data-value="ws:${id}"]`);
   };
   const findPane = (value, id) => {
@@ -1399,7 +1399,7 @@ async function checkRemovalDuringActivation() {
 }
 async function openCommand(title) {
   await shortcut("k");
-  await type('[role="combobox"]', title);
+  await type('[role="dialog"] [role="combobox"]', title);
   // Inventory refresh after rollback can replace a palette option between
   // locating it and the WebDriver click. Retry only a stale-element rejection
   // (the driver did not dispatch that click), never a possibly completed action.
@@ -1914,7 +1914,7 @@ try {
   // dismisses the startup Home draft. Select the real workspace via the palette
   // instead of mutating the app's client stores from the test.
   await shortcut("k");
-  await type('[role="combobox"]', "synthetic-project");
+  await type('[role="dialog"] [role="combobox"]', "synthetic-project");
   await click(`[role="option"][data-value="ws:${workspaceId}"]`);
   await element(composer);
   // Existing app behavior warms a provider when an unbound pane first gains

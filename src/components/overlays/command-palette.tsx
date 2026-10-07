@@ -107,6 +107,9 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { buildNavGroups } from "@/lib/settings-sections";
+import { settingsPagesForQuery } from "@/lib/settings-search";
 
 interface Props {
   open: boolean;
@@ -608,6 +611,29 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     [commandRows, query, commandsOnly, prsOnly],
   );
 
+  // Settings pages are search-only: "settings" lists them all, and a query
+  // that names a page or one of its rows ("scrollback") jumps straight there.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const settingsRows = useMemo<CommandRow[]>(() => {
+    if (prsOnly || query.pathMode) return [];
+    const pages = buildNavGroups(enableAgentChat).flatMap((group) => group.items);
+    return settingsPagesForQuery(query.needle, enableAgentChat).flatMap((id) => {
+      const page = pages.find((item) => item.id === id);
+      if (!page) return [];
+      return [{
+        kind: "command" as const,
+        key: `cmd:settings:${id}`,
+        command: {
+          id: `settings:${id}`,
+          label: `Settings · ${page.label}`,
+          icon: page.icon,
+          run: () => useUIStore.getState().setShowSettings(true, id),
+        },
+        keys: "",
+      }];
+    });
+  }, [prsOnly, query.pathMode, query.needle, enableAgentChat]);
+
   const searching = query.needle !== "";
   const conversationsEligible =
     searching && !commandsOnly && !prsOnly && !query.pathMode;
@@ -728,7 +754,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     conversationRows.length +
     matchedThemes.length +
     matchedThemeStudio.length +
-    matchedCommands.length;
+    matchedCommands.length +
+    settingsRows.length;
 
   // ── Live preview ───────────────────────────────────────────────────────
   //
@@ -1037,11 +1064,25 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           {matchedCoreCommands.map((row) => (
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
+          {settingsRows.length > 0 && (
+            <GroupHeader
+              label="Settings pages"
+              count={`${settingsRows.length}`}
+              first={nothingBeforeCommands && matchedCoreCommands.length === 0}
+            />
+          )}
+          {settingsRows.map((row) => (
+            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+          ))}
           {matchedAddonCommands.length > 0 && (
             <GroupHeader
               label="Add-ons"
               count={`${matchedAddonCommands.length}`}
-              first={nothingBeforeCommands && matchedCoreCommands.length === 0}
+              first={
+                nothingBeforeCommands &&
+                matchedCoreCommands.length === 0 &&
+                settingsRows.length === 0
+              }
             />
           )}
           {matchedAddonCommands.map((row) => (

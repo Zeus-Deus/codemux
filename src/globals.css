@@ -1008,6 +1008,49 @@ body.pane-resizing iframe {
   }
 }
 
+/* A Settings row that search just landed on: tinted with the brand accent and
+ * outlined, held while the scroll settles, then faded out, so the eye finds it.
+ * The neutral surface ladder is too faint for this on a light canvas, so the
+ * tint is ember in every theme. A box-shadow widens the fill and an offset
+ * outline draws the hairline past the row's text without shifting its
+ * layout. Reduced motion
+ * keeps the highlight but drops the fade. The attribute is removed after
+ * 1.6s (FLASH_MS in settings-search.tsx). */
+@keyframes cm-settings-flash {
+  0%,
+  55% {
+    background-color: var(--settings-flash-fill);
+    box-shadow: 0 0 0 var(--settings-flash-bleed) var(--settings-flash-fill);
+    outline-color: var(--settings-flash-ring);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 var(--settings-flash-bleed) transparent;
+    outline-color: transparent;
+  }
+}
+[data-settings-flash] {
+  /* The tint bleeds past the row by the bleed width so its text and
+   * controls sit inside the tint, not on its edge. The hairline is an
+   * outline at the same offset: drawing it as a second box-shadow would
+   * show through the translucent fill shadow as a thick band. */
+  --settings-flash-bleed: 0.5rem;
+  --settings-flash-fill: color-mix(in oklch, var(--accent-ember) 14%, transparent);
+  --settings-flash-ring: color-mix(in oklch, var(--accent-ember) 45%, transparent);
+  border-radius: var(--radius-md);
+  outline: 1px solid transparent;
+  outline-offset: var(--settings-flash-bleed);
+  animation: cm-settings-flash 1.6s ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-settings-flash] {
+    animation: none;
+    background-color: var(--settings-flash-fill);
+    box-shadow: 0 0 0 var(--settings-flash-bleed) var(--settings-flash-fill);
+    outline-color: var(--settings-flash-ring);
+  }
+}
+
 /* Live-status text shimmer for the agent-chat streaming marker
  * ("Working…", "Running <tool>…") and the reasoning block header while
  * thinking (design D9 / D5). A soft light band sweeps across the glyphs

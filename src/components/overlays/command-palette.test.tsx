@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     openThemeStudio: vi.fn(),
     takeCommandPaletteQuery: vi.fn<() => string | null>(() => null),
     setShowNewWorkspaceDialog: vi.fn(),
+    setShowSettings: vi.fn(),
   },
   synced: {
     settings: {
@@ -771,5 +772,30 @@ describe("command palette — reload interface", () => {
     expect(row).toHaveTextContent("Ctrl+Alt+R");
     await user.click(screen.getByText("Reload interface"));
     expect(mocks.backend.reloadInterface).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("command palette — settings pages", () => {
+  it("keeps settings pages out of the resting list", () => {
+    renderPalette();
+    expect(screen.queryByText("Settings pages")).not.toBeInTheDocument();
+  });
+
+  it("opens the page that holds a setting named by the query", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "scrollback");
+
+    expect(screen.getByText("Settings pages")).toBeInTheDocument();
+    await user.click(screen.getByText("Settings · Session Restore"));
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(true, "session_restore");
+  });
+
+  it("lists every page for 'settings'", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "settings");
+    expect(screen.getByText("Settings · Account")).toBeInTheDocument();
+    expect(screen.getByText("Settings · About")).toBeInTheDocument();
   });
 });

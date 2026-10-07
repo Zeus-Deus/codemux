@@ -10,6 +10,37 @@
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
+/** Title and summary at the top of a settings page. */
+export function SectionHeader({ title, description }: { title: string; description: string }) {
+  return (
+    <div className="mb-7">
+      <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">{title}</h2>
+      <p className="text-body-lg text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
+    </div>
+  );
+}
+
+/** One setting: label and description on the left, its control on the
+ *  right. `data-settings-row` marks what Settings search highlights when it
+ *  lands on this row. */
+export function SettingRow({ label, description, children }: {
+  label: string;
+  description?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div data-settings-row className="flex items-center justify-between gap-8 py-4">
+      <div className="min-w-0 space-y-1">
+        <p className="text-body-lg leading-tight font-semibold text-foreground">{label}</p>
+        {description && (
+          <p className="text-body-sm leading-relaxed text-muted-foreground/80">{description}</p>
+        )}
+      </div>
+      <div className="shrink-0">{children}</div>
+    </div>
+  );
+}
+
 /** In-section heading for grouped content (e.g. "AI Tools",
  *  "Detected editors"). Distinct from SectionHeader (which titles
  *  the whole panel) — lower visual weight, no max width, sits
@@ -26,7 +57,7 @@ export function SubsectionHeader({
   className?: string;
 }) {
   return (
-    <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
+    <div data-settings-row className={cn("mb-3 flex items-end justify-between gap-4", className)}>
       <div className="min-w-0">
         <Eyebrow>
           {title}
