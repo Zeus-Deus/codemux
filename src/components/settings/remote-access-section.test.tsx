@@ -360,7 +360,25 @@ describe("RemoteAccessSection — enabled", () => {
     );
   });
 
-  it("toasts and badges a new pending device arriving over the live event", async () => {
+  it("asks before revoking every browser", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteRevokeSession.mockResolvedValue(status({ enabled: true, running: true }));
+    render(<RemoteAccessSection />);
+    await waitFor(() => expect(screen.getByText("MacBook Air")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: /^revoke all$/i }));
+    expect(await screen.findByText(/Revoke 1 browser\?/)).toBeInTheDocument();
+    expect(cmds.webRemoteRevokeSession).not.toHaveBeenCalled();
+
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: /^revoke all$/i }));
+    await waitFor(() =>
+      expect(cmds.webRemoteRevokeSession).toHaveBeenCalledWith("macbook"),
+    );
+  });
+
+  // The "wants to connect" question is asked app-wide by
+  // useRemotePairingRequests; this section only lists the request.
+  it("lists a new pending device arriving over the live event without a second toast", async () => {
     render(<RemoteAccessSection />);
     await waitFor(() => expect(events.cb).not.toBeNull());
     // One pending device already ("Waiting for approval" with count 1).
@@ -380,14 +398,8 @@ describe("RemoteAccessSection — enabled", () => {
       );
     });
 
-    await waitFor(() =>
-      expect(toast.info).toHaveBeenCalledWith(
-        expect.stringMatching(/iPad wants to connect/i),
-        expect.objectContaining({ description: expect.any(String) }),
-      ),
-    );
-    // The new pending device now shows in the list.
-    expect(screen.getByText("iPad")).toBeInTheDocument();
+    expect(await screen.findByText("iPad")).toBeInTheDocument();
+    expect(toast.info).not.toHaveBeenCalled();
   });
 });
 
@@ -870,7 +882,7 @@ describe("RemoteAccessSection — ways to connect", () => {
     expect(screen.queryByText(/every network interface/i)).toBeNull();
   });
 
-  it("lists paired devices and account browsers together under Devices", async () => {
+  it("lists paired devices and account browsers together under Paired browsers", async () => {
     cmds.webRemoteStatus.mockResolvedValue(
       ways({
         sessions: [
@@ -883,7 +895,7 @@ describe("RemoteAccessSection — ways to connect", () => {
     render(<RemoteAccessSection />);
 
     await screen.findByText("Work laptop");
-    expect(screen.getByText(/^Devices$/)).toBeInTheDocument();
+    expect(screen.getByText(/^Paired browsers$/)).toBeInTheDocument();
     expect(screen.getByText("Phone")).toBeInTheDocument();
     expect(screen.getByText("Tablet")).toBeInTheDocument();
     expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument();
@@ -892,7 +904,7 @@ describe("RemoteAccessSection — ways to connect", () => {
   it("shows one empty state when nothing is connected yet", async () => {
     cmds.webRemoteStatus.mockResolvedValue(ways());
     render(<RemoteAccessSection />);
-    expect(await screen.findByText(/No devices yet/)).toBeInTheDocument();
+    expect(await screen.findByText(/No browsers yet/)).toBeInTheDocument();
   });
 });
 

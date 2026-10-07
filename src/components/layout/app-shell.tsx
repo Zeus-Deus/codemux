@@ -1,4 +1,5 @@
 import { useNotificationLink } from "@/hooks/use-notification-link";
+import { useRemotePairingRequests } from "@/hooks/use-remote-pairing-requests";
 import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
 import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
@@ -84,6 +85,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const mobile = useMobileLayout();
   useMobileViewport();
   useNotificationLink();
+  useRemotePairingRequests();
   const isLoading = useAppStore((s) => s.appState === null);
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const syncedLoading = useSyncedSettingsStore((s) => s.isLoading);

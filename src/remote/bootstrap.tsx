@@ -11,7 +11,8 @@
  *      first live connection — returns so `main.tsx` can mount the app.
  *   4. Handles approval mode: a `{approved:false}` pairing shows a
  *      "waiting for approval" state while the transport polls for a
- *      ticket (granted once the desktop approves).
+ *      ticket (granted once the desktop approves). The browser can cancel,
+ *      gives up after `APPROVAL_TIMEOUT_MS`, and says so when declined.
  *
  * The pairing UI depends on nothing from the app itself (no stores, no
  * app components) so it can render standalone. It matches the app's dark
@@ -144,13 +145,14 @@ function extractToken(raw: string): string {
  *  never leaves this page. */
 function AccountForm(props: {
   baseUrl: string;
+  notice: string | null;
   onPaired(result: PairResult): void;
   onUseCode: (() => void) | null;
 }): React.ReactElement {
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(props.notice);
 
   async function submit(e: React.FormEvent): Promise<void> {
     e.preventDefault();
@@ -228,12 +230,13 @@ function AccountForm(props: {
 /** The pairing-code (paste-a-link) form — the offline / no-account path. */
 function CodeForm(props: {
   baseUrl: string;
+  notice: string | null;
   onPaired(result: PairResult): void;
   onUseAccount: (() => void) | null;
 }): React.ReactElement {
   const [value, setValue] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(props.notice);
 
   async function submit(e: React.FormEvent): Promise<void> {
     e.preventDefault();
@@ -307,11 +310,13 @@ function CodeForm(props: {
 
 /** Chooses between account sign-in and pairing-code entry. Opens on account
  *  sign-in when the server advertises account mode, and always keeps the code
- *  path reachable (the offline / no-account fallback). */
-function ConnectScreen(props: {
+ *  path reachable (the offline / no-account fallback). `notice` says why the
+ *  screen is back after a connection attempt ended (declined, timed out). */
+export function ConnectScreen(props: {
   baseUrl: string;
   host: string;
   methods: AuthMethods;
+  notice?: string | null;
   onPaired(result: PairResult): void;
 }): React.ReactElement {
   const [mode, setMode] = React.useState<"account" | "code">(() =>
@@ -324,12 +329,14 @@ function ConnectScreen(props: {
         {mode === "account" ? (
           <AccountForm
             baseUrl={props.baseUrl}
+            notice={props.notice ?? null}
             onPaired={props.onPaired}
             onUseCode={() => setMode("code")}
           />
         ) : (
           <CodeForm
             baseUrl={props.baseUrl}
+            notice={props.notice ?? null}
             onPaired={props.onPaired}
             onUseAccount={
               props.methods.account ? () => setMode("account") : null
@@ -351,9 +358,14 @@ function ConnectScreen(props: {
   );
 }
 
-function ConnectingView(props: {
+/** How long a browser waits for the desktop to approve it before giving up.
+ *  Matches the hosted relay's approval deadline. */
+export const APPROVAL_TIMEOUT_MS = 5 * 60_000;
+
+export function ConnectingView(props: {
   host: string;
   waiting: boolean;
+  onCancel(): void;
 }): React.ReactElement {
   return (
     <div style={overlayStyle}>
@@ -383,12 +395,32 @@ function ConnectingView(props: {
           }}
         >
           {props.waiting
-            ? `Approve this device on the desktop app to finish connecting to ${props.host}.`
+            ? `Approve this browser on the desktop app to finish connecting to ${props.host}. The request expires after ${APPROVAL_TIMEOUT_MS / 60_000} minutes.`
             : `Reaching ${props.host}…`}
         </div>
+        <button type="button" style={switchLinkStyle} onClick={props.onCancel}>
+          Cancel and use a different code
+        </button>
       </div>
     </div>
   );
+}
+
+type ConnectOutcome = "connected" | "unauthorized" | "cancelled" | "timed-out";
+
+/** What the pairing screen says when a connection attempt ends without
+ *  connecting. Cancelling needs no explanation. */
+export function pairingNotice(
+  outcome: Exclude<ConnectOutcome, "connected">,
+  wasWaiting: boolean,
+): string | null {
+  if (outcome === "cancelled") return null;
+  if (outcome === "timed-out") {
+    return "Nobody approved this browser in time. Pair again, and approve the request on the desktop when it appears.";
+  }
+  return wasWaiting
+    ? "The desktop declined this browser. Ask for a new pairing link to try again."
+    : "This browser is no longer paired. Pair again to continue.";
 }
 
 // ── Orchestration ───────────────────────────────────────────────────
@@ -446,19 +478,23 @@ export async function bootstrapRemote(): Promise<void> {
   }
 
   // 2. Connect, prompting for pairing whenever no valid session exists.
+  let notice: string | null = null;
   for (;;) {
     let cameFromPairing = false;
     if (!loadSession()) {
+      const shownNotice = notice;
       const result = await new Promise<PairResult>((resolve) => {
         overlay.render(
           <ConnectScreen
             baseUrl={baseUrl}
             host={host}
             methods={authMethods}
+            notice={shownNotice}
             onPaired={resolve}
           />,
         );
       });
+      notice = null;
       waiting = !result.approved;
       cameFromPairing = true;
     }
@@ -476,19 +512,37 @@ export async function bootstrapRemote(): Promise<void> {
         fetchSnapshot(baseUrl, () => loadSession()?.sessionToken ?? null),
     });
 
-    if (waiting || cameFromPairing) {
-      overlay.render(<ConnectingView host={host} waiting={waiting} />);
-    }
+    let approvalTimer: number | undefined;
+    const outcome = await new Promise<ConnectOutcome>((resolve) => {
+      if (waiting || cameFromPairing) {
+        overlay.render(
+          <ConnectingView
+            host={host}
+            waiting={waiting}
+            onCancel={() => resolve("cancelled")}
+          />,
+        );
+      }
+      if (waiting) {
+        approvalTimer = window.setTimeout(
+          () => resolve("timed-out"),
+          APPROVAL_TIMEOUT_MS,
+        );
+      }
+      transport.connect().then(
+        () => resolve("connected"),
+        () => resolve("unauthorized"),
+      );
+    });
+    window.clearTimeout(approvalTimer);
+    if (outcome === "connected") break;
 
-    try {
-      await transport.connect();
-      break;
-    } catch {
-      // Session invalid/rejected → clear and re-prompt from the top.
-      clearSession();
-      waiting = false;
-      transport.close();
-    }
+    // Declined, revoked, timed out or cancelled: drop the session and
+    // re-prompt from the top, saying why.
+    notice = pairingNotice(outcome, waiting);
+    clearSession();
+    waiting = false;
+    transport.close();
   }
 
   overlay.remove();
