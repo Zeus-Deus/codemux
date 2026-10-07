@@ -3472,6 +3472,19 @@ const handlers: Record<string, Handler> = {
   get_auth_token: () => "mock-token",
   get_sync_status: () => ({ syncAvailable: true, authMethod: "github" }),
   sign_out: () => undefined,
+  // Login screen (reachable after Sign out). The browser never calls back,
+  // so GitHub sign-in stays pending until it is cancelled or times out. An
+  // address starting with "unverified" reproduces the not-verified state.
+  start_oauth_flow: () => undefined,
+  signin_email: (a) => {
+    if (String(a.email ?? "").startsWith("unverified")) {
+      throw "Email not verified";
+    }
+    return { user: MOCK_USER, token: "mock-token", expires_at: "2099-01-01T00:00:00Z" };
+  },
+  signup_email: () => undefined,
+  forgot_password: () => undefined,
+  resend_verification_email: () => undefined,
   skills_sync_status: () => ({ state: "idle", lastSyncAtMillis: null }),
   // ── Usage ──
   // `tzOffsetMinutes` is accepted and ignored: the fixture derives its

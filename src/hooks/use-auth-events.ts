@@ -24,7 +24,7 @@ export function useAuthEvents() {
   // Handle auth-state-changed events from the Rust backend
   const handleAuthEvent = useCallback(
     (payload: AuthStatePayload) => {
-      const oauthWasPending = useAuthStore.getState().isSigningIn;
+      const oauthWasPending = useAuthStore.getState().oauthPending;
       if (payload.authenticated && payload.user) {
         if (useAuthStore.getState().user?.id !== payload.user.id) {
           useSyncedSettingsStore
@@ -46,8 +46,8 @@ export function useAuthEvents() {
           void useAuthStore.getState().bootstrapSession();
         }
       }
-      // Also clear the signing-in state since the flow completed
-      useAuthStore.setState({ isSigningIn: false });
+      // The flow completed either way, so stop waiting on it.
+      useAuthStore.setState({ isSigningIn: false, oauthPending: false });
     },
     [setUser],
   );
