@@ -17,7 +17,10 @@ fn js_lockfile_manager(root: &Path) -> Option<&'static str> {
         Some("pnpm")
     } else if root.join("yarn.lock").exists() {
         Some("yarn")
-    } else if root.join("package-lock.json").exists() {
+    } else if root.join("package-lock.json").exists()
+        || root.join("npm-shrinkwrap.json").exists()
+    {
+        // npm-shrinkwrap.json is npm's publishable lockfile; `npm ci` honours it.
         Some("npm")
     } else {
         None
@@ -366,6 +369,17 @@ mod tests {
         let results = detect_package_manager(dir.path().to_string_lossy().to_string()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "npm");
+        assert_eq!(results[0].command, "npm ci");
+    }
+
+    #[test]
+    fn test_detect_npm_with_shrinkwrap() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(dir.path().join("npm-shrinkwrap.json"), "{}").unwrap();
+
+        let results = detect_package_manager(dir.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(results.len(), 1);
         assert_eq!(results[0].command, "npm ci");
     }
 
