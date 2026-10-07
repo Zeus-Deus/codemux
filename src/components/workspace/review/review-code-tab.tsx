@@ -456,6 +456,8 @@ export function ReviewCodeTab({
 
   // ── Render ──
 
+  const viewedCount = files.filter((f) => viewed.has(f.path)).length;
+
   if (loading && !diffText) {
     return (
       <p className={cn("px-3.5 py-6 text-center text-muted-foreground", tzBody)}>
@@ -481,6 +483,11 @@ export function ReviewCodeTab({
       <div className="flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
         <span className={cn("flex-1 text-muted-foreground", tzMetaNum)}>
           {files.length === 1 ? "1 file" : `${files.length} files`} changed
+          {viewedCount > 0 && (
+            <span data-testid="viewed-count">
+              {" "}· {viewedCount} of {files.length} viewed
+            </span>
+          )}
         </span>
         <div className="flex gap-px rounded-md bg-muted/60 p-0.5" role="radiogroup" aria-label="Diff layout">
           {(["split", "unified"] as const).map((id) => (

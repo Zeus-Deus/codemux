@@ -830,3 +830,28 @@ describe("after a force-push", () => {
     expect(document.querySelector("[data-diff-line]")).toBeNull();
   });
 });
+
+describe("a viewed file", () => {
+  it("reopens from its chevron without losing the Viewed mark", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+    await openCodeTab(user);
+    const file = screen.getAllByTestId("code-file")[0];
+    await user.click(within(file).getByTestId("viewed-toggle"));
+    await waitFor(() =>
+      expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
+    );
+    expect(screen.getByTestId("viewed-count")).toHaveTextContent("1 of 3 viewed");
+
+    await user.click(within(file).getByRole("button", { expanded: false }));
+    expect(file.querySelectorAll("[data-diff-line]").length).toBeGreaterThan(0);
+    expect(file).toHaveAttribute("data-viewed", "true");
+
+    // Unmarking and marking again folds it away like the first time.
+    await user.click(within(file).getByTestId("viewed-toggle"));
+    await user.click(within(file).getByTestId("viewed-toggle"));
+    await waitFor(() =>
+      expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
+    );
+  });
+});
