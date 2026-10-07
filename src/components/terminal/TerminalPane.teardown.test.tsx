@@ -590,7 +590,7 @@ describe("TerminalPane links", () => {
     schedulerHarness();
     renderPane("sess-a");
     await act(async () => {});
-    const provider = h.linkProviders.at(-1)!;
+    const provider = h.linkProviders[h.linkProviders.length - 1];
     let links: { text: string; activate: (event: MouseEvent) => void }[] = [];
     provider.provideLinks(1, (found) => {
       links = found ?? [];
