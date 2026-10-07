@@ -22,17 +22,25 @@ export interface TurnFoldBody {
   turnId: string;
   label: string;
   expanded: boolean;
-  /** The work-entry id holding this fold open: the user opened that work
-   *  log while the turn ran (see `buildTranscriptSlots`). Collapsing the
-   *  fold has to release it too. */
-  pinnedBy: string | null;
+  /** The work-entry ids holding this fold open: the user opened those work
+   *  logs while the turn ran (see `buildTranscriptSlots`). Collapsing the
+   *  fold has to release every one of them. */
+  pinnedBy: readonly string[];
   hiddenCount: number;
   failedCount: number;
 }
 
 export type SlotBody =
   | { kind: "item"; item: ChatViewItem }
-  | { kind: "activity"; items: WorkEntry[]; working: boolean }
+  | {
+      kind: "activity";
+      items: WorkEntry[];
+      /** Holds the active turn's newest work entry: the live row. */
+      working: boolean;
+      /** Belongs to the turn still running, so the user opening it should
+       *  pin the fold that will settle over it. */
+      turnLive: boolean;
+    }
   | TurnFoldBody;
 
 export interface TranscriptSlot {
@@ -53,7 +61,7 @@ type PresentationEntry =
   /** `revealed` marks an item the user pulled back out of an expanded turn
    *  fold — it was explicitly asked for, so the quiet-observation filter
    *  below leaves it alone. */
-  | { kind: "item"; item: ChatViewItem; revealed?: boolean }
+  | { kind: "item"; item: ChatViewItem; revealed?: boolean; turnLive?: boolean }
   | { kind: "turn_fold"; body: TurnFoldBody };
 
 interface TurnSegment {
@@ -281,9 +289,10 @@ function buildPresentationEntries(
     }
 
     if (!ended || !segment.user) {
+      const turnLive = segmentIndex === activeIndex;
       for (const item of segment.items) {
         if (item.kind === "turn_ended" && silentTurnEnd(item)) continue;
-        entries.push({ kind: "item", item });
+        entries.push({ kind: "item", item, turnLive });
       }
       continue;
     }
@@ -294,9 +303,10 @@ function buildPresentationEntries(
     );
     const hiddenIds = new Set(hidden.map((item) => item.id));
     const turnId = turnIdFor(segment, ended);
-    const pinnedBy =
-      hidden.find((item) => expandedTurnIds.has(item.id))?.id ?? null;
-    const expanded = expandedTurnIds.has(turnId) || pinnedBy != null;
+    const pinnedBy = hidden
+      .filter((item) => expandedTurnIds.has(item.id))
+      .map((item) => item.id);
+    const expanded = expandedTurnIds.has(turnId) || pinnedBy.length > 0;
     const body: TurnFoldBody = {
       kind: "turn_fold",
       turnId,
@@ -349,6 +359,7 @@ export function buildTranscriptSlots(
   // any other visible row end it.
   let run: WorkEntry[] = [];
   let runRevealed = false;
+  let runTurnLive = false;
   const flush = () => {
     if (run.length === 0) return;
     const working =
@@ -366,18 +377,25 @@ export function buildTranscriptSlots(
     ) {
       run = [];
       runRevealed = false;
+      runTurnLive = false;
       return;
     }
     const hasWork = run.some(
       (entry) => entry.kind === "tool_call" || entry.kind === "subagent_run",
     );
     if (hasWork) {
-      bodies.push({ kind: "activity", items: run, working });
+      bodies.push({
+        kind: "activity",
+        items: run,
+        working,
+        turnLive: runTurnLive,
+      });
     } else {
       for (const entry of run) bodies.push({ kind: "item", item: entry });
     }
     run = [];
     runRevealed = false;
+    runTurnLive = false;
   };
 
   for (const entry of entries) {
@@ -398,6 +416,7 @@ export function buildTranscriptSlots(
     if (isWorkEntry(item)) {
       run.push(item);
       if (entry.revealed) runRevealed = true;
+      if (entry.turnLive) runTurnLive = true;
       continue;
     }
     flush();
@@ -463,7 +482,8 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.turnId === b.turnId &&
       a.label === b.label &&
       a.expanded === b.expanded &&
-      a.pinnedBy === b.pinnedBy &&
+      a.pinnedBy.length === b.pinnedBy.length &&
+      a.pinnedBy.every((id, index) => id === b.pinnedBy[index]) &&
       a.hiddenCount === b.hiddenCount &&
       a.failedCount === b.failedCount
     );
@@ -471,6 +491,7 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
   if (a.kind === "activity" && b.kind === "activity") {
     return (
       a.working === b.working &&
+      a.turnLive === b.turnLive &&
       a.items.length === b.items.length &&
       a.items.every((item, index) => item === b.items[index])
     );

@@ -480,13 +480,14 @@ function ShowAllButton({
 }
 
 /** Copy chip pinned to the top-right of a command or output block,
- *  revealed when the pointer is over that block (`group/copy`). */
+ *  revealed when the pointer is over that block (`group/copy`). It is
+ *  `select-none` so selecting the command by hand never picks up "Copy". */
 function ToolCopyButton({ text, label }: { text: string; label: string }) {
   return (
     <MessageCopyButton
       text={text}
       label={label}
-      className="absolute right-1.5 top-1.5 bg-background/90 px-1 py-0.5 font-sans group-hover/copy:pointer-events-auto group-hover/copy:opacity-100"
+      className="absolute right-1.5 top-1.5 select-none bg-background/90 px-1 py-0.5 font-sans group-hover/copy:pointer-events-auto group-hover/copy:opacity-100"
     />
   );
 }

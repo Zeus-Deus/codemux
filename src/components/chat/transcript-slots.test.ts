@@ -186,6 +186,20 @@ describe("buildTranscriptSlots — activity grouping", () => {
     ]);
     expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item", "activity"]);
   });
+
+  it("marks every work log of the running turn live, but only the tail as working", () => {
+    const slots = buildTranscriptSlots(
+      [userMsg(0), tool(1), tool(2), assistantMsg(3), tool(4), tool(5, { status: "running" })],
+      true,
+    );
+    const activity = slots
+      .map((slot) => slot.body)
+      .filter((body) => body.kind === "activity");
+    expect(activity.map((body) => [body.working, body.turnLive])).toEqual([
+      [false, true],
+      [true, true],
+    ]);
+  });
 });
 
 describe("buildTranscriptSlots — non-rendering rows", () => {
@@ -290,10 +304,10 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     const fold = slots[1].body;
     if (fold.kind !== "turn_fold") throw new Error("expected a fold");
     expect(fold.expanded).toBe(true);
-    expect(fold.pinnedBy).toBe("re-2");
+    expect(fold.pinnedBy).toEqual(["re-2"]);
     expect(buildTranscriptSlots(settledTurn())[1].body).toMatchObject({
       expanded: false,
-      pinnedBy: null,
+      pinnedBy: [],
     });
   });
 

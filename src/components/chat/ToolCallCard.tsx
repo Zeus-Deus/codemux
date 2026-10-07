@@ -191,7 +191,8 @@ export const ToolCallCard = memo(function ToolCallCard({
         <button
           type="button"
           aria-expanded={expanded}
-          aria-controls={bodyId}
+          // Reveal mounts the body on first open; point at it only then.
+          aria-controls={expanded ? bodyId : undefined}
           onClick={() => setExpanded((v) => !v)}
           className={cn(
             headerClass,

@@ -268,12 +268,12 @@ export const MessageList = memo(function MessageList({
   const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const toggleTurnFold = useCallback((turnId: string, pinnedBy: string | null) => {
+  const toggleTurnFold = useCallback((turnId: string, pinnedBy: readonly string[]) => {
     setExpandedTurnIds((current) => {
       const next = new Set(current);
-      if (next.has(turnId) || (pinnedBy != null && next.has(pinnedBy))) {
+      if (next.has(turnId) || pinnedBy.some((id) => next.has(id))) {
         next.delete(turnId);
-        if (pinnedBy != null) next.delete(pinnedBy);
+        for (const id of pinnedBy) next.delete(id);
       } else {
         next.add(turnId);
       }
@@ -2002,11 +2002,13 @@ function renderAssistantBody(
 function ActivityRow({
   items,
   working,
+  turnLive,
   workspaceId,
   onKeepOpen,
 }: {
   items: WorkEntry[];
   working: boolean;
+  turnLive: boolean;
   workspaceId?: string | null;
   onKeepOpen?: (entryId: string, keep: boolean) => void;
 }) {
@@ -2014,6 +2016,7 @@ function ActivityRow({
     <ActivityBlock
       items={items}
       working={working}
+      turnLive={turnLive}
       workspaceId={workspaceId}
       onKeepOpen={onKeepOpen}
     />
@@ -2029,11 +2032,11 @@ function TurnFoldRow({
   onToggleTurnFold,
 }: {
   turnId: string;
-  pinnedBy: string | null;
+  pinnedBy: readonly string[];
   label: string;
   expanded: boolean;
   failedCount: number;
-  onToggleTurnFold: (turnId: string, pinnedBy: string | null) => void;
+  onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
 }) {
   const Icon = expanded ? ChevronDown : ChevronRight;
   return (
@@ -2112,7 +2115,7 @@ function SlotRow({
   turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   onRevertTurn?: (turnIndex: number) => void;
   revertingTurnIndex?: number | null;
-  onToggleTurnFold: (turnId: string, pinnedBy: string | null) => void;
+  onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
   onKeepWorkLogOpen?: (entryId: string, keep: boolean) => void;
 }) {
   const marginClass =
@@ -2134,6 +2137,7 @@ function SlotRow({
         <ActivityRowMemo
           items={slot.body.items}
           working={slot.body.working}
+          turnLive={slot.body.turnLive}
           workspaceId={workspaceId}
           onKeepOpen={onKeepWorkLogOpen}
         />

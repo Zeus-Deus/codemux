@@ -250,6 +250,8 @@ describe("ToolCallCard", () => {
     // The whole header row is the toggle, named by the command it ran.
     const toggle = screen.getByRole("button", { name: /Ran\s+ls -la/ });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
+    // Nothing to point at until the body mounts on first open.
+    expect(toggle).not.toHaveAttribute("aria-controls");
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(container.textContent).toContain("line1");

@@ -44,16 +44,21 @@ type OrbActivity = ReturnType<typeof turnOrbActivity>;
  * Every disclosure here is the user's own choice, so the block never closes
  * itself when the turn ends: someone reading a diff mid-run keeps reading it.
  * `onKeepOpen` tells the transcript that the user opened this log while the
- * turn ran, so the turn fold that settles over it stays expanded too.
+ * turn ran, so the turn fold that settles over it stays expanded too. That
+ * holds for every log in the running turn (`turnLive`), not just the one with
+ * the live row: agents often write a message between two stretches of work.
  */
 export const ActivityBlock = memo(function ActivityBlock({
   items,
   working,
+  turnLive = false,
   workspaceId,
   onKeepOpen,
 }: {
   items: WorkEntry[];
   working: boolean;
+  /** The block belongs to the turn still running (implied by `working`). */
+  turnLive?: boolean;
   workspaceId?: string | null;
   /** Keyed by the block's first entry id, which is stable for its life. */
   onKeepOpen?: (entryId: string, keep: boolean) => void;
@@ -69,7 +74,7 @@ export const ActivityBlock = memo(function ActivityBlock({
   // expanded fold, and dropping the hint there would fold the turn away
   // under the cursor.
   const keepOpen = (keep: boolean) => {
-    if (working) onKeepOpen?.(blockId, keep);
+    if (working || turnLive) onKeepOpen?.(blockId, keep);
   };
 
   const runs = items.filter(isSubagentRun);
