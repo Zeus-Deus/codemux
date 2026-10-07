@@ -2,7 +2,15 @@ import type { ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
-import { btnCard, btnEmberSolid, plural, tzBody, tzMetaNum, tzRowTitle } from "./review-ui";
+import {
+  btnCard,
+  btnEmberSolid,
+  plural,
+  spinnerRing,
+  tzBody,
+  tzMetaNum,
+  tzRowTitle,
+} from "./review-ui";
 import type { ProviderPresentation } from "@/lib/source-control";
 
 /**
@@ -89,6 +97,7 @@ export function BranchLocalOnlyState({
   onCommitAndPush,
   onOpenChanges,
   pushOnly,
+  pushing = false,
 }: {
   changedFiles: number;
   onCommitAndPush: () => void;
@@ -96,6 +105,8 @@ export function BranchLocalOnlyState({
   /** Nothing to commit — the branch just needs pushing, so the primary
    *  says so instead of sending you to a Changes pane with no work. */
   pushOnly: boolean;
+  /** The push is in flight; the button shows it and takes no second click. */
+  pushing?: boolean;
 }) {
   return (
     <EmptyState
@@ -109,8 +120,22 @@ export function BranchLocalOnlyState({
       }
       actions={
         <>
-          <button type="button" className={btnEmberSolid} onClick={onCommitAndPush}>
-            {pushOnly ? "Push branch" : "Commit and push"}
+          <button
+            type="button"
+            className={btnEmberSolid}
+            onClick={onCommitAndPush}
+            disabled={pushing}
+          >
+            {pushing ? (
+              <>
+                <span aria-hidden className={spinnerRing} />
+                Pushing
+              </>
+            ) : pushOnly ? (
+              "Push branch"
+            ) : (
+              "Commit and push"
+            )}
           </button>
           <button type="button" className={btnCard} onClick={onOpenChanges}>
             Changes

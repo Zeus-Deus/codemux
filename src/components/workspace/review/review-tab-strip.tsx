@@ -33,6 +33,28 @@ interface Props {
  * which is why the panel's resting geometry is already final.
  */
 export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
+  // Roving focus: Tab lands on the active tab, arrows (and Home/End)
+  // move between tabs and switch with them — a tab switch here is cheap.
+  const onKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const index = tabs.findIndex((tab) => tab.id === activeId);
+    const next =
+      event.key === "ArrowRight"
+        ? (index + 1) % tabs.length
+        : event.key === "ArrowLeft"
+          ? (index - 1 + tabs.length) % tabs.length
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? tabs.length - 1
+              : null;
+    if (next == null || !tabs[next]) return;
+    event.preventDefault();
+    onSelect(tabs[next].id);
+    event.currentTarget.parentElement
+      ?.querySelector<HTMLElement>(`[data-testid="review-tab-${tabs[next].id}"]`)
+      ?.focus();
+  };
+
   return (
     <div
       role="tablist"
@@ -47,8 +69,10 @@ export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
             type="button"
             role="tab"
             aria-selected={active}
+            tabIndex={active ? 0 : -1}
             data-testid={`review-tab-${tab.id}`}
             onClick={() => onSelect(tab.id)}
+            onKeyDown={onKeyDown}
             className={cn(
               "-mb-px border-b-[1.5px] py-2.5 transition-colors duration-150",
               tzBodyLg,

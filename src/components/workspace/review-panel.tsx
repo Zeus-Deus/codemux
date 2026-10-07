@@ -217,6 +217,7 @@ export function ReviewPanel({ workspace }: Props) {
       getCachedRepoCheck(cwd) === undefined,
   );
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [pushing, setPushing] = useState(false);
 
   const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
@@ -515,6 +516,7 @@ export function ReviewPanel({ workspace }: Props) {
         <BranchLocalOnlyState
           changedFiles={dirtyFiles}
           pushOnly={dirtyFiles === 0}
+          pushing={pushing}
           onOpenChanges={openChangesPane}
           onCommitAndPush={() => {
             if (dirtyFiles > 0) {
@@ -523,13 +525,16 @@ export function ReviewPanel({ workspace }: Props) {
               openChangesPane();
               return;
             }
+            if (pushing) return;
+            setPushing(true);
             gitPushChanges(cwd, true)
               .then(() => {
                 toast.success("Branch pushed");
                 invalidatePrQueries();
                 void branchInfoQuery.refetch();
               })
-              .catch((err) => toast.error(String(err)));
+              .catch((err) => toast.error(String(err)))
+              .finally(() => setPushing(false));
           }}
         />
       )}

@@ -116,6 +116,20 @@ describe("branch is local only", () => {
       "uncommitted changes",
     );
   });
+
+  it("says Pushing, and takes no second click, while the push runs", () => {
+    render(
+      <BranchLocalOnlyState
+        changedFiles={0}
+        pushOnly
+        pushing
+        onCommitAndPush={vi.fn()}
+        onOpenChanges={vi.fn()}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Pushing" });
+    expect(button).toBeDisabled();
+  });
 });
 
 describe("host not authenticated", () => {

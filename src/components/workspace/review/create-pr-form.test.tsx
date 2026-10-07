@@ -178,6 +178,25 @@ describe("CreatePrForm", () => {
     await waitFor(() => expect(calls).toEqual(["push:false", "create:main:false"]));
   });
 
+  it("moves to the description on Enter instead of publishing", async () => {
+    renderForm();
+    await waitFor(() => expect(titleField().value).not.toBe(""));
+
+    fireEvent.keyDown(titleField(), { key: "Enter" });
+
+    expect(document.activeElement).toBe(bodyField());
+    expect(calls).toEqual([]);
+  });
+
+  it("creates on Ctrl+Enter from the title or the description", async () => {
+    renderForm();
+    await waitFor(() => expect(titleField().value).not.toBe(""));
+
+    fireEvent.keyDown(bodyField(), { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => expect(calls).toEqual(["push:false", "create:main:false"]));
+  });
+
   it("passes the draft flag through", async () => {
     renderForm();
     await waitFor(() => expect(titleField().value).not.toBe(""));

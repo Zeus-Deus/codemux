@@ -56,6 +56,7 @@ import {
   type DraftSource,
 } from "@/lib/pr-draft";
 import type { ProviderPresentation } from "@/lib/source-control";
+import { modEnterLabel } from "@/lib/keybind-utils";
 import { toast } from "@/lib/toast";
 import {
   btnCard,
@@ -172,6 +173,7 @@ export function CreatePrForm({
   const [error, setError] = useState<string | null>(null);
 
   const reviewerInputRef = useRef<HTMLInputElement>(null);
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
 
   // ── What the branch already knows ──
 
@@ -357,8 +359,15 @@ export function CreatePrForm({
               setTitleEdited(true);
               setTitle(event.target.value);
             }}
+            // Enter moves on to the description rather than submitting:
+            // submitting pushes the branch and publishes a PR, which is
+            // too much to hang on the key people press out of habit at
+            // the end of a line. The send chord does submit.
             onKeyDown={(event) => {
-              if (event.key === "Enter") void create(false);
+              if (event.key !== "Enter") return;
+              event.preventDefault();
+              if (event.metaKey || event.ctrlKey) void create(false);
+              else bodyRef.current?.focus();
             }}
           />
         </div>
@@ -369,12 +378,19 @@ export function CreatePrForm({
           </label>
           <textarea
             id="create-pr-body"
+            ref={bodyRef}
             className={`${FIELD} min-h-[126px] resize-y leading-relaxed`}
             value={body}
             placeholder="What this changes, and how you checked."
             onChange={(event) => {
               setBodyEdited(true);
               setBody(event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                event.preventDefault();
+                void create(false);
+              }
             }}
           />
           {template && (
@@ -494,6 +510,7 @@ export function CreatePrForm({
           type="button"
           className={`${btnEmberSolid} min-w-[68px]`}
           data-testid="create-pr-submit"
+          title={`Create (${modEnterLabel()})`}
           disabled={!title.trim() || busy != null}
           onClick={() => void create(false)}
         >
