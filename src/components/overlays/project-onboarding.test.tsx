@@ -229,12 +229,36 @@ describe("ProjectOnboarding — failures", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("created but couldn't be opened");
     expect(mockCloseWorkspace).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Create workspace" }));
+    // The retry only reopens, so the button must not promise a new create.
+    fireEvent.click(screen.getByRole("button", { name: "Open workspace" }));
     await flushMountEffects();
     // A second create would fail with "branch already exists".
     expect(mockCreate).toHaveBeenCalledTimes(1);
     expect(mockActivate).toHaveBeenLastCalledWith("ws-new");
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("toasts a failed open when the wizard was dismissed mid-create", async () => {
+    let failActivate: (err: string) => void = () => {};
+    mockActivate.mockImplementationOnce(
+      () => new Promise<void>((_, reject) => { failActivate = reject; }),
+    );
+    const { unmount } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create workspace" }));
+    await flushMountEffects();
+    // WorkspaceMain auto-dismisses the wizard once the new workspace lands.
+    unmount();
+    await act(async () => {
+      failActivate("window busy");
+    });
+
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      "The workspace was created but couldn't be opened: window busy",
+    );
+    expect(mockCloseWorkspace).not.toHaveBeenCalled();
   });
 
   const worktrees: WorktreeInfo[] = [
@@ -282,6 +306,20 @@ describe("ProjectOnboarding — failures", () => {
     expect(mockActivate).toHaveBeenCalledWith("ws-a");
     expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-temp-1", false);
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("toasts when the imported workspace can't be opened", async () => {
+    mockListWorktrees.mockResolvedValueOnce(worktrees);
+    mockActivate.mockRejectedValueOnce("window busy");
+    renderOnboarding();
+    await flushMountEffects();
+
+    await importAll();
+    await flushMountEffects();
+
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      "Imported, but couldn't open the workspace: window busy",
+    );
   });
 
   it("blocks Create and Back while Import all is running", async () => {

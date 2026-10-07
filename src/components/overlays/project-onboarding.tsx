@@ -119,7 +119,11 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const branchGenTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Workspace a previous Create attempt already made. If opening it failed,
   // a retry only reopens it: creating again would hit "branch already exists".
-  const createdWorkspaceId = useRef<string | null>(null);
+  const [createdWorkspaceId, setCreatedWorkspaceId] = useState<string | null>(null);
+  // The created workspace landing in the app store usually auto-dismisses
+  // this wizard (WorkspaceMain) before a failed open is reported, so late
+  // failures must not rely on inline state alone.
+  const mounted = useRef(true);
 
   // ── External worktrees (not the main repo, not bare, not detached) ──
   const externalWorktrees = useMemo(
@@ -194,7 +198,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
 
   // ── Clear debounce timer on unmount to avoid post-unmount setState ──
   useEffect(() => {
+    mounted.current = true;
     return () => {
+      mounted.current = false;
       if (branchGenTimeout.current) clearTimeout(branchGenTimeout.current);
     };
   }, []);
@@ -303,10 +309,11 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         status: "creating",
       });
 
+      let createdId = createdWorkspaceId;
       try {
-        if (createdWorkspaceId.current) {
+        if (createdId) {
           removePendingWorkspace(tempId);
-          await finishCreate(createdWorkspaceId.current);
+          await finishCreate(createdId);
           return;
         }
 
@@ -354,12 +361,15 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         dbAddRecentProject(projectDir, pName).catch(console.error);
 
         removePendingWorkspace(tempId);
-        createdWorkspaceId.current = created.workspaceId;
-        await finishCreate(created.workspaceId);
+        createdId = created.workspaceId;
+        setCreatedWorkspaceId(createdId);
+        await finishCreate(createdId);
       } catch (err) {
-        if (createdWorkspaceId.current) {
+        if (createdId) {
           removePendingWorkspace(tempId);
-          setError(`The workspace was created but couldn't be opened: ${String(err)}`);
+          const message = `The workspace was created but couldn't be opened: ${String(err)}`;
+          if (mounted.current) setError(message);
+          else toast.error(message);
         } else {
           failPendingWorkspace(tempId, String(err));
           setTimeout(() => removePendingWorkspace(tempId), 5000);
@@ -371,6 +381,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     [
       isCreating,
       importProgress,
+      createdWorkspaceId,
       finishCreate,
       task,
       generatedBranch,
@@ -426,7 +437,11 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         description: `Not imported: ${failed.map((f) => f.branch).join(", ")}`,
       });
     }
-    await activateWorkspace(imported[imported.length - 1]).catch(console.error);
+    // The wizard is usually gone by now (the imports dismiss it), so a
+    // failed open is reported as a toast rather than inline.
+    await activateWorkspace(imported[imported.length - 1]).catch((err) => {
+      toast.error(`Imported, but couldn't open the workspace: ${String(err)}`);
+    });
     await closeWorkspace(tempWorkspaceId, false).catch(() => {});
     const pName = basename(projectDir);
     dbAddRecentProject(projectDir, pName).catch(console.error);
@@ -456,7 +471,13 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   // Create and Import all each retire the temporary workspace and finish
   // the wizard, so only one of them may run at a time.
   const busy = isCreating || importProgress !== null;
-  const createLabel = selectedAgent ? `Create & start ${selectedAgent.name}` : "Create workspace";
+  // After a create whose open failed, the button only reopens that
+  // workspace: task, agent and branch edits no longer apply to it.
+  const createLabel = createdWorkspaceId
+    ? "Open workspace"
+    : selectedAgent
+      ? `Create & start ${selectedAgent.name}`
+      : "Create workspace";
 
   const errorAlert = error && (
     <div
