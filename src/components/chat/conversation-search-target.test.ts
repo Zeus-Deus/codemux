@@ -66,6 +66,7 @@ describe("resolveConversationSearchTargetIndex", () => {
           turnId: "turn-9",
           label: "Worked",
           expanded: false,
+          pinnedBy: [],
           hiddenCount: 3,
           failedCount: 0,
         },

@@ -1,9 +1,8 @@
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
-  ChevronRight,
   Clock,
   Loader2,
   X,
@@ -31,6 +30,9 @@ import type {
 } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
+import { formatActivityDuration, stepDurationMs } from "./activity-steps";
+import { Reveal } from "./Reveal";
+import { StepElapsed } from "./StepElapsed";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolCallBody } from "./ToolCallBodies";
 import { ToolCallStatus } from "./ToolCallStatus";
@@ -38,6 +40,10 @@ import { categoryTint, toolCategory, toolIcon } from "./tool-visuals";
 
 interface Props {
   item: ToolCallItem;
+  /** The call's turn is still running, so a `running` call really is. A
+   *  settled transcript can hold a call that never reported back (crash,
+   *  quit); its start time is no longer meaningful, so no timer counts. */
+  turnLive?: boolean;
   /** Resolved from the slice by matching `item.approval_request_id`
    *  against the thread's permission requests. `null` when the tool
    *  call is not gated (bypassPermissions mode) or the request event
@@ -64,6 +70,7 @@ interface Props {
  */
 export const ToolCallCard = memo(function ToolCallCard({
   item,
+  turnLive = false,
   approval,
   onDecide,
 }: Props) {
@@ -125,54 +132,87 @@ export const ToolCallCard = memo(function ToolCallCard({
     ? safeStringify(item.input)
     : null;
   const canExpand = hasResultBody || inputText !== null;
-  const showBody =
-    expanded && !isPendingApproval && !isResponding && !isDenied;
+  // The approval states own the card's body slot, so only a settled or
+  // executing call toggles.
+  const toggleable =
+    canExpand && !isPendingApproval && !isResponding && !isDenied;
+  const showBody = expanded && toggleable;
+  const bodyId = useId();
+  // An approval-gated call runs from the moment it was answered, not from
+  // when the request was raised.
+  const timed =
+    item.approved_at != null ? { ...item, started_at: item.approved_at } : item;
+  const duration = stepDurationMs(timed);
+
+  // Tinted icon chip · mono command · elapsed · status glyph · chevron.
+  // `min-w-0 truncate` on the label lets long commands ellipsize rather than
+  // push the trailing glyphs off-screen.
+  const headerContent = (
+    <>
+      <span
+        className={cn(
+          "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md",
+          categoryTint(toolCategory(item.tool_name)),
+          isDenied && "opacity-50",
+        )}
+      >
+        <Icon className="size-3" aria-hidden />
+      </span>
+      <span
+        className={cn(
+          "block min-w-0 flex-1 truncate",
+          isDenied && "line-through text-muted-foreground/60",
+        )}
+      >
+        <ToolCallStatus item={item} />
+        {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
+      </span>
+      {isExecuting && turnLive ? (
+        <StepElapsed step={timed} className={ELAPSED_CLASS} />
+      ) : duration != null && (isSuccess || isError) ? (
+        <span className={ELAPSED_CLASS}>{formatActivityDuration(duration)}</span>
+      ) : null}
+      {glyph && (
+        <glyph.Icon
+          className={cn("size-3.5 shrink-0", glyph.className)}
+          aria-hidden
+        />
+      )}
+      {toggleable && (
+        <ChevronDown
+          className={cn(
+            "size-3 shrink-0 text-muted-foreground/60 transition-transform duration-150 motion-reduce:transition-none",
+            expanded && "rotate-180",
+          )}
+          aria-hidden
+        />
+      )}
+    </>
+  );
+  const headerClass = "flex w-full min-w-0 items-center gap-2.5 px-3 py-2.5";
 
   return (
     <div className="overflow-hidden rounded-lg border border-border/60 bg-muted/40">
-      {/* Header row: tinted icon chip · mono command · status glyph ·
-          chevron. `min-w-0 truncate` on the label lets long commands
-          ellipsize rather than push the trailing glyphs off-screen. */}
-      <div className="flex items-center gap-2.5 px-3 py-2.5 min-w-0">
-        <span
+      {/* The whole header is the disclosure target, like a work-log row.
+          It stays a plain row while an approval decides what the card
+          shows. The inset ring keeps focus visible inside the clipped card. */}
+      {toggleable ? (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          // Reveal mounts the body on first open; point at it only then.
+          aria-controls={expanded ? bodyId : undefined}
+          onClick={() => setExpanded((v) => !v)}
           className={cn(
-            "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md",
-            categoryTint(toolCategory(item.tool_name)),
-            isDenied && "opacity-50",
+            headerClass,
+            "text-left transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
           )}
         >
-          <Icon className="size-3" aria-hidden />
-        </span>
-        <div
-          className={cn(
-            "min-w-0 flex-1 truncate",
-            isDenied && "line-through text-muted-foreground/60",
-          )}
-        >
-          <ToolCallStatus item={item} />
-          {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
-        </div>
-        {glyph && (
-          <glyph.Icon
-            className={cn("size-3.5 shrink-0", glyph.className)}
-            aria-hidden
-          />
-        )}
-        {canExpand && !isPendingApproval && !isResponding && (
-          <button
-            type="button"
-            onClick={() => setExpanded((v) => !v)}
-            className="shrink-0 text-muted-foreground/60 hover:text-foreground"
-            aria-label={expanded ? "Collapse" : "Expand"}
-          >
-            {expanded ? (
-              <ChevronDown className="size-3" />
-            ) : (
-              <ChevronRight className="size-3" />
-            )}
-          </button>
-        )}
-      </div>
+          {headerContent}
+        </button>
+      ) : (
+        <div className={headerClass}>{headerContent}</div>
+      )}
 
       {/* Approval footer (pending). Keyed on the approval request id so
           a fresh approval (different request_id) remounts the footer
@@ -209,14 +249,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {/* Result body when expanded — known tools get a polished
           renderer, unknown tools fall back to the raw JSON dump. */}
-      {showBody && (
+      <Reveal open={showBody} id={bodyId}>
         <div className="border-t border-border/60 px-3 py-2.5">
           <ToolCallBody item={item} />
         </div>
-      )}
+      </Reveal>
     </div>
   );
 });
+
+const ELAPSED_CLASS =
+  "shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/60";
 
 // ---------------------------------------------------------------------------
 // Approval footer

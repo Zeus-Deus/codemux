@@ -25,6 +25,8 @@ interface Props {
   streaming: boolean;
   /** Stall-watchdog state — drives the amber "no activity" tail notice. */
   stalled?: { silentForSecs: number } | null;
+  /** Stops the running turn from the stall notice. Must be stable. */
+  onStop?: () => void;
   /** True when the last run never cleanly settled — drives the
    *  "Run interrupted" tail divider. */
   interrupted?: boolean;
@@ -107,6 +109,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   compacting = false,
   streaming,
   stalled,
+  onStop,
   interrupted,
   sendAnchor,
   positionedNonceRef,
@@ -158,6 +161,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         streaming={streaming}
         compacting={compacting}
         stalled={stalled}
+        onStop={onStop}
         interrupted={interrupted}
         sendAnchor={sendAnchor}
         positionedNonceRef={positionedNonceRef}

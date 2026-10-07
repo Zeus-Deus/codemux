@@ -33,7 +33,7 @@ function activitySlot(key: string, items: ToolCallItem[]): TranscriptSlot {
     side: "assistant",
     showAvatar: false,
     turnStart: false,
-    body: { kind: "activity", items, working: false },
+    body: { kind: "activity", items, working: false, turnLive: false },
   };
 }
 

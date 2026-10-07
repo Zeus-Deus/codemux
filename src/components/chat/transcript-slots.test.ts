@@ -186,6 +186,33 @@ describe("buildTranscriptSlots — activity grouping", () => {
     ]);
     expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item", "activity"]);
   });
+
+  it("marks every work log of the running turn live, but only the tail as working", () => {
+    const slots = buildTranscriptSlots(
+      [userMsg(0), tool(1), tool(2), assistantMsg(3), tool(4), tool(5, { status: "running" })],
+      true,
+    );
+    const activity = slots
+      .map((slot) => slot.body)
+      .filter((body) => body.kind === "activity");
+    expect(activity.map((body) => [body.working, body.turnLive])).toEqual([
+      [false, true],
+      [true, true],
+    ]);
+  });
+
+  it("marks a standalone card live only while its turn runs", () => {
+    const gated = tool(1, { status: "running", approval_request_id: "req-1" });
+    const cardLive = (streaming: boolean) =>
+      buildTranscriptSlots([userMsg(0), gated], streaming).map((slot) =>
+        slot.body.kind === "item" && slot.body.item.id === "tc-1"
+          ? slot.body.turnLive === true
+          : null,
+      );
+    expect(cardLive(true)).toEqual([null, true]);
+    // Rehydrated or crashed: nothing settled the call, but it is not running.
+    expect(cardLive(false)).toEqual([null, false]);
+  });
 });
 
 describe("buildTranscriptSlots — non-rendering rows", () => {
@@ -274,6 +301,58 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     const expanded = slots[1].body;
     expect(expanded.kind).toBe("turn_fold");
     if (expanded.kind === "turn_fold") expect(expanded.expanded).toBe(true);
+  });
+
+  it("settles expanded when the user had that turn's work log open", () => {
+    // `re-2` is the first entry of the work log, pinned while the turn ran.
+    const slots = buildTranscriptSlots(settledTurn(), false, new Set(["re-2"]));
+
+    expect(slots.map((slot) => slot.body.kind)).toEqual([
+      "item",
+      "turn_fold",
+      "item",
+      "activity",
+      "item",
+    ]);
+    const fold = slots[1].body;
+    if (fold.kind !== "turn_fold") throw new Error("expected a fold");
+    expect(fold.expanded).toBe(true);
+    expect(fold.pinnedBy).toEqual(["re-2"]);
+    expect(buildTranscriptSlots(settledTurn())[1].body).toMatchObject({
+      expanded: false,
+      pinnedBy: [],
+    });
+  });
+
+  it("settles expanded when the pinned log starts with a still-running subagent", () => {
+    // A background subagent keeps running after its turn settles, so it is
+    // not foldable — the pin on it must still hold the fold open.
+    const background: ChatViewItem = {
+      kind: "subagent_run",
+      id: "run-2",
+      seq: 2,
+      turn_id: "t1",
+      subagents: [{ id: "a", status: "running", items: [], toneIndex: 0 }],
+    };
+    const slots = buildTranscriptSlots(
+      [
+        userMsg(0, "please inspect this", 1_000),
+        assistantMsg(1, "Starting a background check."),
+        background,
+        tool(3),
+        assistantMsg(4, "Done."),
+        turnEnd(5, 14_400),
+      ],
+      false,
+      new Set(["run-2"]),
+    );
+    const fold = slots.find((slot) => slot.body.kind === "turn_fold")?.body;
+    if (fold?.kind !== "turn_fold") throw new Error("expected a fold");
+    expect(fold.expanded).toBe(true);
+    expect(fold.pinnedBy).toEqual(["run-2"]);
+    const log = slots.find((slot) => slot.body.kind === "activity")?.body;
+    if (log?.kind !== "activity") throw new Error("expected a work log");
+    expect(log.items.map((item) => item.id)).toEqual(["run-2", "tc-3"]);
   });
 
   it("leaves pending approvals visible even after a terminal event", () => {

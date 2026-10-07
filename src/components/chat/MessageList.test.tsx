@@ -606,6 +606,133 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("src/components/chat/MessageList.tsx")).toBeInTheDocument();
   });
 
+  it("keeps a work log the user opened mid-run on screen when the turn settles", () => {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-live", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-live" },
+      { ...readCall(2, "/b"), turn_id: "turn-live" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running,
+      {
+        kind: "assistant_message",
+        id: "final-live",
+        seq: 3,
+        turn_id: "turn-live",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-live",
+        seq: 4,
+        turn_id: "turn-live",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    // Collapsing the fold releases the pin, and it stays collapsed.
+    fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  // A live turn often reads: work, a short message, more work. Each log in
+  // that turn is the user's to keep open, not only the one with the live row.
+  function multiStretchTurn(): { running: ChatViewItem[]; settled: ChatViewItem[] } {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-multi", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-multi" },
+      { ...readCall(2, "/b"), turn_id: "turn-multi" },
+      {
+        kind: "assistant_message",
+        id: "between-multi",
+        seq: 3,
+        turn_id: "turn-multi",
+        text: "Now more.",
+        streaming: false,
+      },
+      { ...readCall(4, "/c"), turn_id: "turn-multi" },
+      { ...readCall(5, "/d"), turn_id: "turn-multi", status: "running" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running.slice(0, -1),
+      { ...readCall(5, "/d"), turn_id: "turn-multi" },
+      {
+        kind: "assistant_message",
+        id: "final-multi",
+        seq: 6,
+        turn_id: "turn-multi",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-multi",
+        seq: 7,
+        turn_id: "turn-multi",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    return { running, settled };
+  }
+
+  it("keeps an earlier work log of a live turn open when the turn settles", () => {
+    const { running, settled } = multiStretchTurn();
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    // The first log sits above the intermediate message, away from the live
+    // row; collapsed, it shows its last step.
+    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+  });
+
+  it("collapses a fold pinned by two open logs in one click", () => {
+    const { running, settled } = multiStretchTurn();
+    // Open the first log while it still holds the live row, then the second
+    // one once the agent has written a message and started more work.
+    const view = render(
+      <MessageList messages={running.slice(0, 3)} streaming {...noopHandlers} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    view.rerender(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { name: /\/d/ }));
+    expect(screen.getByText("/c")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    const fold = () => screen.getByRole("button", { name: "Worked for 5s" });
+    expect(fold()).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    expect(screen.getByText("/c")).toBeInTheDocument();
+
+    fireEvent.click(fold());
+    expect(fold()).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.queryByText("/c")).toBeNull();
+  });
+
   it("shows only the newest completed tool call until earlier work is requested", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
@@ -620,7 +747,7 @@ describe("MessageList activity blocks", () => {
     fireEvent.click(screen.getByText("/c"));
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Work log/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /\/b/ })).toBeInTheDocument();
   });
 
   it("keeps a lone successful observational call silent", () => {
@@ -963,6 +1090,47 @@ describe("MessageList dead-run detection (issue #154)", () => {
       expect(screen.getByTestId("run-stalled-notice")).toHaveTextContent(
         "No activity for 1m",
       );
+    });
+
+    it("offers Stop, wired to the turn's stop handler", () => {
+      const onStop = vi.fn();
+      render(
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={{ silentForSecs: 700 }}
+          onStop={onStop}
+          {...noopHandlers}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      expect(onStop).toHaveBeenCalledTimes(1);
+    });
+
+    it("hides on Keep waiting until another full stall passes, and resets on activity", () => {
+      const tree = (stalled: { silentForSecs: number } | null) => (
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={stalled}
+          {...noopHandlers}
+        />
+      );
+      const view = render(tree({ silentForSecs: 700 }));
+      // No stop handler (a read-only pane): only the snooze is offered.
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+
+      view.rerender(tree({ silentForSecs: 1_270 }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+      view.rerender(tree({ silentForSecs: 1_300 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      view.rerender(tree(null));
+      view.rerender(tree({ silentForSecs: 600 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
     });
 
     it("does not render when the thread is not streaming", () => {
