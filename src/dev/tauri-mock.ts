@@ -502,6 +502,57 @@ function emitAppState(): void {
   emitEvent("app-state-changed", appState);
 }
 
+/** The surface whose tree holds `paneId`, as a leaf or a split node. */
+function findSurfaceForPane(
+  paneId: unknown,
+): { workspace: WorkspaceSnapshot; surface: SurfaceSnapshot } | null {
+  const holds = (node: PaneNodeSnapshot): boolean =>
+    node.pane_id === paneId ||
+    (node.kind === "split" && node.children.some(holds));
+  for (const workspace of appState.workspaces) {
+    for (const surface of workspace.surfaces) {
+      if (holds(surface.root)) return { workspace, surface };
+    }
+  }
+  return null;
+}
+
+/** Publish a new snapshot with one surface patched, keeping every other
+ *  object's reference so the store sees exactly what changed. */
+function patchSurface(
+  target: SurfaceSnapshot,
+  patch: Partial<SurfaceSnapshot>,
+): void {
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((ws) =>
+      ws.surfaces.includes(target)
+        ? {
+            ...ws,
+            surfaces: ws.surfaces.map((surface) =>
+              surface === target ? { ...surface, ...patch } : surface,
+            ),
+          }
+        : ws,
+    ),
+  };
+  emitAppState();
+}
+
+/** `node` with the subtree rooted at `paneId` swapped for `replace(it)`. */
+function replacePaneNode(
+  node: PaneNodeSnapshot,
+  paneId: unknown,
+  replace: (found: PaneNodeSnapshot) => PaneNodeSnapshot,
+): PaneNodeSnapshot {
+  if (node.pane_id === paneId) return replace(node);
+  if (node.kind !== "split") return node;
+  return {
+    ...node,
+    children: node.children.map((child) => replacePaneNode(child, paneId, replace)),
+  };
+}
+
 /** One revision counter for every mock delta (activation and the stress
  *  driver alike), because the store requires deltas to be contiguous: two
  *  independent counters would hand it the same revision twice. The mock's
@@ -6164,6 +6215,58 @@ const handlers: Record<string, Handler> = {
     });
     emitAppState();
     return tabId;
+  },
+  /** Splits beside the pane with a fresh terminal, so split layouts (the
+   *  active-pane border, the seam handles) can be exercised in dev. */
+  split_pane: (a) => {
+    const loc = findSurfaceForPane(a.paneId);
+    if (!loc) return null;
+    const n = ++mockTabSeq;
+    const paneId = `pane-mock-split-${n}`;
+    const sessionId = `sess-mock-split-${n}`;
+    const direction = a.direction === "vertical" ? "vertical" : "horizontal";
+    const root = replacePaneNode(loc.surface.root, a.paneId, (found) => ({
+      kind: "split",
+      pane_id: `split-mock-${n}`,
+      direction,
+      child_sizes: [0.5, 0.5],
+      children: [
+        found,
+        { kind: "terminal", pane_id: paneId, session_id: sessionId, title: "Terminal" },
+      ],
+    }));
+    appState.terminal_sessions.push({
+      session_id: sessionId,
+      title: "Terminal",
+      shell: "/bin/bash",
+      cwd: loc.workspace.cwd,
+      cols: 120,
+      rows: 32,
+      state: "ready",
+      last_message: null,
+      exit_code: null,
+      original_command: null,
+      adapter_captures: {},
+    });
+    patchSurface(loc.surface, { root, active_pane_id: paneId });
+    return paneId;
+  },
+  activate_pane: (a) => {
+    const loc = findSurfaceForPane(a.paneId);
+    if (!loc || typeof a.paneId !== "string") return undefined;
+    patchSurface(loc.surface, { active_pane_id: a.paneId });
+    return undefined;
+  },
+  resize_split: (a) => {
+    const loc = findSurfaceForPane(a.paneId);
+    if (!loc || !Array.isArray(a.childSizes)) return undefined;
+    const childSizes = a.childSizes as number[];
+    patchSurface(loc.surface, {
+      root: replacePaneNode(loc.surface.root, a.paneId, (found) =>
+        found.kind === "split" ? { ...found, child_sizes: childSizes } : found,
+      ),
+    });
+    return undefined;
   },
   agent_chat_create_pane: (a) => {
     const ws = findWorkspace(a.workspaceId);
