@@ -2671,6 +2671,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::search_in_files,
             commands::search_file_names,
             commands::file_exists,
+            commands::file_signature,
             commands::read_file,
             commands::write_file,
             commands::save_clipboard_image_bytes,

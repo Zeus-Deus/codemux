@@ -4,9 +4,10 @@ import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
-import { FileCode } from "lucide-react";
+import { Check, FileCode } from "lucide-react";
+import { toast } from "sonner";
 import { useEditorStore } from "@/stores/editor-store";
-import { readFile, writeFile } from "@/tauri/commands";
+import { fileSignature, readFile, writeFile } from "@/tauri/commands";
 import { buildEditorTheme } from "@/lib/codemirror-theme";
 import {
   loadLanguage,
@@ -20,6 +21,7 @@ import { ImageViewer } from "./ImageViewer";
 import { VideoViewer } from "./VideoViewer";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -45,6 +47,37 @@ type ViewMode = EditorViewMode;
 export function isMarkdownFile(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase();
   return ext === "md" || ext === "mdx" || ext === "markdown";
+}
+
+/** How often an open file is re-stat'ed for changes made outside the editor
+ *  (agents, terminals, other tools). A stat is cheap; content is re-read only
+ *  when the size or mtime moves. */
+export const DISK_POLL_MS = 2000;
+const NOTICE_MS = 1500;
+/** Matches the `duration-150` surface fade on the notice. */
+const NOTICE_FADE_MS = 150;
+
+/** Swap the document for `next` by replacing only the span that differs, so
+ *  the cursor, selection and scroll position outside an agent's edit stay
+ *  where the user left them. */
+function replaceDocument(view: EditorView, next: string) {
+  const prev = view.state.doc.toString();
+  const max = Math.min(prev.length, next.length);
+  let start = 0;
+  while (start < max && prev.charCodeAt(start) === next.charCodeAt(start)) start++;
+  let prevEnd = prev.length;
+  let nextEnd = next.length;
+  while (
+    prevEnd > start &&
+    nextEnd > start &&
+    prev.charCodeAt(prevEnd - 1) === next.charCodeAt(nextEnd - 1)
+  ) {
+    prevEnd--;
+    nextEnd--;
+  }
+  view.dispatch({
+    changes: { from: start, to: prevEnd, insert: next.slice(start, nextEnd) },
+  });
 }
 
 export function EditorPane({
@@ -76,6 +109,19 @@ export function EditorPane({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [content, setContent] = useState("");
   const [loadedFilePath, setLoadedFilePath] = useState<string | null>(null);
+  /** Disk content that changed underneath unsaved edits, awaiting the
+   *  user's Reload / Keep mine choice. */
+  const [diskConflict, setDiskConflict] = useState<string | null>(null);
+  const [notice, setNotice] = useState<"saved" | "reloaded" | null>(null);
+  const [noticeFading, setNoticeFading] = useState(false);
+  /** Signature of the disk version the buffer was last reconciled with.
+   *  `null` means unknown, so the next check re-reads and compares content. */
+  const diskSignatureRef = useRef<string | null>(null);
+  const checkingDiskRef = useRef(false);
+  /** Bumped by every load and save, so a disk check that started before one
+   *  of them drops its now-stale read instead of reverting the buffer. */
+  const diskEpochRef = useRef(0);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isMd = filePath != null && isMarkdownFile(filePath);
   const isImage = filePath != null && isImageExtension(filePath);
@@ -109,22 +155,145 @@ export function EditorPane({
     initTab(tabId);
   }, [tabId, initTab]);
 
+  const flashNotice = useCallback((next: "saved" | "reloaded") => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    setNotice(next);
+    setNoticeFading(false);
+    noticeTimerRef.current = setTimeout(() => {
+      setNoticeFading(true);
+      noticeTimerRef.current = setTimeout(() => setNotice(null), NOTICE_FADE_MS);
+    }, NOTICE_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    },
+    [],
+  );
+
+  /** Replace the buffer with `disk` and make it the new clean baseline. */
+  const adoptDiskContent = useCallback(
+    (disk: string) => {
+      const view = viewRef.current;
+      if (view && view.state.doc.toString() !== disk) {
+        isLoadingRef.current = true;
+        try {
+          replaceDocument(view, disk);
+        } finally {
+          isLoadingRef.current = false;
+        }
+      }
+      setBaselineContent(tabId, disk);
+      setContent(disk);
+      setDiskConflict(null);
+    },
+    [tabId, setBaselineContent],
+  );
+
+  /** Reconcile the buffer with a disk version that differs from what it was
+   *  loaded from: reload a clean buffer in place, but never touch unsaved
+   *  edits without asking. */
+  const reconcileDiskContent = useCallback(
+    (disk: string) => {
+      const tab = useEditorStore.getState().getTab(tabId);
+      const view = viewRef.current;
+      if (!tab || !view) return;
+      if (disk === tab.baselineContent) {
+        setDiskConflict(null);
+        return;
+      }
+      if (view.state.doc.toString() === disk) {
+        // The buffer already matches the new disk content: nothing to ask.
+        setBaselineContent(tabId, disk);
+        setContent(disk);
+        setDiskConflict(null);
+        return;
+      }
+      if (tab.isDirty) {
+        setDiskConflict(disk);
+        return;
+      }
+      adoptDiskContent(disk);
+      flashNotice("reloaded");
+    },
+    [tabId, setBaselineContent, adoptDiskContent, flashNotice],
+  );
+
+  const checkDisk = useCallback(async () => {
+    const path = useEditorStore.getState().getTab(tabId)?.filePath;
+    if (!path || checkingDiskRef.current) return;
+    checkingDiskRef.current = true;
+    const epoch = diskEpochRef.current;
+    try {
+      // Stat before reading: a write that lands between the two moves the
+      // signature again, so the next check still catches it.
+      const signature = await fileSignature(path);
+      if (signature === diskSignatureRef.current) return;
+      const disk = await readFile(path);
+      if (epoch !== diskEpochRef.current) return;
+      if (useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
+      diskSignatureRef.current = signature;
+      reconcileDiskContent(disk);
+    } catch {
+      // Deleted, renamed or briefly unreadable mid-write: keep the buffer
+      // as it is and look again on the next tick.
+    } finally {
+      checkingDiskRef.current = false;
+    }
+  }, [tabId, reconcileDiskContent]);
+
   // Save handler
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     const view = viewRef.current;
     const path = useEditorStore.getState().getTab(tabId)?.filePath;
     if (!view || !path) return;
 
     const c = view.state.doc.toString();
-    writeFile(path, c)
-      .then(() => {
-        setBaselineContent(tabId, c);
-        setContent(c);
-      })
-      .catch((err) => {
-        console.error("Failed to save:", err);
+    try {
+      // Refuse to silently overwrite a version written since this buffer
+      // last synced with disk (an agent edit, typically).
+      const signature = await fileSignature(path).catch(() => null);
+      if (signature !== null && signature !== diskSignatureRef.current) {
+        const disk = await readFile(path);
+        diskSignatureRef.current = signature;
+        const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent;
+        if (disk !== baseline && disk !== c) {
+          setDiskConflict(disk);
+          return;
+        }
+      }
+      diskEpochRef.current++;
+      await writeFile(path, c);
+      // Unknown until the next check re-reads it, which also confirms the
+      // write landed as this buffer.
+      diskSignatureRef.current = null;
+      setBaselineContent(tabId, c);
+      setContent(c);
+      setDiskConflict(null);
+      flashNotice("saved");
+    } catch (err) {
+      toast.error(`Couldn't save ${path.split("/").pop() ?? path}`, {
+        description: String(err),
       });
-  }, [tabId, setBaselineContent]);
+    }
+  }, [tabId, setBaselineContent, flashNotice]);
+
+  const reloadFromDisk = useCallback(() => {
+    if (diskConflict == null) return;
+    adoptDiskContent(diskConflict);
+    flashNotice("reloaded");
+  }, [diskConflict, adoptDiskContent, flashNotice]);
+
+  /** Keep the unsaved edits and treat the newer disk version as the base,
+   *  so the next save deliberately replaces it. */
+  const keepMine = useCallback(() => {
+    if (diskConflict == null) return;
+    const view = viewRef.current;
+    setBaselineContent(tabId, diskConflict);
+    setDirty(tabId, view != null && view.state.doc.toString() !== diskConflict);
+    setDiskConflict(null);
+  }, [diskConflict, tabId, setBaselineContent, setDirty]);
 
   // Stable ref for save so keymap always calls the latest version
   const handleSaveRef = useRef(handleSave);
@@ -150,7 +319,7 @@ export function EditorPane({
       {
         key: "Mod-s",
         run: () => {
-          handleSaveRef.current();
+          void handleSaveRef.current();
           return true;
         },
       },
@@ -227,6 +396,9 @@ export function EditorPane({
     isLoadingRef.current = true;
     setErrorMsg(null);
     setLoadedFilePath(null);
+    setDiskConflict(null);
+    diskSignatureRef.current = null;
+    diskEpochRef.current++;
 
     // Fire the file read IPC and the language-module dynamic import
     // concurrently. They are independent \u2014 `readFile` does Tauri IPC
@@ -269,6 +441,26 @@ export function EditorPane({
       }
     });
   }, [filePath, tabId, setBaselineContent]);
+
+  // Watch the open text file for edits made outside the editor. Polling a
+  // stat matches how the diff and changes panels refresh; checks also run
+  // the moment the window regains focus or becomes visible.
+  const watchDisk =
+    filePath != null && loadedFilePath === filePath && errorMsg == null;
+  useEffect(() => {
+    if (!watchDisk) return;
+    const check = () => {
+      if (document.visibilityState === "visible") void checkDisk();
+    };
+    const timer = setInterval(check, DISK_POLL_MS);
+    window.addEventListener("focus", check);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", check);
+      document.removeEventListener("visibilitychange", check);
+    };
+  }, [watchDisk, checkDisk]);
 
   // Markdown opens rendered, which hides the CodeMirror container. When this
   // pane owns its mode (no controlled prop) it flips itself to source for a
@@ -371,6 +563,19 @@ export function EditorPane({
         {isDirty && viewMode === "raw" && (
           <span className="size-1.5 rounded-full bg-foreground/50 shrink-0 ml-1" title="Unsaved changes" />
         )}
+        {notice != null && !isDirty && (
+          <span
+            role="status"
+            className={cn(
+              "ml-1 flex shrink-0 items-center gap-1 text-caption text-muted-foreground",
+              "transition-opacity duration-150 motion-reduce:transition-none",
+              noticeFading && "opacity-0",
+            )}
+          >
+            {notice === "saved" && <Check className="size-3" />}
+            {notice === "saved" ? "Saved" : "Reloaded from disk"}
+          </span>
+        )}
         <div className="flex-1" />
 
         {/* View mode toggle — markdown files only */}
@@ -397,6 +602,28 @@ export function EditorPane({
           </span>
         )}
       </PanelHeader>
+
+      {diskConflict != null && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center gap-2 border-b border-hairline bg-surface-1 px-2 py-1"
+        >
+          <span className="min-w-0 flex-1 truncate text-label text-foreground">
+            This file changed on disk while you had unsaved edits.
+          </span>
+          <Button size="xs" variant="outline" onClick={reloadFromDisk}>
+            Reload
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost"
+            onClick={keepMine}
+            title="Keep your edits. Saving will replace the version on disk."
+          >
+            Keep mine
+          </Button>
+        </div>
+      )}
 
       {/* Image viewer — shown instead of the text editor for image files */}
       {isImage && <ImageViewer key={filePath} filePath={filePath} />}
