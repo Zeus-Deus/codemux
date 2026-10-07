@@ -1,14 +1,20 @@
+import { useEffect } from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import {
   capabilityDefaults,
   defaultModelId,
+  isBootstrapModelId,
 } from "@/lib/agent-chat/capability-defaults";
 import { discardStagedImage } from "@/lib/agent-chat/image-staging";
 import {
   useAgentChatStore,
   type ChatMode,
 } from "@/stores/agent-chat-store";
+import {
+  selectCapabilities,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 
@@ -709,6 +715,43 @@ export const useChatDraftStore = create<ChatDraftStore>()(
     },
   ),
 );
+
+/** Drafts created before a provider's roster loaded hold a placeholder
+ *  model and no effort / context window. Once the roster is available, move
+ *  each unsent one onto the roster's default exactly as a draft created
+ *  after hydration would be seeded. Ids the roster lists are left alone, so
+ *  a model the user picked is never overwritten. */
+export function reseedBootstrapDrafts(): void {
+  const capabilities = useProviderCapabilities.getState();
+  useChatDraftStore.setState((state) => {
+    let draftsById: Record<DraftId, ChatDraft> | null = null;
+    for (const draft of Object.values(state.draftsById)) {
+      if (draft.promoting || draft.promotedTo || draft.materializedTo) continue;
+      if (!isBootstrapModelId(draft.provider, draft.model)) continue;
+      const roster = selectCapabilities(capabilities, draft.provider)?.models;
+      if (!roster?.length || roster.some((m) => m.id === draft.model)) continue;
+      const defaults = capabilityDefaults(draft.provider, roster[0].id);
+      draftsById ??= { ...state.draftsById };
+      draftsById[draft.draftId] = {
+        ...draft,
+        model: defaults.model,
+        effort: defaults.effort,
+        contextWindow: defaults.contextWindow,
+      };
+    }
+    return draftsById ? { draftsById } : state;
+  });
+}
+
+/** Keep placeholder drafts in step with the capability roster for the
+ *  lifetime of the app shell: once for a roster already restored from
+ *  storage, then on every harvest. */
+export function useReseedBootstrapDrafts(): void {
+  useEffect(() => {
+    reseedBootstrapDrafts();
+    return useProviderCapabilities.subscribe(reseedBootstrapDrafts);
+  }, []);
+}
 
 export type PersistedChatDraftStoreState = Pick<
   ChatDraftStore,

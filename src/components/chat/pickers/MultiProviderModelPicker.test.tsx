@@ -221,10 +221,23 @@ describe("MultiProviderModelPicker — trigger", () => {
       .toHaveTextContent("Loading…");
   });
 
-  it("falls back to the raw model id if the model isn't in the caps list", () => {
-    renderPicker({ provider: "claude", model: "claude-future-9000" });
+  it("names an unlisted Claude id instead of showing it raw", () => {
+    renderPicker({ provider: "claude", model: "claude-opus-4-8" });
     expect(screen.getByTestId("multi-provider-model-picker-trigger"))
-      .toHaveTextContent("claude-future-9000");
+      .toHaveTextContent("Claude Opus 4.8");
+  });
+
+  it("falls back to the raw model id when it has no readable form", () => {
+    renderPicker({ provider: "claude", model: "mystery-model" });
+    expect(screen.getByTestId("multi-provider-model-picker-trigger"))
+      .toHaveTextContent("mystery-model");
+  });
+
+  it("reads the default alias as Default before the roster loads", () => {
+    seedStore({ claude: null, codex: null, opencode: null });
+    renderPicker({ provider: "claude", model: "default" });
+    expect(screen.getByTestId("multi-provider-model-picker-trigger"))
+      .toHaveTextContent("Default");
   });
 
   it("resolves a dangling stored 'default' id to the first roster model", () => {

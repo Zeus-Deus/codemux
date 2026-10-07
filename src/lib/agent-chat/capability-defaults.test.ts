@@ -4,6 +4,8 @@ import {
   capabilityDefaults,
   defaultModelId,
   defaultPermissionModeForProvider,
+  fallbackModelLabel,
+  isBootstrapModelId,
   modelLabel,
   modelsForProvider,
 } from "./capability-defaults";
@@ -76,8 +78,10 @@ describe("capability-defaults", () => {
       expect(defaultModelId("claude")).toBe("custom-model-abc");
     });
 
-    it("falls back to the hardcoded Claude default when caps are unhydrated", () => {
-      expect(defaultModelId("claude")).toBe("claude-opus-4-8");
+    it("falls back to the CLI's own default alias when caps are unhydrated", () => {
+      // A concrete id would pin new drafts to a model the CLI may no
+      // longer recommend.
+      expect(defaultModelId("claude")).toBe("default");
     });
 
     it("falls back to the hardcoded Codex default when caps are unhydrated", () => {
@@ -163,6 +167,13 @@ describe("capability-defaults", () => {
       expect(modelLabel("claude", "anything")).toBe("anything");
     });
 
+    it("names an unlisted Claude id instead of showing it raw", () => {
+      useProviderCapabilities.setState({
+        claude: makeClaudeCaps([makeModel({ id: "opus", label: "Claude Opus 5.5" })]),
+      });
+      expect(modelLabel("claude", "claude-opus-4-8")).toBe("Claude Opus 4.8");
+    });
+
     it("resolves a dangling 'default' id to the first model's label", () => {
       // Persisted drafts from before the alias fold store the id
       // "default"; the roster no longer carries that row when a
@@ -184,6 +195,39 @@ describe("capability-defaults", () => {
         ]),
       });
       expect(modelLabel("claude", "mystery")).toBe("mystery");
+    });
+  });
+
+  describe("fallbackModelLabel", () => {
+    it("reads the provider alias as Default before the roster loads", () => {
+      expect(fallbackModelLabel("default")).toBe("Default");
+    });
+
+    it("formats Claude's versioned ids", () => {
+      expect(fallbackModelLabel("claude-opus-4-8")).toBe("Claude Opus 4.8");
+      expect(fallbackModelLabel("claude-fable-5")).toBe("Claude Fable 5");
+      expect(fallbackModelLabel("claude-sonnet-4-5-20250929")).toBe(
+        "Claude Sonnet 4.5",
+      );
+      expect(fallbackModelLabel("claude-opus-4-7[1m]")).toBe("Claude Opus 4.7");
+    });
+
+    it("keeps any other id as-is", () => {
+      expect(fallbackModelLabel("gpt-5.4")).toBe("gpt-5.4");
+      expect(fallbackModelLabel("anthropic/claude-sonnet-4-6")).toBe(
+        "anthropic/claude-sonnet-4-6",
+      );
+    });
+  });
+
+  describe("isBootstrapModelId", () => {
+    it("recognises current and legacy placeholders only for their provider", () => {
+      expect(isBootstrapModelId("claude", "default")).toBe(true);
+      expect(isBootstrapModelId("claude", "claude-opus-4-8")).toBe(true);
+      expect(isBootstrapModelId("claude", "opus")).toBe(false);
+      expect(isBootstrapModelId("codex", "claude-opus-4-8")).toBe(false);
+      expect(isBootstrapModelId("codex", "gpt-5.4")).toBe(true);
+      expect(isBootstrapModelId("claude", null)).toBe(false);
     });
   });
 

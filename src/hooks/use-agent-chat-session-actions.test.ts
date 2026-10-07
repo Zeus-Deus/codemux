@@ -72,7 +72,7 @@ type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
 // `defaultModelForProvider` falls back to this when the provider
 // capabilities store hasn't hydrated (its behaviour under jsdom).
-const CLAUDE_DEFAULT_MODEL = "claude-opus-4-8";
+const CLAUDE_DEFAULT_MODEL = "default";
 
 function makePane(overrides: Partial<AgentChatPane> = {}): AgentChatPane {
   return {
