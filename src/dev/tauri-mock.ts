@@ -625,7 +625,66 @@ const ptyChannels = new Map<string, MockPtyChannelEntry>();
 
 const MOCK_TERMINAL_BANNER =
   "\r\n  \x1b[2m(mock terminal — no PTY in plain-browser dev; " +
-  "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n";
+  "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n" +
+  "  \x1b[2mtyped lines echo back; `exit [code]` ends the shell\x1b[0m\r\n$ ";
+
+/** Mirror a lifecycle change into the session record, as the backend's
+ *  `update_terminal_session_status` does. */
+function setMockSessionState(
+  sessionId: string,
+  state: "ready" | "exited",
+  message: string | null,
+  exitCode: number | null,
+): void {
+  const session = appState.terminal_sessions.find((t) => t.session_id === sessionId);
+  if (!session) return;
+  session.state = state;
+  session.last_message = message;
+  session.exit_code = exitCode;
+}
+
+/** Typed-but-unsubmitted input per session, for the mock line echo. */
+const ptyLineBuffers = new Map<string, string>();
+
+/** A stand-in shell: echo what is typed so links and find have text to
+ *  work on, and treat `exit [code]` as the shell exiting so the terminal's
+ *  exited state and Restart are reachable without a PTY. */
+function mockShellInput(sessionId: string, data: string): void {
+  const entry = ptyChannels.get(sessionId);
+  let line = ptyLineBuffers.get(sessionId) ?? "";
+  let echo = "";
+  for (const ch of data) {
+    if (ch === "\r") {
+      echo += "\r\n";
+      const exit = /^exit(?:\s+(\d+))?$/.exec(line.trim());
+      line = "";
+      if (exit) {
+        if (entry) ptyChannelPush(entry, echo);
+        ptyLineBuffers.delete(sessionId);
+        const code = Number(exit[1] ?? 0);
+        const message =
+          code === 0 ? "Shell exited successfully" : `Shell exited with code ${code}`;
+        setMockSessionState(sessionId, "exited", message, code);
+        emitEvent("terminal-status", {
+          session_id: sessionId,
+          state: "exited",
+          message,
+          exit_code: code,
+        });
+        return;
+      }
+      echo += "$ ";
+    } else if (ch === "\x7f") {
+      if (line) echo += "\b \b";
+      line = line.slice(0, -1);
+    } else if (ch >= " ") {
+      line += ch;
+      echo += ch;
+    }
+  }
+  ptyLineBuffers.set(sessionId, line);
+  if (entry && echo) ptyChannelPush(entry, echo);
+}
 
 // ── MCP fixtures (Settings → MCP Servers) ──
 
@@ -5864,12 +5923,25 @@ const handlers: Record<string, Handler> = {
   //    overlay), then push a one-shot "(mock terminal)" banner through
   //    the PTY output channel so the pane reads as an intentional mock
   //    rather than a dead black box. ──
-  get_terminal_status: (a) => ({
-    session_id: a.sessionId as string,
-    state: "ready",
-    message: null,
-    exit_code: null,
-  }),
+  get_terminal_status: (a) => {
+    const session = appState.terminal_sessions.find((t) => t.session_id === a.sessionId);
+    // A shell exited through the mock line echo stays exited across remounts,
+    // like the backend's runtime-less answer.
+    if (session?.state === "exited") {
+      return {
+        session_id: a.sessionId as string,
+        state: "exited",
+        message: session.last_message,
+        exit_code: session.exit_code,
+      };
+    }
+    return {
+      session_id: a.sessionId as string,
+      state: "ready",
+      message: null,
+      exit_code: null,
+    };
+  },
   attach_pty_output: (a) => {
     const sessionId = a.sessionId as string;
     // Newest attach wins: a fresh Channel has an empty ordering buffer,
@@ -5883,7 +5955,22 @@ const handlers: Record<string, Handler> = {
     return ++ptyOutputGeneration;
   },
   resize_pty: () => undefined,
-  write_to_pty: () => undefined,
+  write_to_pty: (a) => {
+    mockShellInput(a.sessionId as string, String(a.data ?? ""));
+    return undefined;
+  },
+  restart_terminal_session: (a) => {
+    const sessionId = a.sessionId as string;
+    ptyLineBuffers.delete(sessionId);
+    setMockSessionState(sessionId, "ready", null, null);
+    emitEvent("terminal-status", {
+      session_id: sessionId,
+      state: "ready",
+      message: null,
+      exit_code: null,
+    });
+    return undefined;
+  },
   detach_pty_output: (a) => {
     ptyChannels.delete(a.sessionId as string);
     return undefined;

@@ -4,6 +4,10 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { SearchAddon } from "@xterm/addon-search";
+import { Copy, RotateCcw } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { shouldLoadWebglAddon } from "./webgl-renderer-probe";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
@@ -41,9 +45,26 @@ import {
   getTerminalScrollback,
   cacheTerminalScrollback,
   uncacheTerminalScrollback,
+  restartTerminalSession,
+  closePane,
+  createBrowserPane,
+  fileExists,
   Channel,
   type ScrollbackPayload,
 } from "@/tauri/commands";
+import { openExternalUrl } from "@/lib/open-url";
+import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
+import { toast } from "@/lib/toast";
+import {
+  findTerminalLinks,
+  isLoopbackUrl,
+  rangeForMatch,
+  readLogicalLine,
+  resolveTerminalPath,
+  type TerminalLinkMatch,
+} from "./terminal-links";
+import { describeTerminalStatus, reconcileMountedStatus } from "./terminal-status-view";
+import { TerminalFindBar } from "./TerminalFindBar";
 import { writePtyInput } from "./pty-input";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
 import { createWritePump } from "./terminal-write-pump";
@@ -73,6 +94,20 @@ interface Props {
 // `transition: opacity` duration on `.terminal-overlay` in globals.css so the
 // element is only removed from layout (display:none) after the fade completes.
 const OVERLAY_FADE_MS = 160;
+
+const LINK_HINT = "Ctrl+click to open";
+
+const EXIT_CHIP_CLASS =
+  "status-meta inline-flex items-center rounded-sm px-1.5 py-0.5 text-label font-mono";
+const EXIT_CHIP_TONE = {
+  success: "bg-success/12 text-success",
+  danger: "bg-destructive/12 text-destructive",
+} as const;
+
+/** Terminal links open on Ctrl/Cmd+click so a plain click still selects text. */
+function isOpenGesture(event: MouseEvent): boolean {
+  return event.ctrlKey || event.metaKey;
+}
 
 function extractBytes(payload: unknown): Uint8Array | null {
   if (payload instanceof Uint8Array) return payload;
@@ -135,6 +170,12 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     exit_code: null,
   });
   const statusOverlayRef = useRef<HTMLDivElement>(null);
+  // Respawns this pane's shell and re-attaches its output. Set by the mount
+  // effect, which owns the write pump and attach generation it needs.
+  const restartRef = useRef<(() => Promise<void>) | null>(null);
+  const [search, setSearch] = useState<SearchAddon | null>(null);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findToken, setFindToken] = useState(0);
   // Pending display:none after a fade-out, so a status flip mid-fade can cancel it.
   const overlayHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyDecoderRef = useRef(new TextDecoder("utf-8", { fatal: false }));
@@ -207,11 +248,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // and we don't want to schedule a re-render of the whole pane
   // for every status update.
   //
-  // The visual state (spinner vs warning indicator) is also
-  // toggled via display=flex/none on the two icon slots inside
-  // .status-indicator — same DOM-mutation pattern. The Tailwind
-  // classes on the slots define the static look; we just toggle
-  // visibility based on state.
+  // The visual state (spinner, warning or exited dot, exit-code
+  // chip, recovery actions) is toggled the same way, via display on
+  // static slots. The Tailwind classes on the slots define the look;
+  // `describeTerminalStatus` decides which are visible.
   const updateStatusOverlay = useCallback((status: TerminalStatusPayload) => {
     statusRef.current = status;
     if (status.state === "ready") {
@@ -246,28 +286,38 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // Keep the base classes (positioning, backdrop) and append
     // the state for any state-specific CSS hooks downstream.
     el.className = `terminal-overlay ${status.state} absolute inset-0 z-0 flex items-center justify-center p-6 bg-background/95 backdrop-blur-sm`;
-    const failed = status.state === "failed";
-    // Migrating reads as a deliberate transition, not a fresh shell start, so it
-    // gets its own heading; it keeps the spinner (it's an in-progress state).
-    const migrating = status.state === "migrating";
-    // Swap spinner vs warning indicator visibility.
-    const spinner = el.querySelector<HTMLElement>(".status-indicator .spinner");
-    const warning = el.querySelector<HTMLElement>(".status-indicator .warning");
-    if (spinner) spinner.style.display = failed ? "none" : "block";
-    if (warning) warning.style.display = failed ? "flex" : "none";
+    const view = describeTerminalStatus(status);
+    const show = (selector: string, shown: boolean, display = "block") => {
+      const node = el.querySelector<HTMLElement>(selector);
+      if (node) node.style.display = shown ? display : "none";
+    };
+    show(".status-indicator .spinner", view.indicator === "spinner");
+    show(".status-indicator .warning", view.indicator === "warning", "flex");
+    show(".status-indicator .exited", view.indicator === "exited");
     const h2 = el.querySelector("h2");
     const p = el.querySelector("p");
-    const code = el.querySelector(".status-meta");
-    if (h2)
-      h2.textContent = failed
-        ? "Terminal unavailable"
-        : migrating
-          ? "Migrating workspace"
-          : "Terminal starting";
+    const code = el.querySelector<HTMLElement>(".status-meta");
+    if (h2) h2.textContent = view.heading;
     if (p) p.textContent = status.message ?? "Waiting for shell status...";
-    if (code)
-      code.textContent =
-        status.exit_code !== null ? `Exit code: ${status.exit_code}` : "";
+    if (code) {
+      code.textContent = view.exitCode?.label ?? "";
+      code.className = view.exitCode
+        ? `${EXIT_CHIP_CLASS} ${EXIT_CHIP_TONE[view.exitCode.tone]}`
+        : EXIT_CHIP_CLASS;
+      code.style.display = view.exitCode ? "" : "none";
+    }
+    show(".status-actions", view.actions !== "none", "flex");
+    show(".status-actions .status-copy", view.actions === "retry", "");
+    const restart = el.querySelector<HTMLButtonElement>(".status-actions .status-restart");
+    const restartLabel = restart?.querySelector(".status-restart-label");
+    if (restartLabel) {
+      restartLabel.textContent = view.actions === "retry" ? "Retry" : "Restart shell";
+    }
+    // Hand focus to Restart only when it was in this pane (the user typed
+    // `exit` here), so Enter restarts without stealing focus from elsewhere.
+    if (view.actions !== "none" && restart && shellRef.current?.contains(document.activeElement)) {
+      restart.focus();
+    }
   }, []);
 
   // ── Terminal status event ──
@@ -310,13 +360,98 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       fontSize: typography.terminalSize,
       cursorStyle: getTerminalCursorStyle() as "bar" | "block" | "underline",
       altClickMovesCursor: true,
+      // `term.unicode` (Unicode 11 widths below) is a proposed API.
+      allowProposedApi: true,
+      // OSC 8 hyperlinks: same gesture and routing as detected links.
+      linkHandler: {
+        activate: (event, uri) => {
+          if (isOpenGesture(event)) openUrl(uri);
+        },
+        hover: () => {
+          containerEl.title = LINK_HINT;
+        },
+        leave: () => {
+          containerEl.removeAttribute("title");
+        },
+      },
     });
 
     const fitAddon = new FitAddon();
     const serializeAddon = new SerializeAddon();
+    const searchAddon = new SearchAddon();
     term.loadAddon(fitAddon);
     term.loadAddon(serializeAddon);
+    term.loadAddon(searchAddon);
     term.open(containerEl);
+
+    // Agent TUIs draw emoji and symbols that are two cells wide under
+    // Unicode 11 but one under xterm's default v6 tables; the mismatch drifts
+    // the cursor and leaves ghost characters on redraw.
+    term.loadAddon(new Unicode11Addon());
+    term.unicode.activeVersion = "11";
+
+    // ── Links: URLs and file:line references ──
+    // A loopback URL is a dev server, so it opens beside this pane in the
+    // Codemux browser; anything else goes through the app's link routing.
+    function openUrl(url: string) {
+      if (paneId && isLoopbackUrl(url)) {
+        createBrowserPane(paneId, url).catch(() => void openExternalUrl(url));
+        return;
+      }
+      void openExternalUrl(url);
+    }
+
+    function openFile(link: Extract<TerminalLinkMatch, { kind: "file" }>) {
+      const cwd =
+        useTerminalCwdStore.getState().cwds[sid]?.cwd ??
+        useAppStore.getState().appState?.terminal_sessions.find((s) => s.session_id === sid)?.cwd;
+      const target = resolveTerminalPath(link.path, cwd);
+      const workspaceId = getSessionWorkspaceId(sid);
+      if (!target || !workspaceId) {
+        toast.error(`Can't open ${link.path}`, {
+          description: "This terminal's working directory is unknown.",
+        });
+        return;
+      }
+      // An unavailable stat (older remote backend) still opens, like chat links.
+      fileExists(target)
+        .catch(() => true)
+        .then((exists) => {
+          if (exists) openRightPanelDoc(workspaceId, target, link.line, link.column);
+          else toast.error(`File not found: ${target}`);
+        });
+    }
+
+    const linkProviderDisposable = term.registerLinkProvider({
+      provideLinks: (bufferLine, callback) => {
+        const { text, cells } = readLogicalLine(term, bufferLine - 1);
+        const links = findTerminalLinks(text).flatMap((match) => {
+          const range = rangeForMatch(cells, match.start, match.end);
+          // A wrapped link is reported for each of its rows; keep only the
+          // ones that cross the row xterm asked about.
+          if (!range || range.start.y > bufferLine || range.end.y < bufferLine) return [];
+          return [
+            {
+              range,
+              text: text.slice(match.start, match.end),
+              decorations: { pointerCursor: true, underline: true },
+              activate: (event: MouseEvent) => {
+                if (!isOpenGesture(event)) return;
+                if (match.kind === "url") openUrl(match.url);
+                else openFile(match);
+              },
+              hover: () => {
+                containerEl.title = LINK_HINT;
+              },
+              leave: () => {
+                containerEl.removeAttribute("title");
+              },
+            },
+          ];
+        });
+        callback(links.length > 0 ? links : undefined);
+      },
+    });
 
     // ── WebGL renderer (hardware GL only) ──
     // Offload glyph rendering to the GPU — substantially faster and smoother
@@ -363,6 +498,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     webglAddonRef.current = webglAddon;
     kittyStackRef.current = [];
     kittyLevelRef.current = 0;
+    setSearch(searchAddon);
 
     // ── Custom key handler ──
     term.attachCustomKeyEventHandler((ev) => {
@@ -412,7 +548,18 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       const killCombo = resolved.getKeysForAction("backwardKillWord");
       const copyCombo = resolved.getKeysForAction("copySelection");
       const pasteCombo = resolved.getKeysForAction("pasteTerminal");
+      const findCombo = resolved.getKeysForAction("terminalFind");
 
+      // Full-screen apps (vim, less, htop) have no scrollback to search and
+      // their own use for the key, so it passes through on the alt screen.
+      if (findCombo && !isAltScreen(term) && matchesKeyCombo(ev, findCombo)) {
+        if (ev.type === "keydown") {
+          setFindOpen(true);
+          setFindToken((token) => token + 1);
+        }
+        ev.preventDefault?.();
+        return false;
+      }
       if (killCombo && matchesKeyCombo(ev, killCombo)) {
         if (ev.type === "keydown") {
           writePtyInput(sid, "\x17");
@@ -763,6 +910,115 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       },
     });
 
+    // Stages 2 + 3 of the mount, shared with restart: subscribe to the
+    // session's output, then size the PTY to this pane. Resolves false when
+    // the attach failed or the pane went away.
+    const attachOutput = async (): Promise<boolean> => {
+      // Stage 2: attach the channel. Must come AFTER the scrollback is
+      // enqueued so live bytes drain behind the historical bytes. The
+      // callback advances the kitty stack synchronously (the input handler
+      // reads kittyLevel on every keystroke, so it can't wait behind the
+      // throttled pump) then enqueues the bytes for the shared drain.
+      const channel = new Channel<unknown>((payload) => {
+        if (cancelled) return;
+        const bytes = extractBytes(payload);
+        if (!bytes) return;
+        // First live byte on a migrating pane means the replacement PTY is
+        // producing output — dismiss the "Switching to <host>…" overlay even if
+        // the Ready lifecycle event hasn't landed yet (the two ride different
+        // IPC paths, so output can win the race). Cheap string compare per chunk.
+        if (statusRef.current.state === "migrating") {
+          updateStatusOverlay({
+            session_id: sid,
+            state: "ready",
+            message: null,
+            exit_code: null,
+          });
+        }
+        scanKittyProtocol(bytes);
+        pump.enqueue(bytes);
+      });
+
+      try {
+        const generation = (await attachPtyOutput(sid, channel)) ?? null;
+        if (cancelled) {
+          // Unmounted during the attach round-trip: the cleanup below ran
+          // before we recorded the generation, so tear down the subscriber we
+          // just installed here — otherwise it lingers in the backend fan-out
+          // set (dropping bytes via the `cancelled` guard) until the session
+          // closes.
+          if (generation != null) {
+            detachPtyOutput(sid, generation).catch(console.error);
+          }
+          return false;
+        }
+        attachedSessionRef.current = sid;
+        attachedGenerationRef.current = generation;
+        // Reconcile a pause that crossed the HIGH watermark during the
+        // pre-attach scrollback restore, when we had no generation to attribute
+        // it to. Now that we're a subscriber, apply it.
+        if (flowPaused && generation != null) {
+          pausePtyOutput(sid, generation).catch((err) => {
+            flowPaused = false;
+            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
+          });
+        }
+      } catch (err) {
+        if (cancelled) return false;
+        updateStatusOverlay({
+          session_id: sid,
+          state: "failed",
+          message: `Failed to attach terminal output: ${String(err)}`,
+          exit_code: null,
+        });
+        return false;
+      }
+
+      // Stage 3: fit + resize. resizePty is fire-and-forget so doesn't
+      // block the mount finishing.
+      if (mobileRef.current && !phoneControlRef.current) {
+        const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
+        if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
+      } else fitAddon.fit();
+      if ((!mobileRef.current || phoneControlRef.current) && term.cols > 0 && term.rows > 0) {
+        resizePty(sid, term.cols, term.rows).catch(console.error);
+      }
+      return true;
+    };
+
+    restartRef.current = async () => {
+      // The old runtime, and this pane's subscription with it, is gone once
+      // the backend respawns, so drop the stale generation and protocol state.
+      attachedSessionRef.current = null;
+      attachedGenerationRef.current = null;
+      flowPaused = false;
+      kittyStackRef.current = [];
+      kittyLevelRef.current = 0;
+      updateStatusOverlay({
+        session_id: sid,
+        state: "starting",
+        message: "Restarting shell...",
+        exit_code: null,
+      });
+      try {
+        await restartTerminalSession(sid);
+      } catch (err) {
+        if (cancelled) return;
+        updateStatusOverlay({
+          session_id: sid,
+          state: "failed",
+          message: `Failed to restart shell: ${String(err)}`,
+          exit_code: null,
+        });
+        return;
+      }
+      if (cancelled) return;
+      pump.enqueue(
+        new TextEncoder().encode("\r\n\x1b[2m── shell restarted ──\x1b[0m\r\n\r\n"),
+      );
+      if (await attachOutput()) term.focus();
+    };
+
     (async () => {
       // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
       const workspaceId = getSessionWorkspaceId(sid);
@@ -811,7 +1067,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       // Update overlay from whichever result we got.
       if (statusResult.status === "fulfilled") {
-        updateStatusOverlay(statusResult.value);
+        const session = useAppStore
+          .getState()
+          .appState?.terminal_sessions.find((s) => s.session_id === sid);
+        updateStatusOverlay(reconcileMountedStatus(statusResult.value, session));
       } else {
         updateStatusOverlay({
           session_id: sid,
@@ -821,75 +1080,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         });
       }
 
-      // Stage 2: attach the channel. Must come AFTER the scrollback is
-      // enqueued so live bytes drain behind the historical bytes. The
-      // callback advances the kitty stack synchronously (the input handler
-      // reads kittyLevel on every keystroke, so it can't wait behind the
-      // throttled pump) then enqueues the bytes for the shared drain.
-      const channel = new Channel<unknown>((payload) => {
-        if (cancelled) return;
-        const bytes = extractBytes(payload);
-        if (!bytes) return;
-        // First live byte on a migrating pane means the replacement PTY is
-        // producing output — dismiss the "Switching to <host>…" overlay even if
-        // the Ready lifecycle event hasn't landed yet (the two ride different
-        // IPC paths, so output can win the race). Cheap string compare per chunk.
-        if (statusRef.current.state === "migrating") {
-          updateStatusOverlay({
-            session_id: sid,
-            state: "ready",
-            message: null,
-            exit_code: null,
-          });
-        }
-        scanKittyProtocol(bytes);
-        pump.enqueue(bytes);
-      });
-
-      try {
-        const generation = (await attachPtyOutput(sid, channel)) ?? null;
-        if (cancelled) {
-          // Unmounted during the attach round-trip: the cleanup below ran
-          // before we recorded the generation, so tear down the subscriber we
-          // just installed here — otherwise it lingers in the backend fan-out
-          // set (dropping bytes via the `cancelled` guard) until the session
-          // closes.
-          if (generation != null) {
-            detachPtyOutput(sid, generation).catch(console.error);
-          }
-          return;
-        }
-        attachedSessionRef.current = sid;
-        attachedGenerationRef.current = generation;
-        // Reconcile a pause that crossed the HIGH watermark during the
-        // pre-attach scrollback restore, when we had no generation to attribute
-        // it to. Now that we're a subscriber, apply it.
-        if (flowPaused && generation != null) {
-          pausePtyOutput(sid, generation).catch((err) => {
-            flowPaused = false;
-            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
-          });
-        }
-      } catch (err) {
-        if (cancelled) return;
-        updateStatusOverlay({
-          session_id: sid,
-          state: "failed",
-          message: `Failed to attach terminal output: ${String(err)}`,
-          exit_code: null,
-        });
-        return;
-      }
-
-      // Stage 3: fit + resize. resizePty is fire-and-forget so doesn't
-      // block the mount finishing.
-      if (mobileRef.current && !phoneControlRef.current) {
-        const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
-        if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
-      } else fitAddon.fit();
-      if ((!mobileRef.current || phoneControlRef.current) && term.cols > 0 && term.rows > 0) {
-        resizePty(sid, term.cols, term.rows).catch(console.error);
-      }
+      if (!(await attachOutput())) return;
 
       // Timing log gated to slow mounts so steady-state stays quiet.
       // The user can grep stderr for `[codemux::terminal-mount]` while
@@ -969,6 +1160,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       resizeDisposable.dispose();
       writeParsedDisposable.dispose();
       osc7Disposable.dispose();
+      linkProviderDisposable.dispose();
+      restartRef.current = null;
+      setSearch(null);
+      setFindOpen(false);
 
       containerEl.removeEventListener("input", blockNewline, true);
       blockNewlineRef.current = null;
@@ -1100,6 +1295,26 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   }, [focused, sessionId]);
 
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
+
+  const handleRestart = useCallback(() => {
+    void restartRef.current?.();
+  }, []);
+  const handleCopyError = useCallback(() => {
+    navigator.clipboard
+      .writeText(statusRef.current.message ?? "")
+      .then(() => toast.success("Error copied"))
+      .catch(console.error);
+  }, []);
+  const handleClosePane = useCallback(() => {
+    if (paneId) closePane(paneId).catch(console.error);
+  }, [paneId]);
+  const closeFind = useCallback(() => {
+    search?.clearDecorations();
+    termRef.current?.clearSelection();
+    setFindOpen(false);
+    termRef.current?.focus();
+  }, [search]);
+
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
       {mobile && <div className="mobile-terminal-keys">{[["Esc", "\x1b"],["Tab", "\t"],["Ctrl C", "\x03"],["↑", "\x1b[A"],["↓", "\x1b[B"],["←", "\x1b[D"],["→", "\x1b[C"]].map(([label,key]) => <button key={label} onPointerDown={e => e.preventDefault()} onClick={() => writePtyInput(sessionId, key)}>{label}</button>)}<button onClick={() => termRef.current?.focus()}>Keyboard</button><button aria-pressed={phoneControl} onClick={() => setPhoneControl(v => !v)}>{phoneControl ? "Follow desktop size" : "Fit to phone"}</button></div>}
@@ -1114,12 +1329,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         className="terminal-overlay starting absolute inset-0 z-0 flex items-center justify-center p-6 bg-background/95 backdrop-blur-sm"
         style={{ display: statusRef.current.state === "ready" ? "none" : "flex" }}
       >
-        {/* Centered status card. The h2/p/code below are mutated
-            DOM-side in updateStatusOverlay() for perf — don't
-            change their tags or query selectors without updating
-            the mutation code. The spinner is CSS-animated and
-            hidden via `[data-state="failed"]` so failed state
-            gets the warning dot instead.
+        {/* Centered status card. The indicator slots, h2, p, exit
+            chip and action row below are mutated DOM-side in
+            updateStatusOverlay() for perf — don't change their tags
+            or class selectors without updating the mutation code.
 
             For remote workspaces hitting tunnel timeout, the
             failure message includes a "Try Test Connection /
@@ -1127,30 +1340,55 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
             emit path). */}
         <div className="w-full max-w-[420px] rounded-lg border border-border bg-card shadow-lg overflow-hidden">
           <div className="flex items-center gap-3 px-5 py-4 border-b border-border/60">
-            {/* Spinner shown for starting state, warning dot for
-                failed. CSS-only so DOM mutations on state change
-                just toggle the data attribute via className. */}
+            {/* Spinner while starting, warning dot when failed, a
+                still neutral dot once the process has exited. Only
+                one slot is displayed at a time. */}
             <div className="status-indicator relative size-4 shrink-0">
-              <div className="spinner absolute inset-0 rounded-full border-2 border-muted border-t-primary animate-spin" />
+              <div className="spinner absolute inset-0 rounded-full border-2 border-muted border-t-primary motion-safe:animate-spin" />
               <div
                 className="warning absolute inset-0 rounded-full bg-destructive/90 hidden items-center justify-center text-caption font-bold text-destructive-foreground"
                 aria-hidden
               >
                 !
               </div>
+              <div
+                className="exited absolute inset-1 hidden rounded-full bg-muted-foreground/60"
+                aria-hidden
+              />
             </div>
             <h2 className="text-body font-semibold text-foreground leading-tight">
               Terminal starting
             </h2>
           </div>
-          <div className="px-5 py-4 space-y-2">
+          <div className="px-5 py-4 space-y-3">
             <p className="text-body text-muted-foreground leading-relaxed">
               {statusRef.current.message ?? "Waiting for shell status..."}
             </p>
-            <span className="status-meta inline-block text-label font-mono text-muted-foreground/70" />
+            <span
+              className="status-meta inline-flex items-center rounded-sm px-1.5 py-0.5 text-label font-mono"
+              style={{ display: "none" }}
+            />
+            <div className="status-actions items-center gap-2" style={{ display: "none" }}>
+              <Button size="sm" className="status-restart" onClick={handleRestart}>
+                <RotateCcw className="size-3.5" />
+                <span className="status-restart-label">Restart shell</span>
+              </Button>
+              <Button size="sm" variant="ghost" className="status-copy" onClick={handleCopyError}>
+                <Copy className="size-3.5" />
+                Copy error
+              </Button>
+              {paneId && (
+                <Button size="sm" variant="ghost" onClick={handleClosePane}>
+                  Close pane
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       </div>
+      {findOpen && search && (
+        <TerminalFindBar search={search} focusToken={findToken} onClose={closeFind} />
+      )}
     </div>
     </div>
     </div>
