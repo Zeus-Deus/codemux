@@ -157,13 +157,21 @@ export function findAgentTarget(surface: SurfaceSnapshot): AgentTarget | null {
   return toTarget(leaves.find((n) => n.kind === "terminal"));
 }
 
+// C0 controls, DEL and C1 controls. A terminal acts on these (CR/LF
+// submit the line, ^C/^D signal, ESC starts a sequence), so none of them
+// may reach a PTY.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]+/g;
+
 /**
  * A complete reference to the element, left open for the user's
- * instruction. One line, so writing it to a terminal never submits it.
+ * instruction. The tag, text and selector come from the page (an element
+ * id can hold a newline), so every control character is replaced with a
+ * space: the result is one inert line that a terminal never submits.
  */
 export function buildTellAgentPrompt(element: ElementInfo, pageUrl: string): string {
   const text = element.text.replace(/\s+/g, " ").trim().slice(0, 60);
   const desc = `<${element.tag}>${text ? ` "${text}"` : ""}`;
   const where = pageUrl && pageUrl !== "about:blank" ? ` at ${pageUrl}` : "";
-  return `In the browser${where}, the element \`${element.selector}\` (${desc}): `;
+  const prompt = `In the browser${where}, the element \`${element.selector}\` (${desc}): `;
+  return prompt.replace(CONTROL_CHARS, " ");
 }
