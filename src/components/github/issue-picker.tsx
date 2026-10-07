@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { resolveProvider } from "@/lib/source-control";
-import { CircleDot, CircleCheck, Search, Loader2 } from "lucide-react";
+import { CircleDot, CircleCheck, Search } from "lucide-react";
 import { listGithubIssues, listGithubIssuesByPath } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 function IssueRow({
   issue,
@@ -278,7 +279,7 @@ export function IssuePickerPanel({
         )}
         {serverSearching && displayIssues.length > 0 && (
           <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
-            <Loader2 className="size-3 animate-spin" />
+            <Spinner className="size-3" />
             Searching...
           </div>
         )}

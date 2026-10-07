@@ -4,7 +4,6 @@ import {
   Cloud,
   Cpu,
   Laptop,
-  Loader2,
   Pencil,
   Plus,
   RefreshCw,
@@ -32,6 +31,7 @@ import {
 } from "@/tauri/commands";
 import { useHostsStore } from "@/stores/hosts-store";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /**
  * Settings → Hosts (Step 2 of cloud-push).
@@ -330,7 +330,7 @@ export function HostsSection() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
-        <Loader2 className="mr-2 size-4 animate-spin" />
+        <Spinner className="mr-2 size-4" aria-hidden />
         Loading hosts…
       </div>
     );
@@ -624,7 +624,7 @@ export function HostsSection() {
                 >
                   {testingId === selected.id ? (
                     <>
-                      <Loader2 className="size-3.5 animate-spin" />
+                      <Spinner className="size-3.5" aria-hidden />
                       Testing…
                     </>
                   ) : (
@@ -668,7 +668,7 @@ export function HostsSection() {
                       >
                         {installingId === selected.id ? (
                           <>
-                            <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                            <Spinner className="mr-1.5 size-3.5" aria-hidden />
                             Installing…
                           </>
                         ) : (
@@ -705,7 +705,7 @@ export function HostsSection() {
                 >
                   {reinstallingId === selected.id ? (
                     <>
-                      <Loader2 className="size-3.5 animate-spin" />
+                      <Spinner className="size-3.5" aria-hidden />
                       Reinstalling…
                     </>
                   ) : (

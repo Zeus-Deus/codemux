@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { Loader2, RotateCw } from "lucide-react";
+import { RotateCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -30,6 +30,7 @@ import { SkillRow } from "./skill-row";
 import { SkillViewModal } from "./skill-view-modal";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   /** Active workspace's project root (or null when no project is
@@ -172,6 +173,7 @@ export function SkillsSection({ projectRoot }: Props) {
           size="sm"
           onClick={() => loadSkills(projectRoot, true)}
           disabled={loading}
+          aria-busy={loading}
           aria-label="Refresh skills"
         >
           <RotateCw
@@ -235,7 +237,7 @@ export function SkillsSection({ projectRoot }: Props) {
           data-testid="skills-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Loading skills…
         </div>
       ) : skills.length === 0 && !error ? (

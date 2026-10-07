@@ -30,6 +30,10 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // scroll animation lags behind high-resolution wheels. Off by default, which
   // matches the native default — see `set_smooth_scrolling` in src-tauri.
   "appearance.smooth_scrolling": "false",
+  // Force reduced motion regardless of the OS preference. Machine-local for
+  // the same reason as smooth scrolling: what the webview reports depends on
+  // this desktop's toolkit settings. See ReducedMotionProvider.
+  "appearance.reduce_motion": "false",
   // Whether the sidebar inbox cards show the ↑ahead and +/− diff numbers on
   // their mono meta line. The branch name always shows. See sidebar-inbox.tsx.
   "sidebar.show_git_stats": "true",
@@ -157,6 +161,10 @@ export const selectDensity = (s: SettingsStore): AppearanceDensity =>
 export const selectSmoothScrolling = (s: SettingsStore): boolean =>
   (s.settings["appearance.smooth_scrolling"] ??
     SETTINGS_DEFAULTS["appearance.smooth_scrolling"]!) === "true";
+
+export const selectReduceMotion = (s: SettingsStore): boolean =>
+  (s.settings["appearance.reduce_motion"] ??
+    SETTINGS_DEFAULTS["appearance.reduce_motion"]!) === "true";
 
 export const selectSidebarShowGitStats = (s: SettingsStore): boolean =>
   (s.settings["sidebar.show_git_stats"] ??

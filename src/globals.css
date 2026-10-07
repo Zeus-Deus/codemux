@@ -388,6 +388,50 @@
   transition-delay: 0s !important;
 }
 
+/* Reduced motion, app-wide. Follows the OS preference, and the
+ * `reduce-motion` class (Settings → Appearance → Reduce motion) forces it on
+ * for desktops whose webview never reports the preference — WebKitGTK only
+ * does when GTK's gtk-enable-animations is off, which most users never touch.
+ * Everything collapses to its end state instead of being removed, so
+ * animationend/transitionend still fire and Radix overlays still unmount.
+ * Delays are left alone on purpose: some are logic, not motion (BrowserPane
+ * holds its "Reconnecting" chip back 400ms so a brief blip never flashes it).
+ * Spinners are the exception: a frozen spinner reads as a hung app, so they
+ * swap rotation for a slow opacity breath. */
+@keyframes cm-spinner-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  [data-slot="spinner"] {
+    animation: cm-spinner-breathe 1.5s ease-in-out infinite !important;
+  }
+}
+:root.reduce-motion *,
+:root.reduce-motion *::before,
+:root.reduce-motion *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+:root.reduce-motion [data-slot="spinner"] {
+  animation: cm-spinner-breathe 1.5s ease-in-out infinite !important;
+}
+
 .pane-drop-overlay {
   position: absolute;
   inset: 0;
@@ -408,7 +452,7 @@
    away the instant a (re)spawned or migrated session comes alive. Keep this
    duration in sync with OVERLAY_FADE_MS in TerminalPane.tsx. */
 .terminal-overlay {
-  transition: opacity 0.16s ease-out;
+  transition: opacity 0.15s ease-out;
 }
 
 /* Prevent terminals, canvases, and iframes from stealing pointer events during pane resize drag */
@@ -977,6 +1021,36 @@ body.pane-resizing iframe {
 }
 .row-in {
   animation: cm-row-in 0.13s ease;
+}
+
+/* Desktop sidebar toggle. The layout still snaps in one frame (tweening the
+ * gap's width reflowed every terminal and the transcript on each frame, see
+ * sidebar.tsx), so only the panel's paint moves: expanding wipes the full
+ * panel open from the rail's edge, collapsing fades the rail in. Clip-path and
+ * opacity never touch layout. `data-toggled` keeps both off the first paint. */
+@keyframes cm-sidebar-reveal {
+  from {
+    clip-path: inset(0 calc(100% - var(--sidebar-width-icon, 3.25rem)) 0 0);
+  }
+  to {
+    clip-path: inset(0);
+  }
+}
+@keyframes cm-sidebar-rail-in {
+  from {
+    opacity: 0.4;
+  }
+  to {
+    opacity: 1;
+  }
+}
+[data-slot="sidebar"][data-side="left"][data-state="expanded"]
+  [data-slot="sidebar-inner"][data-toggled] {
+  animation: cm-sidebar-reveal 150ms ease-out;
+}
+[data-slot="sidebar"][data-state="collapsed"]
+  [data-slot="sidebar-inner"][data-toggled] {
+  animation: cm-sidebar-rail-in 150ms ease-out;
 }
 
 /* A workspace card arriving in the sidebar inbox — the "creating" stand-in

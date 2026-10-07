@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { Loader2, Wrench } from "lucide-react";
+import { Wrench } from "lucide-react";
 
 import {
   Dialog,
@@ -15,6 +15,7 @@ import {
   type McpServerRuntime,
   type McpTool,
 } from "@/tauri/commands";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   /** Server whose tools we want to display. `null` closes the modal. */
@@ -92,7 +93,7 @@ export function McpToolModal({ server, runtime, onClose }: Props) {
                 data-testid="mcp-tool-modal-loading"
                 className="flex items-center gap-2 py-6 text-body text-muted-foreground"
               >
-                <Loader2 className="size-4 animate-spin" aria-hidden />
+                <Spinner className="size-4" aria-hidden />
                 Loading tools…
               </div>
             ) : error ? (

@@ -6,37 +6,36 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
+// The ping is reserved for `permission`: it is this app's "look at me"
+// signal, and only a blocked agent needs the user. Working agents breathe
+// instead, so five busy dots never drown out the one that is waiting. The
+// permission dot also carries a ring, so it still reads as different from a
+// working dot in greyscale and with motion reduced.
 const STATUS_CONFIG = {
   permission: {
-    pingColor: "bg-status-attention",
-    dotColor: "bg-status-attention",
-    pulse: true,
+    dotColor: "bg-status-attention ring-2 ring-status-attention/35",
+    ping: "bg-status-attention",
     tooltip: "Needs input",
   },
   working: {
-    pingColor: "bg-status-working",
-    dotColor: "bg-status-working",
-    pulse: true,
+    dotColor: "bg-status-working cm-breathe",
+    ping: null,
     tooltip: "Agent working",
   },
-  // Steady on purpose — a background watch loop is presence, not progress,
-  // and the ping animation is this app's "look at me" signal.
+  // Steady on purpose: a background watch loop is presence, not progress.
   monitoring: {
-    pingColor: "",
     dotColor: "bg-status-monitoring",
-    pulse: false,
+    ping: null,
     tooltip: "Monitoring in the background",
   },
   review: {
-    pingColor: "",
     dotColor: "bg-status-open",
-    pulse: false,
+    ping: null,
     tooltip: "Ready for review",
   },
 } as const satisfies Record<ActivePaneStatus, {
-  pingColor: string;
   dotColor: string;
-  pulse: boolean;
+  ping: string | null;
   tooltip: string;
 }>;
 
@@ -60,12 +59,16 @@ export function StatusIndicator({
   const config = STATUS_CONFIG[status];
 
   const dot = (
-    <span className={cn("relative inline-flex size-2", className)}>
-      {config.pulse && (
+    <span
+      data-status={status}
+      className={cn("relative inline-flex size-2", className)}
+    >
+      {config.ping && (
         <span
+          data-status-ping
           className={cn(
-            "absolute inline-flex h-full w-full animate-ping rounded-full opacity-75",
-            config.pingColor,
+            "absolute inline-flex h-full w-full motion-safe:animate-ping rounded-full opacity-75",
+            config.ping,
           )}
         />
       )}

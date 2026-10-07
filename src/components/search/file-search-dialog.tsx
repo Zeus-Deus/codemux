@@ -5,10 +5,10 @@ import {
   DialogTitle,
   DialogDescription,
   DIALOG_CRISP_POSITION,
+  DIALOG_TOP_ANCHORED_MOTION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
-import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
 import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
@@ -16,6 +16,7 @@ import { searchFileNames } from "@/tauri/commands";
 import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { basename } from "@/lib/path";
+import { Spinner } from "@/components/ui/spinner";
 
 export function FileSearchDialog() {
   const open = useUIStore((s) => s.showFileSearch);
@@ -34,34 +35,52 @@ export function FileSearchDialog() {
   const listRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  // Reset state when dialog opens
-  useEffect(() => {
+  // The shell keeps this dialog mounted after its first open so Radix can
+  // play the exit animation. Reset on the opening transition during render,
+  // not in an effect, so the previous query never paints for a frame.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setQuery("");
       setResults([]);
+      setLoading(false);
       setSelectedIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 0);
     }
+  }
+
+  useEffect(() => {
+    if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
   // Debounced search
   useEffect(() => {
-    if (!open || !cwd || !query.trim()) {
+    // Closing keeps the last results so the list fades out intact.
+    if (!open) return;
+    if (!cwd || !query.trim()) {
       setResults([]);
       return;
     }
+    // Ignore a response for a query, workspace or session that has moved on.
+    let stale = false;
     setLoading(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       searchFileNames(cwd, query.trim(), 20)
         .then((files) => {
+          if (stale) return;
           setResults(files);
           setSelectedIndex(0);
         })
-        .catch(() => setResults([]))
-        .finally(() => setLoading(false));
+        .catch(() => {
+          if (!stale) setResults([]);
+        })
+        .finally(() => {
+          if (!stale) setLoading(false);
+        });
     }, 200);
     return () => {
+      stale = true;
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [open, cwd, query]);
@@ -129,7 +148,7 @@ export function FileSearchDialog() {
        *  which landed on the search input's top-right corner because the
        *  content here is `p-0` rather than the `p-4` that button assumes. */}
       <DialogContent
-        className={cn(DIALOG_CRISP_POSITION, "gap-0 p-0")}
+        className={cn(DIALOG_CRISP_POSITION, DIALOG_TOP_ANCHORED_MOTION, "gap-0 p-0")}
         showCloseButton={false}
         onKeyDown={handleKeyDown}
       >
@@ -152,7 +171,7 @@ export function FileSearchDialog() {
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              <Spinner className="size-4 text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (

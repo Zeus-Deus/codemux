@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
+import { useEaseInOnce } from "@/hooks/use-ease-in-once";
 import { QuestionForm, type Question } from "./QuestionForm";
 
 export interface AskUserQuestionOutput {
@@ -19,21 +20,37 @@ export function ComposerPendingInputPanel({
     () => extractQuestions(item.payload),
     [item.payload],
   );
+  // The panel remounts on tab and session switches; a request seen before
+  // renders in place instead of easing in again.
+  const ease = useEaseInOnce(item.id);
+  // A resolved request renders nothing; the transcript marker owns it.
+  if (item.resolution.state !== "pending") return null;
+  // Eases up into place so the composer moving to make room reads as the
+  // agent asking something, not a layout jump.
   return (
-    <QuestionForm
-      questions={questions}
-      active={item.resolution.state === "pending"}
-      onSubmit={(answers) =>
-        onSubmit({
-          questions: isRecord(item.payload)
-            ? (item.payload.questions ?? [])
-            : [],
-          answers: Object.fromEntries(
-            questions.map((q, i) => [q.question, answers[i]]),
-          ),
-        })
+    <div
+      data-testid="pending-input-panel"
+      className={
+        ease
+          ? "animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out"
+          : undefined
       }
-    />
+    >
+      <QuestionForm
+        questions={questions}
+        active={item.resolution.state === "pending"}
+        onSubmit={(answers) =>
+          onSubmit({
+            questions: isRecord(item.payload)
+              ? (item.payload.questions ?? [])
+              : [],
+            answers: Object.fromEntries(
+              questions.map((q, i) => [q.question, answers[i]]),
+            ),
+          })
+        }
+      />
+    </div>
   );
 }
 

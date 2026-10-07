@@ -80,6 +80,28 @@ describe("async question panel", () => {
     );
     input.remove();
   });
+  it("eases in when a question first arrives, not when the pane remounts", () => {
+    // The panel is mounted before any question exists; the entry belongs to
+    // the moment the question shows up.
+    const view = render(
+      <AsyncQuestionPanel threadId="thread" items={[]} working />,
+    );
+    view.rerender(
+      <AsyncQuestionPanel threadId="thread" items={[item("q-ease")]} working />,
+    );
+    expect(screen.getByRole("region", { name: "Agent questions" })).toHaveClass(
+      "animate-in",
+    );
+    view.unmount();
+
+    // Switching tabs away and back remounts the pane for the same question.
+    render(
+      <AsyncQuestionPanel threadId="thread" items={[item("q-ease")]} working />,
+    );
+    expect(
+      screen.getByRole("region", { name: "Agent questions" }),
+    ).not.toHaveClass("animate-in");
+  });
   it("supports free-text-only questions and leaves the normal composer keyboard alone", () => {
     const q = item();
     q.question.questions[0].options = [];

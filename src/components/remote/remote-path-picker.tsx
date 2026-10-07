@@ -240,6 +240,7 @@ export function RemotePathPicker() {
               className="shrink-0"
               onClick={() => navigateTo(currentPath)}
               disabled={loading || !currentPath}
+              aria-busy={loading}
               aria-label="Refresh"
             >
               <RefreshCw

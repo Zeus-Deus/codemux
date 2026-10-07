@@ -97,6 +97,7 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 vi.mock("@/lib/addons/platform", () => ({ executeAddon: vi.fn() }));
 
 import { CommandPalette } from "./command-palette";
+import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import { useSidebarInboxStore, __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
 import { executeAddon } from "@/lib/addons/platform";
 import { useAddonsStore } from "@/stores/addons-store";
@@ -525,6 +526,12 @@ describe("command palette — conversation search", () => {
     expect(document.querySelector("[cmdk-list]")).toHaveClass("max-h-[max(96px,calc(var(--mobile-height,100dvh)-220px))]");
   });
 
+  it("drops in from the top it is anchored to instead of zooming from the middle", () => {
+    renderPalette();
+    const dialog = document.querySelector<HTMLElement>('[data-slot="dialog-content"]')!;
+    for (const cls of DIALOG_TOP_ANCHORED_MOTION.split(" ")) expect(dialog).toHaveClass(cls);
+  });
+
   it("reserves the result viewport even for a single match", async () => {
     mocks.ui.takeCommandPaletteQuery.mockReturnValue(">reload interface");
     renderPalette();
@@ -771,5 +778,44 @@ describe("command palette — reload interface", () => {
     expect(row).toHaveTextContent("Ctrl+Alt+R");
     await user.click(screen.getByText("Reload interface"));
     expect(mocks.backend.reloadInterface).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("command palette — across opens", () => {
+  // jsdom has no CSS animations, so Radix would unmount the content the
+  // instant it closes and every reopen would remount the body regardless.
+  // Reporting an exit animation on `data-state="closed"` keeps the content
+  // mounted until `animationend`, as it is in the app.
+  beforeEach(() => {
+    const realGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+      const styles = realGetComputedStyle(el, pseudo);
+      return new Proxy(styles, {
+        get(target, prop) {
+          if (prop === "animationName") {
+            const state = (el as Element).getAttribute("data-state");
+            return state === "closed" ? "exit" : state === "open" ? "enter" : "none";
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reopens with an empty query while the last open is still animating out", () => {
+    const onOpenChange = vi.fn();
+    const view = render(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "ember" } });
+    expect(screen.getByRole("combobox")).toHaveValue("ember");
+
+    view.rerender(withClient(<CommandPalette open={false} onOpenChange={onOpenChange} />));
+    // Still mounted for the exit animation, with the old query in place.
+    expect(screen.getByRole("dialog", { hidden: true })).toHaveAttribute("data-state", "closed");
+    expect(screen.getByRole("combobox", { hidden: true })).toHaveValue("ember");
+
+    view.rerender(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
+    expect(screen.getByRole("combobox")).toHaveValue("");
   });
 });

@@ -3,7 +3,7 @@ import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
-import { Loader2, Globe } from "lucide-react";
+import { Globe } from "lucide-react";
 import type { ElementInfo } from "./inspector";
 import {
   INSPECTOR_INJECT_SCRIPT,
@@ -34,6 +34,7 @@ import {
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   browserId: string;
@@ -932,7 +933,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               </>
             ) : (
               <>
-                <Loader2 className="size-6 animate-spin text-muted-foreground mb-2" />
+                <Spinner className="size-6 text-muted-foreground mb-2" />
                 <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
@@ -954,7 +955,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               </>
             ) : (
               <>
-                <Loader2 className="size-3 animate-spin text-muted-foreground" />
+                <Spinner className="size-3 text-muted-foreground" />
                 <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}

@@ -9,7 +9,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { DIALOG_CRISP_POSITION } from "@/components/ui/dialog";
+import { DIALOG_CRISP_POSITION, DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import { useUIStore } from "@/stores/ui-store";
 
 vi.mock("@/tauri/commands", () => ({
@@ -62,6 +62,19 @@ describe("search dialogs — crisp positioning", () => {
     const el = contentEl();
     for (const cls of DIALOG_CRISP_POSITION.split(" ")) {
       expect(el).toHaveClass(cls);
+    }
+  });
+
+  // Top-anchored like the command palette, so they drop in from above
+  // instead of zooming out of the middle of the window.
+  it.each([
+    ["file search", "showFileSearch", FileSearchDialog],
+    ["content search", "showContentSearch", ContentSearchDialog],
+  ] as const)("drops the %s in from the top", (_name, flag, Dialog) => {
+    useUIStore.setState({ [flag]: true });
+    render(<Dialog />);
+    for (const cls of DIALOG_TOP_ANCHORED_MOTION.split(" ")) {
+      expect(contentEl()).toHaveClass(cls);
     }
   });
 

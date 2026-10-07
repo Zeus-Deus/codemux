@@ -4,9 +4,10 @@ import {
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
 import type { AsyncQuestionItem } from "@/lib/agent-chat/types";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { useEaseInOnce } from "@/hooks/use-ease-in-once";
 import { agentChatAnswerQuestion, type QuestionAction } from "@/tauri/commands";
 import { QuestionForm, type Question } from "./QuestionForm";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
@@ -77,7 +78,9 @@ export function AsyncQuestionPanel({
   );
   if (!selected && dismissed.length === 0) return null;
   return (
-    <section aria-label="Agent questions" className="pb-2">
+    <QuestionsSection
+      entryId={selected?.question.id ?? dismissed[0].question.id}
+    >
       <div className={CHAT_COLUMN_OUTER}>
         <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
           {selected && (
@@ -185,6 +188,29 @@ export function AsyncQuestionPanel({
           </details>
         </div>
       )}
+    </QuestionsSection>
+  );
+}
+
+/** Mounts when the panel appears, so the entry eases in when a question first
+ *  arrives but not when the pane remounts on a tab or session switch. */
+function QuestionsSection({
+  entryId,
+  children,
+}: {
+  entryId: string;
+  children: ReactNode;
+}) {
+  const ease = useEaseInOnce(entryId);
+  return (
+    <section
+      aria-label="Agent questions"
+      className={cn(
+        "pb-2",
+        ease && "animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out",
+      )}
+    >
+      {children}
     </section>
   );
 }

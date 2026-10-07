@@ -16,7 +16,6 @@ import {
   MonitorSmartphone,
   Keyboard,
   LayoutGrid,
-  LoaderCircle,
   MessageSquareText,
   PanelLeft,
   Play,
@@ -31,6 +30,7 @@ import {
   X,
 } from "lucide-react";
 import { CommandDialog } from "@/components/ui/command";
+import { DIALOG_TOP_ANCHORED_MOTION } from "@/components/ui/dialog";
 import {
   ThemeAnsiDots,
   ThemeCoins,
@@ -107,6 +107,7 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   open: boolean;
@@ -323,6 +324,15 @@ interface ThemeStudioRow {
 }
 
 export function CommandPalette({ open, onOpenChange }: Props) {
+  // The content stays mounted while it animates out, and reopening during
+  // that exit reuses it. A fresh body per open keeps the last query from
+  // coming back.
+  const [openCount, setOpenCount] = useState(0);
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (open) setOpenCount((count) => count + 1);
+  }
   return (
     <CommandDialog
       open={open}
@@ -331,11 +341,14 @@ export function CommandPalette({ open, onOpenChange }: Props) {
       description="Search workspaces, conversations, projects, and commands."
       // Mobile's generic dialog rule centers at mid-screen; this top-anchored
       // palette must instead leave room for its reserved results and keyboard.
-      className="top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!"
+      className={cn(
+        "top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px] in-[[data-mobile]]:top-[calc(var(--mobile-top,0px)+12px)]! in-[[data-mobile]]:p-0!",
+        DIALOG_TOP_ANCHORED_MOTION,
+      )}
     >
       {/* Radix unmounts dialog content while closed, so the body's stores,
           clock, and avatar loads cost nothing until the palette opens. */}
-      <PaletteBody onOpenChange={onOpenChange} />
+      <PaletteBody key={openCount} onOpenChange={onOpenChange} />
     </CommandDialog>
   );
 }
@@ -941,7 +954,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
                   "Loading workspaces…"
                 ) : conversationSearching ? (
                   <span className="inline-flex items-center gap-2">
-                    <LoaderCircle className="size-3.5 animate-spin" />
+                    <Spinner className="size-3.5" />
                     Searching conversations…
                   </span>
                 ) : query.needle === "" ? (

@@ -20,10 +20,10 @@ import {
   FolderGit,
   ChevronDown,
   CornerDownRight,
-  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BranchDetail, WorktreeInfo } from "@/tauri/types";
+import { Spinner } from "@/components/ui/spinner";
 
 function formatRelativeTime(unixSeconds: number): string {
   const now = Math.floor(Date.now() / 1000);
@@ -277,7 +277,7 @@ export function BranchPicker({
           >
             {loading ? (
               <div className="flex items-center justify-center py-8 text-label text-muted-foreground">
-                <Loader2 className="mr-2 size-3.5 animate-spin" />
+                <Spinner className="mr-2 size-3.5" aria-hidden />
                 Loading branches...
               </div>
             ) : (

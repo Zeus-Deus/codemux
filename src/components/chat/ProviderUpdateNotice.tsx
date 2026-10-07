@@ -1,11 +1,12 @@
 import { useEffect, useMemo } from "react";
-import { ArrowUpRight, Check, Download, LoaderCircle, X } from "lucide-react";
+import { ArrowUpRight, Check, Download, X } from "lucide-react";
 import { selectVisibleHealthReport, useProviderHealth } from "@/stores/provider-health-store";
 import { useHermes } from "@/stores/hermes-store";
 import { UPDATE_INTERVAL, updateIdentity, updateTargetKey, useProviderUpdates } from "@/stores/provider-update-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { ProviderLogo } from "./provider-logo";
+import { Spinner } from "@/components/ui/spinner";
 
 const labels: Record<AgentChatProviderKind, string> = {
   claude: "Claude", codex: "Codex", cursor: "Cursor", grok: "Grok", hermes: "Hermes", opencode: "OpenCode",
@@ -66,7 +67,7 @@ export function ProviderUpdateNotice({ provider, threadId, remote = false }: { p
         {!slot.updated && <div className="mt-3 flex items-center justify-between gap-2">
           <span className="text-caption text-muted-foreground">{report.manager}</span>
           {report.can_update ? <button type="button" disabled={slot.updating} onClick={() => void update(target)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-caption font-medium text-primary-foreground transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60">
-            {slot.updating ? <LoaderCircle className="size-3 animate-spin" /> : <Download className="size-3" />}
+            {slot.updating ? <Spinner className="size-3" aria-hidden /> : <Download className="size-3" />}
             {slot.updating ? "Updating…" : slot.error ? "Try again" : "Update"}
           </button> : <a href={report.manager === "Omarchy system package" ? "https://omarchy.org/" : docs[provider]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-caption text-primary">Update guide<ArrowUpRight className="size-3" /></a>}
         </div>}

@@ -1,10 +1,11 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, ArrowRight, RotateCw, Loader2, Crosshair } from "lucide-react";
+import { ArrowLeft, ArrowRight, RotateCw, Crosshair } from "lucide-react";
 import { agentBrowserRun } from "@/tauri/commands";
 import { normalizeBrowserUrl, runBrowserNav } from "./browser-nav";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   browserId: string;
@@ -72,7 +73,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         onClick={() => runBrowserNav(cmdId, "reload").catch(console.error)}
       >
         {navigating || loading ? (
-          <Loader2 className="size-3 animate-spin" />
+          <Spinner className="size-3" />
         ) : (
           <RotateCw className="size-3" />
         )}

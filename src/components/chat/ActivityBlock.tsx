@@ -1,4 +1,4 @@
-import { Check, ChevronDown, ChevronRight, LoaderCircle, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, X } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
@@ -20,6 +20,7 @@ import {
   type StepStatus,
   type WorkLogTotals,
 } from "./activity-steps";
+import { Spinner } from "@/components/ui/spinner";
 
 /** The opened history shows this many recent entries before "Show earlier". */
 export const WORK_LOG_HISTORY_WINDOW = 10;
@@ -347,10 +348,7 @@ function StepGlyph({ status }: { status: StepStatus }) {
   if (status === "unconfirmed") return <span title="Hermes did not report a completion result" className="size-3 text-muted-foreground">?</span>;
   if (status === "running") {
     return (
-      <LoaderCircle
-        className="size-3 animate-spin text-muted-foreground/70"
-        aria-hidden
-      />
+      <Spinner className="size-3 text-muted-foreground/70" aria-hidden />
     );
   }
   if (status === "error") {

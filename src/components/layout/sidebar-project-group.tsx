@@ -26,7 +26,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard, Home, Image as ImageIcon } from "lucide-react";
+import { ChevronRight, Plus, Check, AlertCircle, FolderOpen, Clipboard, Home, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   dbGetUiState,
@@ -46,6 +46,7 @@ import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   projectName: string;
@@ -426,7 +427,7 @@ export function SidebarProjectGroup({
           )}
         >
           {pw.status === "creating" ? (
-            <Loader2 className="size-3.5 animate-spin text-muted-foreground shrink-0" />
+            <Spinner className="size-3.5 text-muted-foreground shrink-0" />
           ) : (
             <AlertCircle className="size-3.5 text-destructive shrink-0" />
           )}

@@ -8,8 +8,6 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { LoaderCircle } from "lucide-react";
-
 import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import {
   buildAttachmentBlock,
@@ -94,6 +92,7 @@ import { cn } from "@/lib/utils";
 import { CHAT_COLUMN } from "./chat-column";
 import { randomUUID } from "@/lib/uuid";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -1307,10 +1306,7 @@ function DraftPendingConversation({
             aria-label="Starting the agent"
           >
             <span className="flex w-[29px] shrink-0 justify-center">
-              <LoaderCircle
-                className="h-[15px] w-[15px] animate-spin text-accent-ember"
-                aria-hidden
-              />
+              <Spinner className="text-accent-ember" aria-hidden />
             </span>
             <span className="shimmer text-body font-semibold">
               {PHASE_LABEL[pending.phase]}

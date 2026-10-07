@@ -8,7 +8,6 @@ import {
   Globe,
   Laptop,
   Link2,
-  Loader2,
   MonitorSmartphone,
   RefreshCw,
   Server,
@@ -91,6 +90,7 @@ import {
   type EndpointGroupView,
 } from "./remote-access-utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 // ── Small presentational bits ────────────────────────────────────────
 
@@ -420,6 +420,7 @@ function PairingPanel({
               variant="outline"
               size="sm"
               disabled={regenerating}
+              aria-busy={regenerating}
               onClick={onRegenerate}
             >
               <RefreshCw
@@ -645,7 +646,7 @@ function LiveState({ tone, children }: { tone: LiveTone; children: React.ReactNo
       )}
     >
       {tone === "pending" ? (
-        <Loader2 className="size-3 animate-spin" />
+        <Spinner className="size-3" />
       ) : (
         <span
           className={cn(
@@ -699,6 +700,7 @@ function FailureCallout({
         size="sm"
         className="shrink-0"
         disabled={retrying}
+        aria-busy={retrying}
         onClick={onRetry}
         aria-label={retryLabel}
       >
@@ -1527,6 +1529,7 @@ export function RemoteAccessSection() {
             size="sm"
             className="shrink-0"
             disabled={retryPending}
+            aria-busy={retryPending}
             onClick={() => void handleRetry("registration")}
             aria-label="Retry registering this device"
           >
@@ -1648,7 +1651,7 @@ export function RemoteAccessSection() {
                 role="status"
                 className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-body text-status-working"
               >
-                <Loader2 className="size-4 shrink-0 animate-spin" />
+                <Spinner className="size-4 shrink-0" />
                 <span>Applying change — reconnecting to this device…</span>
               </div>
             )

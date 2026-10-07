@@ -5,12 +5,13 @@ import {
   resolveProvider,
   type ProviderPresentation,
 } from "@/lib/source-control";
-import { Search, Loader2 } from "lucide-react";
+import { Search } from "lucide-react";
 import { PrStatusIcon, type PrStatusState } from "@/components/github/pr-status-icon";
 import { listPullRequests, getGithubPrByPath } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 
 /**
  * Pull-request picker, mirroring `IssuePickerPanel`.
@@ -301,7 +302,7 @@ export function PrPickerPanel({
         )}
         {directSearching && displayPrs.length > 0 && (
           <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
-            <Loader2 className="size-3 animate-spin" />
+            <Spinner className="size-3" />
             Searching…
           </div>
         )}

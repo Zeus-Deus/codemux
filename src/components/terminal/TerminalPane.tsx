@@ -72,7 +72,7 @@ interface Props {
 // (state → ready, or first output on a migrating pane). Must match the
 // `transition: opacity` duration on `.terminal-overlay` in globals.css so the
 // element is only removed from layout (display:none) after the fade completes.
-const OVERLAY_FADE_MS = 160;
+const OVERLAY_FADE_MS = 150;
 
 function extractBytes(payload: unknown): Uint8Array | null {
   if (payload instanceof Uint8Array) return payload;

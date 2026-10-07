@@ -103,6 +103,19 @@ const CATEGORIES: Category[] = [
       "clone/sweep bars (300ms)",
   },
   {
+    label: "hand-rolled spinners (use <Spinner />, which carries role=status and the reduced-motion hook)",
+    pattern: /\banimate-spin\b/g,
+    budget: 29,
+    why:
+      "the primitive itself and sonner's toast loader; refresh icons that " +
+      "spin in place inside a button carrying aria-busy (9); the review " +
+      "folder's 6-10px border-ring status glyphs (7) and the terminal " +
+      "overlay's ring; the slow decorative spin on the sidebar creating " +
+      "card; and spinners in files with open PRs at the time of the sweep " +
+      "(TasksPanel, ComposerFooter, pr-row, pr-list, usage-section x2, " +
+      "right-panel, sidebar-inbox, sidebar-workspace-row)",
+  },
+  {
     label: "per-icon strokeWidth (one base-layer rule owns icon weight)",
     pattern: /strokeWidth/g,
     scan: (contents) => [contents],
@@ -161,5 +174,20 @@ describe("UI token contract", () => {
     expect(rule).toMatch(/outline:\s*\d/);
     expect(rule).toMatch(/outline-offset/);
     expect(css).not.toMatch(/@apply[^;]*outline-ring/);
+  });
+
+  it("reduces motion app-wide, from the OS and from the in-app setting", () => {
+    // Per-class gates left the status ping, every spinner and every Radix
+    // overlay animating; one global rule is what makes the setting mean it.
+    const css = readFileSync(resolve(root, "src/globals.css"), "utf8");
+    const media = css.match(
+      /@media \(prefers-reduced-motion: reduce\) \{\s*\*,[\s\S]*?\n\}/,
+    )?.[0];
+    expect(media).toMatch(/animation-duration:\s*0\.01ms !important/);
+    expect(media).toMatch(/transition-duration:\s*0\.01ms !important/);
+    expect(media).toMatch(/\[data-slot="spinner"\]/);
+    const forced = css.match(/:root\.reduce-motion \*,[\s\S]*?\}/)?.[0];
+    expect(forced).toMatch(/animation-iteration-count:\s*1 !important/);
+    expect(css).toMatch(/:root\.reduce-motion \[data-slot="spinner"\]/);
   });
 });

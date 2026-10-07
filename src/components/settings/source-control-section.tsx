@@ -18,7 +18,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronRight, Loader2, Plus, RotateCw, X } from "lucide-react";
+import { ChevronRight, Plus, RotateCw, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -58,6 +58,7 @@ import {
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
 import { SubsectionHeader } from "./settings-primitives";
+import { Spinner } from "@/components/ui/spinner";
 
 // ── Diagnostics ──────────────────────────────────────────────────────
 
@@ -496,6 +497,7 @@ export function SourceControlSection() {
             size="sm"
             onClick={() => void rescan()}
             disabled={scanning}
+            aria-busy={scanning}
             aria-label="Rescan source control providers"
           >
             <RotateCw
@@ -518,7 +520,7 @@ export function SourceControlSection() {
 
       {rows === null && scanning ? (
         <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-          <Loader2 className="size-4 animate-spin" aria-hidden />
+          <Spinner className="size-4" aria-hidden />
           Checking installed tooling…
         </div>
       ) : (

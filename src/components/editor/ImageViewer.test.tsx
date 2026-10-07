@@ -24,6 +24,18 @@ describe("ImageViewer", () => {
     expect(img!.getAttribute("alt")).toBe("/abs/photo.png");
   });
 
+  it("fades the image in once it has loaded", () => {
+    const { container } = render(<ImageViewer filePath="/abs/photo.png" />);
+    const img = container.querySelector("img")!;
+    expect(img).toHaveClass("opacity-0", "transition-opacity", "duration-150");
+
+    act(() => {
+      img.dispatchEvent(new Event("load"));
+    });
+
+    expect(img).toHaveClass("opacity-100");
+  });
+
   it("shows a fallback message if the image fails to load", () => {
     const { container, queryByText } = render(
       <ImageViewer filePath="/abs/photo.png" />,

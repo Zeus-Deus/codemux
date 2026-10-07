@@ -5,16 +5,18 @@ import {
   DialogTitle,
   DialogDescription,
   DIALOG_CRISP_POSITION,
+  DIALOG_TOP_ANCHORED_MOTION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
+import { FileCode, CaseSensitive, Regex } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchInFiles } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { SearchResult } from "@/tauri/types";
+import { Spinner } from "@/components/ui/spinner";
 
 interface GroupedResults {
   filePath: string;
@@ -38,34 +40,55 @@ export function ContentSearchDialog() {
   const listRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  // Reset on open
-  useEffect(() => {
+  // The shell keeps this dialog mounted after its first open so Radix can
+  // play the exit animation. Reset on the opening transition during render,
+  // not in an effect, so the previous search never paints for a frame. The
+  // case and regex toggles reset too, as they did when closing unmounted it.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setQuery("");
       setResults([]);
+      setLoading(false);
+      setCaseSensitive(false);
+      setUseRegex(false);
       setSelectedIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 0);
     }
+  }
+
+  useEffect(() => {
+    if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
   // Debounced search
   useEffect(() => {
-    if (!open || !cwd || !query.trim()) {
+    // Closing keeps the last results so the list fades out intact.
+    if (!open) return;
+    if (!cwd || !query.trim()) {
       setResults([]);
       return;
     }
+    // Ignore a response for a query, workspace or session that has moved on.
+    let stale = false;
     setLoading(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       searchInFiles(cwd, query.trim(), useRegex, caseSensitive, 100)
         .then((res) => {
+          if (stale) return;
           setResults(res);
           setSelectedIndex(0);
         })
-        .catch(() => setResults([]))
-        .finally(() => setLoading(false));
+        .catch(() => {
+          if (!stale) setResults([]);
+        })
+        .finally(() => {
+          if (!stale) setLoading(false);
+        });
     }, 300);
     return () => {
+      stale = true;
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [open, cwd, query, useRegex, caseSensitive]);
@@ -140,6 +163,7 @@ export function ContentSearchDialog() {
       <DialogContent
         className={cn(
           DIALOG_CRISP_POSITION,
+          DIALOG_TOP_ANCHORED_MOTION,
           "flex max-h-[80vh] flex-col gap-0 p-0",
         )}
         showCloseButton={false}
@@ -190,7 +214,7 @@ export function ContentSearchDialog() {
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              <Spinner className="size-4 text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (

@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { CheckCircle2, ChevronRight, LoaderCircle } from "lucide-react";
+import { CheckCircle2, ChevronRight } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -238,7 +239,7 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
     >
       <span className="flex size-4 shrink-0 items-center justify-center">
         {agent.status === "running" ? (
-          <LoaderCircle className={cn("size-3.5 animate-spin", tone.text)} aria-hidden />
+          <Spinner className={cn("size-3.5", tone.text)} aria-hidden />
         ) : agent.status === "pending" ? (
           <span className="h-[7px] w-[7px] rounded-full border-[1.4px] border-muted-foreground" aria-hidden />
         ) : (

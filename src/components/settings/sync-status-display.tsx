@@ -17,12 +17,13 @@
 // its own via `useTickEvery(30s)` so the user sees the relative
 // label drift forward without a manual refresh.
 
-import { AlertCircle, CheckCircle2, Loader2, RefreshCw } from "lucide-react";
+import { AlertCircle, CheckCircle2, RefreshCw } from "lucide-react";
 
 import { useSkillsSyncStatus } from "@/hooks/use-skills-sync-status";
 import { useTickEvery } from "@/hooks/use-tick-every";
 import { relativeTime } from "@/lib/relative-time";
 import { useAuthStore } from "@/stores/auth-store";
+import { Spinner } from "@/components/ui/spinner";
 
 export type SyncStateKind = "idle" | "syncing" | "error";
 
@@ -41,10 +42,7 @@ export function SyncStateIcon({ state }: { state: SyncStateKind }) {
       );
     case "syncing":
       return (
-        <Loader2
-          className="size-4 shrink-0 animate-spin text-foreground"
-          aria-label="Syncing"
-        />
+        <Spinner className="text-foreground" label="Syncing" />
       );
     case "error":
       return (
@@ -123,7 +121,7 @@ export function SyncStatusDisplay() {
           className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {isSyncing ? (
-            <Loader2 className="size-3.5 animate-spin" />
+            <Spinner className="size-3.5" aria-hidden />
           ) : (
             <RefreshCw className="size-3.5" />
           )}

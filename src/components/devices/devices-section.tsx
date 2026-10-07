@@ -4,7 +4,6 @@ import {
   ArrowDownToLine,
   ChevronRight,
   Folder,
-  Loader2,
   Plus,
   Trash2,
 } from "lucide-react";
@@ -34,6 +33,7 @@ import {
   type DeviceTone,
 } from "./use-device-cards";
 import { useSweepCandidates } from "./use-sweep-candidates";
+import { Spinner } from "@/components/ui/spinner";
 
 /** The hosted web client; the user picks the device there. */
 const HOSTED_CLIENT_URL = "https://app.codemux.org";
@@ -103,7 +103,7 @@ export function DevicesSection() {
   if (!loaded) {
     return (
       <div className="flex h-full items-center justify-center text-body text-muted-foreground">
-        <Loader2 className="mr-2 size-4 animate-spin" />
+        <Spinner className="mr-2 size-4" aria-hidden />
         Loading devices…
       </div>
     );
@@ -417,9 +417,9 @@ function ProjectCluster({
             className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:opacity-60"
           >
             {pulling ? (
-              <Loader2 className="size-[9px] animate-spin" aria-hidden />
+              <Spinner className="size-3" aria-hidden />
             ) : (
-              <ArrowDownToLine className="size-[9px]" aria-hidden />
+              <ArrowDownToLine className="size-3" aria-hidden />
             )}
             Pull project
           </button>
@@ -516,7 +516,7 @@ function WorkspaceRow({
       <span className="inline-flex items-center gap-1">
         {pullStartedAt !== null ? (
           <span className="inline-flex items-center gap-1.5 px-2 text-caption font-semibold text-muted-foreground">
-            <Loader2 className="size-3 animate-spin" aria-hidden />
+            <Spinner className="size-3" aria-hidden />
             Pulling
             {elapsedSec !== null && (
               <span className="font-mono tabular-nums">{elapsedSec}s</span>
@@ -527,7 +527,7 @@ function WorkspaceRow({
             {canOpenOnHost && (
               <RowAction onClick={() => void handleOpen()} disabled={opening}>
                 {opening ? (
-                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                  <Spinner className="size-3" aria-hidden />
                 ) : (
                   `Open on ${card.name}`
                 )}

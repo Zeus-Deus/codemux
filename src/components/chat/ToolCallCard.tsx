@@ -1,16 +1,15 @@
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type ComponentType } from "react";
 import {
   Check,
   ChevronDown,
   ChevronRight,
   Clock,
-  Loader2,
   X,
-  type LucideIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -97,6 +96,9 @@ export const ToolCallCard = memo(function ToolCallCard({
   const hasImages = hasToolResultImages(item.result_content);
   const defaultExpanded = isPendingApproval || isError || isDiffTool || hasImages;
   const [expanded, setExpanded] = useState(defaultExpanded);
+  // Only a user's own toggle eases the body in. Default-expanded cards
+  // remount as the virtualized transcript scrolls, and must not replay it.
+  const [bodyEase, setBodyEase] = useState(false);
   const hasSeenImagesRef = useRef(hasImages);
 
   // Tool cards usually mount while the call is still running, before
@@ -161,7 +163,10 @@ export const ToolCallCard = memo(function ToolCallCard({
         {canExpand && !isPendingApproval && !isResponding && (
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
+            onClick={() => {
+              setBodyEase(true);
+              setExpanded((v) => !v);
+            }}
             className="shrink-0 text-muted-foreground/60 hover:text-foreground"
             aria-label={expanded ? "Collapse" : "Expand"}
           >
@@ -210,7 +215,14 @@ export const ToolCallCard = memo(function ToolCallCard({
       {/* Result body when expanded — known tools get a polished
           renderer, unknown tools fall back to the raw JSON dump. */}
       {showBody && (
-        <div className="border-t border-border/60 px-3 py-2.5">
+        <div
+          data-testid="tool-call-body"
+          className={cn(
+            "border-t border-border/60 px-3 py-2.5",
+            bodyEase &&
+              "animate-in fade-in-0 slide-in-from-top-1 duration-150 ease-out",
+          )}
+        >
           <ToolCallBody item={item} />
         </div>
       )}
@@ -394,7 +406,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
 // ---------------------------------------------------------------------------
 
 interface StatusGlyph {
-  Icon: LucideIcon;
+  Icon: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   className: string;
 }
 
@@ -411,9 +423,9 @@ function glyphForState(states: {
 }): StatusGlyph | null {
   if (states.isPendingApproval) return { Icon: Clock, className: "text-muted-foreground" };
   if (states.isResponding)
-    return { Icon: Loader2, className: "animate-spin text-muted-foreground" };
+    return { Icon: Spinner, className: "text-muted-foreground" };
   if (states.isExecuting)
-    return { Icon: Loader2, className: "animate-spin text-accent-ember" };
+    return { Icon: Spinner, className: "text-accent-ember" };
   if (states.isSuccess) return { Icon: Check, className: "text-status-open" };
   if (states.isError) return { Icon: X, className: "text-status-attention" };
   if (states.isDenied) return { Icon: X, className: "text-muted-foreground" };
