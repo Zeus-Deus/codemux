@@ -22,6 +22,10 @@ export interface TurnFoldBody {
   turnId: string;
   label: string;
   expanded: boolean;
+  /** The work-entry id holding this fold open: the user opened that work
+   *  log while the turn ran (see `buildTranscriptSlots`). Collapsing the
+   *  fold has to release it too. */
+  pinnedBy: string | null;
   hiddenCount: number;
   failedCount: number;
 }
@@ -246,6 +250,11 @@ function activeTurnIndex(segments: TurnSegment[], streaming: boolean): number {
  * Turn-level presentation derivation. Settled turns retain their terminal
  * assistant answer and replace all routine process output with one quiet fold.
  * Expanding that fold restores the original chronological items.
+ *
+ * `expandedTurnIds` holds turn ids the user expanded, plus the ids of work
+ * entries whose log the user opened mid-run. A fold that settles over such
+ * an entry starts expanded, so the log being read does not vanish when the
+ * turn ends.
  */
 function buildPresentationEntries(
   messages: ChatViewItem[],
@@ -285,12 +294,15 @@ function buildPresentationEntries(
     );
     const hiddenIds = new Set(hidden.map((item) => item.id));
     const turnId = turnIdFor(segment, ended);
-    const expanded = expandedTurnIds.has(turnId);
+    const pinnedBy =
+      hidden.find((item) => expandedTurnIds.has(item.id))?.id ?? null;
+    const expanded = expandedTurnIds.has(turnId) || pinnedBy != null;
     const body: TurnFoldBody = {
       kind: "turn_fold",
       turnId,
       label: foldLabel(segment.user, ended),
       expanded,
+      pinnedBy,
       hiddenCount: hidden.length,
       failedCount: hidden.filter(itemFailed).length,
     };
@@ -451,6 +463,7 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.turnId === b.turnId &&
       a.label === b.label &&
       a.expanded === b.expanded &&
+      a.pinnedBy === b.pinnedBy &&
       a.hiddenCount === b.hiddenCount &&
       a.failedCount === b.failedCount
     );

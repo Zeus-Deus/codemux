@@ -235,6 +235,7 @@ vi.mock("./DebugExitDialog", () => ({
 
 vi.mock("./Composer", async (importOriginal) => {
   const { Composer: RealComposer } = await importOriginal<typeof import("./Composer")>();
+  const { useRef } = await import("react");
   const StubComposer = ({
     zone1Override,
     belowComposerSlot,
@@ -286,13 +287,18 @@ vi.mock("./Composer", async (importOriginal) => {
     sessionAwaitingIntent?: boolean;
     draft: string;
     onDraftChange: (draft: string) => void;
-  }) => (
+  }) => {
+    // The real Composer focuses on the rising edge of `focusOnMount` and
+    // never hands focus back, so a request holds for the stub's lifetime.
+    const focusRequested = useRef(false);
+    if (focusOnMount) focusRequested.current = true;
+    return (
     <div
       data-testid="composer"
       data-provider={provider}
       data-provider-cli-installed={String(providerCliInstalled)}
       data-provider-authenticated={String(providerAuthenticated)}
-      data-focus-on-mount={focusOnMount ? "true" : "false"}
+      data-focus-on-mount={focusRequested.current ? "true" : "false"}
       data-configuration-ready={configurationReady ? "true" : "false"}
       data-session-ready={sessionReady ? "true" : "false"}
       data-session-awaiting-intent={sessionAwaitingIntent ? "true" : "false"}
@@ -371,7 +377,8 @@ vi.mock("./Composer", async (importOriginal) => {
         onClick={() => onPermissionModeChange("ask")}
       />
     </div>
-  );
+    );
+  };
   return { Composer: (props: React.ComponentProps<typeof RealComposer>) => useRealComposer ? <RealComposer {...props} /> : <StubComposer {...props} /> };
 });
 
@@ -1159,6 +1166,27 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="transcript"]'),
     ).toBeNull();
+  });
+
+  it("shows a transcript skeleton, not the new-chat landing, while history loads", async () => {
+    currentMessages = [];
+    let finishRead: (rows: never[]) => void = () => {};
+    vi.mocked(agentChatListMessagesAfter).mockImplementationOnce(
+      () => new Promise((resolve) => { finishRead = resolve; }),
+    );
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="transcript-skeleton"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="home-landing"]')).toBeNull();
+
+    // The read comes back empty: this really is a new chat.
+    await act(async () => {
+      finishRead([]);
+    });
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="home-landing"]')).not.toBeNull(),
+    );
+    expect(container.querySelector('[data-testid="transcript-skeleton"]')).toBeNull();
   });
 
   it("renders ChatTranscript + Composer when messages.length >= 1", async () => {

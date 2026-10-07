@@ -143,6 +143,7 @@ import type {
 
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { TranscriptSkeleton } from "./TranscriptSkeleton";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import {
@@ -1269,12 +1270,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // re-triggers hydrate, but a stable thread id within one mount only
   // hydrates once.
   const hydrateAttemptedRef = useRef<string | null>(null);
+  // The thread whose first hydrate has finished. Until it matches, an empty
+  // slice of a thread this pane opened (rather than started) means "not
+  // loaded yet", not "new chat": the pane shows a transcript skeleton
+  // instead of the landing. A locally started thread has no history to wait
+  // for, and swapping its landing out would remount the focused composer.
+  const [hydratedThreadId, setHydratedThreadId] = useState<string | null>(null);
+  const hydrating =
+    threadId != null &&
+    hydratedThreadId !== threadId &&
+    startupThreadRef.current !== threadId;
   useEffect(() => {
     if (!threadId) return;
     if (hydrateAttemptedRef.current === threadId) return;
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
     void hydrateThreadByCursor(threadId, provider, () => cancelled).finally(() => {
+      if (!cancelled) setHydratedThreadId(threadId);
       // Nonempty transcripts report readiness from their visible rows, not
       // this promise: the virtualizer can still be measuring hidden content.
       if (!cancelled && !useAgentChatStore.getState().threads[threadId]?.messages.length) {
@@ -3912,8 +3924,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       readOnly={!conversationWritable}
       cwd={cwd}
       // An empty pane reads as a new chat: "Describe what you want the
-      // agent to do…" until the first turn lands (design D10 copy).
-      isDraft={messages.length === 0}
+      // agent to do…" until the first turn lands (design D10 copy). A thread
+      // still loading its history is not a new chat.
+      isDraft={messages.length === 0 && !hydrating}
       // A local first send replaces ChatHomeLanding with the transcript;
       // a promoted lazy draft replaces DraftChatSurface with this pane.
       // Both swaps create a new textarea, so explicitly carry keyboard
@@ -4034,7 +4047,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           Renders as a floating top overlay; needs `relative` above. */}
       {conversationWritable && <ProviderStatusNotice provider={provider} />}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
-      {messages.length === 0 ? (
+      {messages.length === 0 && !hydrating ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
         <>
@@ -4056,12 +4069,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 />
               </div>
             </>
+          ) : messages.length === 0 ? (
+            <TranscriptSkeleton />
           ) : (
             <ChatTranscript
               messages={messages}
               streaming={transcriptStreaming}
               compacting={compacting}
               stalled={stalled}
+              onStop={conversationWritable ? handleStop : undefined}
               interrupted={interrupted}
               sendAnchor={sendAnchor}
               positionedNonceRef={sendAnchorPositionedNonceRef}

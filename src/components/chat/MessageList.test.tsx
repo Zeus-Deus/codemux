@@ -606,6 +606,51 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("src/components/chat/MessageList.tsx")).toBeInTheDocument();
   });
 
+  it("keeps a work log the user opened mid-run on screen when the turn settles", () => {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-live", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-live" },
+      { ...readCall(2, "/b"), turn_id: "turn-live" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running,
+      {
+        kind: "assistant_message",
+        id: "final-live",
+        seq: 3,
+        turn_id: "turn-live",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-live",
+        seq: 4,
+        turn_id: "turn-live",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    // Collapsing the fold releases the pin, and it stays collapsed.
+    fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
   it("shows only the newest completed tool call until earlier work is requested", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
@@ -963,6 +1008,47 @@ describe("MessageList dead-run detection (issue #154)", () => {
       expect(screen.getByTestId("run-stalled-notice")).toHaveTextContent(
         "No activity for 1m",
       );
+    });
+
+    it("offers Stop, wired to the turn's stop handler", () => {
+      const onStop = vi.fn();
+      render(
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={{ silentForSecs: 700 }}
+          onStop={onStop}
+          {...noopHandlers}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      expect(onStop).toHaveBeenCalledTimes(1);
+    });
+
+    it("hides on Keep waiting until another full stall passes, and resets on activity", () => {
+      const tree = (stalled: { silentForSecs: number } | null) => (
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={stalled}
+          {...noopHandlers}
+        />
+      );
+      const view = render(tree({ silentForSecs: 700 }));
+      // No stop handler (a read-only pane): only the snooze is offered.
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+
+      view.rerender(tree({ silentForSecs: 1_270 }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+      view.rerender(tree({ silentForSecs: 1_300 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      view.rerender(tree(null));
+      view.rerender(tree({ silentForSecs: 600 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
     });
 
     it("does not render when the thread is not streaming", () => {

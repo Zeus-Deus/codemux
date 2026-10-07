@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/lib/toast", () => ({
@@ -247,11 +247,74 @@ describe("ToolCallCard", () => {
     // Body collapsed by default on success.
     expect(container.textContent).not.toContain("line1");
 
-    // Expand via the chevron button.
-    const toggle = container.querySelector('button[aria-label="Expand"]');
-    expect(toggle).toBeTruthy();
-    fireEvent.click(toggle as HTMLElement);
+    // The whole header row is the toggle, named by the command it ran.
+    const toggle = screen.getByRole("button", { name: /Ran\s+ls -la/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(container.textContent).toContain("line1");
+    const body = document.getElementById(
+      toggle.getAttribute("aria-controls") ?? "",
+    );
+    expect(body).toHaveAttribute("data-state", "open");
+    expect(body?.className).toContain("motion-reduce:transition-none");
+
+    // Collapsing keeps the body mounted so it can ease shut, but hides it
+    // from assistive tech and the tab order.
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(body).toHaveAttribute("data-state", "closed");
+    expect(body).toHaveAttribute("aria-hidden", "true");
+    expect(body).toHaveAttribute("inert");
+  });
+
+  it("keeps the header a plain row while an approval is pending", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ approval_request_id: "req-1" })}
+        approval={makePendingApproval()}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /Ran\s+ls -la/ })).toBeNull();
+  });
+
+  it("shows how long a settled call took", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({
+          status: "done",
+          result_content: "ok",
+          started_at: 1_000,
+          completed_at: 4_200,
+        })}
+        approval={null}
+        onDecide={() => {}}
+      />,
+    );
+    expect(screen.getByText("3s")).toBeInTheDocument();
+  });
+
+  it("ticks elapsed time while a call runs", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      render(
+        <ToolCallCard
+          item={makeTool({ started_at: 10_000 })}
+          approval={null}
+          onDecide={() => {}}
+        />,
+      );
+      const elapsed = screen.getByTestId("step-elapsed");
+      expect(elapsed.textContent).toBe("");
+      act(() => {
+        vi.advanceTimersByTime(65_000);
+      });
+      expect(elapsed.textContent).toBe("1m 5s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("opens when an image arrives asynchronously and respects a later manual collapse", () => {
@@ -282,7 +345,7 @@ describe("ToolCallCard", () => {
       "src",
       "data:image/png;base64,AAAA",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
 
     rerender(

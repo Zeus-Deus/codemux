@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, it, expect } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type {
   ReasoningItem,
@@ -141,13 +141,70 @@ describe("ActivityBlock — one-line work log", () => {
     expect(screen.getByText(/1 failed/)).toBeInTheDocument();
   });
 
-  it("folds the history back to one line when the work settles", () => {
+  it("keeps a history the user opened open when the work settles", () => {
     const items = [read(0, "/a"), read(1, "/b")];
     const { container, rerender } = renderBlock(items, true);
     openLog(container);
     expect(screen.getByText("/a")).toBeInTheDocument();
     rerender(<ActivityBlock items={items} working={false} />);
-    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.getByText("/a")).toBeInTheDocument();
+  });
+
+  it("asks the transcript to keep a log opened mid-run, and lets it go on close", () => {
+    const onKeepOpen = vi.fn();
+    const items = [read(0, "/a"), bash(1, "cargo test", { status: "running" })];
+    const { container } = render(
+      <ActivityBlock items={items} working onKeepOpen={onKeepOpen} />,
+    );
+    openLog(container);
+    expect(onKeepOpen).toHaveBeenLastCalledWith("tc-0", true);
+    fireEvent.click(screen.getByRole("button", { name: /Work log/ }));
+    expect(onKeepOpen).toHaveBeenLastCalledWith("tc-0", false);
+  });
+
+  it("does not pin a log opened after the work settled", () => {
+    const onKeepOpen = vi.fn();
+    const { container } = render(
+      <ActivityBlock
+        items={[read(0, "/a"), read(1, "/b")]}
+        working={false}
+        onKeepOpen={onKeepOpen}
+      />,
+    );
+    openLog(container);
+    expect(onKeepOpen).not.toHaveBeenCalled();
+  });
+});
+
+describe("ActivityBlock — step timing", () => {
+  it("adds the duration to a settled step's meta", () => {
+    const { container } = renderBlock(
+      [
+        bash(0, "cargo build", { started_at: 0, completed_at: 3_400 }),
+        read(1, "/b"),
+      ],
+      false,
+    );
+    openLog(container);
+    expect(screen.getByText("ok · 3s")).toBeInTheDocument();
+  });
+
+  it("ticks elapsed time on the live line while a tool runs", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      renderBlock(
+        [read(0, "/a"), bash(1, "cargo test", { status: "running", started_at: 40_000 })],
+        true,
+      );
+      expect(screen.getByTestId("step-elapsed").textContent).toBe("1m 0s ·");
+      act(() => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(screen.getByTestId("step-elapsed").textContent).toBe("1m 5s ·");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

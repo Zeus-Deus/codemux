@@ -276,6 +276,27 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     if (expanded.kind === "turn_fold") expect(expanded.expanded).toBe(true);
   });
 
+  it("settles expanded when the user had that turn's work log open", () => {
+    // `re-2` is the first entry of the work log, pinned while the turn ran.
+    const slots = buildTranscriptSlots(settledTurn(), false, new Set(["re-2"]));
+
+    expect(slots.map((slot) => slot.body.kind)).toEqual([
+      "item",
+      "turn_fold",
+      "item",
+      "activity",
+      "item",
+    ]);
+    const fold = slots[1].body;
+    if (fold.kind !== "turn_fold") throw new Error("expected a fold");
+    expect(fold.expanded).toBe(true);
+    expect(fold.pinnedBy).toBe("re-2");
+    expect(buildTranscriptSlots(settledTurn())[1].body).toMatchObject({
+      expanded: false,
+      pinnedBy: null,
+    });
+  });
+
   it("leaves pending approvals visible even after a terminal event", () => {
     const gated = tool(2, {
       status: "running",

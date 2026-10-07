@@ -12,10 +12,12 @@ import {
   extractToolResultImages,
   isRenderableImageBlock,
 } from "@/lib/agent-chat/tool-result-images";
+import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { agentChatGetToolResult } from "@/tauri/commands";
 
 import { DiffView } from "./DiffView";
+import { MessageCopyButton } from "./MessageCopyButton";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolResultImages } from "./ToolResultImages";
 import { MarkdownFileLink } from "./MarkdownFileLink";
@@ -30,10 +32,9 @@ const GREP_PREVIEW_MATCHES = 5;
  * for unknown tools, matching pre-Stage-7 behavior — known tools get a
  * polished view that surfaces the most useful field at a glance.
  *
- * `expanded` is the parent's collapsed/expanded state. Bodies that
- * support a "show full" toggle (Bash, Read) read it as the initial
- * value but maintain their own local state so the ChevronDown next to
- * the tool's title and the body's own toggle don't fight.
+ * Bodies that trim their output (Bash tail, Read head, Grep matches) own a
+ * local "show all" toggle in the trimmed block's footer, independent of the
+ * card or row disclosure that hosts them.
  */
 export function ToolCallBody({ item }: { item: ToolCallItem }) {
   const input = isRecord(item.input) ? item.input : null;
@@ -91,13 +92,14 @@ export function BashToolBody({ item, input }: BodyProps) {
   const description = input ? stringField(input, "description") : null;
   const result = contentToString(item.result_content);
   const exitCode = parseExitCode(result, item.status);
-  const tail = tailLines(result, BASH_TAIL_LINES);
-  const tailHidden = countLines(result) - BASH_TAIL_LINES;
+  const [showAll, setShowAll] = useState(false);
+  const totalLines = countLines(result);
+  const tailHidden = totalLines - BASH_TAIL_LINES;
 
   return (
     <div className="space-y-2">
       {command && (
-        <div className="code-surface select-text rounded-md bg-muted/40 px-3 py-2 text-foreground whitespace-pre-wrap break-words">
+        <div className="group/copy code-surface relative select-text rounded-md bg-muted/40 px-3 py-2 text-foreground whitespace-pre-wrap break-words">
           <span className="text-muted-foreground/70">$ </span>
           {command}
           {description && (
@@ -105,17 +107,27 @@ export function BashToolBody({ item, input }: BodyProps) {
               {description}
             </div>
           )}
+          <ToolCopyButton text={command} label="Copy command" />
         </div>
       )}
       {result && (
-        <div className="rounded-md bg-muted/40">
-          <pre className="code-surface whitespace-pre-wrap break-words px-3 py-2 text-foreground">
-            {tail}
+        <div className="group/copy relative rounded-md bg-muted/40">
+          <pre
+            className={cn(
+              "code-surface whitespace-pre-wrap break-words px-3 py-2 text-foreground",
+              showAll && FULL_OUTPUT_CLASS,
+            )}
+          >
+            {showAll ? result : tailLines(result, BASH_TAIL_LINES)}
           </pre>
+          <ToolCopyButton text={result} label="Copy output" />
           {tailHidden > 0 && (
-            <p className="border-t border-border/40 px-3 py-1 text-label text-muted-foreground/70">
-              + {tailHidden} earlier line{tailHidden === 1 ? "" : "s"} hidden
-            </p>
+            <ShowAllButton
+              expanded={showAll}
+              onToggle={() => setShowAll((v) => !v)}
+              showLabel={`Show all ${totalLines} lines`}
+              hideLabel={`Show last ${BASH_TAIL_LINES} lines`}
+            />
           )}
         </div>
       )}
@@ -144,7 +156,12 @@ export function ReadToolBody({ item, input }: BodyProps) {
   const limit = input ? numberField(input, "limit") : null;
   const result = contentToString(item.result_content);
   const totalLines = countLines(result);
-  const preview = result ? headLines(result, READ_PREVIEW_LINES) : null;
+  const [showAll, setShowAll] = useState(false);
+  const preview = result
+    ? showAll
+      ? result
+      : headLines(result, READ_PREVIEW_LINES)
+    : null;
 
   return (
     <div className="space-y-2">
@@ -159,14 +176,23 @@ export function ReadToolBody({ item, input }: BodyProps) {
         </div>
       )}
       {preview && (
-        <div className="rounded-md bg-muted/40">
-          <pre className="code-surface whitespace-pre-wrap break-words px-3 py-2 text-foreground">
+        <div className="group/copy relative rounded-md bg-muted/40">
+          <pre
+            className={cn(
+              "code-surface whitespace-pre-wrap break-words px-3 py-2 text-foreground",
+              showAll && FULL_OUTPUT_CLASS,
+            )}
+          >
             {preview}
           </pre>
+          <ToolCopyButton text={result} label="Copy output" />
           {totalLines > READ_PREVIEW_LINES && (
-            <p className="border-t border-border/40 px-3 py-1 text-label text-muted-foreground/70">
-              Read {totalLines} line{totalLines === 1 ? "" : "s"}
-            </p>
+            <ShowAllButton
+              expanded={showAll}
+              onToggle={() => setShowAll((v) => !v)}
+              showLabel={`Show all ${totalLines} lines`}
+              hideLabel={`Show first ${READ_PREVIEW_LINES} lines`}
+            />
           )}
         </div>
       )}
@@ -179,8 +205,9 @@ export function GrepToolBody({ item, input }: BodyProps) {
   const path = input ? stringField(input, "path") : null;
   const result = contentToString(item.result_content);
   const matches = parseGrepMatches(result);
-  const visible = matches.slice(0, GREP_PREVIEW_MATCHES);
-  const hidden = matches.length - visible.length;
+  const [showAll, setShowAll] = useState(false);
+  const hidden = Math.max(0, matches.length - GREP_PREVIEW_MATCHES);
+  const visible = showAll ? matches : matches.slice(0, GREP_PREVIEW_MATCHES);
 
   return (
     <div className="space-y-2">
@@ -195,27 +222,32 @@ export function GrepToolBody({ item, input }: BodyProps) {
         </div>
       )}
       {matches.length > 0 ? (
-        <div className="select-text rounded-md bg-muted/40 px-3 py-2 space-y-1">
-          <p className="text-label text-muted-foreground/80">
-            {matches.length} match{matches.length === 1 ? "" : "es"}
-          </p>
-          <ul className="space-y-0.5">
-            {visible.map((m, i) => (
-              <li
-                key={i}
-                className="font-mono text-body-sm leading-5 text-foreground break-words"
-              >
-                <span className="text-muted-foreground/70">
-                  <ToolSourcePath path={m.location} />
-                </span>
-                {m.text && <span className="ml-2">{m.text}</span>}
-              </li>
-            ))}
-          </ul>
-          {hidden > 0 && (
-            <p className="text-label text-muted-foreground/70">
-              … + {hidden} more
+        <div className="select-text rounded-md bg-muted/40">
+          <div className={cn("space-y-1 px-3 py-2", showAll && FULL_OUTPUT_CLASS)}>
+            <p className="text-label text-muted-foreground/80">
+              {matches.length} match{matches.length === 1 ? "" : "es"}
             </p>
+            <ul className="space-y-0.5">
+              {visible.map((m, i) => (
+                <li
+                  key={i}
+                  className="font-mono text-body-sm leading-5 text-foreground break-words"
+                >
+                  <span className="text-muted-foreground/70">
+                    <ToolSourcePath path={m.location} />
+                  </span>
+                  {m.text && <span className="ml-2">{m.text}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+          {hidden > 0 && (
+            <ShowAllButton
+              expanded={showAll}
+              onToggle={() => setShowAll((v) => !v)}
+              showLabel={`Show ${hidden} more match${hidden === 1 ? "" : "es"}`}
+              hideLabel={`Show first ${GREP_PREVIEW_MATCHES} matches`}
+            />
           )}
         </div>
       ) : (
@@ -415,6 +447,47 @@ function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
             : `Show ${hidden} more line${hidden === 1 ? "" : "s"} (${formatLazyBytes(stub.bytes)})`}
       </button>
     </div>
+  );
+}
+
+/** A trimmed block opened in full scrolls inside itself instead of
+ *  stretching the transcript by thousands of lines. */
+const FULL_OUTPUT_CLASS = "max-h-[60vh] overflow-auto thin-scrollbar";
+
+/** Footer toggle for a trimmed output block, styled like the lazy-result
+ *  "Show N more lines" footer. */
+function ShowAllButton({
+  expanded,
+  onToggle,
+  showLabel,
+  hideLabel,
+}: {
+  expanded: boolean;
+  onToggle: () => void;
+  showLabel: string;
+  hideLabel: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      onClick={onToggle}
+      className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-label text-muted-foreground transition-colors duration-100 hover:text-foreground"
+    >
+      {expanded ? hideLabel : showLabel}
+    </button>
+  );
+}
+
+/** Copy chip pinned to the top-right of a command or output block,
+ *  revealed when the pointer is over that block (`group/copy`). */
+function ToolCopyButton({ text, label }: { text: string; label: string }) {
+  return (
+    <MessageCopyButton
+      text={text}
+      label={label}
+      className="absolute right-1.5 top-1.5 bg-background/90 px-1 py-0.5 font-sans group-hover/copy:pointer-events-auto group-hover/copy:opacity-100"
+    />
   );
 }
 

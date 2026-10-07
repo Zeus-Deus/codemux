@@ -2498,7 +2498,19 @@ function streamMockWorkLog(
     ["Grep", { pattern: "unread", path: "src/components/layout" }, "sidebar-inbox-card.tsx:42: unread"],
     ["Edit", { file_path: "src/components/layout/sidebar-inbox-card.tsx", old_string: "dot", new_string: "" }, "Applied edit"],
     bash("npm run check"),
-    bash("npm run test -- src/components/layout/sidebar-inbox-card.test.tsx"),
+    // Long enough to trim, so the step's "Show all N lines" footer shows.
+    bash(
+      "npm run test -- src/components/layout/sidebar-inbox-card.test.tsx",
+      [
+        " RUN  v3.2.6 /home/zeus/Projects/codemux",
+        ...Array.from(
+          { length: 20 },
+          (_, i) => ` ✓ sidebar-inbox-card > case ${i + 1} ${2 + (i % 5)}ms`,
+        ),
+        " Test Files  1 passed (1)",
+        "      Tests  20 passed (20)",
+      ].join("\n"),
+    ),
   ]);
   subagents([
     { id: `${turnId}-review`, name: "review diff", tools: 6, ms: 22_000 },
