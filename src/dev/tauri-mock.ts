@@ -6086,6 +6086,19 @@ const handlers: Record<string, Handler> = {
     return { workspace_id: ws.workspace_id, cwd, adopted: false };
   },
   create_worktree_workspace: (a) => {
+    // Mirror the backend's rejections so the New Workspace dialog's
+    // failure recovery can be exercised: a non-git folder always fails,
+    // and `?worktreeFail=1` makes every worktree create fail like git does
+    // when the target path is already taken.
+    const repoPath = String(a.repoPath ?? "");
+    if (repoPath.endsWith("/scratchpad")) {
+      throw new Error(`Not a git repository: ${repoPath}`);
+    }
+    if (new URLSearchParams(location.search).get("worktreeFail") === "1") {
+      throw new Error(
+        `fatal: '${MOCK_HOME_DIR}/.codemux/worktrees/codemux/${String(a.branch ?? "")}' already exists`,
+      );
+    }
     const ws = buildWorktreeWorkspace(
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),

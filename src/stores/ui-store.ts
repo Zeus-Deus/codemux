@@ -6,7 +6,11 @@ import {
 } from "@/lib/right-panel-width";
 import { useAppStore } from "@/stores/app-store";
 import { undockBrowserFromRightPanel } from "@/tauri/commands";
-import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
+import type {
+  ModelSelection,
+  NewWorkspaceDraft,
+  PendingWorkspace,
+} from "@/tauri/types";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
 export type RightPanelCorePane =
@@ -117,6 +121,9 @@ interface UIStore {
   fileSearchTarget: "editor" | "right-panel";
   showNewWorkspaceDialog: boolean;
   newWorkspaceProjectDir: string | null;
+  /** Form contents the dialog restores on open, set only when reopening a
+   *  failed create. Any other open or close clears it. Not persisted. */
+  newWorkspaceDraft: NewWorkspaceDraft | null;
   showSettings: boolean;
   settingsSection: string | null;
   settingsNavigationVersion: number;
@@ -262,6 +269,9 @@ interface UIStore {
   addPendingWorkspace: (pw: PendingWorkspace) => void;
   removePendingWorkspace: (id: string) => void;
   failPendingWorkspace: (id: string, error: string) => void;
+  /** Drop a pending row and, when it carries a draft, reopen the New
+   *  Workspace dialog with that draft so the user can fix and retry. */
+  reopenPendingWorkspace: (id: string) => void;
   setLastSelectedAgentId: (id: string | null) => void;
   setLastModelSelection: (family: string, selection: ModelSelection) => void;
   setShowCommandPalette: (show: boolean) => void;
@@ -303,6 +313,7 @@ export const useUIStore = create<UIStore>()(
       fileSearchTarget: "editor",
       showNewWorkspaceDialog: false,
       newWorkspaceProjectDir: null,
+      newWorkspaceDraft: null,
       showSettings: false,
       settingsSection: null,
       settingsNavigationVersion: 0,
@@ -560,6 +571,7 @@ export const useUIStore = create<UIStore>()(
         set({
           showNewWorkspaceDialog: show,
           newWorkspaceProjectDir: show ? (projectDir ?? null) : null,
+          newWorkspaceDraft: null,
         }),
 
       setShowSettings: (show, section = null) =>
@@ -614,6 +626,24 @@ export const useUIStore = create<UIStore>()(
               : pw,
           ),
         })),
+
+      // The failed row stays until a retry from the dialog replaces it (see
+      // `runCreate`), so closing the reopened dialog never loses the draft.
+      reopenPendingWorkspace: (id) =>
+        set((s) => {
+          const pw = s.pendingWorkspaces.find((p) => p.id === id);
+          if (!pw) return s;
+          if (!pw.draft) {
+            return {
+              pendingWorkspaces: s.pendingWorkspaces.filter((p) => p.id !== id),
+            };
+          }
+          return {
+            showNewWorkspaceDialog: true,
+            newWorkspaceProjectDir: pw.draft.projectDir,
+            newWorkspaceDraft: pw.draft,
+          };
+        }),
 
       setLastSelectedAgentId: (id) => set({ lastSelectedAgentId: id }),
 

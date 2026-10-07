@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { cleanup, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
-import { NewWorkspaceDialog } from "./new-workspace-dialog";
+import { act, cleanup, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { NewWorkspaceDialog, branchNameError } from "./new-workspace-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -132,6 +132,11 @@ import {
   getDefaultBranch,
   getPresets,
   listChatProviderCapabilities,
+  createWorkspace,
+  applyPreset,
+  listBranchesDetailed,
+  listWorktrees,
+  importWorktreeWorkspace,
 } from "@/tauri/commands";
 import {
   _defaultBranchCache,
@@ -272,6 +277,21 @@ beforeEach(() => {
   });
   (checkIsGitRepo as Mock).mockResolvedValue(true);
   (listBranches as Mock).mockResolvedValue([]);
+  (gitFetchPrune as Mock).mockResolvedValue(undefined);
+  (listBranchesDetailed as Mock).mockResolvedValue([]);
+  (listWorktrees as Mock).mockResolvedValue([]);
+  (importWorktreeWorkspace as Mock).mockResolvedValue("ws-new");
+  (getDefaultBranch as Mock).mockResolvedValue("main");
+  (getGitBranchInfo as Mock).mockResolvedValue({
+    branch: "main",
+    ahead: 0,
+    behind: 0,
+  });
+  (createWorktreeWorkspaceResult as Mock).mockResolvedValue({
+    workspaceId: "ws-new",
+    cwd: null,
+    adopted: false,
+  });
   // useDefaultBranch keeps a module-level cache so the same project_root
   // only fetches once per session. Clear it between tests so a previous
   // case's resolved value doesn't pre-populate the next dialog and
@@ -279,7 +299,9 @@ beforeEach(() => {
   _defaultBranchCache.clear();
   _defaultBranchInFlight.clear();
   useUIStore.setState({
+    showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
+    newWorkspaceDraft: null,
     pendingWorkspaces: [],
     lastSelectedAgentId: null,
     lastModelSelections: {},
@@ -326,10 +348,10 @@ describe("NewWorkspaceDialog", () => {
     setAppState("/path/to/project");
     renderDialog(true);
 
-    await waitFor(() => {
-      const hints = screen.getAllByText("Ctrl+Enter to create");
-      expect(hints.length).toBeGreaterThan(0);
-    });
+    const dialog = await screen.findByRole("dialog");
+    const keycap = within(dialog).getByText("Ctrl+Enter");
+    expect(keycap.tagName).toBe("KBD");
+    expect(keycap.parentElement).toHaveTextContent("Ctrl+Enter to create");
   });
 
   it("fetches branches for the project directory", async () => {
@@ -354,8 +376,9 @@ describe("NewWorkspaceDialog", () => {
       </TooltipProvider>,
     );
 
+    // Local + remote listing right away, then again after the fetch lands.
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2);
+      expect(listBranches).toHaveBeenCalledTimes(4);
     });
 
     rerender(
@@ -375,7 +398,7 @@ describe("NewWorkspaceDialog", () => {
     );
 
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2);
+      expect(listBranches).toHaveBeenCalledTimes(4);
     });
   });
 });
@@ -903,21 +926,36 @@ describe("buildPromptWithIssueContext", () => {
 // ── Fetch before branch listing tests ──
 
 describe("Fetch before branch listing", () => {
-  it("calls gitFetchPrune before listing branches", async () => {
+  it("lists local branches without waiting for the network fetch", async () => {
     setAppState("/path/to/project");
     (listBranches as Mock).mockResolvedValue(["main"]);
+    // A fetch that never finishes (slow VPN, offline with a long timeout).
+    (gitFetchPrune as Mock).mockReturnValue(new Promise(() => {}));
 
     renderDialog(true);
 
     await waitFor(() => {
       expect(gitFetchPrune).toHaveBeenCalledWith("/path/to/project");
-    });
-
-    // Branches should still be listed after fetch
-    await waitFor(() => {
       expect(listBranches).toHaveBeenCalledWith("/path/to/project", false);
       expect(listBranches).toHaveBeenCalledWith("/path/to/project", true);
     });
+    expect(listBranches).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-lists branches once the fetch lands", async () => {
+    setAppState("/path/to/project");
+    let finishFetch!: () => void;
+    (gitFetchPrune as Mock).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishFetch = resolve;
+      }),
+    );
+
+    renderDialog(true);
+
+    await waitFor(() => expect(listBranches).toHaveBeenCalledTimes(2));
+    finishFetch();
+    await waitFor(() => expect(listBranches).toHaveBeenCalledTimes(4));
   });
 
   it("still lists branches when fetch fails (no network)", async () => {
@@ -1216,5 +1254,498 @@ describe("Clipboard image paste", () => {
     });
     // Still exactly one chip.
     expect(within(dialog).getAllByText("Pasted image").length).toBe(1);
+  });
+});
+
+// ── Failure recovery, validation, non-git and default-branch routing ──
+
+/** The dialog wired to the store the way the sidebar mounts it, so a
+ *  "Reopen" from a failed create can open it again. */
+function StoreDrivenDialog() {
+  const open = useUIStore((s) => s.showNewWorkspaceDialog);
+  const setOpen = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  return (
+    <TooltipProvider>
+      <NewWorkspaceDialog open={open} onOpenChange={(next) => setOpen(next)} />
+    </TooltipProvider>
+  );
+}
+
+describe("branchNameError", () => {
+  it("accepts empty and ordinary names", () => {
+    expect(branchNameError("")).toBeNull();
+    expect(branchNameError("feature/1234-fix-checkout-race")).toBeNull();
+  });
+
+  it.each([
+    ["my branch", "spaces"],
+    ["fix..it", ".."],
+    ["what?", "~ ^ : ? * ["],
+    ["-leading", "start with -"],
+    ["trailing/", "/"],
+    ["refs.lock", ".lock"],
+    ["feature/.hidden", "start with ."],
+    ["ends.", "end with ."],
+    ["a@{1}", "@{"],
+    ["HEAD", "reserved"],
+  ])("rejects %s", (name, reason) => {
+    expect(branchNameError(name)).toContain(reason);
+  });
+});
+
+describe("Failure recovery", () => {
+  it("keeps the draft on a failed create and Reopen restores it", async () => {
+    setAppState("/path/to/project");
+    (createWorktreeWorkspaceResult as Mock).mockRejectedValueOnce(
+      "fatal: '/wt/my-feature' already exists",
+    );
+    useUIStore.setState({ showNewWorkspaceDialog: true });
+    render(<StoreDrivenDialog />);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "A long task prompt" } },
+    );
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: "my-feature" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
+    });
+    const failed = useUIStore.getState().pendingWorkspaces[0];
+    expect(failed.errorMessage).toBe("fatal: '/wt/my-feature' already exists");
+    expect(failed.draft?.prompt).toBe("A long task prompt");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    const [message, opts] = (toast.error as Mock).mock.calls[0];
+    expect(message).toBe(
+      "Couldn't create workspace: fatal: '/wt/my-feature' already exists",
+    );
+    expect(opts.action.label).toBe("Reopen");
+
+    act(() => opts.action.onClick());
+
+    const reopened = await screen.findByRole("dialog");
+    expect(
+      within(reopened).getByPlaceholderText("What do you want to do?"),
+    ).toHaveValue("A long task prompt");
+    expect(within(reopened).getByPlaceholderText("branch name")).toHaveValue(
+      "my-feature",
+    );
+    // The failed row stays while the reopened dialog is up.
+    expect(useUIStore.getState().pendingWorkspaces).toHaveLength(1);
+  });
+
+  it("keeps the failed row when the reopened dialog closes without a retry", async () => {
+    setAppState("/path/to/project");
+    (createWorktreeWorkspaceResult as Mock)
+      .mockRejectedValueOnce("fatal: boom")
+      .mockRejectedValueOnce("fatal: boom again");
+    useUIStore.setState({ showNewWorkspaceDialog: true });
+    render(<StoreDrivenDialog />);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Do not lose me" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
+    });
+    const failedId = useUIStore.getState().pendingWorkspaces[0].id;
+    const [, opts] = (toast.error as Mock).mock.calls[0];
+
+    // Reopen, then close without resubmitting.
+    act(() => opts.action.onClick());
+    await screen.findByRole("dialog");
+    act(() => useUIStore.getState().setShowNewWorkspaceDialog(false));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(useUIStore.getState().pendingWorkspaces.map((p) => p.id)).toEqual([
+      failedId,
+    ]);
+
+    // The toast's Reopen still works, and a retry replaces the old row.
+    act(() => opts.action.onClick());
+    const reopened = await screen.findByRole("dialog");
+    expect(
+      within(reopened).getByPlaceholderText("What do you want to do?"),
+    ).toHaveValue("Do not lose me");
+    fireEvent.click(within(reopened).getByRole("button", { name: /Create/i }));
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.errorMessage).toBe(
+        "fatal: boom again",
+      );
+    });
+    expect(useUIStore.getState().pendingWorkspaces).toHaveLength(1);
+    expect(useUIStore.getState().pendingWorkspaces[0].id).not.toBe(failedId);
+  });
+
+  it("restores attachments and the linked issue on Reopen and resubmits them", async () => {
+    setAppState("/path/to/project");
+    render(<StoreDrivenDialog />);
+    act(() => {
+      useUIStore.getState().addPendingWorkspace({
+        id: "pending-i",
+        name: "fix-it",
+        projectPath: "/path/to/project",
+        status: "failed",
+        errorMessage: "boom",
+        draft: {
+          projectDir: "/path/to/project",
+          workspaceName: "",
+          branchName: "fix-it",
+          branchAutoFilled: false,
+          prompt: "Look at this",
+          attachments: ["/tmp/shot.png"],
+          linkedIssue: {
+            number: 92,
+            title: "Backend endpoints",
+            state: "Open",
+            labels: [],
+            assignees: [],
+            url: "https://github.com/u/r/issues/92",
+            body: null,
+            comments: [],
+            totalComments: 0,
+            updatedAt: null,
+          },
+          selectedAgentId: "builtin-claude",
+          modelSelection: { model: null, reasoning: null, context: null },
+          baseBranch: "main",
+          branchMode: "create_new",
+          openExistingBranch: null,
+          hostId: null,
+        },
+      });
+      useUIStore.getState().reopenPendingWorkspace("pending-i");
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("shot.png")).toBeInTheDocument();
+    expect(within(dialog).getByText("Backend endpoints")).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+    await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
+    const sentPrompt = (createWorktreeWorkspaceResult as Mock).mock.calls[0][5];
+    expect(sentPrompt).toContain("Look at this");
+    expect(sentPrompt).toContain("Attached files:\n- /tmp/shot.png");
+    expect(sentPrompt).toContain("#92");
+    // The retry replaced the failed row.
+    await waitFor(() =>
+      expect(
+        useUIStore.getState().pendingWorkspaces.some((p) => p.id === "pending-i"),
+      ).toBe(false),
+    );
+  });
+
+  // Regression: reopening a draft for a different project than the dialog
+  // last held used to read as a mid-dialog project switch, which re-armed
+  // default-branch adoption and replaced the draft's base with "main".
+  it("keeps the draft's base branch when Reopen switches project", async () => {
+    setAppState("/proj-b");
+    useUIStore.setState({ showNewWorkspaceDialog: true });
+    render(<StoreDrivenDialog />);
+    await screen.findByRole("dialog");
+    await waitFor(() => expect(getDefaultBranch).toHaveBeenCalledWith("/proj-b"));
+    act(() => useUIStore.getState().setShowNewWorkspaceDialog(false));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+
+    act(() => {
+      useUIStore.getState().addPendingWorkspace({
+        id: "pending-a",
+        name: "fix-a",
+        projectPath: "/proj-a",
+        status: "failed",
+        errorMessage: "boom",
+        draft: {
+          projectDir: "/proj-a",
+          workspaceName: "",
+          branchName: "fix-a",
+          branchAutoFilled: false,
+          prompt: "Retry me",
+          attachments: [],
+          linkedIssue: null,
+          selectedAgentId: "builtin-claude",
+          modelSelection: { model: null, reasoning: null, context: null },
+          baseBranch: "develop",
+          branchMode: "create_new",
+          openExistingBranch: null,
+          hostId: null,
+        },
+      });
+      useUIStore.getState().reopenPendingWorkspace("pending-a");
+    });
+
+    const reopened = await screen.findByRole("dialog");
+    await waitFor(() => expect(getDefaultBranch).toHaveBeenCalledWith("/proj-a"));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(within(reopened).getByText("develop")).toBeInTheDocument();
+    expect(within(reopened).queryByText("main")).not.toBeInTheDocument();
+  });
+
+  it("keeps the draft's model pick over the remembered one on Reopen", async () => {
+    (getPresets as Mock).mockResolvedValueOnce({
+      presets: [
+        {
+          id: "builtin-claude",
+          name: "Claude",
+          description: null,
+          commands: ["claude --dangerously-skip-permissions"],
+          working_directory: null,
+          launch_mode: "NewTab",
+          icon: null,
+          pinned: true,
+          is_builtin: true,
+          auto_run_on_workspace: false,
+          auto_run_on_new_tab: false,
+          kind: "cli",
+        },
+      ],
+    });
+    useUIStore.setState({
+      lastModelSelections: {
+        claude: { model: "claude-sonnet-4-6", reasoning: "high", context: null },
+      },
+    });
+    setAppState("/path/to/project");
+    render(<StoreDrivenDialog />);
+    act(() => {
+      useUIStore.getState().addPendingWorkspace({
+        id: "pending-m",
+        name: "my-feature",
+        projectPath: "/path/to/project",
+        status: "failed",
+        draft: {
+          projectDir: "/path/to/project",
+          workspaceName: "",
+          branchName: "my-feature",
+          branchAutoFilled: false,
+          prompt: "",
+          attachments: [],
+          linkedIssue: null,
+          selectedAgentId: "builtin-claude",
+          modelSelection: {
+            model: "claude-sonnet-4-6",
+            reasoning: null,
+            context: null,
+          },
+          baseBranch: "main",
+          branchMode: "create_new",
+          openExistingBranch: null,
+          hostId: null,
+        },
+      });
+      useUIStore.getState().reopenPendingWorkspace("pending-m");
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(getPresets).toHaveBeenCalled());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
+    expect((createWorktreeWorkspaceResult as Mock).mock.calls[0][8]).toEqual({
+      model: "claude-sonnet-4-6",
+      reasoning: null,
+      context: null,
+    });
+  });
+
+  it("blocks submit on an invalid branch name and says why", async () => {
+    setAppState("/path/to/project");
+    const onOpenChange = vi.fn();
+    renderDialog(true, onOpenChange);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: "my feature" },
+    });
+
+    expect(
+      within(dialog).getByText("Branch names can't contain spaces"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: /Create/i })).toBeDisabled();
+
+    fireEvent.keyDown(dialog, { key: "Enter", ctrlKey: true });
+    await act(async () => {});
+
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+  });
+});
+
+describe("Branch picker shortcuts", () => {
+  const detailed = [
+    { name: "main", last_commit_unix: 1, is_local: true, is_remote: true, is_head: true },
+    { name: "feat-wt", last_commit_unix: 2, is_local: true, is_remote: false, is_head: false },
+  ];
+
+  async function openPicker() {
+    const dialog = await screen.findByRole("dialog");
+    // The prompt grabs focus on a 100ms timer and would dismiss the popover.
+    await waitFor(() => {
+      expect(
+        within(dialog).getByPlaceholderText("What do you want to do?"),
+      ).toHaveFocus();
+    });
+    fireEvent.click(within(dialog).getByText("main").closest("button")!);
+    return dialog;
+  }
+
+  it("shows Syncing while git fetch runs and drops it when done", async () => {
+    setAppState("/path/to/project");
+    let finishFetch!: () => void;
+    (gitFetchPrune as Mock).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishFetch = resolve;
+      }),
+    );
+    (listBranchesDetailed as Mock).mockResolvedValue(detailed);
+    renderDialog(true);
+
+    await openPicker();
+    // Local refs are listed while the fetch is still running.
+    expect(await screen.findByText("feat-wt")).toBeInTheDocument();
+    expect(screen.getByText("Syncing")).toBeInTheDocument();
+
+    await act(async () => finishFetch());
+    await waitFor(() => expect(screen.queryByText("Syncing")).toBeNull());
+  });
+
+  it("reveals the row actions on the keyboard-selected row", async () => {
+    setAppState("/path/to/project");
+    (listBranchesDetailed as Mock).mockResolvedValue(detailed);
+    renderDialog(true);
+
+    await openPicker();
+    const row = (await screen.findByText("feat-wt")).closest("[cmdk-item]")!;
+    const actions = within(row as HTMLElement)
+      .getByRole("button", { name: /Open/ })
+      .closest("span")!;
+    expect(actions.className).toContain("group-data-[selected=true]/row:flex");
+  });
+
+  it("keeps a failed worktree import recoverable instead of failing silently", async () => {
+    setAppState("/path/to/project");
+    (listBranchesDetailed as Mock).mockResolvedValue(detailed);
+    (listWorktrees as Mock).mockResolvedValue([
+      { path: "/wt/feat-wt", branch: "feat-wt", is_bare: false },
+    ]);
+    (importWorktreeWorkspace as Mock).mockRejectedValueOnce("worktree is locked");
+    useUIStore.setState({ showNewWorkspaceDialog: true });
+    render(<StoreDrivenDialog />);
+
+    const dialog = await openPicker();
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Keep me" } },
+    );
+    fireEvent.click(await screen.findByText("feat-wt"));
+
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
+    });
+    expect(importWorktreeWorkspace).toHaveBeenCalledWith(
+      "/wt/feat-wt",
+      "feat-wt",
+      "single",
+    );
+    expect(useUIStore.getState().pendingWorkspaces[0].draft?.prompt).toBe(
+      "Keep me",
+    );
+    const [message, opts] = (toast.error as Mock).mock.calls[0];
+    expect(message).toBe("Couldn't create workspace: worktree is locked");
+    expect(opts.action.label).toBe("Reopen");
+  });
+});
+
+describe("Non-git project", () => {
+  it("explains the missing branch picker and creates in the folder itself", async () => {
+    setAppState("/path/to/project");
+    (checkIsGitRepo as Mock).mockResolvedValue(false);
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByText("Not a git repo · runs in the folder");
+    expect(within(dialog).queryByPlaceholderText("branch name")).toBeNull();
+
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Tidy the notes" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(applyPreset).toHaveBeenCalledWith(
+        "ws-new",
+        "builtin-claude",
+        "current_terminal",
+        "Tidy the notes",
+        null,
+      );
+    });
+    expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+    expect(generateBranchName).not.toHaveBeenCalled();
+  });
+});
+
+describe("Detected default branch routing", () => {
+  async function submitBranch(branch: string) {
+    setAppState("/path/to/project");
+    (getDefaultBranch as Mock).mockResolvedValue("trunk");
+    (getGitBranchInfo as Mock).mockResolvedValue({
+      branch: "feature-x",
+      ahead: 0,
+      behind: 0,
+    });
+    (listBranches as Mock).mockResolvedValue(["trunk", "master", "feature-x"]);
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(listBranches).toHaveBeenCalledTimes(4));
+    await within(dialog).findByText("trunk");
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: branch },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+  }
+
+  it("attaches the repo's detected default to the repo root", async () => {
+    await submitBranch("trunk");
+    await waitFor(() => {
+      expect(createWorkspace).toHaveBeenCalledWith("/path/to/project");
+    });
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+  });
+
+  it("cuts a worktree for master when it is not the default", async () => {
+    await submitBranch("master");
+    await waitFor(() => {
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
+        "/path/to/project",
+        "master",
+        false,
+        "single",
+        null,
+        null,
+        "builtin-claude",
+        null,
+        null,
+      );
+    });
+    expect(createWorkspace).not.toHaveBeenCalled();
   });
 });
