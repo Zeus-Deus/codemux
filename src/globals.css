@@ -582,7 +582,8 @@ body.pane-resizing iframe {
   color: var(--popover-foreground);
 }
 /* Undo window: an ember bar along the bottom edge drains over the toast's
- * lifetime and pauses while the stack is hovered, as Sonner's timer does.
+ * lifetime and pauses while the stack is hovered or the window is hidden, as
+ * Sonner's timer does.
  * A background layer rather than a pseudo-element: Sonner owns both. The
  * swipe-out guard leaves Sonner's own dismiss animation alone. */
 @media (prefers-reduced-motion: no-preference) {
@@ -593,9 +594,11 @@ body.pane-resizing iframe {
     background-size: 0% 2px;
     animation: cm-toast-undo-drain var(--toast-undo-duration, 10s) linear;
   }
-  /* Same selector as the drain rule plus [data-expanded]: the `animation`
-   * shorthand above resets play-state to running, so this must out-rank it. */
-  [data-sonner-toaster] .cn-toast-undo[data-sonner-toast][data-styled="true"][data-type="success"][data-expanded="true"]:not([data-swipe-out="true"]) {
+  /* The drain selector plus [data-expanded], or plus the hidden-window class:
+   * the `animation` shorthand above resets play-state to running, so each
+   * must out-rank it. */
+  [data-sonner-toaster] .cn-toast-undo[data-sonner-toast][data-styled="true"][data-type="success"][data-expanded="true"]:not([data-swipe-out="true"]),
+  [data-sonner-toaster].cm-toaster-hidden .cn-toast-undo[data-sonner-toast][data-styled="true"][data-type="success"]:not([data-swipe-out="true"]) {
     animation-play-state: paused;
   }
 }

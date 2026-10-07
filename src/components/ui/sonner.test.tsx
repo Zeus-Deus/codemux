@@ -43,25 +43,53 @@ describe("Toaster", () => {
     scheme.current = "dark";
     expect(await renderedTheme()).toBe("dark");
   });
+
+  // Sonner pauses its dismiss timer while the document is hidden; the class
+  // lets the undo bar pause with it.
+  it("marks the toaster while the window is hidden", async () => {
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    try {
+      await renderedTheme();
+      const list = () => document.querySelector("[data-sonner-toaster]");
+      expect(list()).not.toHaveClass("cm-toaster-hidden");
+      hidden.mockReturnValue(true);
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(list()).toHaveClass("cm-toaster-hidden");
+      hidden.mockReturnValue(false);
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(list()).not.toHaveClass("cm-toaster-hidden");
+    } finally {
+      hidden.mockRestore();
+    }
+  });
 });
 
 describe("undo bar CSS", () => {
   // The drain rule uses the `animation` shorthand, which resets
-  // animation-play-state to running. The pause rule only wins on hover if
-  // it carries every qualifier of the drain rule and more.
-  it("pauses with a selector that out-ranks the drain rule", () => {
+  // animation-play-state to running. Each pause selector only wins if it
+  // carries every qualifier of the drain rule and more.
+  it("pauses with selectors that out-rank the drain rule", () => {
     const css = readFileSync(resolve(process.cwd(), "src/globals.css"), "utf8").replace(
       /\/\*[\s\S]*?\*\//g,
       "",
     );
     const selectorBefore = (declaration: string) =>
       css.match(new RegExp(`([^{}]+)\\{[^{}]*${declaration}`))?.[1].trim() ?? "";
-    const tokens = (selector: string) => selector.match(/\[[^\]]+\]|\.[\w-]+/g) ?? [];
+    const tokens = (selector: string): string[] => selector.match(/\[[^\]]+\]|\.[\w-]+/g) ?? [];
     const drain = tokens(selectorBefore("animation: cm-toast-undo-drain"));
-    const pause = tokens(selectorBefore("animation-play-state: paused"));
+    const pauses = selectorBefore("animation-play-state: paused").split(",").map(tokens);
     expect(drain.length).toBeGreaterThan(0);
-    expect(pause).toEqual(expect.arrayContaining(drain));
-    expect(pause).toContain('[data-expanded="true"]');
-    expect(pause.length).toBeGreaterThan(drain.length);
+    for (const pause of pauses) {
+      expect(pause).toEqual(expect.arrayContaining(drain));
+      expect(pause.length).toBeGreaterThan(drain.length);
+    }
+    expect(pauses.map((pause) => pause.find((token) => !drain.includes(token)))).toEqual([
+      '[data-expanded="true"]',
+      ".cm-toaster-hidden",
+    ]);
   });
 });
