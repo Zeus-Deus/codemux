@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EditorView } from "@codemirror/view";
+import { undo } from "@codemirror/commands";
 
 // A one-file fake disk: `signature` moves with every write, like size+mtime.
 const disk = { content: "", version: 0 };
@@ -27,6 +28,7 @@ vi.mock("@/lib/editor-languages", async () => ({
 
 import { EditorPane } from "./EditorPane";
 import { useEditorStore } from "@/stores/editor-store";
+import { readFile } from "@/tauri/commands";
 
 // CodeMirror measures selection rectangles; jsdom has no layout for ranges.
 Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
@@ -47,8 +49,8 @@ async function checkDisk() {
   });
 }
 
-async function openEditor() {
-  const { container } = render(<EditorPane tabId={TAB} />);
+async function openEditor(embedded = false) {
+  const { container } = render(<EditorPane tabId={TAB} embedded={embedded} />);
   await waitFor(() => {
     const el = container.querySelector(".cm-editor");
     expect(el && EditorView.findFromDOM(el as HTMLElement)?.state.doc.toString()).toBe(
@@ -94,6 +96,66 @@ describe("EditorPane disk sync", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Reloaded from disk");
   });
 
+  it("keeps a silent reload out of the undo history", async () => {
+    const view = await openEditor();
+    agentWrites("const a = 1;\nconst b = 2;\n");
+    await checkDisk();
+    await waitFor(() => expect(view.state.doc.toString()).toBe("const a = 1;\nconst b = 2;\n"));
+
+    act(() => {
+      undo(view);
+    });
+
+    expect(view.state.doc.toString()).toBe("const a = 1;\nconst b = 2;\n");
+    expect(useEditorStore.getState().tabs[TAB].isDirty).toBe(false);
+  });
+
+  it("shows the reload and save notices in an embedded pane, whose header is hidden", async () => {
+    const view = await openEditor(true);
+    agentWrites("const a = 1;\nconst b = 2;\n");
+    await checkDisk();
+    expect(await screen.findByRole("status")).toHaveTextContent("Reloaded from disk");
+    expect(screen.getByRole("status").closest(".hidden")).toBeNull();
+
+    type(view, "// mine\n");
+    save(view);
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved"));
+    expect(screen.getByRole("status").closest(".hidden")).toBeNull();
+  });
+
+  it("ignores a disk check that read the file while a save was in flight", async () => {
+    const view = await openEditor();
+    type(view, "// mine\n");
+
+    // Hold the write open, start a check that reads the old file, then let
+    // the write land before the check's read resolves.
+    let finishWrite!: () => void;
+    writeFile.mockImplementationOnce(
+      (_path: string, content: string) =>
+        new Promise<void>((resolve) => {
+          finishWrite = () => {
+            disk.content = content;
+            disk.version++;
+            resolve();
+          };
+        }),
+    );
+    save(view);
+    await waitFor(() => expect(writeFile).toHaveBeenCalled());
+
+    let finishRead!: (content: string) => void;
+    vi.mocked(readFile).mockImplementationOnce(
+      () => new Promise<string>((resolve) => (finishRead = resolve)),
+    );
+    agentWrites(disk.content); // the truncate step of the write moves the stat
+    await checkDisk();
+    await act(async () => finishWrite());
+    await act(async () => finishRead("const a = 1;\n"));
+
+    expect(view.state.doc.toString()).toBe("const a = 1;\n// mine\n");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("asks before touching unsaved edits, and Reload takes the disk version", async () => {
     const view = await openEditor();
     type(view, "// mine\n");
@@ -101,7 +163,7 @@ describe("EditorPane disk sync", () => {
     agentWrites("// theirs\n");
     await checkDisk();
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("changed on disk");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
     expect(view.state.doc.toString()).toBe("const a = 1;\n// mine\n");
 
     fireEvent.click(screen.getByRole("button", { name: "Reload" }));
@@ -132,7 +194,36 @@ describe("EditorPane disk sync", () => {
 
     save(view);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("changed on disk");
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(disk.content).toBe("// theirs\n");
+  });
+
+  it("does not save over the disk version while the conflict bar is showing", async () => {
+    const view = await openEditor();
+    type(view, "// mine\n");
+    agentWrites("// theirs\n");
+    await checkDisk();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+
+    save(view);
+    await act(async () => {});
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(disk.content).toBe("// theirs\n");
+    expect(screen.getByRole("alert")).toHaveTextContent(/changed on disk/i);
+  });
+
+  it("a second Ctrl+S after a refused save still does not overwrite", async () => {
+    const view = await openEditor();
+    type(view, "// mine\n");
+    agentWrites("// theirs\n");
+
+    save(view);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed on disk/i);
+    save(view);
+    await act(async () => {});
+
     expect(writeFile).not.toHaveBeenCalled();
     expect(disk.content).toBe("// theirs\n");
   });

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, highlightSpecialChars } from "@codemirror/view";
-import { EditorState, Compartment } from "@codemirror/state";
+import { EditorState, Compartment, Transaction } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
@@ -60,7 +60,7 @@ const NOTICE_FADE_MS = 150;
 /** Swap the document for `next` by replacing only the span that differs, so
  *  the cursor, selection and scroll position outside an agent's edit stay
  *  where the user left them. */
-function replaceDocument(view: EditorView, next: string) {
+function replaceDocument(view: EditorView, next: string, addToHistory: boolean) {
   const prev = view.state.doc.toString();
   const max = Math.min(prev.length, next.length);
   let start = 0;
@@ -77,6 +77,7 @@ function replaceDocument(view: EditorView, next: string) {
   }
   view.dispatch({
     changes: { from: start, to: prevEnd, insert: next.slice(start, nextEnd) },
+    annotations: Transaction.addToHistory.of(addToHistory),
   });
 }
 
@@ -111,7 +112,14 @@ export function EditorPane({
   const [loadedFilePath, setLoadedFilePath] = useState<string | null>(null);
   /** Disk content that changed underneath unsaved edits, awaiting the
    *  user's Reload / Keep mine choice. */
-  const [diskConflict, setDiskConflict] = useState<string | null>(null);
+  const [diskConflict, setDiskConflictState] = useState<string | null>(null);
+  /** Mirrors `diskConflict` synchronously so a save fired in the same tick
+   *  as the conflict appearing still sees it. */
+  const diskConflictRef = useRef<string | null>(null);
+  const setDiskConflict = useCallback((disk: string | null) => {
+    diskConflictRef.current = disk;
+    setDiskConflictState(disk);
+  }, []);
   const [notice, setNotice] = useState<"saved" | "reloaded" | null>(null);
   const [noticeFading, setNoticeFading] = useState(false);
   /** Signature of the disk version the buffer was last reconciled with.
@@ -172,14 +180,17 @@ export function EditorPane({
     [],
   );
 
-  /** Replace the buffer with `disk` and make it the new clean baseline. */
+  /** Replace the buffer with `disk` and make it the new clean baseline.
+   *  `undoable` keeps the replaced text one Ctrl+Z away, so Reload can be
+   *  taken back; a silent reload stays out of the history so Ctrl+Z cannot
+   *  quietly revert the outside edit. */
   const adoptDiskContent = useCallback(
-    (disk: string) => {
+    (disk: string, undoable: boolean) => {
       const view = viewRef.current;
       if (view && view.state.doc.toString() !== disk) {
         isLoadingRef.current = true;
         try {
-          replaceDocument(view, disk);
+          replaceDocument(view, disk, undoable);
         } finally {
           isLoadingRef.current = false;
         }
@@ -188,7 +199,7 @@ export function EditorPane({
       setContent(disk);
       setDiskConflict(null);
     },
-    [tabId, setBaselineContent],
+    [tabId, setBaselineContent, setDiskConflict],
   );
 
   /** Reconcile the buffer with a disk version that differs from what it was
@@ -214,10 +225,10 @@ export function EditorPane({
         setDiskConflict(disk);
         return;
       }
-      adoptDiskContent(disk);
+      adoptDiskContent(disk, false);
       flashNotice("reloaded");
     },
-    [tabId, setBaselineContent, adoptDiskContent, flashNotice],
+    [tabId, setBaselineContent, setDiskConflict, adoptDiskContent, flashNotice],
   );
 
   const checkDisk = useCallback(async () => {
@@ -249,6 +260,10 @@ export function EditorPane({
     const path = useEditorStore.getState().getTab(tabId)?.filePath;
     if (!view || !path) return;
 
+    // A pending conflict means disk holds a version the user has not
+    // chosen to replace yet; Reload or Keep mine decides, not Ctrl+S.
+    if (diskConflictRef.current != null) return;
+
     const c = view.state.doc.toString();
     try {
       // Refuse to silently overwrite a version written since this buffer
@@ -256,6 +271,7 @@ export function EditorPane({
       const signature = await fileSignature(path).catch(() => null);
       if (signature !== null && signature !== diskSignatureRef.current) {
         const disk = await readFile(path);
+        if (useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
         diskSignatureRef.current = signature;
         const baseline = useEditorStore.getState().getTab(tabId)?.baselineContent;
         if (disk !== baseline && disk !== c) {
@@ -265,6 +281,12 @@ export function EditorPane({
       }
       diskEpochRef.current++;
       await writeFile(path, c);
+      // Again after the write: a check that started while it was in flight
+      // may have read the old (or half-written) file.
+      diskEpochRef.current++;
+      // The tab moved to another file while the write was in flight; that
+      // file's load owns the baseline now.
+      if (useEditorStore.getState().getTab(tabId)?.filePath !== path) return;
       // Unknown until the next check re-reads it, which also confirms the
       // write landed as this buffer.
       diskSignatureRef.current = null;
@@ -277,11 +299,11 @@ export function EditorPane({
         description: String(err),
       });
     }
-  }, [tabId, setBaselineContent, flashNotice]);
+  }, [tabId, setBaselineContent, setDiskConflict, flashNotice]);
 
   const reloadFromDisk = useCallback(() => {
     if (diskConflict == null) return;
-    adoptDiskContent(diskConflict);
+    adoptDiskContent(diskConflict, true);
     flashNotice("reloaded");
   }, [diskConflict, adoptDiskContent, flashNotice]);
 
@@ -293,7 +315,7 @@ export function EditorPane({
     setBaselineContent(tabId, diskConflict);
     setDirty(tabId, view != null && view.state.doc.toString() !== diskConflict);
     setDiskConflict(null);
-  }, [diskConflict, tabId, setBaselineContent, setDirty]);
+  }, [diskConflict, tabId, setBaselineContent, setDirty, setDiskConflict]);
 
   // Stable ref for save so keymap always calls the latest version
   const handleSaveRef = useRef(handleSave);
@@ -413,8 +435,10 @@ export function EditorPane({
 
     readPromise
       .then((c) => {
+        // Out of the undo history: Ctrl+Z must not empty a freshly opened file.
         view.dispatch({
           changes: { from: 0, to: view.state.doc.length, insert: c },
+          annotations: Transaction.addToHistory.of(false),
         });
         setBaselineContent(tabId, c);
         setContent(c);
@@ -440,7 +464,7 @@ export function EditorPane({
         });
       }
     });
-  }, [filePath, tabId, setBaselineContent]);
+  }, [filePath, tabId, setBaselineContent, setDiskConflict]);
 
   // Watch the open text file for edits made outside the editor. Polling a
   // stat matches how the diff and changes panels refresh; checks also run
@@ -552,8 +576,28 @@ export function EditorPane({
   // Content to render: if dirty use live editor content, otherwise baseline
   const renderedContent = isDirty ? content : baselineContent;
 
+  // Sits in the header; an embedded pane hides that header, so there the
+  // chip floats over the top-right corner of the content instead.
+  const noticeChip = notice != null && !isDirty && (
+    <span
+      role="status"
+      className={cn(
+        "flex shrink-0 items-center gap-1 text-caption text-muted-foreground",
+        "transition-opacity duration-150 motion-reduce:transition-none",
+        embedded
+          ? "pointer-events-none absolute right-3 top-1.5 z-10 rounded-sm border border-hairline bg-popover px-1.5 py-0.5 shadow-sm"
+          : "ml-1",
+        noticeFading && "opacity-0",
+      )}
+    >
+      {notice === "saved" && <Check className="size-3" />}
+      {notice === "saved" ? "Saved" : "Reloaded from disk"}
+    </span>
+  );
+
   return (
-    <div className="flex h-full w-full flex-col">
+    <div className="relative flex h-full w-full flex-col">
+      {embedded && noticeChip}
       {/* Toolbar — suppressed in the deck, whose shared pane bar owns
           the path crumb and the source/wrap/copy controls. */}
       <PanelHeader className={cn(embedded && "hidden", "gap-1 bg-card px-2")}>
@@ -563,19 +607,7 @@ export function EditorPane({
         {isDirty && viewMode === "raw" && (
           <span className="size-1.5 rounded-full bg-foreground/50 shrink-0 ml-1" title="Unsaved changes" />
         )}
-        {notice != null && !isDirty && (
-          <span
-            role="status"
-            className={cn(
-              "ml-1 flex shrink-0 items-center gap-1 text-caption text-muted-foreground",
-              "transition-opacity duration-150 motion-reduce:transition-none",
-              noticeFading && "opacity-0",
-            )}
-          >
-            {notice === "saved" && <Check className="size-3" />}
-            {notice === "saved" ? "Saved" : "Reloaded from disk"}
-          </span>
-        )}
+        {!embedded && noticeChip}
         <div className="flex-1" />
 
         {/* View mode toggle — markdown files only */}
@@ -608,15 +640,18 @@ export function EditorPane({
           role="alert"
           className="flex shrink-0 items-center gap-2 border-b border-hairline bg-surface-1 px-2 py-1"
         >
-          <span className="min-w-0 flex-1 truncate text-label text-foreground">
-            This file changed on disk while you had unsaved edits.
+          {/* Wraps rather than truncates: a narrow deck must still say why
+              the buttons are there. */}
+          <span className="min-w-0 flex-1 text-label text-foreground">
+            Changed on disk. Your edits are unsaved.
           </span>
-          <Button size="xs" variant="outline" onClick={reloadFromDisk}>
+          <Button size="xs" variant="outline" className="shrink-0" onClick={reloadFromDisk}>
             Reload
           </Button>
           <Button
             size="xs"
             variant="ghost"
+            className="shrink-0"
             onClick={keepMine}
             title="Keep your edits. Saving will replace the version on disk."
           >
