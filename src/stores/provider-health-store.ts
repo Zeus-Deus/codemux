@@ -39,6 +39,18 @@ const HEALTH_TTL_MS = 5 * 60 * 1000;
  *  poll can usefully do. */
 export const HEALTH_REPROBE_MS = HEALTH_TTL_MS;
 
+/** Floor between focus-triggered re-checks, so alt-tabbing through the
+ *  app does not spawn a CLI probe on every switch. */
+const FOCUS_REPROBE_MIN_MS = 10_000;
+
+/** A report that means a session cannot start at all: the CLI is missing,
+ *  or it is installed and signed out. Inconclusive and partial failures do
+ *  not qualify; the session gets a chance to explain itself. */
+export function healthBlocksSend(report: ProviderHealthReport | null): boolean {
+  if (!report || report.status !== "error") return false;
+  return !report.installed || !!report.login_command;
+}
+
 interface ProviderHealthSlot {
   report: ProviderHealthReport | null;
   fetchedAt: number;
@@ -71,6 +83,13 @@ interface ProviderHealthStore {
   /** Scheduled recovery poll: re-probe only an already-unhealthy
    *  provider. No-op while healthy. */
   reprobeUnhealthy: (provider: AgentChatProviderKind) => Promise<void>;
+  /** Pre-send gate: resolves to the report that rules out a session, or
+   *  `null` when sending may proceed. A cached failure is re-probed so a
+   *  sign-in done elsewhere is never blocked by a stale answer. A
+   *  blocking report un-dismisses the banner, which carries its fix. */
+  ensureReady: (
+    provider: AgentChatProviderKind,
+  ) => Promise<ProviderHealthReport | null>;
   dismiss: (provider: AgentChatProviderKind) => void;
 }
 
@@ -226,6 +245,19 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     if (slot.inFlight) return slot.inFlight;
     await get().refresh(provider, { force: true });
   },
+  ensureReady: async (provider) => {
+    const cached = get().slots[provider].report;
+    await get().refresh(provider, { force: healthBlocksSend(cached) });
+    const report = get().slots[provider].report;
+    if (!report || !healthBlocksSend(report)) return null;
+    set((state) => ({
+      slots: {
+        ...state.slots,
+        [provider]: { ...state.slots[provider], dismissedKey: null },
+      },
+    }));
+    return report;
+  },
   dismiss: (provider) => {
     set((state) => {
       const slot = state.slots[provider];
@@ -252,13 +284,17 @@ export function selectVisibleHealthReport(
   return slot.report;
 }
 
-/** Poll an already-known unhealthy provider for recovery on the TTL cadence.
+/** Poll an already-known unhealthy provider for recovery on the TTL
+ *  cadence, and again on mount and whenever the window regains focus.
  *
  *  The poll is what closes the "fixed it, banner still up" gap: nothing
  *  in the app observes a `claude login` run in some other terminal, so
  *  without it a banner could outlive its cause until the next failed
- *  send. There is deliberately no eager `refresh` here: merely restoring a
- *  persisted chat pane is not provider intent and must never spawn a CLI. */
+ *  send. Focus covers the common sign-in path, which finishes in a
+ *  browser and then returns to Codemux; mount covers coming back to the
+ *  chat from the sign-in terminal tab. A provider with no known failure
+ *  is never probed here: merely restoring a persisted chat pane is not
+ *  provider intent and must never spawn a CLI. */
 export function useProviderHealthRecoveryPoll(
   provider: AgentChatProviderKind | null | undefined,
 ): void {
@@ -268,6 +304,16 @@ export function useProviderHealthRecoveryPoll(
     const timer = setInterval(() => {
       void reprobeUnhealthy(provider);
     }, HEALTH_REPROBE_MS);
-    return () => clearInterval(timer);
+    const onFocus = () => {
+      const { fetchedAt } = useProviderHealth.getState().slots[provider];
+      if (Date.now() - fetchedAt < FOCUS_REPROBE_MIN_MS) return;
+      void reprobeUnhealthy(provider);
+    };
+    onFocus();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [provider, reprobeUnhealthy]);
 }

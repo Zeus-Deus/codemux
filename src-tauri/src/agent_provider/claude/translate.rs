@@ -870,13 +870,18 @@ fn translate_assistant(
             subagent: snapshot,
         });
     }
-    if let Some(err) = msg.get("error").and_then(|v| v.as_str()) {
+    let error = msg.get("error").and_then(|v| v.as_str());
+    if let Some(err) = error {
         out.push(ProviderRuntimeEvent::RuntimeWarning {
             thread_id: Some(thread_id.clone()),
             message: format!("assistant error: {err}"),
             original_payload: Some(msg.clone()),
         });
     }
+    // On a signed-out CLI the message text is the CLI's own "Please run
+    // /login" hint, which names a command the chat cannot run. The warning
+    // above already becomes a sign-in notice with a working action.
+    let suppress_text = error == Some("authentication_failed");
     let content = msg
         .get("message")
         .and_then(|m| m.get("content"))
@@ -887,6 +892,7 @@ fn translate_assistant(
                 continue;
             };
             match bty {
+                "text" if suppress_text => {}
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                         out.push(ProviderRuntimeEvent::ItemCompleted {
@@ -2297,6 +2303,25 @@ mod tests {
             e,
             ProviderRuntimeEvent::ItemCompleted { .. }
         )));
+    }
+
+    #[test]
+    fn signed_out_error_drops_the_cli_login_hint_text() {
+        let msg = json!({
+            "type": "assistant",
+            "error": "authentication_failed",
+            "turn_id": "t",
+            "message": {"content": [{"type": "text", "text": "Not logged in · Please run /login"}]}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderRuntimeEvent::RuntimeWarning { message, .. }
+                if message == "assistant error: authentication_failed"
+        )));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })));
     }
 
     #[test]

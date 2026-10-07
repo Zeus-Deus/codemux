@@ -1,4 +1,7 @@
-import { TriangleAlert, X } from "lucide-react";
+import { useState } from "react";
+import { RotateCw, TriangleAlert, X } from "lucide-react";
+
+import { signInToProvider } from "@/lib/agent-chat/provider-sign-in";
 
 import {
   selectVisibleHealthReport,
@@ -17,6 +20,9 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   opencode: "OpenCode",
 };
 
+const ACTION_CLASS =
+  "shrink-0 rounded-sm px-1.5 py-0.5 text-label font-medium transition-colors duration-100 hover:bg-surface-2 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
+
 /**
  * Probe-backed provider status banner for chat surfaces.
  *
@@ -31,22 +37,32 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
  * Dismissal is per failure identity: closing the banner hides THIS
  * status+message; a different failure — or the same one after a
  * recovery — banners again.
+ *
+ * A signed-out CLI gets a Sign in action that opens its login command in a
+ * terminal tab of `workspaceId` (the home workspace when null), and every
+ * failure gets Re-check, so fixing the cause never means waiting out a poll.
  */
 export function ProviderStatusNotice({
   provider,
+  workspaceId = null,
 }: {
   provider: AgentChatProviderKind;
+  workspaceId?: string | null;
 }) {
   useProviderHealthRecoveryPoll(provider);
   const report = useProviderHealth((s) =>
     selectVisibleHealthReport(s, provider),
   );
   const dismiss = useProviderHealth((s) => s.dismiss);
+  const refresh = useProviderHealth((s) => s.refresh);
+  const checking = useProviderHealth((s) => !!s.slots[provider].inFlight);
+  const [signingIn, setSigningIn] = useState(false);
   // Hermes health is profile-scoped and displayed by its picker. A provider-wide
   // setup banner remains stale after selecting a healthy profile.
   if (!report || provider === "hermes") return null;
   const label = PROVIDER_LABEL[report.provider];
   const isError = report.status === "error";
+  const loginCommand = report.login_command;
   return (
     // Floating overlay pinned near the pane top (below the floating
     // titlebar band in GUI chrome) so surfacing/dismissing the banner
@@ -90,6 +106,34 @@ export function ProviderStatusNotice({
               {report.message ?? `${label} is unavailable.`}
             </span>
           </div>
+          {loginCommand && (
+            <button
+              type="button"
+              disabled={signingIn}
+              onClick={() => {
+                setSigningIn(true);
+                void signInToProvider(provider, loginCommand, workspaceId).finally(
+                  () => setSigningIn(false),
+                );
+              }}
+              className={ACTION_CLASS}
+            >
+              Sign in
+            </button>
+          )}
+          <button
+            type="button"
+            aria-label={`Re-check ${label}`}
+            title="Re-check"
+            disabled={checking}
+            onClick={() => void refresh(provider, { force: true })}
+            className={cn(ACTION_CLASS, "p-0.5")}
+          >
+            <RotateCw
+              className={cn("size-3.5", checking && "motion-safe:animate-spin")}
+              aria-hidden
+            />
+          </button>
           <button
             type="button"
             aria-label={`Dismiss ${label} provider status`}

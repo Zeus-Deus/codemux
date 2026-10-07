@@ -2663,6 +2663,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::set_preset_bar_visible,
             commands::reorder_presets,
             commands::apply_preset,
+            commands::open_provider_login_terminal,
             commands::get_workspace_config,
             commands::has_codemuxinclude,
             commands::run_workspace_setup,

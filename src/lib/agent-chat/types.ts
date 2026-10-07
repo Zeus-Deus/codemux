@@ -381,6 +381,10 @@ export interface RuntimeNoticeItem {
    *  (absent / `"warning"`, amber) covers advisories the run may
    *  recover from (rate-limit rejection, resume fallback). */
   severity?: "warning" | "error";
+  /** Set when the run failed because this provider's CLI is signed out.
+   *  The row then renders as a card with a Sign in action rather than as
+   *  a bare line. */
+  signIn?: AgentChatProviderKind;
 }
 
 /**

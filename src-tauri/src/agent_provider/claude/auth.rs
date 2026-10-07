@@ -29,6 +29,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 pub struct ProbeInstalledResult {
     pub installed: bool,
     pub version: Option<String>,
+    /// The CLI exists but did not answer `--version` cleanly.
+    pub unresponsive: bool,
 }
 
 /// Coarse authentication status.
@@ -69,6 +71,7 @@ pub async fn probe_installed(
     Ok(ProbeInstalledResult {
         installed: parsed.installed,
         version: parsed.version,
+        unresponsive: parsed.unresponsive,
     })
 }
 
