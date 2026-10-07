@@ -274,6 +274,32 @@ describe("BrowserPeekOverlay", () => {
     expect(dialog.style.getPropertyValue("--peek-h")).toBe("320px");
   });
 
+  it("shrinks to the 60% cap when the window gets smaller", () => {
+    const original = { width: window.innerWidth, height: window.innerHeight };
+    const setWindow = (width: number, height: number) => {
+      Object.defineProperty(window, "innerWidth", { value: width, configurable: true });
+      Object.defineProperty(window, "innerHeight", { value: height, configurable: true });
+    };
+    try {
+      setWindow(1400, 1000);
+      useBrowserPeekStore.setState({ size: { width: 600, height: 400 } });
+      setAppState([makeSession()]);
+      useBrowserPeekStore.getState().open("ws-1");
+      renderOverlay();
+      const dialog = screen.getByRole("dialog");
+      expect(dialog.style.getPropertyValue("--peek-w")).toBe("600px");
+
+      act(() => {
+        setWindow(800, 600);
+        window.dispatchEvent(new Event("resize"));
+      });
+      expect(dialog.style.getPropertyValue("--peek-w")).toBe("480px");
+      expect(dialog.style.getPropertyValue("--peek-h")).toBe("360px");
+    } finally {
+      setWindow(original.width, original.height);
+    }
+  });
+
   it("says so when promoting to the side panel fails, and stays open", async () => {
     mocks.dockBrowserInRightPanel.mockRejectedValueOnce("dock failed");
     setAppState([makeSession()]);

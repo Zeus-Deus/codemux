@@ -34,6 +34,7 @@ import {
   type BrowserViewportPresetId,
 } from "./browser-nav";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 interface Props {
   browserId: string;
@@ -79,9 +80,13 @@ export function BrowserToolbar({
   const [urlInput, setUrlInput] = useState(currentUrl);
   const [navigating, setNavigating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Bumped by Stop and by each new navigation so a stale `open` that
-  // resolves late cannot clear a newer spinner or overwrite the URL.
+  // Bumped by each new navigation so a stale `open` that resolves late
+  // cannot clear a newer spinner or overwrite the URL.
   const navTokenRef = useRef(0);
+  // The navigation Stop was pressed on. Agent-browser may run commands
+  // one at a time, so `window.stop()` can land after `open` finished: the
+  // page still arrives then, and the address has to follow it.
+  const stoppedTokenRef = useRef(-1);
   const errorId = useId();
   const portsListId = useId();
 
@@ -112,7 +117,8 @@ export function BrowserToolbar({
       onUrlChange(normalized);
       setUrlInput(normalized);
     } catch (err) {
-      if (token !== navTokenRef.current) return;
+      // An abort after Stop is what the user asked for, not a failure.
+      if (token !== navTokenRef.current || token === stoppedTokenRef.current) return;
       setError(`Couldn't open ${normalized}: ${String(err)}`);
     } finally {
       if (token === navTokenRef.current) setNavigating(false);
@@ -120,7 +126,7 @@ export function BrowserToolbar({
   };
 
   const stop = () => {
-    navTokenRef.current++;
+    stoppedTokenRef.current = navTokenRef.current;
     setNavigating(false);
     agentBrowserRun(cmdId, "eval", { script: "window.stop()" }).catch(() => {});
   };
@@ -137,6 +143,11 @@ export function BrowserToolbar({
       toast.error("Couldn't open the page", { description: String(err) });
     });
   };
+
+  // A remote viewer's system browser runs on another machine, where a
+  // localhost URL points somewhere else entirely.
+  const canOpenInSystemBrowser = !isRemoteClient();
+  const showOverflow = canOpenInSystemBrowser || !!onViewportPresetChange;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
@@ -225,46 +236,50 @@ export function BrowserToolbar({
             ))}
           </datalist>
         )}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon-xs" aria-label="More browser actions">
-              <Ellipsis className="size-3" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-56">
-            <DropdownMenuItem
-              disabled={!canOpenExternally(currentUrl)}
-              onSelect={openInSystemBrowser}
-            >
-              <ExternalLink className="size-3.5" />
-              Open in system browser
-            </DropdownMenuItem>
-            {onViewportPresetChange && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel>Viewport</DropdownMenuLabel>
-                <DropdownMenuRadioGroup
-                  value={viewportPreset}
-                  onValueChange={(value) => {
-                    const preset = BROWSER_VIEWPORT_PRESETS.find((p) => p.id === value);
-                    if (preset) onViewportPresetChange(preset.id);
-                  }}
+        {showOverflow && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon-xs" aria-label="More browser actions">
+                <Ellipsis className="size-3" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-56">
+              {canOpenInSystemBrowser && (
+                <DropdownMenuItem
+                  disabled={!canOpenExternally(currentUrl)}
+                  onSelect={openInSystemBrowser}
                 >
-                  {BROWSER_VIEWPORT_PRESETS.map((preset) => (
-                    <DropdownMenuRadioItem key={preset.id} value={preset.id}>
-                      <span className="flex-1">{preset.label}</span>
-                      {preset.size && (
-                        <span className="text-label tabular-nums text-muted-foreground">
-                          {preset.size.width}×{preset.size.height}
-                        </span>
-                      )}
-                    </DropdownMenuRadioItem>
-                  ))}
-                </DropdownMenuRadioGroup>
-              </>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
+                  <ExternalLink className="size-3.5" />
+                  Open in system browser
+                </DropdownMenuItem>
+              )}
+              {onViewportPresetChange && (
+                <>
+                  {canOpenInSystemBrowser && <DropdownMenuSeparator />}
+                  <DropdownMenuLabel>Viewport</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup
+                    value={viewportPreset}
+                    onValueChange={(value) => {
+                      const preset = BROWSER_VIEWPORT_PRESETS.find((p) => p.id === value);
+                      if (preset) onViewportPresetChange(preset.id);
+                    }}
+                  >
+                    {BROWSER_VIEWPORT_PRESETS.map((preset) => (
+                      <DropdownMenuRadioItem key={preset.id} value={preset.id}>
+                        <span className="flex-1">{preset.label}</span>
+                        {preset.size && (
+                          <span className="text-label tabular-nums text-muted-foreground">
+                            {preset.size.width}×{preset.size.height}
+                          </span>
+                        )}
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
       </PanelHeader>
       {error && (
         <p

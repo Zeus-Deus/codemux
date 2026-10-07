@@ -39,8 +39,8 @@ import { PanelHeader } from "@/components/ui/panel-header";
  *  peek and the agent's screenshots stay consistent. */
 const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
 
-/** Matches the `duration-150` exit animation below. */
-const EXIT_MS = 150;
+/** Matches the `duration-250` (overlay) exit animation below. */
+const EXIT_MS = 250;
 
 const STATUS_DOT: Record<BrowserStreamStatus, { className: string; label: string }> = {
   live: { className: "bg-status-open", label: "Live" },
@@ -103,6 +103,8 @@ export function BrowserPeekOverlay() {
   const setStoredSize = useBrowserPeekStore((s) => s.setSize);
   // Live size while a resize drag is in progress; committed on release.
   const [dragSize, setDragSize] = useState<PeekSize | null>(null);
+  // The 60%-of-window cap has to follow the window, not just re-renders.
+  const [winSize, setWinSize] = useState<PeekSize>(windowSize);
 
   const open = guiChrome && isOpen && !!session && !!activeWorkspaceId;
 
@@ -139,6 +141,14 @@ export function BrowserPeekOverlay() {
     }
   }, [activeWorkspaceId]);
 
+  useEffect(() => {
+    if (!open) return;
+    const onResize = () => setWinSize(windowSize());
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [open]);
+
   // Escape closes.
   useEffect(() => {
     if (!open || !activeWorkspaceId) return;
@@ -169,7 +179,7 @@ export function BrowserPeekOverlay() {
   if (!shown) return null;
   const closing = !open;
   const workspaceId = shown.workspaceId;
-  const size = clampPeekSize(dragSize ?? storedSize, windowSize());
+  const size = clampPeekSize(dragSize ?? storedSize, winSize);
   const dot = STATUS_DOT[streamStatus];
 
   // Anchored top-right, so the handle sits bottom-left and the peek
@@ -244,7 +254,7 @@ export function BrowserPeekOverlay() {
       className={cn(
         "absolute right-3.5 top-3.5 z-30 flex h-(--peek-h) w-(--peek-w) flex-col overflow-hidden",
         "rounded-lg border border-border bg-popover shadow-2xl",
-        "animate-in fade-in slide-in-from-top-1 duration-150 ease-out motion-reduce:animate-none",
+        "animate-in fade-in slide-in-from-top-1 duration-250 ease-out motion-reduce:animate-none",
         "data-[state=closed]:pointer-events-none data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:slide-out-to-top-1 data-[state=closed]:fill-mode-forwards",
       )}
     >

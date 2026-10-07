@@ -118,6 +118,14 @@ const CURSOR_PROBE_INTERVAL_MS = 120;
 // legitimately produce no frames, so quiet alone never reconnects.
 const QUIET_BEFORE_PROBE_MS = 15000;
 
+// Slow cadence for retrying a dead stream or a failed daemon start.
+const SLOW_RETRY_MS = 10000;
+
+// A failed `startBrowserStream` may spawn a daemon each time, unlike a
+// cheap WebSocket reconnect, so only a few starts retry on their own.
+// After that the pane waits for "Retry now".
+export const MAX_AUTO_START_RETRIES = 3;
+
 interface PendingMove {
   x: number;
   y: number;
@@ -150,6 +158,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const [retryNonce, setRetryNonce] = useState(0);
   // When the slow reconnect loop will try next; null while not waiting.
   const [retryAt, setRetryAt] = useState<number | null>(null);
+  // Consecutive failed daemon starts; reset by a successful start or by
+  // "Retry now".
+  const startFailuresRef = useRef(0);
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
   useEffect(() => {
@@ -314,7 +325,6 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     let ws: WebSocket | null = null;
     let active = true;
     let slowRetryTimer: ReturnType<typeof setTimeout> | null = null;
-    const slowRetryMs = 10000;
 
     (async () => {
       setStatus("starting");
@@ -338,11 +348,15 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         setErrorMsg(`Failed to start browser: ${err}`);
         // Same slow cadence as the reconnect loop: the daemon may come
         // back on its own, and the user can always retry sooner.
-        setRetryAt(Date.now() + slowRetryMs);
-        slowRetryTimer = setTimeout(() => setRetryNonce((n) => n + 1), slowRetryMs);
+        startFailuresRef.current++;
+        if (startFailuresRef.current <= MAX_AUTO_START_RETRIES) {
+          setRetryAt(Date.now() + SLOW_RETRY_MS);
+          slowRetryTimer = setTimeout(() => setRetryNonce((n) => n + 1), SLOW_RETRY_MS);
+        }
         return;
       }
 
+      startFailuresRef.current = 0;
       if (!active) return;
 
       // The daemon serves HTTP on the same port as the stream WS —
@@ -531,8 +545,8 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           } else {
             setStatus("error");
             setErrorMsg("Stream disconnected");
-            setRetryAt(Date.now() + slowRetryMs);
-            slowRetryTimer = setTimeout(connectWS, slowRetryMs);
+            setRetryAt(Date.now() + SLOW_RETRY_MS);
+            slowRetryTimer = setTimeout(connectWS, SLOW_RETRY_MS);
           }
         };
       }
@@ -581,7 +595,10 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     // reconnects against the fresh URL — the bug the old deps array missed.
   }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl, retryNonce]);
 
-  const retryNow = () => setRetryNonce((n) => n + 1);
+  const retryNow = () => {
+    startFailuresRef.current = 0;
+    setRetryNonce((n) => n + 1);
+  };
 
   const copyErrorDetails = () => {
     const details = [
@@ -961,6 +978,11 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const handleKeyUp = (e: React.KeyboardEvent) => {
     if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
     e.preventDefault();
+    // handleKeyDown kept these from the page, so the page must not see a
+    // release it never got a press for. Ctrl+L without a toolbar (the
+    // peek) was forwarded, so its release is too.
+    const shortcut = browserChromeShortcut(e);
+    if (shortcut && (shortcut !== "address" || urlInputRef.current)) return;
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "v") {
       // Paste is handled via the clipboard bridge — swallow the keyUp
       // so the page doesn't see an unmatched Ctrl+V release.

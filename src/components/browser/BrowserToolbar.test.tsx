@@ -87,6 +87,55 @@ describe("BrowserToolbar", () => {
     expect(onUrlChange).not.toHaveBeenCalled();
   });
 
+  it("follows the page when the open lands after Stop", async () => {
+    let finishOpen: (v: unknown) => void = () => {};
+    mocks.agentBrowserRun.mockImplementation((_id: string, action: string) =>
+      action === "open" ? new Promise((resolve) => (finishOpen = resolve)) : Promise.resolve(null),
+    );
+    const { input, onUrlChange } = renderToolbar();
+    await userEvent.clear(input);
+    await userEvent.type(input, "example.com{Enter}");
+    await userEvent.click(await screen.findByRole("button", { name: "Stop" }));
+
+    // The daemon ran the open to completion before window.stop().
+    finishOpen(null);
+    await vi.waitFor(() => expect(onUrlChange).toHaveBeenCalledWith("https://example.com"));
+    expect(input).toHaveValue("https://example.com");
+  });
+
+  it("does not report an open aborted by Stop as a failure", async () => {
+    let failOpen: (e: unknown) => void = () => {};
+    mocks.agentBrowserRun.mockImplementation((_id: string, action: string) =>
+      action === "open" ? new Promise((_r, reject) => (failOpen = reject)) : Promise.resolve(null),
+    );
+    const { input } = renderToolbar();
+    await userEvent.clear(input);
+    await userEvent.type(input, "example.com{Enter}");
+    await userEvent.click(await screen.findByRole("button", { name: "Stop" }));
+
+    failOpen("net::ERR_ABORTED");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("offers Open in system browser on the desktop only", async () => {
+    renderToolbar({ currentUrl: "http://localhost:5173" });
+    await userEvent.click(screen.getByRole("button", { name: "More browser actions" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Open in system browser" }));
+    expect(mocks.openUrl).toHaveBeenCalledWith("http://localhost:5173");
+    cleanup();
+
+    // On a remote viewer, localhost is the viewer's machine, not the
+    // desktop's, and there is no viewport to set either: no overflow.
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    try {
+      renderToolbar({ currentUrl: "http://localhost:5173" });
+      expect(screen.queryByRole("button", { name: "More browser actions" })).toBeNull();
+    } finally {
+      delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+    }
+  });
+
   it("does not offer a reload while the stream is still connecting", () => {
     renderToolbar({ loading: true });
     expect(screen.getByRole("button", { name: "Connecting" })).toBeDisabled();
