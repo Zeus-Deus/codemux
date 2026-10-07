@@ -107,6 +107,10 @@ function useOverflowEdges(scroller: HTMLElement | null, contentKey: string) {
     const observer =
       typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
     observer?.observe(scroller);
+    // Once the island hits its width cap the scroller's own box stops
+    // changing, so a pill growing or shrinking (a rename, the active chat
+    // tab gaining its chevron) is only seen through the pills themselves.
+    for (const pill of Array.from(scroller.children)) observer?.observe(pill);
     return () => {
       scroller.removeEventListener("scroll", update);
       observer?.disconnect();

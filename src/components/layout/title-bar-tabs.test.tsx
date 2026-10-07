@@ -487,6 +487,41 @@ describe("TitleBarTabs overflow", () => {
     }
   });
 
+  // At the island's width cap the scroller's box stops changing, so a pill
+  // that widens (rename, chat chevron) must be observed on its own or the
+  // end fade goes stale.
+  it("re-measures the edge fade when a tab pill changes width", () => {
+    const observed: Element[] = [];
+    const callbacks: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe(el: Element) {
+        observed.push(el);
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+      const scroller = screen.getByTestId("titlebar-tabs-scroll");
+      const pill = scroller.querySelector("[data-tab-id='tab-c']");
+      expect(observed).toContain(pill);
+
+      Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+      Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+      expect(scroller).not.toHaveAttribute("data-overflow-end");
+      act(() => {
+        for (const cb of callbacks) cb([], {} as ResizeObserver);
+      });
+      expect(scroller).toHaveAttribute("data-overflow-end");
+    } finally {
+      globalThis.ResizeObserver = Original;
+    }
+  });
+
   it("keeps a revealed tab clear of the edge fade", () => {
     render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
     expect(screen.getByTestId("titlebar-tabs-scroll")).toHaveClass("scroll-px-4");
