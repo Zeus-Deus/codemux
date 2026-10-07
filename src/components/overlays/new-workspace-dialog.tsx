@@ -34,7 +34,7 @@ import {
   X,
   CircleDot,
 } from "lucide-react";
-import { toast } from "@/lib/toast";
+import { toast, errorMessage } from "@/lib/toast";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -1038,8 +1038,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       removePendingWorkspace(tempId);
       await activateWorkspace(wsId);
     } catch (err) {
-      toast.error(String(err));
-      failPendingWorkspace(tempId, String(err));
+      toast.failure("Couldn't create the workspace", err);
+      failPendingWorkspace(tempId, errorMessage(err));
       // Auto-remove failed entry after 5 seconds
       setTimeout(() => removePendingWorkspace(tempId), 5000);
     }

@@ -41,6 +41,7 @@ vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  reportFailure: () => vi.fn(),
 }));
 
 vi.mock("@/stores/ui-store", () => ({

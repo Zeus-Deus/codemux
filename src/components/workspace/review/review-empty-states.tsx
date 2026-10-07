@@ -175,7 +175,7 @@ export function CliMissingState({ provider }: { provider: ProviderPresentation }
               const url = /^https?:\/\//.test(provider.installUrl!)
                 ? provider.installUrl!
                 : `https://${provider.installUrl}`;
-              openUrl(url).catch((err) => toast.error(String(err)));
+              openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
             }}
           >
             Install {provider.cli}
@@ -256,7 +256,7 @@ export function UnsupportedHostState({
             type="button"
             className={btnCard}
             onClick={() => {
-              openUrl(url).catch((err) => toast.error(String(err)));
+              openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
             }}
           >
             Open in browser

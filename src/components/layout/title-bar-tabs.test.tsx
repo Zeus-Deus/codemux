@@ -38,6 +38,7 @@ vi.mock("@/tauri/commands", () => ({
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  reportFailure: () => vi.fn(),
 }));
 
 import { TitleBarTabs } from "./title-bar-tabs";

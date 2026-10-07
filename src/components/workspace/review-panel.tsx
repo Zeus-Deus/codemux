@@ -529,7 +529,7 @@ export function ReviewPanel({ workspace }: Props) {
                 invalidatePrQueries();
                 void branchInfoQuery.refetch();
               })
-              .catch((err) => toast.error(String(err)));
+              .catch((err) => toast.failure("Couldn't push the branch", err));
           }}
         />
       )}

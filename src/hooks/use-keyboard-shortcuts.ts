@@ -27,6 +27,7 @@ import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
 } from "@/stores/synced-settings-store";
+import { reportFailure } from "@/lib/toast";
 
 /** Recording mode flag — set by keybind-editor to suppress dispatch */
 let recordingMode = false;
@@ -186,7 +187,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // ── Open project (folder picker) ──
   if (actionId === "openProject") {
-    openProjectFlow().catch(console.error);
+    openProjectFlow().catch(reportFailure("Couldn't open the project"));
     return true;
   }
 
@@ -242,7 +243,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   const activePaneId = surface?.active_pane_id;
 
   if (actionId === "runDevCommand") {
-    runProjectDevCommand(ws.workspace_id).catch(console.error);
+    runProjectDevCommand(ws.workspace_id).catch(reportFailure("Couldn't run the dev command"));
     return true;
   }
 
@@ -298,12 +299,12 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // ── Tabs ──
   if (actionId === "newTab") {
-    createTab(ws.workspace_id, "terminal").catch(console.error);
+    createTab(ws.workspace_id, "terminal").catch(reportFailure("Couldn't open a terminal tab"));
     return true;
   }
   if (actionId === "closeTab") {
     if (ws.tabs.length > 0)
-      closeTab(ws.workspace_id, ws.active_tab_id).catch(console.error);
+      closeTab(ws.workspace_id, ws.active_tab_id).catch(reportFailure("Couldn't close the tab"));
     return true;
   }
 
@@ -318,15 +319,15 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // ── Panes ──
   if (actionId === "splitPaneRight") {
-    if (activePaneId) splitPane(activePaneId, "horizontal").catch(console.error);
+    if (activePaneId) splitPane(activePaneId, "horizontal").catch(reportFailure("Couldn't split the pane"));
     return true;
   }
   if (actionId === "splitPaneDown") {
-    if (activePaneId) splitPane(activePaneId, "vertical").catch(console.error);
+    if (activePaneId) splitPane(activePaneId, "vertical").catch(reportFailure("Couldn't split the pane"));
     return true;
   }
   if (actionId === "closePane") {
-    if (activePaneId) closePane(activePaneId).catch(console.error);
+    if (activePaneId) closePane(activePaneId).catch(reportFailure("Couldn't close the pane"));
     return true;
   }
 

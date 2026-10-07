@@ -185,7 +185,7 @@ export function PullRequestsView() {
       toast.info(`Opening #${number} in the browser`, {
         description: "Codemux couldn't load it from the host.",
       });
-      openUrl(url).catch((err) => toast.error(String(err)));
+      openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
     })();
   }, [pendingSelection, byKey, queryClient, clearPendingPrSelection]);
 
@@ -338,7 +338,7 @@ export function PullRequestsView() {
                 onSelect={openRow}
                 onClose={closeTab}
                 onOpenInBrowser={() => {
-                  openUrl(selected.url).catch((err) => toast.error(String(err)));
+                  openUrl(selected.url).catch((err) => toast.failure("Couldn't open the link", err));
                 }}
               />
               {/* No scroll here: the detail column scrolls its own tab

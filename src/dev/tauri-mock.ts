@@ -4779,6 +4779,11 @@ const handlers: Record<string, Handler> = {
 
   // ── Editors / tooling ──
   detect_editors: () => [],
+  // No mock project configures a run command, so answer the way the backend
+  // does then (Ctrl+Shift+G shows the failure toast).
+  run_project_dev_command: () => {
+    throw "No run command configured. Set one in Settings > Projects.";
+  },
 
   // ── GitHub / PRs (pre-seeded; never hit a real API) ──
   check_gh_available: () => true,

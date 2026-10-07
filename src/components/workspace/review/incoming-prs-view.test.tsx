@@ -23,7 +23,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 
 const mockToastError = vi.fn();
 vi.mock("@/lib/toast", () => ({
-  toast: { error: (...args: unknown[]) => mockToastError(...args) },
+  toast: { failure: (...args: unknown[]) => mockToastError(...args) },
 }));
 
 vi.mock("@/tauri/commands", () => ({
@@ -280,7 +280,10 @@ describe("IncomingPrsView", () => {
     await user.click(screen.getByText("Checkout"));
     await flushPromises();
 
-    expect(mockToastError).toHaveBeenCalledWith("branch already checked out");
+    expect(mockToastError).toHaveBeenCalledWith(
+      "Couldn't check out the pull request",
+      "branch already checked out",
+    );
   });
 
   it("calls listIncomingPrs with correct params", async () => {

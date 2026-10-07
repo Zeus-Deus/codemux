@@ -7,6 +7,7 @@ vi.mock("@/lib/toast", () => ({
   toast: {
     success: vi.fn(),
     error: vi.fn(),
+    failure: vi.fn(),
     warning: vi.fn(),
     info: vi.fn(),
   },
@@ -42,6 +43,7 @@ describe("InterfaceSection", () => {
     invokeMock.mockResolvedValue(undefined);
     vi.mocked(toast.success).mockReset();
     vi.mocked(toast.error).mockReset();
+    vi.mocked(toast.failure).mockReset();
     vi.mocked(toast.warning).mockReset();
     // GUI is the default interface — tests start from the default-on
     // state unless they opt out explicitly.
@@ -119,7 +121,7 @@ describe("InterfaceSection", () => {
     );
   });
 
-  it("surfaces a toast.error and does NOT quit when set_agent_chat_enabled fails", async () => {
+  it("surfaces a failure toast and does NOT quit when set_agent_chat_enabled fails", async () => {
     const user = userEvent.setup();
     invokeMock.mockReset();
     invokeMock.mockRejectedValueOnce(new Error("disk full"));
@@ -129,8 +131,9 @@ describe("InterfaceSection", () => {
     await user.click(screen.getByRole("switch"));
 
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith(
-        expect.stringMatching(/Failed to update the interface setting/i),
+      expect(toast.failure).toHaveBeenCalledWith(
+        "Couldn't update the interface setting",
+        expect.anything(),
       ),
     );
     // No quit_app call should fire even after the 600ms window
@@ -159,8 +162,9 @@ describe("InterfaceSection", () => {
 
     await waitFor(
       () =>
-        expect(toast.error).toHaveBeenCalledWith(
-          expect.stringMatching(/please quit and reopen manually/i),
+        expect(toast.failure).toHaveBeenCalledWith(
+          expect.stringMatching(/Quit and reopen it/i),
+          new Error("app handle gone"),
         ),
       { timeout: 1500 },
     );

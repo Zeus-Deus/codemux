@@ -197,13 +197,13 @@ function CheckRow({
     // copy when this one is empty, so the button never has to wait for
     // a query it didn't start.
     onFixWithAgent(check, excerpt)
-      .catch((err) => toast.error(String(err)))
+      .catch((err) => toast.failure("Couldn't hand the check to an agent", err))
       .finally(() => setHandingOff(false));
   };
 
   const openLog = () => {
     if (!check.detail_url) return;
-    openUrl(check.detail_url).catch((err) => toast.error(String(err)));
+    openUrl(check.detail_url).catch((err) => toast.failure("Couldn't open the link", err));
   };
 
   return (

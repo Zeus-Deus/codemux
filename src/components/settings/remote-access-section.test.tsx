@@ -15,6 +15,7 @@ vi.mock("@/lib/toast", () => ({
   toast: {
     success: vi.fn(),
     error: vi.fn(),
+    failure: vi.fn(),
     info: vi.fn(),
     warning: vi.fn(),
   },
@@ -180,6 +181,7 @@ beforeEach(() => {
   for (const fn of Object.values(cmds)) (fn as ReturnType<typeof vi.fn>).mockReset();
   vi.mocked(toast.success).mockReset();
   vi.mocked(toast.error).mockReset();
+  vi.mocked(toast.failure).mockReset();
   vi.mocked(toast.info).mockReset();
   cmds.webRemoteStatus.mockResolvedValue(status({}));
   cmds.webRemoteListEndpoints.mockResolvedValue(endpoints());
@@ -749,8 +751,9 @@ describe("RemoteAccessSection — ways to connect", () => {
       await screen.findByRole("button", { name: /retry starting the server/i }),
     );
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith(
-        "Still couldn't start the server: Address already in use",
+      expect(toast.failure).toHaveBeenCalledWith(
+        "Still couldn't start the server",
+        "Address already in use",
       ),
     );
   });
@@ -989,6 +992,7 @@ describe("RemoteAccessSection — web-client rebind disconnect", () => {
     expect(screen.getByText(/reconnecting to this device/i)).toBeInTheDocument();
     // …and crucially, NO error toast for the expected disconnect.
     expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.failure).not.toHaveBeenCalled();
   });
 
   it("still surfaces a genuine backend rejection as an error and reverts", async () => {
@@ -1002,7 +1006,7 @@ describe("RemoteAccessSection — web-client rebind disconnect", () => {
     });
 
     await user.click(tailscaleBtn);
-    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    await waitFor(() => expect(toast.failure).toHaveBeenCalled());
     // Reverted: the control snaps back to the server's actual scope.
     await waitFor(() =>
       expect(
