@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CheckCircle2, ChevronRight, LoaderCircle } from "lucide-react";
+import { CheckCircle2, ChevronRight, CircleMinus, LoaderCircle, XCircle } from "lucide-react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -10,7 +10,12 @@ import type { SubagentView, WorkflowRunItem, WorkflowRunStatus } from "@/lib/age
 import { cn } from "@/lib/utils";
 
 import { combinePhases, type CombinedPhase } from "./workflow-phases";
-import { findingTone, workflowAgentTone, workflowPhaseTone } from "./workflow-tone";
+import {
+  findingTone,
+  workflowAgentOutcome,
+  workflowAgentTone,
+  workflowPhaseTone,
+} from "./workflow-tone";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 type AgentFilter = "all" | "running" | "issues";
@@ -90,26 +95,43 @@ function PhaseCard({
   const subLine =
     status === "running"
       ? `${stats.done} done · ${stats.running} running`
-      : (phase.detail ??
-        (status === "pending"
-          ? "queued"
-          : status === "failed"
-            ? `${stats.failed} failed`
-            : `${stats.done} done`));
+      : status === "skipped"
+        ? "not run"
+        : status === "stopped"
+          ? stats.done > 0
+            ? `${stats.done} done · ${stats.failed} stopped`
+            : "stopped"
+          : (phase.detail ??
+            (status === "pending"
+              ? "queued"
+              : status === "failed"
+                ? `${stats.failed} failed`
+                : `${stats.done} done`));
 
   const agentCountLabel = stats.total > 0 ? `${stats.total} agent${stats.total === 1 ? "" : "s"}` : "—";
   const metaLabel =
-    stats.total > 0 ? `${formatCompactTokens(stats.tokens)} · ${formatElapsed(stats.elapsedMs)}` : "queued";
+    stats.total > 0
+      ? `${formatCompactTokens(stats.tokens)} · ${formatElapsed(stats.elapsedMs)}`
+      : status === "pending"
+        ? "queued"
+        : "—";
 
   const statusIcon = (
-    <span className="flex h-[22px] w-[22px] shrink-0 items-center justify-center">
+    <span
+      className="flex h-[22px] w-[22px] shrink-0 items-center justify-center"
+      data-testid="workflow-phase-status"
+      data-status={status}
+    >
       {status === "running" ? (
         // Neutral: a phase is many agents, so it carries no single activity.
         <AgentOrb size={20} aria-hidden />
       ) : status === "pending" ? (
         <span className="h-[9px] w-[9px] rounded-full border-[1.6px] border-muted-foreground" aria-hidden />
       ) : (
-        <CheckCircle2 className={cn("h-[18px] w-[18px]", tone.text)} aria-hidden />
+        <TerminalStatusIcon
+          outcome={status === "done" ? "completed" : status === "failed" ? "failed" : "halted"}
+          className={cn("size-4", tone.text)}
+        />
       )}
     </span>
   );
@@ -217,6 +239,20 @@ function PhaseAgents({
   );
 }
 
+/** A check only for work that completed: a failure gets a cross and work
+ *  that was stopped, interrupted or never started gets a dash. */
+export function TerminalStatusIcon({
+  outcome,
+  className,
+}: {
+  outcome: "completed" | "failed" | "halted";
+  className: string;
+}) {
+  const Icon =
+    outcome === "completed" ? CheckCircle2 : outcome === "failed" ? XCircle : CircleMinus;
+  return <Icon className={className} data-outcome={outcome} aria-hidden />;
+}
+
 function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => void }) {
   const tone = workflowAgentTone(agent.status);
   const badge = subagentFindingBadge(agent);
@@ -242,7 +278,10 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
         ) : agent.status === "pending" ? (
           <span className="h-[7px] w-[7px] rounded-full border-[1.4px] border-muted-foreground" aria-hidden />
         ) : (
-          <CheckCircle2 className={cn("size-3.5", tone.text)} aria-hidden />
+          <TerminalStatusIcon
+            outcome={workflowAgentOutcome(agent.status)}
+            className={cn("size-3.5", tone.text)}
+          />
         )}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">{label}</span>

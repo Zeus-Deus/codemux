@@ -47,6 +47,7 @@ import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
+import { AsyncQuestionRecord } from "./AsyncQuestionPanel";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
@@ -331,6 +332,16 @@ export const MessageList = memo(function MessageList({
   const modeRef = useRef<SendScrollMode>("following-end");
   const isAtEndRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const approvalPending = useMemo(
+    () =>
+      messages.some(
+        (m) =>
+          m.kind === "permission_request" &&
+          m.request_kind !== "user-input" &&
+          m.resolution.state === "pending",
+      ),
+    [messages],
+  );
   const pillTimerRef = useRef<number | null>(null);
   // Bumped whenever a pending "show the pill" decision is invalidated. The
   // timer callback compares against it instead of being cleared, so the
@@ -1384,9 +1395,16 @@ export const MessageList = memo(function MessageList({
           style={{
             bottom: "calc(1rem + var(--composer-overlay-height, 0px))",
           }}
-          className="absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className={cn(
+            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg hover:bg-card hover:text-foreground",
+            approvalPending
+              ? "border-status-working/50 text-foreground"
+              : "border-border text-muted-foreground",
+          )}
         >
-          Jump to latest
+          {/* Approvals render at the live edge, so off the edge means the
+              waiting card is below the viewport. */}
+          {approvalPending ? "Approval needed" : "Jump to latest"}
           <ArrowDown className="size-3.5" aria-hidden />
         </Button>
       )}
@@ -1793,25 +1811,7 @@ function renderAssistantBody(
 ) {
   switch (item.kind) {
     case "async_question":
-      return (
-        <div className="space-y-1 py-1 text-body">
-          {item.question.text && (
-            <p className="text-muted-foreground">{item.question.text}</p>
-          )}
-          {item.question.questions
-            .filter((question) => !item.question.text.includes(question.title))
-            .map((question, index) => (
-              <p key={index}>{question.title}</p>
-            ))}
-          <p className="text-label text-muted-foreground">
-            {item.resolution.status === "answered"
-              ? "Answered"
-              : item.resolution.status === "dismissed"
-                ? "Dismissed"
-                : "Answer above the composer · work can continue"}
-          </p>
-        </div>
-      );
+      return <AsyncQuestionRecord item={item} />;
     case "assistant_message":
       return (
         <AssistantMessage

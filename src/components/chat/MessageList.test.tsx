@@ -30,6 +30,7 @@ import {
   resetTranscriptFadeCacheForTests,
   setRendererMode,
 } from "./transcript-fade";
+import { USER_INPUT_SKIPPED_MESSAGE } from "./ComposerPendingInputPanel";
 import { MessageList } from "./MessageList";
 import { TranscriptTopInsetContext } from "./transcript-top-inset";
 
@@ -260,6 +261,29 @@ describe("MessageList retained scroll state", () => {
     await act(() => new Promise<void>((resolve) => window.setTimeout(resolve, 180)));
     view.rerender(tree("visible"));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Jump to latest" })).not.toBeNull());
+  });
+
+  it("says an approval is waiting when the reader is off the live edge", async () => {
+    const pendingTool: ToolCallItem = {
+      ...readCall(1, "/b"),
+      tool_name: "Bash",
+      input: { command: "npm test" },
+      status: "running",
+      approval_request_id: "req-pill",
+    };
+    const messages: ChatViewItem[] = [
+      readCall(0, "/a"),
+      pendingTool,
+      planReq({ request_id: "req-pill", request_kind: "command", tool_use_id: "tu-1" }),
+    ];
+    const view = render(<MessageList messages={messages} {...noopHandlers} />);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    fireEvent.wheel(viewport, { deltaY: -100 });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Approval needed" })).not.toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
   });
 });
 
@@ -504,13 +528,26 @@ describe("MessageList dispatch", () => {
     expect(screen.getByText("Styling")).toBeInTheDocument();
   });
 
-  it("falls back to the plain marker when a resolved user-input carries no answer", () => {
+  it("falls back to a plain marker when a user-input was cancelled without an answer", () => {
     renderList([
       askReq({
         resolution: { state: "resolved", decision: { decision: "cancel" } },
       }),
     ]);
-    expect(screen.getByText("Answered")).toBeInTheDocument();
+    expect(screen.getByText("Not answered")).toBeInTheDocument();
+  });
+
+  it("marks a skipped user-input prompt as skipped, not answered", () => {
+    renderList([
+      askReq({
+        resolution: {
+          state: "resolved",
+          decision: { decision: "deny", message: USER_INPUT_SKIPPED_MESSAGE },
+        },
+      }),
+    ]);
+    expect(screen.getByText("Skipped")).toBeInTheDocument();
+    expect(screen.queryByText("Answered")).toBeNull();
   });
 
   it("falls back to PermissionRequestBlock for unknown request_kind", () => {

@@ -155,6 +155,7 @@ import { Composer } from "./Composer";
 import { Button } from "@/components/ui/button";
 import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
+  approvalOccupant,
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
@@ -169,6 +170,7 @@ import { DebugExitDialog, type DebugExitChoice } from "./DebugExitDialog";
 import {
   type AskUserQuestionOutput,
   ComposerPendingInputPanel,
+  USER_INPUT_SKIPPED_MESSAGE,
 } from "./ComposerPendingInputPanel";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
@@ -3601,6 +3603,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [pendingUserInput, handleRespond],
   );
 
+  // "Skip · answer in chat": decline the prompt with a note the agent can
+  // act on, then hand the keyboard to the composer for the real answer.
+  const handleSkipUserInput = useCallback(() => {
+    if (!pendingUserInput || pendingUserInput.kind !== "permission_request") {
+      return;
+    }
+    void handleRespond(pendingUserInput.request_id, {
+      decision: "deny",
+      message: USER_INPUT_SKIPPED_MESSAGE,
+    });
+    requestAnimationFrame(() => {
+      paneRootRef.current
+        ?.querySelector<HTMLTextAreaElement>(
+          '[data-testid="composer-wrapper"] textarea',
+        )
+        ?.focus();
+    });
+  }, [pendingUserInput, handleRespond]);
+
   const pendingInputPanelEl =
     pendingUserInput && pendingUserInput.kind === "permission_request" ? (
       <ComposerPendingInputPanel
@@ -3610,6 +3631,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         key={pendingUserInput.request_id}
         item={pendingUserInput}
         onSubmit={handleSubmitUserInput}
+        onSkip={handleSkipUserInput}
       />
     ) : null;
 
@@ -3764,6 +3786,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     goalSourceInTranscript,
     goalLastRun,
   ]);
+  const pendingApprovalOccupant = useMemo(
+    () =>
+      conversationWritable
+        ? approvalOccupant(messages, {
+            onRespond: (requestId, decision) => {
+              void handleRespond(requestId, decision);
+            },
+            onJump: (itemId) =>
+              setMessageJumpRequest((current) => ({
+                itemId,
+                nonce: (current?.nonce ?? 0) + 1,
+              })),
+          })
+        : null,
+    [conversationWritable, messages, handleRespond],
+  );
   // Hidden in a subagent drill-in: the design only shows it in the
   // conversation view. Keyed by thread so the open list never leaks
   // across a thread switch.
@@ -3772,6 +3810,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       key={threadId ?? "no-thread"}
       goal={stripGoal}
       occupants={[
+        pendingApprovalOccupant,
         errorOccupant,
         usageOccupant,
         monitoringOccupant,
@@ -4021,6 +4060,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   return (
     <div
       ref={paneRootRef}
+      data-agent-chat-pane=""
       className="relative flex h-full w-full flex-col bg-background"
       onDragEnter={handlePaneDragEnter}
       onDragLeave={handlePaneDragLeave}

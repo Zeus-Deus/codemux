@@ -1,4 +1,5 @@
 import { statusTone, type SubagentToneClasses } from "@/lib/agent-chat/subagents";
+import type { WorkflowPhaseStatus } from "@/lib/agent-chat/workflows";
 import type { SubagentViewStatus, WorkflowRunStatus } from "@/lib/agent-chat/types";
 
 export type { SubagentToneClasses };
@@ -28,13 +29,13 @@ export function workflowRunTone(status: WorkflowRunStatus): SubagentToneClasses 
   }
 }
 
-/** Tone for a derived phase status (`workflowPhaseStatus`'s
- *  "pending" | "running" | "done" | "failed"). */
-export function workflowPhaseTone(
-  status: "pending" | "running" | "done" | "failed",
-): SubagentToneClasses {
+/** Tone for a derived phase status (`workflowPhaseStatus`). Only a phase
+ *  whose work completed earns the green tone. */
+export function workflowPhaseTone(status: WorkflowPhaseStatus): SubagentToneClasses {
   switch (status) {
     case "pending":
+    case "stopped":
+    case "skipped":
       return statusTone("stopped");
     case "running":
       return statusTone("running");
@@ -52,6 +53,17 @@ export function workflowPhaseTone(
 export function workflowAgentTone(status: SubagentViewStatus): SubagentToneClasses {
   if (status === "pending") return statusTone("stopped");
   return statusTone(status);
+}
+
+/** Which terminal glyph an agent gets: a check only for completed work, a
+ *  cross for a failure, and a dash for anything stopped, interrupted or
+ *  never started. */
+export function workflowAgentOutcome(
+  status: SubagentViewStatus,
+): "completed" | "failed" | "halted" {
+  if (status === "completed") return "completed";
+  if (status === "failed") return "failed";
+  return "halted";
 }
 
 /** Tone for a `subagentFindingBadge` result ("green" | "red" | "muted"),

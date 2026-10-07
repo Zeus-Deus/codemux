@@ -7,13 +7,19 @@ export interface AskUserQuestionOutput {
   answers: Record<string, string>;
 }
 
+/** What the agent is told when the user skips its question. */
+export const USER_INPUT_SKIPPED_MESSAGE =
+  "The user skipped this question and will answer in the chat instead. Stop and wait for their message.";
+
 /** Legacy callback wrapper: preserve each provider's existing answer shape. */
 export function ComposerPendingInputPanel({
   item,
   onSubmit,
+  onSkip,
 }: {
   item: PermissionRequestItem;
   onSubmit: (output: AskUserQuestionOutput) => void | Promise<void>;
+  onSkip?: () => void;
 }) {
   const questions = useMemo(
     () => extractQuestions(item.payload),
@@ -23,6 +29,7 @@ export function ComposerPendingInputPanel({
     <QuestionForm
       questions={questions}
       active={item.resolution.state === "pending"}
+      onSkip={onSkip}
       onSubmit={(answers) =>
         onSubmit({
           questions: isRecord(item.payload)
