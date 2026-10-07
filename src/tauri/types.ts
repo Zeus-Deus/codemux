@@ -639,7 +639,7 @@ export interface PendingWorkspace {
   status: "creating" | "failed";
   errorMessage?: string;
   /** Present when the row came from the New Workspace dialog. A failed
-   *  row with a draft stays until the user reopens or dismisses it. */
+   *  row with a draft stays until the user retries or dismisses it. */
   draft?: NewWorkspaceDraft;
 }
 

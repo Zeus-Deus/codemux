@@ -199,6 +199,8 @@ function errorText(err: unknown): string {
  *  straight away and a pending sidebar row stands in for the workspace.
  *  On failure that row keeps the form draft, and both it and the error
  *  toast offer "Reopen", which brings the dialog back exactly as it was.
+ *  The failed row stays until the reopened draft is submitted again or
+ *  the user dismisses it.
  *
  *  `create` resolves to the workspace to activate, or null when it has
  *  already switched somewhere itself. */
@@ -209,6 +211,14 @@ async function runCreate(
   create: () => Promise<string | null>,
 ): Promise<void> {
   const ui = useUIStore.getState();
+  // A retry of a reopened draft replaces its failed row. Read before
+  // closing, which clears the reopened draft.
+  const reopened = ui.newWorkspaceDraft;
+  if (reopened) {
+    for (const pw of ui.pendingWorkspaces) {
+      if (pw.draft === reopened) ui.removePendingWorkspace(pw.id);
+    }
+  }
   closeDialog();
   const tempId = randomUUID();
   ui.addPendingWorkspace({

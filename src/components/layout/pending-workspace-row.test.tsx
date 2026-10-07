@@ -66,7 +66,9 @@ describe("PendingWorkspaceRow", () => {
     expect(state.showNewWorkspaceDialog).toBe(true);
     expect(state.newWorkspaceProjectDir).toBe("/projects/app");
     expect(state.newWorkspaceDraft).toBe(draft);
-    expect(state.pendingWorkspaces).toEqual([]);
+    // The row stays until a retry replaces it, so closing the reopened
+    // dialog can't lose the draft.
+    expect(state.pendingWorkspaces).toHaveLength(1);
   });
 
   it("dismisses a failed row without reopening", () => {

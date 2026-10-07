@@ -1335,7 +1335,113 @@ describe("Failure recovery", () => {
     expect(within(reopened).getByPlaceholderText("branch name")).toHaveValue(
       "my-feature",
     );
-    expect(useUIStore.getState().pendingWorkspaces).toEqual([]);
+    // The failed row stays while the reopened dialog is up.
+    expect(useUIStore.getState().pendingWorkspaces).toHaveLength(1);
+  });
+
+  it("keeps the failed row when the reopened dialog closes without a retry", async () => {
+    setAppState("/path/to/project");
+    (createWorktreeWorkspaceResult as Mock)
+      .mockRejectedValueOnce("fatal: boom")
+      .mockRejectedValueOnce("fatal: boom again");
+    useUIStore.setState({ showNewWorkspaceDialog: true });
+    render(<StoreDrivenDialog />);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Do not lose me" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.status).toBe("failed");
+    });
+    const failedId = useUIStore.getState().pendingWorkspaces[0].id;
+    const [, opts] = (toast.error as Mock).mock.calls[0];
+
+    // Reopen, then close without resubmitting.
+    act(() => opts.action.onClick());
+    await screen.findByRole("dialog");
+    act(() => useUIStore.getState().setShowNewWorkspaceDialog(false));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(useUIStore.getState().pendingWorkspaces.map((p) => p.id)).toEqual([
+      failedId,
+    ]);
+
+    // The toast's Reopen still works, and a retry replaces the old row.
+    act(() => opts.action.onClick());
+    const reopened = await screen.findByRole("dialog");
+    expect(
+      within(reopened).getByPlaceholderText("What do you want to do?"),
+    ).toHaveValue("Do not lose me");
+    fireEvent.click(within(reopened).getByRole("button", { name: /Create/i }));
+    await waitFor(() => {
+      expect(useUIStore.getState().pendingWorkspaces[0]?.errorMessage).toBe(
+        "fatal: boom again",
+      );
+    });
+    expect(useUIStore.getState().pendingWorkspaces).toHaveLength(1);
+    expect(useUIStore.getState().pendingWorkspaces[0].id).not.toBe(failedId);
+  });
+
+  it("restores attachments and the linked issue on Reopen and resubmits them", async () => {
+    setAppState("/path/to/project");
+    render(<StoreDrivenDialog />);
+    act(() => {
+      useUIStore.getState().addPendingWorkspace({
+        id: "pending-i",
+        name: "fix-it",
+        projectPath: "/path/to/project",
+        status: "failed",
+        errorMessage: "boom",
+        draft: {
+          projectDir: "/path/to/project",
+          workspaceName: "",
+          branchName: "fix-it",
+          branchAutoFilled: false,
+          prompt: "Look at this",
+          attachments: ["/tmp/shot.png"],
+          linkedIssue: {
+            number: 92,
+            title: "Backend endpoints",
+            state: "Open",
+            labels: [],
+            assignees: [],
+            url: "https://github.com/u/r/issues/92",
+            body: null,
+            comments: [],
+            totalComments: 0,
+            updatedAt: null,
+          },
+          selectedAgentId: "builtin-claude",
+          modelSelection: { model: null, reasoning: null, context: null },
+          baseBranch: "main",
+          branchMode: "create_new",
+          openExistingBranch: null,
+          hostId: null,
+        },
+      });
+      useUIStore.getState().reopenPendingWorkspace("pending-i");
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("shot.png")).toBeInTheDocument();
+    expect(within(dialog).getByText("Backend endpoints")).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+    await waitFor(() => expect(createWorktreeWorkspaceResult).toHaveBeenCalled());
+    const sentPrompt = (createWorktreeWorkspaceResult as Mock).mock.calls[0][5];
+    expect(sentPrompt).toContain("Look at this");
+    expect(sentPrompt).toContain("Attached files:\n- /tmp/shot.png");
+    expect(sentPrompt).toContain("#92");
+    // The retry replaced the failed row.
+    await waitFor(() =>
+      expect(
+        useUIStore.getState().pendingWorkspaces.some((p) => p.id === "pending-i"),
+      ).toBe(false),
+    );
   });
 
   // Regression: reopening a draft for a different project than the dialog

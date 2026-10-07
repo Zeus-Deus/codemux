@@ -627,16 +627,18 @@ export const useUIStore = create<UIStore>()(
           ),
         })),
 
+      // The failed row stays until a retry from the dialog replaces it (see
+      // `runCreate`), so closing the reopened dialog never loses the draft.
       reopenPendingWorkspace: (id) =>
         set((s) => {
           const pw = s.pendingWorkspaces.find((p) => p.id === id);
           if (!pw) return s;
-          const pendingWorkspaces = s.pendingWorkspaces.filter(
-            (p) => p.id !== id,
-          );
-          if (!pw.draft) return { pendingWorkspaces };
+          if (!pw.draft) {
+            return {
+              pendingWorkspaces: s.pendingWorkspaces.filter((p) => p.id !== id),
+            };
+          }
           return {
-            pendingWorkspaces,
             showNewWorkspaceDialog: true,
             newWorkspaceProjectDir: pw.draft.projectDir,
             newWorkspaceDraft: pw.draft,

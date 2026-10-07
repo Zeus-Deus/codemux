@@ -5,7 +5,7 @@ import type { PendingWorkspace } from "@/tauri/types";
 
 /** Optimistic sidebar row for a workspace that is still being created, or
  *  that failed. A failed row that carries the dialog's draft stays put
- *  until the user reopens it (restoring their prompt) or dismisses it. */
+ *  until the user retries from the reopened dialog or dismisses it. */
 export function PendingWorkspaceRow({
   pending,
   className,
