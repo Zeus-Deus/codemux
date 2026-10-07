@@ -10,7 +10,7 @@ export function HermesPermissionOptions({ payload, onDecide }: { payload: unknow
   const [disabled, setDisabled] = useState(false);
   const p = payload as { options?: Array<{ optionId: string; name: string; kind: string }>; toolCall?: { title?: string; rawInput?: unknown } };
   const choose = (decision: ApprovalDecision) => { if (submitted.current) return; submitted.current = true; setDisabled(true); onDecide(decision); };
-  return <div className="space-y-2 border-t border-border/60 p-3 text-label">
+  return <div className="space-y-2 border-t border-hairline p-3 text-label">
     <p>{p.toolCall?.title ?? "Hermes requests permission"}</p>
     {p.toolCall?.rawInput != null && <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-muted-foreground">{JSON.stringify(p.toolCall.rawInput, null, 2)}</pre>}
     <div className="flex flex-wrap gap-2">{(p.options ?? []).filter(o => typeof o.optionId === "string" && typeof o.name === "string").map(o => <Button type="button" variant="outline" size="sm" disabled={disabled} key={o.optionId} onClick={() => choose({ decision: "provider_option", option_id: o.optionId })}>{o.name}</Button>)}<Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={() => choose({ decision: "cancel" })}>Cancel</Button></div>

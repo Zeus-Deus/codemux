@@ -197,7 +197,7 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
         "group/row flex items-center justify-between gap-2 pr-1",
         // Active-row highlight stays neutral — accent is reserved for the
         // app shell, not in-pane surfaces.
-        isActive && "bg-muted/70 text-foreground",
+        isActive && "bg-surface-3 text-foreground",
       )}
       data-testid={`session-row-${session.thread_id}`}
     >

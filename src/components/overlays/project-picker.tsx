@@ -158,7 +158,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
+          className="inline-flex items-center gap-1.5 rounded-full bg-surface-2 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-surface-3 hover:text-foreground"
         >
           {selectedName ? (
             // `size="sm"` keeps the trigger pill the same height

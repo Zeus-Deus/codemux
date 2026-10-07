@@ -32,7 +32,7 @@ export function diffRowStyle(line: DiffLine): DiffRowStyle {
       : isTheirsMarker
         ? "bg-accent-violet/15 border-l-2 border-accent-violet"
         : isSeparator
-          ? "bg-muted/40 border-l-2 border-muted-foreground"
+          ? "bg-surface-1 border-l-2 border-muted-foreground"
           : line.type === "add"
             ? "bg-success/10"
             : line.type === "del"

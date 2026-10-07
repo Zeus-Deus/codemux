@@ -316,7 +316,7 @@ export function TypographySettings() {
           <button
             type="button"
             onClick={restoreDefaults}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
           >
             <RotateCcw className="size-3" aria-hidden />
             Restore defaults
@@ -369,7 +369,7 @@ function TypographySurfaceCard({
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-body font-semibold text-foreground">{title}</p>
               {linkedLabel ? (
-                <span className="rounded-full border border-border/55 bg-muted/35 px-2 py-0.5 font-mono text-micro text-muted-foreground/75">
+                <span className="rounded-full border border-hairline bg-surface-1 px-2 py-0.5 font-mono text-micro text-muted-foreground/75">
                   {linkedLabel}
                 </span>
               ) : null}
@@ -462,7 +462,7 @@ function FontFamilyPicker({
         <button
           type="button"
           aria-label={`Font family: ${display}`}
-          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors duration-150 hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 sm:w-[190px] sm:flex-none"
+          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 sm:w-[190px] sm:flex-none"
         >
           <span className="min-w-0 truncate" style={{ fontFamily: fontStack(value, defaultStack) }}>
             {display}
@@ -575,14 +575,14 @@ function InterfacePreview({ family, size }: { family: string; size: number }) {
           <span className="ml-auto text-[0.72em] text-muted-foreground">main</span>
         </div>
         <div className="flex items-center gap-2.5 px-3 py-2.5">
-          <span className="flex size-6 items-center justify-center rounded-md border border-border/60 bg-muted/45 text-[0.68em] font-semibold">
+          <span className="flex size-6 items-center justify-center rounded-md border border-hairline bg-surface-2 text-[0.68em] font-semibold">
             A
           </span>
           <div className="min-w-0">
             <p className="font-semibold leading-tight">Refine terminal typography</p>
             <p className="mt-0.5 text-[0.76em] text-muted-foreground">Working · 4 files changed</p>
           </div>
-          <span className="ml-auto rounded-md bg-muted/55 px-2 py-0.5 text-[0.68em] text-muted-foreground">
+          <span className="ml-auto rounded-md bg-surface-2 px-2 py-0.5 text-[0.68em] text-muted-foreground">
             Review
           </span>
         </div>

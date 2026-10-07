@@ -255,7 +255,7 @@ function ReviewBody({
         </label>
       )}
       {paused && (
-        <p role="note" className="rounded-lg border bg-muted/40 p-3 text-body">
+        <p role="note" className="rounded-lg border bg-surface-1 p-3 text-body">
           Add-ons are paused. CodeMux saves this choice and starts nothing until
           you resume add-ons.
         </p>

@@ -33,7 +33,7 @@ export function ToolCallBlock({ content, error, text }: Props) {
   return (
     <div
       className={cn(
-        "code-surface select-text rounded-md bg-muted/40",
+        "code-surface select-text rounded-md bg-surface-1",
         "text-foreground whitespace-pre-wrap break-words",
         error && "text-foreground",
       )}
@@ -48,7 +48,7 @@ export function ToolCallBlock({ content, error, text }: Props) {
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-label text-muted-foreground hover:text-foreground"
+          className="block w-full border-t border-hairline px-3 py-1.5 text-left text-label text-muted-foreground hover:text-foreground"
         >
           {expanded ? "Show less" : `Show ${hiddenCount} more line${hiddenCount === 1 ? "" : "s"}`}
         </button>

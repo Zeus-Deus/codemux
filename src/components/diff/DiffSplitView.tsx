@@ -63,7 +63,7 @@ function SplitSideLine({
     return (
       <div
         data-diff-hunk
-        className={cn("flex bg-muted/30 whitespace-pre mt-1 first:mt-0", rowHeight)}
+        className={cn("flex bg-surface-1 whitespace-pre mt-1 first:mt-0", rowHeight)}
       >
         <span className="w-10 shrink-0 select-none" />
         <span className={cn("text-muted-foreground/60 px-2 truncate", gutterSize)}>

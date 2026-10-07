@@ -121,7 +121,7 @@ export function WorkflowAgentDetail({
 
       <section>
         <SectionLabel>Prompt</SectionLabel>
-        <div className="break-words rounded-md border border-border/60 bg-muted/30 px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90">
+        <div className="break-words rounded-md border border-hairline bg-surface-1 px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90">
           {derivePrompt(agent)}
         </div>
       </section>
@@ -152,14 +152,14 @@ export function WorkflowAgentDetail({
       <section>
         <SectionLabel>Result</SectionLabel>
         {running ? (
-          <div className="rounded-md border border-border/60 bg-muted/30 px-2.5 py-2.5 text-body-sm text-muted-foreground">
+          <div className="rounded-md border border-hairline bg-surface-1 px-2.5 py-2.5 text-body-sm text-muted-foreground">
             <span className="shimmer font-mono text-body-sm">{subagentActivityLine(agent)}</span>
           </div>
         ) : (
           <div
             className={cn(
               "break-words rounded-md border px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90",
-              badge?.tone === "red" ? cn(tone.softBg, tone.border) : "border-border/60 bg-muted/30",
+              badge?.tone === "red" ? cn(tone.softBg, tone.border) : "border-hairline bg-surface-1",
             )}
           >
             {agent.resultText ?? "No result yet."}

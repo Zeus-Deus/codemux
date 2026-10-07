@@ -101,7 +101,7 @@ export function ContextUsageMeter({
                   // so the footer's right cluster stays on one optical
                   // baseline.
                   "inline-flex h-[34px] w-[34px] items-center justify-center rounded-full",
-                  "text-muted-foreground transition-colors duration-150 hover:bg-muted/60 hover:text-foreground",
+                  "text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
                   "outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                   warning && "text-danger hover:text-danger",
                 )}
@@ -158,7 +158,7 @@ export function ContextUsageMeter({
 
           {usedPercentage !== null && (
             <div
-              className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted/60"
+              className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-2"
               role="progressbar"
               aria-label="Context window used"
               aria-valuenow={Math.round(usedPercentage)}

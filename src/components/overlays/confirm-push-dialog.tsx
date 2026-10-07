@@ -93,7 +93,7 @@ export function ConfirmPushDialog({
         </DialogHeader>
 
         <div className="px-5 pb-4 space-y-3">
-          <ul className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-body-sm text-muted-foreground/85 leading-relaxed space-y-1">
+          <ul className="rounded-md border border-hairline bg-surface-1 px-3 py-2 text-body-sm text-muted-foreground/85 leading-relaxed space-y-1">
             <li>
               • Copies the workspace files to{" "}
               <span className="font-medium text-foreground/90">

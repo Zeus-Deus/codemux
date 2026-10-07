@@ -111,7 +111,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
 
         <div
           data-testid="skill-modal-body"
-          className="flex-1 overflow-y-auto rounded-md border border-border/50 bg-muted/30 p-4"
+          className="flex-1 overflow-y-auto rounded-md border border-hairline bg-surface-1 p-4"
         >
           {skill.readable === false ? (
             <p className="text-body italic text-muted-foreground">

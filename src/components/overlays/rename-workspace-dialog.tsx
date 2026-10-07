@@ -291,7 +291,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             </p>
           </div>
 
-          <div className="flex items-center gap-2 border-t border-border/70 bg-muted/30 px-3 py-[11px]">
+          <div className="flex items-center gap-2 border-t border-hairline-strong bg-surface-1 px-3 py-[11px]">
             <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-caption text-muted-foreground/55">
               <kbd className="rounded-sm border border-border/70 px-[5px] py-0.5 font-mono">
                 esc
@@ -324,7 +324,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               )}
             >
               <span>{submitting ? "Renaming…" : "Rename"}</span>
-              <CornerDownLeft className="size-[11px] opacity-75" />
+              <CornerDownLeft className="size-3 opacity-75" />
             </button>
           </div>
         </form>

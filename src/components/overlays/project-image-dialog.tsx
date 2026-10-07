@@ -74,7 +74,7 @@ export function ProjectImageDialog({
 
         <div className="px-5 pb-4 space-y-4">
           {/* Live preview row */}
-          <div className="flex items-center gap-3 rounded-lg border border-border/60 bg-muted/20 p-3">
+          <div className="flex items-center gap-3 rounded-lg border border-hairline bg-surface-1 p-3">
             <ProjectAvatar
               name={projectName}
               imageUrl={value || null}
