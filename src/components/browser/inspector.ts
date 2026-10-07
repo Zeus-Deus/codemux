@@ -162,18 +162,23 @@ export function findAgentTarget(surface: SurfaceSnapshot): AgentTarget | null {
 // may reach a PTY.
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]+/g;
 
+// A whole surrogate pair, or a surrogate without its other half. The page
+// can supply a lone one (its own text cut splits pairs), and a lone
+// surrogate fails JSON deserialization on the Rust side.
+const SURROGATES = /[\ud800-\udbff][\udc00-\udfff]|[\ud800-\udfff]/g;
+
 /**
  * A complete reference to the element, left open for the user's
  * instruction. The tag, text and selector come from the page (an element
  * id can hold a newline), so every control character is replaced with a
- * space: the result is one inert line that a terminal never submits.
+ * space: the result is one inert line that a terminal never submits. Lone
+ * surrogates become U+FFFD so the prompt always serializes.
  */
 export function buildTellAgentPrompt(element: ElementInfo, pageUrl: string): string {
-  // Truncate by code point: slicing UTF-16 units can split a surrogate
-  // pair, and a lone surrogate fails JSON deserialization on the Rust side.
+  // Truncate by code point so the cut never splits a surrogate pair.
   const text = Array.from(element.text.replace(/\s+/g, " ").trim()).slice(0, 60).join("");
   const desc = `<${element.tag}>${text ? ` "${text}"` : ""}`;
   const where = pageUrl && pageUrl !== "about:blank" ? ` at ${pageUrl}` : "";
   const prompt = `In the browser${where}, the element \`${element.selector}\` (${desc}): `;
-  return prompt.replace(CONTROL_CHARS, " ");
+  return prompt.replace(CONTROL_CHARS, " ").replace(SURROGATES, (m) => (m.length === 2 ? m : "\ufffd"));
 }

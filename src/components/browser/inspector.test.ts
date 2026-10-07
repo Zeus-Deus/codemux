@@ -113,4 +113,16 @@ describe("buildTellAgentPrompt", () => {
     const prompt = buildTellAgentPrompt({ ...element, text }, "about:blank");
     expect(prompt).toContain(`"${"a".repeat(59)}\u{1F600}"`);
   });
+
+  it("replaces lone surrogates the page supplies", () => {
+    // The page-side text cut can leave half a pair; an id can hold one too.
+    const prompt = buildTellAgentPrompt(
+      { ...element, text: `${"\u{1F600}".repeat(59)}\ud83d`, selector: "#a\ude00b" },
+      "about:blank",
+    );
+    // encodeURIComponent throws on any lone surrogate.
+    expect(() => encodeURIComponent(prompt)).not.toThrow();
+    expect(prompt).toContain(`"${"\u{1F600}".repeat(59)}\ufffd"`);
+    expect(prompt).toContain("`#a\ufffdb`");
+  });
 });

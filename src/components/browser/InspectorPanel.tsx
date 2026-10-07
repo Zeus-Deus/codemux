@@ -2,6 +2,8 @@ import { useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Copy, Check, MessageSquarePlus, X } from "lucide-react";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { toast } from "@/lib/toast";
 import type { ElementInfo } from "./inspector";
 
 interface Props {
@@ -18,7 +20,10 @@ export function InspectorPanel({ element, agentTargetTitle, onDismiss, onTellAge
   const noAgentId = useId();
 
   const copySelector = async () => {
-    await navigator.clipboard.writeText(element.selector);
+    if (!(await copyToClipboard(element.selector))) {
+      toast.error(COPY_FAILED_MESSAGE);
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
