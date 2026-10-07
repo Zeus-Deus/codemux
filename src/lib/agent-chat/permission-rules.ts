@@ -99,6 +99,10 @@ const ARBITRARY_CODE_PROGRAMS = new Set([
  *  run`, the long form of `uvx`, is checked separately because `run`
  *  alone (`npm run build`) is safe. */
 const ARBITRARY_CODE_SUBCOMMANDS = new Set(["exec", "dlx", "x"]);
+/** Package managers with such a subcommand. A bare `Bash(npm:*)` rule,
+ *  derived when a flag comes first (`npm --prefix app exec …`), would
+ *  also allow it, so they need at least one subcommand word. */
+const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "uv"]);
 /** Characters that would end or nest Claude's `Tool(content)` rule
  *  syntax. */
 const RULE_DELIMITERS = /[()]/;
@@ -144,6 +148,7 @@ export function suggestPermissionRule(
     const subcommands = words.slice(1);
     if (
       subcommands.some((word) => ARBITRARY_CODE_SUBCOMMANDS.has(word)) ||
+      (PACKAGE_MANAGERS.has(family) && subcommands.length === 0) ||
       (family === "uv" && subcommands[0] === "tool" && subcommands[1] === "run")
     ) {
       return null;
