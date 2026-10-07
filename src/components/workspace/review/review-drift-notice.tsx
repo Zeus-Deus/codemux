@@ -39,6 +39,8 @@ export interface DriftAction {
   busy?: boolean;
   /** What the button says while busy ("Pulling"); defaults to the label. */
   busyLabel?: string;
+  /** Other work is in flight and would drop this click, so don't look live. */
+  disabled?: boolean;
 }
 
 export interface DriftNotice {
@@ -102,7 +104,7 @@ export function ReviewDriftNotice({ notice }: { notice: DriftNotice }) {
           key={action.label}
           type="button"
           onClick={action.onClick}
-          disabled={anyBusy}
+          disabled={anyBusy || action.disabled}
           aria-busy={action.busy || undefined}
           className={
             action.emphasis === "primary"

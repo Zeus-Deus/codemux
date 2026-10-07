@@ -929,6 +929,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
               onClick: () => void stashAndPull(),
               busy: inFlight === "stash-pull",
               busyLabel: "Pulling",
+              // track() drops this click while a bar state change runs.
+              disabled: inFlight != null,
             },
             ...(onOpenChanges
               ? [
@@ -959,6 +961,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
               emphasis: "strong",
               busy: inFlight === "pull",
               busyLabel: "Pulling",
+              disabled: inFlight != null,
             },
           ],
         });

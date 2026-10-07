@@ -688,6 +688,29 @@ describe("drift notices", () => {
     await waitFor(() => expect(ready).toBeEnabled());
   });
 
+  it("holds Pull while a state change from the bar is in flight", async () => {
+    const user = userEvent.setup();
+    let release: () => void = () => {};
+    mockSetPrReady.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { release = () => resolve(); }),
+    );
+    renderDetail({ pr: makePr({ is_draft: true }), gitBehind: 2 });
+    await flush();
+
+    await user.click(screen.getByTestId("review-primary-action"));
+
+    // track() would drop this click, so Pull must not look live.
+    const pull = screen.getByRole("button", { name: "Pull" });
+    expect(pull).toBeDisabled();
+    expect(pull).toHaveTextContent("Pull");
+
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(pull).toBeEnabled());
+  });
+
   it("shows only the most severe notice", async () => {
     // Merged outranks a stale poll and a moved remote.
     renderDetail({
