@@ -293,9 +293,9 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   }
 
   if (mobile) return <LazyBoundary label="mobile workspace" className="h-screen"><MobileShell overlays={<>
-    {commandPaletteMounted && <LazyBoundary label="commands" presentation="overlay"><CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen}/></LazyBoundary>}
-    {fileSearchMounted && <LazyBoundary label="file search" presentation="overlay"><FileSearchDialog/></LazyBoundary>}
-    {contentSearchMounted && <LazyBoundary label="search" presentation="overlay"><ContentSearchDialog/></LazyBoundary>}
+    {commandPaletteMounted && <LazyBoundary label="commands" presentation="overlay" open={commandPaletteOpen}><CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen}/></LazyBoundary>}
+    {fileSearchMounted && <LazyBoundary label="file search" presentation="overlay" open={fileSearchOpen}><FileSearchDialog/></LazyBoundary>}
+    {contentSearchMounted && <LazyBoundary label="search" presentation="overlay" open={contentSearchOpen}><ContentSearchDialog/></LazyBoundary>}
   </>} /></LazyBoundary>;
 
   // Full-screen empty state — no sidebar, no title bar. Bypassed when
@@ -340,6 +340,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
             label="command palette"
             className="fixed inset-0 z-50 h-screen"
             presentation="overlay"
+            open={commandPaletteOpen}
           >
             <CommandPalette
               open={commandPaletteOpen}
@@ -352,6 +353,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
             label="file search"
             className="fixed inset-0 z-50 h-screen"
             presentation="overlay"
+            open={fileSearchOpen}
           >
             <FileSearchDialog />
           </LazyBoundary>
@@ -361,6 +363,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
             label="content search"
             className="fixed inset-0 z-50 h-screen"
             presentation="overlay"
+            open={contentSearchOpen}
           >
             <ContentSearchDialog />
           </LazyBoundary>

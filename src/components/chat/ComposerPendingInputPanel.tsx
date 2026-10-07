@@ -1,6 +1,11 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
 import { QuestionForm, type Question } from "./QuestionForm";
+
+/** Requests whose panel has already eased in. The panel remounts when the
+ *  user switches tabs or sessions and back, and the entry should only play
+ *  when a question first arrives, not on every return to it. */
+const easedRequestIds = new Set<string>();
 
 export interface AskUserQuestionOutput {
   questions: unknown;
@@ -19,12 +24,24 @@ export function ComposerPendingInputPanel({
     () => extractQuestions(item.payload),
     [item.payload],
   );
+  // Decided once per mount: a request seen before renders in place.
+  const [ease] = useState(() => !easedRequestIds.has(item.id));
+  useEffect(() => {
+    easedRequestIds.add(item.id);
+  }, [item.id]);
   // A resolved request renders nothing; the transcript marker owns it.
   if (item.resolution.state !== "pending") return null;
   // Eases up into place so the composer moving to make room reads as the
   // agent asking something, not a layout jump.
   return (
-    <div className="animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out">
+    <div
+      data-testid="pending-input-panel"
+      className={
+        ease
+          ? "animate-in fade-in-0 slide-in-from-bottom-2 duration-150 ease-out"
+          : undefined
+      }
+    >
       <QuestionForm
         questions={questions}
         active={item.resolution.state === "pending"}

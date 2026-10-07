@@ -88,4 +88,46 @@ describe("LazyBoundary", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByText("Automations loaded")).toBeVisible();
   });
+
+  it("hides a closed overlay's failure and retries it on the next open", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let broken = true;
+    function Dialog({ open }: { open: boolean }) {
+      if (broken && open) throw new Error("dialog crashed");
+      return open ? <div>Dialog open</div> : null;
+    }
+    const at = (open: boolean) => (
+      <LazyBoundary label="content search" presentation="overlay" open={open}>
+        <Dialog open={open} />
+      </LazyBoundary>
+    );
+
+    const view = render(at(true));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn’t load content search.",
+    );
+
+    // Escape closes the overlay: the full-screen error must not stay up.
+    view.rerender(at(false));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    broken = false;
+    view.rerender(at(true));
+    expect(screen.getByText("Dialog open")).toBeVisible();
+  });
+
+  it("does not show a closed overlay's loading state", () => {
+    const pending = new Promise<never>(() => {});
+    function SuspendedChild(): never {
+      throw pending;
+    }
+
+    render(
+      <LazyBoundary label="file search" presentation="overlay" open={false}>
+        <SuspendedChild />
+      </LazyBoundary>,
+    );
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
 });
