@@ -287,6 +287,68 @@ describe("RunButton — split variant", () => {
     expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
   });
 
+  it("does not save when the existing scripts cannot be read", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    // Writing after a failed read would wipe setup, teardown and includes.
+    mockGetProjectScripts.mockRejectedValue("read failed");
+    await userEvent.click(await screen.findByRole("button", { name: /cargo run/ }));
+    expect(await screen.findByText("read failed")).toBeInTheDocument();
+    expect(mockSetProjectScripts).not.toHaveBeenCalled();
+    expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
+  });
+
+  it("marks the saved command in the detected list", async () => {
+    mockGetProjectScripts.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: "cargo run",
+      worktree_includes: [],
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Configure run command" }),
+    );
+    const saved = await screen.findByRole("button", { name: /cargo run/ });
+    expect(saved).toHaveAttribute("aria-current", "true");
+    expect(screen.getByRole("button", { name: /pnpm run dev/ })).not.toHaveAttribute(
+      "aria-current",
+    );
+  });
+
+  it("focuses the field with the caret after the command, without selecting it", async () => {
+    mockGetProjectScripts.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: "npm run dev",
+      worktree_includes: [],
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Configure run command" }),
+    );
+    const input = (await screen.findByLabelText("Run command")) as HTMLInputElement;
+    await flushPromises();
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe("npm run dev".length);
+    expect(input.selectionEnd).toBe("npm run dev".length);
+  });
+
+  it("does not return focus to the caret after a pointer pick", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    await userEvent.click(await screen.findByRole("button", { name: /pnpm run dev/ }));
+    await waitFor(() => expect(screen.getByText("Run")).toBeInTheDocument());
+    // Focusing the caret would pop its tooltip right after the pick.
+    expect(
+      screen.getByRole("button", { name: "Configure run command" }),
+    ).not.toHaveFocus();
+  });
+
   it("More settings opens Settings > Projects", async () => {
     renderSplitRunButton();
     await flushPromises();
@@ -313,8 +375,27 @@ describe("RunButton — split variant", () => {
     // The backend ignores DB scripts once a config file exists.
     await userEvent.click(screen.getByText("Set Run"));
     expect(await screen.findByText(".codemux/config.json")).toBeInTheDocument();
+    // The file has no `run`, so the text asks for one instead of claiming
+    // it is set.
+    expect(screen.getByText(/Add a/)).toBeInTheDocument();
     expect(screen.queryByLabelText("Run command")).toBeNull();
     expect(mockDetectRunCandidates).not.toHaveBeenCalled();
+  });
+
+  it("says the config file sets the run command when it has one", async () => {
+    mockGetWorkspaceConfig.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: "yarn dev",
+      worktree_includes: [],
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Configure run command" }),
+    );
+    expect(await screen.findByText(/sets its run command in/)).toBeInTheDocument();
+    expect(screen.queryByText(/Add a/)).toBeNull();
   });
 
   it("re-reads the run command when the active project changes", async () => {

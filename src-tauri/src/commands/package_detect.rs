@@ -190,6 +190,12 @@ pub struct RunCandidate {
 /// Script and target names that usually start a long-running app, best first.
 const RUN_NAMES: [&str; 5] = ["dev", "start", "serve", "run", "watch"];
 
+/// Name parts that mark a script as a one-off task even when another part is
+/// a run name, as in `test:watch`, `build:watch` or `test:run`.
+const TASK_NAMES: [&str; 9] = [
+    "test", "build", "lint", "check", "typecheck", "format", "fmt", "e2e", "coverage",
+];
+
 /// Suggest run commands for a project: package.json scripts (run with the
 /// lockfile's package manager), Makefile and justfile targets, Cargo, Go,
 /// Django and Docker Compose. Best guesses come first.
@@ -282,9 +288,16 @@ fn package_json_run_scripts(root: &Path) -> Vec<String> {
             name.strip_prefix(p)
                 .is_some_and(|base| scripts.contains_key(base))
         });
-        let looks_like_run = name
-            .split([':', '-', '_'])
-            .any(|part| RUN_NAMES.contains(&part));
+        // A variant must start or end with a run name (`dev:web`,
+        // `tauri:dev`) and name no task, so watchers for tests or builds
+        // are not offered as the app's run command.
+        let parts: Vec<&str> = name.split([':', '-', '_']).collect();
+        let edge_is_run = [parts.first(), parts.last()]
+            .into_iter()
+            .flatten()
+            .any(|part| RUN_NAMES.contains(part));
+        let names_task = parts.iter().any(|part| TASK_NAMES.contains(part));
+        let looks_like_run = edge_is_run && !names_task;
         if looks_like_run && !is_hook && !names.contains(name) {
             names.push(name.clone());
         }
@@ -299,11 +312,22 @@ fn run_targets(text: &str) -> Vec<&'static str> {
         .filter(|l| !l.starts_with([' ', '\t', '#', '.']))
         .filter_map(|l| {
             let (head, rest) = l.split_once(':')?;
-            // `name := value` is an assignment, not a target.
-            if rest.starts_with('=') {
+            // `name := value`, `name ::= value` and `A ?= x:y` are
+            // assignments, not targets. `run::` is a double-colon rule.
+            // just recipe parameters (`dev port='3000':`) stay targets.
+            if rest.trim_start_matches(':').starts_with('=') {
                 return None;
             }
-            head.split_whitespace().next()
+            let mut words = head.split_whitespace();
+            let name = words.next()?;
+            if words
+                .next()
+                .is_some_and(|w| ["=", "?=", "+=", "!="].iter().any(|op| w.starts_with(op)))
+            {
+                return None;
+            }
+            // just marks quiet recipes with a leading `@`.
+            Some(name.trim_start_matches('@'))
         })
         .collect();
     RUN_NAMES
@@ -489,6 +513,26 @@ mod tests {
                 "docker compose up",
             ]
         );
+    }
+
+    #[test]
+    fn run_candidates_skip_test_and_build_watchers() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite","test:watch":"vitest","build:watch":"tsc -w","test:run":"vitest run","dev:web":"vite","my-dev-tools":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(run_candidates(&dir), ["npm run dev", "npm run dev:web"]);
+    }
+
+    #[test]
+    fn run_targets_handle_quiet_recipes_and_posix_assignments() {
+        assert_eq!(run_targets("@dev:\n    cargo watch\n"), ["dev"]);
+        assert!(run_targets("run ::= ./app\nstart :::= x\ndev ?= x:y\nserve += a:b\n").is_empty());
+        // just recipe parameters with defaults are still recipes.
+        assert_eq!(run_targets("watch port='3000':\n    x\n"), ["watch"]);
+        assert_eq!(run_targets("serve:: deps\n\t./app\n"), ["serve"]);
     }
 
     #[test]

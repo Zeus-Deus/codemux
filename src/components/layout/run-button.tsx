@@ -1,5 +1,5 @@
-import { useState, useEffect, type FormEvent } from "react";
-import { ChevronDown, Play, Settings } from "lucide-react";
+import { useState, useEffect, useRef, type FormEvent } from "react";
+import { Check, ChevronDown, Play, Settings } from "lucide-react";
 import {
   Tooltip,
   TooltipContent,
@@ -46,6 +46,10 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   // A `.codemux/config.json` overrides the DB scripts the popover writes.
   const [hasConfigFile, setHasConfigFile] = useState(false);
   const [popoverOpen, setPopoverOpen] = useState(false);
+  // Whether the popover was last used with the pointer. Focus then stays put
+  // on close instead of returning to the caret, where it would pop the
+  // caret's tooltip right after a pick. Keyboard users still get focus back.
+  const usedPointerRef = useRef(false);
   // Subscribe to the primitive project_root, not the whole workspace
   // object — full-snapshot rebuilds on every backend tick churn the
   // workspace ref and would re-render this button on every tick.
@@ -165,6 +169,16 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
           align="end"
           sideOffset={6}
           className="w-80 max-w-[calc(100vw-24px)] p-0"
+          onPointerDownCapture={() => {
+            usedPointerRef.current = true;
+          }}
+          onKeyDownCapture={() => {
+            usedPointerRef.current = false;
+          }}
+          onCloseAutoFocus={(e) => {
+            if (usedPointerRef.current) e.preventDefault();
+            usedPointerRef.current = false;
+          }}
         >
           {projectRoot && (
             <RunCommandForm
@@ -257,6 +271,18 @@ function RunCommandForm({
   const [draft, setDraft] = useState(currentCommand ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Focus the field with the caret after the current command. This runs
+  // before the popover's own auto-focus, which then leaves focus alone, so
+  // the field is focused even before detection returns and its text is not
+  // selected.
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }, []);
 
   useEffect(() => {
     if (hasConfigFile) return;
@@ -276,8 +302,19 @@ function RunCommandForm({
   if (hasConfigFile) {
     return (
       <p className="px-3 py-2.5 text-body-sm leading-relaxed text-muted-foreground">
-        This project sets its run command in{" "}
-        <code className="font-mono text-label">.codemux/config.json</code>.
+        {currentCommand ? (
+          <>
+            This project sets its run command in{" "}
+            <code className="font-mono text-label">.codemux/config.json</code>.
+          </>
+        ) : (
+          <>
+            This project uses{" "}
+            <code className="font-mono text-label">.codemux/config.json</code>.
+            Add a <code className="font-mono text-label">run</code> command
+            there.
+          </>
+        )}
       </p>
     );
   }
@@ -288,8 +325,9 @@ function RunCommandForm({
     setSaving(true);
     setError(null);
     try {
-      // Keep the project's other scripts; only the run command changes.
-      const existing = await getProjectScripts(projectRoot).catch(() => null);
+      // Keep the project's other scripts; only the run command changes. A
+      // failed read aborts the save rather than writing empty scripts.
+      const existing = await getProjectScripts(projectRoot);
       await setProjectScripts(projectRoot, {
         setup: existing?.setup ?? [],
         teardown: existing?.teardown ?? [],
@@ -315,23 +353,32 @@ function RunCommandForm({
       {candidates.length > 0 && (
         <div className="flex flex-col p-1.5">
           <Eyebrow className="px-2 pb-1 pt-1">Detected</Eyebrow>
-          {candidates.map((c) => (
-            <button
-              key={c.command}
-              type="button"
-              disabled={saving}
-              onClick={() => void saveAndRun(c.command)}
-              className={POPOVER_ROW}
-            >
-              <Play className="size-3 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 flex-1 truncate font-mono text-label">
-                {c.command}
-              </span>
-              <span className="shrink-0 font-mono text-caption text-muted-foreground/60">
-                {c.source}
-              </span>
-            </button>
-          ))}
+          {candidates.map((c) => {
+            const isCurrent = c.command === currentCommand;
+            return (
+              <button
+                key={c.command}
+                type="button"
+                disabled={saving}
+                // The saved command gets a check instead of the play glyph.
+                aria-current={isCurrent ? "true" : undefined}
+                onClick={() => void saveAndRun(c.command)}
+                className={POPOVER_ROW}
+              >
+                {isCurrent ? (
+                  <Check className="size-3 shrink-0 text-foreground" />
+                ) : (
+                  <Play className="size-3 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate font-mono text-label">
+                  {c.command}
+                </span>
+                <span className="shrink-0 font-mono text-caption text-muted-foreground/60">
+                  {c.source}
+                </span>
+              </button>
+            );
+          })}
         </div>
       )}
       <form
@@ -344,6 +391,7 @@ function RunCommandForm({
         <div className="flex gap-1.5">
           <Input
             id="run-command-input"
+            ref={inputRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="e.g. npm run dev"
