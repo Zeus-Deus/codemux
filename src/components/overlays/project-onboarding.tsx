@@ -117,6 +117,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const taskInputRef = useRef<HTMLInputElement>(null);
   const setupStepRef = useRef<HTMLDivElement>(null);
   const branchGenTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Workspace a previous Create attempt already made. If opening it failed,
+  // a retry only reopens it: creating again would hit "branch already exists".
+  const createdWorkspaceId = useRef<string | null>(null);
 
   // ── External worktrees (not the main repo, not bare, not detached) ──
   const externalWorktrees = useMemo(
@@ -271,10 +274,22 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       .filter(Boolean);
   };
 
+  // Retire the temporary root workspace only once the real one is open.
+  // Closing it first unmounts this wizard, so a failed create used to drop
+  // the user on the empty state with no error and no project.
+  const finishCreate = useCallback(
+    async (workspaceId: string) => {
+      await activateWorkspace(workspaceId);
+      await closeWorkspace(tempWorkspaceId, false).catch(() => {});
+      onComplete();
+    },
+    [tempWorkspaceId, onComplete],
+  );
+
   // ── Create workspace ──
   const handleCreateWorkspace = useCallback(
     async (saveScripts: boolean) => {
-      if (isCreating) return;
+      if (isCreating || importProgress !== null) return;
       setIsCreating(true);
       setError(null);
 
@@ -289,6 +304,12 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       });
 
       try {
+        if (createdWorkspaceId.current) {
+          removePendingWorkspace(tempId);
+          await finishCreate(createdWorkspaceId.current);
+          return;
+        }
+
         // Save scripts if requested
         if (saveScripts) {
           const setup = collectSetupCommands();
@@ -333,32 +354,33 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         dbAddRecentProject(projectDir, pName).catch(console.error);
 
         removePendingWorkspace(tempId);
-        await activateWorkspace(created.workspaceId);
-        // Retire the temporary root workspace only once the real one exists.
-        // Closing it first unmounts this wizard, so a failed create used to
-        // drop the user on the empty state with no error and no project.
-        await closeWorkspace(tempWorkspaceId, false).catch(() => {});
-        onComplete();
+        createdWorkspaceId.current = created.workspaceId;
+        await finishCreate(created.workspaceId);
       } catch (err) {
-        failPendingWorkspace(tempId, String(err));
-        setTimeout(() => removePendingWorkspace(tempId), 5000);
-        setError(`Couldn't create the workspace: ${String(err)}`);
+        if (createdWorkspaceId.current) {
+          removePendingWorkspace(tempId);
+          setError(`The workspace was created but couldn't be opened: ${String(err)}`);
+        } else {
+          failPendingWorkspace(tempId, String(err));
+          setTimeout(() => removePendingWorkspace(tempId), 5000);
+          setError(`Couldn't create the workspace: ${String(err)}`);
+        }
         setIsCreating(false);
       }
     },
     [
       isCreating,
+      importProgress,
+      finishCreate,
       task,
       generatedBranch,
       baseBranch,
       selectedAgentId,
       projectDir,
-      tempWorkspaceId,
       setupMode,
       actions,
       setupContent,
       teardownContent,
-      onComplete,
       addPendingWorkspace,
       removePendingWorkspace,
       failPendingWorkspace,
@@ -368,6 +390,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   // ── Import all external worktrees ──
   const handleImportAll = async () => {
     setShowImportConfirm(false);
+    if (isCreating || importProgress !== null) return;
     setError(null);
     const targets = externalWorktrees.flatMap((wt) =>
       wt.branch
@@ -430,6 +453,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       ? "motion-safe:slide-in-from-right-2"
       : "motion-safe:slide-in-from-left-2",
   );
+  // Create and Import all each retire the temporary workspace and finish
+  // the wizard, so only one of them may run at a time.
+  const busy = isCreating || importProgress !== null;
   const createLabel = selectedAgent ? `Create & start ${selectedAgent.name}` : "Create workspace";
 
   const errorAlert = error && (
@@ -442,7 +468,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         type="button"
         onClick={() => setError(null)}
         aria-label="Dismiss error"
-        className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
+        className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-100"
       >
         <X className="size-3.5" />
       </button>
@@ -501,7 +527,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
               size="sm"
               className="shrink-0 tabular-nums"
               onClick={() => setShowImportConfirm(true)}
-              disabled={importProgress !== null || isCreating}
+              disabled={busy}
             >
               {importProgress
                 ? `Importing ${importProgress.current} / ${importProgress.total}…`
@@ -652,13 +678,16 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                 {/* Mode A: Checklist */}
                 {setupMode === "checklist" && actions.length > 0 && (
                   <div className="space-y-3">
+                    {/* Rows use an inset ring: this list's overflow-hidden
+                        clips the global focus outline, and the first row
+                        takes focus when the step opens. */}
                     <div className="overflow-hidden rounded-lg border bg-card/40 divide-y divide-border/60">
                       {actions.map((action) => (
                         <button
                           key={action.id}
                           type="button"
                           onClick={() => toggleAction(action.id)}
-                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer"
+                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
                         >
                           <div
                             className={cn(
@@ -711,7 +740,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                         variant="ghost"
                         size="sm"
                         onClick={() => handleCreateWorkspace(false)}
-                        disabled={isCreating}
+                        disabled={busy}
                       >
                         Skip
                       </Button>
@@ -784,7 +813,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   <Button
                     variant="outline"
                     onClick={handleBack}
-                    disabled={isCreating}
+                    disabled={busy}
                   >
                     <ChevronLeft className="size-4" />
                     Back
@@ -793,13 +822,13 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     <Button
                       variant="outline"
                       onClick={() => handleCreateWorkspace(false)}
-                      disabled={isCreating}
+                      disabled={busy}
                     >
                       Skip for now
                     </Button>
                     <Button
                       onClick={() => handleCreateWorkspace(true)}
-                      disabled={isCreating}
+                      disabled={busy}
                       className="bg-foreground text-background hover:bg-foreground/90"
                     >
                       {isCreating ? "Creating…" : createLabel}

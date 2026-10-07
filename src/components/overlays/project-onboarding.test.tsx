@@ -167,6 +167,36 @@ describe("ProjectOnboarding — task and agent", () => {
       mockCloseWorkspace.mock.invocationCallOrder[0],
     );
   });
+
+  it("says so when the backend adopts a live workspace and drops the task", async () => {
+    mockCreate.mockResolvedValueOnce({ workspaceId: "ws-live", cwd: null, adopted: true });
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: /create & start/i }));
+    await flushMountEffects();
+
+    expect(vi.mocked(toast.info)).toHaveBeenCalledWith(
+      expect.stringContaining("Your task wasn't sent"),
+    );
+    expect(mockActivate).toHaveBeenCalledWith("ws-live");
+    expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("advances on Enter in the task input but not from the agent picker", async () => {
+    renderOnboarding();
+    await flushMountEffects();
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "Add dark mode" } });
+
+    // Enter on the agent pill (or its portaled menu) must not advance the step.
+    fireEvent.keyDown(screen.getByRole("button", { name: "Agent: Claude Code" }), { key: "Enter" });
+    expect(screen.getByLabelText("Task")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByLabelText("Task"), { key: "Enter" });
+    expect(screen.queryByLabelText("Task")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create & start Claude Code" })).toBeInTheDocument();
+  });
 });
 
 describe("ProjectOnboarding — failures", () => {
@@ -186,6 +216,25 @@ describe("ProjectOnboarding — failures", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /dismiss error/i }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("reopens the created workspace on retry when opening it failed", async () => {
+    mockActivate.mockRejectedValueOnce("window busy");
+    const { onComplete } = renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create workspace" }));
+    await flushMountEffects();
+    expect(screen.getByRole("alert")).toHaveTextContent("created but couldn't be opened");
+    expect(mockCloseWorkspace).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create workspace" }));
+    await flushMountEffects();
+    // A second create would fail with "branch already exists".
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(mockActivate).toHaveBeenLastCalledWith("ws-new");
+    expect(onComplete).toHaveBeenCalledTimes(1);
   });
 
   const worktrees: WorktreeInfo[] = [
@@ -233,6 +282,31 @@ describe("ProjectOnboarding — failures", () => {
     expect(mockActivate).toHaveBeenCalledWith("ws-a");
     expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-temp-1", false);
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks Create and Back while Import all is running", async () => {
+    mockListWorktrees.mockResolvedValueOnce(worktrees);
+    let finishImport: (id: string) => void = () => {};
+    mockImport.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { finishImport = resolve; }),
+    );
+    renderOnboarding();
+    await flushMountEffects();
+    await goToSetupStep();
+
+    await importAll();
+    await flushMountEffects();
+
+    expect(screen.getByRole("button", { name: /importing 1 \/ 2/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create workspace" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Skip for now" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /back/i })).toBeDisabled();
+
+    await act(async () => {
+      finishImport("ws-a");
+    });
+    await flushMountEffects();
+    expect(mockCreate).not.toHaveBeenCalled();
   });
 });
 
