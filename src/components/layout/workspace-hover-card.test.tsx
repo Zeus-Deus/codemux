@@ -769,7 +769,6 @@ describe("WorkspaceHoverCard — hover timing", () => {
     // the card over the menu that was just dismissed.
     setMenuOpen(false);
     pointerEnter(alpha);
-    fireEvent.blur(alpha);
     fireEvent.focus(alpha);
     advance(1000);
     expect(card()).toBeNull();
@@ -859,6 +858,38 @@ describe("WorkspaceHoverCard — hover timing", () => {
     pointerEnter(alpha);
     advance(1000);
     expect(card()).toBeNull();
+  });
+
+  // A keyboard-opened menu (Shift+F10, the Menu key) never sees a pointer,
+  // so neither a pointer leave nor a tracked point can release the latch.
+  // Focus handed back by the menu stays rejected, but focusing the row again
+  // afterwards must open the card, as it does for a row with no menu.
+  it("lets focus open the card again after a keyboard-opened menu closes", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    fireEvent.focus(alpha);
+    setMenuOpen(true);
+    fireEvent.blur(alpha);
+    setMenuOpen(false);
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    fireEvent.blur(alpha);
+    fireEvent.focus(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  // The same keyboard close must not swallow a later mouse user's first
+  // hover either, though no pointerleave ever precedes it.
+  it("opens on the first hover after a keyboard-opened menu closes", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    setMenuOpen(true);
+    setMenuOpen(false);
+
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
   });
 
   it("closes an open card when the menu opens from the keyboard", () => {

@@ -153,6 +153,9 @@ export function WorkspaceHoverCard({
   // down a long menu), no leave will follow, so the next real pointerenter
   // releases it instead, or that hover would be swallowed. Focus handed back
   // to the row by the closing menu still cannot open the card before then.
+  // A menu opened from the keyboard has no pointer to track, so the next
+  // pointerenter releases it too, and so does the row losing focus, which is
+  // the only release a keyboard-only user can reach.
   // The trigger is `asChild`, typed as an anchor; a callback ref takes the
   // row element as the plain HTMLElement it is.
   const triggerRef = useRef<HTMLElement | null>(null);
@@ -167,7 +170,7 @@ export function WorkspaceHoverCard({
       const point = lastPointer.current;
       const rect = triggerRef.current?.getBoundingClientRect();
       lastPointer.current = null;
-      if (point && rect && !rectContains(rect, point)) {
+      if (!point || (rect && !rectContains(rect, point))) {
         releaseOnPointerEnter.current = true;
       }
       return;
@@ -215,6 +218,11 @@ export function WorkspaceHoverCard({
         }}
         onPointerLeave={() => {
           if (!menuOpenRef.current) suppressUntilPointerLeave.current = false;
+        }}
+        onBlur={() => {
+          if (menuOpenRef.current) return;
+          releaseOnPointerEnter.current = false;
+          suppressUntilPointerLeave.current = false;
         }}
       >
         {children}
