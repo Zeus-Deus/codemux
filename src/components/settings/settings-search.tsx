@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 
 import { Eyebrow } from "@/components/ui/eyebrow";
@@ -9,8 +9,23 @@ import {
   type SettingsSearchResult,
 } from "@/lib/settings-search";
 
-/** How long a found row stays lit after search lands on it. */
-const FLASH_MS = 900;
+/** How long a found row stays lit after search lands on it. Matches the
+ *  `cm-settings-flash` animation in globals.css. */
+const FLASH_MS = 1_600;
+/** Room left above or below a nav row scrolled into view. */
+const NAV_SCROLL_MARGIN = 12;
+
+/** Scroll `scroller` the least distance that shows `row`. Unlike
+ *  `scrollIntoView`, this never moves the page's other scroll containers. */
+function keepInView(scroller: HTMLElement, row: HTMLElement) {
+  const box = scroller.getBoundingClientRect();
+  const rect = row.getBoundingClientRect();
+  if (rect.top < box.top) {
+    scroller.scrollTop -= box.top - rect.top + NAV_SCROLL_MARGIN;
+  } else if (rect.bottom > box.bottom) {
+    scroller.scrollTop += rect.bottom - box.bottom + NAV_SCROLL_MARGIN;
+  }
+}
 
 /**
  * The search field at the top of the Settings nav. While it has a query, it
@@ -20,11 +35,14 @@ const FLASH_MS = 900;
  */
 export function SettingsNavSearch({
   agentChatEnabled,
+  activeSection,
   inputRef,
   onNavigate,
   children,
 }: {
   agentChatEnabled: boolean;
+  /** The open page; its nav row is kept in view when it changes. */
+  activeSection: string;
   inputRef: React.RefObject<HTMLInputElement | null>;
   onNavigate: (result: SettingsSearchResult) => void;
   children: React.ReactNode;
@@ -32,6 +50,7 @@ export function SettingsNavSearch({
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const listId = useId();
+  const scrollerRef = useRef<HTMLDivElement>(null);
 
   const groups = useMemo(
     () => searchSettings(query, agentChatEnabled),
@@ -40,6 +59,15 @@ export function SettingsNavSearch({
   const results = useMemo(() => groups.flatMap((g) => g.results), [groups]);
   const searching = query.trim() !== "";
   const active = Math.min(activeIndex, Math.max(results.length - 1, 0));
+
+  // A search result or a palette jump can open a page whose nav row sits below
+  // the fold. Once the nav is back, scroll only the nav so that row shows.
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    if (searching || !scroller) return;
+    const row = scroller.querySelector<HTMLElement>('[aria-current="page"]');
+    if (row) keepInView(scroller, row);
+  }, [activeSection, searching]);
 
   const go = (result: SettingsSearchResult | undefined) => {
     if (!result) return;
@@ -111,7 +139,7 @@ export function SettingsNavSearch({
       </div>
 
       {/* The field stays put; only the list below it scrolls. */}
-      <div className="min-h-0 flex-1 overflow-y-auto pb-4 thin-scrollbar">
+      <div ref={scrollerRef} className="min-h-0 flex-1 overflow-y-auto pb-4 thin-scrollbar">
         {!searching ? (
           children
         ) : groups.length === 0 ? (
@@ -139,15 +167,24 @@ export function SettingsNavSearch({
                         onMouseMove={() => setActiveIndex(optionIndex)}
                         onClick={() => go(result)}
                         className={cn(
-                          "flex h-8 cursor-pointer items-center gap-2 rounded-lg px-2.5 text-body transition-colors duration-150",
+                          "flex min-h-8 cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-body transition-colors duration-150",
                           selected ? "bg-surface-3 text-foreground" : "text-muted-foreground/90",
                         )}
                       >
-                        <span className="min-w-0 flex-1 truncate">
+                        {/* Long labels wrap rather than truncate: the nav is
+                            narrow and the label is the whole answer. */}
+                        <span className="min-w-0 flex-1 leading-snug break-words">
                           <Highlighted text={result.label} query={query} />
+                          {result.matchedKeyword && (
+                            <span className="block text-label text-muted-foreground/70">
+                              Matches <Highlighted text={result.matchedKeyword} query={query} />
+                            </span>
+                          )}
                         </span>
                         {result.anchor === null && (
-                          <span className="shrink-0 text-label text-muted-foreground/70">Page</span>
+                          <span className="shrink-0 self-start pt-px text-label text-muted-foreground/70">
+                            Page
+                          </span>
                         )}
                       </div>
                     );

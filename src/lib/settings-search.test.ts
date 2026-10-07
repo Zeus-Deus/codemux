@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+let remoteClient = false;
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => remoteClient,
+}));
 
 import {
   searchSettings,
@@ -12,12 +17,38 @@ const labels = (query: string, agentChat = true) =>
   );
 
 describe("searchSettings", () => {
+  afterEach(() => {
+    remoteClient = false;
+  });
+
+  it("leaves out rows the web remote does not render", () => {
+    expect(labels("reset")).toContain("About › Reset settings");
+    expect(labels("log file")).toContain("About › Logs");
+    remoteClient = true;
+    expect(labels("reset")).not.toContain("About › Reset settings");
+    expect(labels("log file")).not.toContain("About › Logs");
+    // The page itself is still there.
+    expect(labels("about")).toContain("About › About");
+  });
+
   it("finds a row by a word in its label, on the page that holds it", () => {
     expect(labels("scrollback")).toContain("Session Restore › Scrollback lines");
   });
 
   it("finds a row by a synonym its label does not contain", () => {
     expect(labels("checkpoint")).toEqual(["Agent › Per-turn revert checkpoints"]);
+  });
+
+  it("names the synonym that matched when the label shows no match", () => {
+    const [agent] = searchSettings("snapshot", true);
+    expect(agent.results[0]).toMatchObject({
+      label: "Per-turn revert checkpoints",
+      matchedKeyword: "snapshot",
+    });
+    const [appearance] = searchSettings("palette", true);
+    expect(appearance.results[0]).toMatchObject({ label: "Theme", matchedKeyword: "palette" });
+    // A label that already shows the match needs no hint.
+    expect(searchSettings("scrollback", true)[0].results[0].matchedKeyword).toBeUndefined();
   });
 
   it("requires every word, so a second word narrows", () => {

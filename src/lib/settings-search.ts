@@ -1,3 +1,4 @@
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { buildNavGroups, type Section } from "./settings-sections";
 
 /**
@@ -16,6 +17,8 @@ export interface SettingsSearchEntry {
   label: string;
   /** Words people search with that the label does not contain. */
   keywords?: string;
+  /** The page hides this row on the web remote client. */
+  desktopOnly?: boolean;
 }
 
 /** Synonyms for whole pages, matched alongside the page name. */
@@ -118,8 +121,8 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "about", label: "Version", keywords: "build channel release" },
   { section: "about", label: "Updates", keywords: "check update upgrade" },
   { section: "about", label: "Performance diagnostics", keywords: "perf debug report bug slow" },
-  { section: "about", label: "Logs", keywords: "log file folder debug" },
-  { section: "about", label: "Reset settings", keywords: "defaults restore factory" },
+  { section: "about", label: "Logs", keywords: "log file folder debug", desktopOnly: true },
+  { section: "about", label: "Reset settings", keywords: "defaults restore factory", desktopOnly: true },
 ];
 
 export interface SettingsSearchResult {
@@ -129,6 +132,9 @@ export interface SettingsSearchResult {
   anchor: string | null;
   /** What the result row shows. */
   label: string;
+  /** The synonym that matched when the label holds none of the query's
+   *  words, so the result can say why it is listed. */
+  matchedKeyword?: string;
 }
 
 export interface SettingsSearchGroup {
@@ -152,6 +158,16 @@ function rank(label: string, needles: string[]): number {
   return 3;
 }
 
+/** The first keyword holding one of the query's words, or undefined when the
+ *  label already shows a match. */
+function keywordHint(label: string, keywords: string, needles: string[]): string | undefined {
+  const text = label.toLowerCase();
+  if (needles.some((n) => text.includes(n))) return undefined;
+  return keywords
+    .split(/\s+/)
+    .find((word) => needles.some((n) => word.toLowerCase().includes(n)));
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -162,7 +178,7 @@ function escapeRegExp(text: string): string {
  * A result matches when every word of the query appears in its label, its
  * keywords, or its page's name and keywords — so "git stats" and "appearance
  * orb" both narrow the way they read. Pages hidden by the current flags never
- * appear. Pages are ordered by their strongest result, then nav order, so the
+ * appear, and neither do rows the web remote client does not render. Pages are ordered by their strongest result, then nav order, so the
  * first result is the one the query most plausibly names.
  */
 export function searchSettings(
@@ -172,23 +188,40 @@ export function searchSettings(
   const needles = tokens(query);
   if (needles.length === 0) return [];
   const score = (result: SettingsSearchResult) => rank(result.label, needles);
+  const remote = isRemoteClient();
 
   const groups: SettingsSearchGroup[] = [];
   for (const item of buildNavGroups(agentChatEnabled).flatMap((g) => g.items)) {
-    const sectionText = `${item.label} ${SECTION_KEYWORDS[item.id] ?? ""}`.toLowerCase();
+    const sectionKeywords = SECTION_KEYWORDS[item.id] ?? "";
+    const sectionText = `${item.label} ${sectionKeywords}`.toLowerCase();
     const pageMatches = needles.every((n) => sectionText.includes(n));
     const results: SettingsSearchResult[] = pageMatches
-      ? [{ section: item.id, sectionLabel: item.label, anchor: null, label: item.label }]
+      ? [
+          {
+            section: item.id,
+            sectionLabel: item.label,
+            anchor: null,
+            label: item.label,
+            matchedKeyword: keywordHint(item.label, sectionKeywords, needles),
+          },
+        ]
       : [];
 
     for (const entry of SETTINGS_SEARCH_ENTRIES) {
       if (entry.section !== item.id) continue;
+      if (remote && entry.desktopOnly) continue;
       const rowText = `${entry.label} ${entry.keywords ?? ""}`.toLowerCase();
       if (!needles.every((n) => rowText.includes(n) || sectionText.includes(n))) continue;
       // When the query names the page, list only the rows it also says
       // something about, not every row on the page.
       if (pageMatches && !needles.some((n) => rowText.includes(n))) continue;
-      results.push({ section: item.id, sectionLabel: item.label, anchor: entry.label, label: entry.label });
+      results.push({
+        section: item.id,
+        sectionLabel: item.label,
+        anchor: entry.label,
+        label: entry.label,
+        matchedKeyword: keywordHint(entry.label, `${entry.keywords ?? ""} ${sectionKeywords}`, needles),
+      });
     }
 
     if (results.length === 0) continue;

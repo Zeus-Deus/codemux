@@ -88,6 +88,8 @@ export function AboutSection() {
         <UpdatesRow canAutoUpdate={canAutoUpdateFormat((format ?? "").toLowerCase())} />
         <Separator />
         <DiagnosticsRow />
+        {/* The web remote can neither open the host's files nor reset its
+            settings: the remote policy does not allow `reset_synced_settings`. */}
         {!remote && (
           <>
             <Separator />
@@ -99,10 +101,10 @@ export function AboutSection() {
                 Show log file
               </Button>
             </SettingRow>
+            <Separator />
+            <ResetSettingsRow />
           </>
         )}
-        <Separator />
-        <ResetSettingsRow />
       </div>
     </div>
   );
@@ -130,7 +132,7 @@ function UpdatesRow({ canAutoUpdate }: { canAutoUpdate: boolean }) {
   const installAndRestart = useUpdateStatusStore((s) => s.installAndRestart);
   const requestDesktopUpdate = useUpdateStatusStore((s) => s.requestDesktopUpdate);
 
-  let description: string;
+  let description: React.ReactNode;
   let action: { label: string; run: (() => void) | null } | null = null;
   switch (state) {
     case "checking":
@@ -149,12 +151,18 @@ function UpdatesRow({ canAutoUpdate }: { canAutoUpdate: boolean }) {
         action = {
           label: "Open release page",
           run: () =>
-            void openUrl(`${RELEASES_URL}/tag/v${updateVersion}`).catch(console.error),
+            void openUrl(
+              updateVersion ? `${RELEASES_URL}/tag/v${updateVersion}` : RELEASES_URL,
+            ).catch(console.error),
         };
       }
       break;
     case "downloading":
-      description = `Downloading the update… ${progress}%`;
+      description = (
+        <>
+          Downloading the update… <span className="tabular-nums">{progress}%</span>
+        </>
+      );
       action = { label: "Downloading…", run: null };
       break;
     case "ready":
@@ -243,7 +251,7 @@ function ResetSettingsRow() {
     <>
       <SettingRow
         label="Reset settings"
-        description="Return every synced setting (appearance, editor, terminal, Git, shortcuts, notifications, browser, agent chat and session restore) to its default. Signed in, this applies on every device. Preferences kept only on this device, such as density and sidebar options, stay as they are."
+        description="Return every synced setting (appearance, editor, terminal, Git, shortcuts, notifications, browser, agent chat and session restore) to its default, and delete your custom themes and custom source-control hosts. Signed in, this applies on every device. Preferences kept only on this device, such as density and sidebar options, stay as they are."
       >
         <Button variant="destructive" size="sm" onClick={() => setConfirming(true)}>
           Reset…
@@ -256,7 +264,8 @@ function ResetSettingsRow() {
             <AlertDialogTitle>Reset all synced settings?</AlertDialogTitle>
             <AlertDialogDescription>
               Your theme, fonts, keyboard shortcuts and the other synced settings go back to their
-              defaults. Projects, presets, workspaces and chats are not touched. This can't be undone.
+              defaults. Custom themes and custom source-control hosts are deleted. Projects,
+              presets, workspaces and chats are not touched. This can't be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

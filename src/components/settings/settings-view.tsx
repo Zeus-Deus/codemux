@@ -2455,6 +2455,7 @@ export function SettingsView() {
           <nav className="flex w-60 shrink-0 flex-col border-r border-border bg-background pt-4">
             <SettingsNavSearch
               agentChatEnabled={enableAgentChat}
+              activeSection={activeSection}
               inputRef={searchInputRef}
               onNavigate={navigateToSearchResult}
             >

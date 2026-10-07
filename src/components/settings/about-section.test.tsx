@@ -16,6 +16,11 @@ vi.mock("@/tauri/commands", () => ({
 }));
 vi.mock("@/lib/toast", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
+let remoteClient = false;
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => remoteClient,
+}));
+
 const resetSettings = vi.fn().mockResolvedValue(undefined);
 vi.mock("@/stores/synced-settings-store", () => ({
   useSyncedSettingsStore: (sel: (s: { resetSettings: typeof resetSettings }) => unknown) =>
@@ -50,6 +55,7 @@ describe("AboutSection", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    remoteClient = false;
   });
 
   it("shows the running version and opens its release notes", async () => {
@@ -92,6 +98,13 @@ describe("AboutSection", () => {
     );
   });
 
+  it("falls back to the release list when the new version is unknown", () => {
+    publish({ state: "update-available", updateVersion: null });
+    render(<AboutSection />);
+    fireEvent.click(screen.getByRole("button", { name: "Open release page" }));
+    expect(openUrl).toHaveBeenCalledWith("https://github.com/Zeus-Deus/codemux/releases");
+  });
+
   it("offers the restart once an update is installed", () => {
     const installAndRestart = vi.fn();
     publish({ state: "ready", installAndRestart });
@@ -112,7 +125,18 @@ describe("AboutSection", () => {
     render(<AboutSection />);
     fireEvent.click(screen.getByRole("button", { name: "Reset…" }));
     expect(resetSettings).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: "Reset settings" }));
+    expect(
+      await screen.findByText(/Custom themes and custom source-control hosts are deleted/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reset settings" }));
     expect(resetSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides host-only actions on the web remote", async () => {
+    remoteClient = true;
+    render(<AboutSection />);
+    expect(await screen.findByText(/Codemux v0\.23\.1/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show log file" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset…" })).toBeNull();
   });
 });

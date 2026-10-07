@@ -208,6 +208,7 @@ vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
 }));
 
 import { SettingsView } from "./settings-view";
+import { revealSettingsAnchor } from "./settings-search";
 import * as commands from "@/tauri/commands";
 import { SETTINGS_SEARCH_ENTRIES } from "@/lib/settings-search";
 
@@ -616,6 +617,40 @@ describe("Settings search", () => {
     view.unmount();
   });
 
+  it("scrolls the nav to the page a result opened", () => {
+    const view = render(<SettingsView />);
+    // jsdom has no layout: the nav shows y 100–500 and the About row sits at
+    // y 900–932, below the fold.
+    const scroller = view
+      .getByRole("button", { name: "Account" })
+      .closest<HTMLElement>(".overflow-y-auto")!;
+    let scrollTop = 0;
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = value;
+      },
+    });
+    scroller.getBoundingClientRect = () => new DOMRect(0, 100, 240, 400);
+    const rects = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        return this.getAttribute("aria-current") === "page"
+          ? new DOMRect(0, 900, 240, 32)
+          : new DOMRect(0, 0, 0, 0);
+      });
+
+    fireEvent.change(searchField(view), { target: { value: "diagnostics" } });
+    fireEvent.keyDown(searchField(view), { key: "Enter" });
+
+    expect(view.getByRole("button", { name: "About" })).toHaveAttribute("aria-current", "page");
+    // 932 − 500, plus the 12px margin.
+    expect(scrollTop).toBe(444);
+    rects.mockRestore();
+    view.unmount();
+  });
+
   it("moves through results with the arrow keys", () => {
     const view = render(<SettingsView />);
     fireEvent.change(searchField(view), { target: { value: "cursor" } });
@@ -662,7 +697,8 @@ describe("Settings search", () => {
 
   it("finds every indexed row on the page it points at", async () => {
     // The index stands in for pages that are not rendered, so a renamed row
-    // must be renamed here too or search lands on the top of the page.
+    // must be renamed here too or search lands on the top of the page. The
+    // check uses the same lookup navigation does, not just any text match.
     const view = render(<SettingsView />);
     const sections = new Set(SETTINGS_SEARCH_ENTRIES.map((entry) => entry.section));
     for (const section of sections) {
@@ -673,9 +709,9 @@ describe("Settings search", () => {
         // Some pages fill in after an async load (Presets).
         await waitFor(() =>
           expect(
-            view.queryAllByText(entry.label, { exact: true }).length,
+            revealSettingsAnchor(view.container, entry.label),
             `${section} → ${entry.label}`,
-          ).toBeGreaterThan(0),
+          ).toBe(true),
         );
       }
     }
