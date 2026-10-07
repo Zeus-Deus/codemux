@@ -376,6 +376,19 @@ describe("RemoteAccessSection — enabled", () => {
     );
   });
 
+  it("leaves every browser alone when Revoke all is cancelled", async () => {
+    const user = userEvent.setup();
+    render(<RemoteAccessSection />);
+    await waitFor(() => expect(screen.getByText("MacBook Air")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: /^revoke all$/i }));
+    await user.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: /cancel/i }),
+    );
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(cmds.webRemoteRevokeSession).not.toHaveBeenCalled();
+  });
+
   // The "wants to connect" question is asked app-wide by
   // useRemotePairingRequests; this section only lists the request.
   it("lists a new pending device arriving over the live event without a second toast", async () => {

@@ -29,16 +29,28 @@ function askToApprove(session: WebRemoteSessionView): void {
     session.source === "account"
       ? "Signed in with your Codemux account"
       : "Used a pairing link";
+  // A browser names itself after its platform ("Chrome on Linux"), so only
+  // repeat the platform when the name says something else.
+  const phrase = device.platform ? platformPhrase(device.platform) : "";
+  const platform = phrase === device.title ? "" : phrase;
   toast.info(`${device.title} wants to connect`, {
     id: toastId(session.id),
     // The browser waits until someone answers, so the question stays up.
     duration: Infinity,
-    description: device.platform ? `${platformPhrase(device.platform)}. ${how}.` : `${how}.`,
+    description: platform ? `${platform}. ${how}.` : `${how}.`,
     action: {
       label: "Approve",
       onClick: () => {
         webRemoteApproveSession(session.id)
-          .then(() => toast.success(`${device.title} can now use this desktop.`))
+          .then((status) => {
+            // Approving a request that was rejected or withdrawn meanwhile
+            // changes nothing, so only report what actually happened.
+            if (status.sessions.some((s) => s.id === session.id && s.approved)) {
+              toast.success(`${device.title} can now use this desktop.`);
+            } else {
+              toast.error(`${device.title} is no longer waiting to connect.`);
+            }
+          })
           .catch((err) =>
             toast.error(`Couldn't approve ${device.title}: ${String(err)}`),
           );
@@ -69,21 +81,24 @@ export function useRemotePairingRequests(): void {
     if (isRemoteClient()) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    // Null until the first snapshot, so requests from before launch are seen
-    // as known rather than new.
+    // Set once the launch snapshot is in (or failed to load).
+    let seeded = false;
+    // Null until a first status is known, so requests from before launch are
+    // seen as known rather than new. If the snapshot can't be loaded, the
+    // first event becomes that baseline instead.
     let previous: WebRemoteSessionView[] | null = null;
     // Events that beat the first snapshot, replayed once it lands so a
     // request that arrives during startup is still announced.
     let early: WebRemoteStatus[] = [];
     const asked = new Set<string>();
 
-    const apply = (status: WebRemoteStatus, announce: boolean) => {
+    const apply = (status: WebRemoteStatus) => {
       for (const id of asked) {
         if (status.sessions.some((s) => s.id === id && !s.approved)) continue;
         asked.delete(id);
         toast.dismiss(toastId(id));
       }
-      if (announce && previous) {
+      if (previous) {
         const fresh = new Set(newlyPendingSessionIds(previous, status.sessions));
         for (const session of status.sessions) {
           if (!fresh.has(session.id)) continue;
@@ -95,15 +110,15 @@ export function useRemotePairingRequests(): void {
     };
 
     const seed = (status: WebRemoteStatus | null) => {
-      if (disposed || previous) return;
-      if (status) apply(status, false);
-      else previous = [];
-      for (const event of early) apply(event, true);
+      if (disposed || seeded) return;
+      seeded = true;
+      if (status) apply(status);
+      for (const event of early) apply(event);
       early = [];
     };
     webRemoteStatus().then(seed, () => seed(null));
     onWebRemoteStateChanged((status) => {
-      if (previous) apply(status, true);
+      if (seeded) apply(status);
       else early.push(status);
     })
       .then((fn) => {

@@ -108,6 +108,27 @@ async function pairDevice(baseUrl: string, token: string): Promise<PairResult> {
   return { session, approved: body.approved !== false };
 }
 
+/**
+ * Withdraw this browser's request for approval, so the desktop stops asking
+ * about a browser that cancelled or gave up. Resolves `true` when the desktop
+ * approved it in the meantime (the next ticket poll connects), `false` once
+ * it is withdrawn or when the desktop can't be reached.
+ */
+async function withdrawPairing(baseUrl: string, token: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl}/api/withdraw`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { approved?: unknown };
+    return body.approved === true;
+  } catch {
+    return false;
+  }
+}
+
 // ── URL / token parsing ─────────────────────────────────────────────
 
 function readPairToken(): string | null {
@@ -533,10 +554,16 @@ export async function bootstrapRemote(): Promise<void> {
       // offer Cancel when it doesn't.
       else graceTimer = window.setTimeout(showConnecting, CONNECT_GRACE_MS);
       if (waiting) {
-        approvalTimer = window.setTimeout(
-          () => resolve("timed-out"),
-          APPROVAL_TIMEOUT_MS,
-        );
+        approvalTimer = window.setTimeout(() => {
+          // Withdraw the request so the desktop stops asking. One approved
+          // just before the deadline is kept: the next ticket poll connects.
+          const token = loadSession()?.sessionToken;
+          void (token ? withdrawPairing(baseUrl, token) : Promise.resolve(false)).then(
+            (approved) => {
+              if (!approved) resolve("timed-out");
+            },
+          );
+        }, APPROVAL_TIMEOUT_MS);
       }
       transport.connect().then(
         () => resolve("connected"),
@@ -548,11 +575,15 @@ export async function bootstrapRemote(): Promise<void> {
     if (outcome === "connected") break;
 
     // Declined, revoked, timed out or cancelled: drop the session and
-    // re-prompt from the top, saying why.
+    // re-prompt from the top, saying why. A cancelled request is withdrawn
+    // too (a timed-out one already was); an approved session is left alone.
     notice = pairingNotice(outcome, waiting);
+    const cancelledToken =
+      outcome === "cancelled" ? loadSession()?.sessionToken : undefined;
     clearSession();
     waiting = false;
     transport.close();
+    if (cancelledToken) void withdrawPairing(baseUrl, cancelledToken);
   }
 
   overlay.remove();

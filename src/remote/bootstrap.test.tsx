@@ -91,24 +91,32 @@ describe("ConnectScreen", () => {
 });
 
 describe("bootstrapRemote connect loop", () => {
-  /** Open the page from a pairing link that the desktop must approve. */
-  function openPendingPairingLink() {
+  /** Open the page from a pairing link that the desktop must approve.
+   *  `approvedByNow` is what the desktop answers when the browser withdraws. */
+  function openPendingPairingLink(approvedByNow = false) {
     window.history.replaceState(null, "", "/#pair=abc");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() =>
-        Promise.resolve(
-          new Response(
-            JSON.stringify({ session_id: "s1", session_token: "t1", approved: false }),
-            { status: 200 },
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify(
+            url.endsWith("/api/withdraw")
+              ? { approved: approvedByNow }
+              : { session_id: "s1", session_token: "t1", approved: false },
           ),
+          { status: 200 },
         ),
       ),
     );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  function withdrawCalls(fetchMock: ReturnType<typeof openPendingPairingLink>) {
+    return fetchMock.mock.calls.filter(([url]) => url.endsWith("/api/withdraw"));
   }
 
   it("cancels a pending request back to an empty code form", async () => {
-    openPendingPairingLink();
+    const fetchMock = openPendingPairingLink();
     void bootstrapRemote();
 
     fireEvent.click(await screen.findByRole("button", { name: /use a different code/i }));
@@ -117,6 +125,9 @@ describe("bootstrapRemote connect loop", () => {
     expect(shim.transports[0].close).toHaveBeenCalled();
     expect(loadSession()).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+    // The desktop is told, so it stops asking about this browser.
+    const [[, init]] = withdrawCalls(fetchMock);
+    expect(init?.headers).toEqual({ Authorization: "Bearer t1" });
   });
 
   it("says the desktop declined when the pending request is rejected", async () => {
@@ -142,6 +153,25 @@ describe("bootstrapRemote connect loop", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/in time/);
     expect(shim.transports[0].close).toHaveBeenCalled();
+    expect(withdrawCalls(vi.mocked(fetch))).toHaveLength(1);
+  });
+
+  it("keeps an approval that lands just before the timeout", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    openPendingPairingLink(true);
+    const done = bootstrapRemote();
+    await screen.findByText("Waiting for approval");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(APPROVAL_TIMEOUT_MS);
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(shim.transports[0].close).not.toHaveBeenCalled();
+
+    // The next ticket poll connects.
+    shim.transports[0].settle.resolve();
+    await done;
+    expect(loadSession()).not.toBeNull();
   });
 
   it("offers Cancel when a stored session is slow to reconnect", async () => {
