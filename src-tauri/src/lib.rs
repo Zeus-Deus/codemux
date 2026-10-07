@@ -2653,6 +2653,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::refresh_workspace_pr,
             commands::suggest_issue_branch_name,
             commands::detect_package_manager,
+            commands::detect_run_candidates,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,
