@@ -421,6 +421,19 @@ describe("SidebarInboxCard — multi-select", () => {
     expect(card).toHaveAttribute("data-selected", "true");
     expect(card?.className).toContain("ring-accent-ember/55");
   });
+
+  it("tells assistive tech which card is the open workspace", () => {
+    const { container, unmount } = renderCard({ isActive: true });
+    expect(container.querySelector("[data-inbox-card]")).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    unmount();
+    const other = renderCard({ isActive: false });
+    expect(
+      other.container.querySelector("[data-inbox-card]"),
+    ).not.toHaveAttribute("aria-current");
+  });
 });
 
 describe("SidebarInboxCard — background recede", () => {

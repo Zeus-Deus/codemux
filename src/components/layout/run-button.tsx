@@ -172,7 +172,12 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
       {/* Gear button — opens settings, always available */}
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button variant="ghost" size="icon-xs" onClick={handleConfigure}>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={handleConfigure}
+            aria-label={isConfigured ? "Edit run command" : "Configure run command"}
+          >
             <Settings className="size-4" />
           </Button>
         </TooltipTrigger>

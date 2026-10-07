@@ -12,7 +12,11 @@ import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
-import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
+import {
+  getWorkspaceStatus,
+  STATUS_DOT_CLASS,
+  STATUS_LABEL,
+} from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -27,6 +31,16 @@ interface RailItemRepo {
   path: string;
 }
 
+/** Two letters that tell sibling workspaces of one project apart on the
+ *  rail, where they would otherwise share an identical project avatar:
+ *  the initials of the title's first two words, or its first two letters. */
+export function workspaceMonogram(title: string): string {
+  const words = title.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const letters =
+    words.length > 1 ? words[0][0] + words[1][0] : (words[0] ?? "").slice(0, 2);
+  return letters.toUpperCase();
+}
+
 /** One active workspace as a 28px avatar button in the collapsed rail. Owns
  *  its own appearance load (per-item hook) and a live status subscription so
  *  its corner dot stays current while the sidebar is collapsed. Clicking
@@ -35,10 +49,13 @@ function RailWorkspaceItem({
   workspace,
   repo,
   isActive,
+  showMonogram,
 }: {
   workspace: WorkspaceSnapshot;
   repo: RailItemRepo;
   isActive: boolean;
+  /** Another rail item shares this project, so the avatar alone is ambiguous. */
+  showMonogram: boolean;
 }) {
   const { customColor, imageUrl, imageVersion } = useProjectAppearance(
     repo.path,
@@ -74,9 +91,19 @@ function RailWorkspaceItem({
   // (steady) monitoring > green review (shared `STATUS_DOT_CLASS`). Idle /
   // null shows nothing.
 
-  // Collapsed to a 28px avatar, the rail shows nothing but a status dot — so
-  // the same hover card the expanded inbox uses is the only way to tell two
-  // workspaces of one project apart without expanding the sidebar.
+  // The dot and the pin are visual only; the button's name has to say the
+  // same things for a screen reader.
+  const label = [
+    workspace.title,
+    status && STATUS_LABEL[status],
+    workspace.pinned_at != null && "pinned",
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  // Collapsed to a 28px avatar, two workspaces of one project would look
+  // identical, so siblings carry a monogram of their own title; the hover
+  // card still holds the full details.
   return (
     <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
         <button
@@ -84,7 +111,8 @@ function RailWorkspaceItem({
           data-rail-ws={workspace.workspace_id}
           data-active={isActive ? "true" : undefined}
           onClick={handleClick}
-          aria-label={workspace.title}
+          aria-label={label}
+          aria-current={isActive ? "page" : undefined}
           className={cn(
             "relative flex size-7 items-center justify-center rounded-lg border duration-150",
             "transition-[color,background-color,border-color,opacity] duration-150",
@@ -105,6 +133,15 @@ function RailWorkspaceItem({
             size="md"
             shape="square"
           />
+          {showMonogram && (
+            <span
+              aria-hidden
+              data-rail-monogram
+              className="absolute -bottom-1 -right-1.5 rounded-sm border border-hairline-strong bg-sidebar px-0.5 py-px text-micro font-medium leading-none text-foreground"
+            >
+              {workspaceMonogram(workspace.title)}
+            </span>
+          )}
           {workspace.pinned_at != null && (
             <Pin
               role="img"
@@ -114,6 +151,7 @@ function RailWorkspaceItem({
           )}
           {status && (
             <span
+              aria-hidden
               className={cn(
                 "absolute right-0.5 top-0.5 size-[7px] rounded-full border-[1.5px] border-sidebar",
                 STATUS_DOT_CLASS[status],
@@ -232,6 +270,12 @@ export function SidebarRailWorkspaces() {
     })
     .map(({ ws }) => ws);
 
+  const railCountByProject = new Map<string, number>();
+  for (const ws of railWorkspaces) {
+    const path = repoByWorkspace.get(ws.workspace_id)?.path;
+    if (path) railCountByProject.set(path, (railCountByProject.get(path) ?? 0) + 1);
+  }
+
   return (
     <div className="no-scrollbar flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1">
       <SidebarRailDrafts catalog={sidebarDraftCatalog} />
@@ -244,6 +288,7 @@ export function SidebarRailWorkspaces() {
             workspace={ws}
             repo={repo}
             isActive={ws.workspace_id === activeWorkspaceId}
+            showMonogram={(railCountByProject.get(repo.path) ?? 0) > 1}
           />
         );
       })}
