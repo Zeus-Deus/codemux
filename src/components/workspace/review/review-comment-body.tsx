@@ -48,7 +48,7 @@ export function CommentBody({
     >
       {segments.map((segment, i) =>
         segment.kind === "markdown" ? (
-          <MarkdownRendered key={i} content={segment.text} inline />
+          <MarkdownRendered key={i} content={segment.text} inline untrusted />
         ) : (
           <SuggestionBlock key={i} lines={segment.lines} target={target ?? null} />
         ),

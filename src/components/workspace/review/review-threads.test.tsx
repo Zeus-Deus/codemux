@@ -424,6 +424,62 @@ describe("comment content", () => {
     );
   });
 
+  it("offers no target for a range that starts on the other side", () => {
+    const suggestionTargetFor = vi.fn().mockReturnValue({
+      start: 11,
+      original: ["y"],
+      onApply: vi.fn(),
+    });
+    renderThreads({
+      threads: [
+        thread({
+          line: 12,
+          side: "RIGHT",
+          start_line: 11,
+          start_side: "LEFT",
+          comments: [
+            {
+              id: "C1",
+              database_id: 1,
+              author: "review-bot",
+              body: "```suggestion\nx\n```",
+              created_at: "",
+            },
+          ],
+        }),
+      ],
+      suggestionTargetFor,
+    });
+    expect(suggestionTargetFor).not.toHaveBeenCalled();
+    expect(screen.getByTestId("comment-suggestion")).toBeInTheDocument();
+    expect(screen.queryByTestId("apply-suggestion")).not.toBeInTheDocument();
+  });
+
+  it("keeps a commenter's HTML out of the app but renders the safe parts", () => {
+    renderThreads({
+      threads: [
+        thread({
+          comments: [
+            {
+              id: "C1",
+              database_id: 1,
+              author: "someone",
+              body:
+                '<style>body{display:none}</style><iframe srcdoc="x"></iframe>' +
+                "<details><summary>More</summary>\n\nHidden **detail**.\n\n</details>",
+              created_at: "",
+            },
+          ],
+        }),
+      ],
+    });
+    const body = screen.getByTestId("comment-body");
+    expect(body.querySelector("style")).toBeNull();
+    expect(body.querySelector("iframe")).toBeNull();
+    expect(body.querySelector("details")).not.toBeNull();
+    expect(within(body).getByText("detail").tagName).toBe("STRONG");
+  });
+
   it("offers no Apply where the branch is not checked out", () => {
     renderThreads({
       threads: [
@@ -467,6 +523,23 @@ describe("anchors", () => {
       "aria-expanded",
       "false",
     );
+  });
+
+  it("jumps a flat comment left on a deletion to the old side", async () => {
+    const user = userEvent.setup();
+    const onJumpToLine = vi.fn();
+    renderThreads({
+      inlineComments: [
+        inline({ id: 1, path: "src/a.ts", line: 7, side: "LEFT" }),
+        inline({ id: 2, path: "src/b.ts", line: 9 }),
+      ],
+      onJumpToLine,
+    });
+    const [left, unsided] = screen.getAllByTestId("thread-anchor");
+    await user.click(left);
+    expect(onJumpToLine).toHaveBeenLastCalledWith("src/a.ts", "LEFT", 7);
+    await user.click(unsided);
+    expect(onJumpToLine).toHaveBeenLastCalledWith("src/b.ts", "RIGHT", 9);
   });
 
   it("is a plain label when there is no line to go to", () => {

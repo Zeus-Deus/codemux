@@ -891,6 +891,12 @@ pub(crate) fn split_discussions(v: &Value) -> (Vec<ReviewComment>, Vec<InlineRev
                     created_at,
                 });
             } else {
+                // A note on a removed line has only an `old_line`, which
+                // counts in the old file.
+                let (line, side) = match position["new_line"].as_u64() {
+                    Some(n) => (Some(n), "RIGHT"),
+                    None => (position["old_line"].as_u64(), "LEFT"),
+                };
                 inline.push(InlineReviewComment {
                     id,
                     author,
@@ -901,10 +907,8 @@ pub(crate) fn split_discussions(v: &Value) -> (Vec<ReviewComment>, Vec<InlineRev
                         .or_else(|| position["old_path"].as_str())
                         .unwrap_or("")
                         .to_string(),
-                    line: position["new_line"]
-                        .as_u64()
-                        .or_else(|| position["old_line"].as_u64())
-                        .map(|n| n as u32),
+                    line: line.map(|n| n as u32),
+                    side: line.map(|_| side.to_string()),
                     created_at,
                     in_reply_to_id: if index == 0 { None } else { root_id },
                     pull_request_review_id: root_id,
@@ -1003,6 +1007,7 @@ pub(crate) fn map_discussion_threads(v: &Value) -> Vec<PrReviewThread> {
             line,
             side,
             start_line: None,
+            start_side: None,
             comments,
         });
     }
@@ -2904,6 +2909,7 @@ gitlab.com
         assert_eq!(inline.len(), 2);
         assert_eq!(inline[0].path, "a.txt");
         assert_eq!(inline[0].line, Some(2));
+        assert_eq!(inline[0].side.as_deref(), Some("RIGHT"));
     }
 
     #[test]
@@ -2936,6 +2942,7 @@ gitlab.com
         let (_, inline) = split_discussions(&value);
         assert_eq!(inline[0].path, "a.txt");
         assert_eq!(inline[0].line, Some(7));
+        assert_eq!(inline[0].side.as_deref(), Some("LEFT"));
     }
 
     /// A thread on a deleted line is numbered in the old file; without

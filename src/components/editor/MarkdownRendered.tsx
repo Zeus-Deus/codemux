@@ -1,6 +1,7 @@
 import { memo, useCallback, useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 import { resolveAssetSrc } from "@/lib/asset-url";
@@ -40,6 +41,13 @@ interface Props {
    * the wrapper differs.
    */
   inline?: boolean;
+  /**
+   * The content was written by someone else — a review comment anyone
+   * on the pull request can post. Raw HTML still renders (bots lean on
+   * `<details>` and `<img>`), but through GitHub's own allowlist, so a
+   * `<style>`, `<iframe>` or `<base>` cannot reach the app's DOM.
+   */
+  untrusted?: boolean;
 }
 
 /**
@@ -56,7 +64,12 @@ interface Props {
  * non-skipped render. Wrapping the wrapper itself is what skips the
  * `<ReactMarkdown>` call entirely.
  */
-function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
+function MarkdownRenderedImpl({
+  content,
+  filePath,
+  inline = false,
+  untrusted = false,
+}: Props) {
   /**
    * The image being read full size, if any.
    *
@@ -75,8 +88,12 @@ function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
   // (e.g. a README's `<div align="center">` wrapper and `<img>` logo) so
   // it renders as real elements instead of escaped text. Raw `<img>`
   // tags become proper `img` nodes, so the `img` override below still
-  // routes their `src` through `resolveAssetSrc`.
-  const rehypePlugins = useMemo(() => [rehypeRaw], []);
+  // routes their `src` through `resolveAssetSrc`. Someone else's HTML is
+  // sanitized after it is parsed, never before.
+  const rehypePlugins = useMemo(
+    () => (untrusted ? [rehypeRaw, rehypeSanitize] : [rehypeRaw]),
+    [untrusted],
+  );
 
   const components = useMemo<Components>(
     () => ({

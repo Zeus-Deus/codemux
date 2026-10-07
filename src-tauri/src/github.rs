@@ -257,6 +257,10 @@ pub struct InlineReviewComment {
     pub body: String,
     pub path: String,
     pub line: Option<u32>,
+    /// Which column `line` counts in: `"LEFT"` for a comment on a deleted
+    /// line, `"RIGHT"` otherwise. Absent when the host does not say.
+    #[serde(default)]
+    pub side: Option<String>,
     pub created_at: String,
     pub in_reply_to_id: Option<u64>,
     pub pull_request_review_id: Option<u64>,
@@ -313,10 +317,15 @@ pub struct PrReviewThread {
     /// pin it to a line nobody commented on.
     #[serde(default)]
     pub side: Option<String>,
-    /// First line of a multi-line thread, on the same side. What a
-    /// suggestion on the thread replaces runs from here to `line`.
+    /// First line of a multi-line thread. What a suggestion on the
+    /// thread replaces runs from here to `line`.
     #[serde(default)]
     pub start_line: Option<u32>,
+    /// Which column `start_line` counts in. GitHub lets a range start on
+    /// the other side from where it ends, and then the two numbers are in
+    /// different files — no single run of lines to replace.
+    #[serde(default)]
+    pub start_side: Option<String>,
     pub comments: Vec<PrThreadComment>,
 }
 
@@ -2801,18 +2810,24 @@ pub fn get_pr_inline_comments(
 
     Ok(arr
         .iter()
-        .map(|c| InlineReviewComment {
-            id: c["id"].as_u64().unwrap_or(0),
-            author: c["user"]["login"].as_str().unwrap_or("").to_string(),
-            body: c["body"].as_str().unwrap_or("").to_string(),
-            path: c["path"].as_str().unwrap_or("").to_string(),
-            line: c["line"].as_u64().map(|n| n as u32),
-            created_at: c["created_at"].as_str().unwrap_or("").to_string(),
-            in_reply_to_id: c["in_reply_to_id"].as_u64(),
-            pull_request_review_id: c["pull_request_review_id"].as_u64(),
-        })
+        .map(parse_inline_comment)
         .filter(|c| !c.body.is_empty())
         .collect())
+}
+
+/// One entry of REST's `pulls/{n}/comments`.
+fn parse_inline_comment(c: &serde_json::Value) -> InlineReviewComment {
+    InlineReviewComment {
+        id: c["id"].as_u64().unwrap_or(0),
+        author: c["user"]["login"].as_str().unwrap_or("").to_string(),
+        body: c["body"].as_str().unwrap_or("").to_string(),
+        path: c["path"].as_str().unwrap_or("").to_string(),
+        line: c["line"].as_u64().map(|n| n as u32),
+        side: c["side"].as_str().map(|s| s.to_string()),
+        created_at: c["created_at"].as_str().unwrap_or("").to_string(),
+        in_reply_to_id: c["in_reply_to_id"].as_u64(),
+        pull_request_review_id: c["pull_request_review_id"].as_u64(),
+    }
 }
 
 // ── Review threads ──
@@ -2857,7 +2872,7 @@ repository(owner:$owner,name:$name){{\
 pullRequest(number:$number){{\
 reviewThreads(first:50,after:$endCursor){{\
 pageInfo{{hasNextPage endCursor}}\
-nodes{{id isResolved isOutdated path line startLine diffSide \
+nodes{{id isResolved isOutdated path line startLine diffSide startDiffSide \
 comments(first:100){{pageInfo{{hasNextPage endCursor}}{THREAD_COMMENT_NODES}}}}}}}}}}}}}"
     )
 }
@@ -3046,6 +3061,7 @@ pub(crate) fn parse_review_threads(json: &str) -> Vec<PrReviewThread> {
                 line: node["line"].as_u64().map(|n| n as u32),
                 side: node["diffSide"].as_str().map(|s| s.to_string()),
                 start_line: node["startLine"].as_u64().map(|n| n as u32),
+                start_side: node["startDiffSide"].as_str().map(|s| s.to_string()),
                 comments,
             });
         }
@@ -4268,27 +4284,19 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
                 "body": "This looks wrong",
                 "path": "src/main.rs",
                 "line": 42,
+                "side": "LEFT",
                 "created_at": "2026-01-15T10:00:00Z",
                 "in_reply_to_id": null,
                 "pull_request_review_id": 200
             }
         ]"#;
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
-        let arr = v.as_array().unwrap();
-        let c = &arr[0];
-        let comment = InlineReviewComment {
-            id: c["id"].as_u64().unwrap_or(0),
-            author: c["user"]["login"].as_str().unwrap_or("").to_string(),
-            body: c["body"].as_str().unwrap_or("").to_string(),
-            path: c["path"].as_str().unwrap_or("").to_string(),
-            line: c["line"].as_u64().map(|n| n as u32),
-            created_at: c["created_at"].as_str().unwrap_or("").to_string(),
-            in_reply_to_id: c["in_reply_to_id"].as_u64(),
-            pull_request_review_id: c["pull_request_review_id"].as_u64(),
-        };
+        let comment = parse_inline_comment(&v.as_array().unwrap()[0]);
         assert_eq!(comment.author, "reviewer1");
         assert_eq!(comment.path, "src/main.rs");
         assert_eq!(comment.line, Some(42));
+        // A comment on a deleted line counts in the old file.
+        assert_eq!(comment.side.as_deref(), Some("LEFT"));
         assert_eq!(comment.pull_request_review_id, Some(200));
     }
 
@@ -4990,7 +4998,7 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
 
     const UNRESOLVED_THREAD: &str = r#"{
         "id":"PRRT_kwDOA","isResolved":false,"isOutdated":false,
-        "path":"src/stores/draft-store.ts","line":84,"startLine":82,"diffSide":"RIGHT",
+        "path":"src/stores/draft-store.ts","line":84,"startLine":82,"diffSide":"RIGHT","startDiffSide":"RIGHT",
         "comments":{"nodes":[
           {"id":"PRRC_1","databaseId":8001,"author":{"login":"juliusm"},
            "body":"Worth a comment on why this survives a reload.","createdAt":"2026-08-16T09:00:00Z"},
@@ -5023,6 +5031,7 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         // thread on the right row and a suggestion replace the right lines.
         assert_eq!(thread.side.as_deref(), Some("RIGHT"));
         assert_eq!(thread.start_line, Some(82));
+        assert_eq!(thread.start_side.as_deref(), Some("RIGHT"));
         assert_eq!(thread.comments.len(), 2);
         // The REST id rides along: it is what the reply endpoint
         // addresses and what the UI dedupes the flat list against.
@@ -5043,6 +5052,7 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         // being guessed.
         assert_eq!(threads[0].side, None);
         assert_eq!(threads[0].start_line, None);
+        assert_eq!(threads[0].start_side, None);
     }
 
     /// `--paginate` concatenates one *object* per page here (the timeline

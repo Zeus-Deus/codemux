@@ -374,9 +374,13 @@ function useSuggestionTarget(
   return useMemo(() => {
     if (!suggestionTargetFor || !thread.path || thread.line == null) return null;
     if (!thread.comments.some((c) => hasSuggestion(c.body))) return null;
+    const side = threadSide(thread);
+    // A range that starts on the other side counts its two ends in
+    // different files: there is no one run of lines to show or replace.
+    if (thread.start_side && thread.start_side !== side) return null;
     return suggestionTargetFor({
       path: thread.path,
-      side: threadSide(thread),
+      side,
       start: thread.start_line ?? thread.line,
       end: thread.line,
     });
@@ -933,9 +937,15 @@ export function ReviewThreads({
                 className="group/comment ml-7 mr-1 border-l-2 border-border/50 pl-2 space-y-1"
               >
                 <div className="flex min-w-0 items-center gap-1.5">
-                  {/* REST comments carry no side; RIGHT is where GitHub
-                      puts a comment unless it was left on a deletion. */}
-                  <AnchorPill path={ic.path} line={ic.line} onJump={onJumpToLine} />
+                  {/* LEFT only for a comment left on a deletion; RIGHT
+                      for everything else, and for a payload that does
+                      not say. */}
+                  <AnchorPill
+                    path={ic.path}
+                    line={ic.line}
+                    side={ic.side === "LEFT" ? "LEFT" : "RIGHT"}
+                    onJump={onJumpToLine}
+                  />
                   <CopyButton text={ic.body} />
                 </div>
                 <CommentBody body={ic.body} />
