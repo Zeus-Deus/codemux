@@ -345,6 +345,25 @@ describe("TerminalPane deferred teardown", () => {
     expect(resizePty).not.toHaveBeenCalled();
   });
 
+  // A split or panel change made while the pane was hidden left the shell at
+  // its old width until the next resize event, so the first keystrokes after
+  // showing it wrapped at the stale width.
+  it("re-syncs the PTY size as soon as a hidden pane is shown", async () => {
+    schedulerHarness();
+    const pane = (visible: boolean) => (
+      <TerminalPane sessionId="sess-a" paneId="pane-1" focused={false} visible={visible} title="term" />
+    );
+    const view = render(pane(false));
+    await act(async () => {});
+    vi.mocked(resizePty).mockClear();
+
+    view.rerender(pane(true));
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+    expect(resizePty).toHaveBeenCalledWith("sess-a", 80, 24);
+  });
+
   it("does not serialize, persist or dispose during unmount", async () => {
     const harness = schedulerHarness();
     const view = renderPane("sess-a");
