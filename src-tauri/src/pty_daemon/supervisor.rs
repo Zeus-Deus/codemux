@@ -350,7 +350,7 @@ async fn spawn_daemon_detached() -> Result<PathBuf, PtyDaemonError> {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                Ok(())
+                unblock_all_signals()
             });
         }
     }
@@ -374,6 +374,26 @@ async fn spawn_daemon_detached() -> Result<PathBuf, PtyDaemonError> {
     // `.kill()` first.
 
     Ok(socket_path)
+}
+
+/// Clear the signal mask the daemon would otherwise inherit from the app.
+/// A blocked mask survives exec, passes to every thread the daemon starts
+/// and, through `portable-pty` (which resets dispositions but not the mask),
+/// to every shell. A shell with SIGWINCH blocked never learns its pane was
+/// resized: bash's readline keeps wrapping at the old width and redraws over
+/// what was typed.
+///
+/// # Safety
+/// Only call between fork and exec (`pre_exec`); sigprocmask is
+/// async-signal-safe.
+#[cfg(unix)]
+unsafe fn unblock_all_signals() -> std::io::Result<()> {
+    let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    libc::sigemptyset(empty.as_mut_ptr());
+    if libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut()) == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn choose_socket_path() -> Result<PathBuf, PtyDaemonError> {
@@ -413,6 +433,48 @@ pub fn diagnostics_manifest_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use tokio::net::UnixStream;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_launch_does_not_pass_on_a_blocked_sigwinch() {
+        use std::os::unix::process::CommandExt;
+
+        // `SigBlk` of a child spawned from a thread that blocks SIGWINCH,
+        // with and without the daemon's mask reset.
+        fn child_sigblk(reset: bool) -> u64 {
+            std::thread::spawn(move || {
+                unsafe {
+                    let mut winch = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                    libc::sigemptyset(winch.as_mut_ptr());
+                    libc::sigaddset(winch.as_mut_ptr(), libc::SIGWINCH);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, winch.as_ptr(), std::ptr::null_mut());
+                }
+                let mut cmd = std::process::Command::new("cat");
+                cmd.arg("/proc/self/status");
+                if reset {
+                    unsafe {
+                        cmd.pre_exec(|| unblock_all_signals());
+                    }
+                }
+                let status = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
+                let mask = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigBlk:"))
+                    .unwrap();
+                u64::from_str_radix(mask.trim(), 16).unwrap()
+            })
+            .join()
+            .unwrap()
+        }
+
+        let winch = 1u64 << (libc::SIGWINCH - 1);
+        assert_ne!(
+            child_sigblk(false) & winch,
+            0,
+            "control: the block is inherited"
+        );
+        assert_eq!(child_sigblk(true), 0);
+    }
 
     #[test]
     fn matching_protocol_is_adopted() {
