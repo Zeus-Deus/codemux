@@ -138,7 +138,7 @@ describe("ComposerStrip — shell", () => {
     expect(shell.className).toContain("bg-muted/20");
     expect(shell.className).not.toContain("rounded-t-[19px]");
     const row = rows()[0];
-    expect(row.className).toContain(STRIP_ROW_HEIGHT);
+    expect(row.firstElementChild?.className).toContain(STRIP_ROW_HEIGHT);
   });
 
   it("colours only the mark: an amber, still monitoring dot", () => {
@@ -717,6 +717,106 @@ describe("ComposerStrip — usage limit", () => {
     expect(screen.queryByTestId("composer-strip")).toBeNull();
     rerender(<UsageHarness usageLimit={null} />);
     expect(screen.queryByTestId("composer-strip")).toBeNull();
+  });
+
+  it("explains a manual-only wait below the countdown without hiding its action", () => {
+    render(<UsageHarness usageLimit={limit({
+      resetsAtMs: Date.now() + 30 * MIN,
+      autoResumeBlockedReason: "attempts_exhausted",
+    })} />);
+    expect(screen.getByTestId("composer-strip-usage-explanation")).toHaveTextContent(
+      "Two automatic resumes were already used. The agent won’t continue on its own.",
+    );
+    expect(screen.getByTestId("composer-strip-usage-countdown")).toHaveTextContent("resets in");
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toBeEnabled();
+  });
+
+  it("explains unknown resets and still offers Resume", () => {
+    render(<UsageHarness usageLimit={limit({ window: null })} />);
+    expect(screen.getByTestId("composer-strip-usage-explanation")).toHaveTextContent(
+      "No reset time was reported. The agent won’t continue on its own.",
+    );
+    expect(screen.getByTestId("composer-strip-usage-resume")).toBeEnabled();
+  });
+
+  it("a manual resume stays Resuming… through the disarm that precedes its dispatch", async () => {
+    const settle: Array<() => void> = [];
+    const onResume = vi.fn(
+      () => new Promise<void>((resolve) => settle.push(resolve)),
+    );
+    const armed = limit({
+      resetsAtMs: Date.now() + 20 * MIN,
+      autoResumeAtMs: Date.now() + 21 * MIN,
+    });
+    const { rerender } = render(<UsageHarness usageLimit={armed} onResume={onResume} />);
+    fireEvent.click(screen.getByTestId("composer-strip-usage-try-now"));
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+
+    // The backend clears the schedule before dispatching: same limit, disarmed.
+    rerender(
+      <UsageHarness
+        usageLimit={{ ...armed, autoResumeAtMs: null, autoResumeBlockedReason: "cancelled" }}
+        onResume={onResume}
+      />,
+    );
+    const tryNow = screen.getByTestId("composer-strip-usage-try-now");
+    expect(tryNow).toHaveTextContent("Resuming…");
+    expect(tryNow).toBeDisabled();
+    expect(screen.queryByTestId("composer-strip-usage-explanation")).toBeNull();
+    expect(usageRow()).not.toHaveTextContent(/cancelled/i);
+    fireEvent.click(tryNow);
+    expect(onResume).toHaveBeenCalledTimes(1);
+
+    // A newer limit supersedes the click…
+    const newer = limit({ at: armed.at + 1 });
+    rerender(<UsageHarness usageLimit={newer} onResume={onResume} />);
+    const resume = screen.getByTestId("composer-strip-usage-resume");
+    expect(resume).toHaveTextContent(/^Resume$/);
+    expect(resume).toBeEnabled();
+    fireEvent.click(resume);
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(2));
+
+    // …and the older click settling does not release the newer one.
+    await act(async () => settle[0]!());
+    expect(screen.getByTestId("composer-strip-usage-resume")).toHaveTextContent("Resuming…");
+    expect(screen.getByTestId("composer-strip-usage-resume")).toBeDisabled();
+    await act(async () => settle[1]!());
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-strip-usage-resume")).toBeEnabled(),
+    );
+  });
+
+  it("a manual dispatch failure after the disarm says why nothing will happen", async () => {
+    let fail: (error: Error) => void = () => {};
+    const onResume = vi.fn(
+      () => new Promise<void>((_, reject) => (fail = reject)),
+    );
+    const armed = limit({
+      resetsAtMs: Date.now() + 20 * MIN,
+      autoResumeAtMs: Date.now() + 21 * MIN,
+    });
+    vi.mocked(toast.error).mockClear();
+    const { rerender } = render(<UsageHarness usageLimit={armed} onResume={onResume} />);
+    fireEvent.click(screen.getByTestId("composer-strip-usage-try-now"));
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+    expect(toast.error).not.toHaveBeenCalled();
+    for (const reason of ["cancelled", "dispatch_failed"] as const) {
+      rerender(
+        <UsageHarness
+          usageLimit={{ ...armed, autoResumeAtMs: null, autoResumeBlockedReason: reason }}
+          onResume={onResume}
+        />,
+      );
+    }
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toHaveTextContent("Resuming…");
+    await act(async () => fail(new Error("provider unavailable")));
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    const tryNow = screen.getByTestId("composer-strip-usage-try-now");
+    expect(tryNow).toHaveTextContent("Try now");
+    expect(tryNow).toBeEnabled();
+    expect(screen.getByTestId("composer-strip-usage-explanation")).toHaveTextContent(
+      "The resume couldn’t start. The agent won’t continue on its own.",
+    );
   });
 
   it("buttons call their command and disable while it is in flight", async () => {

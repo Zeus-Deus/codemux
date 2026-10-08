@@ -25,6 +25,7 @@ pub mod pricing;
 pub mod provider;
 pub mod types;
 pub mod slash_commands;
+pub mod usage_limit;
 
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};

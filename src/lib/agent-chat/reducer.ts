@@ -2120,6 +2120,7 @@ function applyEventInner(
           provider: event.provider,
           resetsAtMs,
           autoResumeAtMs: event.auto_resume_at_ms ?? null,
+          autoResumeBlockedReason: event.auto_resume_blocked_reason ?? null,
           window,
           at: now(),
         },
@@ -2128,12 +2129,22 @@ function applyEventInner(
     }
 
     case "usage_resume_cancelled": {
-      if (!state.usageLimit || state.usageLimit.autoResumeAtMs === null) {
+      const reason = event.reason ?? "cancelled";
+      // Disarming nothing changes nothing, but a failed dispatch is news even
+      // when no resume was armed (a manual Resume on an unscheduled limit).
+      if (
+        !state.usageLimit ||
+        (state.usageLimit.autoResumeAtMs === null && reason !== "dispatch_failed")
+      ) {
         return state;
       }
       return {
         ...state,
-        usageLimit: { ...state.usageLimit, autoResumeAtMs: null },
+        usageLimit: {
+          ...state.usageLimit,
+          autoResumeAtMs: null,
+          autoResumeBlockedReason: reason,
+        },
       };
     }
 

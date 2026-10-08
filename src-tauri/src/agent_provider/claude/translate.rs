@@ -795,6 +795,7 @@ fn translate_rate_limit_event(
             provider: ProviderKind::Claude,
             resets_at_ms,
             auto_resume_at_ms: None,
+            auto_resume_blocked_reason: None,
             window: raw_kind.map(|s| s.to_string()),
         });
     }
@@ -822,8 +823,7 @@ fn warning(
 
 /// `type: "assistant"` — may carry text, thinking, and/or tool_use
 /// blocks. Each is emitted as an `ItemCompleted`. The assistant
-/// `error` field (7 enumerated kinds) is surfaced as a
-/// `RuntimeWarning`.
+/// `error` field identifies a usage-limit stop or a runtime warning.
 ///
 /// Subagent handling:
 /// * A top-level `Agent`/`Task` `tool_use` block (in a message with
@@ -871,11 +871,19 @@ fn translate_assistant(
         });
     }
     if let Some(err) = msg.get("error").and_then(|v| v.as_str()) {
-        out.push(ProviderRuntimeEvent::RuntimeWarning {
-            thread_id: Some(thread_id.clone()),
-            message: format!("assistant error: {err}"),
-            original_payload: Some(msg.clone()),
-        });
+        // The SDK can omit rate_limit_event. The enumerated assistant error
+        // still identifies a limit; the backend can fill in a quota reset.
+        let notice = parent.is_none().then(|| crate::agent_provider::usage_limit::usage_limit_notice(
+            thread_id, ProviderKind::Claude, msg, err,
+        )).flatten();
+        if let Some(notice) = notice { out.push(notice); }
+        else {
+            out.push(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: format!("assistant error: {err}"),
+                original_payload: Some(msg.clone()),
+            });
+        }
     }
     let content = msg
         .get("message")
@@ -1625,7 +1633,7 @@ fn translate_result(
         .get("subtype")
         .and_then(|v| v.as_str())
         .unwrap_or("success");
-    let status = match subtype {
+    let mut status = match subtype {
         "success" => TurnStatus::Success,
         "error_max_turns" => TurnStatus::MaxTurns,
         "error_max_budget_usd" => TurnStatus::MaxBudget,
@@ -1652,6 +1660,14 @@ fn translate_result(
     // Context usage first, so the meter is already correct by the time
     // the UI processes the turn settling.
     let mut out = result_context_usage(thread_id, msg, &mut demux.context);
+    if let TurnStatus::Error { subtype, message } = &mut status {
+        if let Some(notice) = crate::agent_provider::usage_limit::usage_limit_notice(
+            thread_id, ProviderKind::Claude, msg, message,
+        ) {
+            *subtype = crate::agent_provider::events::RATE_LIMIT_SUBTYPE.into();
+            out.push(notice);
+        }
+    }
     out.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: thread_id.clone(),
         turn_id,
@@ -2280,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_error_surfaces_as_warning_plus_content() {
+    fn usage_limit_assistant_error_surfaces_notice_without_reset_event() {
         let msg = json!({
             "type": "assistant",
             "error": "rate_limit",
@@ -2290,13 +2306,26 @@ mod tests {
         let events = translate_sdk_message(&tid(), &msg);
         assert!(events.iter().any(|e| matches!(
             e,
-            ProviderRuntimeEvent::RuntimeWarning { message, .. }
-                if message.contains("rate_limit")
+            ProviderRuntimeEvent::UsageLimitReached { resets_at_ms: None, .. }
         )));
+        assert!(!events.iter().any(|e| matches!(e, ProviderRuntimeEvent::RuntimeWarning { .. })));
         assert!(events.iter().any(|e| matches!(
             e,
             ProviderRuntimeEvent::ItemCompleted { .. }
         )));
+    }
+
+    #[test]
+    fn usage_limit_execution_error_preserves_reported_reset() {
+        let msg = json!({"type":"result", "subtype":"error_during_execution",
+            "errors":["You've hit your usage limit"], "reset_at_ms":1_800_000_000_000_i64});
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::UsageLimitReached {
+            resets_at_ms: Some(1_800_000_000_000), ..
+        })));
+        assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted {
+            status: TurnStatus::Error { subtype, .. }, ..
+        } if subtype == "rate_limit")));
     }
 
     #[test]
@@ -2693,6 +2722,7 @@ mod tests {
                 resets_at_ms: None,
                 window: None,
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 ..
             }
         ));

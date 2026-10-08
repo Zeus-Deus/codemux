@@ -94,19 +94,19 @@ impl PlanQuotaStore {
             .and_then(|map| map.get(provider).and_then(|q| q.auth_mode))
     }
 
-    /// The exhausted window with the earliest future reset for `provider`,
+    /// The exhausted window with the latest future reset for `provider`,
     /// as `(resets_at_ms, raw window label)`.
     ///
     /// Fallback for providers whose "usage limit hit" signal carries no
     /// reset time of its own: the last quota reading is the only place the
-    /// provider reported one. See [`earliest_exhausted_reset`].
+    /// provider reported one. See [`blocking_exhausted_reset`].
     pub fn exhausted_reset_for(
         &self,
         provider: &str,
         now_ms: i64,
     ) -> Option<(i64, Option<String>)> {
         let map = self.inner.lock().ok()?;
-        earliest_exhausted_reset(&map.get(provider)?.windows, now_ms)
+        blocking_exhausted_reset(&map.get(provider)?.windows, now_ms)
     }
 }
 
@@ -114,14 +114,16 @@ impl PlanQuotaStore {
 /// 100 because providers round their reported utilization.
 pub const EXHAUSTED_WINDOW_PCT: f64 = 99.0;
 
-/// Pick the earliest *future* reset among the windows that are exhausted
-/// (`used_pct >= EXHAUSTED_WINDOW_PCT`). `None` when no exhausted window
-/// reported a reset that is still ahead — the caller must then treat the
-/// reset as unknown rather than invent one.
-pub fn earliest_exhausted_reset(
+/// All exhausted windows must reset before the account can run again.
+/// An exhausted window without a reported reset makes the wait unknown.
+/// Already-reset readings are stale and do not extend the wait.
+pub fn blocking_exhausted_reset(
     windows: &[PlanUsageWindow],
     now_ms: i64,
 ) -> Option<(i64, Option<String>)> {
+    if windows.iter().any(|w| w.used_pct >= EXHAUSTED_WINDOW_PCT && w.resets_at_ms.is_none()) {
+        return None;
+    }
     windows
         .iter()
         .filter(|w| w.used_pct >= EXHAUSTED_WINDOW_PCT)
@@ -130,7 +132,7 @@ pub fn earliest_exhausted_reset(
                 .filter(|at| *at > now_ms)
                 .map(|at| (at, w.label.clone()))
         })
-        .min_by_key(|(at, _)| *at)
+        .max_by_key(|(at, _)| *at)
 }
 
 /// One bar in the overview chart.
@@ -1176,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_reset_picks_earliest_future_reset_of_exhausted_windows() {
+    fn usage_limit_waits_for_all_exhausted_windows() {
         let at = |kind, pct, reset: Option<i64>, label: &str| PlanUsageWindow {
             kind,
             used_pct: pct,
@@ -1189,22 +1191,23 @@ mod tests {
             at(PlanWindowKind::Other, 50.0, Some(1_100), "a"),
             // Exhausted but already reset — ignored.
             at(PlanWindowKind::Other, 100.0, Some(900), "b"),
-            // Exhausted, no reset reported — ignored.
-            at(PlanWindowKind::Other, 100.0, None, "c"),
             at(PlanWindowKind::SevenDay, 100.0, Some(9_000), "seven_day"),
             at(PlanWindowKind::FiveHour, 99.2, Some(5_000), "five_hour"),
         ];
         assert_eq!(
-            earliest_exhausted_reset(&windows, now),
-            Some((5_000, Some("five_hour".into())))
+            blocking_exhausted_reset(&windows, now),
+            Some((9_000, Some("seven_day".into())))
         );
-        assert_eq!(earliest_exhausted_reset(&windows[..3], now), None);
-        assert_eq!(earliest_exhausted_reset(&[], now), None);
+        assert_eq!(blocking_exhausted_reset(&windows[..2], now), None);
+        assert_eq!(blocking_exhausted_reset(&[], now), None);
+        let mut unknown = windows.clone();
+        unknown.push(at(PlanWindowKind::Other, 100.0, None, "unknown"));
+        assert_eq!(blocking_exhausted_reset(&unknown, now), None);
 
         let store = PlanQuotaStore::default();
         assert_eq!(store.exhausted_reset_for("codex", now), None);
         store.record("codex", windows, None, None, now);
-        assert_eq!(store.exhausted_reset_for("codex", now).map(|r| r.0), Some(5_000));
+        assert_eq!(store.exhausted_reset_for("codex", now).map(|r| r.0), Some(9_000));
         assert_eq!(store.exhausted_reset_for("claude", now), None);
     }
 

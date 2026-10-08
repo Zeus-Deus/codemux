@@ -7207,6 +7207,12 @@ pub async fn spawn_stall_watchdog<R: Runtime>(app: AppHandle<R>) {
 /// `agent_chat_messages`. Extracted so the policy is unit-testable
 /// without an `AppHandle`.
 pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
+    // This explicit adapter restriction belongs in the reopened transcript.
+    // General runtime warnings remain transient SDK diagnostics.
+    if let ProviderRuntimeEvent::RuntimeWarning { thread_id, message, .. } = event {
+        return thread_id.is_some()
+            && message == crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING;
+    }
     matches!(
         event,
         ProviderRuntimeEvent::ItemCompleted { .. }
@@ -7399,7 +7405,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }
@@ -9012,6 +9018,17 @@ mod tests {
             original_payload: None,
         };
         assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_persist_hermes_usage_limit_recovery_warning_only_for_a_thread() {
+        let warning = |thread_id| ProviderRuntimeEvent::RuntimeWarning {
+            thread_id,
+            message: crate::agent_provider::hermes::USAGE_LIMIT_RECOVERY_WARNING.into(),
+            original_payload: None,
+        };
+        assert!(should_persist_event(&warning(Some(tid()))));
+        assert!(!should_persist_event(&warning(None)));
     }
 
     // ── AgentChatChannelRegistry ──
