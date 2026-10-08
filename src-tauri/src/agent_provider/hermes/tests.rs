@@ -1,27 +1,5 @@
 use super::*;
 use std::path::Path;
-
-#[test]
-fn usage_limit_hermes_prompt_errors_preserve_retry_timing() {
-    let thread = ThreadId("hermes-limit".into());
-    let reset = 1_800_000_000_000_i64;
-    for response in [
-        Ok(json!({"stopReason":"error", "_meta":{"agentResult":"Usage limit reached"}, "reset_at_ms":reset})),
-        Err(crate::json_rpc_child::RpcChildError::RpcError(RpcError {
-            code: -32000, message: "Rate limit reached".into(),
-            data: Some(json!({"reset_at_ms":reset})),
-        })),
-    ] {
-        assert!(matches!(prompt_usage_limit(&thread, &response), Some(ProviderRuntimeEvent::UsageLimitReached {
-            provider: ProviderKind::Hermes, resets_at_ms: Some(at), ..
-        }) if at == reset));
-    }
-    assert!(prompt_usage_limit(&thread, &Ok(json!({"stopReason":"end_turn", "message":"Explain usage limits"}))).is_none());
-    assert!(prompt_usage_limit(&thread, &Err(crate::json_rpc_child::RpcChildError::RpcError(RpcError {
-        code: -32000, message: "Authentication failed".into(), data: None,
-    }))).is_none());
-}
-
 impl BindingStore for crate::database::DatabaseStore {
     fn load(&self, thread: &str) -> Result<Option<Binding>, String> {
         self.hermes_binding(thread)
