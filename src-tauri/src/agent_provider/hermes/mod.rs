@@ -34,7 +34,8 @@ fn rpc(error: impl std::fmt::Display) -> ProviderError {
 fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
-const LIMITS: &str = "Reasoning control unavailable in this Hermes adapter. Background learning has no completion acknowledgment; worktree cleanup remains pending. Desktop can read history, but execution handoff is unsupported. Automatic resume after usage limits is unavailable with this Hermes version.";
+const LIMITS: &str = "Reasoning control unavailable in this Hermes adapter. Background learning has no completion acknowledgment; worktree cleanup remains pending. Desktop can read history, but execution handoff is unsupported.";
+pub(crate) const USAGE_LIMIT_RECOVERY_WARNING: &str = "hermes-usage-limit-recovery: Automatic resume after usage limits is unavailable with this Hermes version. Continue manually once your provider limit resets.";
 
 /// Deliberately conservative: the catalog has no unambiguous provider metadata in 0.21.3.
 /// A custom ID containing further colons may be named-provider routing OR an opaque model;
@@ -1075,6 +1076,11 @@ impl AgentProvider for HermesProvider {
         self.inner.emit(ProviderRuntimeEvent::SessionConfigured {
             thread_id: input.thread_id.clone(),
             provider_session_id: ProviderSessionId(sid),
+        });
+        self.inner.emit(ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(input.thread_id.clone()),
+            message: USAGE_LIMIT_RECOVERY_WARNING.into(),
+            original_payload: None,
         });
         self.inner.emit(ProviderRuntimeEvent::RuntimeWarning {
             thread_id: Some(input.thread_id),

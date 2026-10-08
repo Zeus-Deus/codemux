@@ -1138,6 +1138,25 @@ describe("agent-chat reducer", () => {
     warn.mockRestore();
   });
 
+  it("shows the Hermes restriction live and after reopening the transcript", () => {
+    const message = "Automatic resume after usage limits is unavailable with this Hermes version. Continue manually once your provider limit resets.";
+    const event: ProviderRuntimeEvent = {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "hermes-usage-limit-recovery: " + message,
+      original_payload: null,
+    };
+    for (const state of [
+      applyEvent(createEmptyThreadState(), event),
+      replayPayloads([JSON.stringify(event)], { provider: "hermes" }),
+    ]) {
+      expect(state.messages).toEqual([
+        expect.objectContaining({ kind: "runtime_notice", message }),
+      ]);
+      expect(state.usageLimit).toBeNull();
+    }
+  });
+
   it("content_delta that follows a sealed assistant + tool_call starts a NEW assistant block at a fresh seq (AskUserQuestion position bug)", () => {
     // Reproduces the AskUserQuestion "Answered above older tool calls"
     // bug. Timeline: assistant emits a preamble, a tool runs, the user

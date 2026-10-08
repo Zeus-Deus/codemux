@@ -67,4 +67,10 @@ describe("runtimeNoticeFromWarning", () => {
     ).toBeNull();
     expect(runtimeNoticeFromWarning("unknown sdk variant", {})).toBeNull();
   });
+
+  it("shows the explicit Hermes restriction without inferring errors from prose", () => {
+    const text = "Automatic resume after usage limits is unavailable with this Hermes version. Continue manually once your provider limit resets.";
+    expect(runtimeNoticeFromWarning("hermes-usage-limit-recovery: " + text, null)).toBe(text);
+    expect(runtimeNoticeFromWarning(text, null)).toBeNull();
+  });
 });
