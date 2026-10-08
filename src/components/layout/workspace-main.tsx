@@ -9,6 +9,7 @@ import {
 import {
   clampRightPanelWidth,
   maxRightPanelWidth,
+  renderedRightPanelWidth,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
 import { resizeKeyAction } from "@/lib/resize-keys";
@@ -161,9 +162,13 @@ function RightPanelResizer({
       className="group relative z-10 w-px shrink-0 bg-border outline-none"
       onPointerDown={startResize}
       onKeyDown={handleKeyDown}
-      onDoubleClick={() =>
-        commitWidth(useUIStore.getInitialState().rightPanelWidth)
-      }
+      onDoubleClick={() => {
+        // Back to the stored default as is: the drag minimum is for moving
+        // the seam, not for the default width.
+        const width = useUIStore.getInitialState().rightPanelWidth;
+        setRightPanelWidth(width);
+        dbSetUiState("right_panel_width", String(width)).catch(console.error);
+      }}
       role="separator"
       tabIndex={0}
       aria-orientation="vertical"
@@ -365,14 +370,10 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
   // ResizeObserver) fall back to the stored value — the observer corrects
   // it on the very next frame, and clamping against a width of 0 would
   // snap every panel to its minimum.
-  // The measured row only caps the panel so the content keeps its room. It
-  // never widens the panel past the stored width: the minimum is for drags
-  // and key presses, and raising the stored default to it here would take
-  // that space from the content on a narrow window.
-  const effectiveRightPanelWidth =
-    contentRowWidth > 0
-      ? Math.min(storedRightPanelWidth, maxRightPanelWidth(contentRowWidth))
-      : storedRightPanelWidth;
+  const effectiveRightPanelWidth = renderedRightPanelWidth(
+    storedRightPanelWidth,
+    contentRowWidth,
+  );
   const activeTab = activeWorkspace.tabs.find(
     (t) => t.tab_id === activeWorkspace.active_tab_id,
   );

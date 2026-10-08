@@ -97,3 +97,12 @@ export function clampRightPanelWidth(
     Math.min(maxRightPanelWidth(available), width),
   );
 }
+
+/**
+ * The width the panel is drawn at. A measured row only caps the stored width
+ * so the content keeps its room; it never raises it to the drag minimum.
+ * The title bar uses the same value so its band stops at the panel's edge.
+ */
+export function renderedRightPanelWidth(stored: number, available: number): number {
+  return available > 0 ? Math.min(stored, maxRightPanelWidth(available)) : stored;
+}

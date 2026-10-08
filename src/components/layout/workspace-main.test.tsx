@@ -591,7 +591,7 @@ describe("WorkspaceMain right panel resizer keyboard and reset", () => {
     state.rightPanelTabs = { "ws-1": "files" };
     const { getByRole } = render(<WorkspaceMain />);
     fireEvent.doubleClick(getByRole("separator", { name: "Resize right panel" }));
-    // The default sits under today's floor, so it renders at the floor.
-    expect(state.panelWidths).toEqual([360]);
+    // The stored default as is: the drag minimum does not raise it.
+    expect(state.panelWidths).toEqual([320]);
   });
 });
