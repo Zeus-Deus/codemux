@@ -19,6 +19,7 @@ const state = {
   tasks: null as TasksSnapshot | null,
   rightPanelTabs: {} as Record<string, string | null>,
   rightPanelMaximized: false,
+  rightPanelWidth: 320,
   rowWidths: [] as number[],
   panelWidths: [] as number[],
 };
@@ -104,7 +105,7 @@ vi.mock("@/stores/ui-store", () => ({
         onboardingProjectDir: null,
         setOnboardingProjectDir: vi.fn(),
         rightPanelTabs: state.rightPanelTabs,
-        rightPanelWidth: 320,
+        rightPanelWidth: state.rightPanelWidth,
         rightPanelRowWidth: 0,
         rightPanelMaximized: state.rightPanelMaximized,
         setRightPanelWidth: (width: number) => state.panelWidths.push(width),
@@ -186,6 +187,7 @@ beforeEach(() => {
   state.tasks = null;
   state.rightPanelTabs = {};
   state.rightPanelMaximized = false;
+  state.rightPanelWidth = 320;
   state.rowWidths = [];
   state.panelWidths = [];
 });
@@ -447,6 +449,46 @@ describe("WorkspaceMain right-panel full expand", () => {
     expect(getByTestId("right-panel-column")).toHaveClass("shrink-0");
     expect(getByTestId("workspace-content-column")).toHaveClass("flex-1");
     expect(getByTestId("right-panel-resizer")).toBeInTheDocument();
+  });
+
+  describe("with a measured content row", () => {
+    const rowWidth = 800;
+    let rectSpy: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          observe() {}
+          disconnect() {}
+        },
+      );
+      rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+        width: rowWidth,
+        height: 600,
+      } as DOMRect);
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      rectSpy.mockRestore();
+    });
+
+    // Raising the stored default to the drag minimum took that width from
+    // the workspace column on a narrow window.
+    it("keeps a stored width below the drag minimum as it is", () => {
+      state.enableAgentChat = true;
+      state.rightPanelTabs = { "ws-1": "files" };
+      const { getByTestId } = render(<WorkspaceMain />);
+      expect(getByTestId("right-panel-column").style.width).toBe("320px");
+    });
+
+    it("caps a wide stored width so the workspace column keeps its room", () => {
+      state.enableAgentChat = true;
+      state.rightPanelTabs = { "ws-1": "files" };
+      state.rightPanelWidth = 3000;
+      const { getByTestId } = render(<WorkspaceMain />);
+      // min(800 * 0.75, 800 - 240) = 560
+      expect(getByTestId("right-panel-column").style.width).toBe("560px");
+    });
   });
 
   it("swaps to a flexible panel and a zero-width workspace column when expanded", () => {

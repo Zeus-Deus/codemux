@@ -365,9 +365,13 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
   // ResizeObserver) fall back to the stored value — the observer corrects
   // it on the very next frame, and clamping against a width of 0 would
   // snap every panel to its minimum.
+  // The measured row only caps the panel so the content keeps its room. It
+  // never widens the panel past the stored width: the minimum is for drags
+  // and key presses, and raising the stored default to it here would take
+  // that space from the content on a narrow window.
   const effectiveRightPanelWidth =
     contentRowWidth > 0
-      ? clampRightPanelWidth(storedRightPanelWidth, contentRowWidth)
+      ? Math.min(storedRightPanelWidth, maxRightPanelWidth(contentRowWidth))
       : storedRightPanelWidth;
   const activeTab = activeWorkspace.tabs.find(
     (t) => t.tab_id === activeWorkspace.active_tab_id,
