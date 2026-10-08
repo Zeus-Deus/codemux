@@ -20,6 +20,7 @@ import {
   formatResetTime,
   nextUsageLimitBoundary,
   usageLimitPhase,
+  usageResumeExplanation,
   usageWindowLabel,
 } from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
@@ -266,7 +267,12 @@ export function useUsageLimitOccupant({
   onCancel: () => Promise<void>;
 }): StripOccupant | null {
   const [clock, setClock] = useState(() => Date.now());
-  const [pending, setPending] = useState<"resume" | "cancel" | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    kind: "resume" | "cancel";
+    limitKey: string;
+    token: number;
+  } | null>(null);
+  const tokenRef = useRef(0);
 
   useEffect(() => {
     if (!usageLimit) return;
@@ -286,16 +292,20 @@ export function useUsageLimitOccupant({
     return () => window.clearTimeout(id);
   }, [usageLimit, clock]);
 
-  // A new limit, a disarm, or a thread switch settles any in-flight click.
-  useEffect(() => {
-    setPending(null);
-  }, [usageLimit, threadId]);
+  // A click belongs to the limit it was made on. A disarm keeps the limit's
+  // `at`, so a manual resume stays pending while the backend clears the old
+  // schedule before dispatching; a newer limit or a thread switch has a new
+  // key and supersedes it.
+  const limitKey = usageLimit ? `${threadId ?? ""}\u0000${usageLimit.at}` : null;
+  const pending =
+    pendingAction && pendingAction.limitKey === limitKey ? pendingAction.kind : null;
 
-  if (!usageLimit || streaming) return null;
+  if (!usageLimit || streaming || limitKey === null) return null;
 
   const run = (kind: "resume" | "cancel") => {
     if (pending) return;
-    setPending(kind);
+    const token = ++tokenRef.current;
+    setPendingAction({ kind, limitKey, token });
     const action = kind === "resume" ? onResume : onCancel;
     void Promise.resolve()
       .then(action)
@@ -308,19 +318,23 @@ export function useUsageLimitOccupant({
           { description: error instanceof Error ? error.message : String(error) },
         );
       })
-      .finally(() => setPending(null));
+      // An older click settling must not release a newer one.
+      .finally(() =>
+        setPendingAction((cur) => (cur?.token === token ? null : cur)),
+      );
   };
 
   const busy = pending !== null;
+  const resuming = pending === "resume";
   const tryNow: StripAction = {
-    label: "Try now",
+    label: resuming ? "Resuming…" : "Try now",
     title: "Resume now instead of waiting for the reset",
     testId: "composer-strip-usage-try-now",
     disabled: busy,
     onClick: () => run("resume"),
   };
   const resume: StripAction = {
-    label: "Resume",
+    label: resuming ? "Resuming…" : "Resume",
     title: "Continue the run the usage limit stopped",
     tone: "solid",
     testId: "composer-strip-usage-resume",
@@ -382,6 +396,9 @@ export function useUsageLimitOccupant({
       };
       break;
   }
+  // The disarm that precedes a manual dispatch is not news; explain only
+  // what the user is left with once the resume settles.
+  row.note = resuming ? null : usageResumeExplanation(usageLimit, clock);
   return { kind: "usage", summary: row, rows: [row] };
 }
 

@@ -2975,6 +2975,7 @@ describe("usage limit", () => {
       provider: "claude",
       resetsAtMs: 5_000_000,
       autoResumeAtMs: 5_060_000,
+      autoResumeBlockedReason: null,
       window: "five_hour",
       at: 1_000,
     });
@@ -3013,6 +3014,50 @@ describe("usage limit", () => {
     expect(
       applyEvent(idle, { type: "usage_resume_cancelled", thread_id: "t1" }),
     ).toBe(idle);
+  });
+
+  it("replays why continuation is unavailable or failed", () => {
+    const state = runEvents([
+      limitEvent({ auto_resume_at_ms: null, auto_resume_blocked_reason: "attempts_exhausted" }),
+    ]);
+    expect(state.usageLimit?.autoResumeBlockedReason).toBe("attempts_exhausted");
+    const failed = runEvents([
+      limitEvent(),
+      { type: "usage_resume_cancelled", thread_id: "t1", reason: "dispatch_failed" },
+    ]);
+    expect(failed.usageLimit?.autoResumeBlockedReason).toBe("dispatch_failed");
+    expect(failed.usageLimit?.autoResumeAtMs).toBeNull();
+  });
+
+  it("a manual dispatch failure lands after the disarm that preceded it", () => {
+    // Manual Resume: the backend disarms first, then reports the failure.
+    const disarmed = runEvents([
+      limitEvent(),
+      { type: "usage_resume_cancelled", thread_id: "t1", reason: "cancelled" },
+    ]);
+    expect(disarmed.usageLimit?.autoResumeBlockedReason).toBe("cancelled");
+    const failed = applyEvent(disarmed, {
+      type: "usage_resume_cancelled",
+      thread_id: "t1",
+      reason: "dispatch_failed",
+    });
+    expect(failed.usageLimit).toMatchObject({
+      autoResumeAtMs: null,
+      autoResumeBlockedReason: "dispatch_failed",
+      at: disarmed.usageLimit?.at,
+    });
+
+    // Disarming an unarmed limit keeps its own explanation.
+    const unknown = runEvents([
+      limitEvent({ resets_at_ms: null, auto_resume_at_ms: null, auto_resume_blocked_reason: "unknown_reset" }),
+    ]);
+    expect(
+      applyEvent(unknown, { type: "usage_resume_cancelled", thread_id: "t1", reason: "cancelled" }),
+    ).toBe(unknown);
+    expect(
+      applyEvent(unknown, { type: "usage_resume_cancelled", thread_id: "t1", reason: "dispatch_failed" })
+        .usageLimit?.autoResumeBlockedReason,
+    ).toBe("dispatch_failed");
   });
 
   it("the closing turn_completed keeps the limit and records a silent boundary", () => {

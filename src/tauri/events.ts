@@ -16,6 +16,10 @@ import type { AutomationRunView } from "./commands";
 
 export type EventCallback<T> = (payload: T) => void;
 
+export type UsageResumeBlockedReason =
+  | "disabled" | "unknown_reset" | "reset_passed" | "reset_too_far"
+  | "attempts_exhausted" | "cancelled" | "dispatch_failed" | "storage_failed";
+
 export const onAppStateChanged = (cb: EventCallback<AppStateSnapshot>): Promise<UnlistenFn> =>
   listen<AppStateSnapshot>("app-state-changed", (e) => cb(e.payload));
 
@@ -601,6 +605,7 @@ export type ProviderRuntimeEvent =
       /** When Codemux will resume the run on its own (unix ms); `null` when
        *  no automatic resume is armed. */
       auto_resume_at_ms?: number | null;
+      auto_resume_blocked_reason?: UsageResumeBlockedReason | null;
       /** Exhausted window, e.g. `five_hour`, `seven_day`, `seven_day_opus`. */
       window?: string | null;
     }
@@ -609,6 +614,7 @@ export type ProviderRuntimeEvent =
   | {
       type: "usage_resume_cancelled";
       thread_id: string;
+      reason?: UsageResumeBlockedReason | null;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

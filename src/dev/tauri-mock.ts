@@ -4510,6 +4510,7 @@ const handlers: Record<string, Handler> = {
     emitChatEvent(threadId, {
       type: "usage_resume_cancelled",
       thread_id: threadId,
+      reason: "cancelled",
     });
     return undefined;
   },

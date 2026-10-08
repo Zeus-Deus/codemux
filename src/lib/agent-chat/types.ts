@@ -9,6 +9,7 @@ import type {
   SubagentTaskKind,
   TasksSnapshot,
   TurnStatus,
+  UsageResumeBlockedReason,
 } from "@/tauri/events";
 
 export type { SubagentStatus, SubagentTaskKind };
@@ -408,6 +409,7 @@ export interface UsageLimitState {
   resetsAtMs: number | null;
   /** When Codemux resumes on its own; `null` when nothing is armed. */
   autoResumeAtMs: number | null;
+  autoResumeBlockedReason?: UsageResumeBlockedReason | null;
   window: string | null;
   /** Clock time the limit was observed. */
   at: number;

@@ -829,6 +829,9 @@ pub enum ProviderRuntimeEvent {
         /// out, or automatic attempts exhausted).
         #[serde(default)]
         auto_resume_at_ms: Option<i64>,
+        /// Why the backend could not arm an automatic continuation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_resume_blocked_reason: Option<UsageResumeBlockedReason>,
         /// Which quota window was exhausted, as the provider names it
         /// (e.g. `"five_hour"`, `"seven_day"`). `None` when unknown.
         #[serde(default)]
@@ -839,7 +842,24 @@ pub enum ProviderRuntimeEvent {
     /// because the automatic dispatch failed. The UI falls back to the
     /// manual resume affordance. Persisted so hydrate does not resurrect a
     /// stale countdown.
-    UsageResumeCancelled { thread_id: ThreadId },
+    UsageResumeCancelled {
+        thread_id: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<UsageResumeBlockedReason>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageResumeBlockedReason {
+    Disabled,
+    UnknownReset,
+    ResetPassed,
+    ResetTooFar,
+    AttemptsExhausted,
+    Cancelled,
+    DispatchFailed,
+    StorageFailed,
 }
 
 /// Turn-error subtype providers stamp on a [`TurnStatus::Error`] when the
@@ -1137,6 +1157,7 @@ mod tests {
             provider: ProviderKind::Claude,
             resets_at_ms: Some(1_800_000_000_000),
             auto_resume_at_ms: Some(1_800_000_045_000),
+            auto_resume_blocked_reason: None,
             window: Some("five_hour".into()),
         };
         let v = serde_json::to_value(&event).unwrap();
@@ -1176,6 +1197,7 @@ mod tests {
             provider: ProviderKind::Codex,
             resets_at_ms: None,
             auto_resume_at_ms: None,
+            auto_resume_blocked_reason: None,
             window: None,
         };
         let v = serde_json::to_value(&event).unwrap();
@@ -1193,6 +1215,7 @@ mod tests {
             ProviderRuntimeEvent::UsageLimitReached {
                 resets_at_ms: None,
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 window: None,
                 ..
             }
@@ -1203,13 +1226,14 @@ mod tests {
     fn usage_resume_cancelled_wire_shape_round_trips() {
         let event = ProviderRuntimeEvent::UsageResumeCancelled {
             thread_id: ThreadId("t1".into()),
+            reason: None,
         };
         let v = serde_json::to_value(&event).unwrap();
         assert_eq!(v, json!({"type": "usage_resume_cancelled", "thread_id": "t1"}));
         let back: ProviderRuntimeEvent = serde_json::from_value(v).unwrap();
         assert!(matches!(
             back,
-            ProviderRuntimeEvent::UsageResumeCancelled { thread_id } if thread_id.0 == "t1"
+            ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } if thread_id.0 == "t1"
         ));
     }
 

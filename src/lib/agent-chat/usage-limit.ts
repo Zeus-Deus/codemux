@@ -1,5 +1,6 @@
 import { formatClockTime } from "./goal";
 import type { UsageLimitState } from "./types";
+import type { UsageResumeBlockedReason } from "@/tauri/events";
 
 /**
  * Presentation helpers for a provider usage-limit stop: the transcript
@@ -20,6 +21,35 @@ export const FINE_TICK_WINDOW_MS = 2 * 60_000;
 
 export const FINE_TICK_MS = 1_000;
 export const COARSE_TICK_MS = 15_000;
+
+/** Why nothing is armed, in the past tense so a row hydrated hours later or
+ *  read after the reset still holds. Never names a button: the same note
+ *  sits beside "Try now" before the reset and "Resume" after it. */
+const BLOCKED_REASON_TEXT: Record<UsageResumeBlockedReason, string> = {
+  disabled: "Automatic resume was turned off in Settings → Agent.",
+  unknown_reset: "No reset time was reported.",
+  reset_passed: "The reported reset time had already passed.",
+  reset_too_far: "The reset was more than 26 hours away.",
+  attempts_exhausted: "Two automatic resumes were already used.",
+  cancelled: "Automatic resume was cancelled.",
+  dispatch_failed: "The resume couldn’t start.",
+  storage_failed: "The automatic resume couldn’t be saved.",
+};
+
+const MANUAL_ONLY = "The agent won’t continue on its own.";
+
+export function usageResumeExplanation(limit: UsageLimitState, now: number): string | null {
+  if (limit.autoResumeAtMs !== null) {
+    return usageLimitPhase(limit, now).kind === "reset"
+      ? "Automatic resume hasn’t started."
+      : null;
+  }
+  const reason =
+    limit.autoResumeBlockedReason ??
+    // Old transcript rows do not carry a reason. Explain only what is known.
+    (limit.resetsAtMs === null ? "unknown_reset" : null);
+  return reason ? `${BLOCKED_REASON_TEXT[reason]} ${MANUAL_ONLY}` : null;
+}
 
 const WINDOW_LABELS: Record<string, string> = {
   five_hour: "5-hour limit",

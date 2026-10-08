@@ -69,6 +69,8 @@ export interface StripRow {
   mark: StripMark;
   label: string;
   detail?: string | null;
+  /** Explanation that must stay readable instead of truncating with detail. */
+  note?: string | null;
   /** A detail that is a pure function of the clock (a countdown), repainted
    *  on its own interval without re-rendering the strip. */
   liveDetail?: {
@@ -413,48 +415,60 @@ function StripRowView({
       data-testid="composer-strip-row"
       data-kind={kind}
       data-row-id={row.id}
-      className={cn(
-        "flex shrink-0 items-center gap-2.5 px-2",
-        STRIP_ROW_HEIGHT,
-      )}
+      className="shrink-0"
     >
-      <span className="flex size-5 shrink-0 items-center justify-center">
-        <StripMarkView mark={row.mark} />
-      </span>
-      <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
-        {row.label}
-      </span>
-      {row.liveDetail ? (
-        <TickingText
-          testId={row.liveDetail.testId}
-          className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground tabular-nums"
-          compute={row.liveDetail.compute}
-          intervalMs={row.liveDetail.intervalMs}
-        />
-      ) : (
-        <span
-          className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
-          title={row.detail ?? undefined}
+      <div
+        className={cn(
+          "flex shrink-0 items-center gap-2.5 px-2",
+          STRIP_ROW_HEIGHT,
+        )}
+      >
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          <StripMarkView mark={row.mark} />
+        </span>
+        <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
+          {row.label}
+        </span>
+        {row.liveDetail ? (
+          <TickingText
+            testId={row.liveDetail.testId}
+            className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground tabular-nums"
+            compute={row.liveDetail.compute}
+            intervalMs={row.liveDetail.intervalMs}
+          />
+        ) : (
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
+            title={row.detail ?? undefined}
+          >
+            {row.detail}
+          </span>
+        )}
+        {row.meta && (
+          <span className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground tabular-nums">
+            {row.meta}
+          </span>
+        )}
+        {row.elapsed && (
+          <TickingText
+            className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
+            compute={row.elapsed}
+          />
+        )}
+        {row.secondaryAction && (
+          <StripActionButton action={row.secondaryAction} />
+        )}
+        {row.action && <StripActionButton action={row.action} />}
+        {trailing}
+      </div>
+      {row.note && (
+        <p
+          data-testid="composer-strip-usage-explanation"
+          className="pb-2 pl-[38px] pr-3 text-label leading-relaxed text-muted-foreground"
         >
-          {row.detail}
-        </span>
+          {row.note}
+        </p>
       )}
-      {row.meta && (
-        <span className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground tabular-nums">
-          {row.meta}
-        </span>
-      )}
-      {row.elapsed && (
-        <TickingText
-          className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
-          compute={row.elapsed}
-        />
-      )}
-      {row.secondaryAction && (
-        <StripActionButton action={row.secondaryAction} />
-      )}
-      {row.action && <StripActionButton action={row.action} />}
-      {trailing}
     </li>
   );
 }

@@ -71,6 +71,7 @@ pub struct MockAgentProvider {
     rollback_error: Arc<Mutex<Option<String>>>,
     fast_mode_error: Mutex<Option<ProviderError>>,
     send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    send_error: Mutex<Option<ProviderError>>,
     /// Every `StartSessionInput` received, in order, so tests can assert
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
@@ -89,6 +90,7 @@ impl MockAgentProvider {
             rollback_error: Arc::new(Mutex::new(None)),
             fast_mode_error: Mutex::new(None),
             send_gate: Mutex::new(None),
+            send_error: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -115,6 +117,12 @@ impl MockAgentProvider {
         let release = Arc::new(tokio::sync::Notify::new());
         *self.send_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
         (entered, release)
+    }
+
+    /// Reject the next `send_turn` (after any held gate releases).
+    #[allow(dead_code)]
+    pub fn fail_next_send(&self, error: ProviderError) {
+        *self.send_error.lock().unwrap() = Some(error);
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -184,6 +192,9 @@ impl AgentProvider for MockAgentProvider {
         if let Some((entered, release)) = gate {
             entered.notify_one();
             release.notified().await;
+        }
+        if let Some(error) = self.send_error.lock().unwrap().take() {
+            return Err(error);
         }
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {

@@ -7399,7 +7399,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. }
         | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
-        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }

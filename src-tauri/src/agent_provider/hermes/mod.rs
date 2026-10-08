@@ -34,6 +34,26 @@ fn rpc(error: impl std::fmt::Display) -> ProviderError {
 fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
+
+fn prompt_usage_limit(
+    thread: &ThreadId,
+    response: &Result<Value, crate::json_rpc_child::RpcChildError>,
+) -> Option<ProviderRuntimeEvent> {
+    let (payload, message) = match response {
+        Ok(result) if matches!(text(result, "stopReason"), Some("error" | "rate_limit")) => {
+            let detail = result.pointer("/_meta/agentResult").or_else(|| result.get("agentResult"));
+            let message = text(result, "message")
+                .or_else(|| detail.and_then(Value::as_str))
+                .or_else(|| detail.and_then(|value| text(value, "message")))
+                .unwrap_or_default();
+            (result, message)
+        }
+        Err(crate::json_rpc_child::RpcChildError::RpcError(error)) =>
+            (error.data.as_ref().unwrap_or(&Value::Null), error.message.as_str()),
+        _ => return None,
+    };
+    crate::agent_provider::usage_limit::usage_limit_notice(thread, ProviderKind::Hermes, payload, message)
+}
 const LIMITS: &str = "Reasoning control unavailable in this Hermes adapter. Background learning has no completion acknowledgment; worktree cleanup remains pending. Desktop can read history, but execution handoff is unsupported.";
 
 /// Deliberately conservative: the catalog has no unambiguous provider metadata in 0.21.3.
@@ -652,6 +672,7 @@ impl Inner {
             let thread = job.input.thread_id.clone();
             let turn = TurnId(Uuid::new_v4().to_string());
             let mut dispatched = false;
+            let mut limit_notice = None;
             {
                 let mut state = chat.state.lock().await;
                 if state.cancel_epoch != job.cancel_epoch {
@@ -682,9 +703,12 @@ impl Inner {
                 dispatched = true;
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
-                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await.map_err(rpc)?;
+                let response = runtime.child.request_with_timeout("session/prompt",json!({"sessionId":binding.acp_session_id,"prompt":[{"type":"text","text":job.input.text}]}),Duration::from_secs(24*60*60)).await;
+                limit_notice = prompt_usage_limit(&thread, &response);
+                let response = response.map_err(rpc)?;
                 let (tx,rx) = oneshot::channel(); let _=runtime.barrier.send(tx); let _=rx.await;
                 if text(&response,"stopReason") == Some("cancelled") { chat.state.lock().await.cancelled=true; }
+                if limit_notice.is_some() { return Err(invalid(text(&response, "message").unwrap_or("Hermes usage limit reached"))); }
                 // Empty new sessions are ephemeral upstream. Ask the official load endpoint
                 // for provenance once history exists, suppressing its native replay.
                 if chat.binding.lock().await.current_native_id.is_none() && text(&response,"stopReason") != Some("cancelled") {
@@ -743,13 +767,15 @@ impl Inner {
                 }
             } else if let Some(message) = error.as_ref() {
                 TurnStatus::Error {
-                    subtype: "hermes".into(),
+                    subtype: if limit_notice.is_some() { "rate_limit".into() } else { "hermes".into() },
                     message: message.clone(),
                 }
             } else {
                 TurnStatus::Success
             };
-            if error.is_some() {
+            // A temporary quota refusal does not invalidate this native
+            // session or its provenance. The continuation can reuse it.
+            if error.is_some() && limit_notice.is_none() {
                 state.error = error.clone();
             }
             state.active = None;
@@ -759,6 +785,9 @@ impl Inner {
                     thread_id: thread.clone(),
                     queued_id: job.id.clone(),
                 });
+            }
+            if !state.cancelled {
+                if let Some(notice) = limit_notice { self.emit(notice); }
             }
             self.emit(ProviderRuntimeEvent::TurnCompleted {
                 thread_id: thread.clone(),

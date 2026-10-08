@@ -465,6 +465,7 @@ async fn usage_resume_manual_dispatch_rejects_overlap_and_preserves_a_new_limit(
                 provider: ProviderKind::Claude,
                 resets_at_ms: Some(reset),
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 window: None,
             },
         );
@@ -487,6 +488,145 @@ async fn usage_resume_manual_dispatch_rejects_overlap_and_preserves_a_new_limit(
             .count(),
         1
     );
+}
+
+fn usage_resume_cancel_reasons(
+    captured: &std::sync::Mutex<Vec<AgentChatEventPayload>>,
+) -> Vec<Option<codemux_lib::agent_provider::events::UsageResumeBlockedReason>> {
+    captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|payload| match &payload.event {
+            ProviderRuntimeEvent::UsageResumeCancelled { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn usage_resume_manual_dispatch_failure_reports_why_after_disarm() {
+    use codemux_lib::agent_provider::events::UsageResumeBlockedReason;
+    use codemux_lib::agent_provider::{AgentProvider, ProviderError};
+    use codemux_lib::commands::usage_resume::agent_chat_resume_after_usage_limit;
+
+    let app = mock_app_with_chat_state();
+    app.manage(test_observability(true));
+    let registry = ProviderRegistry::new();
+    let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+    registry.set_claude(provider.clone() as _).await;
+    app.manage(registry);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    let thread = "usage-resume-manual-failure";
+    db.upsert_agent_chat_session(thread, "ws", None, "claude")
+        .unwrap();
+    let channels: State<'_, AgentChatChannelRegistry> = handle.state();
+    let (channel, captured) = capture_channel();
+    channels.attach(thread, channel);
+    db.upsert_agent_chat_usage_resume(thread, "claude", Some(1_000))
+        .unwrap();
+    provider.start_session(start_input(thread)).await.unwrap();
+    provider.fail_next_send(ProviderError::RpcError {
+        message: "provider unavailable".into(),
+    });
+
+    agent_chat_resume_after_usage_limit(
+        handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(thread.into()),
+    )
+    .await
+    .unwrap_err();
+
+    // The schedule was cleared before the dispatch, and clients learn why
+    // nothing will happen next instead of being left on "cancelled".
+    assert!(db.get_agent_chat_usage_resume(thread).is_none());
+    assert_eq!(
+        usage_resume_cancel_reasons(&captured),
+        vec![
+            Some(UsageResumeBlockedReason::Cancelled),
+            Some(UsageResumeBlockedReason::DispatchFailed),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn usage_resume_manual_dispatch_failure_keeps_a_newer_limit() {
+    use codemux_lib::agent_provider::events::UsageResumeBlockedReason;
+    use codemux_lib::agent_provider::{AgentProvider, ProviderError};
+    use codemux_lib::commands::usage_resume::agent_chat_resume_after_usage_limit;
+
+    let app = mock_app_with_chat_state();
+    app.manage(test_observability(true));
+    let registry = ProviderRegistry::new();
+    let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+    registry.set_claude(provider.clone() as _).await;
+    app.manage(registry);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    let thread = "usage-resume-failure-new-limit";
+    db.upsert_agent_chat_session(thread, "ws", None, "claude")
+        .unwrap();
+    let channels: State<'_, AgentChatChannelRegistry> = handle.state();
+    let (channel, captured) = capture_channel();
+    channels.attach(thread, channel);
+    db.upsert_agent_chat_usage_resume(thread, "claude", Some(1_000))
+        .unwrap();
+    provider.start_session(start_input(thread)).await.unwrap();
+    let (entered, release) = provider.hold_next_send();
+    provider.fail_next_send(ProviderError::RpcError {
+        message: "provider unavailable".into(),
+    });
+
+    let resume = agent_chat_resume_after_usage_limit(
+        handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(thread.into()),
+    );
+    let newer_limit = async {
+        timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 60_000;
+        forward_event(
+            &handle,
+            ProviderRuntimeEvent::UsageLimitReached {
+                thread_id: ThreadId(thread.into()),
+                provider: ProviderKind::Claude,
+                resets_at_ms: Some(reset),
+                auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
+                window: None,
+            },
+        );
+        release.notify_one();
+        reset
+    };
+    let (result, reset) = tokio::join!(resume, newer_limit);
+    result.unwrap_err();
+
+    // The limit reported mid-dispatch stays armed, and no failure report
+    // follows it to overwrite that schedule on any client.
+    let row = db
+        .get_agent_chat_usage_resume(thread)
+        .expect("newer limit remains armed");
+    assert_eq!(row.resume_at_ms, Some(reset + 45_000));
+    assert_eq!(
+        usage_resume_cancel_reasons(&captured),
+        vec![Some(UsageResumeBlockedReason::Cancelled)]
+    );
+    assert!(captured.lock().unwrap().iter().any(|payload| matches!(
+        payload.event,
+        ProviderRuntimeEvent::UsageLimitReached {
+            auto_resume_at_ms: Some(at),
+            ..
+        } if at == reset + 45_000
+    )));
 }
 
 #[tokio::test]
@@ -2364,20 +2504,26 @@ fn now_ms() -> i64 {
 /// status gets a notice synthesized ahead of the settled turn, with the
 /// reset taken from its last quota reading and the resume armed centrally.
 #[test]
-fn rate_limited_turn_synthesizes_an_armed_usage_limit_notice() {
+fn usage_limit_codex_turn_waits_for_weekly_and_hourly_windows() {
     use codemux_lib::agent_provider::{PlanUsageWindow, PlanWindowKind};
     use codemux_lib::commands::usage::PlanQuotaStore;
 
     let app = mock_app_with_chat_state();
     let quota = PlanQuotaStore::default();
-    let reset = now_ms() + 60 * 60 * 1000;
+    let hourly_reset = now_ms() + 60 * 60 * 1000;
+    let reset = hourly_reset + 60 * 60 * 1000;
     quota.record(
         "codex",
         vec![PlanUsageWindow {
             kind: PlanWindowKind::FiveHour,
             used_pct: 100.0,
-            resets_at_ms: Some(reset),
+            resets_at_ms: Some(hourly_reset),
             label: Some("five_hour".into()),
+        }, PlanUsageWindow {
+            kind: PlanWindowKind::SevenDay,
+            used_pct: 100.0,
+            resets_at_ms: Some(reset),
+            label: Some("seven_day".into()),
         }],
         None,
         None,
@@ -2396,7 +2542,7 @@ fn rate_limited_turn_synthesizes_an_armed_usage_limit_notice() {
     assert_eq!(rows[0]["type"], "usage_limit_reached");
     assert_eq!(rows[0]["provider"], "codex");
     assert_eq!(rows[0]["resets_at_ms"], reset);
-    assert_eq!(rows[0]["window"], "five_hour");
+    assert_eq!(rows[0]["window"], "seven_day");
     assert_eq!(rows[0]["auto_resume_at_ms"], reset + 45_000);
     assert_eq!(rows[1]["type"], "turn_completed");
 
@@ -2424,6 +2570,7 @@ fn usage_limit_notice_is_deduped_per_turn_and_respects_the_setting() {
         provider: ProviderKind::Claude,
         resets_at_ms: Some(reset),
         auto_resume_at_ms: None,
+        auto_resume_blocked_reason: None,
         window: Some("five_hour".into()),
     };
     forward_event(&handle, notice());
@@ -2437,6 +2584,7 @@ fn usage_limit_notice_is_deduped_per_turn_and_respects_the_setting() {
         .collect();
     assert_eq!(notices.len(), 1, "{rows:?}");
     assert!(notices[0]["auto_resume_at_ms"].is_null(), "setting is off");
+    assert_eq!(notices[0]["auto_resume_blocked_reason"], "disabled");
     assert!(db.get_agent_chat_usage_resume("thread-dedupe").is_none());
 
     // The next turn may raise its own notice again.
@@ -2446,4 +2594,62 @@ fn usage_limit_notice_is_deduped_per_turn_and_respects_the_setting() {
         .filter(|r| r["type"] == "usage_limit_reached")
         .count();
     assert_eq!(count, 2);
+}
+
+#[test]
+fn usage_limit_claude_assistant_error_uses_the_last_reported_quota_reset() {
+    use codemux_lib::agent_provider::{PlanUsageWindow, PlanWindowKind};
+    use codemux_lib::commands::usage::PlanQuotaStore;
+    let app = mock_app_with_chat_state();
+    let quota = PlanQuotaStore::default();
+    let reset = now_ms() + 3_600_000;
+    quota.record("claude", vec![PlanUsageWindow {
+        kind: PlanWindowKind::FiveHour, used_pct:100.0, resets_at_ms:Some(reset), label:Some("five_hour".into()),
+    }], None, None, now_ms());
+    app.manage(quota);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    db.upsert_agent_chat_session("claude-missing-event", "ws", None, "claude").unwrap();
+    let events = codemux_lib::agent_provider::claude::translate::translate_sdk_message(
+        &ThreadId("claude-missing-event".into()),
+        &serde_json::json!({"type":"assistant", "error":"rate_limit", "message":{"content":[]}}),
+    );
+    for event in events { forward_event(&handle, event); }
+    let notice = &persisted_types(&db, "claude-missing-event")[0];
+    assert_eq!(notice["resets_at_ms"], reset);
+    assert_eq!(notice["auto_resume_at_ms"], reset + 45_000);
+}
+
+#[tokio::test]
+async fn usage_resume_scheduler_rebuilds_the_conversation_and_dispatches_once() {
+    use codemux_lib::commands::usage_resume::fire_usage_resumes_for_test;
+    let app = mock_app_with_chat_state();
+    app.manage(test_observability(true));
+    let registry = ProviderRegistry::new();
+    let provider = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+    registry.set_codex(provider.clone() as _).await;
+    app.manage(registry);
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = state.create_workspace_at_path(directory.path().into());
+    bind_chat_pane(&state, &workspace.0, "scheduled-restart");
+    let db: State<'_, DatabaseStore> = handle.state();
+    db.upsert_agent_chat_session("scheduled-restart", &workspace.0, directory.path().to_str(), "codex").unwrap();
+    db.set_agent_chat_sdk_session_id("scheduled-restart", "saved-conversation").unwrap();
+    db.append_agent_chat_message("scheduled-restart", &serde_json::json!({
+        "type":"user_message", "thread_id":"scheduled-restart", "text":"Finish the importer and its unfinished delegated work"
+    }).to_string()).unwrap();
+    db.upsert_agent_chat_usage_resume("scheduled-restart", "codex", Some(now_ms() - 1)).unwrap();
+    fire_usage_resumes_for_test(&handle).await;
+    fire_usage_resumes_for_test(&handle).await;
+    let calls = provider.calls.snapshot();
+    assert_eq!(calls.iter().filter(|c| matches!(c, MockCall::SendTurn(_, _))).count(), 1);
+    assert!(calls.iter().any(|c| matches!(c, MockCall::SendTurn(_, text) if text.contains("unfinished delegated work"))));
+    let starts = provider.start_inputs();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].resume_cursor, Some(serde_json::json!({"resume":"saved-conversation"})));
+    let resume = db.get_agent_chat_usage_resume("scheduled-restart").unwrap();
+    assert_eq!(resume.attempts, 1);
+    assert_eq!(resume.resume_at_ms, None);
 }
