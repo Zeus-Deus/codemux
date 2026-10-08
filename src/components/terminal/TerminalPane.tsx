@@ -1100,18 +1100,6 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   }, [focused, sessionId]);
 
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
-
-  // Resizes are skipped while the pane is hidden, so a split or a panel change
-  // made then leaves the shell at its old width. Re-sync on the first frame
-  // the pane is shown again, before the next keystroke can wrap at the stale
-  // width.
-  useEffect(() => {
-    if (!visible) return;
-    const frame = requestAnimationFrame(() => {
-      void syncTerminalSize();
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [visible, syncTerminalSize]);
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
       {mobile && <div className="mobile-terminal-keys">{[["Esc", "\x1b"],["Tab", "\t"],["Ctrl C", "\x03"],["↑", "\x1b[A"],["↓", "\x1b[B"],["←", "\x1b[D"],["→", "\x1b[C"]].map(([label,key]) => <button key={label} onPointerDown={e => e.preventDefault()} onClick={() => writePtyInput(sessionId, key)}>{label}</button>)}<button onClick={() => termRef.current?.focus()}>Keyboard</button><button aria-pressed={phoneControl} onClick={() => setPhoneControl(v => !v)}>{phoneControl ? "Follow desktop size" : "Fit to phone"}</button></div>}
