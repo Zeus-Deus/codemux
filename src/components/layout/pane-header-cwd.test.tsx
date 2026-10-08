@@ -426,4 +426,14 @@ describe("split resize handle", () => {
     expect(seam.parentElement).not.toHaveClass("overflow-hidden");
     expect(seam).toHaveClass("-right-[6.5px]", "w-3");
   });
+
+  // Without a clip, a terminal sized wider than its cell painted over the
+  // neighbouring pane and covered its controls.
+  it("clips each pane to its own cell", () => {
+    const seam = mountSplit();
+    const clips = document.querySelectorAll("[data-split-cell-clip]");
+    expect(clips).toHaveLength(2);
+    clips.forEach((clip) => expect(clip).toHaveClass("overflow-hidden", "size-full"));
+    expect(clips[0].contains(seam)).toBe(false);
+  });
 });

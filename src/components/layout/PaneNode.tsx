@@ -386,16 +386,19 @@ function PaneNodeImpl({
     return (
       <div style={gridStyle} data-split-container data-split-pane-id={node.pane_id}>
         {node.children.map((child, i) => (
-          // No overflow clip on the cell: the pane shell clips its own
-          // content, and the seam handle must reach past this cell's edge so
-          // its centre, not just its near half, is hit-testable.
+          // The cell itself is not clipped, so the seam handle can reach past
+          // its edge and its centre, not just its near half, is hit-testable.
+          // The pane is clipped by its own wrapper instead: a terminal sized
+          // wider than its cell would otherwise paint over the neighbour.
           <div key={child.pane_id} className="relative min-w-0 min-h-0">
-            <PaneNode
-              node={child}
-              activePaneId={activePaneId}
-              visible={visible}
-              workspaceId={workspaceId}
-            />
+            <div data-split-cell-clip className="size-full min-w-0 min-h-0 overflow-hidden">
+              <PaneNode
+                node={child}
+                activePaneId={activePaneId}
+                visible={visible}
+                workspaceId={workspaceId}
+              />
+            </div>
             {i < node.children.length - 1 && (
               <SplitResizeHandle node={node} index={i} />
             )}
