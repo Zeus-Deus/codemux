@@ -25,7 +25,7 @@
   "effort": "high",
   "cliVersion": "2.1.295",
   "requestedReview": "Read-only final followup using Read/Glob/Grep; safe mode; no work delegated",
-  "evidenceTiming": "Final frontend source and refreshed19-flow/19-responsive-case evidence, after all verified UI fixes and route validation.",
+  "evidenceTiming": "Reviewed source after all behavioral UI fixes and route validation, before subsequent CI UUID-helper/radius-token alignment. Those small followups passed251 focused tests and refreshed19-flow/19-responsive-case evidence.",
   "verdict": "No remaining material UI defects found; three previous findings verified fixed.",
   "functionalTestBudget": "Separate from authorized $2 functional live-test cap"
 }

@@ -2,15 +2,15 @@
   "preview": "isolated source snapshot; Tauri development mock IPC",
   "productionSourceDifferences": [],
   "sourceHashes": {
-    "src/components/workflows/workflow-panel.tsx": "e75a8906d5740aa9da9b9d64de1dab1101e5730aac2d284735993e6f18103822",
+    "src/components/workflows/workflow-panel.tsx": "086f43418327596297c5fdc9469a6fbedafe5921f9cfb478a0e339f1a93c7ad5",
     "src/components/workflows/workflow-setup.tsx": "5a808e5c6e253cc2d78ada1d850ea7d8ba363ab66294b6907097cd0c111b6485",
     "src/components/workflows/workflow-presentation.ts": "e054eb3116448cbfc11009fdf7e04ed3911ba8f6f81d47ad307a2f24fefd38b7",
-    "src/components/workflows/use-workflow-runtime.ts": "de50c4e51a5b44bbe3ed5f71466345d4f077ea2e8d4094284776ba516de205f7",
+    "src/components/workflows/use-workflow-runtime.ts": "929bc65cf479b2f659dda49472f34e821a6df829215248db79862688dbbc0bf1",
     "src/stores/workflow-inspector-store.ts": "51286937e8a6fc8732f90dee926ec1c25afbe441cd4b5a1f448831b67cee4938",
     "scripts/e2e/workflows-ui.mjs": "de583f418143403457260a142a4f4f50cddc9d7baa07a869f97a502fee91ff41",
     "scripts/e2e/workflows-responsive.mjs": "1350d50f78ba4b9d54f84e00a728be1ca557f1041534dbb2e642bc73c192964e",
-    "src/tauri/workflows.ts": "f2b01de3e8e4ca2f94f1c526e62fdcadf3ed5ce5899ba712e772a150fb57a964",
-    "src/dev/workflow-mock.ts": "d37ab4282003a0ffedb5fa3f1cc78f70ac7db170f7cad91433f0ed92feb9e9d2"
+    "src/tauri/workflows.ts": "26f70a49b4846d4c155c2672505be30b9cdf1f117258edcb8e677119ad9e6435",
+    "src/dev/workflow-mock.ts": "c494884ce82881408171b9417685b106616cd8e435f9688a312759340cf3aa32"
   },
   "capture": "Visible pane clip with captureBeyondViewport:false preserves layout and inspector state; full viewport captures also included.",
   "fonts": "Local app fonts served from workspace dependencies by snapshot-only Vite filesystem allowlist.",
@@ -25,14 +25,16 @@
   "counts": {
     "workflowFlows": 19,
     "responsiveLayouts": 19,
-    "affectedTests": 67
+    "affectedTests": 67,
+    "ciRegressionTests": 164
   },
-  "verifiedAtUtc": "2026-10-09T13:54:00.087347+00:00",
+  "verifiedAtUtc": "2026-10-09T14:13:35.952851+00:00",
   "comparedProductionFiles": 670,
   "affectedTestRuns": [
     "66 passed: 29 panel +24 presentation +13 mock before final outside-focus guard.",
     "30 panel passed after the final outside-focus guard; unchanged24 presentation and13 mock previously passed.",
-    "npm run check passed after the final source changes."
+    "npm run check passed after the final source changes.",
+    "CI follow-up:164 passed (124 AgentChatPane +30 workflow panel +10 UI token-contract); npm run check passed."
   ],
   "reviewFixes": [
     "Deep task196 selection and split-to-single transition keep Back visible; a short-height screenshot now shows the detail header.",
@@ -43,13 +45,16 @@
     "Model and effort strings are normalized only on launch, preserving text while typing."
   ],
   "rootAffectedVerification": {
-    "frontendTests": 112,
+    "frontendTests": 251,
     "files": [
       "workflow-panel:30",
       "workflow-presentation:24",
       "workflow-mock:13",
       "ComposerFooter:33",
-      "pane-registry:12"
+      "pane-registry:12",
+      "AgentChatPane:124",
+      "ui-token-contract:10",
+      "uuid:5"
     ],
     "npmRunCheck": "passed",
     "npmRunBuild": "passed"
@@ -58,5 +63,19 @@
     "total": 19,
     "visiblePaneMeasurements": 16,
     "mobileShellAvailabilityChecks": 3
+  },
+  "ciFollowUp": {
+    "markerRadius": "Existing rounded-sm token replaces a hardcoded radius; token budget unchanged.",
+    "startupFixture": "UI-store mock now supplies required rightPanelTabs for the real composer. All124 AgentChatPane tests passed, including the cascading resolveStart failure.",
+    "uuids": "Snapshot includes shared UUID helper changes in use-workflow-runtime.ts, workflow-mock.ts and tauri/workflows.ts.",
+    "browserProof": "19 workflow flows +19 responsive layouts passed on these identical sources, no provider calls or tokens."
+  },
+  "ciFollowup": {
+    "changes": [
+      "Use existing randomUUID helper at all workflow frontend call sites",
+      "Use supported rounded-sm capacity marker",
+      "Complete chat startup test UI-store fixture"
+    ],
+    "verification": "251 focused frontend tests and npm run check passed;19 workflow flows and19 responsive cases refreshed with identical source."
   }
 }

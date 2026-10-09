@@ -1,3 +1,4 @@
+import { randomUUID } from "@/lib/uuid";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -97,7 +98,7 @@ export function useWorkflowRuntime(workspaceId: string) {
   };
   const launch = useMutation({
     mutationFn: ({ spec, source }: { spec: WorkflowRunSpec; source: string }) =>
-      workflowScriptRun(spec, source, { routes: spec.routes.map((route) => route.id) }, crypto.randomUUID()),
+      workflowScriptRun(spec, source, { routes: spec.routes.map((route) => route.id) }, randomUUID()),
     onSuccess: accept,
   });
   const control = useMutation({

@@ -413,7 +413,7 @@ child generations they accepted, so replacing or retiring that input revokes sta
 results and file application, including after database reopen.
 
 The final focused verification passed `npm run check`, the production frontend
-build, **112 affected frontend tests**, **79 workflow tests**, **14 filtered managed
+build, **251 affected frontend tests**, **79 workflow tests**, **14 filtered managed
 adapter/process tests**, **eight fake native/bridge integration tests**, **20 managed
 sidecar tests**, **13 Hermes library/RPC tests**, and the Claude sidecar typecheck and
 **47 fake SDK session tests**. The managed native bundle was rebuilt with reviewed
@@ -465,3 +465,11 @@ The [actual hosted check](assets/workflow-ui-review/hosted-validation.json) pass
 all six pages and five evidence downloads, with no browser errors or failed assets.
 The original licensed fonts are embedded in the review stylesheet to avoid
 opaque-origin font requests; the production design system is unchanged.
+
+CI subsequently caught existing app conventions missed by the initial focused
+checks: workflow IDs must use the shared UUID helper, worker markers must use a
+supported radius token, and chat startup tests must provide the required panel
+selection map. These were corrected without changing production chat startup.
+The expanded 251-test check includes all 124 chat startup tests plus UUID and
+UI-token contracts; both browser evidence sets were refreshed. The saved Opus
+review predates these small convention fixes, as its metadata states.

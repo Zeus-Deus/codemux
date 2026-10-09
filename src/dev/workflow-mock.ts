@@ -1,3 +1,4 @@
+import { randomUUID } from "@/lib/uuid";
 /** Token-free browser-preview workflow runtime. State survives page reloads. */
 import type {
   WorkflowChangeEvent,
@@ -92,7 +93,7 @@ function addTask(run: WorkflowRunSnapshot, raw: WorkflowTaskSpec) {
 function create(spec: WorkflowRunSpec, key: string) {
   validate(spec);
   if (state.keys[key]) return getRun(state.keys[key]);
-  const id = crypto.randomUUID();
+  const id = randomUUID();
   const run: WorkflowRunSnapshot = { id, status: "running", cancel_requested: false, pause_requested: false, error: null, revision: 1, created_at_ms: Date.now(), updated_at_ms: Date.now(), spec: clone(spec), tasks: spec.tasks.map(taskSnapshot), usage: usage(), resolved_limits: { ...DEFAULT_WORKFLOW_LIMITS, ...spec.limits, concurrency: Math.min(spec.limits.concurrency || 4, 8) }, script: null };
   state.runs.unshift(run);
   if (state.runs.length > MAX_RUNS) state.runs = state.runs.slice(0, MAX_RUNS);
@@ -132,7 +133,7 @@ function schedule(run: WorkflowRunSnapshot) {
         if (dependencies.some((dependency) => ["failed", "blocked", "cancelled"].includes(dependency.status))) { task.status = "blocked"; task.error = "A required dependency did not succeed."; settleWaiters(run, task); changed = true; continue; }
         if (dependencies.some((dependency) => dependency.status !== "succeeded") || running >= run.resolved_limits.concurrency) continue;
         if (run.tasks.reduce((count, item) => count + item.attempts.length, 0) >= run.resolved_limits.max_attempts) { task.status = "failed"; task.error = "Attempt budget exceeded."; settleWaiters(run, task); changed = true; continue; }
-        const attempt: WorkflowAttempt = { id: crypto.randomUUID(), generation: task.generation, operation_id: crypto.randomUUID(), status: "running", route_id: task.spec.route_id ?? run.spec.routes[0].id, started_at_ms: Date.now(), finished_at_ms: null, cancel_requested: false, reserved_tokens: 0, external_ref: null, output: null, error: null, usage: usage(), artifacts: [] };
+        const attempt: WorkflowAttempt = { id: randomUUID(), generation: task.generation, operation_id: randomUUID(), status: "running", route_id: task.spec.route_id ?? run.spec.routes[0].id, started_at_ms: Date.now(), finished_at_ms: null, cancel_requested: false, reserved_tokens: 0, external_ref: null, output: null, error: null, usage: usage(), artifacts: [] };
         task.current_attempt = attempt;
         task.attempts.push(attempt);
         task.status = "running";
@@ -273,7 +274,7 @@ export function workflowMockHandlers(listener?: (event: WorkflowChangeEvent) => 
     workflow_script_list: (args) => clone(state.scripts.filter((script) => script.workspace_id === args.workspaceId)),
     workflow_script_save: (args) => {
       const existing = state.scripts.find((script) => script.workspace_id === args.workspaceId && script.title === args.name);
-      const script: WorkflowScript = { id: existing?.id ?? crypto.randomUUID(), workspace_id: String(args.workspaceId), title: String(args.name), source: String(args.source), updated_at_ms: Date.now() };
+      const script: WorkflowScript = { id: existing?.id ?? randomUUID(), workspace_id: String(args.workspaceId), title: String(args.name), source: String(args.source), updated_at_ms: Date.now() };
       state.scripts = [script, ...state.scripts.filter((item) => item.id !== script.id)];
       persist();
       return clone(script);

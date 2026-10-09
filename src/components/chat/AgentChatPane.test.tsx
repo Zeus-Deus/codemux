@@ -436,10 +436,11 @@ vi.mock("./WorkspaceStatusCluster", () => ({
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: Object.assign(
     vi.fn((selector: (s: unknown) => unknown) =>
-      selector({ setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock }),
+      selector({ rightPanelTabs: {}, setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock }),
     ),
     {
       getState: () => ({
+        rightPanelTabs: {},
         setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock,
       }),
     },

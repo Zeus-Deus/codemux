@@ -1,3 +1,4 @@
+import { randomUUID } from "@/lib/uuid";
 import { invoke } from "@tauri-apps/api/core";
 import type { AgentChatProviderKind } from "./types";
 
@@ -164,7 +165,7 @@ export const workflowArtifactPreview = (runId: string, taskId: string, attemptId
 export const workflowCancel = (runId: string) => invoke<WorkflowRunSnapshot>("workflow_cancel", { runId });
 export const workflowReconcile = (runId: string, taskId: string) => invoke<WorkflowRunSnapshot>("workflow_reconcile", { runId, taskId });
 export const workflowRetry = (runId: string, taskId: string) => invoke<WorkflowRunSnapshot>("workflow_retry", { runId, taskId });
-export const workflowReplace = (runId: string, taskId: string, spec: WorkflowTaskSpec, idempotencyKey = crypto.randomUUID()) => invoke<WorkflowRunSnapshot>("workflow_replace", { runId, taskId, spec, idempotencyKey });
+export const workflowReplace = (runId: string, taskId: string, spec: WorkflowTaskSpec, idempotencyKey = randomUUID()) => invoke<WorkflowRunSnapshot>("workflow_replace", { runId, taskId, spec, idempotencyKey });
 export const workflowRetire = (runId: string, taskId: string) => invoke<WorkflowRunSnapshot>("workflow_retire", { runId, taskId });
 export const workflowMessage = (runId: string, taskId: string, text: string) => invoke<WorkflowRunSnapshot>("workflow_message", { runId, taskId, text });
 export const workflowScriptsList = (workspaceId: string) => invoke<WorkflowScript[]>("workflow_script_list", { workspaceId });
