@@ -263,7 +263,14 @@ impl Task {
                 status: SessionStatus::Closed | SessionStatus::Error { .. },
                 ..
             } => {
+                // Stop, close and restarts end the task before their session
+                // closes, so a session ending here is the child dying. A turn
+                // it never finished is a failure, not a wait on the user.
                 self.open_requests.clear();
+                self.last_status.get_or_insert_with(|| TurnStatus::Error {
+                    subtype: "session_ended".into(),
+                    message: "Its session ended before it finished.".into(),
+                });
                 settle = true;
             }
             ProviderRuntimeEvent::RequestOpened { request_id, .. } => {
@@ -297,6 +304,19 @@ impl Task {
         }
         // Only a dispatched task can finish.
         (settle && self.phase == Phase::Running, failure)
+    }
+
+    /// Whether the child is waiting on the user: an open question or
+    /// approval, unless its turn already failed (a question left open by a
+    /// failed or dead child will never be answered into this task).
+    fn awaits_user(&self) -> bool {
+        !self.turn_failed() && (self.asking || !self.open_requests.is_empty())
+    }
+
+    fn turn_failed(&self) -> bool {
+        self.last_status
+            .as_ref()
+            .is_some_and(|status| !matches!(status, TurnStatus::Success))
     }
 
     /// How the task ends if its child is idle now (`finalize_outcome`).
@@ -610,9 +630,7 @@ fn activity_line(task: &Task) -> String {
                 provider_label(task.provider),
                 clock(at)
             ),
-            None if task.asking || !task.open_requests.is_empty() => {
-                "Waiting for your answer in its tab".into()
-            }
+            None if task.awaits_user() => "Waiting for your answer in its tab".into(),
             None => "Working in its tab".into(),
         },
         Phase::Completed(_) => "Finished".into(),
@@ -1358,11 +1376,14 @@ async fn child_busy<R: Runtime>(
     // Senders hold the activity lock until the provider has the turn, and
     // "Resume now" disarms its resume before it dispatches.
     let dispatching = usage_resume::activity_lock(child).try_lock().is_err();
+    // An armed usage resume still counts after a failed (rate-limited) turn;
+    // an open question does not.
+    let turn_failed = state.task_matches(child, Task::turn_failed);
     dispatching
-        || state.task_matches(child, |task| task.asking || !task.open_requests.is_empty())
-        || app
-            .try_state::<DatabaseStore>()
-            .is_some_and(|db| resume_armed(&db, child) || db.has_open_async_question(child))
+        || state.task_matches(child, Task::awaits_user)
+        || app.try_state::<DatabaseStore>().is_some_and(|db| {
+            resume_armed(&db, child) || (!turn_failed && db.has_open_async_question(child))
+        })
         || usage_resume::thread_busy(app, provider, &ThreadId(child.to_string())).await
 }
 

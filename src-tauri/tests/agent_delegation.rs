@@ -1130,6 +1130,81 @@ mod delegation {
     }
 
     #[tokio::test]
+    async fn a_child_that_fails_or_dies_with_a_question_open_still_reports() {
+        let h = Harness::new().await;
+        let ask = |child: &str| {
+            forward_event(
+                &h.handle,
+                ProviderRuntimeEvent::QuestionsAsked {
+                    thread_id: ThreadId(child.to_string()),
+                    question: UserQuestionSet {
+                        id: format!("q-{child}"),
+                        target: "native".into(),
+                        source_item_id: "q".into(),
+                        source_turn_id: "child-turn".into(),
+                        text: String::new(),
+                        questions: vec![UserQuestion {
+                            title: "Which storage?".into(),
+                            options: vec![],
+                        }],
+                        subagent_id: None,
+                    },
+                },
+            );
+        };
+
+        // The turn fails while the child's question is still open: the
+        // question can no longer be answered into this task, so it fails and
+        // reports instead of waiting forever.
+        let failed = h
+            .delegate_and_dispatch(args("codex", "Add slugify helper"))
+            .await;
+        ask(&failed);
+        assert_eq!(
+            h.card(&failed).activity.as_deref(),
+            Some("Waiting for your answer in its tab")
+        );
+        h.turn_ends(
+            &failed,
+            TurnStatus::Error {
+                subtype: "error_during_execution".into(),
+                message: "Codex crashed mid-task".into(),
+            },
+        );
+        h.settle(&failed).await;
+        assert_eq!(h.card(&failed).status, SubagentStatus::Failed);
+        assert_eq!(
+            h.card(&failed).result_text.as_deref(),
+            Some("Codex crashed mid-task")
+        );
+        let wakes = h.wait_for_wakes(1).await;
+        assert!(wakes[0].contains("status=\"failed\" title=\"Add slugify helper\""));
+
+        // The session dies with a question open and no turn end at all.
+        let dead = h
+            .delegate_and_dispatch(args("codex", "Review the parser"))
+            .await;
+        ask(&dead);
+        forward_event(
+            &h.handle,
+            ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ThreadId(dead.clone()),
+                status: SessionStatus::Error {
+                    message: "app-server exited".into(),
+                },
+            },
+        );
+        h.settle(&dead).await;
+        assert_eq!(h.card(&dead).status, SubagentStatus::Failed);
+        assert_eq!(
+            h.card(&dead).result_text.as_deref(),
+            Some("Its session ended before it finished.")
+        );
+        let wakes = h.wait_for_wakes(2).await;
+        assert!(wakes[1].contains("status=\"failed\" title=\"Review the parser\""));
+    }
+
+    #[tokio::test]
     async fn the_sweep_needs_two_idle_passes_and_waits_for_open_questions() {
         let h = Harness::new().await;
         let child = h

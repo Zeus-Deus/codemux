@@ -1691,7 +1691,7 @@ fn spawn_incoming_requests_task(
                         let result = handle_dynamic_tool_call(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
-                            Some(&session.host_caller),
+                            Some((&session.host_caller, session.provider_session_id.0.as_str())),
                             params,
                         )
                         .await;
@@ -1722,7 +1722,8 @@ fn spawn_incoming_requests_task(
 async fn handle_dynamic_tool_call(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
-    host_caller: Option<&crate::mcp::registry::HostCaller>,
+    // The root chat's caller and its Codex thread id.
+    host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
@@ -1730,9 +1731,26 @@ async fn handle_dynamic_tool_call(
         (Some(registry), Ok(call)) => {
             let name = registry_tool_name(&call.tool);
             // Host tools answer synchronously (no provider waits), which
-            // matters here: this request loop handles approvals too.
-            let host =
-                host_caller.and_then(|caller| registry.host_call(caller, &name, &call.arguments));
+            // matters here: this request loop handles approvals too. They act
+            // as the root chat, so a call from another thread (a native
+            // subagent that inherited the dynamic tools) is refused rather
+            // than handed the root's identity and permission mode.
+            let host = host.and_then(|(caller, root_thread)| {
+                if call.thread_id == root_thread {
+                    registry.host_call(caller, &name, &call.arguments)
+                } else {
+                    registry
+                        .host_tools(caller)
+                        .iter()
+                        .any(|tool| tool.prefixed_name == name)
+                        .then(|| {
+                            json!({
+                                "content": [{ "type": "text", "text": "This tool is only available in the main conversation, not from a subagent." }],
+                                "isError": true,
+                            })
+                        })
+                }
+            });
             match host {
                 Some(result) => Ok(result),
                 None => {
@@ -2122,6 +2140,78 @@ mod tests {
         assert_eq!(response["success"], true, "{response}");
         assert_eq!(response["contentItems"][0]["text"], "routed");
         call.assert_async().await;
+    }
+
+    struct HandOffHost;
+
+    impl crate::mcp::registry::HostTools for HandOffHost {
+        fn tools_for(&self, _caller: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool {
+                name: "delegate_task".into(),
+                prefixed_name: "mcp__codemux__delegate_task".into(),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux-host".into(),
+            }]
+        }
+
+        fn call(
+            &self,
+            caller: &crate::mcp::registry::HostCaller,
+            prefixed_name: &str,
+            _arguments: &Value,
+        ) -> Option<Value> {
+            (prefixed_name == "mcp__codemux__delegate_task").then(|| {
+                json!({ "content": [{ "type": "text", "text": format!("as {}", caller.thread_id) }] })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tools_answer_only_the_root_thread() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(HandOffHost));
+        let caller = crate::mcp::registry::HostCaller {
+            thread_id: "codemux-chat".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: None,
+            permission_mode: Some("danger-full-access".into()),
+        };
+        let request = |thread: &str| {
+            json!({
+                "threadId": thread,
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux__delegate_task",
+                "arguments": {}
+            })
+        };
+
+        let root = handle_dynamic_tool_call(
+            Some(&registry),
+            None,
+            Some((&caller, "codex-root")),
+            request("codex-root"),
+        )
+        .await;
+        assert_eq!(root["success"], true, "{root}");
+        assert_eq!(root["contentItems"][0]["text"], "as codemux-chat");
+
+        // A native subagent that inherited the dynamic tools has its own
+        // thread id and must not act as the root chat.
+        let native_child = handle_dynamic_tool_call(
+            Some(&registry),
+            None,
+            Some((&caller, "codex-root")),
+            request("codex-native-child"),
+        )
+        .await;
+        assert_eq!(native_child["success"], false, "{native_child}");
+        assert!(native_child["contentItems"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("only available in the main conversation"));
     }
 
     #[tokio::test]
