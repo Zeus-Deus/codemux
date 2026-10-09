@@ -279,6 +279,9 @@ pub struct JsonRpcChild {
     /// second call observes `true` via `swap` and returns early; the
     /// original cleanup has already fired.
     shutdown_started: Arc<AtomicBool>,
+    /// Only workflow-owned children get their own process group. Regular
+    /// chat sessions retain their existing lifecycle.
+    managed_group: Option<u32>,
 }
 
 impl JsonRpcChild {
@@ -287,12 +290,30 @@ impl JsonRpcChild {
     /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot be
     /// started or its stdio pipes cannot be captured.
     pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {
+        Self::spawn_internal(config, false).await
+    }
+
+    pub async fn spawn_managed(config: SpawnConfig) -> Result<Self, RpcChildError> {
+        Self::spawn_internal(config, true).await
+    }
+
+    async fn spawn_internal(config: SpawnConfig, managed: bool) -> Result<Self, RpcChildError> {
         let mut cmd = Command::new(&config.program);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        if managed {
+            cmd.process_group(0);
+        }
+        #[cfg(not(unix))]
+        if managed {
+            return Err(RpcChildError::ProtocolError(
+                "managed process containment is unavailable on this platform".into(),
+            ));
+        }
 
         // Agent CLIs are ordinary host binaries: under an AppImage they would
         // otherwise inherit AppRun's LD_LIBRARY_PATH and link against our
@@ -308,6 +329,7 @@ impl JsonRpcChild {
         }
 
         let mut child = cmd.spawn().map_err(RpcChildError::SpawnFailed)?;
+        let managed_group = if managed { child.id() } else { None };
         let stdin = child.stdin.take().ok_or_else(|| {
             RpcChildError::SpawnFailed(std::io::Error::other("stdin pipe not captured"))
         })?;
@@ -488,6 +510,7 @@ impl JsonRpcChild {
             exit_info,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
+            managed_group,
         })
     }
 
@@ -640,7 +663,8 @@ impl JsonRpcChild {
         // Poll alive for a short while to give the watchdog a chance to
         // actually reap the process; this keeps the caller's ordering
         // predictable.
-        let deadline = std::time::Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT + Duration::from_secs(1);
+        let deadline =
+            std::time::Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT + Duration::from_secs(1);
         while self.alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -653,6 +677,84 @@ impl JsonRpcChild {
         self.alive.load(Ordering::SeqCst)
     }
 
+    /// Verify the owned process group is gone. A stop RPC or a closed
+    /// session map is insufficient evidence for releasing workflow leases.
+    pub async fn shutdown_managed(&self) -> Result<(), RpcChildError> {
+        let Some(group) = self.managed_group else {
+            return Err(RpcChildError::ProtocolError(
+                "child was not spawned as a managed attempt".into(),
+            ));
+        };
+        #[cfg(unix)]
+        {
+            // Signal while the owned leader is still unreaped. Managed
+            // adapters expose no shell/agent tools, so no arbitrary process
+            // can escape into another session before this boundary.
+            if self.is_alive() {
+                let result = unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                {
+                    return Err(RpcChildError::IoError(std::io::Error::last_os_error()));
+                }
+            }
+            self.shutdown().await?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let exists = unsafe { libc::kill(-(group as i32), 0) } == 0
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+                if !self.is_alive() && !exists {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(RpcChildError::ProtocolError(
+                        "managed process group quiescence is unconfirmed".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = group;
+            Err(RpcChildError::ProtocolError(
+                "managed containment unavailable".into(),
+            ))
+        }
+    }
+
+    pub fn managed_evidence(&self) -> Result<Value, RpcChildError> {
+        let group = self.managed_group.ok_or_else(|| {
+            RpcChildError::ProtocolError("unmanaged child has no workflow evidence".into())
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            fn start(pid: u32) -> Result<u64, RpcChildError> {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map_err(RpcChildError::IoError)?;
+                stat.rsplit_once(") ")
+                    .and_then(|(_, tail)| tail.split_whitespace().nth(19))
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| {
+                        RpcChildError::ProtocolError("process start identity is unavailable".into())
+                    })
+            }
+            let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map_err(RpcChildError::IoError)?;
+            Ok(
+                serde_json::json!({"kind":"linux_process_group","pid":group,"start_time_ticks":start(group)?,"boot_id":boot_id.trim(),
+                "host_pid":std::process::id(),"host_start_time_ticks":start(std::process::id())?}),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = group;
+            Err(RpcChildError::ProtocolError(
+                "durable managed process identity is unavailable on this platform".into(),
+            ))
+        }
+    }
+
     async fn write_line(&self, value: &Value) -> Result<(), RpcChildError> {
         let mut guard = self.writer.lock().await;
         let writer = guard.as_mut().ok_or(RpcChildError::AlreadyShutdown)?;
@@ -660,7 +762,10 @@ impl JsonRpcChild {
             RpcChildError::ProtocolError(format!("failed to encode outgoing message: {err}"))
         })?;
         line.push(b'\n');
-        writer.write_all(&line).await.map_err(RpcChildError::IoError)?;
+        writer
+            .write_all(&line)
+            .await
+            .map_err(RpcChildError::IoError)?;
         writer.flush().await.map_err(RpcChildError::IoError)?;
         Ok(())
     }
@@ -706,10 +811,7 @@ async fn route_incoming_line(
     let obj = match value.as_object() {
         Some(o) => o.clone(),
         None => {
-            eprintln!(
-                "[json_rpc_child] dropping non-object JSON: {}",
-                value
-            );
+            eprintln!("[json_rpc_child] dropping non-object JSON: {}", value);
             return;
         }
     };
@@ -732,9 +834,7 @@ async fn route_incoming_line(
             };
             let sender = pending.lock().ok().and_then(|mut m| m.remove(id_u64));
             let Some(tx) = sender else {
-                eprintln!(
-                    "[json_rpc_child] response for unknown id {id_u64} (possibly timed out)"
-                );
+                eprintln!("[json_rpc_child] response for unknown id {id_u64} (possibly timed out)");
                 return;
             };
             let outcome: PendingResult = if let Some(err_val) = obj.get("error") {
@@ -793,5 +893,47 @@ impl std::fmt::Debug for JsonRpcChild {
             .field("alive", &self.alive.load(Ordering::SeqCst))
             .field("default_timeout", &self.default_timeout)
             .finish()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod managed_tests {
+    use super::*;
+
+    fn fake_config() -> SpawnConfig {
+        SpawnConfig {
+            program: PathBuf::from("/bin/cat"),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            default_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_child_group_shutdown_is_verified() {
+        let child = JsonRpcChild::spawn_managed(fake_config()).await.unwrap();
+        let evidence = child.managed_evidence().unwrap();
+        let group = evidence["pid"].as_u64().unwrap() as i32;
+        assert_ne!(group, unsafe { libc::getpgrp() });
+        assert_eq!(unsafe { libc::getpgid(group) }, group);
+        assert!(evidence["start_time_ticks"].as_u64().is_some());
+        assert_eq!(
+            evidence["host_pid"].as_u64(),
+            Some(std::process::id().into())
+        );
+        child.shutdown_managed().await.unwrap();
+        assert!(!child.is_alive());
+        assert_eq!(unsafe { libc::kill(-group, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        let ordinary = JsonRpcChild::spawn(fake_config()).await.unwrap();
+        assert!(ordinary.managed_evidence().is_err());
+        assert!(ordinary.shutdown_managed().await.is_err());
+        assert!(ordinary.is_alive());
+        ordinary.shutdown().await.unwrap();
     }
 }

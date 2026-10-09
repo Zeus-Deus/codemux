@@ -1,0 +1,62 @@
+{
+  "preview": "isolated source snapshot; Tauri development mock IPC",
+  "productionSourceDifferences": [],
+  "sourceHashes": {
+    "src/components/workflows/workflow-panel.tsx": "e75a8906d5740aa9da9b9d64de1dab1101e5730aac2d284735993e6f18103822",
+    "src/components/workflows/workflow-setup.tsx": "5a808e5c6e253cc2d78ada1d850ea7d8ba363ab66294b6907097cd0c111b6485",
+    "src/components/workflows/workflow-presentation.ts": "e054eb3116448cbfc11009fdf7e04ed3911ba8f6f81d47ad307a2f24fefd38b7",
+    "src/components/workflows/use-workflow-runtime.ts": "de50c4e51a5b44bbe3ed5f71466345d4f077ea2e8d4094284776ba516de205f7",
+    "src/stores/workflow-inspector-store.ts": "51286937e8a6fc8732f90dee926ec1c25afbe441cd4b5a1f448831b67cee4938",
+    "scripts/e2e/workflows-ui.mjs": "de583f418143403457260a142a4f4f50cddc9d7baa07a869f97a502fee91ff41",
+    "scripts/e2e/workflows-responsive.mjs": "1350d50f78ba4b9d54f84e00a728be1ca557f1041534dbb2e642bc73c192964e",
+    "src/tauri/workflows.ts": "f2b01de3e8e4ca2f94f1c526e62fdcadf3ed5ce5899ba712e772a150fb57a964",
+    "src/dev/workflow-mock.ts": "d37ab4282003a0ffedb5fa3f1cc78f70ac7db170f7cad91433f0ed92feb9e9d2"
+  },
+  "capture": "Visible pane clip with captureBeyondViewport:false preserves layout and inspector state; full viewport captures also included.",
+  "fonts": "Local app fonts served from workspace dependencies by snapshot-only Vite filesystem allowlist.",
+  "externalRequests": "Browser runners block all non-localhost HTTP(S); existing mock favicon image attempts only.",
+  "providerCalls": 0,
+  "modelTokens": 0,
+  "limitations": [
+    "Native narrow-window presentation is emulated with mock IPC, not a real Tauri window.",
+    "200% zoom uses equivalent CSS viewport and device scale rather than changing a browser profile setting.",
+    "Responsive UI tests do not exercise real provider execution or SSH/mobile managed-worker support."
+  ],
+  "counts": {
+    "workflowFlows": 19,
+    "responsiveLayouts": 19,
+    "affectedTests": 67
+  },
+  "verifiedAtUtc": "2026-10-09T13:54:00.087347+00:00",
+  "comparedProductionFiles": 670,
+  "affectedTestRuns": [
+    "66 passed: 29 panel +24 presentation +13 mock before final outside-focus guard.",
+    "30 panel passed after the final outside-focus guard; unchanged24 presentation and13 mock previously passed.",
+    "npm run check passed after the final source changes."
+  ],
+  "reviewFixes": [
+    "Deep task196 selection and split-to-single transition keep Back visible; a short-height screenshot now shows the detail header.",
+    "Tracked inspector focus clears on outside pointer/focus or window blur; polling cannot restore a task row after leaving the inspector.",
+    "Resize-only scrolling preserves outside composer focus.",
+    "Historical file artifacts remain reviewable but have no Apply button or current-application copy.",
+    "Live setup requires valid OpenCode provider/model and empty Cursor effort; dry runs stay available.",
+    "Model and effort strings are normalized only on launch, preserving text while typing."
+  ],
+  "rootAffectedVerification": {
+    "frontendTests": 112,
+    "files": [
+      "workflow-panel:30",
+      "workflow-presentation:24",
+      "workflow-mock:13",
+      "ComposerFooter:33",
+      "pane-registry:12"
+    ],
+    "npmRunCheck": "passed",
+    "npmRunBuild": "passed"
+  },
+  "responsiveCaseCounts": {
+    "total": 19,
+    "visiblePaneMeasurements": 16,
+    "mobileShellAvailabilityChecks": 3
+  }
+}

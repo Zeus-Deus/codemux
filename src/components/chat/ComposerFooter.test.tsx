@@ -382,3 +382,15 @@ describe("provider steering capability", () => {
     expect(screen.getByRole("option", { name: /^Interrupt and send/ })).not.toHaveAttribute("aria-disabled", "true");
   });
 });
+
+
+describe("dynamic workflow entry", () => {
+  it("opens workflows from a non-Claude composer and exposes pane state", () => {
+    const onWorkflowsClick = vi.fn();
+    renderFooter({ provider: "codex", onWorkflowsClick, workflowsOpen: true });
+    const button = screen.getByRole("button", { name: "Open dynamic workflows" });
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(button);
+    expect(onWorkflowsClick).toHaveBeenCalledOnce();
+  });
+});

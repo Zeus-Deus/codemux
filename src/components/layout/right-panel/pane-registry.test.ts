@@ -29,6 +29,12 @@ describe("pane registry", () => {
     expect(paneMeta("browser")?.conditional).toBeUndefined();
   });
 
+  it("keeps dynamic workflows independent of native orchestration", () => {
+    expect(paneMeta("workflows")?.label).toBe("Workflows");
+    expect(paneMeta("workflows")?.conditional).toBeUndefined();
+    expect(paneMeta("orchestration")?.conditional).toBe(true);
+  });
+
   it("lists exactly the availability-gated panes as conditional", () => {
     expect([...CONDITIONAL_PANES]).toEqual(["tasks", "subagents", "orchestration"]);
   });

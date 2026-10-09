@@ -52,6 +52,8 @@ export interface EventEmitter extends PermissionsEmitter {
  *  `Options` a production integration actually sets; everything else
  *  is intentionally left unset (see the research report §14). */
 export interface SessionStartInput {
+  /** Set only by a host-owned workflow attempt registration. */
+  managed?: boolean;
   /** Runtime-owned thread identifier (not the SDK's session uuid). */
   threadId: string;
   /** Absolute working directory for the session. Required. */
@@ -67,6 +69,8 @@ export interface SessionStartInput {
    *  `fastModePerSessionOptIn` flag prevents this UI choice from leaking into
    *  the user's next standalone Claude Code session. */
   fastMode?: boolean;
+  maxBudgetUsd?: number;
+  maxTurns?: number;
   /** Initial permission mode. */
   permissionMode?: PermissionMode;
   /** Must be `true` when `permissionMode === "bypassPermissions"`. */
@@ -208,6 +212,8 @@ function buildQueryOptions(
   };
 
   if (input.model !== undefined) opts.model = input.model;
+  if (input.maxBudgetUsd !== undefined) opts.maxBudgetUsd = input.maxBudgetUsd;
+  if (input.maxTurns !== undefined) opts.maxTurns = input.maxTurns;
   if (input.effort !== undefined) {
     // `EffortLevel` in 0.2.114 accepts "xhigh" and "max", but older
     // and newer versions have historically tightened/loosened this
@@ -265,6 +271,32 @@ function buildQueryOptions(
     };
   }
 
+  if (input.managed) {
+    // Workflows use only host-authorized virtual tools. Native shell, file,
+    // delegation, plugins, and configured MCPs cannot bypass attempt scope.
+    opts.tools = [];
+    // All MCP tools are deferred by current CLIs. This small captured set
+    // must load upfront because managed sessions expose no ToolSearch.
+    opts.env = { ...opts.env, ENABLE_TOOL_SEARCH: "false", MCP_CONNECTION_NONBLOCKING: "0", ENABLE_CLAUDEAI_MCP_SERVERS: "false" };
+    opts.disallowedTools = ["Bash", "Agent", "Task", "Workflow"];
+    opts.settingSources = [];
+    opts.strictMcpConfig = true;
+    opts.plugins = [];
+    const managedSettings = { disableAllHooks: true, ultracode: false };
+    opts.settings = managedSettings;
+    opts.allowedTools = mcpTools.map((tool) => `mcp__codemux__${tool.prefixedName}`);
+    const managedNames = new Set(mcpTools.flatMap((tool) => [tool.prefixedName, `mcp__codemux__${tool.prefixedName}`]));
+    opts.canUseTool = async (name, toolInput) => managedNames.has(name)
+      ? { behavior: "allow", updatedInput: toolInput }
+      : { behavior: "deny", message: "Native tools are unavailable to this managed workflow attempt" };
+    opts.permissionMode = "default";
+    opts.allowDangerouslySkipPermissions = false;
+    opts.extraArgs = {};
+    opts.additionalDirectories = [];
+    delete opts.resume;
+    delete opts.sessionId;
+  }
+
   return opts as Options;
 }
 
@@ -279,6 +311,7 @@ export class ClaudeSession {
   private promptQueue: AsyncPromptQueue<SDKUserMessage>;
   /** Rebuilt by `ensureLiveQuery` after an interrupt, so mutable. */
   private query: Query;
+  private currentQueryModel: string | undefined;
   private readonly emitter: EventEmitter;
   private readonly pendingApprovals: PendingApprovals;
   private closed = false;
@@ -342,6 +375,7 @@ export class ClaudeSession {
     // recordings don't mutate the caller's object; copy `mcpTools` too
     // since it's the one array field a rebuild reads back.
     this.startInput = { ...input };
+    this.currentQueryModel = input.model;
     if (input.mcpTools) {
       this.startInput.mcpTools = [...input.mcpTools];
     }
@@ -604,9 +638,12 @@ export class ClaudeSession {
     // If a per-turn model override was supplied, apply it before the
     // turn is dispatched. The SDK applies `setModel` to subsequent
     // messages, not retroactively, which matches what we want.
-    if (input.modelOverride !== undefined) {
+    // The initial query already owns its configured model. Its control
+    // channel may wait for initialization, which needs the first prompt.
+    if (input.modelOverride !== undefined && input.modelOverride !== this.currentQueryModel) {
       try {
         await this.query.setModel(input.modelOverride);
+        this.currentQueryModel = input.modelOverride;
       } catch (err) {
         logger.warn("setModel on turn-override failed", {
           threadId: this.threadId,
@@ -733,6 +770,7 @@ export class ClaudeSession {
     }
     const options = buildQueryOptions(rebuildInput, this.canUseTool);
     this.query = queryFactory({ prompt: this.promptQueue, options });
+    this.currentQueryModel = rebuildInput.model;
     this.iterationTask = this.consumeMessages();
   }
 
@@ -781,6 +819,7 @@ export class ClaudeSession {
     }
     if (this.queryDead) return;
     await this.query.setModel(model);
+    this.currentQueryModel = model;
   }
 
   /** One-shot attempt to restore real bypass on the live query after
@@ -848,6 +887,47 @@ export class ClaudeSession {
       throw new Error("session is closed");
     }
     return this.query.initializationResult();
+  }
+
+  /** A managed first prompt must not race SDK initialization or its MCP
+   * connection: the stream-input path can otherwise start without tools. */
+  async waitManagedReady(): Promise<void> {
+    if (!this.startInput.managed) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ready = async () => {
+      await this.query.initializationResult();
+      const expected = this.startInput.mcpTools?.map(tool => tool.prefixedName) ?? [];
+      if (expected.length === 0) return;
+      while (!this.closed) {
+        const servers = await this.query.mcpServerStatus();
+        if (servers.some(server => server.name !== "codemux")) {
+          throw new Error("Managed session exposed an unexpected MCP server");
+        }
+        const server = servers.find(server => server.name === "codemux");
+        if (server?.status === "connected") {
+          const actual = new Set(server.tools?.map(tool => tool.name) ?? []);
+          if (actual.size !== expected.length || expected.some(name => !actual.has(name))) {
+            throw new Error("Managed MCP catalog does not match the captured workflow tools");
+          }
+          return;
+        }
+        if (server && server.status !== "pending") {
+          throw new Error("Managed MCP server failed to connect");
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      throw new Error("Managed session closed during tool initialization");
+    };
+    try {
+      await Promise.race([
+        ready(),
+        new Promise<void>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Managed tool initialization timed out")), 15_000);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /** Close the session: stop the iteration loop, close the prompt

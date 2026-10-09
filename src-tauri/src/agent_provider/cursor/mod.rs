@@ -1,6 +1,7 @@
 //! Cursor Agent provider using Cursor's official ACP stdio server.
 
 pub mod capabilities;
+pub mod managed;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +40,8 @@ pub struct CursorAgentProvider {
     config: CursorProviderConfig,
     slash_command_cache: Arc<AcpSlashCommandCache>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<AcpSession>>>>,
+    managed_sessions:
+        Arc<RwLock<HashMap<ThreadId, Arc<super::managed_bridge::ManagedBridgeSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 }
 
@@ -56,6 +59,7 @@ impl CursorAgentProvider {
             config,
             slash_command_cache,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            managed_sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
         }
     }
@@ -75,11 +79,15 @@ impl CursorAgentProvider {
 impl Drop for CursorAgentProvider {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
+        let managed_sessions = Arc::clone(&self.managed_sessions);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let sessions = std::mem::take(&mut *sessions.write().await);
                 for (_, session) in sessions {
                     session.shutdown().await;
+                }
+                for (_, session) in std::mem::take(&mut *managed_sessions.write().await) {
+                    let _ = session.shutdown_managed().await;
                 }
             });
         }
@@ -103,11 +111,65 @@ impl AgentProvider for CursorAgentProvider {
         }
     }
 
+    fn managed_capabilities(&self) -> super::managed::ManagedCapabilities {
+        super::managed::ManagedCapabilities {
+            scoped_tools: true,
+            native_fanout_disabled: true,
+            enforced_read_only: true,
+            isolated_writes: true,
+            verified_stop: cfg!(target_os = "linux"),
+        }
+    }
+
+    async fn stop_managed_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let session = self
+            .managed_sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound {
+                thread_id: thread_id.clone(),
+            })?;
+        session.shutdown_managed().await?;
+        self.managed_sessions.write().await.remove(&thread_id);
+        Ok(())
+    }
+
     async fn start_session(
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
+        if let Some(context) = super::managed::lookup_session(&thread_id) {
+            if self.sessions.read().await.contains_key(&thread_id)
+                || self.managed_sessions.read().await.contains_key(&thread_id)
+            {
+                return Err(ProviderError::ValidationError {
+                    message: "Cursor thread already has a session".into(),
+                });
+            }
+            let session = managed::spawn(input, context, self.event_tx.clone()).await?;
+            let ordinary = self.sessions.read().await;
+            let mut sessions = self.managed_sessions.write().await;
+            if ordinary.contains_key(&thread_id) || sessions.contains_key(&thread_id) {
+                drop(sessions);
+                drop(ordinary);
+                session.shutdown_managed().await?;
+                return Err(ProviderError::ValidationError {
+                    message: "Cursor thread already has a session".into(),
+                });
+            }
+            sessions.insert(thread_id, Arc::clone(&session));
+            drop(sessions);
+            drop(ordinary);
+            return Ok(session.provider_session().await);
+        }
+        if self.managed_sessions.read().await.contains_key(&thread_id) {
+            return Err(ProviderError::ValidationError {
+                message: "Cursor thread already has a managed session".into(),
+            });
+        }
         // Evict a corpse under the write lock so check→remove is atomic
         // against a concurrent rebuild. A read-lock check followed by a
         // separate write-lock remove lets two starts both observe the same
@@ -155,9 +217,10 @@ impl AgentProvider for CursorAgentProvider {
         // with nothing holding a handle to shut it down.
         {
             let mut sessions = self.sessions.write().await;
-            if sessions
-                .get(&thread_id)
-                .is_some_and(|existing| !existing.is_dead())
+            if self.managed_sessions.read().await.contains_key(&thread_id)
+                || sessions
+                    .get(&thread_id)
+                    .is_some_and(|existing| !existing.is_dead())
             {
                 drop(sessions);
                 session.shutdown().await;
@@ -180,6 +243,15 @@ impl AgentProvider for CursorAgentProvider {
     }
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        if let Some(session) = self
+            .managed_sessions
+            .read()
+            .await
+            .get(&input.thread_id)
+            .cloned()
+        {
+            return session.send_turn(input).await;
+        }
         let session = self.session(&input.thread_id).await?;
         Ok(match session.enqueue_or_send(input).await? {
             SendOutcome::Started(turn_id) => TurnStartResult {
@@ -200,6 +272,9 @@ impl AgentProvider for CursorAgentProvider {
         thread_id: ThreadId,
         turn_id: Option<TurnId>,
     ) -> Result<(), ProviderError> {
+        if let Some(session) = self.managed_sessions.read().await.get(&thread_id).cloned() {
+            return session.interrupt().await;
+        }
         self.session(&thread_id).await?.interrupt(turn_id).await
     }
 
@@ -265,6 +340,9 @@ impl AgentProvider for CursorAgentProvider {
     }
 
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        if self.managed_sessions.read().await.contains_key(&thread_id) {
+            self.stop_managed_session(thread_id.clone()).await?;
+        }
         if let Some(session) = self.sessions.write().await.remove(&thread_id) {
             session.shutdown().await;
         }
@@ -295,18 +373,30 @@ impl AgentProvider for CursorAgentProvider {
                 resume_cursor: Some(serde_json::json!({ "schemaVersion": 1, "sessionId": session.provider_session_id.0 })),
             });
         }
+        for session in self.managed_sessions.read().await.values() {
+            result.push(session.provider_session().await);
+        }
         Ok(result)
     }
 
     async fn has_session(&self, thread_id: &ThreadId) -> bool {
-        self.sessions
+        self.managed_sessions
             .read()
             .await
             .get(thread_id)
             .is_some_and(|session| !session.is_dead())
+            || self
+                .sessions
+                .read()
+                .await
+                .get(thread_id)
+                .is_some_and(|session| !session.is_dead())
     }
 
     async fn turn_active(&self, thread_id: &ThreadId) -> bool {
+        if let Some(session) = self.managed_sessions.read().await.get(thread_id).cloned() {
+            return session.turn_active().await;
+        }
         let Some(session) = self.sessions.read().await.get(thread_id).cloned() else {
             return false;
         };
@@ -337,5 +427,9 @@ impl AgentProvider for CursorAgentProvider {
             }
         });
         Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+    }
+
+    fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
+        super::managed_bridge::event_stream(&self.event_tx, thread_id)
     }
 }

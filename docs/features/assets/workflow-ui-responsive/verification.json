@@ -1,0 +1,401 @@
+{
+  "providerCalls": 0,
+  "modelTokens": 0,
+  "checked": [
+    "360px pane",
+    "provider model/effort requirements at narrow and wide widths",
+    "2560px wide split",
+    "480px height",
+    "200% effective reflow",
+    "long unbroken names and provider errors",
+    "24 routes",
+    "1000 task graph with bounded visible rows",
+    "large result",
+    "keyboard detail focus and Back restoration",
+    "reduced-motion media",
+    "mobile browser shell boundaries",
+    "native layout emulation down to 375px with collapsed sidebar"
+  ],
+  "results": [
+    {
+      "name": "setup-narrow",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pane": {
+        "width": 363,
+        "height": 898,
+        "overflow": false
+      },
+      "layout": "setup",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": true,
+      "navigationCount": 1
+    },
+    {
+      "name": "setup-provider-requirements-narrow",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pane": {
+        "width": 363,
+        "height": 898,
+        "overflow": false
+      },
+      "layout": "setup",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": true,
+      "navigationCount": 1
+    },
+    {
+      "name": "setup-provider-requirements-wide",
+      "viewport": {
+        "width": 2560,
+        "height": 1440
+      },
+      "pane": {
+        "width": 2272,
+        "height": 1374,
+        "overflow": false
+      },
+      "layout": "setup",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": false,
+      "navigationCount": 1
+    },
+    {
+      "name": "large-graph-narrow",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pane": {
+        "width": 363,
+        "height": 898,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 200,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "detail-long-content",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pane": {
+        "width": 363,
+        "height": 898,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "large-graph-settled",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pane": {
+        "width": 363,
+        "height": 898,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 300,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "long-result-narrow",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pane": {
+        "width": 363,
+        "height": 898,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "wide-split",
+      "viewport": {
+        "width": 2560,
+        "height": 1440
+      },
+      "pane": {
+        "width": 2272,
+        "height": 1374,
+        "overflow": false
+      },
+      "layout": "split",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 300,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "short-height-detail",
+      "viewport": {
+        "width": 1280,
+        "height": 480
+      },
+      "pane": {
+        "width": 363,
+        "height": 378,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "short-height-checkpoints",
+      "viewport": {
+        "width": 1280,
+        "height": 480
+      },
+      "pane": {
+        "width": 363,
+        "height": 378,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 300,
+      "scrollable": true,
+      "navigationCount": 2
+    },
+    {
+      "name": "many-routes-short-height",
+      "viewport": {
+        "width": 1280,
+        "height": 480
+      },
+      "pane": {
+        "width": 363,
+        "height": 378,
+        "overflow": false
+      },
+      "layout": "setup",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": true,
+      "navigationCount": 3
+    },
+    {
+      "name": "zoom-200-percent",
+      "viewport": {
+        "width": 1024,
+        "height": 768
+      },
+      "pane": {
+        "width": 363,
+        "height": 666,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": false,
+      "navigationCount": 3,
+      "zoom": {
+        "physicalSize": [
+          2048,
+          1536
+        ],
+        "effectiveCssViewport": [
+          1024,
+          768
+        ],
+        "deviceScaleFactor": 2,
+        "note": "200% desktop reflow equivalent using CDP CSS viewport and pixel density; not a browser setting mutation"
+      }
+    },
+    {
+      "name": "browser-mobile-1023",
+      "viewport": {
+        "width": 1023,
+        "height": 844
+      },
+      "boundary": {
+        "mobile": true,
+        "browserClient": true,
+        "workflowVisible": false,
+        "hasWorkflowComposerEntry": false,
+        "documentOverflow": false
+      }
+    },
+    {
+      "name": "browser-mobile-768",
+      "viewport": {
+        "width": 768,
+        "height": 844
+      },
+      "boundary": {
+        "mobile": true,
+        "browserClient": true,
+        "workflowVisible": false,
+        "hasWorkflowComposerEntry": false,
+        "documentOverflow": false
+      }
+    },
+    {
+      "name": "browser-mobile-375",
+      "viewport": {
+        "width": 375,
+        "height": 844
+      },
+      "boundary": {
+        "mobile": true,
+        "browserClient": true,
+        "workflowVisible": false,
+        "hasWorkflowComposerEntry": false,
+        "documentOverflow": false
+      }
+    },
+    {
+      "name": "native-layout-960",
+      "viewport": {
+        "width": 960,
+        "height": 720
+      },
+      "pane": {
+        "width": 908,
+        "height": 654,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": false,
+      "navigationCount": 3
+    },
+    {
+      "name": "native-layout-640",
+      "viewport": {
+        "width": 640,
+        "height": 720
+      },
+      "pane": {
+        "width": 640,
+        "height": 618,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": false,
+      "navigationCount": 3
+    },
+    {
+      "name": "native-layout-480",
+      "viewport": {
+        "width": 480,
+        "height": 720
+      },
+      "pane": {
+        "width": 480,
+        "height": 618,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": false,
+      "navigationCount": 3
+    },
+    {
+      "name": "native-layout-375",
+      "viewport": {
+        "width": 375,
+        "height": 720
+      },
+      "pane": {
+        "width": 375,
+        "height": 618,
+        "overflow": false
+      },
+      "layout": "single",
+      "documentOverflow": false,
+      "overflowing": [],
+      "renderedTaskRows": 0,
+      "scrollable": false,
+      "navigationCount": 3
+    }
+  ],
+  "blockedExternalRequests": [
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    },
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    },
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    },
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    },
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    },
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    },
+    {
+      "origin": "https://www.google.com",
+      "path": "/s2/favicons",
+      "resourceType": "image"
+    }
+  ],
+  "pageErrors": []
+}

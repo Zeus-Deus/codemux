@@ -79,6 +79,7 @@ pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod project_identity;
 pub mod workspaces_sync;
+pub mod workflows;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -336,6 +337,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                app.state::<commands::workflows::WorkflowState>().request_shutdown();
                 if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
                     tauri::async_runtime::block_on(manager.shutdown());
                 }
@@ -417,6 +419,7 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(auth::AuthState::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        .manage(commands::workflows::WorkflowState::open_default())
         // Per-thread live event channels for the chat pane: each
         // mounted pane attaches a tauri::ipc::Channel keyed by
         // thread_id; forward_event routes that thread's runtime
@@ -1102,6 +1105,9 @@ fn build_core_app<R: tauri::Runtime>(
                     agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
                     sidecar,
                 );
+            }
+            if let Some(sidecar) = agent_provider::managed_bridge::resolve_sidecar(resource_dir.as_deref()) {
+                std::env::set_var(agent_provider::managed_bridge::SIDECAR_PATH_ENV, sidecar);
             }
 
             // Agent-chat provider registry initialisation.
@@ -2325,6 +2331,24 @@ fn build_core_app<R: tauri::Runtime>(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::workflows::workflow_capabilities,
+            commands::workflows::workflow_list,
+            commands::workflows::workflow_get,
+            commands::workflows::workflow_create,
+            commands::workflows::workflow_script_execute,
+            commands::workflows::workflow_pause,
+            commands::workflows::workflow_resume,
+            commands::workflows::workflow_cancel,
+            commands::workflows::workflow_cancel_task,
+            commands::workflows::workflow_retry,
+            commands::workflows::workflow_reconcile,
+            commands::workflows::workflow_replace,
+            commands::workflows::workflow_retire,
+            commands::workflows::workflow_message,
+            commands::workflows::workflow_script_save,
+            commands::workflows::workflow_script_list,
+            commands::workflows::workflow_integrate_artifact,
+            commands::workflows::workflow_artifact_preview,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,

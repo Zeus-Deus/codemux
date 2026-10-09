@@ -26,6 +26,34 @@ Codemux's separate `hermes_bindings` table retains profile identity, installatio
 
 ## Reproducible checks
 
+### Managed dynamic workflows
+
+Dynamic workflows use Hermes's separate [official Python library](https://hermes-agent.nousresearch.com/docs/guides/python-library/) and [tool registry](https://hermes-agent.nousresearch.com/docs/developer-guide/tools-runtime/). They require a prepared Python 3.14 source environment; CodeMux does not install dependencies, run Hermes setup, refresh OAuth credentials, or repair an installation.
+
+Start CodeMux with absolute paths configured:
+
+```sh
+export CODEMUX_HERMES_SOURCE=/absolute/path/to/prepared/hermes-agent
+export CODEMUX_HERMES_PYTHON=/absolute/path/to/prepared/venv/bin/python
+export CODEMUX_HERMES_PROFILE_HOME=/absolute/path/to/existing/profile
+```
+
+The profile home defaults to `HERMES_HOME` or `~/.hermes` when omitted. The interpreter must retain its virtual-environment path, including a symlink when Python uses one. Prepare that environment with Hermes's [official PM workflow](https://hermes-agent.nousresearch.com/docs/reference/package-management/) outside CodeMux. Source directories with a repository `.env`, incomplete updates, missing dependencies, incompatible library APIs, or startup operations that require personal installation writes fail with a setup error.
+
+Managed Hermes supports explicitly configured direct API-key and local routes. It reads only routing fields and the relevant API key from the existing profile, then resolves the route inside a fresh owned home. Named/custom provider inventories, credential pools, OAuth, external secret commands, plugin providers, external-process transports, and environment interpolation require additional adapter support and are rejected. A model override must stay within the configured provider. These restrictions are independent of ordinary ACP chat compatibility.
+
+Provider endpoint overrides are captured from the selected profile's model configuration or its supported `.env` variables before the clean environment is created. Custom and local routes require an explicit HTTP or HTTPS endpoint. Unrelated inherited endpoint variables cannot silently redirect the selected route.
+
+Before inference, the adapter confirms the exact captured host tool schemas. Native tools, delegation, MCP, memory, background review, context files, checkpoints, compression, and fallback providers are disabled. Host tools retain the workflow attempt's read/write authority. A public Python audit hook rejects outside file mutations and process launches; the host separately verifies the owned Linux process group has stopped before releasing workspace authority. This guards the official library's startup behavior and does not claim an operating-system sandbox for arbitrary replacement Python code.
+
+The token-free adapter tests use a fake official library and exercise coordination, cancellation, tool-schema injection, routing restrictions, JSON-RPC, and startup write guards:
+
+```sh
+python -m unittest discover -s sidecar/managed-workflow -p test_hermes.py -v
+```
+
+### Ordinary ACP chat
+
 Run the deterministic official-runtime harness:
 
 ```sh

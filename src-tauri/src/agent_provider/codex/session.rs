@@ -17,8 +17,8 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::agent_provider::{
-    ProviderError, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome, SendTurnInput,
-    PlanAuthMode, SessionStatus, ThreadId, TurnId, UsageBaseline,
+    PlanAuthMode, ProviderError, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome,
+    SendTurnInput, SessionStatus, ThreadId, TurnId, UsageBaseline,
 };
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 use crate::mcp::registry::McpRegistry;
@@ -26,10 +26,10 @@ use crate::mcp::registry::McpRegistry;
 use super::protocol::{
     AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, CollaborationMode,
     CollaborationModeSettings, DynamicToolCallParams, DynamicToolSpec,
-    GetAccountRateLimitsResponse, InitializeParams,
-    NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadRollbackParams,
-    ThreadStartParams, ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams,
-    TurnStartResponse, RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
+    GetAccountRateLimitsResponse, InitializeParams, NotificationMessage, ServerRequestMessage,
+    ThreadResumeParams, ThreadRollbackParams, ThreadStartParams, ThreadStartResponse,
+    TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
+    RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
 };
 use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
@@ -239,6 +239,7 @@ pub(crate) struct CodexSession {
     /// session's workspace — the registry's shared MCP child cannot
     /// learn the caller from its env.
     workspace_id: Option<String>,
+    managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
 }
 
 impl CodexSession {
@@ -279,19 +280,48 @@ impl CodexSession {
             env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
         }
 
-        let child = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.codex_binary.clone(),
-            args: vec!["app-server".into()],
-            env,
-            cwd: Some(cwd.clone()),
-            default_timeout: DEFAULT_RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|e| ProviderError::ProcessError {
-            message: "failed to spawn `codex app-server`".into(),
-            source: Some(e.to_string()),
-        })?;
-        let child = Arc::new(child);
+        let managed = crate::agent_provider::managed::lookup_session(&thread_id);
+        if managed.is_some() && resume_cursor.is_some() {
+            return Err(ProviderError::ValidationError {
+                message: "managed attempts cannot resume an unscoped native session".into(),
+            });
+        }
+        // Managed threads select no native environment, including writer
+        // attempts. File access goes through the host's scoped virtual tools.
+        // The read-only policy is an independent defense for native startup.
+        let permission_mode = if managed.is_some() {
+            Some("managed-read-only".to_owned())
+        } else {
+            permission_mode
+        };
+        let child = if managed.is_some() {
+            spawn_managed_codex(
+                &spawn,
+                &env,
+                &cwd,
+                managed
+                    .as_ref()
+                    .ok_or_else(|| ProviderError::ValidationError {
+                        message: "missing managed authority".into(),
+                    })?,
+            )
+            .await?
+        } else {
+            Arc::new(
+                JsonRpcChild::spawn(SpawnConfig {
+                    program: spawn.codex_binary.clone(),
+                    args: vec!["app-server".into()],
+                    env,
+                    cwd: Some(cwd.clone()),
+                    default_timeout: DEFAULT_RPC_TIMEOUT,
+                })
+                .await
+                .map_err(|e| ProviderError::ProcessError {
+                    message: "failed to spawn `codex app-server`".into(),
+                    source: Some(e.to_string()),
+                })?,
+            )
+        };
 
         // Pull the single incoming-request receiver before any background
         // tasks start; otherwise the adapter could race the watchdog.
@@ -303,56 +333,72 @@ impl CodexSession {
             })?;
 
         // --- initialize handshake -------------------------------------------
-        let init_params = serde_json::to_value(InitializeParams {
-            client_info: spawn.client_info.clone(),
-            capabilities: Capabilities {
-                experimental_api: true,
-            },
-        })
-        .map_err(|e| ProviderError::ProcessError {
-            message: "serialize initialize params".into(),
-            source: Some(e.to_string()),
-        })?;
-        child
-            .request("initialize", init_params)
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("initialize failed: {e}"),
+        if managed.is_none() {
+            let init_params = serde_json::to_value(InitializeParams {
+                client_info: spawn.client_info.clone(),
+                capabilities: Capabilities {
+                    experimental_api: true,
+                },
+            })
+            .map_err(|e| ProviderError::ProcessError {
+                message: "serialize initialize params".into(),
+                source: Some(e.to_string()),
             })?;
-        child
-            .notify("initialized", json!({}))
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("initialized notification failed: {e}"),
-            })?;
+            child
+                .request("initialize", init_params)
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: format!("initialize failed: {e}"),
+                })?;
+            child
+                .notify("initialized", json!({}))
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: format!("initialized notification failed: {e}"),
+                })?;
+        }
 
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
-        let dynamic_tools = match spawn.mcp_registry.as_ref() {
-            Some(registry) => {
-                let tools = if spawn.codex_home.is_none() {
-                    registry
-                        .list_all_tools_excluding_source(
-                            crate::mcp::McpConfigSource::CodexUser,
-                        )
-                        .await
-                } else {
-                    registry.list_all_tools().await
-                };
-                Some(
-                    tools
-                        .into_iter()
-                        .map(|tool| DynamicToolSpec::Function {
-                            name: codex_dynamic_tool_name(&tool.prefixed_name),
-                            description: tool.description.unwrap_or_default(),
-                            input_schema: tool.input_schema,
-                            defer_loading: None,
-                        })
-                        .collect(),
-                )
+        let dynamic_tools = if let Some(context) = managed.as_ref() {
+            Some(
+                context
+                    .handler
+                    .tools()
+                    .into_iter()
+                    .map(|tool| DynamicToolSpec::Function {
+                        name: tool.name,
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                        defer_loading: None,
+                    })
+                    .collect(),
+            )
+        } else {
+            match spawn.mcp_registry.as_ref() {
+                Some(registry) => {
+                    let tools = if spawn.codex_home.is_none() {
+                        registry
+                            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
+                            .await
+                    } else {
+                        registry.list_all_tools().await
+                    };
+                    Some(
+                        tools
+                            .into_iter()
+                            .map(|tool| DynamicToolSpec::Function {
+                                name: codex_dynamic_tool_name(&tool.prefixed_name),
+                                description: tool.description.unwrap_or_default(),
+                                input_schema: tool.input_schema,
+                                defer_loading: None,
+                            })
+                            .collect(),
+                    )
+                }
+                None => None,
             }
-            None => None,
         };
 
         // Best-effort probes. Failures are non-fatal — we log via
@@ -376,6 +422,16 @@ impl CodexSession {
         match child.request("account/read", json!({})).await {
             Ok(resp) => match serde_json::from_value::<AccountReadResponse>(resp) {
                 Ok(info) if info.needs_login() => {
+                    if managed.is_some() {
+                        child.shutdown_managed().await.map_err(|error| {
+                            ProviderError::ProcessError {
+                                message: "managed Codex authentication rejection stop unconfirmed"
+                                    .into(),
+                                source: Some(error.to_string()),
+                            }
+                        })?;
+                        return Err(ProviderError::ValidationError{message:"managed-start-rejected: Codex requires authentication; run codex login before launching a workflow".into()});
+                    }
                     let _ = child.shutdown().await;
                     return Err(ProviderError::NotAuthenticated {
                         provider: crate::agent_provider::ProviderKind::Codex,
@@ -507,7 +563,15 @@ impl CodexSession {
                                     ),
                                     original_payload: None,
                                 });
-                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?
+                                start_fresh_thread(
+                                    &child,
+                                    cwd.clone(),
+                                    model.clone(),
+                                    permission_mode.clone(),
+                                    fast_mode,
+                                    dynamic_tools.clone(),
+                                )
+                                .await?
                             }
                             Err(e) => {
                                 return Err(ProviderError::RpcError {
@@ -516,10 +580,30 @@ impl CodexSession {
                             }
                         }
                     }
-                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?,
+                    None => {
+                        start_fresh_thread(
+                            &child,
+                            cwd.clone(),
+                            model.clone(),
+                            permission_mode.clone(),
+                            fast_mode,
+                            dynamic_tools.clone(),
+                        )
+                        .await?
+                    }
                 }
             }
-            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?,
+            None => {
+                start_fresh_thread(
+                    &child,
+                    cwd.clone(),
+                    model.clone(),
+                    permission_mode.clone(),
+                    fast_mode,
+                    dynamic_tools.clone(),
+                )
+                .await?
+            }
         };
 
         // --- assemble session handle ----------------------------------------
@@ -547,6 +631,7 @@ impl CodexSession {
             dead: Arc::new(AtomicBool::new(false)),
             recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
             workspace_id,
+            managed,
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -903,10 +988,12 @@ impl CodexSession {
                         ),
                         original_payload: None,
                     });
-                    let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                        thread_id: self.thread_id.clone(),
-                        queued_id: queued.queued_id,
-                    });
+                    let _ = self
+                        .event_tx()
+                        .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                            thread_id: self.thread_id.clone(),
+                            queued_id: queued.queued_id,
+                        });
                     continue;
                 }
             }
@@ -932,10 +1019,12 @@ impl CodexSession {
             }
         };
         if removed {
-            let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                thread_id: self.thread_id.clone(),
-                queued_id: queued_id.to_string(),
-            });
+            let _ = self
+                .event_tx()
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id: queued_id.to_string(),
+                });
         }
         drop(outbound);
         self.drain_queue().await;
@@ -997,10 +1086,12 @@ impl CodexSession {
             state.queued_turns.drain(..).map(|q| q.queued_id).collect()
         };
         for queued_id in drained {
-            let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                thread_id: self.thread_id.clone(),
-                queued_id,
-            });
+            let _ = self
+                .event_tx()
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id,
+                });
         }
     }
 
@@ -1132,6 +1223,9 @@ impl CodexSession {
             collaboration_mode,
         };
         let mut params_value = serde_json::to_value(&params).unwrap();
+        if self.managed.is_some() {
+            restrict_managed_codex_environment(&mut params_value);
+        }
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
         }
@@ -1394,12 +1488,11 @@ impl CodexSession {
     ) -> Result<(), ProviderError> {
         let jsonrpc_id = {
             let mut state = self.state.lock().await;
-            state
-                .pending_approvals
-                .remove(&request_id)
-                .ok_or_else(|| ProviderError::RequestNotPending {
+            state.pending_approvals.remove(&request_id).ok_or_else(|| {
+                ProviderError::RequestNotPending {
                     request_id: request_id.clone(),
-                })?
+                }
+            })?
         };
         let payload = serde_json::to_value(&response).unwrap();
         self.child
@@ -1458,6 +1551,275 @@ impl CodexSession {
             state.active_turn = None;
         }
     }
+
+    pub async fn shutdown_managed(&self) -> Result<(), ProviderError> {
+        if self.managed.is_none() {
+            return Err(ProviderError::ValidationError {
+                message: "session is not a managed attempt".into(),
+            });
+        }
+        self.child
+            .shutdown_managed()
+            .await
+            .map_err(|error| ProviderError::ProcessError {
+                message: "managed Codex stop is unconfirmed".into(),
+                source: Some(error.to_string()),
+            })?;
+        if let Some(context) = self.managed.as_ref() {
+            context
+                .handler
+                .quiesce()
+                .await
+                .map_err(|error| ProviderError::ProcessError {
+                    message: "managed Codex host-tool stop unconfirmed".into(),
+                    source: Some(error),
+                })?;
+        }
+        self.shutdown().await;
+        Ok(())
+    }
+}
+
+const MANAGED_DISABLED_FEATURES: &[&str] = &[
+    "multi_agent",
+    "multi_agent_v2",
+    "shell_tool",
+    "unified_exec",
+    "hooks",
+    "plugins",
+    "plugin_hooks",
+    "apps",
+    "code_mode",
+    "code_mode_host",
+    "code_mode_only",
+    "code_mode_prewarm",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "in_app_browser",
+    "in_app_chat",
+    "in_app_dictation",
+    "in_app_local_automation",
+    "in_app_updates",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "tool_suggest",
+    "image_generation",
+    "view_image",
+    "daemon_auto_start",
+    "deferred_executor",
+    "shell_snapshot",
+    "apply_patch_freeform",
+];
+
+fn managed_codex_args(disabled_servers: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    for feature in MANAGED_DISABLED_FEATURES {
+        args.extend(["-c".into(), format!("features.{feature}=false")]);
+    }
+    args.extend([
+        "-c".into(),
+        "agents.enabled=false".into(),
+        "-c".into(),
+        "web_search=\"disabled\"".into(),
+    ]);
+    for name in disabled_servers {
+        // Quoted TOML keys preserve punctuation; these are argv entries,
+        // never shell interpolation or mutations of the user's config.
+        args.extend([
+            "-c".into(),
+            format!(
+                "mcp_servers.{}.enabled=false",
+                serde_json::to_string(name).unwrap_or_default()
+            ),
+        ]);
+    }
+    args.push("app-server".into());
+    args
+}
+
+fn disabled(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| v == &json!(false) || v.get("enabled") == Some(&json!(false)))
+}
+
+fn enabled_native_servers(config: &Value) -> Result<Vec<String>, String> {
+    let Some(servers) = config.get("mcp_servers") else {
+        return Ok(vec![]);
+    };
+    if servers.is_null() {
+        return Ok(vec![]);
+    }
+    let servers = servers
+        .as_object()
+        .ok_or("invalid native MCP configuration")?;
+    Ok(servers
+        .iter()
+        .filter(|(_, server)| !disabled(server.get("enabled")))
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
+fn validate_managed_codex_config(config: &Value, feature_report: &Value) -> Result<(), String> {
+    let features = config
+        .get("features")
+        .and_then(Value::as_object)
+        .ok_or("Codex did not report effective feature controls")?;
+    for key in MANAGED_DISABLED_FEATURES {
+        if !disabled(features.get(*key)) {
+            return Err(format!("managed Codex requires features.{key}=false"));
+        }
+    }
+    let reported = feature_report
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("Codex feature capabilities are unavailable")?;
+    // Require the actual implementation to recognize the essential controls;
+    // a permissive config parser accepting unknown keys proves nothing.
+    for key in [
+        "shell_tool",
+        "multi_agent",
+        "multi_agent_v2",
+        "hooks",
+        "plugins",
+        "apps",
+        "code_mode_host",
+    ] {
+        let feature = reported
+            .iter()
+            .find(|feature| feature.get("name").and_then(Value::as_str) == Some(key))
+            .ok_or_else(|| format!("Codex lacks verified {key} control"))?;
+        if feature.get("enabled") != Some(&json!(false)) {
+            return Err(format!("Codex still enables {key}"));
+        }
+    }
+    // 0.160 keeps this execution backend on despite config false. Tool
+    // authority is gated separately by shell_tool and the acknowledged empty
+    // environment selection; require the backend to be recognized, not off.
+    let unified_exec = reported
+        .iter()
+        .find(|feature| feature.get("name").and_then(Value::as_str) == Some("unified_exec"));
+    if unified_exec
+        .and_then(|feature| feature.get("enabled"))
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err("Codex lacks a recognized unified_exec backend".into());
+    }
+    if config.get("web_search").and_then(Value::as_str) != Some("disabled") {
+        return Err("Codex web search was not disabled".into());
+    }
+    if !enabled_native_servers(config)?.is_empty() {
+        return Err("native MCPs are still enabled in managed Codex".into());
+    }
+    Ok(())
+}
+
+async fn spawn_managed_codex(
+    spawn: &CodexSpawnConfig,
+    env: &HashMap<String, String>,
+    cwd: &std::path::Path,
+    context: &crate::agent_provider::managed::ManagedSession,
+) -> Result<Arc<JsonRpcChild>, ProviderError> {
+    let mut disabled_servers = Vec::new();
+    for pass in 0..2 {
+        let child = Arc::new(
+            JsonRpcChild::spawn_managed(SpawnConfig {
+                program: spawn.codex_binary.clone(),
+                args: managed_codex_args(&disabled_servers),
+                env: env.clone(),
+                cwd: Some(cwd.into()),
+                default_timeout: DEFAULT_RPC_TIMEOUT,
+            })
+            .await
+            .map_err(|error| ProviderError::ProcessError {
+                message: "managed Codex launch failed".into(),
+                source: Some(error.to_string()),
+            })?,
+        );
+        let recorded = child
+            .managed_evidence()
+            .map_err(|e| e.to_string())
+            .and_then(|evidence| context.handler.record_runtime(evidence));
+        if let Err(error) = recorded {
+            child
+                .shutdown_managed()
+                .await
+                .map_err(|stop| ProviderError::ProcessError {
+                    message: "managed Codex startup stop unconfirmed".into(),
+                    source: Some(stop.to_string()),
+                })?;
+            return Err(ProviderError::ValidationError {
+                message: format!("managed-start-rejected: {error}"),
+            });
+        }
+        let checked = async {
+            child
+                .request(
+                    "initialize",
+                    serde_json::to_value(InitializeParams {
+                        client_info: spawn.client_info.clone(),
+                        capabilities: Capabilities {
+                            experimental_api: true,
+                        },
+                    })
+                    .map_err(|e| e.to_string())?,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            child
+                .notify("initialized", json!({}))
+                .await
+                .map_err(|e| e.to_string())?;
+            let response = child
+                .request("config/read", json!({"includeLayers":false,"cwd":cwd}))
+                .await
+                .map_err(|e| e.to_string())?;
+            let config = response
+                .get("config")
+                .ok_or("Codex did not report effective configuration")?;
+            let servers = enabled_native_servers(config)?;
+            if !servers.is_empty() && pass == 0 {
+                return Ok(Some(servers));
+            }
+            let feature_report = child
+                .request("experimentalFeature/list", json!({"limit":1000}))
+                .await
+                .map_err(|e| e.to_string())?;
+            validate_managed_codex_config(config, &feature_report)?;
+            Ok::<_, String>(None)
+        }
+        .await;
+        match checked {
+            Ok(None) => return Ok(child),
+            Ok(Some(servers)) => {
+                child
+                    .shutdown_managed()
+                    .await
+                    .map_err(|error| ProviderError::ProcessError {
+                        message: "managed Codex configuration probe stop unconfirmed".into(),
+                        source: Some(error.to_string()),
+                    })?;
+                disabled_servers = servers;
+            }
+            Err(error) => {
+                child.shutdown_managed().await.map_err(|stop_error| {
+                    ProviderError::ProcessError {
+                        message: "managed Codex rejected configuration but stop is unconfirmed"
+                            .into(),
+                        source: Some(stop_error.to_string()),
+                    }
+                })?;
+                return Err(ProviderError::ValidationError {
+                    message: format!("managed-start-rejected: {error}"),
+                });
+            }
+        }
+    }
+    Err(ProviderError::ValidationError {
+        message: "managed-start-rejected: native MCP configuration did not stabilize".into(),
+    })
 }
 
 impl Drop for CodexSession {
@@ -1478,15 +1840,46 @@ impl Drop for CodexSession {
 ///
 /// Returns `None` when no mode is set — callers skip the RPC fields
 /// entirely rather than sending empty strings.
-pub(crate) fn codex_permission_mode_to_policy_pair(
-    mode: Option<&str>,
-) -> Option<(String, String)> {
+pub(crate) fn codex_permission_mode_to_policy_pair(mode: Option<&str>) -> Option<(String, String)> {
     match mode? {
+        "managed-read-only" => Some(("never".into(), "read-only".into())),
         "read-only" => Some(("untrusted".into(), "read-only".into())),
         "workspace-write" => Some(("on-request".into(), "workspace-write".into())),
         "danger-full-access" => Some(("never".into(), "danger-full-access".into())),
         _ => None,
     }
+}
+
+fn restrict_managed_codex_environment(params: &mut Value) {
+    // Exact experimental thread/start and turn/start API in Codex 0.160.
+    // Omission selects the default environment; [] removes environment-native
+    // shell, apply_patch, and view_image tools while retaining dynamic tools.
+    // See rust-v0.160.0/core/src/tools/spec_plan.rs:1083,1269,1283,1425.
+    params["environments"] = json!([]);
+    params["approvalPolicy"] = json!("never");
+}
+
+fn validate_managed_codex_thread(response: &Value) -> Result<(), String> {
+    if !response
+        .get("thread")
+        .and_then(|thread| thread.get("environments"))
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Err("Codex did not acknowledge an empty native environment selection".into());
+    }
+    if response.get("approvalPolicy").and_then(Value::as_str) != Some("never") {
+        return Err("Codex did not acknowledge approvals disabled".into());
+    }
+    if response
+        .get("sandbox")
+        .and_then(|sandbox| sandbox.get("type"))
+        .and_then(Value::as_str)
+        != Some("readOnly")
+    {
+        return Err("Codex did not acknowledge the read-only native startup policy".into());
+    }
+    Ok(())
 }
 
 /// Issue a fresh `thread/start` and return the Codex-assigned thread id.
@@ -1498,6 +1891,7 @@ async fn start_fresh_thread(
     fast_mode: bool,
     dynamic_tools: Option<Vec<DynamicToolSpec>>,
 ) -> Result<String, ProviderError> {
+    let managed = permission_mode.as_deref() == Some("managed-read-only");
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
             Some((ap, sb)) => (Some(ap), Some(sb)),
@@ -1515,18 +1909,41 @@ async fn start_fresh_thread(
         dynamic_tools,
         experimental_raw_events: false,
     };
-    let params_value = serde_json::to_value(&params).unwrap();
-    let resp = child
-        .request("thread/start", params_value)
-        .await
-        .map_err(|e| ProviderError::RpcError {
-            message: format!("thread/start failed: {e}"),
-        })?;
-    let parsed: ThreadStartResponse =
-        serde_json::from_value(resp).map_err(|e| ProviderError::RpcError {
-            message: format!("malformed thread/start response: {e}"),
-        })?;
-    Ok(parsed.thread_id().to_string())
+    let mut params_value = serde_json::to_value(&params).unwrap();
+    if managed {
+        restrict_managed_codex_environment(&mut params_value);
+    }
+    let started = async {
+        let resp = child
+            .request("thread/start", params_value)
+            .await
+            .map_err(|e| format!("thread/start failed: {e}"))?;
+        if managed {
+            validate_managed_codex_thread(&resp)?;
+        }
+        let parsed: ThreadStartResponse = serde_json::from_value(resp)
+            .map_err(|e| format!("malformed thread/start response: {e}"))?;
+        Ok::<_, String>(parsed.thread_id().to_owned())
+    }
+    .await;
+    match started {
+        Ok(id) => Ok(id),
+        Err(message) if managed => {
+            // No turn has been started. Refuse older/unknown APIs instead of
+            // falling back to native file access, and prove process shutdown.
+            child
+                .shutdown_managed()
+                .await
+                .map_err(|error| ProviderError::ProcessError {
+                    message: "managed Codex thread rejection stop unconfirmed".into(),
+                    source: Some(error.to_string()),
+                })?;
+            Err(ProviderError::ValidationError {
+                message: format!("managed-start-rejected: {message}"),
+            })
+        }
+        Err(message) => Err(ProviderError::RpcError { message }),
+    }
 }
 
 /// Case-insensitive match against the recoverable-resume-error snippet list.
@@ -1584,8 +2001,8 @@ fn spawn_notifications_task(
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
+    let mut notifications = child.notifications();
     tokio::spawn(async move {
-        let mut notifications = child.notifications();
         // One demux per session, rooted at the parent Codex thread id, so
         // child-thread (sub-agent) registrations persist across messages.
         let parent_codex_thread_id = {
@@ -1643,7 +2060,13 @@ fn spawn_notifications_task(
                                 _ => session.drain_queue().await,
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            if session.managed.is_some() {
+                                let _=event_tx.send(ProviderRuntimeEvent::RuntimeWarning{
+                                    thread_id:Some(session.thread_id.clone()),
+                                    message:format!("Managed event stream lagged: native Codex notification channel dropped {count}"),original_payload:None,
+                                });
+                            }
                             // Lag is logged but ignored — the upstream
                             // buffer is large enough in practice.
                             continue;
@@ -1674,6 +2097,22 @@ fn spawn_incoming_requests_task(
                     let Some(req) = maybe_req else { break; };
                     let msg = ServerRequestMessage::from_raw(&req.method, req.params.clone());
                     if let ServerRequestMessage::ToolCall(params) = msg {
+                        if let Some(context) = session.managed.clone() {
+                            // Managed callbacks never touch the broad MCP
+                            // registry, and cannot block the request reader.
+                            let child = Arc::clone(&child);
+                            tokio::spawn(async move {
+                                let result = match serde_json::from_value::<DynamicToolCallParams>(params) {
+                                    Ok(call) => match context.call(&call.tool, call.arguments).await {
+                                        Ok(value) => json!({"success":true,"contentItems":[{"type":"inputText","text":value.to_string()}]}),
+                                        Err(error) => json!({"success":false,"contentItems":[{"type":"inputText","text":error}]}),
+                                    },
+                                    Err(error) => json!({"success":false,"contentItems":[{"type":"inputText","text":error.to_string()}]}),
+                                };
+                                let _ = child.respond(req.id, Ok(result)).await;
+                            });
+                            continue;
+                        }
                         let result = handle_dynamic_tool_call(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
@@ -1712,7 +2151,11 @@ async fn handle_dynamic_tool_call(
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
     let (success, result) = match (registry, parsed) {
         (Some(registry), Ok(call)) => match registry
-            .dispatch_tool_call(&registry_tool_name(&call.tool), call.arguments, workspace_id)
+            .dispatch_tool_call(
+                &registry_tool_name(&call.tool),
+                call.arguments,
+                workspace_id,
+            )
             .await
         {
             Ok(result) => {
@@ -1881,10 +2324,7 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
             // adapter-internal reads stay consistent.
             state.status = match p.status.as_str() {
                 "failed" | "error" => SessionStatus::Error {
-                    message: p
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "turn failed".into()),
+                    message: p.error.clone().unwrap_or_else(|| "turn failed".into()),
                 },
                 _ => SessionStatus::Ready,
             };
@@ -1894,8 +2334,7 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
             // Scope a terminal error to the parent session only when it is
             // unscoped or explicitly targets the parent thread; a
             // sub-agent's error must not fail the whole session.
-            if e
-                .thread_id
+            if e.thread_id
                 .as_deref()
                 .map_or(true, |t| t == state.codex_thread_id)
             {
@@ -1913,6 +2352,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_codex_configuration_requires_verified_isolation() {
+        let features: serde_json::Map<String, Value> = MANAGED_DISABLED_FEATURES
+            .iter()
+            .map(|key| (key.to_string(), json!(false)))
+            .collect();
+        let mut report = json!({"data":MANAGED_DISABLED_FEATURES.iter().map(|key|json!({"name":key,"enabled":false})).collect::<Vec<_>>()});
+        let mut config = json!({"features":features,"web_search":"disabled","mcp_servers":{"native":{"enabled":false}}});
+        assert!(validate_managed_codex_config(&config, &report).is_ok());
+        config["features"]["multi_agent_v2"] = json!({"enabled":false});
+        assert!(validate_managed_codex_config(&config, &report).is_ok());
+        config["features"]["shell_tool"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_err());
+        config["features"]["shell_tool"] = json!(false);
+        config["mcp_servers"]["native"]["enabled"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_err());
+        config["mcp_servers"]["native"]["enabled"] = json!(false);
+        assert!(validate_managed_codex_config(&config, &json!({"data":[]})).is_err());
+        let backend = report["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|feature| feature["name"] == "unified_exec")
+            .unwrap();
+        backend["enabled"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_ok());
+        let shell = report["data"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|feature| feature["name"] == "shell_tool")
+            .unwrap();
+        shell["enabled"] = json!(true);
+        assert!(validate_managed_codex_config(&config, &report).is_err());
+        let args = managed_codex_args(&["name.with.dot\"quoted".into()]);
+        assert!(args.contains(&"mcp_servers.\"name.with.dot\\\"quoted\".enabled=false".to_string()));
+        assert_eq!(args.last().unwrap(), "app-server");
+    }
+
+    #[test]
+    fn managed_codex_no_environment_request_preserves_captured_tools() {
+        let tool = json!({"name":"workflow_submit_result","description":"Result","inputSchema":{"type":"object"}});
+        let mut thread = json!({"dynamicTools":[tool.clone()],"sandbox":"read-only"});
+        restrict_managed_codex_environment(&mut thread);
+        assert_eq!(thread["environments"], json!([]));
+        assert_eq!(thread["approvalPolicy"], "never");
+        assert_eq!(thread["sandbox"], "read-only");
+        assert_eq!(thread["dynamicTools"], json!([tool]));
+        let mut turn = json!({"threadId":"owned","input":[{"type":"text","text":"work"}]});
+        restrict_managed_codex_environment(&mut turn);
+        assert_eq!(turn["environments"], json!([]));
+        assert_eq!(turn["approvalPolicy"], "never");
+        assert_eq!(turn["input"][0]["text"], "work");
+    }
+
+    #[test]
+    fn managed_codex_no_environment_ack_fails_closed() {
+        let response = json!({"thread":{"environments":[]},"approvalPolicy":"never","sandbox":{"type":"readOnly"}});
+        assert!(validate_managed_codex_thread(&response).is_ok());
+        for environments in [Value::Null, json!([{"id":"native"}]), json!({})] {
+            let mut rejected = response.clone();
+            rejected["thread"]["environments"] = environments;
+            assert!(validate_managed_codex_thread(&rejected).is_err());
+        }
+        let mut missing = response.clone();
+        missing["thread"]
+            .as_object_mut()
+            .unwrap()
+            .remove("environments");
+        assert!(validate_managed_codex_thread(&missing).is_err());
+        for key in ["approvalPolicy", "sandbox"] {
+            let mut missing = response.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(validate_managed_codex_thread(&missing).is_err());
+        }
+        let mut approvals = response.clone();
+        approvals["approvalPolicy"] = json!("on-request");
+        assert!(validate_managed_codex_thread(&approvals).is_err());
+        let mut writable = response;
+        writable["sandbox"]["type"] = json!("workspaceWrite");
+        assert!(validate_managed_codex_thread(&writable).is_err());
+    }
+
+    #[test]
     fn runtime_identity_uses_the_resolved_turn_settings() {
         let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high")).unwrap();
         assert_eq!(mode.mode, "default");
@@ -1927,9 +2449,18 @@ mod tests {
 
     #[test]
     fn codex_plan_labels_are_humanized_and_unknowns_pass_through() {
-        assert_eq!(codex_plan_label(Some("pro")).as_deref(), Some("ChatGPT Pro"));
-        assert_eq!(codex_plan_label(Some("plus")).as_deref(), Some("ChatGPT Plus"));
-        assert_eq!(codex_plan_label(Some("Team")).as_deref(), Some("ChatGPT Team"));
+        assert_eq!(
+            codex_plan_label(Some("pro")).as_deref(),
+            Some("ChatGPT Pro")
+        );
+        assert_eq!(
+            codex_plan_label(Some("plus")).as_deref(),
+            Some("ChatGPT Plus")
+        );
+        assert_eq!(
+            codex_plan_label(Some("Team")).as_deref(),
+            Some("ChatGPT Team")
+        );
         // A plan tag we have never seen still gets a readable name
         // rather than being dropped.
         assert_eq!(
@@ -1945,7 +2476,9 @@ mod tests {
         assert!(is_recoverable_resume_error(
             "rpc error -32600: no rollout found for thread id 019db5ad"
         ));
-        assert!(is_recoverable_resume_error("rpc error: Thread not found (code 42)"));
+        assert!(is_recoverable_resume_error(
+            "rpc error: Thread not found (code 42)"
+        ));
         assert!(is_recoverable_resume_error("missing thread"));
         assert!(is_recoverable_resume_error("unknown thread"));
         assert!(is_recoverable_resume_error("NO SUCH THREAD"));

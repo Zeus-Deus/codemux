@@ -20,6 +20,8 @@ pub mod grok;
 pub mod health;
 pub mod hermes;
 pub mod instance;
+pub mod managed;
+pub mod managed_bridge;
 pub mod opencode;
 pub mod pricing;
 pub mod provider;

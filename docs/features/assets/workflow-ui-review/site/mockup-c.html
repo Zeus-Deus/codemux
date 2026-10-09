@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup C · Map — CodeMux workflow UI (illustrative)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3C%2Fsvg%3E">
+<link rel="stylesheet" href="assets/app.css">
+<style>
+  .phases { display: flex; align-items: center; gap: 6px; padding: 10px 14px 0; font-size: var(--t-label); color: var(--muted-foreground); flex-wrap: wrap; }
+  .phases .ph-i { display: inline-flex; align-items: center; gap: 4px; }
+  .phases .ph-i.cur { color: var(--foreground); font-weight: 600; }
+  .phases .ph-i.done { color: var(--muted-foreground); }
+  .phases .sep { width: 14px; height: 1px; background: var(--hairline-strong); }
+  .map { padding: 12px 14px 6px; }
+  .spine { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 9px; border: 1px solid var(--hairline-strong); font-size: var(--t-body-sm); }
+  .spine:hover { background: var(--surface-2); }
+  .spine[aria-selected="true"] { background: var(--surface-3); border-color: var(--accent-ember); }
+  .spine .sub { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); }
+  .bracket { height: 12px; margin: 0 9px; border: 1px solid var(--hairline-strong); border-top: 0; border-radius: 0 0 6px 6px; position: relative; }
+  .bracket span { position: absolute; left: 50%; top: 2px; transform: translateX(-50%); background: var(--background); padding: 0 6px; font-family: var(--font-code); font-size: 0.625rem; color: var(--muted-foreground); }
+  .graph { position: relative; margin-top: 14px; }
+  .graph svg { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+  .edge { fill: none; stroke: var(--hairline-strong); stroke-width: 1.5; }
+  .edge.hl { stroke: var(--accent-ember); }
+  .edge.dim { opacity: .35; }
+  .node { position: absolute; height: 48px; border-radius: 9px; border: 1px solid var(--hairline-strong); background: var(--background); padding: 6px 8px; display: grid; gap: 2px; align-content: center; min-width: 0; }
+  .node:hover { background: var(--surface-2); }
+  .node .n1 { display: flex; align-items: center; gap: 5px; font-size: var(--t-label); font-weight: 500; min-width: 0; }
+  .node .n1 span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node .n2 { font-family: var(--font-code); font-size: 0.625rem; color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node.running { border-color: color-mix(in oklch, var(--status-working) 55%, transparent); }
+  .node.unknown { border-color: var(--status-attention); background: repeating-linear-gradient(-45deg, color-mix(in oklch, var(--status-attention) 12%, transparent) 0 5px, var(--background) 5px 10px); }
+  .node.cancelled, .node.queued { border-style: dashed; }
+  .node.replaced::before { content: ""; position: absolute; inset: -4px 4px auto 4px; height: 4px; border: 1px solid var(--hairline-strong); border-bottom: 0; border-radius: 6px 6px 0 0; }
+  .node[aria-selected="true"] { border-color: var(--accent-ember); box-shadow: 0 0 0 1px var(--accent-ember); }
+  .node.dim { opacity: .45; }
+  .frontier { position: absolute; min-height: 48px; border-radius: 9px; border: 1px dashed var(--hairline-strong); display: grid; place-items: center; text-align: center; font-size: var(--t-caption); color: var(--muted-foreground); padding: 4px 6px; line-height: 1.3; }
+  .blockers { margin: 6px 14px 12px; display: grid; gap: 3px; font-size: var(--t-body-sm); }
+  .blockers li { list-style: none; color: color-mix(in oklch, var(--foreground) 88%, var(--muted-foreground)); }
+  .blockers ul { margin: 0; padding: 0; display: grid; gap: 3px; }
+  .levels { padding: 8px 14px; display: grid; gap: 10px; }
+  .levels .lv-opt { display: flex; gap: 8px; align-items: center; padding: 6px 7px; border-radius: 7px; font-size: var(--t-body-sm); }
+  .levels .lv-opt[aria-selected="true"] { background: var(--surface-3); }
+  .levels .lv-opt:hover { background: var(--surface-2); }
+  .c-split { display: grid; grid-template-columns: 1fr minmax(360px, 40%); min-height: 100%; }
+  .c-split > div + div { border-left: 1px solid var(--hairline); }
+  .drawer { border-top: 1px solid var(--hairline); }
+</style>
+</head>
+<body>
+<noscript><p style="padding:20px">This interactive mockup needs JavaScript.</p></noscript>
+<script src="assets/kit.js"></script>
+<script>
+(function () {
+  const { ic, esc, t, stat, usageLine, runControls, runMeta, taskDetail, filesView, ledger } = K;
+  const S = K.S;
+  const PH = ["Plan", "Build", "Audit", "Verify", "Complete"];
+  function levels(s) {
+    const L = {}, lv = (id) => (L[id] !== undefined ? L[id] : (L[id] = s.tasks[id].deps.length ? 1 + Math.max(...s.tasks[id].deps.map(lv)) : 0));
+    s.order.filter((id) => id !== "coordinator").forEach(lv); return L;
+  }
+  function trace(s, id) {
+    const up = new Set(), down = new Set();
+    const u = (x) => s.tasks[x].deps.forEach((d) => { if (!up.has(d)) { up.add(d); u(d); } });
+    const d = (x) => s.tasks[x].dependents.forEach((c) => { if (!down.has(c)) { down.add(c); d(c); } });
+    if (id && id !== "coordinator" && s.tasks[id]) { u(id); d(id); }
+    return { up, down };
+  }
+  function nodeAttrs(id, s, cls, style, extra) {
+    const tk = s.tasks[id], sel = S.sel === id && S.view !== "run";
+    return `role="option" aria-selected="${sel}" tabindex="${sel ? 0 : -1}" data-act="select" data-arg="${id}" data-fk="row-${id}" class="${cls}" ${style ? `style="${style}"` : ""} aria-label="${esc(tk.title)}, ${K.ST[tk.status][2]}${tk.deps.length ? ", needs " + tk.deps.join(" and ") : ""}${extra || ""}"`;
+  }
+  function graph(s, W) {
+    const L = levels(s), ids = Object.keys(L), maxL = Math.max(...ids.map((i) => L[i]));
+    const frontier = !s.tasks.synthesis && ["running", "paused", "unknown"].includes(s.status);
+    const cols = maxL + 1 + (frontier ? 1 : 0), gap = 18, w = Math.min(150, (W - gap * (cols - 1)) / cols), h = 48, vg = 14;
+    const col = {}; ids.forEach((id) => (col[L[id]] = col[L[id]] || []).push(id));
+    const pos = {}; Object.entries(col).forEach(([l, list]) => list.forEach((id, i) => (pos[id] = { x: l * (w + gap), y: i * (h + vg) })));
+    const rows = Math.max(...Object.values(col).map((c) => c.length)), H0 = rows * (h + vg) - vg, skips = ids.some((id) => s.tasks[id].deps.some((d) => L[id] - L[d] > 1)), H = H0 + (skips ? 18 : 0);
+    const { up, down } = trace(s, S.view !== "run" ? S.sel : null), hasSel = S.view !== "run" && S.sel && S.sel !== "coordinator";
+    const on = (id) => !hasSel || id === S.sel || up.has(id) || down.has(id);
+    let edges = "";
+    ids.forEach((id) => s.tasks[id].deps.forEach((d) => { const a = pos[d], b = pos[id]; const x1 = a.x + w, y1 = a.y + h / 2, x2 = b.x, y2 = b.y + h / 2, dx = Math.max(10, (x2 - x1) / 2);
+      // Edges that skip a level route underneath the intermediate column instead of hiding behind its nodes.
+      const skip = L[id] - L[d] > 1, path = skip ? `M${x1} ${y1} C${x1 + 14} ${H - 2}, ${x2 - 14} ${H - 2}, ${x2} ${y2}` : `M${x1} ${y1} C${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+      const hl = hasSel && on(id) && on(d); edges += `<path class="edge ${hl ? "hl" : hasSel ? "dim" : ""}" d="${path}"/>`; }));
+    const order = ids.sort((a, b) => L[a] - L[b] || pos[a].y - pos[b].y);
+    const nodes = order.map((id) => { const tk = s.tasks[id], a = tk.current;
+      const r = (a ? a.route : tk.route).replace("/", "·");
+      return `<div ${nodeAttrs(id, s, `node ${tk.status} ${tk.gen > 1 ? "replaced" : ""} ${on(id) ? "" : "dim"}`, `left:${pos[id].x}px;top:${pos[id].y}px;width:${w}px`, tk.gen > 1 ? ", generation 2 replaced a failed attempt" : "")}>
+        <div class="n1">${stat(tk.status, "")}<span>${esc(id)}</span></div><div class="n2">${tk.gen > 1 ? "g2 · " : ""}${tk.status === "unknown" ? "held · " : ""}${r}</div></div>`; }).join("");
+    const fr = frontier ? `<div class="frontier" style="left:${(maxL + 1) * (w + gap)}px;top:0;width:${w}px" aria-hidden="true">next step decided by the coordinator after results</div>` : "";
+    return { html: `<div class="graph" style="height:${H}px;width:${cols * (w + gap) - gap}px"><svg width="100%" height="${H}" aria-hidden="true">${edges}</svg>${nodes}${fr}</div>`, order };
+  }
+  function blockers(s) {
+    const out = [];
+    s.order.forEach((id) => { const tk = s.tasks[id]; if (id === "coordinator") return;
+      const open = tk.deps.filter((d) => s.tasks[d].status !== "succeeded");
+      if (["queued", "waiting"].includes(tk.status) && open.length) out.push(`<b>${id}</b> waits on ${open.map((d) => `${d} (${K.ST[s.tasks[d].status][2]})`).join(", ")}${tk.held ? " · admission paused" : ""}`);
+      if (tk.status === "unknown") out.push(`<b class="bad">${id}</b> is unknown — coordinator and everything after it wait until Reconcile`);
+      if (tk.needsRepair) out.push(`<b class="work">${id}</b> was cancelled but is required — its dependents can't finish until it is repaired`);
+    });
+    if (!s.tasks.synthesis && ["running", "paused", "unknown"].includes(s.status)) out.push(`No synthesis task yet — the coordinator adds it once storage, ui and tests report`);
+    if (s.status === "completed") out.push(`Nothing blocked. The coordinator accepted storage@g2 and ui@g1.`);
+    if (s.status === "cancelled") out.push(`Run cancelled — nothing will be admitted. Retry and Apply are revoked.`);
+    return `<div class="blockers" role="note" aria-label="What is blocking progress"><div class="eyebrow" style="margin-bottom:2px">Blocking progress</div><ul>${out.map((x) => `<li>${x}</li>`).join("")}</ul></div>`;
+  }
+  function levelList(s) {
+    const L = levels(s), max = Math.max(...Object.values(L));
+    const lv = []; for (let i = 0; i <= max; i++) lv.push(Object.keys(L).filter((id) => L[id] === i));
+    const opt = (id) => { const tk = s.tasks[id]; return `<div ${nodeAttrs(id, s, "lv-opt")}>${stat(tk.status, "")}<span style="flex:1">${esc(tk.title)}</span><span class="mono cap muted">${tk.deps.length ? "← " + tk.deps.join(", ") : "start"}</span></div>`; };
+    return `<div class="levels" role="listbox" aria-label="Tasks by dependency level">${lv.map((ids, i) => `<div role="group" aria-label="Level ${i + 1}"><div class="eyebrow" style="margin-bottom:3px">Level ${i + 1}</div>${ids.map(opt).join("")}</div>`).join("")}</div>`;
+  }
+  function body(s, W) {
+    const m = runMeta(s), cur = PH.indexOf(s.phase), c = s.tasks.coordinator, narrow = S.width === "narrow";
+    const g = narrow ? null : graph(s, W);
+    return `<div class="runbar"><div class="runbar-top"><h2>Refactor session recovery</h2>${m.html}</div>
+        <div class="meta"><span>${s.busy}/2 workers</span><span>${t(s.now)} elapsed</span><button class="chip" data-act="setup" data-fk="rb-setup">${ic("settings", 11)}setup & limits</button></div>${runControls(s)}</div>
+      <div class="phases" aria-label="Phases recorded by the workflow">${PH.map((p, i) => `${i ? '<span class="sep" aria-hidden="true"></span>' : ""}<span class="ph-i ${i === cur ? "cur" : i < cur ? "done" : ""}">${i < cur || s.phase === "Complete" ? ic("check", 11) : ""}${p}${i === cur && s.phase !== "Complete" ? '<span class="sr-only"> (current)</span>' : ""}</span>`).join("")}</div>
+      ${s.needs.length ? s.needs.map((n) => `<div class="banner ${n.kind === "paused" ? "work" : n.kind === "cancelled" ? "" : "bad"}" role="note"><span class="sm">${esc(n.text)}</span>${n.act ? `<div class="row-acts"><button class="btn sm" data-act="${n.act}" data-arg="${n.task || ""}" data-fk="nb-${n.act}">${{ resume: "Resume", reconcile: "Reconcile task", retry: "Retry task" }[n.act]}</button>${K.mockTag}</div>` : ""}</div>`).join("") : ""}
+      <div class="map" role="listbox" aria-label="Task dependency map. Arrow keys move between tasks; Enter inspects.">
+        <div ${nodeAttrs("coordinator", s, "spine")}>${stat(c.status, "")}<span style="flex:1;min-width:0"><b style="font-weight:500">coordinator</b> <span class="sub">claude/coordinator · ${c.attempts.length} turns</span><span class="sub" style="display:block">${c.status === "waiting" ? `waiting for ${c.waitingFor.join(", ")} · yielded, holds no slot` : K.ST[c.status][2]}</span></span></div>
+        <div class="bracket" aria-hidden="true"><span>created by coordinator</span></div>
+        ${narrow ? "" : g.html}
+      </div>
+      ${narrow ? levelList(s) : ""}
+      ${blockers(s)}
+      <p class="tok" style="padding:0 14px 12px;margin:0">${usageLine(s.usage)}</p>`;
+  }
+  function side(s) {
+    if (S.view === "files") return filesView(S.artifact, s, { back: S.width === "expanded" ? null : "Back to task" });
+    if (S.view === "task") return taskDetail(S.sel, s, { back: S.width === "expanded" ? null : "Close" });
+    return `<div class="td"><div class="eyebrow">What is verified</div>${ledger(s)}</div>`;
+  }
+  K.mount({
+    letter: "C", name: "Map", tagline: "organized by what depends on what",
+    setup: (s) => K.setupView(s, { tallScript: true, order: ["goal", "script", "routes", "limits", "writes", "launch"],
+      head: `<div><h3 tabindex="-1" id="td-title">New workflow</h3><p class="why" style="margin:4px 0 0">The script is the plan's source. The map draws only the tasks the script and coordinator actually create — nothing in advance.</p></div>` }),
+    focusOnSelect: null,
+    render(s) {
+      const pw = document.getElementById("pane").clientWidth || 500;
+      if (S.width === "expanded") return `<div class="c-split"><div>${body(s, pw * 0.6 - 30)}</div><div>${side(s)}</div></div>`;
+      if (S.width === "narrow" && S.view !== "run") return side(s);
+      return body(s, pw - 30) + `<div class="drawer">${side(s)}</div>`;
+    },
+    act(a, arg) {
+      if (a === "select") { S.sel = arg; S.view = "task"; if (S.width === "narrow") K.focusAfter("#td-title"); return true; }
+      if (a === "back") { if (S.view === "files") { S.view = "task"; K.focusAfter("#td-title"); } else { const f = S.sel; S.view = "run"; K.focusAfter(f ? `[data-fk="row-${f}"]` : "#pane"); } return true; }
+    },
+    after() { document.querySelectorAll('#pane [role="listbox"]').forEach((lb) => { if (!lb.querySelector('[role="option"][tabindex="0"]')) { const o = lb.querySelector('[role="option"]'); if (o) o.tabIndex = 0; } }); }
+  });
+})();
+</script>
+</body>
+</html>

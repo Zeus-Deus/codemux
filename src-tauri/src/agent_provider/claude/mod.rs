@@ -169,6 +169,21 @@ impl AgentProvider for ClaudeAgentProvider {
         }
     }
 
+    fn managed_capabilities(&self) -> crate::agent_provider::managed::ManagedCapabilities {
+        crate::agent_provider::managed::ManagedCapabilities {
+            scoped_tools: true, native_fanout_disabled: true, enforced_read_only: true,
+            isolated_writes: true, verified_stop: cfg!(target_os = "linux"),
+        }
+    }
+
+    async fn stop_managed_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let session = self.sessions.read().await.get(&thread_id).cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound { thread_id: thread_id.clone() })?;
+        session.shutdown_managed().await?;
+        self.sessions.write().await.remove(&thread_id);
+        Ok(())
+    }
+
     async fn start_session(
         &self,
         input: StartSessionInput,
@@ -412,5 +427,19 @@ impl AgentProvider for ClaudeAgentProvider {
             }
         });
         Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+    }
+
+    fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
+        let rx = self.event_tx.subscribe();
+        let id = thread_id.clone();
+        Box::pin(futures_util::stream::unfold((rx,id), |(mut rx,id)| async move {
+            match rx.recv().await {
+                Ok(item)=>Some((item,(rx,id))),
+                Err(broadcast::error::RecvError::Closed)=>None,
+                Err(broadcast::error::RecvError::Lagged(count))=>Some((ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id:Some(id.clone()),message:format!("Managed event stream lagged by {count} events"),original_payload:None,
+                },(rx,id))),
+            }
+        }))
     }
 }

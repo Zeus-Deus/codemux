@@ -1,0 +1,114 @@
+{
+  "results": [
+    {
+      "width": 1440,
+      "initial": {
+        "origin": "null",
+        "width": 1440,
+        "scrollWidth": 1440,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "previewFrames": 3,
+        "overflow": []
+      },
+      "keyboard": {
+        "tab": "t-b",
+        "focus": "t-b",
+        "panel": "B · Lanes"
+      },
+      "state": {
+        "selected": "unknown",
+        "focus": "BUTTON ",
+        "preview": [
+          "http://127.0.0.1:43773/mockup-b.html#embed=1&state=unknown",
+          "http://127.0.0.1:43773/mockup-a.html#embed=1&state=unknown",
+          "http://127.0.0.1:43773/mockup-c.html#embed=1&state=unknown"
+        ],
+        "fullLinks": [
+          "mockup-b.html#state=unknown",
+          "mockup-b.html#state=unknown",
+          "mockup-a.html#state=unknown",
+          "mockup-c.html#state=unknown"
+        ]
+      },
+      "embedded": [
+        {
+          "origin": "null",
+          "title": "Mockup B · Lanes — CodeMux workflow UI (illustrative)",
+          "state": "unknown",
+          "paneWidth": 500,
+          "tag": "workflows · needs attention · 2/2 workers· mock data · illustrative run, writes opted inΣ 151k obs + 14.8k est"
+        }
+      ]
+    },
+    {
+      "width": 375,
+      "initial": {
+        "origin": "null",
+        "width": 375,
+        "scrollWidth": 375,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "previewFrames": 3,
+        "overflow": []
+      },
+      "keyboard": {
+        "tab": "t-b",
+        "focus": "t-b",
+        "panel": "B · Lanes"
+      },
+      "state": {
+        "selected": "unknown",
+        "focus": "BUTTON ",
+        "preview": [
+          "http://127.0.0.1:43773/mockup-b.html#embed=1&state=unknown",
+          "http://127.0.0.1:43773/mockup-a.html#embed=1&state=unknown",
+          "http://127.0.0.1:43773/mockup-c.html#embed=1&state=unknown"
+        ],
+        "fullLinks": [
+          "mockup-b.html#state=unknown",
+          "mockup-b.html#state=unknown",
+          "mockup-a.html#state=unknown",
+          "mockup-c.html#state=unknown"
+        ]
+      },
+      "embedded": [
+        {
+          "origin": "null",
+          "title": "Mockup B · Lanes — CodeMux workflow UI (illustrative)",
+          "state": "unknown",
+          "paneWidth": 500,
+          "tag": "workflows · needs attention · 2/2 workers· mock data · illustrative run, writes opted inΣ 151k obs + 14.8k est"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "width": 375,
+    "scrollWidth": 375,
+    "links": [
+      "index.html",
+      "evidence/live-validation.json",
+      "evidence/synthetic-validation.json"
+    ]
+  },
+  "errors": [],
+  "external": [],
+  "failed": []
+}
