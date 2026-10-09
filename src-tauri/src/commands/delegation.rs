@@ -265,12 +265,20 @@ impl Task {
             } => {
                 // Stop, close and restarts end the task before their session
                 // closes, so a session ending here is the child dying. A turn
-                // it never finished is a failure, not a wait on the user.
+                // it never finished, or a question it can no longer take an
+                // answer to, is a failure, not a wait on the user.
+                let waiting = self.awaits_user();
                 self.open_requests.clear();
-                self.last_status.get_or_insert_with(|| TurnStatus::Error {
-                    subtype: "session_ended".into(),
-                    message: "Its session ended before it finished.".into(),
-                });
+                if waiting || self.last_status.is_none() {
+                    self.last_status = Some(TurnStatus::Error {
+                        subtype: "session_ended".into(),
+                        message: if waiting {
+                            "Its session ended while it was waiting for your answer.".into()
+                        } else {
+                            "Its session ended before it finished.".into()
+                        },
+                    });
+                }
                 settle = true;
             }
             ProviderRuntimeEvent::RequestOpened { request_id, .. } => {

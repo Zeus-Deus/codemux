@@ -1198,10 +1198,60 @@ mod delegation {
         assert_eq!(h.card(&dead).status, SubagentStatus::Failed);
         assert_eq!(
             h.card(&dead).result_text.as_deref(),
-            Some("Its session ended before it finished.")
+            Some("Its session ended while it was waiting for your answer.")
         );
         let wakes = h.wait_for_wakes(2).await;
         assert!(wakes[1].contains("status=\"failed\" title=\"Review the parser\""));
+
+        // A successful turn that left its question open is a real wait, until
+        // the session dies: then nobody can answer into this task any more.
+        let waiting = h
+            .delegate_and_dispatch(args("codex", "Pick a storage engine"))
+            .await;
+        ask(&waiting);
+        h.child_reports(&waiting, "Which storage should I use?");
+        h.settle(&waiting).await;
+        assert_eq!(h.card(&waiting).status, SubagentStatus::Running);
+        assert_eq!(
+            h.card(&waiting).activity.as_deref(),
+            Some("Waiting for your answer in its tab")
+        );
+        forward_event(
+            &h.handle,
+            ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ThreadId(waiting.clone()),
+                status: SessionStatus::Error {
+                    message: "app-server exited".into(),
+                },
+            },
+        );
+        h.settle(&waiting).await;
+        assert_eq!(h.card(&waiting).status, SubagentStatus::Failed);
+        assert_eq!(
+            h.card(&waiting).result_text.as_deref(),
+            Some("Its session ended while it was waiting for your answer.")
+        );
+        let wakes = h.wait_for_wakes(3).await;
+        assert!(wakes[2].contains("status=\"failed\" title=\"Pick a storage engine\""));
+
+        // A session that dies mid-turn with nothing asked fails plainly.
+        let crashed = h
+            .delegate_and_dispatch(args("codex", "Bump the lockfile"))
+            .await;
+        forward_event(
+            &h.handle,
+            ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ThreadId(crashed.clone()),
+                status: SessionStatus::Error {
+                    message: "app-server exited".into(),
+                },
+            },
+        );
+        h.settle(&crashed).await;
+        assert_eq!(
+            h.card(&crashed).result_text.as_deref(),
+            Some("Its session ended before it finished.")
+        );
     }
 
     #[tokio::test]
