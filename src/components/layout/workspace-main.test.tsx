@@ -117,7 +117,10 @@ vi.mock("@/stores/ui-store", () => ({
     ),
     {
       getState: () => ({
-        setRightPanelWidth: vi.fn(),
+        setRightPanelWidth: (width: number) => state.panelWidths.push(width),
+        resetRightPanelWidth: () => {
+          state.panelResets += 1;
+        },
         setRightPanelRowWidth: (width: number) => state.rowWidths.push(width),
       }),
     },
@@ -130,7 +133,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { WorkspaceMain } from "./workspace-main";
-import { dbSetUiState } from "@/tauri/commands";
+import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -599,5 +602,21 @@ describe("WorkspaceMain right panel resizer keyboard and reset", () => {
     expect(state.panelResets).toBe(1);
     expect(state.panelWidths).toEqual([]);
     expect(dbSetUiState).toHaveBeenLastCalledWith("right_panel_width", "320");
+  });
+
+  it("restores a saved default without widening it to the drag minimum", async () => {
+    vi.mocked(dbGetUiState).mockResolvedValueOnce("320");
+    render(<WorkspaceMain />);
+    await act(async () => {});
+    expect(state.panelResets).toBe(1);
+    expect(state.panelWidths).toEqual([]);
+  });
+
+  it("restores any other saved width through the drag setter", async () => {
+    vi.mocked(dbGetUiState).mockResolvedValueOnce("480");
+    render(<WorkspaceMain />);
+    await act(async () => {});
+    expect(state.panelResets).toBe(0);
+    expect(state.panelWidths).toEqual([480]);
   });
 });

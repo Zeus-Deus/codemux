@@ -232,10 +232,17 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
     useUIStore.getState().setRightPanelRowWidth(contentRowWidth);
   }, [contentRowWidth]);
 
-  // Load persisted right panel width from SQLite on mount
+  // Load persisted right panel width from SQLite on mount. A saved default
+  // goes back through the reset so the drag minimum doesn't widen it.
   useEffect(() => {
     dbGetUiState("right_panel_width").then((val) => {
-      if (val) useUIStore.getState().setRightPanelWidth(Number(val));
+      if (!val) return;
+      const width = Number(val);
+      if (width === RIGHT_PANEL_DEFAULT_WIDTH) {
+        useUIStore.getState().resetRightPanelWidth();
+      } else {
+        useUIStore.getState().setRightPanelWidth(width);
+      }
     }).catch(() => {});
   }, []);
 
