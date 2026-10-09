@@ -77,5 +77,20 @@
       "Complete chat startup test UI-store fixture"
     ],
     "verification": "251 focused frontend tests and npm run check passed;19 workflow flows and19 responsive cases refreshed with identical source."
-  }
+  },
+  "sourceHashScope": "Source hashes and the snapshot comparison describe the browser capture at verifiedAtUtc. Later nonvisual changes have their own hashes and checks below.",
+  "nonvisualFollowUps": [
+    {
+      "verifiedAtUtc": "2026-10-09T14:24:31.244619+00:00",
+      "file": "src/components/workflows/use-workflow-runtime.ts",
+      "sha256": "cbcb02879f50dc56707bc3ad01d4f7ae677295a1c05ba5ff5016dfdd994f23c0",
+      "change": "Host-wide workflow events refresh run history even while a terminal run is selected, using the existing250ms coalescing queue.",
+      "verification": [
+        "31 workflow panel tests passed, including normal and lagged production null-ID payloads with a different run finishing.",
+        "npm run check passed.",
+        "git diff --check passed."
+      ],
+      "browserEvidence": "Earlier browser captures remain applicable to layout; this event refresh behavior is verified by the focused component regression, not by the earlier mock browser runs."
+    }
+  ]
 }

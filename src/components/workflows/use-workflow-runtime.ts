@@ -77,7 +77,9 @@ export function useWorkflowRuntime(workspaceId: string) {
       if (payload.kind === "created") refreshHistory = true;
       if (payload.run_id === null) {
         refreshRun = !!selectedId;
-        refreshHistory = !selectedId;
+        // Host-wide notifications can describe another run finishing while
+        // the selected terminal run has stopped polling.
+        refreshHistory = true;
       }
       if (payload.run_id !== null && payload.run_id === selectedId) {
         const cached = client.getQueryData<WorkflowRunSnapshot>(["workflows", workspaceId, "run", selectedId]);

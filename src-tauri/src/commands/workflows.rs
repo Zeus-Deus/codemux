@@ -36,8 +36,9 @@ pub struct WorkflowState {
     artifacts: Arc<ArtifactStore>,
     started: AtomicBool,
     policy: HostPolicy,
-    _ownership: Option<RuntimeOwnership>,
+    _ownership: Option<Arc<RuntimeOwnership>>,
     live: Mutex<Option<Arc<LiveWorkflowDriver>>>,
+    driver_task: Mutex<Option<tauri::async_runtime::JoinHandle<Result<(), String>>>>,
 }
 
 impl WorkflowState {
@@ -52,7 +53,7 @@ impl WorkflowState {
             let root = directory
                 .as_ref()
                 .ok_or("Workflow data directory is unavailable")?;
-            ownership = Some(lock_runtime(root)?);
+            ownership = Some(Arc::new(lock_runtime(root)?));
             let service =
                 WorkflowService::open(root.join("workflows.db"), policy.global_concurrency)?;
             policy.configure(&service)?;
@@ -70,17 +71,154 @@ impl WorkflowState {
             policy: policy.unwrap_or_default(),
             _ownership: ownership,
             live: Mutex::new(None),
+            driver_task: Mutex::new(None),
         }
     }
     fn service(&self) -> Result<WorkflowService, String> {
         self.service.clone()
     }
 
-    pub fn request_shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.shutdown_with_deadline(
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(3),
+        )
+        .await
+    }
+
+    async fn shutdown_with_deadline(
+        &self,
+        driver_deadline: std::time::Duration,
+        checkpoint_deadline: std::time::Duration,
+    ) -> Result<(), String> {
+        let mut errors = vec![];
         if let Ok(service) = &self.service {
-            if let Err(error) = service.shutdown_signal() {
-                eprintln!("[codemux::workflows] shutdown checkpoint failed: {error}");
+            service.latch_shutdown();
+            let service = service.clone();
+            let ownership = self._ownership.clone();
+            // Database locking or filesystem I/O cannot hold up native stop.
+            // Keep the process-ownership lock alive while a late checkpoint
+            // finishes, preventing a second host from recovering underneath it.
+            let checkpoint = tokio::task::spawn_blocking(move || {
+                let _ownership = ownership;
+                service.shutdown_signal()
+            });
+            match tokio::time::timeout(checkpoint_deadline, checkpoint).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => errors.push(format!("shutdown checkpoint failed: {error}")),
+                Ok(Err(error)) => errors.push(format!("shutdown checkpoint task failed: {error}")),
+                Err(_) => errors.push(
+                    "shutdown checkpoint timed out; native teardown continues with holds retained"
+                        .into(),
+                ),
             }
+        }
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| "Workflow driver registry is unavailable")?
+            .clone();
+        if let Some(live) = &live {
+            if let Err(error) = live.abort_owned_startups().await {
+                errors.push(error);
+            }
+        }
+        let task = self
+            .driver_task
+            .lock()
+            .map_err(|_| "Workflow driver task is unavailable")?
+            .take();
+        let wait_driver = async {
+            let mut errors = vec![];
+            if let Some(mut task) = task {
+                match tokio::time::timeout(driver_deadline, &mut task).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(error))) => errors.push(error),
+                    Ok(Err(error)) => errors.push(format!("workflow driver join failed: {error}")),
+                    Err(_) => {
+                        // Only this retained driver is aborted. Its JoinSet drops
+                        // attempt futures; provider ownership is cleaned up below.
+                        task.abort();
+                        if tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+                            .await
+                            .is_err()
+                        {
+                            errors.push("workflow driver cancellation did not finish".into());
+                        }
+                        errors.push(
+                            "workflow driver exceeded shutdown deadline; durable holds retained"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            errors
+        };
+        let stop_owned = async {
+            let mut errors = vec![];
+            if let Some(live) = &live {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(18),
+                    live.shutdown_owned_runtimes(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(error),
+                    Err(_) => errors
+                        .push("owned workflow teardown timed out; durable holds retained".into()),
+                }
+            }
+            errors
+        };
+        let drain_scripts = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.scripts.drain_active(),
+        );
+        // A stalled driver/checkpoint must not defer native stop for the whole
+        // driver deadline. Keep both futures owned and wait for their proofs.
+        let (driver_errors, stop_errors, script_result) =
+            tokio::join!(wait_driver, stop_owned, drain_scripts);
+        errors.extend(driver_errors);
+        errors.extend(stop_errors);
+        match script_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(_) => {
+                errors.push(
+                    "workflow script drain timed out; ownership retained until the script exits"
+                        .into(),
+                );
+                let scripts = self.scripts.clone();
+                let ownership = self._ownership.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ownership = ownership;
+                    let _ = scripts.drain_active().await;
+                });
+            }
+        }
+        if let Some(live) = &live {
+            // Catch a startup registered concurrently with the first snapshot.
+            if let Err(error) = live.abort_owned_startups().await {
+                errors.push(error);
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(18),
+                live.shutdown_owned_runtimes(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(_) => {
+                    errors.push("owned workflow teardown timed out; durable holds retained".into())
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 }
@@ -154,11 +292,19 @@ fn start_runtime<R: Runtime>(app: &AppHandle<R>, state: &WorkflowState) -> Resul
         live,
     });
     let driver_service = service.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = driver_service.run_driver(driver).await {
+    let ownership = state._ownership.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let _ownership = ownership;
+        let result = driver_service.run_driver(driver).await;
+        if let Err(error) = &result {
             eprintln!("[codemux::workflows] driver stopped: {error}");
         }
+        result
     });
+    *state
+        .driver_task
+        .lock()
+        .map_err(|_| "Workflow driver task is unavailable")? = Some(task);
     let mut events = service.subscribe();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -703,6 +849,243 @@ mod tests {
         assert!(lock_runtime(directory.path()).is_ok());
     }
 
+    fn test_state(service: WorkflowService, root: &std::path::Path) -> WorkflowState {
+        WorkflowState {
+            service: Ok(service),
+            scripts: WorkflowScriptRuntime::default(),
+            artifacts: Arc::new(ArtifactStore::new(root.join("artifacts"))),
+            started: AtomicBool::new(true),
+            policy: HostPolicy::default(),
+            _ownership: Some(Arc::new(lock_runtime(root).unwrap())),
+            live: Mutex::new(None),
+            driver_task: Mutex::new(None),
+        }
+    }
+
+    fn shutdown_spec() -> RunSpec {
+        serde_json::from_value(serde_json::json!({
+            "workspace_id":"fixture","title":"shutdown","goal":"No provider calls","mode":"dry_run",
+            "routes":[{"id":"fake","provider":"fake"}],
+            "tasks":[{"id":"active","title":"active","prompt":"token-free"},
+                     {"id":"queued","title":"queued","prompt":"token-free"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn workflow_owner_handoff_precedes_prelaunch_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("workflows.db");
+        let first = test_state(WorkflowService::open(&database, 1).unwrap(), root.path());
+        let service = first.service().unwrap();
+        let run = service.create(shutdown_spec(), "handoff").unwrap();
+        let dispatch = service.claim_next().unwrap().unwrap();
+        service.mark_running(&dispatch).unwrap();
+        assert!(lock_runtime(root.path()).is_err());
+        assert_eq!(
+            service.snapshot(&run.id).unwrap().tasks[0].status,
+            workflows::TaskStatus::Running
+        );
+        drop(first);
+        let _next_owner = lock_runtime(root.path()).unwrap();
+        let recovered = WorkflowService::open(&database, 1).unwrap();
+        let snapshot = recovered.snapshot(&run.id).unwrap();
+        assert!(snapshot.pause_requested);
+        assert_eq!(snapshot.tasks[0].status, workflows::TaskStatus::Failed);
+        assert_eq!(snapshot.usage.reserved_tokens, 0);
+        assert!(recovered.authorize_attempt(&dispatch).is_err());
+        assert!(recovered.claim_next().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_app_exit_joins_delayed_worker_and_checkpoints_queued_work() {
+        struct SlowStop {
+            started: Arc<tokio::sync::Notify>,
+            stopped: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl WorkflowDriver for SlowStop {
+            async fn execute(
+                &self,
+                _: Dispatch,
+                _: WorkflowService,
+                mut cancellation: watch::Receiver<bool>,
+            ) -> ExecutionReport {
+                self.started.notify_one();
+                while !*cancellation.borrow() {
+                    cancellation.changed().await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+                self.stopped.store(true, Ordering::SeqCst);
+                ExecutionReport::cancelled()
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let service = WorkflowService::open(root.path().join("workflows.db"), 1).unwrap();
+        let run = service.create(shutdown_spec(), "exit").unwrap();
+        let state = test_state(service.clone(), root.path());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let driver = Arc::new(SlowStop {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        });
+        let task_service = service.clone();
+        *state.driver_task.lock().unwrap() = Some(tauri::async_runtime::spawn(async move {
+            task_service.run_driver(driver).await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        state.shutdown().await.unwrap();
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(state.driver_task.lock().unwrap().is_none());
+        let snapshot = service.snapshot(&run.id).unwrap();
+        assert!(snapshot.pause_requested);
+        assert_eq!(snapshot.tasks[0].status, workflows::TaskStatus::Cancelled);
+        assert_eq!(snapshot.tasks[1].status, workflows::TaskStatus::Queued);
+        assert!(snapshot.tasks.iter().all(|task| task
+            .current_attempt
+            .as_ref()
+            .is_none_or(|attempt| !attempt.status.holds_capacity())));
+    }
+
+    #[tokio::test]
+    async fn workflow_app_exit_aborts_only_retained_unresponsive_driver() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let service = WorkflowService::open(root.path().join("workflows.db"), 1).unwrap();
+        let run = service.create(shutdown_spec(), "unresponsive").unwrap();
+        let state = test_state(service.clone(), root.path());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        *state.driver_task.lock().unwrap() = Some(tauri::async_runtime::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), String>>().await
+        }));
+        let error = state
+            .shutdown_with_deadline(
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("exceeded shutdown deadline"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(service.snapshot(&run.id).unwrap().pause_requested);
+        assert!(service.claim_next().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_app_exit_drains_owned_suspended_script_without_provider_work() {
+        let root = tempfile::tempdir().unwrap();
+        let service = WorkflowService::open(root.path().join("workflows.db"), 1).unwrap();
+        let mut spec = shutdown_spec();
+        spec.tasks.clear();
+        spec.script = Some(ScriptSpec {
+            source: "await new Promise(() => {}); return {late:true};".into(),
+            args: Value::Null,
+            api_version: 1,
+        });
+        let run = service.create(spec, "script-exit").unwrap();
+        let state = test_state(service.clone(), root.path());
+        state.scripts.start(service.clone(), &run.id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if service.snapshot(&run.id).unwrap().script.unwrap().status
+                    == ScriptStatus::Running
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.shutdown().await.unwrap();
+        assert!(!state.scripts.is_running(&run.id));
+        let snapshot = service.snapshot(&run.id).unwrap();
+        assert!(snapshot.pause_requested);
+        assert_eq!(snapshot.script.unwrap().status, ScriptStatus::Paused);
+        assert!(service
+            .set_script_status(
+                &run.id,
+                ScriptStatus::Completed,
+                Some(serde_json::json!({"late":true})),
+                None
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn workflow_app_exit_bounds_blocked_checkpoint_and_retains_process_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let service = WorkflowService::open(root.path().join("workflows.db"), 1).unwrap();
+        let run = service
+            .create(shutdown_spec(), "blocked-checkpoint")
+            .unwrap();
+        let dispatch = service.claim_next().unwrap().unwrap();
+        service.mark_running(&dispatch).unwrap();
+        let state = test_state(service.clone(), root.path());
+        let (release, blocked) = std::sync::mpsc::channel();
+        struct Release(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let release = Release(Some(release));
+        let acquired = Arc::new(tokio::sync::Notify::new());
+        let blocker = tokio::task::spawn_blocking({
+            let service = service.clone();
+            let acquired = acquired.clone();
+            move || {
+                service.with_connection(|_| {
+                    acquired.notify_one();
+                    blocked.recv().unwrap();
+                    Ok(())
+                })
+            }
+        });
+        acquired.notified().await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.shutdown_with_deadline(
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("checkpoint timed out"));
+        assert!(service.claim_next().unwrap().is_none());
+        assert!(service.authorize_attempt(&dispatch).is_err());
+        drop(state);
+        assert!(lock_runtime(root.path()).is_err());
+        drop(release);
+        blocker.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(owner) = lock_runtime(root.path()) {
+                    drop(owner);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.snapshot(&run.id).unwrap().pause_requested);
+    }
+
     #[cfg(unix)]
     #[test]
     fn workflow_commands_ipc_execute_persisted_dry_run_without_provider_registry() {
@@ -793,8 +1176,9 @@ mod tests {
                 // is installed: any accidental model lookup makes this fail.
                 started: AtomicBool::new(true),
                 policy,
-                _ownership: Some(lock_runtime(directory.path()).unwrap()),
+                _ownership: Some(Arc::new(lock_runtime(directory.path()).unwrap())),
                 live: Mutex::new(None),
+                driver_task: Mutex::new(None),
             })
             .invoke_handler(tauri::generate_handler![
                 crate::commands::workflows::workflow_create,

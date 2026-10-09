@@ -221,12 +221,14 @@ impl AgentProvider for ClaudeAgentProvider {
             self.event_tx.clone(),
         )
         .await?;
+        let mut startup_guard = session.managed_startup_guard();
         let session_id = session.provider_session_id.clone();
         let sdk_session_id = session.state.lock().await.sdk_session_id.clone();
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(thread_id.clone(), Arc::clone(&session));
         }
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(ProviderSession {
             thread_id,
             provider: ProviderKind::Claude,

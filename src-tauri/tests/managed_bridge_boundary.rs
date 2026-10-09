@@ -33,6 +33,7 @@ for line in sys.stdin:
   emit({'id':'early','method':'managed/tool_call','params':{'name':'workflow_result','arguments':{'phase':'before-ready'}}})
   early=json.loads(sys.stdin.readline())
   if 'error' not in early: raise RuntimeError('Host admitted a pre-ready call')
+  if mode=='never-ready':continue
   emit({'id':i,'result':{'protocolVersion':1,'provider':'cursor','adapterVersion':'unreviewed' if mode=='wrong-version' else 'cursor-sdk-1.0.37','sessionId':'fresh','tools':[t['name'] for t in p['tools']],'isolation':{'nativeTools':[],'nativeFanout':False,'ambientConfig':False}}})
  elif method=='startTurn':
   turn=p['turnId'];emit({'id':i,'result':{}})
@@ -105,4 +106,28 @@ async fn managed_bridge_denies_unowned_tools_and_wrong_turn_notifications() {
         if mode == "forged-tool" { assert!(captured.calls.lock().unwrap().is_empty()); }
         session.shutdown_managed().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn managed_bridge_cancelled_initialization_stops_owned_child() {
+    let captured=Arc::new(Captured::default());
+    let startup_captured=Arc::clone(&captured);
+    let startup=tokio::spawn(async move {spawn("never-ready",startup_captured).await});
+    let deadline=std::time::Instant::now()+Duration::from_secs(3);
+    let pid=loop {
+        if let Some(evidence)=captured.evidence.lock().unwrap().clone() {break evidence["pid"].as_u64().unwrap() as i32;}
+        assert!(std::time::Instant::now()<deadline,"startup evidence missing");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    startup.abort();
+    match startup.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("blocked initialization completed before cancellation"),
+    }
+    while unsafe {libc::kill(-pid,0)}==0 {
+        assert!(std::time::Instant::now()<deadline,"aborted bridge startup retained its group");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ESRCH));
+    assert!(captured.calls.lock().unwrap().is_empty());
 }

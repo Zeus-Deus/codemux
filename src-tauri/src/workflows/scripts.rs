@@ -40,6 +40,7 @@ pub struct ScriptTemplate {
 #[derive(Clone, Default)]
 pub struct WorkflowScriptRuntime {
     running: Arc<Mutex<HashSet<String>>>,
+    idle: Arc<Notify>,
 }
 
 impl WorkflowScriptRuntime {
@@ -47,7 +48,27 @@ impl WorkflowScriptRuntime {
         self.running.lock().is_ok_and(|set| set.contains(id))
     }
 
+    /// Observe real completion of owned script threads; the caller chooses a
+    /// deadline. A blocked thread is never treated as safely aborted.
+    pub async fn drain_active(&self) -> Result<(), String> {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self
+                .running
+                .lock()
+                .map_err(|_| "Script runtime unavailable")?
+                .is_empty()
+            {
+                return Ok(());
+            }
+            idle.await;
+        }
+    }
+
     pub fn start(&self, service: WorkflowService, id: &str) -> Result<(), String> {
+        service.ensure_runtime_active()?;
         let run = service.snapshot(id)?;
         if run.cancel_requested
             || run.script.as_ref().is_some_and(|script| {
@@ -76,6 +97,7 @@ impl WorkflowScriptRuntime {
             if running.len() >= 4 {
                 return Err("Four scripts are already active. Finish or cancel a run before starting another.".into());
             }
+            service.ensure_runtime_active()?;
             running.insert(id.to_owned());
         }
         let runtime = self.clone();
@@ -83,6 +105,7 @@ impl WorkflowScriptRuntime {
         tauri::async_runtime::spawn_blocking(move || {
             let cleanup = RunningScript {
                 running: runtime.running.clone(),
+                idle: runtime.idle.clone(),
                 id: id.clone(),
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -95,6 +118,12 @@ impl WorkflowScriptRuntime {
                     })
             }))
             .unwrap_or_else(|_| Err("Workflow script runtime panicked".into()));
+            // The shutdown checkpoint owns durable paused state. A late script
+            // result must neither revive it nor wait for database publication.
+            if service.ensure_runtime_active().is_err() {
+                drop(cleanup);
+                return;
+            }
             let state = service.snapshot(&id);
             match (result, state) {
                 (Ok(result), Ok(run)) if !run.cancel_requested => {
@@ -110,7 +139,7 @@ impl WorkflowScriptRuntime {
                     }
                 }
                 (Err(error), Ok(run)) if !run.cancel_requested => {
-                    let status = if matches!(run.status, RunStatus::Paused | RunStatus::Unknown) {
+                    let status = if matches!(run.status, RunStatus::Paused | RunStatus::Unknown | RunStatus::Stopping) {
                         ScriptStatus::Paused
                     } else {
                         ScriptStatus::Failed
@@ -128,6 +157,7 @@ impl WorkflowScriptRuntime {
 
 struct RunningScript {
     running: Arc<Mutex<HashSet<String>>>,
+    idle: Arc<Notify>,
     id: String,
 }
 impl Drop for RunningScript {
@@ -135,6 +165,7 @@ impl Drop for RunningScript {
         if let Ok(mut running) = self.running.lock() {
             running.remove(&self.id);
         }
+        self.idle.notify_waiters();
     }
 }
 struct MonitorGuard(tokio::task::JoinHandle<()>);
@@ -377,17 +408,18 @@ impl ScriptHost {
     async fn check_running(&self) -> Result<(), String> {
         let mut snapshots = self.snapshot.clone();
         loop {
+            self.service.ensure_runtime_active()?;
             let state = snapshots.borrow().clone();
             if state.cancel_requested || self.stopped.load(Ordering::Relaxed) {
                 return Err("Workflow was cancelled or stopped".into());
             }
-            if matches!(
+            if state.error.is_some() || matches!(
                 state.status,
-                RunStatus::Unknown | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Stopping
+                RunStatus::Unknown | RunStatus::Failed | RunStatus::Cancelled
             ) {
                 return Err(format!("Workflow cannot continue while {:?}", state.status));
             }
-            if state.status != RunStatus::Paused {
+            if !matches!(state.status, RunStatus::Paused | RunStatus::Stopping) {
                 return Ok(());
             }
             snapshots
@@ -523,6 +555,8 @@ pub(crate) fn task_list(run: &RunSnapshot) -> Value {
 }
 
 async fn execute(service: WorkflowService, id: &str, max_interrupts: u64) -> Result<Value, String> {
+    service.ensure_runtime_active()?;
+    let shutdown = service.shutdown_watch();
     let run = service.snapshot(id)?;
     let script = run.spec.script.clone().ok_or("Missing workflow script")?;
     service.set_script_status(id, ScriptStatus::Running, None, None)?;
@@ -533,9 +567,18 @@ async fn execute(service: WorkflowService, id: &str, max_interrupts: u64) -> Res
     let monitor_stop = stopped.clone();
     let monitor_service = service.clone();
     let monitor_id = id.to_owned();
+    let monitor_shutdown = shutdown.clone();
     let monitor = MonitorGuard(tokio::spawn(async move {
         loop {
-            match events.recv().await {
+            let event = tokio::select! {
+                biased;
+                _=wait_for_shutdown(monitor_shutdown.clone())=>{
+                    monitor_stop.store(true, Ordering::Relaxed);
+                    break;
+                },
+                event=events.recv()=>event,
+            };
+            match event {
                 Ok(event) if event.run_id != monitor_id => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {}
@@ -583,9 +626,11 @@ async fn execute(service: WorkflowService, id: &str, max_interrupts: u64) -> Res
         .saturating_sub(super::now_ms().saturating_sub(run.created_at_ms) as u64);
     let deadline = Instant::now() + Duration::from_millis(remaining);
     let interrupts = Arc::new(AtomicU64::new(0));
+    let interrupt_service = service.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
             stopped.load(Ordering::Relaxed)
+                || interrupt_service.ensure_runtime_active().is_err()
                 || Instant::now() >= deadline
                 || interrupts.fetch_add(1, Ordering::Relaxed) >= max_interrupts
         })))
@@ -611,6 +656,8 @@ async fn execute(service: WorkflowService, id: &str, max_interrupts: u64) -> Res
     // A suspended user-created Promise does not execute QuickJS instructions,
     // so its deadline and cancellation need a host-side wake as well.
     let result = tokio::select! {
+        biased;
+        _=wait_for_shutdown(shutdown)=>Err("Workflow host is shutting down".into()),
         result=evaluation=>result,
         _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>Err("Workflow script wall-time limit reached".into()),
         error=wait_for_stop(host.snapshot.clone())=>Err(error),
@@ -632,13 +679,25 @@ async fn execute(service: WorkflowService, id: &str, max_interrupts: u64) -> Res
         .map_err(|e| format!("Workflow result must be JSON serializable: {e}"))
 }
 
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    loop {
+        let stopped = *shutdown.borrow();
+        if stopped {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn wait_for_stop(mut snapshots: watch::Receiver<Arc<RunSnapshot>>) -> String {
     loop {
         let run = snapshots.borrow().clone();
-        if run.cancel_requested
+        if run.cancel_requested || run.error.is_some()
             || matches!(
                 run.status,
-                RunStatus::Unknown | RunStatus::Cancelled | RunStatus::Failed | RunStatus::Stopping
+                RunStatus::Unknown | RunStatus::Cancelled | RunStatus::Failed
             )
         {
             return "Workflow was cancelled or interrupted".into();
@@ -977,6 +1036,94 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("cancelled"));
         stop.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_script_shutdown_stops_pending_promise_and_fences_completion() {
+        for checkpoint_failure in [false, true] {
+            let service = WorkflowService::open(":memory:", 2).unwrap();
+            let run = run(
+                &service,
+                "await workflow.phase('Promise ready');return await new Promise(()=>{});",
+            );
+            let scripts = WorkflowScriptRuntime::default();
+            scripts.start(service.clone(), &run.id).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = service.snapshot(&run.id).unwrap();
+                    if snapshot.script.as_ref().unwrap().phase.as_deref() == Some("Promise ready") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+            assert!(scripts.is_running(&run.id));
+            if checkpoint_failure {
+                service.with_connection(|connection| {
+                    connection.execute_batch(
+                        "CREATE TEMP TRIGGER fail_script_checkpoint BEFORE UPDATE ON workflow_runs
+                         BEGIN SELECT RAISE(ABORT, 'injected script checkpoint failure'); END;",
+                    ).map_err(|error| error.to_string())
+                }).unwrap();
+            }
+            let checkpoint = service.shutdown_signal();
+            if checkpoint_failure {
+                assert!(checkpoint.unwrap_err().contains("injected script checkpoint failure"));
+            } else {
+                checkpoint.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), scripts.drain_active())
+                .await.unwrap().unwrap();
+            assert!(!scripts.is_running(&run.id));
+            let stopped = service.snapshot(&run.id).unwrap();
+            let script = stopped.script.unwrap();
+            assert_eq!(script.status, if checkpoint_failure { ScriptStatus::Running } else { ScriptStatus::Paused });
+            assert!(script.result.is_none());
+            for status in [ScriptStatus::Running, ScriptStatus::Completed, ScriptStatus::Failed] {
+                assert!(service.set_script_status(&run.id, status, Some(json!({"late":true})), None)
+                    .unwrap_err().contains("shutting down"));
+            }
+            assert!(scripts.start(service.clone(), &run.id).unwrap_err().contains("shutting down"));
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_script_shutdown_interrupts_cpu_loop_without_database_event() {
+        let service = WorkflowService::open(":memory:", 2).unwrap();
+        initialize(&service).unwrap();
+        let run = run(&service, "await workflow.phase('CPU ready');while(true){}");
+        service.with_connection(|connection| {
+            let mut snapshot = super::super::store::load(connection, &run.id)?;
+            snapshot.resolved_limits.wall_time_ms = 5000;
+            super::super::store::save(connection, &snapshot, "bounded-cpu-fixture")
+        }).unwrap();
+        let execute_service = service.clone();
+        let id = run.id.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(execute(execute_service, &id, u64::MAX))
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = service.snapshot(&run.id).unwrap();
+                if snapshot.script.as_ref().unwrap().phase.as_deref() == Some("CPU ready") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        service.latch_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        let promptly = joined.is_ok();
+        // Even a failing regression joins its owned blocking thread after the
+        // fixture's finite wall-time limit; aborting it would not stop QuickJS.
+        let result = match joined {
+            Ok(result) => result.unwrap(),
+            Err(_) => tokio::time::timeout(Duration::from_secs(6), task).await.unwrap().unwrap(),
+        };
+        assert!(promptly, "pure JS ignored the host shutdown latch");
+        assert!(result.is_err());
+        assert!(service.snapshot(&run.id).unwrap().script.unwrap().result.is_none());
     }
 
     #[tokio::test]

@@ -75,11 +75,13 @@ for line in sys.stdin:
   elif i=='owned':completed()
   continue
  if i is None:continue
+ if mode=='codex-hang' and method=='initialize':continue
  if method=='config/read':reply(i,{'config':{'features':features,'web_search':'disabled','mcp_servers':{}}})
  elif method=='experimentalFeature/list':reply(i,{'data':[{'name':k,'enabled':k=='unified_exec'} for k in features]})
  elif method=='account/read':reply(i,{'account':None if mode=='codex-unauth' else {'type':'apiKey'},'requiresOpenaiAuth':True})
  elif method=='start-session':
   thread=params['threadId']
+  if mode=='claude-hang':continue
   if mode=='claude-not-ready':emit({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'managed native tool catalog incomplete'}})
   else:reply(i,{'threadId':thread,'pathToClaudeCodeExecutable':params['pathToClaudeCodeExecutable']})
  elif method=='thread/start':reply(i,{'thread':{'id':thread,'environments':[]},'approvalPolicy':'never','sandbox':{'type':'readOnly'}})
@@ -343,4 +345,62 @@ async fn managed_native_claude_readiness_rejection_proves_owned_process_stopped(
         !PathBuf::from(format!("/proc/{pid}")).exists(),
         "owned fake with rejected tool catalog remained alive"
     );
+}
+
+async fn pre_start_provider(kind: &str, binary: PathBuf) -> Arc<dyn AgentProvider> {
+    if kind == "claude" {
+        Arc::new(ClaudeAgentProvider::new(ClaudeProviderConfig { sidecar_binary:Some(binary), claude_binary:Some("/fake/never-executed-claude".into()), event_channel_capacity:1024, mcp_registry:None }).await.unwrap())
+    } else {
+        Arc::new(CodexAgentProvider::new(CodexProviderConfig { codex_binary:binary, codex_home:None,event_channel_capacity:1024,client_info:ClientInfo {name:"fixture".into(),title:"fixture".into(),version:"0".into()},mcp_registry:None }))
+    }
+}
+
+#[tokio::test]
+async fn managed_native_missing_and_nonexecutable_binaries_prove_no_start() {
+    use std::os::unix::fs::PermissionsExt;
+    for kind in ["claude", "codex"] {
+        for missing in [true, false] {
+            let (dir, binary, capture) = fixture();
+            let binary = if missing { dir.path().join("missing-executable") } else {
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap(); binary
+            };
+            let id=ThreadId(uuid::Uuid::new_v4().to_string());
+            let tools=Arc::new(CapturedTools::default());
+            let _guard=register_session(id.clone(),ManagedSession {handler:tools.clone(),read_only:true}).unwrap();
+            let provider=pre_start_provider(kind,binary).await;
+            let error=provider.start_session(start(id.clone(),&dir,&capture,kind)).await.unwrap_err();
+            assert!(matches!(error,codemux_lib::agent_provider::ProviderError::ValidationError {message} if message.starts_with("managed-start-rejected: setup_required:")));
+            assert!(tools.evidence.lock().unwrap().is_none());
+            assert!(!provider.has_session(&id).await);
+            assert!(!capture.exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_native_cancelled_initialization_stops_owned_child() {
+    for kind in ["claude", "codex"] {
+        let (dir,binary,capture)=fixture();
+        let id=ThreadId(uuid::Uuid::new_v4().to_string());
+        let tools=Arc::new(CapturedTools::default());
+        let _guard=register_session(id.clone(),ManagedSession {handler:tools.clone(),read_only:true}).unwrap();
+        let provider=pre_start_provider(kind,binary).await;
+        let input=start(id.clone(),&dir,&capture,&format!("{kind}-hang"));
+        let startup_provider=Arc::clone(&provider);
+        let startup=tokio::spawn(async move {startup_provider.start_session(input).await});
+        let deadline=std::time::Instant::now()+Duration::from_secs(3);
+        let pid=loop {
+            if let Some(evidence)=tools.evidence.lock().unwrap().clone() {break evidence["pid"].as_u64().unwrap() as i32;}
+            assert!(std::time::Instant::now()<deadline,"startup did not capture evidence");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        startup.abort(); assert!(startup.await.unwrap_err().is_cancelled());
+        while unsafe {libc::kill(-pid,0)}==0 {
+            assert!(std::time::Instant::now()<deadline,"aborted initialization retained native group");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ESRCH));
+        assert!(!provider.has_session(&id).await);
+        assert!(tools.calls.lock().unwrap().is_empty());
+    }
 }

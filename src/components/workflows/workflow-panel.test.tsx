@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { DEFAULT_WORKFLOW_LIMITS, type WorkflowRunSnapshot, type WorkflowTaskSnapshot } from "@/tauri/workflows";
+import { DEFAULT_WORKFLOW_LIMITS, type WorkflowChangeEvent, type WorkflowRunSnapshot, type WorkflowTaskSnapshot } from "@/tauri/workflows";
 import { useWorkflowUIStore } from "@/stores/workflow-ui-store";
 import { useWorkflowInspectorStore } from "@/stores/workflow-inspector-store";
 
@@ -21,7 +21,7 @@ vi.mock("@/tauri/workflows", async (original) => ({
 }));
 import { WorkflowPanel, WORKFLOW_STARTER } from "./workflow-panel";
 
-let changeListener: ((event: { payload: { run_id: string; revision: number; kind: string } }) => void) | undefined;
+let changeListener: ((event: { payload: WorkflowChangeEvent }) => void) | undefined;
 const zeroUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0, reserved_tokens: 0, estimated_tokens: 0, tokens_unknown: false, cost_usd: 0, cost_unknown: false };
 function task(status: WorkflowTaskSnapshot["status"] = "queued"): WorkflowTaskSnapshot {
   return { retired: false, spec: { id: "inspect", title: "Inspect fixture", prompt: "Read the synthetic fixture", route_id: "codex", access: "read_only", dependencies: [], scope: [], required: true }, generation: 1, status, depth: 0, parent_task_id: null, current_attempt: null, attempts: [], result: null, error: null, waiting_for: [], messages: [] };
@@ -204,6 +204,30 @@ describe("dynamic workflow panel", () => {
     mocks.get.mockResolvedValue({ ...snapshot, revision: 10 });
     for (let revision = 5; revision <= 10; revision++) changeListener!({ payload: { run_id: snapshot.id, revision, kind: "finished" } });
     await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+  });
+
+  it("refreshes other run history once for coalesced host-wide notifications while inspecting a completed run", async () => {
+    const selected = { ...run([task("succeeded")]), status: "completed" as const };
+    const other = { ...run(), id: "other-run", spec: { ...run().spec, title: "Other review" } };
+    mocks.get.mockResolvedValue(selected); mocks.list.mockResolvedValue([selected, other]);
+    useWorkflowUIStore.getState().selectRun("fixture-workspace", selected.id);
+    mount();
+    await screen.findByTestId("workflow-run-inspector");
+    await screen.findByRole("option", { name: "Other review · Running" });
+    await waitFor(() => expect(changeListener).toBeDefined());
+    // Wait for the initial terminal selection's history invalidation to settle.
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+    const historyRequests = mocks.list.mock.calls.length;
+    const snapshotRequests = mocks.get.mock.calls.length;
+    mocks.list.mockResolvedValue([selected, { ...other, status: "completed", revision: other.revision + 1 }]);
+    act(() => {
+      for (let count = 0; count < 10; count++) changeListener!({ payload: { run_id: null, revision: count % 2 ? other.revision + 1 : null } });
+    });
+    await screen.findByRole("option", { name: "Other review · Completed" });
+    expect(mocks.list).toHaveBeenCalledTimes(historyRequests + 1);
+    expect(mocks.get).toHaveBeenCalledTimes(snapshotRequests + 1);
+    expect(screen.getByTestId("workflow-run-picker")).toHaveValue(selected.id);
+    expect(screen.getByTestId("workflow-run-status")).toHaveAttribute("data-status", "completed");
   });
 
   it("lazily reviews retained before/after files before applying the sealed current artifact", async () => {

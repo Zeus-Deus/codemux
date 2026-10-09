@@ -267,6 +267,7 @@ impl ManagedBridgeSession {
                 });
             }
         };
+        let mut startup_guard = child.managed_startup_guard();
         let recorded = child
             .managed_evidence()
             .map_err(|error| error.to_string())
@@ -401,6 +402,7 @@ impl ManagedBridgeSession {
                 thread_id: session.thread_id.clone(),
                 provider_session_id: session.provider_session_id.clone(),
             });
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(session)
     }
 
@@ -642,6 +644,7 @@ impl ManagedBridgeSession {
 
 impl Drop for ManagedBridgeSession {
     fn drop(&mut self) {
+        self.child.request_managed_shutdown();
         let child = Arc::clone(&self.child);
         let state_dir = self.state_dir.clone();
         let context = Arc::clone(&self.context);

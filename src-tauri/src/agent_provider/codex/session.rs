@@ -281,9 +281,14 @@ impl CodexSession {
         }
 
         let managed = crate::agent_provider::managed::lookup_session(&thread_id);
+        if managed.is_some() && !cfg!(target_os = "linux") {
+            return Err(ProviderError::ValidationError {
+                message: "managed-start-rejected: managed Codex requires Linux process containment".into(),
+            });
+        }
         if managed.is_some() && resume_cursor.is_some() {
             return Err(ProviderError::ValidationError {
-                message: "managed attempts cannot resume an unscoped native session".into(),
+                message: "managed-start-rejected: managed attempts cannot resume an unscoped native session".into(),
             });
         }
         // Managed threads select no native environment, including writer
@@ -322,6 +327,8 @@ impl CodexSession {
                 })?,
             )
         };
+
+        let mut startup_guard = child.managed_startup_guard();
 
         // Pull the single incoming-request receiver before any background
         // tasks start; otherwise the adapter could race the watchdog.
@@ -608,6 +615,7 @@ impl CodexSession {
 
         // --- assemble session handle ----------------------------------------
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
+        if let Some(guard) = startup_guard.as_mut() { guard.set_task_shutdown(shutdown_tx.clone()); }
         let state = Mutex::new(CodexSessionState {
             codex_thread_id: codex_thread_id.clone(),
             active_turn: None,
@@ -675,7 +683,14 @@ impl CodexSession {
             guard.push(watchdog_task);
         }
 
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(session)
+    }
+
+    pub(crate) fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
+        let mut guard = self.child.managed_startup_guard()?;
+        guard.set_task_shutdown(self.shutdown_tx.clone());
+        Some(guard)
     }
 
     /// Clone of the canonical event broadcaster, for methods that emit
@@ -1733,11 +1748,17 @@ async fn spawn_managed_codex(
                 default_timeout: DEFAULT_RPC_TIMEOUT,
             })
             .await
-            .map_err(|error| ProviderError::ProcessError {
-                message: "managed Codex launch failed".into(),
-                source: Some(error.to_string()),
+            .map_err(|error| match error {
+                crate::json_rpc_child::RpcChildError::SpawnFailed(io) => ProviderError::ValidationError {
+                    message: format!("managed-start-rejected: setup_required: failed to spawn Codex workflow app-server: {io}"),
+                },
+                other => ProviderError::ProcessError {
+                    message: "managed Codex launch failed".into(),
+                    source: Some(other.to_string()),
+                },
             })?,
         );
+        let mut startup_guard = child.managed_startup_guard();
         let recorded = child
             .managed_evidence()
             .map_err(|e| e.to_string())
@@ -1792,7 +1813,10 @@ async fn spawn_managed_codex(
         }
         .await;
         match checked {
-            Ok(None) => return Ok(child),
+            Ok(None) => {
+                if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
+                return Ok(child);
+            },
             Ok(Some(servers)) => {
                 child
                     .shutdown_managed()

@@ -22,7 +22,7 @@ use std::{
     path::Path,
     sync::{atomic::AtomicBool, Arc, Mutex},
 };
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 
 #[derive(Clone)]
 pub struct WorkflowService {
@@ -36,15 +36,20 @@ struct Inner {
     notify: Notify,
     driver_running: AtomicBool,
     shutdown_requested: AtomicBool,
+    shutdown: watch::Sender<bool>,
     events: broadcast::Sender<WorkflowEvent>,
 }
 
 impl WorkflowService {
+    /// Persistent recovery requires exclusive runtime ownership before opening
+    /// the database, after the prior owner's execution has ended. The app's
+    /// WorkflowState acquires its runtime lock before calling this method.
     pub fn open(path: impl AsRef<Path>, global_concurrency: usize) -> Result<Self, String> {
         if !(1..=256).contains(&global_concurrency) {
             return Err("Global concurrency must be 1–256".into());
         }
         let (events, _) = broadcast::channel(256);
+        let (shutdown, _) = watch::channel(false);
         let service = Self {
             inner: Arc::new(Inner {
                 store: store::Store::open(path.as_ref())?,
@@ -54,6 +59,7 @@ impl WorkflowService {
                 notify: Notify::new(),
                 driver_running: AtomicBool::new(false),
                 shutdown_requested: AtomicBool::new(false),
+                shutdown,
                 events,
             }),
         };
@@ -109,12 +115,32 @@ impl WorkflowService {
     /// Application shutdown checkpoints queued work without cancelling the
     /// whole run. Active attempts lose authority and retain holds until stopped.
     pub fn shutdown_signal(&self) -> Result<(), String> {
-        self.pause_all()?;
+        self.latch_shutdown();
+        self.pause_all()
+    }
+    /// Revoke admission and callbacks without waiting for database access.
+    pub fn latch_shutdown(&self) {
+        // Revoke in-memory admission and callbacks even if the durable
+        // checkpoint fails. Existing reservations remain held on that error.
         self.inner
             .shutdown_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.shutdown.send_replace(true);
         self.inner.notify.notify_one();
-        Ok(())
+    }
+    pub(super) fn shutdown_watch(&self) -> watch::Receiver<bool> {
+        self.inner.shutdown.subscribe()
+    }
+    pub(super) fn ensure_runtime_active(&self) -> Result<(), String> {
+        if self
+            .inner
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Err("Workflow host is shutting down".into())
+        } else {
+            Ok(())
+        }
     }
     pub fn pause_all(&self) -> Result<(), String> {
         let changed = self.with_connection(|c| {
@@ -303,6 +329,7 @@ impl WorkflowService {
             let scope = format!("{id}/{kind}");
             let mut run = store::load(&tx, id)?;
             if let Some(dispatch) = authority {
+                self.ensure_runtime_active()?;
                 authorize_in_run(&run, dispatch)?;
             }
             if let Some(key) = key {
@@ -466,7 +493,19 @@ impl WorkflowService {
         result: Option<Value>,
         error: Option<String>,
     ) -> Result<RunSnapshot, String> {
+        if matches!(
+            status,
+            ScriptStatus::Running | ScriptStatus::Completed | ScriptStatus::Failed
+        ) {
+            self.ensure_runtime_active()?;
+        }
         self.mutate(id, "script", None, json!(status), |run| {
+            if matches!(
+                status,
+                ScriptStatus::Running | ScriptStatus::Completed | ScriptStatus::Failed
+            ) {
+                self.ensure_runtime_active()?;
+            }
             if run.cancel_requested {
                 return Err("Cancelled run cannot execute a script".into());
             }
@@ -522,7 +561,10 @@ impl WorkflowService {
     }
 
     pub fn authorize_attempt(&self, dispatch: &Dispatch) -> Result<(), String> {
-        authorize_in_run(&self.snapshot(&dispatch.run_id)?, dispatch).map(|_| ())
+        self.ensure_runtime_active()?;
+        let run = self.snapshot(&dispatch.run_id)?;
+        self.ensure_runtime_active()?;
+        authorize_in_run(&run, dispatch).map(|_| ())
     }
 
     pub(crate) fn observe_successful_dependencies(
@@ -534,6 +576,7 @@ impl WorkflowService {
             return self.authorize_attempt(dispatch);
         }
         let changed = self.with_connection(|connection| {
+            self.ensure_runtime_active()?;
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| error.to_string())?;
@@ -579,6 +622,7 @@ impl WorkflowService {
         apply: impl FnOnce(&TaskSnapshot, &AttemptSnapshot) -> Result<T, String>,
     ) -> Result<T, String> {
         self.with_connection(|c| {
+            self.ensure_runtime_active()?;
             let run = store::load(c, run_id)?;
             if run.cancel_requested {
                 return Err("Run authority was revoked".into());
@@ -755,6 +799,7 @@ impl WorkflowService {
                 .map_err(|e| e.to_string())?;
             for mut run in store::list_active(&tx)? {
                 let mut changed = false;
+                let mut released_reservations = 0u64;
                 for task in &mut run.tasks {
                     if let Some(attempt) = task.attempts.last_mut() {
                         if matches!(
@@ -763,18 +808,40 @@ impl WorkflowService {
                                 | AttemptStatus::Running
                                 | AttemptStatus::Stopping
                         ) {
-                            attempt.status = AttemptStatus::Unknown;
-                            attempt.error = Some(
-                                "Execution interrupted; external outcome requires reconciliation"
-                                    .into(),
-                            );
+                            if attempt.external_execution_fenced && attempt.external_ref.is_none() {
+                                // Production acquires exclusive runtime ownership before
+                                // opening this store. A fenced driver cannot launch until
+                                // its durable external intent exists; no predecessor can
+                                // continue and create that intent after this handoff.
+                                attempt.status = if run.cancel_requested || attempt.cancel_requested {
+                                    AttemptStatus::Cancelled
+                                } else {
+                                    AttemptStatus::Failed
+                                };
+                                attempt.error = Some("Execution interrupted before external startup; explicitly retry and resume to run this task".into());
+                                attempt.finished_at_ms = Some(now_ms());
+                                attempt.output = None;
+                                attempt.artifacts.clear();
+                                attempt.usage = Usage { tokens_unknown:false, cost_unknown:false, cost_usd:Some(0.0), ..Usage::default() };
+                                released_reservations = released_reservations.saturating_add(attempt.reserved_tokens);
+                                task.status = if attempt.status == AttemptStatus::Cancelled { TaskStatus::Cancelled } else { TaskStatus::Failed };
+                                task.result = None;
+                                run.pause_requested = true;
+                            } else {
+                                attempt.status = AttemptStatus::Unknown;
+                                attempt.error = Some(
+                                    "Execution interrupted; external outcome requires reconciliation"
+                                        .into(),
+                                );
+                                task.status = TaskStatus::Unknown;
+                            }
                             task.current_attempt = Some(attempt.clone());
-                            task.status = TaskStatus::Unknown;
                             task.error = attempt.error.clone();
                             changed = true;
                         }
                     }
                 }
+                run.usage.reserved_tokens = run.usage.reserved_tokens.saturating_sub(released_reservations);
                 if let Some(script) = run.script.as_mut() {
                     if matches!(script.status, ScriptStatus::Pending | ScriptStatus::Running) {
                         script.status = ScriptStatus::Paused;
@@ -1002,9 +1069,11 @@ fn authorize_in_run<'a>(
     run: &'a RunSnapshot,
     dispatch: &Dispatch,
 ) -> Result<&'a TaskSnapshot, String> {
+    // Stopping can describe one cancelled branch. Global revocation remains
+    // controlled by run flags, and each admitted attempt keeps its own fence.
     if run.cancel_requested
         || run.error.is_some()
-        || !matches!(run.status, RunStatus::Running | RunStatus::Paused)
+        || !matches!(run.status, RunStatus::Running | RunStatus::Paused | RunStatus::Stopping)
     {
         return Err("Run authority is paused or revoked".into());
     }
@@ -1290,35 +1359,39 @@ fn settle(run: &mut RunSnapshot) {
             ) {
                 continue;
             }
-            let statuses: Vec<TaskStatus> = task
+            let dependencies: Vec<&TaskSnapshot> = task
                 .spec
                 .dependencies
                 .iter()
-                .filter_map(|id| positions.get(id).map(|i| run.tasks[*i].status))
+                .filter_map(|id| positions.get(id).map(|i| &run.tasks[*i]))
                 .collect();
-            let waited: Vec<TaskStatus> = task
+            let waited: Vec<&TaskSnapshot> = task
                 .waiting_for
                 .iter()
-                .filter_map(|id| positions.get(id).map(|i| run.tasks[*i].status))
+                .filter_map(|id| positions.get(id).map(|i| &run.tasks[*i]))
                 .collect();
-            let broken = statuses.iter().any(|s| {
-                matches!(
-                    s,
-                    TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
-                )
-            });
+            let broken = dependencies.iter().any(|dependency| {
+                dependency.retired
+                    || matches!(
+                        dependency.status,
+                        TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+                    )
+            }) || waited.iter().any(|dependency| dependency.retired);
+            let waiting = !task.waiting_for.is_empty()
+                && !waited
+                    .iter()
+                    .all(|dependency| task_terminal(dependency.status));
             let task = &mut run.tasks[index];
             if broken {
                 task.status = TaskStatus::Blocked;
                 task.error = Some("A required dependency did not succeed".into());
             } else {
                 task.error = None;
-                task.status =
-                    if !task.waiting_for.is_empty() && !waited.iter().all(|s| task_terminal(*s)) {
-                        TaskStatus::Waiting
-                    } else {
-                        TaskStatus::Queued
-                    };
+                task.status = if waiting {
+                    TaskStatus::Waiting
+                } else {
+                    TaskStatus::Queued
+                };
             }
         }
     }

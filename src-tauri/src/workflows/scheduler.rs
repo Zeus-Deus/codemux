@@ -14,6 +14,10 @@ use super::*;
 /// Returning a known disposition certifies execution has stopped. Unknown
 /// keeps its admission/write holds; a successful provider interrupt alone is
 /// insufficient evidence for a known disposition.
+/// Before spawning a process or beginning any external execution, a driver
+/// must durably commit external_ref intent using record_external_ref. Newly
+/// claimed attempts persist this contract; recovery may infer zero execution
+/// from an absent reference only after exclusive prior-owner handoff.
 #[async_trait]
 pub trait WorkflowDriver: Send + Sync {
     async fn execute(
@@ -124,6 +128,9 @@ fn sample(schema: &Value, depth: usize) -> Value {
 impl WorkflowService {
     /// Claiming commits dispatch intent before the driver sees any work.
     pub fn claim_next(&self) -> Result<Option<Dispatch>, String> {
+        if self.inner.shutdown_requested.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let route_limits = self
             .inner
             .route_limits
@@ -137,11 +144,12 @@ impl WorkflowService {
             .map_err(|_| "Provider limit lock poisoned")?
             .clone();
         let (dispatch,changes)=self.with_connection(|c|{
+            if self.inner.shutdown_requested.load(Ordering::SeqCst) {return Ok((None,vec![]));}
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
             let mut runs=store::list_active(&tx)?;
             let mut changes=vec![];
             for run in &mut runs {
-                if (run.status==RunStatus::Running || (run.status==RunStatus::Paused && run.tasks.iter().any(|t|t.current_attempt.as_ref().is_some_and(|a|a.status.holds_capacity()))))
+                if (run.status==RunStatus::Running || (matches!(run.status,RunStatus::Paused|RunStatus::Stopping) && run.tasks.iter().any(|t|t.current_attempt.as_ref().is_some_and(|a|a.status.holds_capacity()))))
                     && now_ms().saturating_sub(run.created_at_ms) as u64>=run.resolved_limits.wall_time_ms {
                     run.error=Some("Workflow wall-time limit reached".into());
                     for task in &mut run.tasks {cancel_task(task);}
@@ -179,8 +187,8 @@ impl WorkflowService {
                 }
                 for (task_index,task) in run.tasks.iter().enumerate() {
                     if task.status!=TaskStatus::Queued || !task.spec.dependencies.iter()
-                        .all(|id|run.tasks.iter().any(|t|&t.spec.id==id && t.status==TaskStatus::Succeeded))
-                        || !task.waiting_for.iter().all(|id|run.tasks.iter().any(|t|&t.spec.id==id && task_terminal(t.status))) {continue;}
+                        .all(|id|run.tasks.iter().any(|t|&t.spec.id==id && !t.retired && t.status==TaskStatus::Succeeded))
+                        || !task.waiting_for.iter().all(|id|run.tasks.iter().any(|t|&t.spec.id==id && !t.retired && task_terminal(t.status))) {continue;}
                     let route=task.spec.route_id.as_ref().and_then(|id|run.spec.routes.iter().find(|r|&r.id==id))
                         .unwrap_or(&run.spec.routes[task_index%run.spec.routes.len()]);
                     if *route_counts.get(&route.id).unwrap_or(&0)>=*route_limits.get(&route.id).unwrap_or(&self.inner.global_concurrency) {continue;}
@@ -194,6 +202,9 @@ impl WorkflowService {
             }
             // Drop borrowed active census before modifying the selected snapshot.
             drop(active);
+            if self.inner.shutdown_requested.load(Ordering::SeqCst) {
+                tx.commit().map_err(|e|e.to_string())?;return Ok((None,changes));
+            }
             let dispatch=if let Some((run_index,selection))=selected {
                 let run=&mut runs[run_index];
                 if let Some((task_index,route))=selection {
@@ -203,7 +214,7 @@ impl WorkflowService {
                     let attempt=AttemptSnapshot {id:uuid::Uuid::new_v4().to_string(),generation:task.generation,
                         operation_id:uuid::Uuid::new_v4().to_string(),status:AttemptStatus::Dispatching,route_id:route.id.clone(),
                         started_at_ms:now_ms(),finished_at_ms:None,cancel_requested:false,reserved_tokens:reservation,
-                        external_ref:None,output:None,error:None,usage:Usage::default(),artifacts:vec![]};
+                        external_execution_fenced:true,external_ref:None,output:None,error:None,usage:Usage::default(),artifacts:vec![]};
                     task.status=TaskStatus::Running;task.error=None;task.attempts.push(attempt.clone());task.current_attempt=Some(attempt.clone());
                     let dispatch=Dispatch {run_id:run.id.clone(),task_id:task.spec.id.clone(),generation:task.generation,
                         attempt_id:attempt.id,operation_id:attempt.operation_id,task:task.spec.clone(),route,

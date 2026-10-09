@@ -751,6 +751,7 @@ fn workflow_recovery_never_retries_unknown_and_preserves_admission_and_usage() {
     input.limits.token_budget = Some(5000);
     let run = service.create(input, "create").unwrap();
     let dispatch = service.claim_next().unwrap().unwrap();
+    service.record_external_ref(&run.id, &dispatch.attempt_id, json!({"phase":"starting","provider":"fake"})).unwrap();
     assert_eq!(
         service.snapshot(&run.id).unwrap().usage.reserved_tokens,
         4096
@@ -777,6 +778,101 @@ fn workflow_recovery_never_retries_unknown_and_preserves_admission_and_usage() {
     );
     assert_eq!(recovered.snapshot(&run.id).unwrap().usage.total_tokens, 37);
     assert_eq!(recovered.claim_next().unwrap().unwrap().task_id, "b");
+}
+
+#[test]
+fn workflow_retired_success_blocks_queued_consumer_before_admission() {
+    let (_directory, service) = fixture_service(1);
+    let prerequisite = task("prerequisite");
+    let mut consumer = task("consumer");
+    consumer.dependencies = vec![prerequisite.id.clone()];
+    let mut input = spec(vec![prerequisite, consumer]);
+    input.mode = RunMode::Live;
+    let run = service.create(input, "retired-input").unwrap();
+    let first = service.claim_next().unwrap().unwrap();
+    finish(&service, &first);
+    service.retire(&run.id, "prerequisite").unwrap();
+    assert!(service.claim_next().unwrap().is_none());
+    let run = service.snapshot(&run.id).unwrap();
+    let consumer = run.tasks.iter().find(|task| task.spec.id == "consumer").unwrap();
+    assert_eq!(consumer.status, TaskStatus::Blocked);
+    assert!(consumer.attempts.is_empty());
+    assert_eq!(run.usage.reserved_tokens, 0);
+    assert_eq!(run.tasks.iter().map(|task| task.attempts.len()).sum::<usize>(), 1);
+}
+
+#[test]
+fn workflow_recovery_fenced_prelaunch_releases_holds_and_requires_explicit_retry() {
+    for stage in ["dispatching", "running", "stopping"] {
+        let (directory, service) = fixture_service(1);
+        let mut input = spec(vec![task("a"), task("b")]);
+        input.mode = RunMode::Live;
+        let run = service.create(input, stage).unwrap();
+        let old = service.claim_next().unwrap().unwrap();
+        if stage != "dispatching" { service.mark_running(&old).unwrap(); }
+        if stage == "stopping" { service.cancel_task(&run.id, "a").unwrap(); }
+        assert_eq!(service.snapshot(&run.id).unwrap().usage.reserved_tokens, 4096);
+        // No driver or provider was started. Reopen only after the previous
+        // service has been dropped, mirroring the exclusive owner handoff.
+        drop(service);
+        let recovered = WorkflowService::open(directory.path().join("workflow.sqlite"), 1).unwrap();
+        let snapshot = recovered.snapshot(&run.id).unwrap();
+        assert!(snapshot.pause_requested);
+        assert_eq!(snapshot.status, RunStatus::Paused);
+        assert_eq!(snapshot.usage.reserved_tokens, 0);
+        let attempt = snapshot.tasks[0].current_attempt.as_ref().unwrap();
+        assert_eq!(attempt.status, if stage == "stopping" { AttemptStatus::Cancelled } else { AttemptStatus::Failed });
+        assert!(attempt.finished_at_ms.is_some());
+        assert!(attempt.external_ref.is_none() && attempt.output.is_none() && attempt.artifacts.is_empty());
+        assert_eq!(attempt.usage.cost_usd, Some(0.0));
+        assert_eq!(attempt.usage.total_tokens, 0);
+        assert!(!attempt.usage.tokens_unknown && !attempt.usage.cost_unknown);
+        assert!(recovered.authorize_attempt(&old).is_err());
+        assert!(recovered.finish_attempt(&old, ExecutionReport::success(json!({"late":true}))).is_err());
+        assert!(recovered.claim_next().unwrap().is_none());
+        let other = recovered.create(spec(vec![task("other")]), "capacity-released").unwrap();
+        let available = recovered.claim_next().unwrap().unwrap();
+        assert_eq!(available.run_id, other.id);
+        finish(&recovered, &available);
+        recovered.retry(&run.id, "a").unwrap();
+        assert!(recovered.claim_next().unwrap().is_none());
+        recovered.resume(&run.id).unwrap();
+        let fresh = recovered.claim_next().unwrap().unwrap();
+        assert_eq!(fresh.task_id, "a");
+        assert_ne!(fresh.attempt_id, old.attempt_id);
+        assert!(recovered.authorize_attempt(&old).is_err());
+        assert!(recovered.finish_attempt(&old, ExecutionReport::success(json!({"late":true}))).is_err());
+    }
+}
+
+#[test]
+fn workflow_recovery_never_infers_zero_for_legacy_or_existing_unknown_attempts() {
+    for stage in ["legacy", "unknown"] {
+        let (directory, service) = fixture_service(1);
+        let mut input = spec(vec![task("a")]);
+        input.mode = RunMode::Live;
+        let run = service.create(input, stage).unwrap();
+        let dispatch = service.claim_next().unwrap().unwrap();
+        if stage == "legacy" {
+            let mut value = serde_json::to_value(service.snapshot(&run.id).unwrap()).unwrap();
+            value["tasks"][0]["attempts"][0].as_object_mut().unwrap().remove("external_execution_fenced");
+            value["tasks"][0]["current_attempt"].as_object_mut().unwrap().remove("external_execution_fenced");
+            let legacy: RunSnapshot = serde_json::from_value(value).unwrap();
+            assert!(!legacy.tasks[0].current_attempt.as_ref().unwrap().external_execution_fenced);
+            service.with_connection(|connection| store::save(connection, &legacy, "legacy-fixture")).unwrap();
+        } else {
+            service.finish_attempt(&dispatch, ExecutionReport::unknown("Uncertain driver outcome")).unwrap();
+        }
+        drop(service);
+        let recovered = WorkflowService::open(directory.path().join("workflow.sqlite"), 1).unwrap();
+        let snapshot = recovered.snapshot(&run.id).unwrap();
+        assert_eq!(snapshot.status, RunStatus::Unknown);
+        assert_eq!(snapshot.usage.reserved_tokens, 4096);
+        assert_eq!(snapshot.tasks[0].current_attempt.as_ref().unwrap().status, AttemptStatus::Unknown);
+        assert!(recovered.retry(&run.id, "a").is_err());
+        recovered.create(spec(vec![task("other")]), "capacity-held").unwrap();
+        assert!(recovered.claim_next().unwrap().is_none());
+    }
 }
 
 #[test]
@@ -1309,6 +1405,25 @@ struct CountingDriver {
     calls: AtomicUsize,
 }
 
+struct OwnedStressDriver(Option<tokio::task::JoinHandle<Result<(), String>>>);
+
+impl OwnedStressDriver {
+    async fn stop(mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for OwnedStressDriver {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 struct PanickingDriver;
 #[async_trait]
 impl WorkflowDriver for PanickingDriver {
@@ -1353,16 +1468,21 @@ impl WorkflowDriver for CountingDriver {
         cancel: watch::Receiver<bool>,
     ) -> ExecutionReport {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        struct ActiveCount<'a>(&'a AtomicUsize);
+        impl Drop for ActiveCount<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _active = ActiveCount(&self.active);
         self.peak.fetch_max(active, Ordering::SeqCst);
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let report = DryRunDriver {
+        DryRunDriver {
             delay: Duration::from_millis(1),
             fail_tasks: HashSet::new(),
         }
         .execute(dispatch, service, cancel)
-        .await;
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        report
+        .await
     }
 }
 
@@ -1374,12 +1494,32 @@ async fn workflow_actual_scheduler_stress_hundreds_of_tasks_without_model_tokens
     let run = service.create(input, "stress").unwrap();
     assert_eq!(run.resolved_limits.concurrency, 4);
     let driver = Arc::new(CountingDriver::default());
-    let handle = tokio::spawn({
+    let mut events = service.subscribe();
+    let owned = OwnedStressDriver(Some(tokio::spawn({
         let service = service.clone();
         let driver = driver.clone();
         async move { service.run_driver(driver).await }
-    });
-    let completed = await_status(&service, &run.id, RunStatus::Completed).await;
+    })));
+    // Full Windows CI shares its runner with thousands of other tests and
+    // persists three transitions per task. Observe coalesced changes rather
+    // than repeatedly decoding this large snapshot on a 5ms polling loop.
+    let deadline = Duration::from_secs(if cfg!(windows) { 120 } else { 30 });
+    let completed = tokio::time::timeout(deadline, async {
+        loop {
+            let snapshot = service.snapshot(&run.id).unwrap();
+            if snapshot.status == RunStatus::Completed {
+                break snapshot;
+            }
+            match events.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(error) => panic!("stress observation stream closed: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            while events.try_recv().is_ok() {}
+        }
+    })
+    .await
+    .expect("256-task scheduler did not complete within its stress-fixture deadline");
     assert_eq!(driver.calls.load(Ordering::SeqCst), 256);
     assert!(driver.peak.load(Ordering::SeqCst) <= 4);
     assert!(driver.peak.load(Ordering::SeqCst) > 1);
@@ -1388,8 +1528,8 @@ async fn workflow_actual_scheduler_stress_hundreds_of_tasks_without_model_tokens
     assert!(!completed.usage.tokens_unknown);
     assert_eq!(completed.usage.cost_usd, Some(0.0));
     assert!(!completed.usage.cost_unknown);
-    handle.abort();
-    let _ = handle.await;
+    owned.stop().await;
+    assert_eq!(driver.active.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1505,6 +1645,147 @@ async fn workflow_shutdown_before_driver_start_cannot_be_overwritten() {
     service.run_driver(driver.clone()).await.unwrap();
     assert_eq!(driver.calls.load(Ordering::SeqCst), 0);
     assert_eq!(service.snapshot(&run.id).unwrap().status, RunStatus::Paused);
+}
+
+#[test]
+fn workflow_shutdown_checkpoint_failure_revokes_admission_and_callback_authority() {
+    let (_dir, service) = fixture_service(2);
+    let mut run_spec = spec(vec![task("a"), task("queued")]);
+    run_spec.mode = RunMode::Live;
+    let run = service.create(run_spec, "failed-checkpoint").unwrap();
+    let dispatch = service.claim_next().unwrap().unwrap();
+    service.mark_running(&dispatch).unwrap();
+    let child = task("child");
+    service
+        .add_tasks_as(&dispatch, vec![child.clone()], "child-add")
+        .unwrap();
+    service
+        .with_connection(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_shutdown_checkpoint BEFORE UPDATE ON workflow_runs
+                     BEGIN SELECT RAISE(ABORT, 'injected shutdown checkpoint failure'); END;",
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+    let error = service.shutdown_signal().unwrap_err();
+    assert!(
+        error.contains("injected shutdown checkpoint failure"),
+        "{error}"
+    );
+    let unchanged = service.snapshot(&run.id).unwrap();
+    assert_eq!(unchanged.status, RunStatus::Running);
+    assert!(
+        !unchanged.tasks[0]
+            .current_attempt
+            .as_ref()
+            .unwrap()
+            .cancel_requested
+    );
+    assert_eq!(unchanged.usage.reserved_tokens, 4096);
+    assert!(service.claim_next().unwrap().is_none());
+    assert!(service
+        .authorize_attempt(&dispatch)
+        .unwrap_err()
+        .contains("shutting down"));
+    // Replaying an already committed graph operation must recheck authority.
+    assert!(service
+        .add_tasks_as(&dispatch, vec![child], "child-add")
+        .unwrap_err()
+        .contains("shutting down"));
+    assert!(service
+        .observe_successful_dependencies(&dispatch, &[("child".into(), 1)])
+        .unwrap_err()
+        .contains("shutting down"));
+
+    service
+        .with_connection(|connection| {
+            connection
+                .execute_batch("DROP TRIGGER fail_shutdown_checkpoint")
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+    let held = service.snapshot(&run.id).unwrap();
+    assert_eq!(held.usage.reserved_tokens, 4096);
+    assert_eq!(held.tasks[0].attempts.len(), 1);
+    assert!(held.tasks.iter().skip(1).all(|task| task.attempts.is_empty()));
+    assert!(service.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn workflow_branch_stopping_preserves_wall_time_limit_for_active_sibling() {
+    let (_dir, service) = fixture_service(2);
+    let mut run_spec = spec(vec![task("branch"), task("sibling"), task("queued")]);
+    run_spec.mode = RunMode::Live;
+    let run = service.create(run_spec, "stopping-deadline").unwrap();
+    let branch = service.claim_next().unwrap().unwrap();
+    let sibling = service.claim_next().unwrap().unwrap();
+    service.mark_running(&branch).unwrap();
+    service.mark_running(&sibling).unwrap();
+    service.cancel_task(&run.id, "branch").unwrap();
+    assert_eq!(service.snapshot(&run.id).unwrap().status, RunStatus::Stopping);
+    service.authorize_attempt(&sibling).unwrap();
+
+    service
+        .with_connection(|connection| {
+            let mut snapshot = store::load(connection, &run.id)?;
+            snapshot.created_at_ms = now_ms() - snapshot.resolved_limits.wall_time_ms as i64 - 1;
+            store::save(connection, &snapshot, "elapsed-deadline-fixture")
+        })
+        .unwrap();
+    assert!(service.claim_next().unwrap().is_none());
+    let expired = service.snapshot(&run.id).unwrap();
+    assert_eq!(expired.error.as_deref(), Some("Workflow wall-time limit reached"));
+    assert_eq!(expired.status, RunStatus::Stopping);
+    assert!(service.cancellation_requested(&sibling));
+    assert!(service.authorize_attempt(&sibling).is_err());
+    assert_eq!(expired.usage.reserved_tokens, 8192);
+    assert!(expired.tasks[2].attempts.is_empty());
+}
+
+#[test]
+fn workflow_retired_waited_child_blocks_yielded_consumer_before_continuation() {
+    let (_dir, service) = fixture_service(1);
+    let mut run_spec = spec(vec![task("parent")]);
+    run_spec.mode = RunMode::Live;
+    let run = service.create(run_spec, "retired-waited-child").unwrap();
+    let parent = service.claim_next().unwrap().unwrap();
+    service.mark_running(&parent).unwrap();
+    service
+        .add_tasks_as(&parent, vec![task("child")], "child-add")
+        .unwrap();
+    service
+        .finish_attempt(&parent, ExecutionReport::waiting(vec!["child".into()]))
+        .unwrap();
+    let child = service.claim_next().unwrap().unwrap();
+    assert_eq!(child.task_id, "child");
+    finish(&service, &child);
+    let ready = service.snapshot(&run.id).unwrap();
+    assert_eq!(ready.tasks[0].status, TaskStatus::Queued);
+    assert_eq!(ready.tasks[0].attempts.len(), 1);
+
+    service.retire(&run.id, "child").unwrap();
+    assert!(service.claim_next().unwrap().is_none());
+    let blocked = service.snapshot(&run.id).unwrap();
+    assert_eq!(blocked.tasks[0].status, TaskStatus::Blocked);
+    assert_eq!(blocked.tasks[0].attempts.len(), 1);
+    assert_eq!(
+        blocked.tasks[0].current_attempt.as_ref().unwrap().id,
+        parent.attempt_id
+    );
+    assert!(blocked.tasks[0].result.is_none());
+    assert!(blocked.tasks[0].accepted_dependencies.is_empty());
+    assert_eq!(blocked.usage.reserved_tokens, 0);
+    assert_eq!(
+        blocked
+            .tasks
+            .iter()
+            .map(|task| task.attempts.len())
+            .sum::<usize>(),
+        2
+    );
 }
 
 #[test]

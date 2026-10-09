@@ -34,6 +34,7 @@ pub struct LiveWorkflowDriver {
     tool_factory: ToolFactory,
     artifacts: Arc<ArtifactStore>,
     inflight: Mutex<HashMap<String, Arc<AttemptTools>>>,
+    shutting_down: AtomicBool,
 }
 
 impl LiveWorkflowDriver {
@@ -49,10 +50,68 @@ impl LiveWorkflowDriver {
             tool_factory,
             artifacts,
             inflight: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
     pub fn artifact_store(&self) -> Arc<ArtifactStore> {
         Arc::clone(&self.artifacts)
+    }
+
+    /// Called only after the host has checkpointed shutdown and revoked attempt
+    /// authority. Aborting a startup future runs the provider's owned-child guard;
+    /// observing that guard finish is separate from proving the process stopped.
+    pub async fn abort_owned_startups(&self) -> Result<(), String> {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let owned = self.owned_tools()?;
+        for tools in &owned {
+            tools.close();
+            if let Some(startup) = tools
+                .startup_abort
+                .lock()
+                .map_err(|_| "startup ownership unavailable")?
+                .as_ref()
+            {
+                startup.abort();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            futures_util::future::join_all(owned.iter().map(|tools| tools.drain_startup())).await;
+        })
+        .await
+        .map_err(|_| "owned startup cancellation did not finish".to_string())
+    }
+
+    fn owned_tools(&self) -> Result<Vec<Arc<AttemptTools>>, String> {
+        Ok(self
+            .inflight
+            .lock()
+            .map_err(|_| "attempt ownership unavailable")?
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    /// The driver may have returned Unknown or been aborted while a provider was
+    /// stopping. Reconcile those owned sessions concurrently before app exit.
+    /// Failed proofs retain their durable admission and write holds.
+    pub async fn shutdown_owned_runtimes(&self) -> Result<(), String> {
+        let owned = self.owned_tools()?;
+        let results = futures_util::future::join_all(owned.iter().map(|tools| async move {
+            // Native teardown never needs the database, which may be blocked
+            // by checkpoint I/O. Identity and process evidence are locally owned.
+            let reference = json!({"provider":tools.dispatch.route.provider,
+                "thread_id":format!("workflow-{}",tools.dispatch.attempt_id),
+                "attempt_id":tools.dispatch.attempt_id,
+                "process":tools.runtime_evidence.lock().map_err(|_| "runtime evidence unavailable")?.clone()});
+            self.reconcile_owned_runtime(&reference).await
+        }))
+        .await;
+        let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub async fn reconcile_owned_runtime(&self, reference: &Value) -> Result<(), String> {
@@ -80,27 +139,42 @@ impl LiveWorkflowDriver {
             .get(id)
             .cloned();
         if let Some(tools) = tools.as_ref() {
-            tools.quiesce().await?;
+            tools.close();
             if tools.startup_active.load(Ordering::SeqCst) {
                 return Err("owned initialization is still running; a delayed session cannot yet be ruled out".into());
             }
         }
-        let mut local_stop = false;
-        if let Some(provider) = (self.providers)(kind).await {
-            match tokio::time::timeout(
-                Duration::from_secs(12),
-                provider.stop_managed_session(thread),
-            )
-            .await
-            {
-                Ok(Ok(())) => local_stop = true,
-                Ok(Err(crate::agent_provider::ProviderError::SessionNotFound { .. })) => {}
-                Ok(Err(error)) => return Err(error.to_string()),
-                Err(_) => return Err("owned runtime reconciliation timed out".into()),
+        let mut local_stop = tools
+            .as_ref()
+            .is_some_and(|tools| tools.process_stopped.load(Ordering::SeqCst));
+        if !local_stop {
+            if let Some(provider) = (self.providers)(kind).await {
+                let stop = match tools.as_ref() {
+                    Some(tools) => tools.stop_owned_provider(&provider, thread).await,
+                    None => tokio::time::timeout(
+                        Duration::from_secs(12),
+                        provider.stop_managed_session(thread),
+                    )
+                    .await
+                    .map_err(|_| "owned runtime reconciliation timed out")?,
+                };
+                match stop {
+                    Ok(()) => local_stop = true,
+                    Err(crate::agent_provider::ProviderError::SessionNotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         if !local_stop {
+            if let Some(tools) = tools.as_ref() {
+                tools.quiesce().await?;
+            }
             prove_quiescent_inner(reference, tools.is_some())?;
+        }
+        if let Some(tools) = tools.as_ref() {
+            tools.process_stopped.store(true, Ordering::SeqCst);
+            // Drain failure retains holds, but cannot prevent native stop.
+            tools.quiesce().await?;
         }
         self.inflight
             .lock()
@@ -211,9 +285,14 @@ impl LiveWorkflowDriver {
         // Subscribe before start/send; a synchronous fake or fast native
         // session can publish completion before send_turn returns.
         let mut events = provider.managed_event_stream(&thread_id);
+        // Durable launch fence: a fenced attempt with no external_ref cannot
+        // have started a provider. Keep this commit before every spawn/start.
         if let Err(error)=service.record_external_ref(&dispatch.run_id,&dispatch.attempt_id,json!({
             "provider":dispatch.route.provider,"thread_id":thread_id.0,"attempt_id":dispatch.attempt_id,"checkout":artifact.checkout,
             "phase":"starting"})) { return known_zero(ExecutionReport::failed(error)); }
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return known_zero(ExecutionReport::cancelled());
+        }
         let input = StartSessionInput {
             thread_id: thread_id.clone(),
             cwd: artifact.checkout.clone(),
@@ -241,11 +320,18 @@ impl LiveWorkflowDriver {
         let start_guard = Arc::clone(&registration);
         let startup_tools = Arc::clone(&tools);
         tools.startup_active.store(true, Ordering::SeqCst);
+        // Construct before spawn so aborting a task before its first poll also
+        // clears startup_active and releases the managed registration.
+        let startup_guard = StartupGuard(startup_tools);
         let mut startup = tokio::spawn(async move {
             let _guard = start_guard;
-            let _startup = StartupGuard(startup_tools);
+            let _startup = startup_guard;
             start_provider.start_session(input).await
         });
+        *tools
+            .startup_abort
+            .lock()
+            .expect("new attempt startup lock") = Some(startup.abort_handle());
         let session = tokio::select! {
             result=&mut startup=>match result {
                 Ok(Ok(session))=>session,
@@ -495,13 +581,9 @@ async fn stopped(
     mut report: ExecutionReport,
 ) -> ExecutionReport {
     tools.close();
-    let stopped = tokio::time::timeout(
-        Duration::from_secs(12),
-        provider.stop_managed_session(thread_id.clone()),
-    )
-    .await;
+    let stopped = tools.stop_owned_provider(provider, thread_id.clone()).await;
     let drained = tokio::time::timeout(Duration::from_secs(5), tools.drain()).await;
-    if !matches!(stopped, Ok(Ok(()))) || drained.is_err() {
+    if stopped.is_err() || drained.is_err() {
         report.disposition = super::ExecutionDisposition::Unknown;
         report.error=Some("provider/process or host-tool quiescence is unconfirmed; admission and write ownership remain held".into());
     }
@@ -521,6 +603,10 @@ struct AttemptTools {
     closed: AtomicBool,
     active: AtomicUsize,
     startup_active: AtomicBool,
+    startup_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    runtime_evidence: Mutex<Option<Value>>,
+    process_stopped: AtomicBool,
+    stop_lock: tokio::sync::Mutex<()>,
     idle: Notify,
     wake: Notify,
     max_output_bytes: usize,
@@ -547,6 +633,10 @@ impl AttemptTools {
             closed: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             startup_active: AtomicBool::new(false),
+            startup_abort: Mutex::new(None),
+            runtime_evidence: Mutex::new(None),
+            process_stopped: AtomicBool::new(false),
+            stop_lock: tokio::sync::Mutex::new(()),
             idle: Notify::new(),
             wake: Notify::new(),
             max_output_bytes,
@@ -561,10 +651,41 @@ impl AttemptTools {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
+    async fn stop_owned_provider(
+        &self,
+        provider: &Arc<dyn AgentProvider>,
+        thread: ThreadId,
+    ) -> Result<(), crate::agent_provider::ProviderError> {
+        // Driver cancellation and application exit can meet at the same attempt.
+        // Serialize them and retain the actual proof so a removed provider map
+        // cannot turn an already verified stop into a spurious Unknown hold.
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let _stop = self.stop_lock.lock().await;
+            if self.process_stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            provider.stop_managed_session(thread).await?;
+            self.process_stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .map_err(|_| crate::agent_provider::ProviderError::ValidationError {
+            message: "owned runtime stop timed out".into(),
+        })?
+    }
     async fn drain(&self) {
         loop {
             let notified = self.idle.notified();
             if self.active.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+    async fn drain_startup(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if !self.startup_active.load(Ordering::SeqCst) {
                 return;
             }
             notified.await;
@@ -661,6 +782,10 @@ impl ManagedToolHandler for AttemptTools {
             .map_err(|_| "host tool calls are still in flight".into())
     }
     fn record_runtime(&self, evidence: Value) -> Result<(), String> {
+        *self
+            .runtime_evidence
+            .lock()
+            .map_err(|_| "runtime evidence unavailable")? = Some(evidence.clone());
         self.authority()?;
         self.service.record_external_ref(&self.dispatch.run_id,&self.dispatch.attempt_id,json!({
             "provider":self.dispatch.route.provider,"thread_id":format!("workflow-{}",self.dispatch.attempt_id),
@@ -1033,6 +1158,8 @@ mod tests {
         MissingSidecar,
         UnexecutableSidecar,
         InvalidSidecarFormat,
+        PendingStartup,
+        StopOnce,
     }
     struct FakeProvider {
         kind: ProviderKind,
@@ -1067,6 +1194,9 @@ mod tests {
             assert!(input.resume_cursor.is_none());
             assert_eq!(input.model.as_deref(), Some("fake"));
             assert_eq!(input.effort.as_deref(), Some("high"));
+            if matches!(self.behavior, Behavior::PendingStartup) {
+                return std::future::pending().await;
+            }
             if matches!(self.behavior, Behavior::SetupDenied) {
                 return Err(ProviderError::ValidationError {
                     message:
@@ -1256,7 +1386,7 @@ mod tests {
                 });
             } else if !matches!(
                 self.behavior,
-                Behavior::NoCompletion | Behavior::WaitWithLateUsage
+                Behavior::NoCompletion | Behavior::WaitWithLateUsage | Behavior::StopOnce
             ) {
                 self.events
                     .send(ProviderRuntimeEvent::ContentDelta {
@@ -1288,6 +1418,13 @@ mod tests {
                 return Err(ProviderError::ValidationError {
                     message: "unconfirmed fake process".into(),
                 });
+            }
+            if matches!(self.behavior, Behavior::StopOnce) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if self.session.lock().unwrap().take().is_none() {
+                    return Err(ProviderError::SessionNotFound { thread_id: id });
+                }
+                return Ok(());
             }
             if matches!(self.behavior, Behavior::WaitWithLateUsage) {
                 self.events
@@ -1408,6 +1545,251 @@ mod tests {
         );
         (root, service, dispatch, driver)
     }
+    #[tokio::test]
+    async fn workflow_executor_exit_and_driver_cancel_share_actual_stop_proof() {
+        let (_root, service, dispatch, driver) = fixture(
+            ProviderKind::Claude,
+            Behavior::StopOnce,
+            true,
+            TaskAccess::ReadOnly,
+        );
+        let driver = Arc::new(driver);
+        let (cancel, receiver) = watch::channel(false);
+        let worker = tokio::spawn({
+            let driver = driver.clone();
+            let service = service.clone();
+            let dispatch = dispatch.clone();
+            async move { driver.execute(dispatch, service, receiver).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service.snapshot(&dispatch.run_id).unwrap().tasks[0]
+                    .current_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.external_ref.as_ref())
+                    .is_some_and(|reference| reference["phase"] == "ready")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service.shutdown_signal().unwrap();
+        cancel.send(true).unwrap();
+        driver.abort_owned_startups().await.unwrap();
+        let (report, stop) = tokio::join!(worker, driver.shutdown_owned_runtimes());
+        stop.unwrap();
+        let report = report.unwrap();
+        assert_eq!(
+            report.disposition,
+            super::super::ExecutionDisposition::Cancelled
+        );
+        service.finish_attempt(&dispatch, report).unwrap();
+        assert!(!service.snapshot(&dispatch.run_id).unwrap().tasks[0]
+            .current_attempt
+            .as_ref()
+            .unwrap()
+            .status
+            .holds_capacity());
+        assert!(driver.owned_tools().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_executor_exit_stops_native_owner_despite_blocked_host_callback() {
+        struct SlowTool(Arc<Notify>);
+        #[async_trait]
+        impl ManagedToolHandler for SlowTool {
+            fn tools(&self) -> Vec<ManagedTool> {
+                vec![ManagedTool {
+                    name: "slow".into(),
+                    description: "token-free hung callback".into(),
+                    input_schema: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, _: Value) -> Result<Value, String> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let (_root, service, dispatch, mut driver) = fixture(
+            ProviderKind::Claude,
+            Behavior::NoCompletion,
+            true,
+            TaskAccess::ReadOnly,
+        );
+        let started = Arc::new(Notify::new());
+        driver.tool_factory = Arc::new({
+            let started = started.clone();
+            move |_, _| Arc::new(SlowTool(started.clone()))
+        });
+        let driver = Arc::new(driver);
+        let (_cancel, receiver) = watch::channel(false);
+        let worker = tokio::spawn({
+            let driver = driver.clone();
+            let service = service.clone();
+            let dispatch = dispatch.clone();
+            async move { driver.execute(dispatch, service, receiver).await }
+        });
+        let tools = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(tools) = driver.owned_tools().unwrap().first().cloned() {
+                    if !tools.startup_active.load(Ordering::SeqCst)
+                        && (driver.providers)(ProviderKind::Claude)
+                            .await
+                            .unwrap()
+                            .has_session(&ThreadId(format!("workflow-{}", dispatch.attempt_id)))
+                            .await
+                    {
+                        break tools;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let callback = tokio::spawn({
+            let tools = tools.clone();
+            async move { tools.call("slow", json!({})).await }
+        });
+        started.notified().await;
+        service.shutdown_signal().unwrap();
+        worker.abort();
+        let _ = worker.await;
+        driver.abort_owned_startups().await.unwrap();
+        let error = driver.shutdown_owned_runtimes().await.unwrap_err();
+        assert!(error.contains("host tool calls are still in flight"));
+        assert!((driver.providers)(ProviderKind::Claude)
+            .await
+            .unwrap()
+            .list_sessions()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!driver.owned_tools().unwrap().is_empty());
+        assert!(service.snapshot(&dispatch.run_id).unwrap().tasks[0]
+            .current_attempt
+            .as_ref()
+            .unwrap()
+            .status
+            .holds_capacity());
+        callback.abort();
+        let _ = callback.await;
+        driver.shutdown_owned_runtimes().await.unwrap();
+        assert!(driver.owned_tools().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_executor_exit_stops_owned_session_when_snapshot_database_fails() {
+        let (_root, service, dispatch, driver) = fixture(
+            ProviderKind::Claude,
+            Behavior::NoCompletion,
+            true,
+            TaskAccess::ReadOnly,
+        );
+        let driver = Arc::new(driver);
+        let (_cancel, receiver) = watch::channel(false);
+        let worker = tokio::spawn({
+            let driver = driver.clone();
+            let service = service.clone();
+            let dispatch = dispatch.clone();
+            async move { driver.execute(dispatch, service, receiver).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let ready = service.snapshot(&dispatch.run_id).unwrap().tasks[0]
+                    .current_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.external_ref.as_ref())
+                    .is_some_and(|reference| reference["phase"] == "ready");
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service
+            .with_connection(|connection| {
+                connection
+                    .execute("DROP TABLE workflow_runs", [])
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(service.shutdown_signal().is_err());
+        worker.abort();
+        let _ = worker.await;
+        driver.abort_owned_startups().await.unwrap();
+        driver.shutdown_owned_runtimes().await.unwrap();
+        let provider = (driver.providers)(ProviderKind::Claude).await.unwrap();
+        assert!(provider.list_sessions().await.unwrap().is_empty());
+        assert!(driver.owned_tools().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_executor_exit_aborts_owned_pending_startup_and_preserves_uncertainty() {
+        let (_root, service, dispatch, driver) = fixture(
+            ProviderKind::Claude,
+            Behavior::PendingStartup,
+            true,
+            TaskAccess::Write,
+        );
+        let driver = Arc::new(driver);
+        let (cancel, receiver) = watch::channel(false);
+        let worker = tokio::spawn({
+            let driver = driver.clone();
+            let service = service.clone();
+            let dispatch = dispatch.clone();
+            async move { driver.execute(dispatch, service, receiver).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let ready = driver
+                    .owned_tools()
+                    .unwrap()
+                    .iter()
+                    .any(|tools| tools.startup_active.load(Ordering::SeqCst));
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service.shutdown_signal().unwrap();
+        cancel.send(true).unwrap();
+        driver.abort_owned_startups().await.unwrap();
+        assert!(driver
+            .owned_tools()
+            .unwrap()
+            .iter()
+            .all(|tools| !tools.startup_active.load(Ordering::SeqCst)));
+        let report = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.disposition,
+            super::super::ExecutionDisposition::Unknown
+        );
+        service.finish_attempt(&dispatch, report).unwrap();
+        driver.shutdown_owned_runtimes().await.unwrap();
+        assert!(driver.owned_tools().unwrap().is_empty());
+        assert!(service.snapshot(&dispatch.run_id).unwrap().tasks[0]
+            .current_attempt
+            .as_ref()
+            .unwrap()
+            .status
+            .holds_capacity());
+        assert!(service.claim_next().unwrap().is_none());
+        assert!(service.authorize_attempt(&dispatch).is_err());
+    }
+
     #[tokio::test]
     async fn workflow_executor_fake_all_provider_labels_enforce_result_and_scope_without_tokens() {
         for kind in [

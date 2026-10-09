@@ -206,6 +206,10 @@ pub struct AttemptSnapshot {
     pub finished_at_ms: Option<i64>,
     pub cancel_requested: bool,
     pub reserved_tokens: u64,
+    /// This dispatch requires durable external_ref intent before external work.
+    /// Legacy attempts do not establish that absence of a reference means zero execution.
+    #[serde(default)]
+    pub external_execution_fenced: bool,
     pub external_ref: Option<Value>,
     pub output: Option<Value>,
     pub error: Option<String>,

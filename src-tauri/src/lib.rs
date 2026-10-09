@@ -337,7 +337,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                app.state::<commands::workflows::WorkflowState>().request_shutdown();
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<commands::workflows::WorkflowState>().shutdown(),
+                ) {
+                    eprintln!("[codemux::workflows] shutdown incomplete: {error}");
+                }
                 if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
                     tauri::async_runtime::block_on(manager.shutdown());
                 }

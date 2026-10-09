@@ -230,6 +230,11 @@ impl ClaudeSession {
         // the inherited env, so an empty map (no workspace resolved) is a
         // no-op and the sidecar inherits Codemux's env unchanged.
         let managed = crate::agent_provider::managed::lookup_session(&thread_id);
+        if managed.is_some() && !cfg!(target_os = "linux") {
+            return Err(ProviderError::ValidationError {
+                message: "managed-start-rejected: managed Claude requires Linux process containment".into(),
+            });
+        }
         let budget_error = |message: String| ProviderError::ValidationError {
             message: if managed.is_some() {
                 format!("managed-start-rejected: {message}")
@@ -241,7 +246,7 @@ impl ClaudeSession {
         let max_turns = optional_positive_turns(&input.extra).map_err(budget_error)?;
         if managed.is_some() && input.resume_cursor.is_some() {
             return Err(ProviderError::ValidationError {
-                message: "managed attempts cannot resume an unscoped native session".into(),
+                message: "managed-start-rejected: managed attempts cannot resume an unscoped native session".into(),
             });
         }
         let sidecar_binary = spawn.sidecar_binary;
@@ -258,6 +263,11 @@ impl ClaudeSession {
             JsonRpcChild::spawn(sidecar_config).await
         }
         .map_err(|e| match e {
+            crate::json_rpc_child::RpcChildError::SpawnFailed(ref io) if managed.is_some() => {
+                ProviderError::ValidationError {
+                    message: format!("managed-start-rejected: setup_required: failed to spawn Claude workflow sidecar: {io}"),
+                }
+            }
             // A missing sidecar binary is an install problem, not a
             // generic process failure — classify it so the UI can render
             // the actionable "not installed" state (mirrors the probe
@@ -279,6 +289,7 @@ impl ClaudeSession {
             },
         })?;
         let sidecar = Arc::new(sidecar);
+        let mut startup_guard = sidecar.managed_startup_guard();
         if let Some(context) = managed.as_ref() {
             let recorded = sidecar
                 .managed_evidence()
@@ -428,6 +439,7 @@ impl ClaudeSession {
 
         let provider_session_id = ProviderSessionId(parsed.thread_id.clone());
         let (shutdown_tx, _) = broadcast::channel(4);
+        if let Some(guard) = startup_guard.as_mut() { guard.set_task_shutdown(shutdown_tx.clone()); }
         let state = Mutex::new(ClaudeSessionState {
             status: SessionStatus::Ready,
             active_turn: None,
@@ -508,7 +520,14 @@ impl ClaudeSession {
             guard.push(mcp_refresh_task);
         }
 
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(session)
+    }
+
+    pub(crate) fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
+        let mut guard = self.sidecar.managed_startup_guard()?;
+        guard.set_task_shutdown(self.shutdown_tx.clone());
+        Some(guard)
     }
 
     /// Send a user turn, or **queue** it behind the active turn.

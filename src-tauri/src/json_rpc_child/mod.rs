@@ -66,6 +66,8 @@ const INCOMING_REQUEST_CHANNEL_CAPACITY: usize = 256;
 /// Depth of the notifications broadcast channel. Lagging subscribers
 /// observe a `Lagged` error rather than blocking the reader task.
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 512;
+/// Shared by the managed sidecar readers. Includes JSON escaping, envelope and LF.
+const MANAGED_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// Parameters for spawning a JSON-RPC child process.
 #[derive(Debug, Clone)]
@@ -121,7 +123,8 @@ impl std::error::Error for RpcError {}
 /// Every way [`JsonRpcChild`] operations can fail.
 #[derive(Debug)]
 pub enum RpcChildError {
-    /// Spawning the subprocess failed before stdio could be attached.
+    /// Command::spawn failed: no executable started. Post-spawn setup failures
+    /// use a different variant and must not be classified as known-zero.
     SpawnFailed(std::io::Error),
     /// The subprocess exited before a pending operation could complete.
     ChildExited {
@@ -284,11 +287,66 @@ pub struct JsonRpcChild {
     managed_group: Option<u32>,
 }
 
+/// Created before spawning the watchdog, so even an unpolled task owns group
+/// cleanup. Drop runs before the inner Child can reap/release its leader PID.
+struct OwnedRpcProcess {
+    inner: tokio::process::Child,
+    managed_group: Option<u32>,
+}
+
+impl Drop for OwnedRpcProcess {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(group) = self.managed_group {
+            if self.inner.id() == Some(group) {
+                let _ = signal_owned_managed_group(group);
+            }
+        }
+    }
+}
+
+/// Cancelling startup must stop its owned child even if a callback/task still
+/// holds an Arc. Successful insertion explicitly transfers lifecycle ownership.
+pub(crate) struct ManagedStartupGuard {
+    child: Arc<JsonRpcChild>,
+    task_shutdown: Option<broadcast::Sender<()>>,
+    armed: bool,
+}
+
+impl ManagedStartupGuard {
+    pub(crate) fn set_task_shutdown(&mut self, sender: broadcast::Sender<()>) {
+        self.task_shutdown = Some(sender);
+    }
+    pub(crate) fn disarm(&mut self) { self.armed = false; }
+}
+
+impl Drop for ManagedStartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(sender) = &self.task_shutdown { let _ = sender.send(()); }
+            self.child.request_managed_shutdown();
+        }
+    }
+}
+
 impl JsonRpcChild {
+    pub(crate) fn managed_startup_guard(self: &Arc<Self>) -> Option<ManagedStartupGuard> {
+        self.managed_group.map(|_| ManagedStartupGuard {
+            child: Arc::clone(self), task_shutdown: None, armed: true,
+        })
+    }
+
+    pub(crate) fn request_managed_shutdown(&self) {
+        if self.managed_group.is_some() {
+            if let Some(sender) = self.shutdown_tx.lock().ok().and_then(|mut slot| slot.take()) {
+                let _ = sender.send(());
+            }
+        }
+    }
     /// Spawn a child process and return a handle attached to its stdio.
     ///
-    /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot be
-    /// started or its stdio pipes cannot be captured.
+    /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot start.
+    /// An unexpected pipe-capture failure after spawn is a protocol error.
     pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {
         Self::spawn_internal(config, false).await
     }
@@ -308,7 +366,7 @@ impl JsonRpcChild {
         if managed {
             cmd.process_group(0);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         if managed {
             return Err(RpcChildError::ProtocolError(
                 "managed process containment is unavailable on this platform".into(),
@@ -328,16 +386,17 @@ impl JsonRpcChild {
             cmd.current_dir(cwd);
         }
 
-        let mut child = cmd.spawn().map_err(RpcChildError::SpawnFailed)?;
+        let child = cmd.spawn().map_err(RpcChildError::SpawnFailed)?;
         let managed_group = if managed { child.id() } else { None };
-        let stdin = child.stdin.take().ok_or_else(|| {
-            RpcChildError::SpawnFailed(std::io::Error::other("stdin pipe not captured"))
+        let mut child = OwnedRpcProcess { inner: child, managed_group };
+        let stdin = child.inner.stdin.take().ok_or_else(|| {
+            RpcChildError::ProtocolError("spawned child stdin pipe not captured".into())
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            RpcChildError::SpawnFailed(std::io::Error::other("stdout pipe not captured"))
+        let stdout = child.inner.stdout.take().ok_or_else(|| {
+            RpcChildError::ProtocolError("spawned child stdout pipe not captured".into())
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            RpcChildError::SpawnFailed(std::io::Error::other("stderr pipe not captured"))
+        let stderr = child.inner.stderr.take().ok_or_else(|| {
+            RpcChildError::ProtocolError("spawned child stderr pipe not captured".into())
         })?;
 
         let writer = Arc::new(tokio::sync::Mutex::new(Some(stdin)));
@@ -421,14 +480,36 @@ impl JsonRpcChild {
             // child has truly gone away.
             let _incoming_keepalive = incoming_tx;
             tokio::spawn(async move {
-                let exit_status = tokio::select! {
-                    status = child.wait() => status,
-                    _ = shutdown_rx => {
-                        match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.wait()).await {
-                            Ok(s) => s,
-                            Err(_) => {
-                                let _ = child.kill().await;
-                                child.wait().await
+                let exit_status = {
+                    #[cfg(target_os = "linux")]
+                    if let Some(group) = managed_group {
+                        wait_managed_child(&mut child, group, shutdown_rx).await
+                    } else {
+                        tokio::select! {
+                            status = child.inner.wait() => status,
+                            _ = shutdown_rx => {
+                                match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.inner.wait()).await {
+                                    Ok(s) => s,
+                                    Err(_) => {
+                                        let _ = child.inner.kill().await;
+                                        child.inner.wait().await
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        tokio::select! {
+                            status = child.inner.wait() => status,
+                            _ = shutdown_rx => {
+                                match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.inner.wait()).await {
+                                    Ok(s) => s,
+                                    Err(_) => {
+                                        let _ = child.inner.kill().await;
+                                        child.inner.wait().await
+                                    }
+                                }
                             }
                         }
                     }
@@ -622,6 +703,11 @@ impl JsonRpcChild {
                 "error": err,
             }),
         };
+        let response = if self.managed_group.is_some() {
+            bound_managed_response(response)?
+        } else {
+            response
+        };
         self.write_line(&response).await
     }
 
@@ -687,17 +773,12 @@ impl JsonRpcChild {
         };
         #[cfg(unix)]
         {
-            // Signal while the owned leader is still unreaped. Managed
-            // adapters expose no shell/agent tools, so no arbitrary process
-            // can escape into another session before this boundary.
-            if self.is_alive() {
-                let result = unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
-                if result != 0
-                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-                {
-                    return Err(RpcChildError::IoError(std::io::Error::last_os_error()));
-                }
-            }
+            // The watchdog signals the group before reaping its owned leader,
+            // on both voluntary exit and shutdown. Never signal a numeric PGID
+            // here: the leader may already be reaped and its PID reused.
+            // Request stop before waiting for the writer lock: a sidecar that
+            // stopped reading can leave a write blocked on pipe backpressure.
+            self.request_managed_shutdown();
             self.shutdown().await?;
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
@@ -758,10 +839,7 @@ impl JsonRpcChild {
     async fn write_line(&self, value: &Value) -> Result<(), RpcChildError> {
         let mut guard = self.writer.lock().await;
         let writer = guard.as_mut().ok_or(RpcChildError::AlreadyShutdown)?;
-        let mut line = serde_json::to_vec(value).map_err(|err| {
-            RpcChildError::ProtocolError(format!("failed to encode outgoing message: {err}"))
-        })?;
-        line.push(b'\n');
+        let line = encode_frame(value, self.managed_group.is_some())?;
         writer
             .write_all(&line)
             .await
@@ -784,6 +862,85 @@ impl JsonRpcChild {
         }
         RpcChildError::AlreadyShutdown
     }
+}
+
+fn encode_frame(value: &Value, managed: bool) -> Result<Vec<u8>, RpcChildError> {
+    let mut line = serde_json::to_vec(value).map_err(|err| {
+        RpcChildError::ProtocolError(format!("failed to encode outgoing message: {err}"))
+    })?;
+    line.push(b'\n');
+    if managed && line.len() > MANAGED_MAX_FRAME_BYTES {
+        return Err(RpcChildError::ProtocolError(
+            "managed RPC frame exceeds 2 MiB wire limit".into(),
+        ));
+    }
+    Ok(line)
+}
+
+fn bound_managed_response(response: Value) -> Result<Value, RpcChildError> {
+    if encode_frame(&response, false)?.len() <= MANAGED_MAX_FRAME_BYTES {
+        return Ok(response);
+    }
+    let error = serde_json::json!({"jsonrpc":"2.0","id":response.get("id"),
+        "error":{"code":-32000,"message":"Managed tool response exceeds 2 MiB wire limit; reduce response size or split requests"}});
+    // A hostile oversized request ID must not turn the bounded error into
+    // another oversized frame.
+    encode_frame(&error, true)?;
+    Ok(error)
+}
+
+#[cfg(target_os = "linux")]
+fn managed_leader_exited(pid: u32) -> std::io::Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } == pid as i32);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_managed_child(
+    child: &mut OwnedRpcProcess,
+    group: u32,
+    shutdown: oneshot::Receiver<()>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let exited = async {
+        loop {
+            if managed_leader_exited(group)? { return Ok::<_, std::io::Error>(()); }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        result = exited => result?,
+        _ = shutdown => { managed_leader_exited(group)?; }
+    }
+    // WNOWAIT keeps the owned leader (including a zombie) unreaped. Its PID
+    // cannot be reused until this sole owner calls child.wait() below, so the
+    // negative-PGID signal cannot target a recycled, unrelated process group.
+    signal_owned_managed_group(group)?;
+    let status = child.inner.wait().await;
+    if status.is_ok() { child.managed_group = None; }
+    status
+}
+
+#[cfg(target_os = "linux")]
+fn signal_owned_managed_group(group: u32) -> std::io::Result<()> {
+    managed_leader_exited(group)?;
+    let result = unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) { return Err(error); }
+    }
+    Ok(())
 }
 
 /// Parse and dispatch a single line of stdout.
@@ -935,5 +1092,188 @@ mod managed_tests {
         assert!(ordinary.shutdown_managed().await.is_err());
         assert!(ordinary.is_alive());
         ordinary.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn managed_frames_bound_escaped_content_and_full_envelopes() {
+        for content in ["\0".repeat(1024 * 1024), "x".repeat(MANAGED_MAX_FRAME_BYTES - 1)] {
+            let response = bound_managed_response(serde_json::json!({"jsonrpc":"2.0","id":"tool","result":{"content":content}})).unwrap();
+            assert!(response.get("error").is_some());
+            assert!(encode_frame(&response, true).unwrap().len() <= MANAGED_MAX_FRAME_BYTES);
+        }
+        let response = bound_managed_response(serde_json::json!({"jsonrpc":"2.0","id":"tool","result":{"content":"x".repeat(MANAGED_MAX_FRAME_BYTES - 1024)}})).unwrap();
+        assert!(response.get("result").is_some());
+        assert!(encode_frame(&response, true).unwrap().len() <= MANAGED_MAX_FRAME_BYTES);
+        assert!(encode_frame(&serde_json::json!({"text":"\0".repeat(1024 * 1024)}), true).is_err());
+        assert!(managed_leader_exited(std::process::id()).is_err(), "an unrelated PID is not waitable ownership");
+    }
+
+    #[tokio::test]
+    async fn managed_oversized_tool_reply_is_recoverable_on_same_transport() {
+        let config = SpawnConfig { program: "python3".into(), args: vec!["-u".into(), "-c".into(), r#"
+import json,sys
+for line in sys.stdin:
+ request=json.loads(line)
+ for name in ['escaped','near-limit','within-limit']:
+  print(json.dumps({'jsonrpc':'2.0','id':name,'method':'tool','params':{}}),flush=True)
+  response=json.loads(sys.stdin.readline())
+  assert ('error' in response) == (name != 'within-limit')
+  if name=='within-limit':assert response['result']['content'].startswith('x')
+ print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'usable':True}}),flush=True)
+"#.into()], env: HashMap::new(), cwd: None, default_timeout: Duration::from_secs(5) };
+        let child = Arc::new(JsonRpcChild::spawn_managed(config).await.unwrap());
+        let mut incoming = child.incoming_requests().unwrap();
+        let request_child = Arc::clone(&child);
+        let request = tokio::spawn(async move { request_child.request("exercise", Value::Null).await });
+        for content in ["\0".repeat(1024 * 1024), "x".repeat(MANAGED_MAX_FRAME_BYTES - 1), "x".repeat(MANAGED_MAX_FRAME_BYTES - 1024)] {
+            let call = incoming.recv().await.unwrap();
+            child.respond(call.id, Ok(serde_json::json!({"content":content}))).await.unwrap();
+        }
+        assert_eq!(request.await.unwrap().unwrap(), serde_json::json!({"usable":true}));
+        assert!(child.is_alive());
+        child.shutdown_managed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_shutdown_stops_child_with_blocked_pipe_writer() {
+        let child = Arc::new(JsonRpcChild::spawn_managed(SpawnConfig {
+            program: "python3".into(), args: vec!["-c".into(), "import time;time.sleep(600)".into()],
+            env: HashMap::new(), cwd: None, default_timeout: Duration::from_secs(5),
+        }).await.unwrap());
+        let group = child.managed_group.unwrap() as i32;
+        let mut cleanup = child.managed_startup_guard().unwrap();
+        let writer_child = Arc::clone(&child);
+        let writer = tokio::spawn(async move {
+            writer_child.notify("backpressure", serde_json::json!({"content":"x".repeat(1024 * 1024)})).await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while child.writer.try_lock().is_ok() {
+            assert!(!writer.is_finished(), "fixture write completed without pipe backpressure");
+            assert!(std::time::Instant::now() < deadline, "fixture did not acquire the writer");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!writer.is_finished());
+        tokio::time::timeout(Duration::from_secs(3), child.shutdown_managed()).await
+            .expect("managed shutdown waited behind the blocked writer").unwrap();
+        assert!(writer.await.unwrap().is_err());
+        assert_eq!(unsafe { libc::kill(-group, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        cleanup.disarm();
+    }
+
+    #[tokio::test]
+    async fn managed_cancelled_startup_stops_child_despite_retained_arc() {
+        let child = Arc::new(JsonRpcChild::spawn_managed(fake_config()).await.unwrap());
+        let retained = Arc::clone(&child);
+        let group = child.managed_group.unwrap() as i32;
+        drop(child.managed_startup_guard().unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(-group, 0) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "cancelled startup retained its group");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        retained.shutdown_managed().await.unwrap();
+    }
+
+    async fn run_under_isolated_subreaper(name: &str) -> bool {
+        if std::env::var("CODEMUX_MANAGED_ORPHAN_TEST_CHILD").ok().as_deref() != Some(name) {
+            // An isolated subreaper owns fixture orphans. Never change the
+            // application's/global test process reaping policy or leave zombies.
+            let script = r#"
+import ctypes,os,signal,subprocess,sys,time
+assert ctypes.CDLL(None,use_errno=True).prctl(36,1,0,0,0)==0
+child=subprocess.Popen([sys.argv[1],'--exact',sys.argv[2],'--nocapture'],env={**os.environ,'CODEMUX_MANAGED_ORPHAN_TEST_CHILD':sys.argv[2]})
+result=1;deadline=time.monotonic()+15
+try:
+ while time.monotonic()<deadline:
+  try:pid,status=os.waitpid(-1,os.WNOHANG)
+  except ChildProcessError:break
+  if pid==child.pid:result=os.waitstatus_to_exitcode(status);break
+  time.sleep(.01)
+finally:
+ # These are direct unreaped children of this fixture's subreaper only.
+ with open('/proc/self/task/%s/children'%os.getpid()) as source:owned=source.read().split()
+ for pid in owned:
+  try:os.kill(int(pid),signal.SIGKILL)
+  except ProcessLookupError:pass
+ while True:
+  try:os.waitpid(-1,0)
+  except ChildProcessError:break
+sys.exit(result)
+"#;
+            let status = Command::new("python3").args(["-c", script]).arg(std::env::current_exe().unwrap()).arg(name).status().await.unwrap();
+            assert!(status.success());
+            return true;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn managed_unpolled_watchdog_drop_stops_leader_and_descendant() {
+        if run_under_isolated_subreaper("json_rpc_child::managed_tests::managed_unpolled_watchdog_drop_stops_leader_and_descendant").await { return; }
+        let script = r#"
+import os,sys,time
+descendant=os.fork()
+if descendant==0:
+ time.sleep(600)
+ os._exit(0)
+print(descendant,flush=True)
+sys.stdin.readline()
+"#;
+        let child = Command::new("python3").args(["-u", "-c", script])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .kill_on_drop(true).process_group(0).spawn().unwrap();
+        let group = child.id().unwrap();
+        let mut child = OwnedRpcProcess { inner:child,managed_group:Some(group) };
+        let mut output = BufReader::new(child.inner.stdout.take().unwrap());
+        let mut line = String::new(); output.read_line(&mut line).await.unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        let (_shutdown, shutdown_rx) = oneshot::channel();
+        let unpolled = async move { wait_managed_child(&mut child, group, shutdown_rx).await };
+        // The async body never runs. Its captured ownership wrapper must stop
+        // the group before Child's drop can release the original PID.
+        drop(unpolled);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            // There is deliberately no watchdog left to await Child::wait().
+            // Reap only this fixture's direct child, whose dropped Tokio handle
+            // may otherwise leave it queued as a zombie until runtime teardown.
+            let mut status = 0;
+            let reaped = unsafe { libc::waitpid(group as i32, &mut status, libc::WNOHANG) };
+            if reaped == group as i32 {
+                assert!(libc::WIFSIGNALED(status));
+                assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+            } else if reaped == -1 {
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            }
+            if unsafe { libc::kill(-(group as i32), 0) } != 0 { break; }
+            assert!(std::time::Instant::now() < deadline, "unpolled watchdog left an owned group");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert!(!PathBuf::from(format!("/proc/{descendant}")).exists());
+    }
+
+    #[tokio::test]
+    async fn managed_group_stops_descendants_after_leader_exit() {
+        if run_under_isolated_subreaper("json_rpc_child::managed_tests::managed_group_stops_descendants_after_leader_exit").await { return; }
+        let script = r#"
+import json,os,sys,time
+request=json.loads(sys.stdin.readline())
+descendant=os.fork()
+if descendant==0:
+ time.sleep(600)
+ os._exit(0)
+print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'descendant':descendant}}),flush=True)
+os._exit(0)
+"#;
+        let child = JsonRpcChild::spawn_managed(SpawnConfig { program:"python3".into(), args:vec!["-u".into(),"-c".into(),script.into()],env:HashMap::new(),cwd:None,default_timeout:Duration::from_secs(5) }).await.unwrap();
+        let group = child.managed_group.unwrap() as i32;
+        let response = child.request("fork", Value::Null).await.unwrap();
+        child.shutdown_managed().await.unwrap();
+        assert_eq!(unsafe { libc::kill(-group, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert!(!PathBuf::from(format!("/proc/{}", response["descendant"].as_u64().unwrap())).exists());
     }
 }

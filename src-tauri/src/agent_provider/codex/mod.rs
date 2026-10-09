@@ -237,11 +237,13 @@ impl AgentProvider for CodexAgentProvider {
             input.recorded_usage_baseline,
         )
         .await?;
+        let mut startup_guard = session.managed_startup_guard();
 
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(thread_id.clone(), Arc::clone(&session));
         }
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
 
         Ok(ProviderSession {
             thread_id,

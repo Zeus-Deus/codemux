@@ -188,6 +188,36 @@ hold because the user clicked it. An interrupted task can then be retried.
 Linux recovery uses boot ID, process start identity, process-group membership and
 prior-host identity. Missing evidence or a still-live owner keeps the hold.
 
+A cancelled branch retains its own stop hold while unrelated active siblings keep
+their scoped authority. Script continuations wait through branch teardown;
+whole-run cancellation, shutdown, errors and unknown outcomes still revoke them.
+Retiring a child blocks queued dependency consumers and yielded coordinators
+before another attempt is admitted. Run history refreshes on coalesced host-wide
+events even while a different completed run is selected.
+
+New dispatches record whether they enforce a durable launch fence. After exclusive
+host ownership transfers, a fenced interrupted attempt with no external launch
+reference is proven unstarted: it releases its reservation with zero usage and
+pauses for explicit retry. Legacy, referenced and already-unknown attempts retain
+their holds. Late results from the old attempt cannot overwrite a fresh retry.
+
+Application exit immediately latches admission/tool revocation, retains and joins
+the driver, and stops locally owned provider runtimes concurrently. A bounded
+checkpoint runs off the UI thread and keeps the ownership lock until it finishes;
+database failure or a stuck callback cannot skip native process teardown. Startup
+futures have cancellation guards, and managed process groups are signalled while
+their leader remains owned and unreaped, including when the leader exits first.
+Failed process/tool proofs retain recovery holds. The asynchronous teardown stages
+have individual deadlines; the driver deadline alone is not a total exit-time cap.
+Suspended promises and pure script loops also observe a database-independent host
+shutdown signal. Exit waits for real script completion with a deadline; a blocked
+thread keeps host ownership, and late script results cannot mark a paused run complete.
+
+The managed JSON-RPC wire limit is 2 MiB including JSON escaping, the response
+envelope and newline. File/output limits do not override this transport bound.
+Oversized tool replies return a bounded error so the session can make a smaller
+subsequent request without losing its transport.
+
 Completed script observations replay in their original delivery order, preserving
 completion-dependent branches. Reusing a mutation key with different input is
 rejected. A durable mutation with an uncertain completion fails closed rather
@@ -413,8 +443,8 @@ child generations they accepted, so replacing or retiring that input revokes sta
 results and file application, including after database reopen.
 
 The final focused verification passed `npm run check`, the production frontend
-build, **251 affected frontend tests**, **79 workflow tests**, **14 filtered managed
-adapter/process tests**, **eight fake native/bridge integration tests**, **20 managed
+build, **252 affected frontend tests**, **96 workflow tests**, **20 filtered managed
+adapter/process tests**, **eleven fake native/bridge integration tests**, **21 managed
 sidecar tests**, **13 Hermes library/RPC tests**, and the Claude sidecar typecheck and
 **47 fake SDK session tests**. The managed native bundle was rebuilt with reviewed
 **Bun 1.3.12**; its official Cursor workspace, ripgrep and parser readiness probe
@@ -473,3 +503,35 @@ selection map. These were corrected without changing production chat startup.
 The expanded 251-test check includes all 124 chat startup tests plus UUID and
 UI-token contracts; both browser evidence sets were refreshed. The saved Opus
 review predates these small convention fixes, as its metadata states.
+
+### Review followups
+
+The latest focused checks include branch cancellation with a live sibling and a
+pinned script, retired explicit and awaited dependencies, zero-execution recovery
+and stale-result rejection, failed and blocked shutdown checkpoints, suspended
+script promises and pure loops, slow/unresponsive drivers, concurrent stop proof,
+native startup cancellation before readiness, leader-first exit with descendants,
+an unpolled watchdog and a blocked stdin writer. Serialized oversized responses
+also leave the native transport usable for a smaller subsequent callback.
+The 96-test workflow batch passed in 17.06 seconds on this Linux host. The
+256-task stress observer now coalesces progress events and owns its driver on
+failure; its Windows deadline is separate from the unchanged count/concurrency
+and accounting assertions. Windows-specific confirmation belongs to CI.
+
+The run-picker regression raised the affected frontend total to 252. It covers
+production host-wide payloads with numeric and null revisions while a different
+terminal run is selected, including coalescing ten events into one refresh.
+Earlier screenshots and Opus review describe the recorded visual source snapshot;
+this nonvisual followup has its own hash and component check in the provenance.
+
+Linux AppImage builds use `npm run tauri` or the verified release builder. Their
+private linuxdeploy patcher override preserves the exact owned Bun sidecars and
+Cursor SDK's two verified static helpers; dynamic native libraries still receive
+normal RPATH relocation. A copied x64 SDK tree passed the actual GTK packaging
+pass and zero-model native readiness. Ripgrep and the sandbox helper remained
+byte-identical and executable, while the parser binding received its normal
+RPATH. [Local packaging proof](assets/dynamic-workflows/packaging-readiness.json)
+records this fixture's hashes and limits. Seven focused packaging regressions and
+four release-policy checks passed. Installer verification now compares each
+extracted managed sidecar with its staged hash and runs Linux native readiness
+against the extracted payload; final archive results are reported from CI.

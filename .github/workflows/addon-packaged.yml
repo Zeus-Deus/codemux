@@ -5,6 +5,10 @@ on:
     paths:
       [
         "scripts/addons/**",
+        "scripts/appimage-patchelf*",
+        "scripts/tauri*.mjs",
+        "scripts/build-managed-workflow-sidecar.sh",
+        "sidecar/managed-workflow/**",
         "packages/plugin-*/**",
         "examples/addons/**",
         "src/components/addons/**",
@@ -161,6 +165,12 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: src-tauri/binaries/codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu --check-native
+
+      - name: Verify Bun-safe AppImage relocation
+        if: runner.os == 'Linux'
+        env:
+          CODEMUX_TEST_BUN_SIDECAR: src-tauri/binaries/codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu
+        run: node --test scripts/appimage-patchelf.test.mjs scripts/addons/managed-sidecar-provenance.test.mjs
 
       - name: Stage agent-browser sidecar binary
         shell: bash

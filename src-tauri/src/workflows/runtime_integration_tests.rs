@@ -37,6 +37,11 @@ struct Evidence {
     checkpoint_release: Notify,
     uncertain_started: Notify,
     permit_uncertain_stop: AtomicBool,
+    sibling_started: Notify,
+    sibling_release: Notify,
+    branch_started: Notify,
+    branch_stop_started: Notify,
+    branch_stop_release: Notify,
 }
 
 struct ScriptedProvider {
@@ -351,6 +356,18 @@ impl AgentProvider for ScriptedProvider {
                     queued_id: None,
                 });
             }
+            "branch-stop" => {
+                self.evidence.branch_started.notify_one();
+                return Ok(TurnStartResult {
+                    turn_id: TurnId(dispatch.attempt_id), steered: false, queued_id: None,
+                });
+            }
+            "active-sibling" => {
+                self.evidence.sibling_started.notify_one();
+                self.evidence.sibling_release.notified().await;
+                self.tool(&context, &dispatch, "workflow_write_file", json!({"path":"src/survives.txt","content":"independent work\n"})).await;
+                self.tool(&context, &dispatch, "workflow_submit_result", json!({"output":{"ok":true}})).await;
+            }
             "survivor" => {
                 assert!(context
                     .call(
@@ -413,6 +430,10 @@ impl AgentProvider for ScriptedProvider {
             .get(attempt)
             .unwrap()
             .clone();
+        if dispatch.task_id == "branch-stop" {
+            self.evidence.branch_stop_started.notify_one();
+            self.evidence.branch_stop_release.notified().await;
+        }
         if dispatch.task_id == "uncertain"
             && !self.evidence.permit_uncertain_stop.load(Ordering::SeqCst)
         {
@@ -632,6 +653,42 @@ impl Fixture {
         })
     }
 }
+#[tokio::test]
+async fn workflow_runtime_branch_cancel_preserves_active_sibling_and_script_wait() {
+    let fixture = Fixture::new(2);
+    let mut cancelled = worker("branch-stop", "claude", "src/pending.txt");
+    cancelled.required = false;
+    let mut spec = run_spec(vec![cancelled, worker("active-sibling", "codex", "src/survives.txt")], 2);
+    spec.script = Some(ScriptSpec {
+        source: "const result=await workflow.wait('active-sibling');return {status:result.status};".into(),
+        args: json!({}), api_version: scripts::SCRIPT_API_VERSION,
+    });
+    let run = fixture.create(spec, "independent-branch-stop");
+    let scripts = scripts::WorkflowScriptRuntime::default();
+    scripts.start(fixture.service.clone(), &run.id).unwrap();
+    let runtime = OwnedRuntime::start(fixture.service.clone(), fixture.driver());
+    tokio::time::timeout(Duration::from_secs(3), fixture.evidence.sibling_started.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), fixture.evidence.branch_started.notified()).await.unwrap();
+    fixture.service.cancel_task(&run.id, "branch-stop").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), fixture.evidence.branch_stop_started.notified()).await.unwrap();
+    assert_eq!(fixture.service.snapshot(&run.id).unwrap().status, RunStatus::Stopping);
+    fixture.evidence.sibling_release.notify_one();
+    let stopping = fixture.until(&run.id, |run| run.tasks.iter().any(|task| task.spec.id == "active-sibling" && task.status == TaskStatus::Succeeded)).await;
+    assert_eq!(stopping.status, RunStatus::Stopping);
+    assert_ne!(stopping.script.as_ref().unwrap().status, ScriptStatus::Failed);
+    let cancelled = stopping.tasks.iter().find(|task| task.spec.id == "branch-stop").unwrap();
+    assert_eq!(cancelled.current_attempt.as_ref().unwrap().status, AttemptStatus::Stopping);
+    let sibling = stopping.tasks.iter().find(|task| task.spec.id == "active-sibling").unwrap();
+    let artifact = fixture.artifacts.inspect(&sibling.current_attempt.as_ref().unwrap().id).unwrap();
+    assert_eq!(std::fs::read_to_string(artifact.checkout.join("src/survives.txt")).unwrap(), "independent work\n");
+    fixture.evidence.branch_stop_release.notify_one();
+    let completed = fixture.until(&run.id, |run| run.status == RunStatus::Completed).await;
+    assert_eq!(completed.script.as_ref().unwrap().status, ScriptStatus::Completed);
+    assert_eq!(completed.script.as_ref().unwrap().result, Some(json!({"status":"succeeded"})));
+    assert_eq!(fixture.evidence.active.load(Ordering::SeqCst), 0);
+    runtime.stop().await;
+}
+
 struct OwnedRuntime {
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
