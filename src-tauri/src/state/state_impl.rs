@@ -981,6 +981,65 @@ pub struct InitialChatPane {
 
 pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
+    // Runtime-only lookup authority, bounded by live workspace ids. Always
+    // acquire `inner` first; validation and PR publication share that lock.
+    pr_lookup_authorities: Mutex<HashMap<String, Arc<()>>>,
+}
+
+/// Authority captured before a workspace PR lookup starts. Arc identity is a
+/// generation without counter wraparound or any serialized snapshot fields.
+#[derive(Clone)]
+pub(crate) struct WorkspacePrLookup {
+    pub(crate) workspace_id: String,
+    pub(crate) cwd: String,
+    authority: Arc<()>,
+    explicit: bool,
+}
+
+/// Operation-local stored path identities, retained across mutation I/O even
+/// if the initiating workspace closes. Never serialized or globally registered.
+pub(crate) struct WorkspacePrMutationScope {
+    paths: Vec<String>,
+}
+
+impl WorkspacePrMutationScope {
+    fn matches(&self, workspace: &WorkspaceSnapshot) -> bool {
+        !workspace.attach_only
+            && self.paths.iter().any(|path| {
+                let path = Path::new(path);
+                Path::new(&workspace.cwd) == path
+                    || workspace
+                        .worktree_path
+                        .as_deref()
+                        .is_some_and(|p| Path::new(p) == path)
+                    || workspace
+                        .project_root
+                        .as_deref()
+                        .is_some_and(|p| Path::new(p) == path)
+            })
+    }
+}
+
+fn write_workspace_prs(workspace: &mut WorkspaceSnapshot, prs: Vec<WorkspacePr>) -> bool {
+    let primary = prs.first();
+    let pr_number = primary.map(|pr| pr.number);
+    let pr_state = primary.map(|pr| pr.state.clone());
+    let pr_url = primary.map(|pr| pr.url.clone());
+    let pr_head_branch = primary.and_then(|pr| pr.head_branch.clone());
+    if workspace.prs == prs
+        && workspace.pr_number == pr_number
+        && workspace.pr_state == pr_state
+        && workspace.pr_url == pr_url
+        && workspace.pr_head_branch == pr_head_branch
+    {
+        return false;
+    }
+    workspace.prs = prs;
+    workspace.pr_number = pr_number;
+    workspace.pr_state = pr_state;
+    workspace.pr_url = pr_url;
+    workspace.pr_head_branch = pr_head_branch;
+    true
 }
 
 /// Outcome of [`AppStateStore::adopt_or_create_worktree_workspace`]:
@@ -1084,6 +1143,7 @@ impl Default for AppStateStore {
     fn default() -> Self {
         Self {
             inner: Mutex::new(default_app_state()),
+            pr_lookup_authorities: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1238,7 +1298,9 @@ impl AppStateStore {
                 workspace.imported_snapshot_only = Some(workspace.is_local_import_snapshot_only());
             }
         }
-        *self.inner.lock().unwrap() = snapshot;
+        let mut current = self.inner.lock().unwrap();
+        self.pr_lookup_authorities.lock().unwrap().clear();
+        *current = snapshot;
     }
 
     /// Remove all workspaces and sessions, keeping config intact.
@@ -1247,6 +1309,7 @@ impl AppStateStore {
     pub fn clear_workspaces(&self) {
         let mut snapshot = self.inner.lock().unwrap();
         snapshot.workspaces.clear();
+        self.pr_lookup_authorities.lock().unwrap().clear();
         snapshot.terminal_sessions.clear();
         snapshot.active_workspace_id = WorkspaceId(String::new());
     }
@@ -3079,6 +3142,136 @@ impl AppStateStore {
         })
     }
 
+    /// Capture all background lookup authorities before any detection/auth or
+    /// batch I/O. Capturing later (after A returns while B is pending) would
+    /// accidentally authorize an old answer with a newer refresh generation.
+    pub(crate) fn workspace_pr_poll_lookups(&self) -> Vec<WorkspacePrLookup> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        authorities.retain(|id, _| snapshot.workspaces.iter().any(|w| w.workspace_id.0 == *id));
+        snapshot
+            .workspaces
+            .iter()
+            .filter(|w| !w.attach_only)
+            .map(|w| {
+                let authority = authorities
+                    .entry(w.workspace_id.0.clone())
+                    .or_insert_with(|| Arc::new(()))
+                    .clone();
+                WorkspacePrLookup {
+                    workspace_id: w.workspace_id.0.clone(),
+                    cwd: w.worktree_path.clone().unwrap_or_else(|| w.cwd.clone()),
+                    authority,
+                    explicit: false,
+                }
+            })
+            .collect()
+    }
+
+    /// Capture the command path and matched stored project roots while revoking
+    /// pre-mutation reads under the same state lock. Retain this scope across
+    /// I/O; completion must not depend on the initiating workspace staying live.
+    pub(crate) fn invalidate_workspace_pr_lookups_for_path(
+        &self,
+        path: &str,
+    ) -> WorkspacePrMutationScope {
+        let snapshot = self.inner.lock().unwrap();
+        let mut scope = WorkspacePrMutationScope {
+            paths: vec![path.to_owned()],
+        };
+        let roots: Vec<String> = snapshot
+            .workspaces
+            .iter()
+            .filter(|w| scope.matches(w))
+            .filter_map(|w| w.project_root.clone())
+            .collect();
+        scope.paths.extend(roots);
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        for workspace in snapshot.workspaces.iter().filter(|w| scope.matches(w)) {
+            authorities.remove(&workspace.workspace_id.0);
+        }
+        scope
+    }
+
+    /// Revoke during-mutation reads for matching CURRENT workspaces, including
+    /// siblings created after the initial revocation, using only retained paths.
+    pub(crate) fn invalidate_workspace_pr_lookups_for_scope(
+        &self,
+        scope: &WorkspacePrMutationScope,
+    ) {
+        let snapshot = self.inner.lock().unwrap();
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        for workspace in snapshot.workspaces.iter().filter(|w| scope.matches(w)) {
+            authorities.remove(&workspace.workspace_id.0);
+        }
+    }
+
+    /// An explicit refresh supersedes older reads immediately, even if its
+    /// lookup later preserves the pill or writes identical data.
+    pub(crate) fn begin_workspace_pr_refresh(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkspacePrLookup, String> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id && !w.attach_only)
+            .ok_or_else(|| format!("No local workspace found: {workspace_id}"))?;
+        let authority = Arc::new(());
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .insert(workspace_id.to_owned(), authority.clone());
+        Ok(WorkspacePrLookup {
+            workspace_id: workspace_id.to_owned(),
+            cwd: workspace
+                .worktree_path
+                .clone()
+                .unwrap_or_else(|| workspace.cwd.clone()),
+            authority,
+            explicit: true,
+        })
+    }
+
+    /// Validate id, current local checkout and generation, then publish both
+    /// the PR list and its scalars under the same state lock. Rejected and
+    /// unchanged publications keep the poller's emit gate closed.
+    pub(crate) fn publish_workspace_pr_lookup(
+        &self,
+        lookup: &WorkspacePrLookup,
+        outcome: crate::github::WorkspacePrsOutcome,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace) = snapshot.workspaces.iter_mut().find(|w| {
+            w.workspace_id.0 == lookup.workspace_id
+                && !w.attach_only
+                && w.worktree_path.as_deref().unwrap_or(&w.cwd) == lookup.cwd
+        }) else {
+            return false;
+        };
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        if !authorities
+            .get(&lookup.workspace_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &lookup.authority))
+        {
+            return false;
+        }
+        // Fence background reads captured DURING an explicit refresh as well.
+        // Only its still-current completion may advance authority; a stale
+        // no-op/Preserve completion must never reauthorize an older batch.
+        if lookup.explicit {
+            authorities.insert(lookup.workspace_id.clone(), Arc::new(()));
+        }
+        match outcome {
+            crate::github::WorkspacePrsOutcome::Write(prs) => {
+                write_workspace_prs(workspace, crate::workspace_pr_rows(prs))
+            }
+            crate::github::WorkspacePrsOutcome::Clear => write_workspace_prs(workspace, Vec::new()),
+            crate::github::WorkspacePrsOutcome::Preserve => false,
+        }
+    }
+
     /// Returns true when the stored PR pill actually changed (same
     /// emit-gating contract as `update_workspace_git_info`).
     pub fn update_workspace_pr_info(
@@ -3097,6 +3290,11 @@ impl AppStateStore {
         else {
             return false;
         };
+        // Immediate writes revoke older lookups even when the value is equal.
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .remove(workspace_id);
         // The head branch joins the equality gate rather than riding along
         // silently: a badge that stays numerically identical while moving
         // from the current branch to a side branch (or back) changes whether
@@ -3119,7 +3317,8 @@ impl AppStateStore {
     /// Replace the whole set of PRs a workspace owns, deriving the flat
     /// `pr_*` scalars from its head.
     ///
-    /// This is the writer the pollers use. It exists alongside
+    /// Immediate writes revoke pending lookups, including no-op writes. The
+    /// async pollers use `publish_workspace_pr_lookup` instead. This exists alongside
     /// `update_workspace_pr_info` rather than replacing it because the
     /// worktree-creation seed knows a PR *number* and nothing else, which is
     /// not enough to build a `WorkspacePr`; that path stays scalar-only and is
@@ -3137,25 +3336,11 @@ impl AppStateStore {
         else {
             return false;
         };
-        let primary = prs.first();
-        let pr_number = primary.map(|pr| pr.number);
-        let pr_state = primary.map(|pr| pr.state.clone());
-        let pr_url = primary.map(|pr| pr.url.clone());
-        let pr_head_branch = primary.and_then(|pr| pr.head_branch.clone());
-        if workspace.prs == prs
-            && workspace.pr_number == pr_number
-            && workspace.pr_state == pr_state
-            && workspace.pr_url == pr_url
-            && workspace.pr_head_branch == pr_head_branch
-        {
-            return false;
-        }
-        workspace.prs = prs;
-        workspace.pr_number = pr_number;
-        workspace.pr_state = pr_state;
-        workspace.pr_url = pr_url;
-        workspace.pr_head_branch = pr_head_branch;
-        true
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .remove(workspace_id);
+        write_workspace_prs(workspace, prs)
     }
 
     /// Record the branch a worktree workspace was created from. Set once at
@@ -3210,6 +3395,12 @@ impl AppStateStore {
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
         {
+            if workspace.worktree_path.as_ref() != Some(&worktree_path) {
+                self.pr_lookup_authorities
+                    .lock()
+                    .unwrap()
+                    .remove(workspace_id);
+            }
             workspace.worktree_path = Some(worktree_path);
             workspace.title = title;
         }
@@ -3653,6 +3844,12 @@ impl AppStateStore {
             .iter_mut()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
+            if workspace.cwd != cwd {
+                self.pr_lookup_authorities
+                    .lock()
+                    .unwrap()
+                    .remove(workspace_id);
+            }
             workspace.cwd = cwd;
             return true;
         }
@@ -3670,6 +3867,10 @@ impl AppStateStore {
                 .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
             let removed = snapshot.workspaces.remove(workspace_index);
+            self.pr_lookup_authorities
+                .lock()
+                .unwrap()
+                .remove(workspace_id);
             let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
             let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
             snapshot
@@ -3711,6 +3912,10 @@ impl AppStateStore {
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
         let removed = snapshot.workspaces.remove(workspace_index);
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .remove(workspace_id);
         let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
         let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
         snapshot
@@ -12017,6 +12222,323 @@ mod workspace_activity_tests {
 #[cfg(test)]
 mod metadata_change_tests {
     use super::*;
+
+    fn pr_lookup_result(number: u32) -> crate::github::WorkspacePrsOutcome {
+        crate::github::WorkspacePrsOutcome::Write(vec![crate::github::SourcedPr {
+            pr: serde_json::from_value(serde_json::json!({
+                "number": number, "state": "OPEN", "title": "Synthetic PR",
+                "url": format!("https://example.test/pr/{number}"),
+                "head_branch": format!("feature-{number}"), "base_branch": "main",
+            }))
+            .unwrap(),
+            source: crate::github::PrSource::Branch,
+            checkout_branch: Some(format!("feature-{number}")),
+        }])
+    }
+
+    fn assert_pr(store: &AppStateStore, id: &str, number: Option<u32>) {
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id.0 == id)
+            .unwrap();
+        assert_eq!(ws.pr_number, number, "scalar publication");
+        assert_eq!(
+            ws.prs.first().map(|pr| pr.number),
+            number,
+            "list publication"
+        );
+        assert_eq!(ws.pr_state, number.map(|_| "OPEN".into()));
+        assert_eq!(
+            ws.pr_url,
+            number.map(|n| format!("https://example.test/pr/{n}"))
+        );
+        assert_eq!(ws.pr_head_branch, number.map(|n| format!("feature-{n}")));
+    }
+
+    fn delayed_batch_cannot_overwrite_refresh(clear: bool) {
+        let store = Arc::new(AppStateStore::default());
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        store.update_workspace_cwd(&a, "/synthetic/repo-a".into());
+        store.update_workspace_cwd(&b, "/synthetic/repo-b".into());
+        let captured = store.workspace_pr_poll_lookups();
+        let (a_done_tx, a_done_rx) = std::sync::mpsc::channel();
+        let (b_release_tx, b_release_rx) = std::sync::mpsc::channel();
+        let worker_store = store.clone();
+        let worker_a = a.clone();
+        let worker_b = b.clone();
+        let batch = std::thread::spawn(move || {
+            // Repo A has its answer, but the actual batch cannot publish it
+            // until the later repo B lookup returns. No sleeps or real I/O.
+            let answer_a = pr_lookup_result(10);
+            a_done_tx.send(()).unwrap();
+            b_release_rx.recv().unwrap();
+            let a_changed = worker_store.publish_workspace_pr_lookup(
+                captured
+                    .iter()
+                    .find(|t| t.workspace_id == worker_a)
+                    .unwrap(),
+                answer_a,
+            );
+            let b_changed = worker_store.publish_workspace_pr_lookup(
+                captured
+                    .iter()
+                    .find(|t| t.workspace_id == worker_b)
+                    .unwrap(),
+                pr_lookup_result(20),
+            );
+            (a_changed, b_changed)
+        });
+        a_done_rx.recv().unwrap();
+        let fresh = store.begin_workspace_pr_refresh(&a).unwrap();
+        let outcome = if clear {
+            crate::github::WorkspacePrsOutcome::Clear
+        } else {
+            pr_lookup_result(11)
+        };
+        store.publish_workspace_pr_lookup(&fresh, outcome);
+        b_release_tx.send(()).unwrap();
+        let (a_changed, b_changed) = batch.join().unwrap();
+        assert_pr(&store, &a, if clear { None } else { Some(11) });
+        assert!(!a_changed, "a stale result must not open the emit gate");
+        assert!(b_changed, "refresh A must not invalidate unrelated B");
+        assert_pr(&store, &b, Some(20));
+    }
+
+    #[test]
+    fn pr_publication_delayed_batch_refuses_old_a_after_refresh_write() {
+        delayed_batch_cannot_overwrite_refresh(false);
+    }
+
+    #[test]
+    fn pr_publication_delayed_batch_refuses_old_a_after_refresh_clear() {
+        delayed_batch_cannot_overwrite_refresh(true);
+    }
+
+    #[test]
+    fn pr_publication_authority_inventory_is_runtime_only_and_removed_on_close_clear() {
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        let captured = store.workspace_pr_poll_lookups();
+        assert_eq!(store.pr_lookup_authorities.lock().unwrap().len(), 2);
+        let serialized = serde_json::to_string(&store.snapshot()).unwrap();
+        assert!(!serialized.contains("pr_lookup_authorit"));
+        store.close_workspace(&a).unwrap();
+        assert_eq!(store.pr_lookup_authorities.lock().unwrap().len(), 1);
+        store.clear_workspaces();
+        assert!(store.pr_lookup_authorities.lock().unwrap().is_empty());
+        assert!(captured
+            .iter()
+            .all(|t| !store.publish_workspace_pr_lookup(t, pr_lookup_result(10))));
+        assert!(!store.update_workspace_prs(&b, Vec::new()));
+        assert!(store.begin_workspace_pr_refresh("missing").is_err());
+        assert!(store.pr_lookup_authorities.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pr_publication_immediate_noop_list_write_revokes_old_lookup() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.update_workspace_prs(&id, Vec::new()));
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_immediate_noop_scalar_write_revokes_old_lookup() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.update_workspace_pr_info(&id, None, None, None, None));
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_replaced_snapshot_revokes_same_id_and_path() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        store.replace_snapshot(store.snapshot());
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_returning_to_same_cwd_does_not_reauthorize() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        store.update_workspace_cwd(&id, "/synthetic/moved".into());
+        store.update_workspace_cwd(&id, old.cwd.clone());
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_returning_to_same_worktree_does_not_reauthorize() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        store.set_workspace_worktree(&id, "/synthetic/worktree".into(), "fixture".into());
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        store.set_workspace_worktree(&id, "/synthetic/other".into(), "fixture".into());
+        store.set_workspace_worktree(&id, old.cwd.clone(), "fixture".into());
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_path_mutation_revokes_siblings_not_unrelated_workspaces() {
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        let c = store.create_workspace().0;
+        for (id, path) in [
+            (&a, "/synthetic/a"),
+            (&b, "/synthetic/b"),
+            (&c, "/synthetic/c"),
+        ] {
+            store.update_workspace_cwd(id, path.into());
+        }
+        store.set_workspace_project_root(&a, "/synthetic/repository".into());
+        store.set_workspace_project_root(&b, "/synthetic/repository".into());
+        let captured = store.workspace_pr_poll_lookups();
+        store.invalidate_workspace_pr_lookups_for_path("/synthetic/a");
+        for token in captured {
+            let changed = store.publish_workspace_pr_lookup(&token, pr_lookup_result(10));
+            assert_eq!(
+                changed,
+                token.workspace_id == c,
+                "only the unrelated workspace keeps authority"
+            );
+        }
+        assert_pr(&store, &a, None);
+        assert_pr(&store, &b, None);
+        assert_pr(&store, &c, Some(10));
+    }
+
+    #[test]
+    fn pr_publication_overlapping_refresh_preserve_cannot_reauthorize_old_batch() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let batch = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        let first = store.begin_workspace_pr_refresh(&id).unwrap();
+        let second = store.begin_workspace_pr_refresh(&id).unwrap();
+        let during = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        assert!(store.publish_workspace_pr_lookup(&second, pr_lookup_result(11)));
+        assert!(!store.publish_workspace_pr_lookup(&first, pr_lookup_result(11)));
+        assert!(!store
+            .publish_workspace_pr_lookup(&first, crate::github::WorkspacePrsOutcome::Preserve));
+        assert!(
+            !store.publish_workspace_pr_lookup(&first, crate::github::WorkspacePrsOutcome::Clear)
+        );
+        assert!(!store.publish_workspace_pr_lookup(&batch, pr_lookup_result(10)));
+        assert!(!store.publish_workspace_pr_lookup(&during, pr_lookup_result(10)));
+        assert_pr(&store, &id, Some(11));
+    }
+
+    #[test]
+    fn pr_publication_begin_refresh_fences_even_before_its_lookup_finishes() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let batch = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.publish_workspace_pr_lookup(&batch, pr_lookup_result(10)));
+        assert!(!store.publish_workspace_pr_lookup(
+            &fresh,
+            crate::github::workspace_prs_outcome(Err("fixture lookup failure".into()))
+        ));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_none_and_error_preserve_data_and_emit_gate() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(store.publish_workspace_pr_lookup(&fresh, pr_lookup_result(11)));
+        for outcome in [
+            crate::github::WorkspacePrsOutcome::Preserve,
+            crate::github::workspace_prs_outcome(Err("fixture lookup failure".into())),
+        ] {
+            let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+            assert!(!store.publish_workspace_pr_lookup(&fresh, outcome));
+            assert_pr(&store, &id, Some(11));
+        }
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.publish_workspace_pr_lookup(&fresh, pr_lookup_result(11)));
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(
+            store.publish_workspace_pr_lookup(&fresh, crate::github::WorkspacePrsOutcome::Clear)
+        );
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(
+            !store.publish_workspace_pr_lookup(&fresh, crate::github::WorkspacePrsOutcome::Clear)
+        );
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_moved_deleted_and_remote_targets_refuse_write_and_clear() {
+        for clear in [false, true] {
+            for change in ["move", "delete", "attach"] {
+                let store = AppStateStore::default();
+                let id = store.create_workspace().0;
+                let seed = store.begin_workspace_pr_refresh(&id).unwrap();
+                store.publish_workspace_pr_lookup(&seed, pr_lookup_result(11));
+                let captured = store.begin_workspace_pr_refresh(&id).unwrap();
+                match change {
+                    "move" => {
+                        store.update_workspace_cwd(&id, "/synthetic/moved".into());
+                    }
+                    "delete" => {
+                        store.close_workspace(&id).unwrap();
+                    }
+                    "attach" => {
+                        store
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .workspaces
+                            .iter_mut()
+                            .find(|w| w.workspace_id.0 == id)
+                            .unwrap()
+                            .attach_only = true;
+                        assert!(store.begin_workspace_pr_refresh(&id).is_err());
+                    }
+                    _ => unreachable!(),
+                }
+                let outcome = if clear {
+                    crate::github::WorkspacePrsOutcome::Clear
+                } else {
+                    pr_lookup_result(10)
+                };
+                assert!(!store.publish_workspace_pr_lookup(&captured, outcome));
+                if change != "delete" {
+                    assert_pr(&store, &id, Some(11));
+                }
+            }
+        }
+    }
 
     #[test]
     fn git_info_reports_change_only_when_a_field_moves() {

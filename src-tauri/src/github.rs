@@ -536,6 +536,7 @@ pub fn get_pr_timeline(repo_path: &Path, pr_number: u32) -> Result<Vec<PrTimelin
 struct LocalGhAuth {
     status: GhStatus,
     identity: Option<u64>,
+    token: Option<Arc<str>>,
 }
 
 static GH_LOCAL_AUTH: OnceLock<Mutex<HashMap<String, (Instant, u64, LocalGhAuth)>>> =
@@ -573,7 +574,8 @@ fn local_gh_auth(host: &str) -> LocalGhAuth {
     let cache = GH_LOCAL_AUTH.get_or_init(Mutex::default);
     let fingerprint = auth_fingerprint(host);
     // Serialize local keyring reads too: a page fan-out should not open one
-    // secret-service round trip per repository. No token is retained or logged.
+    // secret-service round trip per repository. Tokens stay in this bounded
+    // in-memory cache only; never log or persist them.
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
     if let Some((fetched_at, previous, auth)) = cache.get(host) {
         if *previous == fingerprint && fetched_at.elapsed() < CLI_AVAILABILITY_TTL {
@@ -598,11 +600,13 @@ fn local_gh_auth(host: &str) -> LocalGhAuth {
             LocalGhAuth {
                 status: GhStatus::Authenticated { username },
                 identity: Some(identity.finish()),
+                token: Some(Arc::from(output.stdout.trim())),
             }
         }
         _ => LocalGhAuth {
             status: GhStatus::NotAuthenticated,
             identity: None,
+            token: None,
         },
     };
     if cache.len() >= 64 {
@@ -615,6 +619,10 @@ fn local_gh_auth(host: &str) -> LocalGhAuth {
 /// Credential identity is a process-local hash; it never contains the token.
 pub(crate) fn gh_credential_identity(host: &str) -> Option<u64> {
     local_gh_auth(host).identity
+}
+
+pub(crate) fn gh_api_token(host: &str) -> Option<Arc<str>> {
+    local_gh_auth(host).token
 }
 
 /// `gh auth status` validates credentials remotely. Token availability and the
@@ -1018,7 +1026,7 @@ pub fn get_pull_request(repo_path: &Path, number: u32) -> Result<PullRequestInfo
         repo_path,
         &[
             "pr", "view", &number_str,
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,author,body,comments,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,author,body,comments,changedFiles,headRefOid,headRepositoryOwner,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews",
         ],
         ISSUE_FETCH_TIMEOUT,
     )?;
@@ -1077,7 +1085,46 @@ pub const MAX_PR_REVIEW_DIFF_BYTES: usize = 4 * 1024 * 1024;
 
 /// The whole patch, for reviewing rather than summarising.
 pub fn get_pr_review_diff(repo_path: &Path, number: u32) -> Result<String, String> {
-    get_pr_diff_capped(repo_path, number, true, MAX_PR_REVIEW_DIFF_BYTES)
+    get_pr_diff_capped_inner(repo_path, number, true, MAX_PR_REVIEW_DIFF_BYTES, true)
+}
+
+/// Bind a live review patch to the SHA used by the frontend's cache key.
+/// Verify the remote head before AND after the uncached patch read: ordering
+/// a detail refresh first cannot rule out a push between those reads.
+/// Omitted SHAs retain the provider's existing unversioned read contract.
+/// Head reads bypass successful cache entries, but not budget refusals.
+pub fn get_pr_review_diff_for_head(
+    repo_path: &Path,
+    number: u32,
+    expected_head_sha: Option<&str>,
+) -> Result<String, String> {
+    if let Some(expected) = expected_head_sha {
+        verify_pr_review_head(repo_path, number, expected)?;
+    }
+    let diff = get_pr_review_diff(repo_path, number)?;
+    if let Some(expected) = expected_head_sha {
+        verify_pr_review_head(repo_path, number, expected)?;
+    }
+    Ok(diff)
+}
+
+fn verify_pr_review_head(repo_path: &Path, number: u32, expected: &str) -> Result<(), String> {
+    let number_str = number.to_string();
+    let output = crate::github_budget::run_fresh(
+        repo_path,
+        &["pr", "view", &number_str, "--json", "headRefOid"],
+        ISSUE_FETCH_TIMEOUT,
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|error| format!("Failed to parse pull request head: {error}"))?;
+    let actual = value["headRefOid"]
+        .as_str()
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| "GitHub did not return a pull request head SHA".to_string())?;
+    if actual != expected {
+        return Err("Pull request head changed while loading the review diff; refresh and try again".into());
+    }
+    Ok(())
 }
 
 fn get_pr_diff_capped(
@@ -1085,6 +1132,16 @@ fn get_pr_diff_capped(
     number: u32,
     full: bool,
     max_bytes: usize,
+) -> Result<String, String> {
+    get_pr_diff_capped_inner(repo_path, number, full, max_bytes, false)
+}
+
+fn get_pr_diff_capped_inner(
+    repo_path: &Path,
+    number: u32,
+    full: bool,
+    max_bytes: usize,
+    fresh: bool,
 ) -> Result<String, String> {
     if !gh_available() {
         return Err("gh CLI is not installed".into());
@@ -1102,7 +1159,11 @@ fn get_pr_diff_capped(
     if !full {
         args.push("--name-only");
     }
-    let output = run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?;
+    let output = if fresh {
+        crate::github_budget::run_fresh(repo_path, &args, ISSUE_FETCH_TIMEOUT)?
+    } else {
+        run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?
+    };
 
     if !full || output.len() <= max_bytes {
         return Ok(output);
@@ -1298,10 +1359,447 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
     Ok(resolve_branch_pr(repo_path)?.pr)
 }
 
-/// The `--json` field set every branch-PR query asks for. Shared by the
-/// per-branch lookup and the repo-wide fallback list so `parse_pr_json` can
-/// never be handed a row that is missing a field one caller relies on.
-const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,headRefOid,headRepositoryOwner,author,body,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews";
+// Sidebar discovery is branch-scoped and intentionally omits detail fields.
+#[cfg(test)]
+#[path = "github_discovery_tests.rs"]
+mod discovery_tests;
+
+// Sidebar discovery is branch-scoped, never a truncated repository-wide list.
+// Each request is bounded to 16 connections of at most 100 lightweight rows.
+const DISCOVERY_BRANCHES_PER_QUERY: usize = 16;
+const DISCOVERY_ROWS_PER_BRANCH: usize = 100;
+const DISCOVERY_GRAPHQL_FIELDS: &str = "number url state title headRefName baseRefName isDraft updatedAt createdAt headRefOid headRepositoryOwner { login }";
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DiscoveryScope {
+    host: String,
+    owner: String,
+    repository: String,
+    account: Option<u64>,
+}
+
+impl DiscoveryScope {
+    fn resolve(repo_path: &Path) -> Result<Self, String> {
+        // Use the quota owner's host selection, including GH_HOST / GH_REPO.
+        let host = crate::github_budget::host_for_path(repo_path)?;
+        let selector = std::env::var("GH_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let remote = if selector.is_none() {
+            let detected = crate::git_provider::try_detect_provider(repo_path)?;
+            let name = detected.remote_name.ok_or("No selected GitHub remote")?;
+            run_git_optional(
+                repo_path,
+                &["config", "--get", &format!("remote.{name}.url")],
+            )
+        } else {
+            None
+        };
+        Self::from_selected(
+            &host,
+            selector.as_deref(),
+            remote.as_deref(),
+            gh_credential_identity(&host),
+        )
+    }
+
+    fn from_selected(
+        host: &str,
+        selector: Option<&str>,
+        remote: Option<&str>,
+        account: Option<u64>,
+    ) -> Result<Self, String> {
+        let selected = selector.or(remote).ok_or("No selected GitHub repository")?;
+        let path = if selected.contains("://") {
+            url::Url::parse(selected)
+                .map_err(|_| "Invalid GitHub repository URL")?
+                .path()
+                .trim_matches('/')
+                .trim_end_matches(".git")
+                .to_owned()
+        } else if selector.is_some() {
+            let parts: Vec<_> = selected.split('/').collect();
+            match parts.as_slice() {
+                [owner, repository] => format!("{owner}/{repository}"),
+                [_, owner, repository] => format!("{owner}/{repository}"),
+                _ => return Err("Invalid GitHub repository selector".into()),
+            }
+        } else {
+            selected
+                .split_once(':')
+                .ok_or("Invalid GitHub remote URL")?
+                .1
+                .trim_matches('/')
+                .trim_end_matches(".git")
+                .to_owned()
+        };
+        let (owner, repository) = path
+            .split_once('/')
+            .ok_or("Invalid GitHub repository identity")?;
+        let valid = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                && !matches!(s, "." | "..")
+        };
+        if !valid(owner) || !valid(repository) {
+            return Err("Invalid GitHub repository identity".into());
+        }
+        Ok(Self {
+            host: host.to_ascii_lowercase(),
+            owner: owner.to_ascii_lowercase(),
+            repository: repository.to_ascii_lowercase(),
+            account,
+        })
+    }
+}
+
+/// A poll snapshot may outlive a checkout move, deletion or remote attachment.
+/// Read back the same id AND effective checkout path before publishing badges.
+pub(crate) fn workspace_pr_poll_target_is_current(
+    targets: &[(String, String)],
+    workspace_id: &str,
+    cwd: &str,
+) -> bool {
+    targets
+        .iter()
+        .any(|(id, path)| id == workspace_id && path == cwd)
+}
+
+type DiscoveryRows = HashMap<String, Result<Vec<serde_json::Value>, String>>;
+
+fn discovery_query(_scope: &DiscoveryScope, branches: &[String], open_only: bool) -> String {
+    let mut query =
+        "query($owner:String!,$name:String!) { repository(owner:$owner,name:$name) {".to_owned();
+    let states = if open_only {
+        "[OPEN]"
+    } else {
+        "[OPEN,CLOSED,MERGED]"
+    };
+    for (index, branch) in branches.iter().enumerate() {
+        query.push_str(&format!(" b{index}:pullRequests(headRefName:{},states:{states},first:{DISCOVERY_ROWS_PER_BRANCH},orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ totalCount pageInfo {{ hasNextPage }} nodes {{ {DISCOVERY_GRAPHQL_FIELDS} }} }}", serde_json::to_string(branch).unwrap()));
+    }
+    query.push_str(" } }");
+    query
+}
+
+fn parse_discovery_response(output: &str, branches: &[String]) -> Result<DiscoveryRows, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(output).map_err(|e| format!("Failed to parse discovery JSON: {e}"))?;
+    // HTTP 200 with GraphQL errors is not an authoritative answer, even when
+    // `data` also contains rows. Never turn null/missing connections into [].
+    if value
+        .get("errors")
+        .is_some_and(|errors| errors.as_array().is_none_or(|errors| !errors.is_empty()))
+    {
+        return Err("GitHub discovery returned GraphQL errors".into());
+    }
+    let repository = value["data"]["repository"]
+        .as_object()
+        .ok_or("GitHub discovery repository is unavailable")?;
+    let mut result = DiscoveryRows::new();
+    for (index, branch) in branches.iter().enumerate() {
+        let parse = || -> Result<Vec<serde_json::Value>, String> {
+            let connection = repository
+                .get(&format!("b{index}"))
+                .ok_or("Missing GitHub branch connection")?;
+            let rows = connection["nodes"]
+                .as_array()
+                .ok_or("Missing GitHub branch rows")?;
+            let total = connection["totalCount"]
+                .as_u64()
+                .ok_or("Missing GitHub branch count")?;
+            if connection["pageInfo"]["hasNextPage"].as_bool() != Some(false)
+                || total != rows.len() as u64
+                || rows.len() > DISCOVERY_ROWS_PER_BRANCH
+            {
+                return Err(
+                    "GitHub branch discovery was incomplete; preserving workspace PRs".into(),
+                );
+            }
+            let mut numbers = std::collections::HashSet::new();
+            for row in rows {
+                let number = row["number"]
+                    .as_u64()
+                    .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                    .ok_or("Invalid GitHub PR number")?;
+                if !numbers.insert(number)
+                    || row["headRefName"].as_str() != Some(branch.as_str())
+                    || !matches!(row["state"].as_str(), Some("OPEN" | "CLOSED" | "MERGED"))
+                    || row["isDraft"].as_bool().is_none()
+                    || ["url", "title", "baseRefName", "updatedAt"]
+                        .iter()
+                        .any(|field| row[*field].as_str().is_none())
+                {
+                    return Err("Invalid GitHub branch discovery row".into());
+                }
+            }
+            Ok(rows.clone())
+        };
+        result.insert(branch.clone(), parse());
+    }
+    Ok(result)
+}
+
+fn query_discovery(
+    repo_path: &Path,
+    scope: &DiscoveryScope,
+    branches: &[String],
+    open_only: bool,
+) -> Result<DiscoveryRows, String> {
+    if branches.is_empty() || branches.len() > DISCOVERY_BRANCHES_PER_QUERY {
+        return Err("Invalid GitHub discovery batch size".into());
+    }
+    // An account switch while local git was scanned must not mix two users'
+    // answers. The shared quota owner still admits and meters every request.
+    if gh_credential_identity(&scope.host) != scope.account {
+        return Err("GitHub account changed during workspace discovery".into());
+    }
+    let query = format!("query={}", discovery_query(scope, branches, open_only));
+    let owner = format!("owner={}", scope.owner);
+    let name = format!("name={}", scope.repository);
+    // Flat first:100 connections with no nested connections: conservatively
+    // one point per branch plus overhead, not the generic nested-read cap.
+    let output = crate::github_budget::run_bounded_graphql(
+        repo_path,
+        &[
+            "api",
+            "graphql",
+            "--hostname",
+            &scope.host,
+            "-f",
+            &query,
+            "-f",
+            &owner,
+            "-f",
+            &name,
+        ],
+        branches.len() as u64 + 1,
+        BRANCH_PR_LOOKUP_TIMEOUT,
+    )?;
+    if gh_credential_identity(&scope.host) != scope.account {
+        return Err("GitHub account changed during workspace discovery".into());
+    }
+    parse_discovery_response(&output, branches)
+}
+
+/// The request planner is shared by strong and side-branch discovery. Sibling
+/// paths share a selected host/repository/account, not merely an origin URL.
+fn discover_grouped(
+    requests: &[(PathBuf, DiscoveryScope, Vec<String>)],
+    open_only: bool,
+    query: &mut impl FnMut(&Path, &DiscoveryScope, &[String], bool) -> Result<DiscoveryRows, String>,
+) -> HashMap<(DiscoveryScope, String), Result<Vec<serde_json::Value>, String>> {
+    let mut groups: HashMap<DiscoveryScope, (PathBuf, std::collections::BTreeSet<String>)> =
+        HashMap::new();
+    for (path, scope, branches) in requests {
+        let (_, names) = groups
+            .entry(scope.clone())
+            .or_insert_with(|| (path.clone(), Default::default()));
+        names.extend(branches.iter().cloned());
+    }
+    let mut result = HashMap::new();
+    for (scope, (path, branches)) in groups {
+        let branches: Vec<_> = branches.into_iter().collect();
+        for batch in branches.chunks(DISCOVERY_BRANCHES_PER_QUERY) {
+            let fetched = query(&path, &scope, batch, open_only);
+            for branch in batch {
+                let rows = match &fetched {
+                    Ok(rows) => rows
+                        .get(branch)
+                        .cloned()
+                        .unwrap_or_else(|| Err("Missing GitHub branch answer".into())),
+                    Err(error) => Err(error.clone()),
+                };
+                result.insert((scope.clone(), branch.clone()), rows);
+            }
+        }
+    }
+    result
+}
+
+struct WorkspaceDiscovery {
+    path: PathBuf,
+    scope: DiscoveryScope,
+    branch: String,
+    default_branch: Option<String>,
+    owned: Vec<String>,
+    config: RemoteConfig,
+}
+
+impl WorkspaceDiscovery {
+    fn read(path: &Path) -> Result<Self, String> {
+        let branch = run_git_optional(path, &["branch", "--show-current"])
+            .ok_or("detached HEAD: no branch to resolve a PR for")?;
+        let scope = DiscoveryScope::resolve(path)?;
+        let default_branch = crate::git::find_default_branch(path);
+        let owned = match default_branch.as_deref() {
+            Some(default) if default != branch => worktree_owned_branches(path, default)
+                .into_iter()
+                .filter(|name| name != &branch)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            scope,
+            branch,
+            default_branch,
+            owned,
+            config: RemoteConfig::read(path),
+        })
+    }
+
+    fn is_default_branch(&self) -> bool {
+        self.default_branch.as_deref() == Some(self.branch.as_str())
+    }
+
+    fn strong_branches(&self) -> Vec<String> {
+        std::iter::once(self.branch.clone())
+            .chain(self.owned.iter().cloned())
+            .collect()
+    }
+
+    fn recent_branches(&self) -> Vec<String> {
+        let reflog = run_git_optional(
+            &self.path,
+            &[
+                "reflog",
+                "show",
+                "--max-count",
+                &REFLOG_SCAN_ENTRIES.to_string(),
+                "HEAD",
+            ],
+        )
+        .unwrap_or_default();
+        parse_recent_checkout_branches(
+            &reflog,
+            &self.branch,
+            self.default_branch.as_deref(),
+            REFLOG_CANDIDATE_LIMIT,
+        )
+    }
+
+    fn select_strong(
+        &self,
+        rows: &HashMap<(DiscoveryScope, String), Result<Vec<serde_json::Value>, String>>,
+    ) -> Result<Vec<SourcedPr>, String> {
+        let mut prs = Vec::new();
+        for branch in self.strong_branches() {
+            let rows = rows
+                .get(&(self.scope.clone(), branch.clone()))
+                .ok_or("Missing GitHub discovery answer")?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let owner = self.config.head_owner(&branch);
+            if let Some(pr) = select_branch_pr(
+                rows.iter().map(parse_pr_json),
+                &branch,
+                owner.as_deref(),
+                branch == self.branch && self.is_default_branch(),
+            ) {
+                if !prs
+                    .iter()
+                    .any(|entry: &SourcedPr| entry.pr.number == pr.number)
+                {
+                    prs.push(SourcedPr {
+                        pr,
+                        source: if branch == self.branch {
+                            PrSource::Branch
+                        } else {
+                            PrSource::Worktree
+                        },
+                        checkout_branch: Some(self.branch.clone()),
+                    });
+                }
+            }
+        }
+        promote_primary_pr(&mut prs);
+        Ok(prs)
+    }
+}
+
+/// Positional results retain the caller's workspace/path identity. A partial or
+/// failed branch connection is Err for affected workspaces, never a clear.
+pub fn get_workspace_prs_batch(paths: &[PathBuf]) -> Vec<Result<Vec<SourcedPr>, String>> {
+    get_workspace_prs_batch_with(
+        paths
+            .iter()
+            .map(|path| WorkspaceDiscovery::read(path))
+            .collect(),
+        query_discovery,
+    )
+}
+
+fn get_workspace_prs_batch_with(
+    contexts: Vec<Result<WorkspaceDiscovery, String>>,
+    mut query: impl FnMut(&Path, &DiscoveryScope, &[String], bool) -> Result<DiscoveryRows, String>,
+) -> Vec<Result<Vec<SourcedPr>, String>> {
+    let strong_requests: Vec<_> = contexts
+        .iter()
+        .filter_map(|context| context.as_ref().ok())
+        .map(|context| {
+            (
+                context.path.clone(),
+                context.scope.clone(),
+                context.strong_branches(),
+            )
+        })
+        .collect();
+    let rows = discover_grouped(&strong_requests, false, &mut query);
+    let mut results: Vec<_> = contexts
+        .iter()
+        .map(|context| match context {
+            Ok(context) => context.select_strong(&rows),
+            Err(error) => Err(error.clone()),
+        })
+        .collect();
+    let mut fallback_requests = Vec::new();
+    let mut fallback_candidates = Vec::new();
+    for (index, context) in contexts.iter().enumerate() {
+        let Ok(context) = context else {
+            continue;
+        };
+        if results[index].as_ref().is_ok_and(|prs| prs.is_empty()) && !context.is_default_branch() {
+            let candidates = context.recent_branches();
+            if !candidates.is_empty() {
+                fallback_requests.push((
+                    context.path.clone(),
+                    context.scope.clone(),
+                    candidates.clone(),
+                ));
+                fallback_candidates.push((index, candidates));
+            }
+        }
+    }
+    let rows = discover_grouped(&fallback_requests, true, &mut query);
+    for (index, candidates) in fallback_candidates {
+        let context = contexts[index].as_ref().unwrap();
+        let selected = || -> Result<Vec<SourcedPr>, String> {
+            let mut all = Vec::new();
+            for branch in &candidates {
+                let branch_rows = rows
+                    .get(&(context.scope.clone(), branch.clone()))
+                    .ok_or("Missing GitHub fallback answer")?
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                all.extend(branch_rows.iter().map(parse_pr_json));
+            }
+            Ok(select_first_candidate_pr(&all, &candidates, &|branch| {
+                context.config.head_owner(branch)
+            })
+            .map(|pr| SourcedPr {
+                pr,
+                source: PrSource::SideBranch,
+                checkout_branch: Some(context.branch.clone()),
+            })
+            .into_iter()
+            .collect())
+        };
+        results[index] = selected();
+    }
+    results
+}
 
 /// The current branch's PR plus the branch context that produced it.
 ///
@@ -1323,45 +1821,22 @@ impl BranchPrLookup {
 }
 
 fn resolve_branch_pr(repo_path: &Path) -> Result<BranchPrLookup, String> {
-    let Some(branch) = run_git_optional(repo_path, &["branch", "--show-current"]) else {
-        return Err("detached HEAD: no branch to resolve a PR for".to_string());
-    };
-    let expected_owner = resolve_branch_head_owner(repo_path, &branch);
-    let output = run_gh_timed(
-        repo_path,
-        &[
-            "pr",
-            "list",
-            // Bare branch name on purpose — gh does not match the
-            // `owner:branch` form here. Fork disambiguation happens
-            // client-side via `expected_owner`.
-            "--head",
-            &branch,
-            "--state",
-            "all",
-            // 100 is gh's per-page maximum. Generous because the newest PR
-            // being paged out of a reused branch name's history is the one
-            // failure mode a smaller cap can produce.
-            "--limit",
-            "100",
-            "--json",
-            BRANCH_PR_JSON_FIELDS,
-        ],
-        BRANCH_PR_LOOKUP_TIMEOUT,
-    )?;
-    let value: serde_json::Value =
-        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
-    let rows = value
-        .as_array()
-        .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?;
+    let branch = run_git_optional(repo_path, &["branch", "--show-current"])
+        .ok_or("detached HEAD: no branch to resolve a PR for")?;
+    let scope = DiscoveryScope::resolve(repo_path)?;
+    let branches = vec![branch.clone()];
+    let mut rows = query_discovery(repo_path, &scope, &branches, false)?;
+    let rows = rows
+        .remove(&branch)
+        .ok_or("Missing GitHub branch answer")??;
     let default_branch = crate::git::find_default_branch(repo_path);
-    let is_default_branch = default_branch.as_deref() == Some(branch.as_str());
-
+    let config = RemoteConfig::read(repo_path);
+    let owner = config.head_owner(&branch);
     let pr = select_branch_pr(
         rows.iter().map(parse_pr_json),
         &branch,
-        expected_owner.as_deref(),
-        is_default_branch,
+        owner.as_deref(),
+        default_branch.as_deref() == Some(branch.as_str()),
     );
     Ok(BranchPrLookup {
         branch,
@@ -1373,20 +1848,6 @@ fn resolve_branch_pr(repo_path: &Path) -> Result<BranchPrLookup, String> {
 /// Drop derived caches after a successful remote mutation. The coordinator
 /// clears raw responses separately; neither action releases an account pause.
 pub(crate) fn invalidate_github_reads() {
-    crate::github_cache::invalidate_pr_cache(None);
-    crate::github_cache::invalidate_issue_cache(None);
-    if let Some(cache) = FALLBACK_PR_LIST_CACHE.get() {
-        cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-    }
-    if let Some(cache) = WORKTREE_PR_LIST_CACHE.get() {
-        cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-    }
     if let Some(cache) = SIDE_BRANCH_PR_CACHE.get() {
         cache
             .lock()
@@ -1406,23 +1867,10 @@ const REFLOG_SCAN_ENTRIES: usize = 50;
 /// How many distinct recently-checked-out branches the fallback considers.
 const REFLOG_CANDIDATE_LIMIT: usize = 5;
 
-/// Repo-wide PR page size for the fallback. Smaller than the per-branch
-/// query's 100 because the fallback only ever asks about branches checked
-/// out in the recent past, whose PRs are correspondingly recent.
-const FALLBACK_PR_LIST_LIMIT: &str = "50";
-
-/// How long one fallback result is reused. Shared by the background PR poller so
-/// the 5s active-workspace sweep can't multiply it.
-///
-/// It gates **both** fallback caches, and between them the whole fallback
-/// costs nothing on a repeat call: several no-PR workspaces sharing a repo
-/// cost one `gh` call per minute between them, and each workspace runs its
-/// local git probes (`reflog show`, plus at most a couple of `config`
-/// reads) at most once a minute — not once per 5s sweep.
+/// Reuse a successful single-workspace side-branch result for one minute.
+/// The poll batch uses its own shared branch connections; this memo only
+/// avoids repeated local reflog reads on the single-PR consumer path.
 const FALLBACK_PR_LIST_TTL: Duration = Duration::from_secs(60);
-
-type FallbackPrListCache = Mutex<HashMap<String, (Instant, Arc<Vec<serde_json::Value>>)>>;
-static FALLBACK_PR_LIST_CACHE: OnceLock<FallbackPrListCache> = OnceLock::new();
 
 /// Memoized fallback outcome, keyed by `(worktree path, current branch)`.
 ///
@@ -1435,7 +1883,8 @@ static FALLBACK_PR_LIST_CACHE: OnceLock<FallbackPrListCache> = OnceLock::new();
 /// A branch switch is a new key and is answered immediately; only a PR
 /// opened on an already-scanned branch waits out the TTL, which is the same
 /// latency the memoized `gh` list already imposes.
-type SideBranchPrCache = Mutex<HashMap<(PathBuf, String), (Instant, Option<PullRequestInfo>)>>;
+type SideBranchPrCache =
+    Mutex<HashMap<(PathBuf, String, DiscoveryScope), (Instant, Option<PullRequestInfo>)>>;
 static SIDE_BRANCH_PR_CACHE: OnceLock<SideBranchPrCache> = OnceLock::new();
 
 /// TTL memoization over a `Mutex<HashMap>`: `compute` runs only when no
@@ -1531,54 +1980,25 @@ fn parse_recent_checkout_branches(
     candidates
 }
 
-/// Cache key for the repo-wide fallback list: the origin URL, so sibling
-/// worktrees of one repo share a single entry (they share the PR list too).
-/// Repos without an origin fall back to their own path, which is still
-/// correct, just unshared.
-fn fallback_pr_list_key(repo_path: &Path) -> String {
-    run_git_optional(repo_path, &["config", "--get", "remote.origin.url"])
-        .unwrap_or_else(|| repo_path.to_string_lossy().into_owned())
-}
-
-/// One repo-wide `gh pr list` of **open** PRs, memoized for
-/// [`FALLBACK_PR_LIST_TTL`].
-///
-/// Listing the repo once and matching every candidate branch against it
-/// client-side keeps the fallback at a flat one extra `gh` call, instead of
-/// one per candidate.
-///
-/// `--state open` (which includes drafts) rather than `--state all`: the
-/// fallback only ever badges an open PR — see [`select_first_candidate_pr`]
-/// — so fetching history would be paid-for rows that the selector discards.
-/// The selector re-checks the state anyway, so the two cannot drift.
-fn fallback_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, String> {
-    let key = fallback_pr_list_key(repo_path);
-    let cache = FALLBACK_PR_LIST_CACHE.get_or_init(FallbackPrListCache::default);
-
-    memoize_ok(cache, key, FALLBACK_PR_LIST_TTL, || {
-        let output = run_gh_timed(
-            repo_path,
-            &[
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                FALLBACK_PR_LIST_LIMIT,
-                "--json",
-                BRANCH_PR_JSON_FIELDS,
-            ],
-            BRANCH_PR_LOOKUP_TIMEOUT,
-        )?;
-        let value: serde_json::Value =
-            serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
-        Ok(Arc::new(
-            value
-                .as_array()
-                .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?
-                .clone(),
-        ))
-    })
+/// Complete branch-scoped open PR connections for the side-branch fallback.
+fn fallback_pr_list(
+    repo_path: &Path,
+    branches: &[String],
+) -> Result<Arc<Vec<serde_json::Value>>, String> {
+    let scope = DiscoveryScope::resolve(repo_path)?;
+    let mut rows = discover_grouped(
+        &[(repo_path.to_owned(), scope.clone(), branches.to_vec())],
+        true,
+        &mut query_discovery,
+    );
+    let mut all = Vec::new();
+    for branch in branches {
+        all.extend(
+            rows.remove(&(scope.clone(), branch.clone()))
+                .ok_or("Missing GitHub fallback answer")??,
+        );
+    }
+    Ok(Arc::new(all))
 }
 
 /// Badge-only fallback: the open PR of a branch this worktree checked out
@@ -1603,7 +2023,11 @@ fn get_side_branch_pr(
     lookup: &BranchPrLookup,
 ) -> Result<Option<PullRequestInfo>, String> {
     let cache = SIDE_BRANCH_PR_CACHE.get_or_init(SideBranchPrCache::default);
-    let key = (repo_path.to_path_buf(), lookup.branch.clone());
+    let key = (
+        repo_path.to_path_buf(),
+        lookup.branch.clone(),
+        DiscoveryScope::resolve(repo_path)?,
+    );
     memoize_ok(cache, key, FALLBACK_PR_LIST_TTL, || {
         resolve_side_branch_pr(repo_path, lookup)
     })
@@ -1638,7 +2062,7 @@ fn resolve_side_branch_pr(
         return Ok(None);
     }
 
-    let rows = fallback_pr_list(repo_path)?;
+    let rows = fallback_pr_list(repo_path, &candidates)?;
     let prs: Vec<PullRequestInfo> = rows.iter().map(parse_pr_json).collect();
     Ok(select_first_candidate_pr(&prs, &candidates, &|candidate| {
         resolve_branch_head_owner(repo_path, candidate)
@@ -1704,50 +2128,6 @@ fn select_first_candidate_pr(
 /// deep enough to exceed this is past the point where a sidebar pill is the
 /// right surface for it anyway.
 const WORKTREE_BRANCH_LIMIT: usize = 32;
-
-/// Repo-wide PR page size for the worktree-owned-branch list. Larger than
-/// [`FALLBACK_PR_LIST_LIMIT`] because this list must include history: the
-/// whole point of the set is to show that the early PRs of a stack merged
-/// while the later ones have not.
-const WORKTREE_PR_LIST_LIMIT: &str = "100";
-
-type WorktreePrListCache = Mutex<HashMap<String, (Instant, Arc<Vec<serde_json::Value>>)>>;
-static WORKTREE_PR_LIST_CACHE: OnceLock<WorktreePrListCache> = OnceLock::new();
-
-/// One repo-wide `gh pr list --state all`, memoized for
-/// [`FALLBACK_PR_LIST_TTL`].
-///
-/// Deliberately a second cache rather than widening [`fallback_pr_list`] to
-/// `--state all`: that list is capped at 50 rows, and on a busy repo the 50
-/// most recent PRs are mostly merged, so admitting history there would push
-/// the open PRs the side-branch fallback looks for off the end of the page.
-///
-/// It is only ever reached for a workspace that owns branches beyond its own
-/// checked-out one — the ordinary one-branch workspace never pays for it.
-fn worktree_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, String> {
-    let key = fallback_pr_list_key(repo_path);
-    let cache = WORKTREE_PR_LIST_CACHE.get_or_init(WorktreePrListCache::default);
-
-    memoize_ok(cache, key, FALLBACK_PR_LIST_TTL, || {
-        let output = run_gh_timed(
-            repo_path,
-            &[
-                "pr",
-                "list",
-                "--state",
-                "all",
-                "--limit",
-                WORKTREE_PR_LIST_LIMIT,
-                "--json",
-                BRANCH_PR_JSON_FIELDS,
-            ],
-            BRANCH_PR_LOOKUP_TIMEOUT,
-        )?;
-        let value: serde_json::Value =
-            serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
-        Ok(Arc::new(value.as_array().cloned().unwrap_or_default()))
-    })
-}
 
 /// Why a PR belongs to a workspace — which decides what may be concluded
 /// from it.
@@ -1914,19 +2294,21 @@ impl RemoteConfig {
 /// unit of work, and branches reachable from it but not yet pushed are
 /// ordinary local history rather than anything it opened.
 ///
-/// Cost per poll: one `for-each-ref`, plus — only when some owned branch has
-/// PR rows — one `git config` read and a repo-wide PR list memoized across
-/// workspaces. Nothing here is memoized per workspace, deliberately: the only
-/// callers are the background poller and a manual refresh, so a cache sized to the
-/// poll interval would expire before the next poll could use it.
+/// Sibling workspaces are grouped by the selected host/repository/account.
+/// Current and worktree-owned branches share bounded alias queries; only a
+/// complete strong empty answer admits a second, open-only side-branch batch.
+/// Detail hydration is intentionally left to the PR-detail read owner.
 ///
 /// Error contract matches [`get_workspace_pr`] exactly: `Err` means the
 /// lookup could not answer and the stored set must be preserved, while an
 /// empty vector is the authoritative "this workspace has no PRs".
 pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
-    get_workspace_prs_with(repo_path, resolve_branch_pr(repo_path)?, worktree_pr_list)
+    get_workspace_prs_batch(&[repo_path.to_owned()])
+        .pop()
+        .unwrap()
 }
 
+#[cfg(test)]
 fn get_workspace_prs_with(
     repo_path: &Path,
     lookup: BranchPrLookup,
