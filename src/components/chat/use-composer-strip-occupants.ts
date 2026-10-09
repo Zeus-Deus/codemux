@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
+import { delegationPhaseSummary, delegationRow } from "@/lib/agent-chat/delegation";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
+  delegationElapsedLabel,
   formatElapsed,
+  runningDelegations,
   runningSubagentEntries,
   subagentActivityLine,
   subagentElapsedMs,
@@ -24,6 +27,7 @@ import {
 } from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
 import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
 
@@ -178,6 +182,127 @@ export function useSubagentOccupant({
     };
   });
   return { kind: "running", summary, rows, live: true };
+}
+
+/**
+ * Delegation occupant: tasks this chat handed to other agents that are still
+ * running in their own tabs.
+ *
+ * Calm on purpose — no sweep, no orb. The parent is not working; it is
+ * waiting to continue, and the copy says exactly that ("Continues when Codex
+ * finishes"). While the parent itself streams, the row only notes that
+ * reports will post here. Never withheld behind the transcript card: this is
+ * the one place that explains why the chat will pick up again on its own.
+ *
+ * Stop's pending state copies the monitoring occupant: "Stopping…" holds
+ * until the task leaves the running set (the backend's Stopped snapshot),
+ * not until the command returns. "Stop all" rides on the first row, so it
+ * survives opening the strip.
+ */
+export function useDelegationOccupant({
+  messages,
+  threadId,
+  streaming,
+  onOpen,
+  onStop,
+}: {
+  messages: ChatViewItem[];
+  threadId: string | null;
+  /** The parent's own live-run flag. */
+  streaming: boolean;
+  onOpen: (childThreadId: string) => void;
+  /** Swallows its own errors (`stopDelegatedTask`), so nothing unwinds. */
+  onStop: (provider: AgentChatProviderKind, childThreadId: string) => void;
+}): StripOccupant | null {
+  // Row ids are unique per child, so a settled task's id can never match a
+  // running row again; only a thread switch needs to drop them.
+  const [stopping, setStopping] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    setStopping((current) => (current.size === 0 ? current : new Set()));
+  }, [threadId]);
+
+  const running = runningDelegations(messages);
+  if (running.length === 0) return null;
+
+  const models = running.map((view) => ({ view, row: delegationRow(null, view) }));
+  const stop = (targets: typeof models) => {
+    const fresh = targets.filter(({ view }) => !stopping.has(view.id));
+    if (fresh.length === 0) return;
+    setStopping((current) => new Set([...current, ...fresh.map(({ view }) => view.id)]));
+    for (const { row } of fresh) {
+      if (row.provider && row.childThreadId) onStop(row.provider, row.childThreadId);
+    }
+  };
+  const count = models.length;
+  const label = streaming
+    ? `${count} delegated task${count === 1 ? "" : "s"} running`
+    : count === 1
+      ? `Continues when ${models[0].row.providerLabel} finishes`
+      : `Continues when ${count} agents finish`;
+
+  const taskRow = (model: (typeof models)[number], solo: boolean): StripRow => {
+    const { view, row } = model;
+    const pending = stopping.has(view.id);
+    const thread = row.childThreadId;
+    return {
+      id: `delegation:${view.id}`,
+      mark: { kind: "providers", providers: row.provider ? [row.provider] : [] },
+      label: solo ? label : row.providerLabel,
+      detail: `${row.title} · ${solo && streaming ? "reports post here" : row.line}`,
+      elapsed: (now) => delegationElapsedLabel([view], now),
+      secondaryAction: {
+        label: pending ? "Stopping…" : "Stop",
+        title: `Stop this task in ${row.providerLabel}`,
+        tone: "quiet",
+        testId: "composer-strip-delegation-stop",
+        disabled: pending,
+        onClick: () => stop([model]),
+      },
+      action: thread
+        ? {
+            label: "Open",
+            title: `Open the ${row.providerLabel} chat`,
+            testId: "composer-strip-delegation-open",
+            onClick: () => onOpen(thread),
+          }
+        : null,
+    };
+  };
+
+  if (count === 1) {
+    const row = taskRow(models[0], true);
+    return { kind: "delegation", summary: row, rows: [row] };
+  }
+
+  const rows = models.map(({ row }) => row);
+  const blocked = rows.some((row) => row.phase === "waiting" || row.phase === "paused");
+  const allStopping = running.every((view) => stopping.has(view.id));
+  const header: StripRow = {
+    id: "delegation:all",
+    mark: { kind: "providers", providers: [...new Set(rows.flatMap((row) => row.provider ?? []))] },
+    label,
+    detail: streaming
+      ? "reports post here"
+      : blocked
+        ? delegationPhaseSummary(rows)
+        : "working in their tabs",
+    elapsed: (now) => delegationElapsedLabel(running, now),
+    secondaryAction: {
+      label: allStopping ? "Stopping…" : "Stop all",
+      title: `Stop all ${count} delegated tasks`,
+      tone: "quiet",
+      testId: "composer-strip-delegation-stop-all",
+      disabled: allStopping,
+      onClick: () => stop(models),
+    },
+    action: null,
+    countsAsItem: false,
+  };
+  return {
+    kind: "delegation",
+    summary: header,
+    rows: [header, ...models.map((model) => taskRow(model, false))],
+  };
 }
 
 /**

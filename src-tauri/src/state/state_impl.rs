@@ -2727,6 +2727,83 @@ impl AppStateStore {
         Ok((new_pane_id, true))
     }
 
+    /// Open a chat pane bound to `thread_id` in its own tab, placed after
+    /// the tab that holds `beside_thread_id` and any tabs right after it
+    /// that hold one of `siblings` (so a chat's delegated tabs read in the
+    /// order they were started), WITHOUT moving the user's focus: the active
+    /// workspace, tab and surface are exactly what they were. The tab and
+    /// surface are titled `title` (inactive tabs show the tab title). One
+    /// locked mutation, so no client ever observes the new tab focused. Used
+    /// for delegated chats, which run in the background next to the chat
+    /// that started them.
+    ///
+    /// Bind-at-create stays idempotent: a pane already bound to `thread_id`
+    /// is reused (and left where it is) instead of cloned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_background_chat_tab(
+        &self,
+        workspace_id: &str,
+        provider: crate::agent_provider::ProviderKind,
+        cwd: Option<String>,
+        thread_id: &str,
+        beside_thread_id: &str,
+        siblings: &[String],
+        title: &str,
+    ) -> Result<PaneId, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let index = snapshot
+            .workspaces
+            .iter()
+            .position(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+        let active_workspace_id = snapshot.active_workspace_id.clone();
+        let workspace = &snapshot.workspaces[index];
+        let focus = (
+            workspace.active_tab_id.clone(),
+            workspace.active_surface_id.clone(),
+        );
+        let (pane_id, created) = Self::create_chat_pane_locked(
+            &mut snapshot,
+            workspace_id,
+            Some(provider),
+            cwd,
+            Some(crate::presets::LaunchMode::NewTab),
+            Some(thread_id.to_string()),
+        )?;
+        snapshot.active_workspace_id = active_workspace_id;
+        let workspace = &mut snapshot.workspaces[index];
+        (workspace.active_tab_id, workspace.active_surface_id) = focus;
+        if !created {
+            return Ok(pane_id);
+        }
+        // `NewTab` appended the tab and its surface: title both, and move the
+        // tab after the parent's tab and its earlier siblings.
+        let Some(mut new_tab) = workspace.tabs.pop() else {
+            return Ok(pane_id);
+        };
+        new_tab.title = title.to_string();
+        if let Some(surface) = workspace.surfaces.last_mut() {
+            surface.title = title.to_string();
+        }
+        let holds = |tab: &TabSnapshot, thread: &str| {
+            workspace.surfaces.iter().any(|surface| {
+                tab.surface_id.as_ref() == Some(&surface.surface_id)
+                    && find_agent_chat_pane_id(&surface.root, thread).is_some()
+            })
+        };
+        let is_sibling = |tab: &TabSnapshot| siblings.iter().any(|sibling| holds(tab, sibling));
+        let tabs = &workspace.tabs;
+        let insert_at = match tabs.iter().position(|tab| holds(tab, beside_thread_id)) {
+            Some(parent) => {
+                let rest = &tabs[parent + 1..];
+                parent + 1 + rest.iter().take_while(|tab| is_sibling(tab)).count()
+            }
+            None => tabs.len(),
+        };
+        workspace.tabs.insert(insert_at, new_tab);
+        Ok(pane_id)
+    }
+
     pub fn materialize_chat_workspace(
         &self,
         cwd: PathBuf,
@@ -9657,6 +9734,138 @@ mod tests {
             .unwrap();
         assert_eq!(active_tab.surface_id.as_ref(), Some(&bound_surface));
         assert_eq!(snapshot.active_workspace_id.0, workspace_id.0);
+    }
+
+    /// A delegated chat opens as its own tab right after the chat that
+    /// started it, bound and titled, while the user's focus stays put.
+    #[test]
+    fn create_background_chat_tab_keeps_focus_and_sits_beside_its_parent() {
+        use crate::agent_provider::ProviderKind;
+        use crate::presets::LaunchMode;
+
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        store
+            .create_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                Some(LaunchMode::NewTab),
+                Some("parent-thread".into()),
+            )
+            .unwrap();
+        // A later tab holds focus, so "beside the parent" is not "at the end".
+        store
+            .create_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                Some(LaunchMode::NewTab),
+                None,
+            )
+            .unwrap();
+        let workspace_of = |store: &AppStateStore| {
+            store
+                .snapshot()
+                .workspaces
+                .into_iter()
+                .find(|w| w.workspace_id == workspace_id)
+                .expect("workspace should exist")
+        };
+        let before = workspace_of(&store);
+        let tab_count = before.tabs.len();
+
+        let pane = store
+            .create_background_chat_tab(
+                &workspace_id.0,
+                ProviderKind::Codex,
+                Some("/repo".into()),
+                "child-thread",
+                "parent-thread",
+                &[],
+                "Codex · Add slugify helper",
+            )
+            .unwrap();
+
+        let after = workspace_of(&store);
+        assert_eq!(store.snapshot().active_workspace_id, workspace_id);
+        assert_eq!(after.active_tab_id, before.active_tab_id);
+        assert_eq!(after.active_surface_id, before.active_surface_id);
+        assert_eq!(after.tabs.len(), tab_count + 1);
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane.0),
+            Some((ProviderKind::Codex, "child-thread".to_string()))
+        );
+        let surface_of = |thread: &str| {
+            after
+                .surfaces
+                .iter()
+                .find(|s| find_agent_chat_pane_id(&s.root, thread).is_some())
+                .map(|s| s.surface_id.clone())
+                .expect("thread should have a surface")
+        };
+        let tab_index = |surface: SurfaceId| {
+            after
+                .tabs
+                .iter()
+                .position(|t| t.surface_id.as_ref() == Some(&surface))
+                .expect("surface should have a tab")
+        };
+        let parent_index = tab_index(surface_of("parent-thread"));
+        let child_index = tab_index(surface_of("child-thread"));
+        assert_eq!(child_index, parent_index + 1);
+        assert_eq!(after.tabs[child_index].title, "Codex · Add slugify helper");
+        let child_surface = after
+            .surfaces
+            .iter()
+            .find(|s| s.surface_id == surface_of("child-thread"))
+            .unwrap();
+        assert_eq!(child_surface.title, "Codex · Add slugify helper");
+
+        // Idempotent on the thread: no second tab, focus still untouched.
+        let again = store
+            .create_background_chat_tab(
+                &workspace_id.0,
+                ProviderKind::Codex,
+                None,
+                "child-thread",
+                "parent-thread",
+                &[],
+                "ignored",
+            )
+            .unwrap();
+        assert_eq!(again, pane);
+        let last = workspace_of(&store);
+        assert_eq!(last.tabs.len(), tab_count + 1);
+        assert_eq!(last.active_tab_id, before.active_tab_id);
+        assert_eq!(last.active_surface_id, before.active_surface_id);
+
+        // A later sibling goes after the earlier one, not between it and the
+        // parent, so the tabs read in the order they were started.
+        store
+            .create_background_chat_tab(
+                &workspace_id.0,
+                ProviderKind::Claude,
+                None,
+                "second-child",
+                "parent-thread",
+                &["child-thread".to_string()],
+                "Claude · Review the parser",
+            )
+            .unwrap();
+        let ordered = workspace_of(&store);
+        let titles: Vec<&str> = ordered
+            .tabs
+            .iter()
+            .skip(parent_index + 1)
+            .take(2)
+            .map(|tab| tab.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Codex · Add slugify helper", "Claude · Review the parser"]
+        );
+        assert_eq!(ordered.active_tab_id, before.active_tab_id);
     }
 
     fn active_surface_id(store: &AppStateStore, workspace_id: &str) -> SurfaceId {

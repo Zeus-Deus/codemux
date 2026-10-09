@@ -17,6 +17,7 @@ import type {
 import { cn } from "@/lib/utils";
 
 import { ActivityBlock } from "./ActivityBlock";
+import { DelegationCard } from "./DelegationCard";
 import { AssistantMessage } from "./AssistantMessage";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
@@ -99,6 +100,8 @@ export function SubagentView({
               <div className="border-b border-border/60 pb-2 text-label text-muted-foreground">
                 {slot.body.label}
               </div>
+            ) : slot.body.kind === "delegation" ? (
+              <DelegationCard entries={slot.body.entries} />
             ) : (
               <SubItem item={slot.body.item} workspaceId={workspaceId} cwd={cwd} />
             )}

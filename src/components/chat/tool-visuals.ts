@@ -12,6 +12,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import { isDelegateToolName } from "@/lib/agent-chat/delegation";
+
 /**
  * Shared tool → icon / category-tint mapping (design D6). One source of
  * truth for both the single tool card and the tool group card so their
@@ -46,6 +48,10 @@ const CATEGORY_BY_TOOL: Record<string, ToolCategory> = {
 };
 
 export function toolCategory(toolName: string): ToolCategory {
+  // `delegate_task` hands work to another agent. It normally renders as the
+  // delegation card; anywhere it shows up as a plain tool row (whatever the
+  // adapter's prefix), it is an agent hand-off.
+  if (isDelegateToolName(toolName)) return "agent";
   return CATEGORY_BY_TOOL[toolName] ?? "other";
 }
 
@@ -66,6 +72,7 @@ const ICON_BY_TOOL: Record<string, LucideIcon> = {
 };
 
 export function toolIcon(toolName: string): LucideIcon {
+  if (isDelegateToolName(toolName)) return Bot;
   return ICON_BY_TOOL[toolName] ?? Wrench;
 }
 

@@ -1136,6 +1136,7 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         // demux re-stamps it onto every subsequent snapshot for this id.
         task_kind: None,
         model: get("model"),
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -1345,6 +1346,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         description: None,
         task_kind: None,
         model: None,
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,

@@ -7,6 +7,7 @@ pub mod automations;
 pub mod branch_name;
 pub mod browser;
 pub mod database;
+pub mod delegation;
 pub mod files;
 pub mod gemini;
 pub mod git;

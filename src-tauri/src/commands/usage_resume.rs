@@ -142,7 +142,7 @@ pub fn build_usage_resume_text(last_user_text: Option<&str>) -> String {
     format!("{USAGE_RESUME_NOTE}\n\n{quoted}")
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -343,8 +343,17 @@ async fn dispatch_resume<R: Runtime>(
         let last = db.latest_agent_chat_user_message_text(&thread_id.0, USAGE_RESUME_NOTE_PREFIX);
         build_usage_resume_text(last.as_deref())
     };
-    let input = SendTurnCommandInput {
-        thread_id: thread_id.clone(),
+    let input = queued_turn(thread_id.clone(), text);
+    send_turn_with_origin(app.clone(), provider, input, TurnOrigin::UsageResume)
+        .await
+        .map(|_| ())
+}
+
+/// A plain queued turn whose full text is persisted as the user message
+/// (`display_text: None`), so the transcript shows exactly what was sent.
+pub(super) fn queued_turn(thread_id: ThreadId, text: String) -> SendTurnCommandInput {
+    SendTurnCommandInput {
+        thread_id,
         text,
         display_text: None,
         skill_ids: Vec::new(),
@@ -356,15 +365,12 @@ async fn dispatch_resume<R: Runtime>(
         permission_mode_override: None,
         client_nonce: None,
         delivery: crate::agent_provider::types::MessageDelivery::Queue,
-    };
-    send_turn_with_origin(app.clone(), provider, input, TurnOrigin::UsageResume)
-        .await
-        .map(|_| ())
+    }
 }
 
 /// Whether the thread has a run in flight — the same two signals
 /// `agent_chat_turn_active` ORs.
-async fn thread_busy<R: Runtime>(
+pub(super) async fn thread_busy<R: Runtime>(
     app: &AppHandle<R>,
     provider: ProviderKind,
     thread_id: &ThreadId,

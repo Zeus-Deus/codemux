@@ -242,6 +242,10 @@ export interface SubagentSnapshot {
    *  every consumer treats as `"agent"`. */
   task_kind?: SubagentTaskKind | null;
   model?: string | null;
+  /** Requested effort / reasoning level. Only cross-provider delegations
+   *  (`subagent_id` "delegate:<child thread>") report it, and only when the
+   *  user named one. */
+  effort?: string | null;
   status: SubagentStatus;
   /** Live "currently doing X" line pushed by the provider. */
   activity?: string | null;

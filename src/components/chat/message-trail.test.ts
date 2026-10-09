@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 
+import { DELEGATION_RESULTS_PREFIX } from "@/lib/agent-chat/delegation";
 import type { ChatViewItem, ToolCallItem } from "@/lib/agent-chat/types";
 
 import {
@@ -93,6 +94,22 @@ describe("buildTrailEntries", () => {
     });
     // Second turn's slot index is 2 (user), reply lives at slot 4.
     expect(entries[1].slotIndex).toBe(2);
+  });
+
+  it("names the delegated results turn instead of quoting its raw text", () => {
+    const results = `${DELEGATION_RESULTS_PREFIX}\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" thread="c1">\n<report>Done.</report>\n</task>`;
+    const entries = buildTrailEntries(
+      buildTranscriptSlots([
+        userMsg(0, "have Codex do it"),
+        userMsg(1, results),
+        assistantMsg(2, "Codex added slugify."),
+      ]),
+    );
+    expect(entries.map((entry) => entry.userText)).toEqual([
+      "have Codex do it",
+      "Delegated results",
+    ]);
+    expect(entries[1].replySnippet).toBe("Codex added slugify.");
   });
 
   it("leaves the reply snippet empty when a turn has no assistant reply", () => {

@@ -1,3 +1,5 @@
+import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
+
 import type { TranscriptSlot } from "./transcript-slots";
 
 /**
@@ -55,7 +57,11 @@ export function buildTrailEntries(slots: TranscriptSlot[]): TrailEntry[] {
       messageId: slots[i].messageId,
       slotIndex: i,
       turnIndex,
-      userText: body.item.text.trim(),
+      // Codemux posts delegated tasks' reports as a turn of its own; name
+      // it like its divider does rather than quoting the raw results text.
+      userText: isDelegationResultsText(body.item.text)
+        ? "Delegated results"
+        : body.item.text.trim(),
       replySnippet,
     });
     turnIndex += 1;

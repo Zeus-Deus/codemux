@@ -138,6 +138,10 @@ pub struct SubagentSnapshot {
     /// Model the subagent runs on, when reported.
     #[serde(default)]
     pub model: Option<String>,
+    /// Effort / reasoning level the subagent was asked to run with, when
+    /// one was chosen. Only cross-provider delegation sets it today.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Current lifecycle status.
     #[serde(default)]
     pub status: SubagentStatus,
@@ -942,6 +946,7 @@ mod tests {
             description: Some("Explore the repo".into()),
             task_kind: Some(SubagentTaskKind::Agent),
             model: Some("claude-sonnet-4".into()),
+            effort: Some("high".into()),
             status: SubagentStatus::Running,
             activity: Some("Reading files".into()),
             result_text: None,
@@ -974,6 +979,7 @@ mod tests {
         assert!(snap.name.is_none());
         assert!(snap.tool_use_count.is_none());
         assert!(snap.provider_ref.is_none());
+        assert!(snap.effort.is_none(), "payloads persisted before `effort` existed decode as None");
         // The graceful-degradation contract: an SDK that never reports a task
         // type leaves this `None`, and every consumer treats that as agent work.
         assert!(snap.task_kind.is_none());

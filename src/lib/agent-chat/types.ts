@@ -240,6 +240,9 @@ export interface SubagentView {
    *  and counting it there is what used to pin a thread at "Working". */
   taskKind?: SubagentTaskKind;
   model?: string;
+  /** Requested effort / reasoning level (`SubagentSnapshot.effort`). Set
+   *  only on cross-provider delegations, and only when the user named one. */
+  effort?: string;
   status: SubagentViewStatus;
   /** The spawning tool_use / call id (`SubagentSnapshot.parent_item_id`)
    *  for all three providers. Lets a parent-scoped `tool_result` settle

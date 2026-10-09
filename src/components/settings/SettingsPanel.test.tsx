@@ -62,6 +62,7 @@ vi.mock("@/stores/settings-store", () => {
     "sidebar.auto_settle_days": "3",
     "agents.orb_match_activity": "true",
     "agents.auto_resume_usage_limit": "true",
+    "agents.cross_provider_delegation": "true",
     "chat.code_wrap": "false",
   };
   // Built lazily: `mockSettingsSet` is hoisted below this factory.
@@ -87,6 +88,7 @@ vi.mock("@/stores/settings-store", () => {
     selectSidebarAutoSettleDays: () => 3,
     selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
+    selectCrossProviderDelegation: () => false,
   };
 });
 

@@ -57,6 +57,7 @@ import {
   SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
   selectAutoResumeUsageLimit,
+  selectCrossProviderDelegation,
   selectOrbMatchActivity,
   type AppearanceDensity,
   type AutoSettleDays,
@@ -1245,6 +1246,7 @@ export function SettingsView() {
   );
   const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
+  const crossProviderDelegation = useSettingsStore(selectCrossProviderDelegation);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -2058,6 +2060,21 @@ export function SettingsView() {
                       onCheckedChange={(checked) =>
                         storeSet(
                           "agents.auto_resume_usage_limit",
+                          checked ? "true" : "false",
+                        )
+                      }
+                    />
+                  </SettingRow>
+                  <Separator />
+                  <SettingRow
+                    label="Delegate to other agents"
+                    description="When you ask for it, a Full-access Claude or Codex chat can hand a task to another installed agent, e.g. “have Codex implement X, then review it”. Each task opens as a tab next to the chat and shares its folder. Turning this off hides the tool from Claude chats right away and from new Codex chats."
+                  >
+                    <Switch
+                      checked={crossProviderDelegation}
+                      onCheckedChange={(checked) =>
+                        storeSet(
+                          "agents.cross_provider_delegation",
                           checked ? "true" : "false",
                         )
                       }

@@ -1,7 +1,13 @@
+import {
+  isDelegatedRun,
+  isDelegateToolCall,
+  linkDelegations,
+} from "@/lib/agent-chat/delegation";
 import type {
   ChatViewItem,
   ReasoningItem,
   SubagentRunItem,
+  SubagentView,
   ToolCallItem,
   TurnEndedItem,
   UserMessageItem,
@@ -26,9 +32,22 @@ export interface TurnFoldBody {
   failedCount: number;
 }
 
+/** One cross-provider delegation on a transcript card: the `delegate_task`
+ *  call that started it, the live row the backend reports for it, or both
+ *  once they are linked. */
+export interface DelegationEntry {
+  /** Stable key: the call's id, else the orphan row's id. */
+  key: string;
+  call: ToolCallItem | null;
+  view: SubagentView | null;
+}
+
 export type SlotBody =
   | { kind: "item"; item: ChatViewItem }
   | { kind: "activity"; items: WorkEntry[]; working: boolean }
+  /** Contiguous delegations, one card. Never folded into the work log or
+   *  a settled turn: the hand-off is the turn's visible outcome. */
+  | { kind: "delegation"; entries: DelegationEntry[] }
   | TurnFoldBody;
 
 export interface TranscriptSlot {
@@ -78,6 +97,7 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *    approval footer must render on a standalone `ToolCallCard`.
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
+ *  - `delegate_task` calls — they render as the delegation card.
  * (`subagent_run` items are not tool calls; the slot builder joins them into
  * the same work-log line separately.)
  */
@@ -85,7 +105,8 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
     item.kind === "tool_call" &&
     item.approval_request_id == null &&
-    !isTaskSummaryTool(item)
+    !isTaskSummaryTool(item) &&
+    !isDelegateToolCall(item)
   );
 }
 
@@ -94,7 +115,18 @@ function isActivityStep(item: ChatViewItem): item is ActivityStep {
 }
 
 function isWorkEntry(item: ChatViewItem): item is WorkEntry {
-  return item.kind === "subagent_run" || isActivityStep(item);
+  return (
+    (item.kind === "subagent_run" && !isDelegatedRun(item)) ||
+    isActivityStep(item)
+  );
+}
+
+/** A row that belongs on the delegation card rather than anywhere else. */
+function isDelegationItem(item: ChatViewItem): boolean {
+  return (
+    (item.kind === "subagent_run" && isDelegatedRun(item)) ||
+    isDelegateToolCall(item)
+  );
 }
 
 function splitTurns(messages: ChatViewItem[]): TurnSegment[] {
@@ -159,6 +191,8 @@ function isFoldableSettledItem(
   terminalId: string | null,
   pendingRequestIds: ReadonlySet<string>,
 ): boolean {
+  // A delegation outlives its turn and stays where it was handed off.
+  if (isDelegationItem(item)) return false;
   switch (item.kind) {
     case "assistant_message":
       return item.id !== terminalId;
@@ -316,9 +350,15 @@ export function buildTranscriptSlots(
   expandedTurnIds: ReadonlySet<string> = new Set(),
 ): TranscriptSlot[] {
   // Request rows owned by an inline tool/workflow footer do not render twice.
+  // The delegation card has no such footer, so a gated delegate call keeps
+  // its standalone row.
   const mergedRequestIds = new Set<string>();
   for (const item of messages) {
-    if (item.kind === "tool_call" && item.approval_request_id) {
+    if (
+      item.kind === "tool_call" &&
+      item.approval_request_id &&
+      !isDelegationItem(item)
+    ) {
       mergedRequestIds.add(item.approval_request_id);
     }
     if (item.kind === "workflow_run" && item.approvalRequestId) {
@@ -331,7 +371,16 @@ export function buildTranscriptSlots(
     streaming,
     expandedTurnIds,
   );
+  const links = linkDelegations(messages);
   const bodies: SlotBody[] = [];
+  // Contiguous delegations share one card, whatever mix of calls and
+  // orphan rows they arrive as.
+  let delegations: DelegationEntry[] = [];
+  const flushDelegations = () => {
+    if (delegations.length === 0) return;
+    bodies.push({ kind: "delegation", entries: delegations });
+    delegations = [];
+  };
   // One uninterrupted stretch of mechanical work. Subagent runs join the
   // stretch instead of splitting it; prose, approvals, task checklists and
   // any other visible row end it.
@@ -371,6 +420,7 @@ export function buildTranscriptSlots(
   for (const entry of entries) {
     if (entry.kind === "turn_fold") {
       flush();
+      flushDelegations();
       bodies.push(entry.body);
       continue;
     }
@@ -381,17 +431,40 @@ export function buildTranscriptSlots(
     ) {
       continue;
     }
+    if (isDelegationItem(item)) {
+      if (item.kind === "tool_call") {
+        flush();
+        delegations.push({
+          key: item.id,
+          call: item,
+          view: links.viewByCallId.get(item.id) ?? null,
+        });
+      } else if (item.kind === "subagent_run") {
+        // Rows a call already shows render there; only orphans land here.
+        // A card of claimed rows renders nothing and splits nothing.
+        const orphans = item.subagents.filter((view) => !links.claimed.has(view.id));
+        if (orphans.length === 0) continue;
+        flush();
+        for (const view of orphans) {
+          delegations.push({ key: view.id, call: null, view });
+        }
+      }
+      continue;
+    }
     // Non-error turn-ended markers were already dropped above, so they do not
     // split a stretch either.
     if (isWorkEntry(item)) {
+      flushDelegations();
       run.push(item);
       if (entry.revealed) runRevealed = true;
       continue;
     }
     flush();
+    flushDelegations();
     bodies.push({ kind: "item", item });
   }
   flush();
+  flushDelegations();
 
   const slots: TranscriptSlot[] = [];
   let prevSide: "user" | "assistant" | null = null;
@@ -462,6 +535,19 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.items.every((item, index) => item === b.items[index])
     );
   }
+  if (a.kind === "delegation" && b.kind === "delegation") {
+    return (
+      a.entries.length === b.entries.length &&
+      a.entries.every((entry, index) => {
+        const other = b.entries[index];
+        return (
+          entry.key === other.key &&
+          entry.call === other.call &&
+          entry.view === other.view
+        );
+      })
+    );
+  }
   return false;
 }
 
@@ -476,6 +562,12 @@ function slotIdentity(body: SlotBody): {
   }
   if (body.kind === "turn_fold") {
     const id = `turn-fold:${body.turnId}`;
+    return { key: id, messageId: id, scrollAnchor: false };
+  }
+  if (body.kind === "delegation") {
+    // The first entry is the hand-off that opened the card, so the key
+    // holds still as later delegations join it.
+    const id = `delegation:${body.entries[0].key}`;
     return { key: id, messageId: id, scrollAnchor: false };
   }
   return {

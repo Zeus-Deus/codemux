@@ -1077,6 +1077,67 @@ describe("MessageList usage limit", () => {
     expect(screen.getByTestId("auto-resume-divider-text")).toHaveTextContent(text);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
   });
+
+  it("renders the delegated-results turn as its divider, not a user bubble", () => {
+    const text =
+      '[Codemux: delegated task results]\nCodemux posted this message, not the user.\n\n<task provider="codex" status="completed" title="Add slugify helper" duration="6m 12s" thread="c1">\n<report>Done.</report>\n</task>';
+    renderList([userTurn, { kind: "user_message", id: "um-2", seq: 1, text }]);
+    expect(screen.getByTestId("delegation-results-divider")).toHaveTextContent(
+      "Delegated results · Codex · completed",
+    );
+    expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
+  });
+
+  it("renders a delegate_task call as the delegation card, not a tool row", () => {
+    const delegateCall: ToolCallItem = {
+      kind: "tool_call",
+      id: "tc-delegate",
+      seq: 1,
+      turn_id: "t1",
+      tool_use_id: "tu-delegate",
+      tool_name: "mcp__codemux__delegate_task",
+      input: {
+        provider: "codex",
+        title: "Add slugify helper",
+        task: "Add slugify(text) with table tests.",
+      },
+      status: "done",
+      result_content: [
+        {
+          type: "text",
+          text: JSON.stringify({ started: { provider: "codex", thread: "child-1" } }),
+        },
+      ],
+      approval_request_id: null,
+    };
+    renderList([
+      userTurn,
+      delegateCall,
+      {
+        kind: "subagent_run",
+        id: "sr-1",
+        seq: 2,
+        turn_id: "t1",
+        subagents: [
+          {
+            id: "delegate:child-1",
+            name: "Codex",
+            agentType: "codex",
+            description: "Add slugify helper",
+            status: "running",
+            activity: "Working in its tab",
+            items: [],
+            toneIndex: 0,
+          },
+        ],
+      },
+    ]);
+    const cards = screen.getAllByTestId("delegation-card");
+    expect(cards).toHaveLength(1);
+    expect(screen.getAllByTestId("delegation-row")).toHaveLength(1);
+    expect(screen.getByTestId("delegation-row-line")).toHaveTextContent("Working in its tab");
+    expect(screen.queryByText("mcp__codemux__delegate_task")).toBeNull();
+  });
 });
 
 describe("MessageList new-turn scroll contract", () => {
