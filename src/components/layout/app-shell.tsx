@@ -1,6 +1,6 @@
 import { useNotificationLink } from "@/hooks/use-notification-link";
 import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
-import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
+import { lazy, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -105,9 +105,10 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const contentSearchOpen = useUIStore((s) => s.showContentSearch);
   const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  // Width lives in the persisted UI store: the full-screen pages below
-  // unmount `SidebarProvider`, which would otherwise reset it to default.
+  // Open state and width live in the persisted UI store: the full-screen
+  // pages below unmount `SidebarProvider`, which would otherwise reset them.
+  const sidebarOpen = useUIStore((s) => s.sidebarOpen);
+  const setSidebarOpen = useUIStore((s) => s.setSidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
   const setSidebarWidth = useUIStore((s) => s.setSidebarWidth);
 
@@ -229,7 +230,10 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // `setSidebarOpen` alone cannot reach. This registration still matters for
   // the branches that return before `SidebarProvider` renders.
   useEffect(() => {
-    useUIStore.getState().setSidebarToggleFn(() => setSidebarOpen((o) => !o));
+    useUIStore.getState().setSidebarToggleFn(() => {
+      const ui = useUIStore.getState();
+      ui.setSidebarOpen(!ui.sidebarOpen);
+    });
     return () => useUIStore.getState().setSidebarToggleFn(null);
   }, []);
 
@@ -305,7 +309,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
     <div className="relative flex h-screen max-h-screen flex-col overflow-hidden">
       <TitleBar
         sidebarOpen={sidebarOpen}
-        onToggleSidebar={() => setSidebarOpen((o) => !o)}
+        onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
       />
       <SidebarProvider
         open={sidebarOpen}

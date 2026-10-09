@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MAX_STORED_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
@@ -88,6 +89,10 @@ interface UIStore {
    *  rather than in `SidebarProvider` because full-screen pages (Settings,
    *  Automations, …) unmount the provider. Clamped by the provider. */
   sidebarWidth: number;
+  /** Left sidebar expanded (true) or collapsed to the icon rail. Persisted
+   *  next to its width so the two halves of one preference survive a
+   *  restart together. */
+  sidebarOpen: boolean;
   rightPanelWidth: number;
   /** Measured width of the row the panel shares with the workspace content
    *  (`workspace-main.tsx` owns the measurement). Runtime-only, never
@@ -231,7 +236,10 @@ interface UIStore {
     order: readonly RightPanelTab[],
   ) => void;
   setSidebarWidth: (width: number) => void;
+  setSidebarOpen: (open: boolean) => void;
   setRightPanelWidth: (width: number) => void;
+  /** Back to the default width, which sits below the drag minimum. */
+  resetRightPanelWidth: () => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
@@ -297,7 +305,8 @@ export const useUIStore = create<UIStore>()(
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
-      rightPanelWidth: 320,
+      sidebarOpen: true,
+      rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
       fileSearchTarget: "editor",
@@ -540,7 +549,12 @@ export const useUIStore = create<UIStore>()(
           ),
         }),
 
+      resetRightPanelWidth: () =>
+        set({ rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH }),
+
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
+
+      setSidebarOpen: (open) => set({ sidebarOpen: open }),
 
       setRightPanelRowWidth: (width) =>
         set((state) =>
@@ -702,6 +716,7 @@ export const useUIStore = create<UIStore>()(
         rightPanelPanes: state.rightPanelPanes,
         rightPanelDismissedPanes: state.rightPanelDismissedPanes,
         sidebarWidth: state.sidebarWidth,
+        sidebarOpen: state.sidebarOpen,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,

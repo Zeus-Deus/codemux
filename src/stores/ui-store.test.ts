@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { RIGHT_PANEL_MIN_WIDTH } from "@/lib/right-panel-width";
+import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+} from "@/lib/right-panel-width";
 import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 
@@ -23,6 +26,7 @@ beforeEach(() => {
     rightPanelTabs: {},
     rightPanelLastTabs: {},
     sidebarWidth: 288,
+    sidebarOpen: true,
     rightPanelWidth: 320,
     rightPanelMaximized: false,
     showNewWorkspaceDialog: false,
@@ -162,6 +166,16 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.hasSeenOnboarding).toBe(true);
     });
 
+    // The rail-or-expanded choice is half of one preference with the width;
+    // forgetting it made rail users collapse the sidebar on every launch.
+    it("persists the sidebar's collapsed state alongside its width", () => {
+      useUIStore.getState().setSidebarOpen(false);
+
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.sidebarOpen).toBe(false);
+      expect(persisted.state.sidebarWidth).toBe(288);
+    });
+
     it("does NOT persist onboardingProjectDir (session-only)", () => {
       useUIStore.getState().setOnboardingProjectDir("/home/user/myproj");
 
@@ -253,6 +267,15 @@ describe("ui-store — onboarding state", () => {
     it("still refuses a width below the panel minimum", () => {
       useUIStore.getState().setRightPanelWidth(10);
       expect(useUIStore.getState().rightPanelWidth).toBe(RIGHT_PANEL_MIN_WIDTH);
+    });
+
+    it("resets to the default width, below the drag minimum", () => {
+      useUIStore.getState().setRightPanelWidth(900);
+      useUIStore.getState().resetRightPanelWidth();
+      expect(useUIStore.getState().rightPanelWidth).toBe(
+        RIGHT_PANEL_DEFAULT_WIDTH,
+      );
+      expect(RIGHT_PANEL_DEFAULT_WIDTH).toBeLessThan(RIGHT_PANEL_MIN_WIDTH);
     });
 
     it("persists the left sidebar width", () => {

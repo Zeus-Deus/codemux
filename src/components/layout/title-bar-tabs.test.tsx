@@ -401,3 +401,129 @@ describe("TitleBarTabs", () => {
     expect(mocks.activateTab).toHaveBeenCalledWith("ws-1", "tab-term");
   });
 });
+
+// Overflowing tabs used to vanish past the island's edge with nothing to
+// say they exist, and a tab activated by shortcut could stay clipped.
+describe("TitleBarTabs overflow", () => {
+  afterEach(() => {
+    cleanup();
+    delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+
+  it("fades whichever edge has tabs scrolled past it", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    const scroller = screen.getByTestId("titlebar-tabs-scroll");
+    expect(scroller).not.toHaveAttribute("data-overflow-start");
+    expect(scroller).not.toHaveAttribute("data-overflow-end");
+
+    Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    Object.defineProperty(scroller, "scrollLeft", { value: 0, writable: true, configurable: true });
+    fireEvent.scroll(scroller);
+    expect(scroller).not.toHaveAttribute("data-overflow-start");
+    expect(scroller).toHaveAttribute("data-overflow-end");
+
+    scroller.scrollLeft = 200;
+    fireEvent.scroll(scroller);
+    expect(scroller).toHaveAttribute("data-overflow-start");
+    expect(scroller).toHaveAttribute("data-overflow-end");
+
+    scroller.scrollLeft = 400;
+    fireEvent.scroll(scroller);
+    expect(scroller).toHaveAttribute("data-overflow-start");
+    expect(scroller).not.toHaveAttribute("data-overflow-end");
+  });
+
+  it("scrolls a tab activated from outside the strip into view", () => {
+    const scrolled: Element[] = [];
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      value(this: Element) {
+        scrolled.push(this);
+      },
+      configurable: true,
+    });
+    const ws = makeThreeTabWorkspace();
+    const view = render(<TitleBarTabs workspace={ws} />);
+    scrolled.length = 0;
+
+    view.rerender(<TitleBarTabs workspace={{ ...ws, active_tab_id: "tab-c" }} />);
+    expect(scrolled).toHaveLength(1);
+    expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-c");
+  });
+
+  // A panel or sidebar growing narrows the strip after activation, which
+  // used to leave the selected pill clipped or pushed out of view.
+  it("re-reveals the active tab when the strip changes width", () => {
+    const scrolled: Element[] = [];
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      value(this: Element) {
+        scrolled.push(this);
+      },
+      configurable: true,
+    });
+    const callbacks: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      const ws = makeThreeTabWorkspace();
+      const view = render(<TitleBarTabs workspace={ws} />);
+      view.rerender(<TitleBarTabs workspace={{ ...ws, active_tab_id: "tab-b" }} />);
+      scrolled.length = 0;
+
+      act(() => {
+        for (const cb of callbacks) cb([], {} as ResizeObserver);
+      });
+      expect(scrolled).toHaveLength(1);
+      expect(scrolled[0]).toHaveAttribute("data-tab-id", "tab-b");
+    } finally {
+      globalThis.ResizeObserver = Original;
+    }
+  });
+
+  // At the island's width cap the scroller's box stops changing, so a pill
+  // that widens (rename, chat chevron) must be observed on its own or the
+  // end fade goes stale.
+  it("re-measures the edge fade when a tab pill changes width", () => {
+    const observed: Element[] = [];
+    const callbacks: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(cb: ResizeObserverCallback) {
+        callbacks.push(cb);
+      }
+      observe(el: Element) {
+        observed.push(el);
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+      const scroller = screen.getByTestId("titlebar-tabs-scroll");
+      const pill = scroller.querySelector("[data-tab-id='tab-c']");
+      expect(observed).toContain(pill);
+
+      Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+      Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+      expect(scroller).not.toHaveAttribute("data-overflow-end");
+      act(() => {
+        for (const cb of callbacks) cb([], {} as ResizeObserver);
+      });
+      expect(scroller).toHaveAttribute("data-overflow-end");
+    } finally {
+      globalThis.ResizeObserver = Original;
+    }
+  });
+
+  it("keeps a revealed tab clear of the edge fade", () => {
+    render(<TitleBarTabs workspace={makeThreeTabWorkspace()} />);
+    expect(screen.getByTestId("titlebar-tabs-scroll")).toHaveClass("scroll-px-4");
+  });
+});

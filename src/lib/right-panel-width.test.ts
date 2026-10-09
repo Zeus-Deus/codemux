@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  renderedRightPanelWidth,
   MIN_CONTENT_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
   clampRightPanelWidth,
@@ -58,5 +59,20 @@ describe("clampRightPanelWidth", () => {
     // `maxRightPanelWidth(0)` is the sanity ceiling, so an un-laid-out row
     // never silently shrinks a panel the user sized deliberately.
     expect(clampRightPanelWidth(900, 0)).toBe(900);
+  });
+});
+
+describe("renderedRightPanelWidth", () => {
+  it("keeps a stored width below the drag minimum as it is", () => {
+    expect(renderedRightPanelWidth(320, 800)).toBe(320);
+  });
+
+  it("caps a stored width that would squeeze the content", () => {
+    // min(800 * 0.75, 800 - 240) = 560
+    expect(renderedRightPanelWidth(3000, 800)).toBe(560);
+  });
+
+  it("uses the stored width until the row is measured", () => {
+    expect(renderedRightPanelWidth(900, 0)).toBe(900);
   });
 });

@@ -38,6 +38,13 @@
  */
 export const RIGHT_PANEL_MIN_WIDTH = 360;
 
+/**
+ * Width a fresh install opens the panel at, and what double-clicking the seam
+ * returns to. It sits below {@link RIGHT_PANEL_MIN_WIDTH}, which bounds drags
+ * and key presses, so resetting must not go through the drag setter.
+ */
+export const RIGHT_PANEL_DEFAULT_WIDTH = 320;
+
 /** The panel's share of the content row when the fraction rule binds. */
 export const RIGHT_PANEL_MAX_FRACTION = 0.75;
 
@@ -96,4 +103,13 @@ export function clampRightPanelWidth(
     RIGHT_PANEL_MIN_WIDTH,
     Math.min(maxRightPanelWidth(available), width),
   );
+}
+
+/**
+ * The width the panel is drawn at. A measured row only caps the stored width
+ * so the content keeps its room; it never raises it to the drag minimum.
+ * The title bar uses the same value so its band stops at the panel's edge.
+ */
+export function renderedRightPanelWidth(stored: number, available: number): number {
+  return available > 0 ? Math.min(stored, maxRightPanelWidth(available)) : stored;
 }

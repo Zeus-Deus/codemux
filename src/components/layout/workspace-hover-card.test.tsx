@@ -50,6 +50,7 @@ import {
   WorkspaceHoverCard,
   WorkspaceHoverCardBody,
 } from "./workspace-hover-card";
+import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
 import { __resetHoverCardGroupForTests } from "@/lib/hover-card-group";
 
 function makeWorkspace(
@@ -727,6 +728,233 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(card()).toBeNull();
     advance(1);
     expect(screen.getByText("beta")).toBeInTheDocument();
+  });
+
+  /** One row inside the right-click menu's open-state provider, as
+   *  `WorkspaceInboxMenu` renders it. */
+  function renderMenuRow() {
+    const row = (menuOpen: boolean) => (
+      <WorkspaceMenuOpenContext.Provider value={menuOpen}>
+        <WorkspaceHoverCard
+          workspace={makeWorkspace({ workspace_id: "alpha", title: "alpha" })}
+          repo={{ name: "myapp", path: "/home/u/projects/myapp" }}
+          status={null}
+        >
+          <div tabIndex={0}>row-alpha</div>
+        </WorkspaceHoverCard>
+      </WorkspaceMenuOpenContext.Provider>
+    );
+    const view = render(row(false));
+    return {
+      alpha: screen.getByText("row-alpha"),
+      setMenuOpen: (open: boolean) => view.rerender(row(open)),
+    };
+  }
+
+  // Regression: the modal menu took the pointer off the row, which cleared
+  // the pointer-down suppression, and the row's focus then reopened the card
+  // on top of the menu, where it ate the first click.
+  it("never opens over the row's right-click menu, nor when focus returns after it", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    pointerEnter(alpha);
+    advance(50);
+    fireEvent.pointerDown(alpha, { pointerType: "mouse", button: 2 });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    // Closing hands the pointer and focus back to the row; neither may pop
+    // the card over the menu that was just dismissed.
+    setMenuOpen(false);
+    pointerEnter(alpha);
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    pointerLeave(alpha);
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  // The menu can close with the pointer far from the row (an item low in a
+  // long menu). No pointerleave follows then, so the suppression must not
+  // outlive the menu or the next real hover onto the row is swallowed.
+  it("opens on the next hover when the menu closes with the pointer off the row", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    pointerEnter(alpha);
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      button: 2,
+      clientX: 20,
+      clientY: 110,
+    });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    act(() => {
+      fireEvent.pointerMove(window, { clientX: 60, clientY: 400 });
+    });
+    setMenuOpen(false);
+
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  // Closing the modal menu hands focus back to the row. With the pointer
+  // elsewhere, that focus must not pop the card beside the row, where no
+  // pointerleave would ever close it again.
+  it("ignores focus returning when the menu closes with the pointer off the row", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      button: 2,
+      clientX: 20,
+      clientY: 110,
+    });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    fireEvent.blur(alpha);
+    act(() => {
+      fireEvent.pointerMove(window, { clientX: 60, clientY: 400 });
+    });
+    setMenuOpen(false);
+
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    // The next real hover onto the row still opens it.
+    fireEvent.blur(alpha);
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  it("stays suppressed when the menu closes with the pointer still on the row", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    pointerEnter(alpha);
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      button: 2,
+      clientX: 20,
+      clientY: 110,
+    });
+    setMenuOpen(true);
+    pointerLeave(alpha);
+    setMenuOpen(false);
+
+    pointerEnter(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+  });
+
+  // A keyboard-opened menu (Shift+F10, the Menu key) never sees a pointer,
+  // so neither a pointer leave nor a tracked point can release the latch.
+  // Focus handed back by the menu stays rejected, but focusing the row again
+  // afterwards must open the card, as it does for a row with no menu.
+  it("lets focus open the card again after a keyboard-opened menu closes", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    fireEvent.focus(alpha);
+    setMenuOpen(true);
+    fireEvent.blur(alpha);
+    setMenuOpen(false);
+    fireEvent.focus(alpha);
+    advance(1000);
+    expect(card()).toBeNull();
+
+    fireEvent.blur(alpha);
+    fireEvent.focus(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  // The same keyboard close must not swallow a later mouse user's first
+  // hover either, though no pointerleave ever precedes it.
+  it("opens on the first hover after a keyboard-opened menu closes", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    setMenuOpen(true);
+    setMenuOpen(false);
+
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  // Focus moving from the row to one of its nested actions blurs the row
+  // too; that must not release the pointer-down suppression, or the focus
+  // landing on the action reopens the card the click just dismissed.
+  it("keeps a click on a nested action suppressed while focus is already in the row", () => {
+    render(
+      <WorkspaceHoverCard
+        workspace={makeWorkspace()}
+        repo={{ name: "myapp", path: "/home/u/projects/myapp" }}
+        status={null}
+      >
+        <div tabIndex={0} data-testid="focus-row">
+          <button type="button">Snooze</button>
+        </div>
+      </WorkspaceHoverCard>,
+    );
+    const row = screen.getByTestId("focus-row");
+    const action = screen.getByText("Snooze");
+    pointerEnter(row);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+
+    fireEvent.pointerDown(row, { pointerType: "mouse" });
+    act(() => row.focus());
+    fireEvent.pointerDown(action, { pointerType: "mouse" });
+    act(() => action.focus());
+    advance(1000);
+    expect(card()).toBeNull();
+  });
+
+  // A row clicked earlier keeps that point; once the pointer has left, a
+  // keyboard-opened menu closing must not read it as the pointer still being
+  // on the row, or the next hover onto the row is swallowed.
+  it("opens on the first hover after a keyboard menu on a row clicked earlier", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    vi.spyOn(alpha, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 100, 200, 30),
+    );
+    pointerEnter(alpha);
+    fireEvent.pointerDown(alpha, {
+      pointerType: "mouse",
+      clientX: 20,
+      clientY: 110,
+    });
+    pointerLeave(alpha);
+    fireEvent.focus(alpha);
+    setMenuOpen(true);
+    setMenuOpen(false);
+    fireEvent.focus(alpha);
+
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+  });
+
+  it("closes an open card when the menu opens from the keyboard", () => {
+    const { alpha, setMenuOpen } = renderMenuRow();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toBeNull();
+
+    setMenuOpen(true);
+    advance(1000);
+    expect(card()).toBeNull();
   });
 });
 

@@ -25,7 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { groupEditors } from "@/lib/editor-groups";
-import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import { renderedRightPanelWidth } from "@/lib/right-panel-width";
 import {
   RIGHT_PANEL_RESIZER_REACH,
   panelClusterRight,
@@ -537,7 +537,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const rightPanelWidth = useUIStore((s) => {
     const stored = s.rightPanelWidth ?? 320;
     const row = s.rightPanelRowWidth ?? 0;
-    return row > 0 ? clampRightPanelWidth(stored, row) : stored;
+    return renderedRightPanelWidth(stored, row);
   });
   const activeWorkspacePanelOpen = useUIStore((s) =>
     activeWorkspaceId
@@ -647,11 +647,18 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           data-testid="titlebar-drag-layer"
           data-tauri-drag-region
           className="pointer-events-auto absolute inset-y-0 left-0"
-          style={{
-            right: rightPanelOpen
-              ? `${panelBandWidth + (panelMaximized ? 0 : RIGHT_PANEL_RESIZER_REACH)}px`
-              : 0,
-          }}
+          // Maximized, the panel owns everything right of the sidebar, so
+          // the layer is sized from the left instead of trusting a row
+          // measurement that may not have landed yet.
+          style={
+            panelMaximized
+              ? { width: `${sidebarGapWidth}px` }
+              : {
+                  right: rightPanelOpen
+                    ? `${panelBandWidth + RIGHT_PANEL_RESIZER_REACH}px`
+                    : 0,
+                }
+          }
         />
       )}
 

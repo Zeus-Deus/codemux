@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Terminal } from "lucide-react";
 import {
   HoverCard,
@@ -40,6 +47,7 @@ import {
   useHoverCardGroupActive,
 } from "@/lib/hover-card-group";
 import { useProjectAppearance } from "./use-project-appearance";
+import { WorkspaceMenuOpenContext } from "./workspace-menu-open-context";
 import { cn } from "@/lib/utils";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
@@ -75,6 +83,15 @@ const OPEN_DELAY_MS = 150;
  *  outright the moment another one opens (`registerOpenHoverCard`). */
 const CLOSE_DELAY_MS = 100;
 
+function rectContains(rect: DOMRect, point: { x: number; y: number }) {
+  return (
+    point.x >= rect.left &&
+    point.x <= rect.right &&
+    point.y >= rect.top &&
+    point.y <= rect.bottom
+  );
+}
+
 // `shortenPath`, `STATUS_LABEL`, and the status tone classes are shared with
 // the command palette — see `@/lib/shorten-path` and `@/lib/pane-status`.
 
@@ -97,6 +114,8 @@ export function WorkspaceHoverCard({
 }: Props) {
   const groupActive = useHoverCardGroupActive();
   const suppressUntilPointerLeave = useRef(false);
+  const menuOpen = useContext(WorkspaceMenuOpenContext);
+  const menuOpenRef = useRef(menuOpen);
   // `instant` is captured when the card opens, not read live, and it governs
   // BOTH ends of the card's motion (see `data-instant` in
   // `@/components/ui/hover-card`). A card that DID wait its delay animates in
@@ -110,7 +129,9 @@ export function WorkspaceHoverCard({
   });
 
   const handleOpenChange = useCallback((next: boolean) => {
-    if (next && suppressUntilPointerLeave.current) return;
+    if (next && (suppressUntilPointerLeave.current || menuOpenRef.current)) {
+      return;
+    }
     // Read the store directly rather than closing over `groupActive`: this
     // fires from Radix's own timer, and the answer must be the phase as it
     // stands right now, before this card joins it below. Read OUTSIDE the
@@ -124,6 +145,46 @@ export function WorkspaceHoverCard({
     }));
   }, []);
 
+  // The modal menu makes the row lose the pointer, which would clear the
+  // suppression; hold it from the menu opening until the pointer leaves the
+  // row after the menu closes, so neither focus returning nor the pointer
+  // being handed back to the row can pop the card over the dismissed menu.
+  // If the pointer is already off the row when the menu closes (an item far
+  // down a long menu), no leave will follow, so the next real pointerenter
+  // releases it instead, or that hover would be swallowed. Focus handed back
+  // to the row by the closing menu still cannot open the card before then.
+  // A menu opened from the keyboard has no pointer to track, so the next
+  // pointerenter releases it too, and so does focus leaving the row, which is
+  // the only release a keyboard-only user can reach.
+  // The trigger is `asChild`, typed as an anchor; a callback ref takes the
+  // row element as the plain HTMLElement it is.
+  const triggerRef = useRef<HTMLElement | null>(null);
+  const setTriggerNode = useCallback((node: HTMLElement | null) => {
+    triggerRef.current = node;
+  }, []);
+  const lastPointer = useRef<{ x: number; y: number } | null>(null);
+  const releaseOnPointerEnter = useRef(false);
+  useEffect(() => {
+    menuOpenRef.current = menuOpen;
+    if (!menuOpen) {
+      const point = lastPointer.current;
+      const rect = triggerRef.current?.getBoundingClientRect();
+      lastPointer.current = null;
+      if (!point || (rect && !rectContains(rect, point))) {
+        releaseOnPointerEnter.current = true;
+      }
+      return;
+    }
+    suppressUntilPointerLeave.current = true;
+    releaseOnPointerEnter.current = false;
+    setCardState((prev) => ({ ...prev, open: false }));
+    const track = (event: PointerEvent) => {
+      lastPointer.current = { x: event.clientX, y: event.clientY };
+    };
+    window.addEventListener("pointermove", track, { capture: true, passive: true });
+    return () => window.removeEventListener("pointermove", track, { capture: true });
+  }, [menuOpen]);
+
   useEffect(() => {
     if (!open) return;
     return registerOpenHoverCard(() =>
@@ -133,20 +194,42 @@ export function WorkspaceHoverCard({
 
   return (
     <HoverCard
-      open={open}
+      open={open && !menuOpen}
       onOpenChange={handleOpenChange}
       openDelay={groupActive ? 0 : OPEN_DELAY_MS}
       closeDelay={CLOSE_DELAY_MS}
     >
       <HoverCardTrigger
         asChild
-        onPointerDownCapture={() => {
+        ref={setTriggerNode}
+        onPointerDownCapture={(event) => {
           // Selection must not leave a preview covering the newly opened chat.
           // Capture also catches nested row actions that stop propagation.
           suppressUntilPointerLeave.current = true;
+          releaseOnPointerEnter.current = false;
+          lastPointer.current = { x: event.clientX, y: event.clientY };
           setCardState((prev) => ({ ...prev, open: false }));
         }}
+        // Runs before Radix's own enter handler, so this hover can open.
+        onPointerEnter={() => {
+          if (!releaseOnPointerEnter.current || menuOpenRef.current) return;
+          releaseOnPointerEnter.current = false;
+          suppressUntilPointerLeave.current = false;
+        }}
         onPointerLeave={() => {
+          if (menuOpenRef.current) return;
+          suppressUntilPointerLeave.current = false;
+          // The point is stale once the pointer is off the row; a menu later
+          // opened from the keyboard must not read it as still on the row.
+          lastPointer.current = null;
+        }}
+        onBlur={(event) => {
+          if (menuOpenRef.current) return;
+          // Blur bubbles: focus moving to a nested action is still inside the
+          // row, and the pointer-down that moved it must stay suppressed.
+          const next = event.relatedTarget;
+          if (next instanceof Node && event.currentTarget.contains(next)) return;
+          releaseOnPointerEnter.current = false;
           suppressUntilPointerLeave.current = false;
         }}
       >
