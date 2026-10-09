@@ -141,13 +141,14 @@ pub async fn get_branch_pull_request(path: String) -> Result<Option<PullRequestI
 
 #[tauri::command]
 pub async fn create_pull_request(
+    state: State<'_, AppStateStore>,
     path: String,
     title: String,
     body: String,
     base: Option<String>,
     draft: bool,
 ) -> Result<PullRequestInfo, String> {
-    tokio::task::spawn_blocking(move || {
+    run_pr_mutation(&state, path, "create_pull_request", move |path| {
         provider_for(&path, Operation::Comment)?.create_pull_request(
             Path::new(&path),
             &title,
@@ -157,7 +158,6 @@ pub async fn create_pull_request(
         )
     })
     .await
-    .map_err(|e| format!("create_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -234,8 +234,11 @@ pub async fn list_prs_overview(path: String) -> Result<crate::github::PrsOvervie
 
 /// Explicit refresh clears successful responses without lifting a host pause.
 #[tauri::command]
-pub async fn refresh_github_read_cache(path: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+pub async fn refresh_github_read_cache(
+    state: State<'_, AppStateStore>,
+    path: String,
+) -> Result<(), String> {
+    run_pr_mutation(&state, path, "refresh_github_read_cache", move |path| {
         let provider = provider_for(&path, Operation::ListRead)?;
         if provider.kind() == git_provider::ProviderKind::GitHub {
             crate::github_budget::invalidate_read_cache(Path::new(&path))?;
@@ -244,7 +247,6 @@ pub async fn refresh_github_read_cache(path: String) -> Result<(), String> {
         Ok(())
     })
     .await
-    .map_err(|e| format!("refresh_github_read_cache task join failed: {e}"))?
 }
 
 /// The slow half of the same rows: CI rollup and line counts by number.
@@ -280,6 +282,7 @@ pub async fn github_rate_limit(path: String) -> Result<crate::github::GhRateLimi
 
 #[tauri::command]
 pub async fn merge_pull_request(
+    state: State<'_, AppStateStore>,
     path: String,
     pr_number: u32,
     method: String,
@@ -291,7 +294,7 @@ pub async fn merge_pull_request(
     // (path, number, method) keeps the previous behaviour instead of
     // silently flipping to "keep the branch".
     let delete_branch = delete_branch.unwrap_or(true);
-    tokio::task::spawn_blocking(move || {
+    run_pr_mutation(&state, path, "merge_pull_request", move |path| {
         provider_for(&path, Operation::MergeWithStrategies)?.merge_pull_request(
             Path::new(&path),
             pr_number,
@@ -302,44 +305,54 @@ pub async fn merge_pull_request(
         )
     })
     .await
-    .map_err(|e| format!("merge_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub async fn close_pull_request(path: String, pr_number: u32) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+pub async fn close_pull_request(
+    state: State<'_, AppStateStore>,
+    path: String,
+    pr_number: u32,
+) -> Result<(), String> {
+    run_pr_mutation(&state, path, "close_pull_request", move |path| {
         provider_for(&path, Operation::DraftReadyCloseReopen)?.close_pull_request(Path::new(&path), pr_number)
     })
     .await
-    .map_err(|e| format!("close_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub async fn reopen_pull_request(path: String, pr_number: u32) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+pub async fn reopen_pull_request(
+    state: State<'_, AppStateStore>,
+    path: String,
+    pr_number: u32,
+) -> Result<(), String> {
+    run_pr_mutation(&state, path, "reopen_pull_request", move |path| {
         provider_for(&path, Operation::DraftReadyCloseReopen)?.reopen_pull_request(Path::new(&path), pr_number)
     })
     .await
-    .map_err(|e| format!("reopen_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub async fn set_pr_ready(path: String, pr_number: u32, ready: bool) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+pub async fn set_pr_ready(
+    state: State<'_, AppStateStore>,
+    path: String,
+    pr_number: u32,
+    ready: bool,
+) -> Result<(), String> {
+    run_pr_mutation(&state, path, "set_pr_ready", move |path| {
         provider_for(&path, Operation::DraftReadyCloseReopen)?.set_pull_request_ready(Path::new(&path), pr_number, ready)
     })
     .await
-    .map_err(|e| format!("set_pr_ready task join failed: {e}"))?
 }
 
 #[tauri::command]
 pub async fn update_pull_request(
+    state: State<'_, AppStateStore>,
     path: String,
     pr_number: u32,
     title: Option<String>,
     body: Option<String>,
 ) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+    run_pr_mutation(&state, path, "update_pull_request", move |path| {
         provider_for(&path, Operation::Comment)?.update_pull_request(
             Path::new(&path),
             pr_number,
@@ -348,7 +361,6 @@ pub async fn update_pull_request(
         )
     })
     .await
-    .map_err(|e| format!("update_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -697,25 +709,56 @@ pub async fn refresh_workspace_issue<R: tauri::Runtime>(
     Ok(())
 }
 
+/// The manual-refresh boundary, with only blocking external I/O injectable.
+/// The command and deterministic publication regressions run this same path.
+async fn refresh_workspace_pr_with_lookup(
+    state: &AppStateStore,
+    workspace_id: &str,
+    lookup: impl FnOnce(
+            String,
+        ) -> Result<
+            (
+                Option<String>,
+                Result<Vec<crate::github::SourcedPr>, String>,
+            ),
+            String,
+        > + Send
+        + 'static,
+) -> Result<bool, String> {
+    let target = state.begin_workspace_pr_refresh(workspace_id)?;
+    let cwd = target.cwd.clone();
+    let (provider_kind, result) = tokio::task::spawn_blocking(move || lookup(cwd))
+        .await
+        .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
+    state.update_workspace_provider_kind(workspace_id, provider_kind);
+    Ok(state.publish_workspace_pr_lookup(&target, crate::github::workspace_prs_outcome(result)))
+}
+
+/// Revoke pre-mutation and during-mutation answers without touching unrelated
+/// projects. Tauri injects state; this adds no request/wire fields.
+async fn run_pr_mutation<T: Send + 'static>(
+    state: &AppStateStore,
+    path: String,
+    task: &str,
+    mutate: impl FnOnce(String) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let scope = state.invalidate_workspace_pr_lookups_for_path(&path);
+    let result = tokio::task::spawn_blocking(move || mutate(path))
+        .await
+        .map_err(|e| format!("{task} task join failed: {e}"))?;
+    if result.is_ok() {
+        state.invalidate_workspace_pr_lookups_for_scope(&scope);
+    }
+    result
+}
+
 #[tauri::command]
 pub async fn refresh_workspace_pr<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
 ) -> Result<(), String> {
-    let cwd = {
-        let snapshot = state.snapshot();
-        let ws = snapshot
-            .workspaces
-            .iter()
-            .find(|w| w.workspace_id.0 == workspace_id)
-            .ok_or_else(|| format!("No workspace found: {workspace_id}"))?;
-        // Match frontend logic: worktree_path ?? cwd (pr-panel.tsx:328)
-        ws.worktree_path.clone().unwrap_or_else(|| ws.cwd.clone())
-    };
-
-    let cwd_for_pr = cwd.clone();
-    let (detected, lookup) = tokio::task::spawn_blocking(move || {
+    refresh_workspace_pr_with_lookup(&state, &workspace_id, move |cwd_for_pr| {
         // Advisory resolution, like every other data command here — a
         // manual refresh must keep working on a host detection can't name
         // but the CLI can resolve.
@@ -726,28 +769,9 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
             crate::github::invalidate_github_reads();
         }
         let lookup = provider.workspace_pull_requests(Path::new(&cwd_for_pr));
-        Ok::<_, String>((detected, lookup))
+        Ok((git_provider::provider_kind_field(&detected), lookup))
     })
-    .await
-    .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
-    state.update_workspace_provider_kind(
-        &workspace_id,
-        git_provider::provider_kind_field(&detected),
-    );
-    // Decision matrix, shared with both background pollers via
-    // `branch_pr_outcome`: match → write, successful empty → clear, lookup
-    // error (or detached HEAD) → leave the stored info untouched. A failed
-    // lookup is deliberately not an `Err` back to the frontend: a manual
-    // refresh during a rebase should be a no-op, not an error toast.
-    match crate::github::workspace_prs_outcome(lookup) {
-        crate::github::WorkspacePrsOutcome::Write(prs) => {
-            state.update_workspace_prs(&workspace_id, crate::workspace_pr_rows(prs));
-        }
-        crate::github::WorkspacePrsOutcome::Clear => {
-            state.update_workspace_prs(&workspace_id, Vec::new());
-        }
-        crate::github::WorkspacePrsOutcome::Preserve => {}
-    }
+    .await?;
     crate::state::emit_app_state(&app);
     Ok(())
 }
@@ -818,6 +842,330 @@ fn resolve_workspace_cwd(state: &AppStateStore, workspace_id: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publication_rows(number: u32) -> Vec<crate::github::SourcedPr> {
+        vec![crate::github::SourcedPr {
+            pr: serde_json::from_value(serde_json::json!({
+                "number": number, "state": "OPEN", "title": "Synthetic PR",
+                "url": format!("https://example.test/pr/{number}"), "head_branch": "fixture",
+            }))
+            .unwrap(),
+            source: crate::github::PrSource::Branch,
+            checkout_branch: Some("fixture".into()),
+        }]
+    }
+
+    async fn overlapping_refresh(clear: bool) {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        store.set_workspace_worktree(&id, "/synthetic/worktree".into(), "fixture".into());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old = refresh_workspace_pr_with_lookup(&store, &id, move |cwd| {
+            assert_eq!(cwd, "/synthetic/worktree");
+            let old_answer = publication_rows(10);
+            done_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok((None, Ok(old_answer)))
+        });
+        let fresh = async {
+            done_rx.await.unwrap();
+            let result = refresh_workspace_pr_with_lookup(&store, &id, move |_| {
+                Ok((None, Ok(if clear { vec![] } else { publication_rows(11) })))
+            })
+            .await;
+            release_tx.send(()).unwrap();
+            result.unwrap()
+        };
+        let (old_result, _) = tokio::join!(old, fresh);
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == id)
+            .unwrap();
+        let expected = if clear { None } else { Some(11) };
+        assert_eq!(ws.pr_number, expected);
+        assert_eq!(ws.prs.first().map(|p| p.number), expected);
+        assert!(
+            !old_result.unwrap(),
+            "stale command completion must not report a write"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_refresh_boundary_refuses_overlapping_write() {
+        overlapping_refresh(false).await;
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_refresh_boundary_refuses_overlapping_clear() {
+        overlapping_refresh(true).await;
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_refresh_error_preserves_without_error_to_caller() {
+        let store = std::sync::Arc::new(AppStateStore::default());
+        let id = store.create_workspace().0;
+        assert!(refresh_workspace_pr_with_lookup(&store, &id, |_| {
+            Ok((None, Ok(publication_rows(11))))
+        })
+        .await
+        .unwrap());
+        let before = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        let worker = store.clone();
+        assert!(!refresh_workspace_pr_with_lookup(&store, &id, move |_| {
+            assert!(
+                !worker.publish_workspace_pr_lookup(
+                    &before,
+                    crate::github::WorkspacePrsOutcome::Write(publication_rows(10))
+                ),
+                "capture must precede external I/O"
+            );
+            Ok((None, Err("Detached HEAD / fixture unavailable".into())))
+        })
+        .await
+        .unwrap());
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == id)
+            .unwrap();
+        assert_eq!(ws.pr_number, Some(11));
+        assert_eq!(ws.prs[0].number, 11);
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_mutation_boundary_fences_before_io_and_after_success() {
+        let store = std::sync::Arc::new(AppStateStore::default());
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        store.update_workspace_cwd(&a, "/synthetic/a".into());
+        store.update_workspace_cwd(&b, "/synthetic/b".into());
+        let targets = store.workspace_pr_poll_lookups();
+        let old_a = targets
+            .iter()
+            .find(|t| t.workspace_id == a)
+            .unwrap()
+            .clone();
+        let old_b = targets
+            .iter()
+            .find(|t| t.workspace_id == b)
+            .unwrap()
+            .clone();
+        let worker = store.clone();
+        let worker_a = a.clone();
+        let (before_refused, during) =
+            run_pr_mutation(&store, "/synthetic/a".into(), "fixture", move |_| {
+                let before_refused = !worker.publish_workspace_pr_lookup(
+                    &old_a,
+                    crate::github::WorkspacePrsOutcome::Write(publication_rows(10)),
+                );
+                let during = worker
+                    .workspace_pr_poll_lookups()
+                    .into_iter()
+                    .find(|t| t.workspace_id == worker_a)
+                    .unwrap();
+                Ok((before_refused, during))
+            })
+            .await
+            .unwrap();
+        assert!(
+            before_refused,
+            "mutation must revoke already pending answers before external I/O"
+        );
+        assert!(
+            !store.publish_workspace_pr_lookup(
+                &during,
+                crate::github::WorkspacePrsOutcome::Write(publication_rows(12))
+            ),
+            "successful mutation must revoke during-mutation answers"
+        );
+        assert!(store.publish_workspace_pr_lookup(
+            &old_b,
+            crate::github::WorkspacePrsOutcome::Write(publication_rows(20))
+        ));
+    }
+
+    fn publication_workspace(store: &AppStateStore, name: &str, root: &str) -> String {
+        let id = store
+            .create_empty_workspace_at_path(std::path::PathBuf::from(format!(
+                "/synthetic/{name}-cwd"
+            )))
+            .0;
+        store.set_workspace_worktree(&id, format!("/synthetic/{name}"), "fixture".into());
+        store.set_workspace_project_root(&id, root.into());
+        id
+    }
+
+    fn publication_pill(store: &AppStateStore, id: &str) -> serde_json::Value {
+        let workspace = store.find_workspace(id).unwrap();
+        serde_json::json!({
+            "prs": workspace.prs,
+            "pr_number": workspace.pr_number,
+            "pr_state": workspace.pr_state,
+            "pr_url": workspace.pr_url,
+            "pr_head_branch": workspace.pr_head_branch,
+        })
+    }
+
+    async fn mutation_scope_survives_close(clear: bool, create_during: bool, succeed: bool) {
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let a = publication_workspace(&store, "a", "/synthetic/repository");
+        let mut b =
+            (!create_during).then(|| publication_workspace(&store, "b", "/synthetic/repository"));
+        let c = publication_workspace(&store, "c", "/synthetic/unrelated");
+        let before = store.workspace_pr_poll_lookups();
+        let unrelated = before.iter().find(|t| t.workspace_id == c).unwrap().clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Only external I/O is substituted: the actual boundary captures and
+        // revokes against the real store before entering this blocked closure.
+        let mutation = run_pr_mutation(&store, "/synthetic/a".into(), "fixture", move |path| {
+            assert_eq!(path, "/synthetic/a");
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            if succeed {
+                Ok(()) // A successful no-op must still fence during-I/O reads.
+            } else {
+                Err("synthetic mutation failure".into())
+            }
+        });
+        let interleave = async {
+            started_rx.await.unwrap();
+            for token in before.iter().filter(|t| t.workspace_id != c) {
+                assert!(
+                    !store.publish_workspace_pr_lookup(
+                        token,
+                        crate::github::WorkspacePrsOutcome::Write(publication_rows(10))
+                    ),
+                    "initial revocation must precede mutation I/O"
+                );
+            }
+            // This B did not exist at the first revocation: retaining only
+            // initial workspace IDs is insufficient even after A closes.
+            let b = b
+                .get_or_insert_with(|| publication_workspace(&store, "b", "/synthetic/repository"));
+            let mut seed_rows = publication_rows(21);
+            seed_rows.extend(publication_rows(22));
+            assert!(store.update_workspace_prs(b, crate::workspace_pr_rows(seed_rows)));
+            let expected = publication_pill(&store, b);
+            assert_eq!(expected["prs"].as_array().unwrap().len(), 2);
+            let during = store
+                .workspace_pr_poll_lookups()
+                .into_iter()
+                .find(|t| t.workspace_id == *b)
+                .unwrap();
+            let delayed = if clear {
+                crate::github::WorkspacePrsOutcome::Clear
+            } else {
+                crate::github::WorkspacePrsOutcome::Write(publication_rows(10))
+            };
+            store.close_workspace(&a).unwrap();
+            assert!(store.find_workspace(&a).is_none());
+            assert_eq!(publication_pill(&store, b), expected);
+            release_tx.send(()).unwrap();
+            (b.clone(), during, delayed, expected)
+        };
+        let (result, (b, during, delayed, expected)) = tokio::join!(mutation, interleave);
+        if succeed {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err(), "synthetic mutation failure");
+        }
+        // C's pre-mutation token survives both boundaries and A's closure.
+        assert!(store.publish_workspace_pr_lookup(
+            &unrelated,
+            crate::github::WorkspacePrsOutcome::Write(publication_rows(30))
+        ));
+        assert_eq!(store.find_workspace(&c).unwrap().pr_number, Some(30));
+        let changed = store.publish_workspace_pr_lookup(&during, delayed);
+        assert_eq!(
+            changed, !succeed,
+            "successful mutation must reject sibling's delayed answer after initiating workspace closes"
+        );
+        if succeed {
+            assert_eq!(publication_pill(&store, &b), expected);
+            let fresh = store
+                .workspace_pr_poll_lookups()
+                .into_iter()
+                .find(|t| t.workspace_id == b)
+                .unwrap();
+            assert!(store.publish_workspace_pr_lookup(
+                &fresh,
+                crate::github::WorkspacePrsOutcome::Write(publication_rows(23))
+            ));
+        } else {
+            assert_eq!(store.find_workspace(&b).unwrap().pr_number, Some(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_mutation_scope_survives_close_for_delayed_write() {
+        mutation_scope_survives_close(false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_mutation_scope_survives_close_for_delayed_clear() {
+        mutation_scope_survives_close(true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_mutation_scope_survives_close_for_new_sibling_write() {
+        mutation_scope_survives_close(false, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_mutation_scope_survives_close_for_new_sibling_clear() {
+        mutation_scope_survives_close(true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn pr_publication_actual_mutation_scope_failure_keeps_during_io_authority() {
+        mutation_scope_survives_close(false, false, false).await;
+    }
+
+    #[test]
+    fn pr_publication_mutating_commands_use_the_publication_invalidation_boundary() {
+        let source = include_str!("github.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        for name in [
+            "create_pull_request",
+            "merge_pull_request",
+            "close_pull_request",
+            "reopen_pull_request",
+            "set_pr_ready",
+            "update_pull_request",
+            "refresh_github_read_cache",
+        ] {
+            let command = source
+                .split(&format!("pub async fn {name}("))
+                .nth(1)
+                .unwrap()
+                .split("#[tauri::command]")
+                .next()
+                .unwrap();
+            assert!(
+                command.contains("state: State<'_, AppStateStore>"),
+                "{name} needs injected local state"
+            );
+            assert!(
+                command.contains("run_pr_mutation("),
+                "{name} must revoke publication authority"
+            );
+        }
+    }
     use crate::git_provider::detect::DetectedProvider;
     use crate::git_provider::github::GitHubProvider;
     use crate::git_provider::gitlab::GitLabProvider;

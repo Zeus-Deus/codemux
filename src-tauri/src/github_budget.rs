@@ -49,6 +49,7 @@ struct HostState {
     snapshot: Option<Snapshot>,
     pause_until: u64,
     refusals: u32,
+    refusal_generation: u64,
     probe_error: Option<(Instant, String)>,
     probe_failures: u32,
     core_pause_until: u64,
@@ -56,7 +57,7 @@ struct HostState {
     probe_running: bool,
     core_debt: ChargeDebt,
     graphql_debt: ChargeDebt,
-    probe_boundary: Option<(ChargeDebt, ChargeDebt, u64)>,
+    probe_boundary: Option<(ChargeDebt, ChargeDebt, u64, u64)>,
 }
 
 /// Fixed-size per-account ledger: cache eviction cannot forgive a charge.
@@ -625,6 +626,7 @@ fn retry_epoch(message: &str, now: u64) -> Option<u64> {
 }
 
 fn record_refusal(state: &mut HostState, message: &str, now: u64) {
+    state.refusal_generation = state.refusal_generation.wrapping_add(1);
     state.refusals = state.refusals.saturating_add(1);
     let delay = (60_u64.saturating_mul(1_u64 << state.refusals.saturating_sub(1).min(4))).min(900);
     let until = retry_epoch(message, now).unwrap_or(now.saturating_add(delay));
@@ -810,7 +812,12 @@ impl Coordinator {
         let state = self.hosts.get_mut(&host_key).unwrap();
         if needs_probe {
             state.probe_running = true;
-            state.probe_boundary = Some((state.core_debt, state.graphql_debt, now));
+            state.probe_boundary = Some((
+                state.core_debt,
+                state.graphql_debt,
+                now,
+                state.refusal_generation,
+            ));
             return Admission::Probe;
         }
         if diagnostic {
@@ -904,9 +911,16 @@ impl Coordinator {
         let boundary = state.probe_boundary.take();
         match output.result.and_then(parse_snapshot) {
             Ok(snapshot) => {
+                // A read may have refused this account since probe admission.
+                // Its older success cannot supply post-refusal quota evidence.
+                if boundary
+                    .is_some_and(|(_, _, _, generation)| generation != state.refusal_generation)
+                {
+                    return;
+                }
                 let core = snapshot.core;
                 let graphql = snapshot.graphql;
-                if let Some((core_debt, graphql_debt, started)) = boundary {
+                if let Some((core_debt, graphql_debt, started, _)) = boundary {
                     if state
                         .snapshot
                         .as_ref()
@@ -1023,6 +1037,14 @@ impl Coordinator {
             reset,
             observed_remaining,
         };
+        // Only inferred bucket pauses can be lifted by conservative quota
+        // evidence; the account-wide refusal cooldown remains untouched.
+        if quota.remaining > quota.limit.div_ceil(10) {
+            match selected {
+                Bucket::Core => state.core_pause_until = 0,
+                Bucket::Graphql => state.graphql_pause_until = 0,
+            }
+        }
         if let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&snapshot.raw) {
             let resource = match selected {
                 Bucket::Core => "core",
@@ -1725,6 +1747,372 @@ fn run_with_stdin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_reservation_pause_recovers_graphql_headroom() {
+        let args = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        for concurrent in [false, true] {
+            let mut c = Coordinator::default();
+            let host = "review-graphql-reservation.example.test";
+            let account = (host.to_string(), Some(17));
+            let initial = if concurrent { 900 } else { 700 };
+            let snapshot = parse_snapshot(quota(4999, initial)).unwrap();
+            let reset = snapshot.graphql.reset;
+            c.hosts.entry(account.clone()).or_default().snapshot = Some(snapshot);
+            let a = match c.prepare(host, Some(17), 1, 1, &args, false) {
+                Admission::Read(plan) => plan,
+                _ => panic!("A must reserve 200 points"),
+            };
+            let b = if concurrent {
+                match c.prepare(host, Some(17), 2, 2, &args, false) {
+                    Admission::Read(plan) => Some(plan),
+                    _ => panic!("B must retain its separate reservation"),
+                }
+            } else {
+                None
+            };
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                500
+            );
+            assert!(
+                !matches!(
+                    c.prepare_with_cost(host, Some(17), 3, 3, &args, false, 2),
+                    Admission::Read(_)
+                ),
+                "temporary reservations must still protect the reserve"
+            );
+            let date = chrono::DateTime::from_timestamp(reset as i64, 0)
+                .unwrap()
+                .to_rfc3339();
+            c.finish(
+                a,
+                &args,
+                Executed::plain(Ok(serde_json::json!({"data":{"rateLimit":{
+                    "limit":5000,"remaining":initial - 1,"cost":1,"resetAt":date
+                }}})
+                .to_string())),
+            )
+            .unwrap();
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                699,
+                "a live B reservation must remain subtracted"
+            );
+            assert!(matches!(c.prepare_with_cost(host, Some(17), 4, 4, &args, false, 2), Admission::Read(_)),
+                "authoritative headroom must recover bounded discovery after a reservation-only pause");
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                697
+            );
+            if let Some(b) = b {
+                c.finish(b, &args, metered_output("graphql", initial - 2, reset))
+                    .unwrap();
+                assert_eq!(
+                    c.hosts[&account]
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .graphql
+                        .remaining,
+                    896
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_reservation_pause_recovers_core_lookup_headroom() {
+        let mut c = Coordinator::default();
+        let host = "review-core-reservation.example.test";
+        let account = (host.to_string(), None);
+        let snapshot = parse_snapshot(quota(700, 4999)).unwrap();
+        let reset = snapshot.core.reset;
+        c.hosts.entry(account.clone()).or_default().snapshot = Some(snapshot);
+        let core = ["api", "repos/fixture/repo"];
+        let cli = ["pr", "list", "--limit", "1", "--json", "number"];
+        let a = match c.prepare_with_cost(host, None, 1, 1, &core, false, 200) {
+            Admission::Read(plan) => plan,
+            _ => panic!("A must reserve 200 core points"),
+        };
+        assert!(
+            !matches!(c.prepare(host, None, 2, 2, &cli, false), Admission::Read(_)),
+            "the two-point repository lookup must not spend the core floor"
+        );
+        c.finish(a, &core, metered_output("core", 699, reset))
+            .unwrap();
+        assert!(matches!(c.prepare(host, None, 3, 3, &cli, false), Admission::Read(_)),
+            "authoritative core headroom must recover the repository lookup after a reservation-only pause");
+        assert_eq!(
+            c.hosts[&account].snapshot.as_ref().unwrap().core.remaining,
+            697
+        );
+    }
+
+    #[test]
+    fn review_pre_refusal_probe_cannot_restore_snapshot_or_reconcile_debt() {
+        let args = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        for late_success in [false, true] {
+            let mut c = Coordinator::default();
+            let host = "review-probe-refusal.example.test";
+            let account = (host.to_string(), Some(23));
+            c.hosts.entry(account.clone()).or_default().snapshot =
+                Some(parse_snapshot(quota(4999, 1500)).unwrap());
+            let admit = |c: &mut Coordinator, key| match c.prepare(
+                host,
+                Some(23),
+                key,
+                key,
+                &args,
+                false,
+            ) {
+                Admission::Read(plan) => plan,
+                _ => panic!("read must be admitted"),
+            };
+            let completed = admit(&mut c, 1);
+            c.finish(completed, &args, Executed::plain(Ok("[]".into())))
+                .unwrap();
+            let a = admit(&mut c, 2);
+            let b = if late_success {
+                Some(admit(&mut c, 3))
+            } else {
+                None
+            };
+            c.hosts
+                .get_mut(&account)
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .fetched = Instant::now() - PROBE_TTL;
+            assert!(matches!(
+                c.prepare(host, Some(23), 4, 4, &args, false),
+                Admission::Probe
+            ));
+            let sampled_before_refusal = quota(4999, 1300);
+            assert!(c
+                .finish(
+                    a,
+                    &args,
+                    Executed::plain(Err("HTTP 429; Retry-After: 1".into()))
+                )
+                .is_err());
+            if let Some(b) = b {
+                c.finish(b, &args, Executed::plain(Ok("[]".into())))
+                    .unwrap();
+                assert_eq!(
+                    c.hosts[&account].refusals, 0,
+                    "the refusal streak is not a stable probe fence"
+                );
+            }
+            assert!(c.hosts[&account].snapshot.is_none());
+            let before = c.hosts[&account].graphql_debt;
+            let pause = c.hosts[&account].pause_until;
+            c.probe_finished(host, Some(23), Executed::plain(Ok(sampled_before_refusal)));
+            let state = &c.hosts[&account];
+            assert!(
+                state.snapshot.is_none(),
+                "a pre-refusal successful probe must not install a fresh snapshot"
+            );
+            assert_eq!(
+                state.graphql_debt.confirmed, before.confirmed,
+                "superseded quota evidence must not reconcile confirmed debt"
+            );
+            assert_eq!(state.graphql_debt.uncertain, before.uncertain);
+            assert_eq!(state.graphql_debt.uncertain_until, before.uncertain_until);
+            assert_eq!(state.pause_until, pause);
+            assert!(
+                !state.probe_running,
+                "discarded probes must release the transport slot"
+            );
+            assert!(state.probe_boundary.is_none());
+            assert!(
+                matches!(
+                    c.prepare(host, Some(23), 5, 5, &args, false),
+                    Admission::Complete(Err(_))
+                ),
+                "discarding the probe must not lift the genuine refusal cooldown"
+            );
+            // Advance only the cooldown boundary, avoiding a real clock sleep.
+            c.hosts.get_mut(&account).unwrap().pause_until = epoch() - 1;
+            assert!(
+                matches!(
+                    c.prepare(host, Some(23), 6, 6, &args, false),
+                    Admission::Probe
+                ),
+                "the first uncached read after cooldown must admit a post-refusal probe"
+            );
+            c.probe_finished(host, Some(23), Executed::plain(Ok(quota(4999, 1100))));
+            assert!(c.hosts[&account].snapshot.is_some());
+            assert!(!c.hosts[&account].probe_running);
+            assert_eq!(c.hosts[&account].graphql_debt.confirmed, 0);
+            assert_eq!(c.hosts[&account].graphql_debt.uncertain, before.uncertain);
+        }
+    }
+
+    #[test]
+    fn review_bucket_recovery_keeps_debt_floor_and_refusal_cooldown() {
+        for selected in [Bucket::Core, Bucket::Graphql] {
+            let mut c = Coordinator::default();
+            let host = "review-pause-controls.example.test";
+            let account = (host.to_string(), None);
+            let snapshot = parse_snapshot(quota(500, 500)).unwrap();
+            let reset = snapshot.core.reset;
+            let state = c.hosts.entry(account.clone()).or_default();
+            state.snapshot = Some(snapshot);
+            state.core_pause_until = reset;
+            state.graphql_pause_until = reset;
+            state.pause_until = epoch() + 120;
+            let cooldown = state.pause_until;
+            let paused = |c: &Coordinator| match selected {
+                Bucket::Core => c.hosts[&account].core_pause_until,
+                Bucket::Graphql => c.hosts[&account].graphql_pause_until,
+            };
+            assert!(c.observe(&account, selected, 5000, 500, reset));
+            assert_eq!(
+                paused(&c),
+                reset,
+                "the exact reserve does not clear a pause"
+            );
+            assert!(!c.observe(&account, selected, 5000, 4999, reset - 1));
+            assert_eq!(paused(&c), reset, "stale evidence cannot clear a pause");
+            // Establish a newer epoch, but retain an unobserved charge.
+            let state = c.hosts.get_mut(&account).unwrap();
+            match selected {
+                Bucket::Core => state.core_debt.confirmed = 200,
+                Bucket::Graphql => state.graphql_debt.confirmed = 200,
+            }
+            assert!(c.observe(&account, selected, 5000, 700, reset + 1));
+            assert_eq!(
+                paused(&c),
+                reset,
+                "debt-adjusted headroom still stops at the floor"
+            );
+            assert!(c.observe(&account, selected, 5000, 699, reset + 1));
+            assert_eq!(
+                paused(&c),
+                reset,
+                "older remaining samples cannot refill quota"
+            );
+            assert!(c.observe(&account, selected, 5000, 701, reset + 2));
+            assert_eq!(paused(&c), 0);
+            assert_eq!(
+                c.hosts[&account].pause_until, cooldown,
+                "bucket recovery must not lift an account refusal cooldown"
+            );
+            let args = match selected {
+                Bucket::Core => vec!["api", "repos/fixture/repo"],
+                Bucket::Graphql => vec!["api", "graphql", "-f", "query=query { viewer { login } }"],
+            };
+            assert!(matches!(
+                c.prepare_with_cost(host, None, 1, 1, &args, false, 2),
+                Admission::Complete(Err(_))
+            ));
+            c.hosts.get_mut(&account).unwrap().pause_until = epoch() - 1;
+            assert!(
+                matches!(
+                    c.prepare_with_cost(host, None, 2, 2, &args, false, 2),
+                    Admission::Complete(Err(_))
+                ),
+                "one point of recovered headroom cannot admit a two-point read"
+            );
+        }
+    }
+
+    #[test]
+    fn review_superseded_probe_wakes_existing_waiters() {
+        let host = "review-probe-waiter.example.test";
+        let account = (host.to_string(), Some(29));
+        let active_args = ["api", "repos/fixture/active"];
+        let a = {
+            let mut c = lock_until(Instant::now() + Duration::from_secs(3)).unwrap();
+            c.hosts.entry(account.clone()).or_default().snapshot =
+                Some(parse_snapshot(quota(4999, 4999)).unwrap());
+            let a = match c.prepare(host, Some(29), 1, 1, &active_args, false) {
+                Admission::Read(plan) => plan,
+                _ => panic!("A not admitted"),
+            };
+            c.hosts
+                .get_mut(&account)
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .fetched = Instant::now() - PROBE_TTL;
+            a
+        };
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let probe = threads.spawn(move || {
+                run_read_with(
+                    host,
+                    Some(29),
+                    Path::new("/fixture-probe"),
+                    &["api", "repos/fixture/probe"],
+                    Instant::now() + Duration::from_secs(4),
+                    |args, _| {
+                        assert_eq!(args.get(1), Some(&"rate_limit"));
+                        let sample = quota(4999, 4999);
+                        sample_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                        Executed::plain(Ok(sample))
+                    },
+                )
+            });
+            sample_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let waiter = threads.spawn(move || {
+                READ_WAIT_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        wait_tx.send(()).unwrap();
+                    }))
+                });
+                let result = run_read_with(
+                    host,
+                    Some(29),
+                    Path::new("/fixture-waiter"),
+                    &["api", "repos/fixture/waiter"],
+                    Instant::now() + Duration::from_secs(4),
+                    |_, _| panic!("cooldown must prevent waiter transport"),
+                );
+                done_tx.send(result).unwrap();
+            });
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Deliberately do not notify here: only the real probe-completion
+            // path can wake this already sleeping waiter.
+            assert!(lock_until(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                .finish(a, &active_args, Executed::plain(Err("HTTP 429".into())))
+                .is_err());
+            release_tx.send(()).unwrap();
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("discarded probe did not notify existing waiters");
+            assert!(result.unwrap_err().contains("paused until"));
+            assert!(probe.join().unwrap().unwrap_err().contains("paused until"));
+            waiter.join().unwrap();
+        });
+        let c = lock_until(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(c.hosts[&account].snapshot.is_none());
+        assert!(!c.hosts[&account].probe_running);
+    }
 
     #[test]
     fn bounded_query_cost_cannot_be_used_for_writes_or_unbounded_reads() {
