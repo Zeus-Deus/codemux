@@ -182,8 +182,9 @@ export class FakeQuery implements AsyncIterable<SDKMessage> {
   async supportedAgents(): Promise<[]> {
     return [];
   }
-  async mcpServerStatus(): Promise<[]> {
-    return [];
+  async mcpServerStatus(): Promise<import("@anthropic-ai/claude-agent-sdk").McpServerStatus[]> {
+    const names = this.capturedOptions?.allowedTools ?? [];
+    return names.length > 0 ? [{name:"codemux",status:"connected",tools:names.map(name=>({name:name.replace(/^mcp__codemux__/, "")}))}] : [];
   }
   async getContextUsage(): Promise<Record<string, never>> {
     return {};

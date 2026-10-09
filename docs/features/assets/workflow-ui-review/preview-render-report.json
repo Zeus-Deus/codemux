@@ -1,0 +1,711 @@
+{
+  "count": 24,
+  "status": "passed",
+  "viewport": {
+    "width": 1440,
+    "height": 900,
+    "deviceScaleFactor": 1
+  },
+  "reducedMotion": true,
+  "errors": [],
+  "external": [],
+  "failed": [],
+  "results": [
+    {
+      "file": "a-setup.png",
+      "letter": "a",
+      "state": "setup",
+      "actual": {
+        "state": "setup",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "a-running.png",
+      "letter": "a",
+      "state": "running",
+      "actual": {
+        "state": "running",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "a-paused.png",
+      "letter": "a",
+      "state": "paused",
+      "actual": {
+        "state": "paused",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "a-unknown.png",
+      "letter": "a",
+      "state": "unknown",
+      "actual": {
+        "state": "unknown",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "a-review.png",
+      "letter": "a",
+      "state": "review",
+      "actual": {
+        "state": "review",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "a-cancelled.png",
+      "letter": "a",
+      "state": "cancelled",
+      "actual": {
+        "state": "cancelled",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "b-setup.png",
+      "letter": "b",
+      "state": "setup",
+      "actual": {
+        "state": "setup",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "b-running.png",
+      "letter": "b",
+      "state": "running",
+      "actual": {
+        "state": "running",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "b-paused.png",
+      "letter": "b",
+      "state": "paused",
+      "actual": {
+        "state": "paused",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "b-unknown.png",
+      "letter": "b",
+      "state": "unknown",
+      "actual": {
+        "state": "unknown",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "b-review.png",
+      "letter": "b",
+      "state": "review",
+      "actual": {
+        "state": "review",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "b-cancelled.png",
+      "letter": "b",
+      "state": "cancelled",
+      "actual": {
+        "state": "cancelled",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "c-setup.png",
+      "letter": "c",
+      "state": "setup",
+      "actual": {
+        "state": "setup",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "c-running.png",
+      "letter": "c",
+      "state": "running",
+      "actual": {
+        "state": "running",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "c-paused.png",
+      "letter": "c",
+      "state": "paused",
+      "actual": {
+        "state": "paused",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "c-unknown.png",
+      "letter": "c",
+      "state": "unknown",
+      "actual": {
+        "state": "unknown",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "c-review.png",
+      "letter": "c",
+      "state": "review",
+      "actual": {
+        "state": "review",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "c-cancelled.png",
+      "letter": "c",
+      "state": "cancelled",
+      "actual": {
+        "state": "cancelled",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "d-setup.png",
+      "letter": "d",
+      "state": "setup",
+      "actual": {
+        "state": "setup",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "d-running.png",
+      "letter": "d",
+      "state": "running",
+      "actual": {
+        "state": "running",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "d-paused.png",
+      "letter": "d",
+      "state": "paused",
+      "actual": {
+        "state": "paused",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "d-unknown.png",
+      "letter": "d",
+      "state": "unknown",
+      "actual": {
+        "state": "unknown",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "d-review.png",
+      "letter": "d",
+      "state": "review",
+      "actual": {
+        "state": "review",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    },
+    {
+      "file": "d-cancelled.png",
+      "letter": "d",
+      "state": "cancelled",
+      "actual": {
+        "state": "cancelled",
+        "width": "normal",
+        "paneWidth": 500,
+        "embed": true,
+        "reviewStripHidden": true,
+        "fonts": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ],
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "errors": [],
+      "external": [],
+      "failed": []
+    }
+  ]
+}

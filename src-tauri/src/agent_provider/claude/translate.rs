@@ -1626,6 +1626,21 @@ fn translate_result(
         .and_then(|v| v.as_str())
         .unwrap_or("success");
     let status = match subtype {
+        // The CLI can report an API failure (including output truncation)
+        // with the success subtype. The explicit error flag takes precedence.
+        "success" if msg.get("is_error").and_then(|value| value.as_bool()) == Some(true) => {
+            TurnStatus::Error {
+                subtype: "error_result".into(),
+                message: msg
+                    .get("errors")
+                    .and_then(|value| value.as_array())
+                    .and_then(|values| values.first())
+                    .and_then(|value| value.as_str())
+                    .or_else(|| msg.get("result").and_then(|value| value.as_str()))
+                    .unwrap_or("Claude reported an error")
+                    .to_string(),
+            }
+        }
         "success" => TurnStatus::Success,
         "error_max_turns" => TurnStatus::MaxTurns,
         "error_max_budget_usd" => TurnStatus::MaxBudget,
@@ -2374,6 +2389,30 @@ mod tests {
             }
         } else {
             panic!("expected TurnCompleted");
+        }
+    }
+
+    #[test]
+    fn result_success_subtype_with_error_flag_preserves_failure_and_usage() {
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "turn_id": "t",
+            "result": "API Error: response exceeded the output token maximum",
+            "total_cost_usd": 0.002,
+            "usage": {},
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted { turn_id, status, usage, .. } => {
+                assert_eq!(turn_id.0, "t");
+                assert!(matches!(status, TurnStatus::Error { subtype, message }
+                    if subtype == "error_result"
+                        && message == "API Error: response exceeded the output token maximum"));
+                assert_eq!(usage.as_ref().unwrap().total_cost_usd, Some(0.002));
+            }
+            _ => panic!("expected failed TurnCompleted"),
         }
     }
 

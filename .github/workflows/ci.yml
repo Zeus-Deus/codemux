@@ -72,7 +72,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: "1.3.12"
 
       - name: Install sidecar dependencies
         shell: bash
@@ -94,6 +94,19 @@ jobs:
       - name: Sidecar unit tests
         shell: bash
         run: cd sidecar/claude-agent && bun test
+
+      - name: Managed workflow sidecar checks
+        shell: bash
+        run: |
+          cd sidecar/managed-workflow
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
+
+      - name: Hermes managed library boundary tests
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: python3 -m unittest discover -s sidecar/managed-workflow -p test_hermes.py
 
       - name: TypeScript typecheck
         run: npm run check
@@ -279,7 +292,7 @@ jobs:
         # `cargo check` fails tauri-build's externalBin validation.
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: "1.3.12"
 
       - name: Stage claude-agent sidecar binary
         shell: bash
@@ -307,6 +320,15 @@ jobs:
             touch "$DEST"
             chmod +x "$DEST" 2>/dev/null || true
           fi
+
+      - name: Stage managed workflow sidecar
+        shell: bash
+        run: bash scripts/build-managed-workflow-sidecar.sh --strict
+
+      - name: Managed workflow bundled native readiness
+        if: runner.os == 'Linux'
+        shell: bash
+        run: src-tauri/binaries/codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu --check-native
 
       - name: Stage agent-browser sidecar binary
         shell: bash

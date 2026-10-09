@@ -119,12 +119,23 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
       cwd,
       pathToClaudeCodeExecutable,
     };
+    const managed = optBoolean(p["managed"], "managed");
+    if (managed !== undefined) input.managed = managed;
     const model = optString(p["model"], "model");
     if (model !== undefined) input.model = model;
     const effort = optString(p["effort"], "effort");
     if (effort !== undefined) input.effort = effort;
     const fastMode = optBoolean(p["fastMode"], "fastMode");
     if (fastMode !== undefined) input.fastMode = fastMode;
+    for (const key of ["maxBudgetUsd", "maxTurns"] as const) {
+      const value = p[key];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 ||
+        (key === "maxTurns" && (!Number.isInteger(value) || value > 0xffff_ffff))) {
+        throw new InvalidParamsError(`${key} must be a finite positive ${key === "maxTurns" ? "32-bit integer" : "number"}`);
+      }
+      input[key] = value;
+    }
     const permissionMode = optString(p["permissionMode"], "permissionMode");
     if (permissionMode !== undefined) {
       input.permissionMode = permissionMode as PermissionMode;
@@ -185,6 +196,12 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
     }
 
     const session = new ClaudeSession(input, emit);
+    try {
+      await session.waitManagedReady();
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
     sessions.set(threadId, session);
     return {
       threadId,

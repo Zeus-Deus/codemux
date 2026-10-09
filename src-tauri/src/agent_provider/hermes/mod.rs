@@ -1,6 +1,7 @@
 //! Official Hermes ACP integration. Profile ownership and native history stay in Hermes.
 //! No Cursor/Grok authentication, fallback, full-access policy, or idle process reaping.
 pub mod binding;
+mod managed;
 pub mod profile;
 
 use super::*;
@@ -181,6 +182,7 @@ struct Runtime {
 struct Inner {
     runtimes: Mutex<HashMap<String, Arc<Runtime>>>,
     chats: Mutex<HashMap<ThreadId, Arc<Chat>>>,
+    managed_chats: Mutex<HashMap<ThreadId, Arc<super::managed_bridge::ManagedBridgeSession>>>,
     starts: Mutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
     runtime_starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     store: Arc<dyn BindingStore>,
@@ -196,6 +198,7 @@ impl HermesProvider {
             inner: Arc::new(Inner {
                 runtimes: Mutex::new(HashMap::new()),
                 chats: Mutex::new(HashMap::new()),
+                managed_chats: Mutex::new(HashMap::new()),
                 starts: Mutex::new(HashMap::new()),
                 runtime_starts: Mutex::new(HashMap::new()),
                 store,
@@ -241,6 +244,9 @@ impl HermesProvider {
             .ok_or_else(|| ProviderError::SessionNotFound {
                 thread_id: id.clone(),
             })
+    }
+    async fn managed_chat(&self, id: &ThreadId) -> Option<Arc<super::managed_bridge::ManagedBridgeSession>> {
+        self.inner.managed_chats.lock().await.get(id).cloned()
     }
     /// Discovery creates an unprompted native session through the same owned runtime.
     /// Hermes has no standalone model-catalog RPC. It is not imported as a Codemux chat.
@@ -795,6 +801,24 @@ impl AgentProvider for HermesProvider {
             ..Default::default()
         }
     }
+    fn managed_capabilities(&self) -> super::managed::ManagedCapabilities {
+        managed::capabilities()
+    }
+    async fn stop_managed_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let session = self
+            .inner
+            .managed_chats
+            .lock()
+            .await
+            .get(&thread_id)
+            .cloned();
+        let session = session.ok_or_else(|| ProviderError::SessionNotFound {
+            thread_id: thread_id.clone(),
+        })?;
+        session.shutdown_managed().await?;
+        self.inner.managed_chats.lock().await.remove(&thread_id);
+        Ok(())
+    }
     async fn start_session(
         &self,
         input: StartSessionInput,
@@ -808,6 +832,22 @@ impl AgentProvider for HermesProvider {
             .or_default()
             .clone();
         let _start = start_lock.lock().await;
+        if self.managed_chat(&input.thread_id).await.is_some() {
+            return Err(invalid("Hermes chat is already open"));
+        }
+        if let Some(context) = super::managed::lookup_session(&input.thread_id) {
+            if self.inner.chats.lock().await.contains_key(&input.thread_id) {
+                return Err(invalid("Hermes chat is already open"));
+            }
+            let session = managed::start(input, context, self.inner.events.clone()).await?;
+            let snapshot = session.provider_session().await;
+            self.inner
+                .managed_chats
+                .lock()
+                .await
+                .insert(session.thread_id.clone(), session);
+            return Ok(snapshot);
+        }
         if let Ok(chat) = self.chat(&input.thread_id).await {
             if chat.runtime.child.is_alive() && {
                 let s = chat.state.lock().await;
@@ -1084,6 +1124,9 @@ impl AgentProvider for HermesProvider {
         Ok(snapshot)
     }
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        if let Some(session) = self.managed_chat(&input.thread_id).await {
+            return session.send_turn(input).await;
+        }
         if input.effort_override.is_some()
             || input.permission_mode_override.is_some()
             || !input.images.is_empty()
@@ -1176,6 +1219,9 @@ impl AgentProvider for HermesProvider {
         thread_id: ThreadId,
         turn_id: Option<TurnId>,
     ) -> Result<(), ProviderError> {
+        if let Some(session) = self.managed_chat(&thread_id).await {
+            return session.interrupt().await;
+        }
         let chat = self.chat(&thread_id).await?;
         if turn_id.is_none() {
             let mut queue = chat.runtime.queue.lock().await;
@@ -1424,6 +1470,15 @@ impl AgentProvider for HermesProvider {
         self.inner.store.save(&b).map_err(invalid)
     }
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        if self
+            .inner
+            .managed_chats
+            .lock()
+            .await
+            .contains_key(&thread_id)
+        {
+            return self.stop_managed_session(thread_id).await;
+        }
         let Ok(chat) = self.chat(&thread_id).await else {
             return Ok(());
         };
@@ -1481,6 +1536,10 @@ impl AgentProvider for HermesProvider {
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         let chats: Vec<_> = self.inner.chats.lock().await.values().cloned().collect();
         let mut out = vec![];
+        let managed: Vec<_> = self.inner.managed_chats.lock().await.values().cloned().collect();
+        for session in managed {
+            out.push(session.provider_session().await);
+        }
         for chat in chats {
             let b = chat.binding.lock().await;
             out.push(ProviderSession {
@@ -1494,6 +1553,9 @@ impl AgentProvider for HermesProvider {
         Ok(out)
     }
     async fn has_session(&self, id: &ThreadId) -> bool {
+        if let Some(session) = self.managed_chat(id).await {
+            return !session.is_dead();
+        }
         match self.chat(id).await {
             Ok(c) => {
                 c.runtime.child.is_alive() && {
@@ -1505,6 +1567,9 @@ impl AgentProvider for HermesProvider {
         }
     }
     async fn turn_active(&self, id: &ThreadId) -> bool {
+        if let Some(session) = self.managed_chat(id).await {
+            return session.turn_active().await;
+        }
         match self.chat(id).await {
             Ok(c) => c.state.lock().await.active.is_some(),
             Err(_) => false,
@@ -1521,6 +1586,9 @@ impl AgentProvider for HermesProvider {
                 }
             }
         }))
+    }
+    fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
+        super::managed_bridge::event_stream(&self.inner.events, thread_id)
     }
 }
 

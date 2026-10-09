@@ -1,4 +1,4 @@
-// Inspect actual installer payloads, then execute only their bundled native host.
+// Inspect actual installer payloads, then run their host and token-free readiness.
 // This is a packaged-runtime gate, not a substitute for desktop GUI acceptance.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -8,6 +8,7 @@ import { cpus, platform, release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fault } from "./host-limits.mjs";
 import { verifyAppImageElf } from "./elf-provenance.mjs";
+import { verifyManagedSidecar } from "./managed-sidecar-provenance.mjs";
 const bundleRoot = resolve(
   process.argv[2] ?? "src-tauri/target/release/bundle",
 );
@@ -17,6 +18,9 @@ const hostName =
     ? "codemux-addon-host-windows-x64.exe"
     : "codemux-addon-host-linux-x64";
 const releaseHost = await readFile(`src-tauri/binaries/${hostName}`);
+const managedName = process.platform === "win32"
+  ? "codemux-managed-workflow-sidecar-x86_64-pc-windows-msvc.exe"
+  : `codemux-managed-workflow-sidecar-${process.arch === "arm64" ? "aarch64" : "x86_64"}-unknown-linux-gnu`;
 const expected = createHash("sha256").update(releaseHost).digest("hex");
 assert.match(
   await readFile(`src-tauri/binaries/.${hostName}.profile`, "utf8"),
@@ -82,6 +86,9 @@ try {
       "Installer must contain exactly one platform host",
     );
     const host = hosts[0];
+    const sidecars = (await files(unpack)).filter((file) => file.endsWith(managedName));
+    assert.equal(sidecars.length, 1, "Installer must contain exactly one platform managed sidecar");
+    const managedSidecar = await verifyManagedSidecar(`src-tauri/binaries/${managedName}`, sidecars[0]);
     const packagedBytes = await readFile(host);
     const packagedSha256 = createHash("sha256")
       .update(packagedBytes)
@@ -114,6 +121,7 @@ try {
       format,
       packagedSha256,
       provenance,
+      managedSidecar,
       hostPath: host.slice(unpack.length + 1),
       faults,
     });
@@ -134,7 +142,7 @@ try {
     JSON.stringify(evidence, null, 2) + "\n",
   );
   console.log(
-    "PASS: installer host provenance, clean-environment SDK callbacks and packaged hostile-runtime deadlines",
+    "PASS: installer host/sidecar provenance, token-free native readiness, SDK callbacks and packaged hostile-runtime deadlines",
   );
 } finally {
   await rm(root, {

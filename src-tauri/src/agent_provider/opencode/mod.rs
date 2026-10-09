@@ -59,6 +59,7 @@ pub mod capabilities;
 pub mod client;
 pub mod discovery;
 pub mod manager;
+pub mod managed;
 pub mod protocol;
 pub mod server;
 pub mod session;

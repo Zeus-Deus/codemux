@@ -2,6 +2,7 @@ import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
+  Network,
   Check,
   ListTodo,
   LoaderCircle,
@@ -88,6 +89,8 @@ interface Props {
   tasks?: { completed: number; total: number; running?: boolean } | null;
   tasksOpen?: boolean;
   onTasksClick?: () => void;
+  onWorkflowsClick?: () => void;
+  workflowsOpen?: boolean;
   /** Content for the flexible gap between the attach button and the
    *  right-pinned controls: the placeholder while the pill is collapsed,
    *  "Enter to queue" while expanded. */
@@ -153,6 +156,8 @@ export function ComposerFooter({
   tasks = null,
   tasksOpen = false,
   onTasksClick,
+  onWorkflowsClick,
+  workflowsOpen = false,
   gap = null,
   onGapPointerDown,
   showContextMeter = true,
@@ -219,6 +224,9 @@ export function ComposerFooter({
       </div>
 
       <div className="flex min-w-0 items-center gap-1">
+        {onWorkflowsClick && (
+          <button type="button" data-testid="composer-workflows-toggle" aria-label="Open dynamic workflows" aria-pressed={workflowsOpen} title="Dynamic workflows" onClick={onWorkflowsClick} className={cn("inline-flex size-[28px] shrink-0 items-center justify-center rounded-lg transition-colors duration-100", workflowsOpen ? "bg-surface-3 text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground")}><Network className="size-3.5" aria-hidden /></button>
+        )}
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
             {/* Reports run state rather than reading as a setting: amber +

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup B · Lanes — CodeMux workflow UI (illustrative)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3C%2Fsvg%3E">
+<link rel="stylesheet" href="assets/app.css">
+<style>
+  .cap-line { padding: 10px 14px 4px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; font-size: var(--t-body-sm); }
+  .cap-line b { font-weight: 600; }
+  .lanes { padding: 6px 14px 4px; display: grid; grid-template-columns: 62px 1fr; row-gap: 5px; }
+  .ln { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); align-self: center; line-height: 1.2; }
+  .ln b { display: block; color: var(--foreground); font-weight: 500; }
+  .trk { position: relative; height: 30px; border-radius: 6px; background: var(--surface-1); }
+  .trk.thin { height: 20px; background: transparent; border: 1px dashed var(--hairline-strong); }
+  .blk { position: absolute; top: 3px; bottom: 3px; min-width: 5px; border-radius: 5px; display: flex; align-items: center; gap: 4px; padding: 0 6px; overflow: hidden; white-space: nowrap; font-family: var(--font-code); font-size: var(--t-caption); background: var(--surface-3); color: var(--foreground); border: 1px solid transparent; }
+  .blk:hover { filter: brightness(1.25); }
+  .blk[aria-selected="true"] { outline: 2px solid var(--accent-ember); outline-offset: 0; z-index: 2; }
+  .blk:focus-visible { outline: 2px solid color-mix(in oklch, var(--ring) 85%, white 15%); z-index: 3; }
+  .blk.running { background: color-mix(in oklch, var(--status-working) 16%, transparent); border-color: color-mix(in oklch, var(--status-working) 50%, transparent); }
+  .blk.draining { border-style: dashed; }
+  .blk.failed { background: color-mix(in oklch, var(--status-attention) 12%, transparent); border-color: color-mix(in oklch, var(--status-attention) 55%, transparent); }
+  .blk.unknown { background: repeating-linear-gradient(-45deg, color-mix(in oklch, var(--status-attention) 26%, transparent) 0 5px, transparent 5px 10px); border-color: var(--status-attention); }
+  .blk.cancelled { background: transparent; border: 1px dashed var(--hairline-strong); color: var(--muted-foreground); }
+  .blk.waiting, .blk.coord { background: color-mix(in oklch, var(--status-monitoring) 12%, transparent); }
+  .trk.thin .blk { top: 2px; bottom: 2px; background: transparent; border: 1px dashed color-mix(in oklch, var(--status-monitoring) 55%, transparent); color: var(--status-monitoring); }
+  .now { position: absolute; top: -4px; bottom: -4px; right: 0; width: 0; border-right: 1px solid var(--accent-ember); }
+  .axis { position: relative; height: 16px; font-family: var(--font-code); font-size: 0.625rem; color: var(--muted-foreground); }
+  .axis span { position: absolute; transform: translateX(-50%); top: 2px; }
+  .queue { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-height: 20px; }
+  .legend { padding: 2px 14px 10px 76px; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: var(--t-caption); color: var(--muted-foreground); }
+  .legend i { display: inline-block; width: 14px; height: 9px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; border: 1px solid transparent; }
+  .nowlist { margin: 0; padding: 4px 14px 10px; list-style: none; display: grid; gap: 4px; border-bottom: 1px solid var(--hairline); }
+  .nowlist li { display: grid; grid-template-columns: 62px 1fr; gap: 8px; font-size: var(--t-body-sm); }
+  .nowlist li > span:first-child { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); padding-top: 2px; }
+  .sheet-h { padding: 10px 14px 0; display: flex; gap: 8px; align-items: center; }
+  .b-split { display: grid; grid-template-columns: 1fr minmax(360px, 42%); min-height: 100%; }
+  .b-split > div + div { border-left: 1px solid var(--hairline); }
+  .deck[data-width="narrow"] .blk .lbl-x { display: none; }
+</style>
+</head>
+<body>
+<noscript><p style="padding:20px">This interactive mockup needs JavaScript.</p></noscript>
+<script src="assets/kit.js"></script>
+<script>
+(function () {
+  const { ic, esc, t, k, stat, usageLine, runControls, runMeta, taskDetail, filesView, ledger, tokLine } = K;
+  const S = K.S;
+  S.extra.att = null;
+  const pct = (v, now) => (100 * v) / now;
+  function yielded(s) {
+    const cs = s.attempts.filter((a) => a.task === "coordinator"), out = [];
+    cs.forEach((a, i) => { if (a.status === "waiting" && a.end !== null) { const nx = cs[i + 1]; const end = nx ? nx.start : (["waiting"].includes(s.tasks.coordinator.status) ? s.now : a.end); if (end > a.end) out.push([a.end, end, !nx]); } });
+    return out;
+  }
+  function label(a) { return `${a.task}${a.task === "coordinator" ? " " + a.n : a.gen > 1 ? " g" + a.gen : a.n > 1 ? " #" + a.n : ""}`; }
+  function block(a, s) {
+    const end = a.end === null ? s.now : a.end, cls = a.task === "coordinator" && a.status !== "running" ? "coord" : a.status;
+    const word = a.status === "waiting" ? "turn ended, yielded" : a.status === "unknown" ? "unknown, slot held" : a.draining ? "running, draining" : K.ST[a.status][2];
+    const al = `${label(a)}, ${a.route}, slot ${a.slot}, ${t(a.start)} to ${a.end === null ? "now" : t(a.end)}, ${word}`;
+    const sel = S.extra.att === a.id;
+    return `<div class="blk ${cls} ${a.draining ? "draining" : ""}" role="option" aria-selected="${sel}" tabindex="${sel ? 0 : -1}" aria-label="${esc(al)}" data-act="pick" data-arg="${a.id}" data-fk="blk-${a.id}" style="left:${pct(a.start, s.now)}%;width:calc(${pct(end - a.start, s.now)}% - 2px)">
+      ${a.status === "failed" ? ic("x", 10, "bad") : a.status === "unknown" ? ic("help", 10, "bad") : a.status === "succeeded" ? ic("check", 10, "ok") : ""}<span class="lbl-x">${esc(label(a))}</span></div>`;
+  }
+  function lanes(s) {
+    const step = s.now > 600 ? 240 : 120, ticks = []; for (let x = 0; x <= s.now - 40; x += step) ticks.push(x);
+    const queued = s.order.filter((id) => s.tasks[id].status === "queued");
+    const y = yielded(s);
+    return `<div class="lanes" role="group" aria-label="Worker slots over time">
+      <span></span><div class="axis" aria-hidden="true">${ticks.map((x) => `<span style="left:${pct(x, s.now)}%">${t(x)}</span>`).join("")}<span style="left:auto;right:0;transform:none" class="ember">now ${t(s.now)}</span></div>
+      <div role="listbox" aria-label="Attempts by slot, oldest first. Arrow keys move; Enter inspects." style="grid-column:1/3;display:grid;grid-template-columns:62px 1fr;row-gap:5px">
+      ${[1, 2].map((n) => { const sl = s.slots[n - 1]; return `<span class="ln"><b>Slot ${n}</b>${sl.held ? '<span class="bad">held</span>' : sl.attempt ? '<span class="work">busy</span>' : "free"}</span><div class="trk">${s.attempts.filter((a) => a.slot === n).map((a) => block(a, s)).join("")}<span class="now" aria-hidden="true"></span></div>`; }).join("")}
+      </div>
+      <span class="ln"><b>Yielded</b>no slot</span><div class="trk thin">${y.map(([a, b, open]) => `<div class="blk" aria-hidden="true" style="left:${pct(a, s.now)}%;width:calc(${pct(b - a, s.now)}% - 2px)"><span class="lbl-x">coordinator waiting</span></div>`).join("")}</div>
+      <span class="ln"><b>Queue</b>${queued.length}</span><div class="queue">${queued.length ? queued.map((id) => { const tk = s.tasks[id]; return `<button class="chip" data-act="pickTask" data-arg="${id}" data-fk="q-${id}">${ic("circle", 10)}${id} · needs ${tk.waitingFor.join(", ")}${tk.held ? " · admission paused" : ""}</button>`; }).join("") : '<span class="cap muted">empty</span>'}</div>
+    </div>
+    <div class="legend" aria-hidden="true"><span><i style="background:color-mix(in oklch,var(--status-working) 16%,transparent);border-color:var(--status-working)"></i>running</span><span><i style="background:var(--surface-3)"></i>done</span><span><i style="border-color:var(--status-attention)"></i>failed</span><span><i style="background:repeating-linear-gradient(-45deg,color-mix(in oklch,var(--status-attention) 40%,transparent) 0 3px,transparent 3px 6px);border-color:var(--status-attention)"></i>held · unknown</span><span><i style="border:1px dashed var(--status-monitoring)"></i>yielded</span></div>`;
+  }
+  function nowList(s) {
+    const rows = s.slots.map((sl) => { const a = sl.attempt && s.att[sl.attempt];
+      return `<li><span>Slot ${sl.n}</span><span>${a ? `${stat(a.status, a.status === "unknown" ? "held — unknown" : a.draining ? "draining" : "running")} <b style="font-weight:500">${esc(K.TASKS[a.task].title)}</b> <span class="mono cap muted">${a.route} · ${t(s.now - a.start)}</span>${a.status === "unknown" ? `<span class="why" style="display:block">Counts toward the ceiling until Reconcile proves it stopped.</span>` : ""}` : `<span class="muted">free${s.status === "paused" ? " — admission paused" : s.status === "completed" || s.status === "cancelled" ? "" : " — next admission when a task is ready"}</span>`}</span></li>`; });
+    const c = s.tasks.coordinator;
+    rows.push(`<li><span>Coordinator</span><span>${c.status === "waiting" ? `${stat("waiting", "yielded")} <span class="sm">waiting for ${c.waitingFor.join(", ")} — holds no slot; resumes in the next free one</span>` : stat(c.status)}</span></li>`);
+    return `<ul class="nowlist" aria-label="What each slot is doing now">${rows.join("")}</ul>`;
+  }
+  function needsBanner(s) {
+    return s.needs.map((n) => `<div class="banner ${n.kind === "paused" ? "work" : n.kind === "cancelled" ? "" : "bad"}" role="note"><span class="sm">${esc(n.text)}</span>${n.act ? `<div class="row-acts"><button class="btn sm" data-act="${n.act}" data-arg="${n.task || ""}" data-fk="nb-${n.act}">${{ resume: "Resume", reconcile: "Reconcile task", retry: "Retry task" }[n.act]}</button>${K.mockTag}</div>` : ""}</div>`).join("");
+  }
+  function sheet(s) {
+    if (S.view === "files") return filesView(S.artifact, s, { back: "Back to attempt" });
+    const a = S.extra.att && s.att[S.extra.att];
+    const id = a ? a.task : S.sel;
+    if (!id) return `<div class="td"><div class="eyebrow">What is verified</div>${ledger(s)}<p class="lbl muted" style="margin:0">Select an attempt block or a queued task to inspect it.</p></div>`;
+    const head = a ? `<div class="sheet-h"><span class="eyebrow">Selected attempt</span><span class="mono cap muted">#${a.n} · slot ${a.slot} · ${t(a.start)}–${a.end === null ? "now" : t(a.end)}</span><span style="margin-left:auto">${tokLine(a)}</span></div>` : "";
+    return head + taskDetail(id, s, { back: S.width === "expanded" ? null : "Close" });
+  }
+  K.mount({
+    letter: "B", name: "Lanes", tagline: "organized by who holds capacity, over time",
+    setup: (s) => K.setupView(s, { order: ["limits", "routes", "goal", "script", "writes", "launch"],
+      head: `<div><h3 tabindex="-1" id="td-title">New workflow</h3><p class="why" style="margin:4px 0 0">Capacity comes first: the worker ceiling sets how many lanes the run gets. Routes decide who can take a lane.</p></div>` }),
+    act(a, arg) {
+      if (a === "pick") { S.extra.att = arg; S.sel = s0().att[arg].task; S.view = "task"; return true; }
+      if (a === "pickTask") { S.extra.att = null; S.sel = arg; S.view = "task"; K.focusAfter("#td-title"); return true; }
+      if (a === "select") { const s = s0(); const tk = s.tasks[arg]; S.extra.att = tk && tk.current ? tk.current.id : null; S.sel = arg; S.view = "task"; K.focusAfter("#td-title"); return true; }
+      if (a === "back") { if (S.view === "files") { S.view = "task"; K.focusAfter("#td-title"); } else { const f = S.extra.att; S.view = "run"; S.extra.att = null; S.sel = null; K.focusAfter(f ? `[data-fk="blk-${f}"]` : "#pane"); } return true; }
+      if (a === "state") S.extra.att = null;
+    },
+    render(s) {
+      const m = runMeta(s);
+      const top = `<div class="runbar"><div class="runbar-top"><h2>Refactor session recovery</h2>${m.html}</div>
+        <div class="meta"><span>phase ${s.phase}</span><span>${t(s.now)} elapsed</span><button class="chip" data-act="setup" data-fk="rb-setup">${ic("settings", 11)}setup & limits</button></div>${runControls(s)}</div>
+        ${needsBanner(s)}
+        <div class="cap-line"><b>${s.busy} of 2 slots in use</b><span class="muted lbl">ceiling 2 · host 8 · waiting coordinators don't count</span></div>
+        ${lanes(s)}${nowList(s)}<p class="tok" style="padding:8px 14px 10px;margin:0">${usageLine(s.usage)}</p>`;
+      if (S.width === "expanded") return `<div class="b-split"><div>${top}</div><div>${sheet(s)}</div></div>`;
+      return top + `<div style="border-top:1px solid var(--hairline)">${sheet(s)}</div>`;
+    },
+    after() { const lb = document.querySelector('#pane [role="listbox"]'); if (lb && !lb.querySelector('[tabindex="0"]')) { const o = lb.querySelector('[role="option"]'); if (o) o.tabIndex = 0; } }
+  });
+  function s0() { return K.snap(); }
+})();
+</script>
+</body>
+</html>

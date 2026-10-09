@@ -130,7 +130,7 @@ jobs:
         # targets glibc 2.31+, which the runner satisfies.
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.2.21"
+          bun-version: "1.3.12"
 
       - name: Stage claude-agent sidecar binary
         # Mirrors the agent-browser stage below: explicit pre-stage
@@ -154,6 +154,16 @@ jobs:
             ls -la src-tauri/binaries/ || true
             exit 1
           fi
+
+      - name: Stage managed workflow sidecar
+        # SDK code and native assets ship together; no install happens at runtime.
+        shell: bash
+        run: bash scripts/build-managed-workflow-sidecar.sh --strict
+
+      - name: Managed workflow bundled native readiness
+        if: runner.os == 'Linux'
+        shell: bash
+        run: src-tauri/binaries/codemux-managed-workflow-sidecar-x86_64-unknown-linux-gnu --check-native
 
       - name: Stage agent-browser sidecar binary
         # `shell: bash` works on both Linux and windows-latest because Git

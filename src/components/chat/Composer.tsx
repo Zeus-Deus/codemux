@@ -1,3 +1,6 @@
+import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { usePopupArrowNavigation } from "./use-popup-arrow-navigation";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
@@ -486,6 +489,10 @@ export function Composer({
 }: Props) {
   const connectionStatus = useRemoteConnectionStore(s => s.status);
   const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
+  const workflowsEnabled = useFeatureFlags((state) => state.enableAgentChat);
+  const workflowWorkspace = useAppStore((state) => workspaceId ? state.appState?.workspaces.find((workspace) => workspace.workspace_id === workspaceId) : undefined);
+  const workflowsAvailable = workflowsEnabled && !!workflowWorkspace && !workflowWorkspace.host_id && !workflowWorkspace.attach_only && !isRemoteClient();
+  const workflowsOpen = useUIStore((state) => workspaceId ? state.rightPanelTabs[workspaceId] === "workflows" : false);
   const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
   const addonActions = useAddonComposerActions(addonComposer);
   const configurationEnabled = sessionReady && configurationReady;
@@ -3609,6 +3616,8 @@ export function Composer({
             tasks={tasks}
             tasksOpen={tasksOpen}
             onTasksClick={onTasksClick}
+            workflowsOpen={workflowsOpen}
+            onWorkflowsClick={workspaceId && workflowsAvailable ? () => useUIStore.getState().setRightPanelTab(workspaceId, "workflows") : undefined}
             gap={
               !expanded ? (
                 <span

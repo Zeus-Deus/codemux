@@ -14,6 +14,7 @@ import {
   type SessionStartInput,
 } from "../src/session.ts";
 import { asQuery, FakeQuery } from "./fake-query.ts";
+import { buildMethods, _resetSessionsForTests } from "../src/methods/index.ts";
 
 interface RecordedNotification {
   method: string;
@@ -125,6 +126,144 @@ test("session starts with minimal options and emits session-configured", () => {
   expect(fake.capturedOptions?.includePartialMessages).toBe(true);
 });
 
+test("managed workflows expose only virtual tools and ignore native settings", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput({
+    managed: true,
+    effort: "ultracode",
+    settings: { hooks: { PreToolUse: ["unsafe"] }, ultracode: true },
+    extraArgs: { tools: "Bash,Agent", "plugin-dir": "/tmp/plugin" },
+    permissionMode: "bypassPermissions",
+    additionalDirectories: ["/tmp/outside"],
+    resume: "old-unscoped-session",
+    mcpTools: [{ name: "workflow_submit_result", prefixedName: "workflow_submit_result", description: "submit", inputSchema: { type: "object" }, serverId: "workflow" }],
+  }), emit);
+  const options = fake.capturedOptions;
+  expect(options?.tools).toEqual([]);
+  expect(options?.env?.ENABLE_TOOL_SEARCH).toBe("false");
+  expect(options?.env?.MCP_CONNECTION_NONBLOCKING).toBe("0");
+  expect(options?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
+  expect(options?.settingSources).toEqual([]);
+  expect(options?.strictMcpConfig).toBe(true);
+  expect(options?.plugins).toEqual([]);
+  expect(options?.extraArgs).toEqual({});
+  expect(options?.additionalDirectories).toEqual([]);
+  expect(options?.resume).toBeUndefined();
+  expect(options?.permissionMode).toBe("default");
+  expect(options?.settings).toEqual({ disableAllHooks: true, ultracode: false });
+  expect(options?.allowedTools).toEqual(["mcp__codemux__workflow_submit_result"]);
+  expect((await options!.canUseTool!("Bash", { command: "unsafe" }, { signal: new AbortController().signal, toolUseID: "native" })).behavior).toBe("deny");
+  expect((await options!.canUseTool!("mcp__codemux__workflow_submit_result", { output: true }, { signal: new AbortController().signal, toolUseID: "virtual" })).behavior).toBe("allow");
+  await session.close();
+});
+
+test("managed MCP discovery override preserves environment and does not affect ordinary chats", async () => {
+  const { emit } = recordingEmitter();
+  const oldSearch = process.env.ENABLE_TOOL_SEARCH;
+  const oldConnect = process.env.MCP_CONNECTION_NONBLOCKING;
+  const oldCloudMcp = process.env.ENABLE_CLAUDEAI_MCP_SERVERS;
+  process.env.ENABLE_TOOL_SEARCH = "true";
+  process.env.MCP_CONNECTION_NONBLOCKING = "1";
+  process.env.ENABLE_CLAUDEAI_MCP_SERVERS = "true";
+  try {
+    const managed = new ClaudeSession(minimalInput({ managed: true }), emit);
+    expect(fake.capturedOptions?.env?.ENABLE_TOOL_SEARCH).toBe("false");
+    expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("0");
+    expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
+    expect(fake.capturedOptions?.env?.PATH).toBe(process.env.PATH);
+    expect(fake.capturedOptions?.tools).toEqual([]);
+    await managed.close();
+    const ordinary = new ClaudeSession(minimalInput(), emit);
+    expect(fake.capturedOptions?.env?.ENABLE_TOOL_SEARCH).toBe("true");
+    expect(fake.capturedOptions?.env?.MCP_CONNECTION_NONBLOCKING).toBe("1");
+    expect(fake.capturedOptions?.env?.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("true");
+    expect(fake.capturedOptions?.tools).toBeUndefined();
+    await ordinary.close();
+  } finally {
+    if (oldSearch === undefined) delete process.env.ENABLE_TOOL_SEARCH;
+    else process.env.ENABLE_TOOL_SEARCH = oldSearch;
+    if (oldConnect === undefined) delete process.env.MCP_CONNECTION_NONBLOCKING;
+    else process.env.MCP_CONNECTION_NONBLOCKING = oldConnect;
+    if (oldCloudMcp === undefined) delete process.env.ENABLE_CLAUDEAI_MCP_SERVERS;
+    else process.env.ENABLE_CLAUDEAI_MCP_SERVERS = oldCloudMcp;
+  }
+});
+
+test("start-session RPC forwards the host managed flag to SDK isolation", async () => {
+  const { emit } = recordingEmitter();
+  const methods = buildMethods(emit);
+  try {
+    await methods["start-session"]!({
+      threadId: "managed-rpc",
+      cwd: "/tmp/fake-checkout",
+      pathToClaudeCodeExecutable: "/fake/claude",
+      managed: true,
+      maxBudgetUsd: 0.2,
+      maxTurns: 6,
+      extraArgs: { tools: "Bash" },
+    });
+    expect(fake.capturedOptions?.tools).toEqual([]);
+    expect(fake.capturedOptions?.settingSources).toEqual([]);
+    expect(fake.capturedOptions?.extraArgs).toEqual({});
+    expect(fake.capturedOptions?.maxBudgetUsd).toBe(0.2);
+    expect(fake.capturedOptions?.maxTurns).toBe(6);
+    await methods["stop-session"]!({ threadId: "managed-rpc" });
+  } finally {
+    _resetSessionsForTests();
+  }
+});
+
+test("start-session rejects invalid native budget and turn caps", async () => {
+  const { emit } = recordingEmitter();
+  const methods = buildMethods(emit);
+  for (const limits of [
+    { maxBudgetUsd: 0 }, { maxBudgetUsd: -1 }, { maxBudgetUsd: "0.2" },
+    { maxBudgetUsd: Infinity }, { maxBudgetUsd: NaN },
+    { maxTurns: 0 }, { maxTurns: -1 }, { maxTurns: 1.5 }, { maxTurns: 2 ** 32 },
+  ]) {
+    await expect(methods["start-session"]!({
+      threadId: "invalid-budget", cwd: "/tmp/fake-checkout",
+      pathToClaudeCodeExecutable: "/fake/claude", ...limits,
+    })).rejects.toThrow("must be a finite positive");
+  }
+});
+
+test("managed start ACK waits for SDK initialization and the captured MCP catalog", async () => {
+  let initialize!: () => void;
+  const initialized = new Promise<void>(resolve => { initialize = resolve; });
+  setQueryFactoryForTests(args => {
+    fake = new FakeQuery(args);
+    fake.initializationResult = async () => { await initialized; return {}; };
+    return asQuery(fake);
+  });
+  const { emit } = recordingEmitter();
+  const methods = buildMethods(emit);
+  try {
+    let acknowledged = false;
+    const started = methods["start-session"]!({threadId:"ready-test",cwd:"/tmp/fake",pathToClaudeCodeExecutable:"/fake/claude",managed:true,mcpTools:[{name:"workflow_submit_result",prefixedName:"workflow_submit_result",description:"submit",serverId:"workflow",inputSchema:{type:"object"}}]}).then(() => { acknowledged=true; });
+    await new Promise(resolve=>setTimeout(resolve,10));
+    expect(acknowledged).toBe(false);
+    expect(fake.capturedPrompts).toHaveLength(0);
+    initialize();
+    await started;
+    expect(acknowledged).toBe(true);
+    await methods["stop-session"]!({threadId:"ready-test"});
+  } finally { _resetSessionsForTests(); }
+});
+
+test("managed start rejects a connected catalog with missing captured tools", async () => {
+  setQueryFactoryForTests(args => {
+    fake = new FakeQuery(args);
+    fake.mcpServerStatus = async () => [{name:"codemux",status:"connected",tools:[]}];
+    return asQuery(fake);
+  });
+  const { emit } = recordingEmitter();
+  const methods = buildMethods(emit);
+  await expect(methods["start-session"]!({threadId:"missing-test",cwd:"/tmp/fake",pathToClaudeCodeExecutable:"/fake/claude",managed:true,mcpTools:[{name:"workflow_wait",prefixedName:"workflow_wait",description:"wait",serverId:"workflow",inputSchema:{type:"object"}}]})).rejects.toThrow("catalog does not match");
+  expect(fake.closed).toBe(true);
+  expect(fake.capturedPrompts).toHaveLength(0);
+});
+
 test("fast mode is scoped to the current session and wins over raw settings", () => {
   const { emit } = recordingEmitter();
   new ClaudeSession(
@@ -149,6 +288,41 @@ test("sendTurn enqueues a user message that the fake query receives", async () =
   await new Promise((r) => setTimeout(r, 10));
   expect(fake.capturedPrompts.length).toBe(1);
   expect(fake.capturedPrompts[0]?.type).toBe("user");
+  await session.close();
+});
+
+test("unchanged first-turn model does not block on the uninitialized SDK control channel", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput({ model: "configured-model" }), emit);
+  fake.setModel = () => new Promise<void>(() => {});
+  const accepted = await Promise.race([
+    session.sendTurn({ text: "first prompt", modelOverride: "configured-model" }).then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  expect(accepted).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(fake.capturedPrompts[0]?.message.content).toBe("first prompt");
+  await session.close();
+});
+
+test("changed per-turn model still uses the SDK control channel", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput({ model: "configured-model" }), emit);
+  await session.sendTurn({ text: "next prompt", modelOverride: "other-model" });
+  expect(fake.setModelCalls).toEqual(["other-model"]);
+  await session.close();
+});
+
+test("per-turn model A to B to A restores the actual live model", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput({ model: "A" }), emit);
+  await session.sendTurn({ text: "first", modelOverride: "A" });
+  await session.sendTurn({ text: "second", modelOverride: "B" });
+  await session.sendTurn({ text: "third", modelOverride: "A" });
+  expect(fake.setModelCalls).toEqual(["B", "A"]);
+  await session.setModel("B");
+  await session.sendTurn({ text: "fourth", modelOverride: "A" });
+  expect(fake.setModelCalls).toEqual(["B", "A", "B", "A"]);
   await session.close();
 });
 

@@ -3,6 +3,7 @@
 // only these verified files and never a second, unverified build.
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { tauriBuildEnv } from "../tauri-env.mjs";
 
 const require = createRequire(import.meta.url);
 function run(args, env = process.env) {
@@ -17,7 +18,7 @@ if (
   args.some((arg) => /^(-d|--debug|-t|--target)(=|$)/.test(arg))
 )
   throw Error("Usage: verified-tauri-build.mjs build [bundle options]");
-run([require.resolve("@tauri-apps/cli/tauri.js"), ...args]);
+run([require.resolve("@tauri-apps/cli/tauri.js"), ...args], tauriBuildEnv(args));
 // Inspecting and executing the packaged host needs no signing or upload token.
 const secret =
   /^(TAURI_SIGNING_|ACTIONS_ID_TOKEN_)|^(GITHUB_TOKEN|GH_TOKEN|ACTIONS_RUNTIME_TOKEN)$/i;

@@ -1,0 +1,76 @@
+{
+  "observed_at_utc": "2026-10-09 08:52:31 UTC",
+  "validation_kind": "token_free_production_host_integration",
+  "command": "TAURI_CONFIG='{\"bundle\":{\"externalBin\":[],\"resources\":[]}}' CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j 2 --manifest-path src-tauri/Cargo.toml --lib workflow_runtime_ -- --test-threads=2",
+  "observed_result": {"passed": 4, "failed": 0, "test_execution_seconds": 0.22},
+  "host_components": ["WorkflowService", "SQLite workflow store", "production admission scheduler", "LiveWorkflowDriver", "captured managed graph/file/result tools", "ArtifactStore", "QuickJS orchestration runtime"],
+  "providers": {"kind": "deterministic AgentProvider trait fixtures", "configured_route_labels": ["claude", "codex"], "real_model_turns": 0, "real_model_tokens": 0, "network_calls": 0, "provider_subprocesses": 0},
+  "cases": [
+    {"name": "mixed_route_coordinator_capacity_one", "status": "passed", "proof": [
+      "Six ordered live-host attempts: Claude coordinator, Codex accepted child, failed Claude child, Claude repair continuation, Codex generation-2 repair, Claude synthesis continuation.",
+      "Peak admitted fixture sessions stayed at one. Parent yielded twice, releasing capacity so children could execute.",
+      "Repeated child-spawn identity produced three tasks rather than duplicate children. The accepted child executed once.",
+      "Captured host tools rejected a child scope outside the parent scope and an out-of-scope file write.",
+      "A failed child result reached the coordinator; replacement changed its generation and route, and next-attempt guidance reached the repaired child.",
+      "An accepted child artifact was read and imported into the coordinator checkout before another yield. The next continuation retained those imported files.",
+      "On continuation 3, a fresh ready wait for the older successful sibling authorizes reading its accepted artifact even though that sibling was absent from the last dispatched wait set.",
+      "At a quiescent paused checkpoint, reopening SQLite admitted no work until explicit resume. Completed sibling work was not repeated.",
+      "Final artifact contained src/accepted.txt, src/repaired.txt and src/summary.txt. Source files stayed unchanged until accepted-attempt integration; repeated integration preserved the installed result and outside-scope file.",
+      "Every retained old managed context rejected late result submission after execution stopped. Observed fixture accounting was zero tokens and zero cost."]},
+    {"name": "cancel_unknown_recovery_hold", "status": "passed", "proof": [
+      "A live-host attempt wrote only to its private checkout, then deliberately refused to certify stop after cancellation.",
+      "The attempt became Unknown, retained its 4096-token admission reservation, blocked the queued successor and refused retry.",
+      "Late file and result callbacks were denied. The unaccepted artifact stayed unsealed and source remained untouched.",
+      "Reopening SQLite preserved the hold. An unsuccessful reconciliation did not admit the successor.",
+      "Only explicit fixture-verified stop plus host reconciliation released the reservation. The successor then ran once through the other route.",
+      "There were two fixture turns total and peak active sessions stayed at one."]},
+    {"name": "quickjs_live_tool_coordination", "status": "passed", "proof": [
+      "QuickJS programmatically created children through journaled host calls, used Claude/Codex-labelled routes and waited for typed results.",
+      "The script observed a controlled failed child, added guidance, replaced it with generation 2 on the other route and awaited successful repair.",
+      "A declared-dependency synthesis worker imported both accepted artifacts through captured live file tools and submitted its JSON result.",
+      "Four fixture turns produced three tasks; the accepted sibling executed once and the repaired child retained both attempt records.",
+      "Final script result persisted its input marker and synthesized output. Database reopen preserved Completed state.",
+      "Replaying the creation identity and asking to start the completed pinned script produced no additional turns.",
+      "Observed fixture accounting was zero tokens and zero cost; peak admitted sessions did not exceed two. Source checkout remained unchanged."]},
+    {"name": "runtime_single_owner_lock", "status": "passed", "proof": [
+      "A second workflow runtime owner was rejected while the temporary owner lock was held; ownership became available after explicit drop."]}
+  ],
+  "additional_regression": {
+    "name": "later_continuation_ready_wait_for_older_successful_sibling",
+    "status": "passed_after_fix",
+    "purpose": "Verify that a later parent continuation can freshly wait for and access an already-completed sibling artifact, even when that sibling was absent from the last dispatched wait set.",
+    "baseline": {
+      "passed": 0, "failed": 1,
+      "observed_error": "artifact access requires a declared or awaited dependency",
+      "valid_scope": "src/accepted.txt is inside the coordinator src scope",
+      "observed_precondition": "workflow_wait returned ready for accepted generation 1 on parent continuation 3",
+      "note": "The deterministic fixture asserts valid tool calls succeed; its assertion failure left the run Unknown with an admission hold, as required by panic recovery.",
+      "command": "TAURI_CONFIG='{\"bundle\":{\"externalBin\":[],\"resources\":[]}}' CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j 2 --manifest-path src-tauri/Cargo.toml --lib workflow_runtime_mixed_routes_repair_yield_import_and_reopen_with_capacity_one -- --test-threads=2"
+    },
+    "post_fix": {
+      "command": "TAURI_CONFIG='{\"bundle\":{\"externalBin\":[],\"resources\":[]}}' CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j 2 --manifest-path src-tauri/Cargo.toml --lib workflow_runtime_ -- --test-threads=2",
+      "suite_passed": 4, "suite_failed": 0,
+      "reported_by": "executor-owner agent, confirmed by coordinating agent",
+      "proof": [
+        "The stricter capacity-one coordinator case successfully waits for accepted generation 1 on continuation 3, after the last dispatched wait set contained only the repaired child.",
+        "Host-observed successful wait generations grant current-generation dependency access; reading src/accepted.txt succeeds within the coordinator src scope.",
+        "The remaining repair, pause/reopen, artifact integration, unknown-stop and QuickJS assertions continue to pass."],
+      "direct_reverification": "The full affected --lib workflows filter passed all 72 tests after the ready-wait authority and managed startup-override fixes; the stricter named regression passed in this run."
+    }
+  },
+  "limits": [
+    "Provider behavior and stop certification are deterministic fixtures; this does not establish real Claude/Codex adapter behavior, model planning quality or paid-provider billing.",
+    "Recovery exercised reopening the durable workflow database after stopping the owned scheduler, in the same test process; it is not an operating-system process crash test.",
+    "Temporary Git fixtures, SQLite files and artifact directories were used. No user configuration, credentials or projects were modified."
+  ],
+  "latest_verified_at_utc": "2026-10-09 09:15:00 UTC",
+  "affected_workflow_suite": {
+    "command": "TAURI_CONFIG='{\"bundle\":{\"externalBin\":[],\"resources\":[]}}' CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test -j 2 --manifest-path src-tauri/Cargo.toml --lib workflows -- --test-threads=2",
+    "passed": 72, "failed": 0, "ignored": 0, "test_execution_seconds": 17.17, "exit_code": 0, "native_inference_included": false,
+    "warnings": "Four existing unused-variable warnings in unrelated git.rs test code."
+  },
+  "cargo_check": {
+    "command": "TAURI_CONFIG='{\"bundle\":{\"externalBin\":[],\"resources\":[]}}' CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo check -j 2 --manifest-path src-tauri/Cargo.toml",
+    "exit_code": 0, "elapsed_seconds": 16.06, "warnings": []
+  }
+}
