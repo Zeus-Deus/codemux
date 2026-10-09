@@ -1161,12 +1161,19 @@ mod tests {
         PendingStartup,
         StopOnce,
     }
+    #[derive(Default)]
+    struct FakeProviderObservations {
+        no_completion_turn_started: Notify,
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+    }
     struct FakeProvider {
         kind: ProviderKind,
         events: broadcast::Sender<ProviderRuntimeEvent>,
         behavior: Behavior,
         stop_confirmed: bool,
         session: Mutex<Option<ProviderSession>>,
+        observations: Arc<FakeProviderObservations>,
     }
     #[async_trait]
     impl AgentProvider for FakeProvider {
@@ -1189,6 +1196,7 @@ mod tests {
             &self,
             input: StartSessionInput,
         ) -> Result<ProviderSession, ProviderError> {
+            self.observations.starts.fetch_add(1, Ordering::SeqCst);
             assert!(crate::agent_provider::managed::lookup_session(&input.thread_id).is_some());
             assert!(input.fresh_session);
             assert!(input.resume_cursor.is_none());
@@ -1407,6 +1415,11 @@ mod tests {
                     })
                     .unwrap();
             }
+            if matches!(self.behavior, Behavior::NoCompletion) {
+                // Cancellation tests must reach an actual active turn before
+                // cancelling, regardless of checkout/startup latency.
+                self.observations.no_completion_turn_started.notify_one();
+            }
             Ok(TurnStartResult {
                 steered: false,
                 turn_id: turn,
@@ -1414,6 +1427,7 @@ mod tests {
             })
         }
         async fn stop_managed_session(&self, id: ThreadId) -> Result<(), ProviderError> {
+            self.observations.stops.fetch_add(1, Ordering::SeqCst);
             if !self.stop_confirmed {
                 return Err(ProviderError::ValidationError {
                     message: "unconfirmed fake process".into(),
@@ -1502,6 +1516,22 @@ mod tests {
         Dispatch,
         LiveWorkflowDriver,
     ) {
+        let (root, service, dispatch, driver, _) =
+            observed_fixture(kind, behavior, stop_confirmed, access);
+        (root, service, dispatch, driver)
+    }
+    fn observed_fixture(
+        kind: ProviderKind,
+        behavior: Behavior,
+        stop_confirmed: bool,
+        access: TaskAccess,
+    ) -> (
+        tempfile::TempDir,
+        WorkflowService,
+        Dispatch,
+        LiveWorkflowDriver,
+        Arc<FakeProviderObservations>,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -1524,12 +1554,14 @@ mod tests {
         let dispatch = service.claim_next().unwrap().unwrap();
         service.mark_running(&dispatch).unwrap();
         let (events, _) = broadcast::channel(32);
+        let observations = Arc::new(FakeProviderObservations::default());
         let fake: Arc<dyn AgentProvider> = Arc::new(FakeProvider {
             kind,
             events,
             behavior,
             stop_confirmed,
             session: Mutex::new(None),
+            observations: Arc::clone(&observations),
         });
         let lookup: ProviderLookup = Arc::new(move |_| {
             let provider = Arc::clone(&fake);
@@ -1543,7 +1575,7 @@ mod tests {
             factory,
             Arc::new(ArtifactStore::new(root.path().join("artifacts"))),
         );
-        (root, service, dispatch, driver)
+        (root, service, dispatch, driver, observations)
     }
     #[tokio::test]
     async fn workflow_executor_exit_and_driver_cancel_share_actual_stop_proof() {
@@ -2005,25 +2037,118 @@ mod tests {
     }
     #[tokio::test]
     async fn workflow_executor_cancellation_requires_verified_stop() {
-        let (_root, service, dispatch, driver) = fixture(
+        for stop_confirmed in [true, false] {
+            let (_root, service, dispatch, driver, observations) = observed_fixture(
+                ProviderKind::Claude,
+                Behavior::NoCompletion,
+                stop_confirmed,
+                TaskAccess::ReadOnly,
+            );
+            let provider = (driver.providers)(ProviderKind::Claude).await.unwrap();
+            let thread_id = ThreadId(format!("workflow-{}", dispatch.attempt_id));
+            let (tx, rx) = watch::channel(false);
+            let cancel_active_turn = async {
+                observations.no_completion_turn_started.notified().await;
+                assert_eq!(observations.starts.load(Ordering::SeqCst), 1);
+                assert!(provider.has_session(&thread_id).await);
+                assert_eq!(
+                    service.snapshot(&dispatch.run_id).unwrap().tasks[0]
+                        .current_attempt
+                        .as_ref()
+                        .unwrap()
+                        .external_ref
+                        .as_ref()
+                        .unwrap()["phase"],
+                    "ready"
+                );
+                service.cancel(&dispatch.run_id).unwrap();
+                tx.send(true).unwrap();
+            };
+            let (report, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(
+                    driver.execute(dispatch.clone(), service.clone(), rx),
+                    cancel_active_turn
+                )
+            })
+            .await
+            .expect("fake provider must start, cancel, and attempt verified stop");
+            assert_eq!(observations.stops.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.has_session(&thread_id).await, !stop_confirmed);
+            assert_eq!(
+                report.disposition,
+                if stop_confirmed {
+                    super::super::ExecutionDisposition::Cancelled
+                } else {
+                    super::super::ExecutionDisposition::Unknown
+                }
+            );
+            service.finish_attempt(&dispatch, report).unwrap();
+            let run = service.snapshot(&dispatch.run_id).unwrap();
+            let attempt = run.tasks[0].current_attempt.as_ref().unwrap();
+            assert_eq!(
+                attempt.status,
+                if stop_confirmed {
+                    super::super::AttemptStatus::Cancelled
+                } else {
+                    super::super::AttemptStatus::Unknown
+                }
+            );
+            assert_eq!(attempt.status.holds_capacity(), !stop_confirmed);
+            assert_eq!(run.usage.reserved_tokens > 0, !stop_confirmed);
+            assert!(attempt.output.is_none());
+            assert!(service.claim_next().unwrap().is_none());
+        }
+    }
+    #[tokio::test]
+    async fn workflow_executor_cancellation_before_launch_is_durable_and_known_zero() {
+        let (_root, service, dispatch, mut driver, observations) = observed_fixture(
             ProviderKind::Claude,
             Behavior::NoCompletion,
             true,
-            TaskAccess::ReadOnly,
+            TaskAccess::Write,
         );
         let (tx, rx) = watch::channel(false);
+        let resolver = Arc::clone(&driver.resolver);
         let cancellation_service = service.clone();
         let run_id = dispatch.run_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            cancellation_service.cancel(&run_id).unwrap();
+        driver.resolver = Arc::new(move |workspace| {
+            let source = resolver(workspace)?;
+            // Reproduce cancellation after initial authorization but before
+            // checkout preparation commits any external execution intent.
+            cancellation_service.cancel(&run_id)?;
             tx.send(true).unwrap();
+            Ok(source)
         });
-        let report = driver.execute(dispatch, service, rx).await;
+        let report = driver.execute(dispatch.clone(), service.clone(), rx).await;
+        // The revoked launch fence reports its local failure; durable finishing
+        // must retain the user's cancellation and its proven zero accounting.
         assert_eq!(
             report.disposition,
-            super::super::ExecutionDisposition::Cancelled
+            super::super::ExecutionDisposition::Failed
         );
+        assert_eq!(report.usage.total_tokens, 0);
+        assert_eq!(report.usage.estimated_tokens, 0);
+        assert_eq!(report.usage.cost_usd, Some(0.0));
+        assert!(!report.usage.tokens_unknown && !report.usage.cost_unknown);
+        assert_eq!(observations.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(observations.stops.load(Ordering::SeqCst), 0);
+        assert!(driver.owned_tools().unwrap().is_empty());
+        service.finish_attempt(&dispatch, report).unwrap();
+        let run = service.snapshot(&dispatch.run_id).unwrap();
+        let task = &run.tasks[0];
+        let attempt = task.current_attempt.as_ref().unwrap();
+        assert_eq!(run.status, super::super::RunStatus::Cancelled);
+        assert_eq!(task.status, super::super::TaskStatus::Cancelled);
+        assert_eq!(attempt.status, super::super::AttemptStatus::Cancelled);
+        assert!(!attempt.status.holds_capacity());
+        assert!(attempt.external_ref.is_none());
+        assert!(attempt.output.is_none());
+        assert_eq!(run.usage.reserved_tokens, 0);
+        assert_eq!(run.usage.total_tokens, 0);
+        assert_eq!(run.usage.estimated_tokens, 0);
+        assert_eq!(run.usage.cost_usd, Some(0.0));
+        assert!(!run.usage.tokens_unknown && !run.usage.cost_unknown);
+        assert!(service.claim_next().unwrap().is_none());
     }
     #[tokio::test]
     async fn workflow_executor_collects_late_and_post_stop_usage() {
