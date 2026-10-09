@@ -134,8 +134,22 @@ describe("OpenCode managed native HTTP boundary (no inference)", () => {
     expect((await fetch(mcp.url, { method: "POST", body })).status).toBe(401);
     const forged = await (await fetch(mcp.url, { method: "POST", headers: { Authorization: `Bearer ${mcp.token}` }, body })).json();
     expect(forged).toMatchObject({ error: { code: -32602 } });
-    expect((await fetch(mcp.url, { method: "POST", headers: { Authorization: `Bearer ${mcp.token}` },
-      body: "x".repeat(2 * 1024 * 1024 + 1) })).status).toBe(413);
+    let oversizedResponse: Response | undefined;
+    try {
+      oversizedResponse = await fetch(mcp.url, { method: "POST", headers: { Authorization: `Bearer ${mcp.token}` },
+        body: "x".repeat(2 * 1024 * 1024 + 1) });
+    } catch (error) {
+      // The pinned Windows runtime can reset an oversized POST before its 413
+      // reaches fetch. Require that exact observed error and a healthy endpoint.
+      if (process.platform !== "win32" || Bun.version !== "1.3.12"
+          || !(error instanceof Error) || !("code" in error) || error.code !== "ECONNRESET") throw error;
+    }
+    if (oversizedResponse) expect(oversizedResponse.status).toBe(413);
+    expect(calls).toEqual([]);
+    const healthy = await fetch(mcp.url, { method: "POST", headers: { Authorization: `Bearer ${mcp.token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) });
+    expect(healthy.status).toBe(200);
+    expect(await healthy.json()).toEqual({ jsonrpc: "2.0", id: 2, result: { tools: [tool] } });
     expect(calls).toEqual([]);
   });
 });
