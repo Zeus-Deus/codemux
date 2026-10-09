@@ -2865,9 +2865,9 @@ export interface HostStatusView {
   reachable: boolean;
   /** ISO timestamp of the last successful probe; null if never reached. */
   last_seen_at: string | null;
-  /** Last probe problem: the unreachable reason, or — while reachable — a
-   *  degraded note such as the host agent being missing or the inventory
-   *  failing. Null when clean. */
+  /** Last probe problem: the unreachable reason, or — while reachable —
+   *  why the device needs setup (host agent missing, damaged or out of
+   *  date). Null when clean. */
   last_error: string | null;
   /** Sum of the host's workspace directories in bytes; null if unknown. */
   disk_bytes: number | null;
@@ -2921,6 +2921,13 @@ export const hostsBootstrapInstall = (id: number, uname: string) =>
  *  Test connection is required. */
 export const hostsReinstallRemote = (id: number) =>
   invoke<HostBootstrapResult>("hosts_reinstall_remote", { id });
+
+/** This machine's hostname, shown as the local device ("ai-node"). */
+export const getLocalDeviceName = () => invoke<string>("get_local_device_name");
+
+/** Host aliases from `~/.ssh/config`, offered as suggestions when adding a
+ *  device. Wildcard patterns are skipped. */
+export const hostsSshConfigHosts = () => invoke<string[]>("hosts_ssh_config_hosts");
 
 // ── Automations (scheduled agent runs) ──
 //
@@ -3223,6 +3230,38 @@ export interface OpenOnHostOutcome {
  *  re-activates the existing local view. */
 export const workspaceOpenOnHost = (syncRowId: number) =>
   invoke<OpenOnHostOutcome>("workspace_open_on_host", { syncRowId });
+
+export interface CreateWorkspaceOnHostRequest {
+  hostId: number;
+  /** Local project root that identifies the repo. The device gets its own
+   *  checkout from the project's git remote (cloned on first use). `null`
+   *  starts in the device's home directory. */
+  projectPath: string | null;
+  /** Worktree branch to create on the device when `newBranch`. */
+  branch: string | null;
+  /** Create a new worktree; false works in the device's checkout. */
+  newBranch: boolean;
+  /** Branch the new worktree starts from; null = the repo default. */
+  baseBranch: string | null;
+  initialChat?: InitialChatPane;
+  select?: boolean;
+}
+
+/** Create a workspace that lives on a device: the checkout, terminals and
+ *  agent all run there. Returns the workspace id and its path on the
+ *  device. */
+export const createWorkspaceOnHost = (
+  req: CreateWorkspaceOnHostRequest,
+): Promise<WorkspaceCreateResult> =>
+  invoke<unknown>("create_workspace_on_host", {
+    hostId: req.hostId,
+    projectPath: req.projectPath,
+    branch: req.branch,
+    newBranch: req.newBranch,
+    baseBranch: req.baseBranch,
+    ...(req.initialChat ? { initialChat: req.initialChat } : {}),
+    ...(req.select !== undefined ? { select: req.select } : {}),
+  }).then(normalizeWorkspaceCreate);
 
 // ── Web Remote Access ──
 //

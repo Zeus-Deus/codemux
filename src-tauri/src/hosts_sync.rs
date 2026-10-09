@@ -6,30 +6,47 @@
 //! Wire model:
 //! - `pull(token)` → GET `/api/hosts` → upsert each server row into the
 //!   local DB. Server rows are authoritative for any host whose
-//!   `server_id` matches a local row.
+//!   `server_id` matches a local row, unless that row still has
+//!   unpushed changes (`dirty=1`): the pull runs first, so the server
+//!   copy is older than the user's edit or delete.
 //! - `push(token)` → for each local row with `dirty=1`:
-//!     - if `deleted_at IS NOT NULL && server_id IS NOT NULL`:
-//!       DELETE `/api/hosts/:server_id`, then `mark_host_synced` so the
-//!       next `purge_acknowledged_deletes` removes the tombstone.
+//!     - if `deleted_at IS NOT NULL`: DELETE `/api/hosts/:server_id`
+//!       (when it has one), then `mark_host_synced` so the next
+//!       `purge_acknowledged_deletes` removes the tombstone.
 //!     - elif `server_id IS NULL`: POST `/api/hosts` → server returns
-//!       the assigned `id`; we `mark_host_synced(id, Some(server_id))`.
+//!       the assigned `id`; we `mark_host_synced(row, Some(server_id))`.
 //!     - elif `server_id IS NOT NULL`: PATCH `/api/hosts/:server_id`
-//!       with the updated fields → `mark_host_synced(id, None)`.
+//!       with the updated fields → `mark_host_synced(row, None)`. A 404
+//!       means another device removed it; the removal wins.
+//! - A sync that changes the device list emits `hosts-changed`, so the
+//!   UI picks up devices added, renamed or removed elsewhere.
 //! - `try_sync` is the public entrypoint: pull then push, swallowing
 //!   any single-call failures so a flaky network doesn't strand the
 //!   user. Anything still dirty after a failed push stays dirty and
-//!   the next `try_sync` retries.
+//!   the next `try_sync` retries. It runs after every local edit and
+//!   once shortly after launch (`spawn_startup_host_sync`), so a device
+//!   that just signed in picks up the devices added elsewhere.
+//! - A pulled row whose `sshTarget` would not be a safe single ssh
+//!   argument is skipped: targets reach `ssh` argv, and the account is
+//!   not trusted to have validated them.
+//! - A run reads the token only once it holds the queue, and stops if
+//!   that session is replaced mid-run (`SyncSession`), so a sign-out or
+//!   account switch never sends one account's devices with another
+//!   account's token or merges its list into theirs. Every request and
+//!   every write made from an answer checks the session first: an
+//!   upload acknowledged after the switch must not stamp the old
+//!   account's `server_id` on a row the new account still has to push.
 //!
 //! Failure mode policy: a failed push leaves the row dirty and logs
 //! once. We do not surface the error to the user via toast — they
 //! already see the host in the UI, the sync indicator in Settings →
 //! Account tells them when it last completed.
 
-use crate::auth::{api_base_url, is_token_expired, load_token};
+use crate::auth::{api_base_url, is_token_expired, load_token, AuthState};
 use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::Manager;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
 
 /// Wire shape returned by `GET /api/hosts` and `POST /api/hosts`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,39 +80,118 @@ struct HostUpsertBody<'a> {
     ssh_target: &'a str,
 }
 
-/// Guard against concurrent sync attempts. Foreground sync + the
-/// fire-and-forget sync each Tauri host CRUD command triggers could
-/// otherwise overlap and double-push the same row. Skipping when one
-/// is already in flight is correct: the in-flight one already sees
-/// the latest dirty rows.
-static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Queues `try_sync_with_app` runs. Two overlapping runs (the startup
+/// pull racing the sync a device edit triggers) would both POST the same
+/// new row and leave the account with a duplicate device; queued, the
+/// second run finds the row already synced.
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Ceiling on one queued sync, so a stalled request can't hold the lock.
+const SYNC_BUDGET: Duration = Duration::from_secs(60);
+
+/// Event emitted (no payload) when a sync changed the device list, so
+/// the frontend hosts store reloads it. Mirrors `HOSTS_CHANGED_EVENT` in
+/// `src/stores/hosts-store.ts`.
+pub const HOSTS_CHANGED_EVENT: &str = "hosts-changed";
+
+/// The parts of the device list the UI shows, compared before and after
+/// a sync to tell whether it changed anything. The poller's local-only
+/// columns are left out so its writes don't count.
+fn visible_hosts(db: &DatabaseStore) -> Vec<(i64, Option<String>, String, String, bool)> {
+    db.list_hosts()
+        .into_iter()
+        .map(|h| (h.id, h.server_id, h.name, h.ssh_target, h.dirty))
+        .collect()
+}
+
+/// The signed-in session a sync run works for. Local writes made from
+/// the account's answers, and the read of what to upload with its
+/// token, happen only while that session is still current: after a
+/// sign-out or account switch the run stops instead of mixing accounts.
+struct SyncSession<'a> {
+    auth: &'a AuthState,
+    generation: u64,
+}
+
+impl SyncSession<'_> {
+    fn commit<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+        self.auth
+            .commit_if_session_current(self.generation, commit)
+            .ok_or_else(|| "the signed-in account changed during sync".to_string())
+    }
+
+    /// Checked before each request, so a replaced session's token sends
+    /// nothing more.
+    fn ensure_current(&self) -> Result<(), String> {
+        self.commit(|| ())
+    }
+}
 
 /// Convenience wrapper used by Tauri commands. Resolves the database
 /// + token from the app state and calls `try_sync`. Returns Ok(()) if
 /// the user isn't signed in (sync isn't an error in that case).
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    // Queue before reading the token: a run that waited out a sign-out
+    // or account switch must sync whoever is signed in now, not upload
+    // the new account's devices with the old account's token.
+    let _queued = SYNC_LOCK.lock().await;
     let db = app.state::<DatabaseStore>();
-    let token = match valid_token(&db) {
-        Some(t) => t,
-        None => return Ok(()),
+    let auth = app.state::<AuthState>();
+    let (generation, token) = auth.session_snapshot(|| valid_token(&db));
+    let Some(token) = token else {
+        return Ok(());
+    };
+    let session = SyncSession {
+        auth: &auth,
+        generation,
     };
     // Clone-by-value the Arc/State so we can drop the State borrow
     // before awaiting (Tauri's State is not Send across awaits).
     let db_ref: &DatabaseStore = &db;
-    let pull_err = match pull(&token, db_ref).await {
-        Ok(()) => None,
-        Err(e) => Some(e),
-    };
-    let push_err = match push(&token, db_ref).await {
-        Ok(()) => None,
-        Err(e) => Some(e),
-    };
+    let before = visible_hosts(db_ref);
+    let outcome = tokio::time::timeout(SYNC_BUDGET, async {
+        let pull_err = pull(&token, db_ref, &session).await.err();
+        let push_err = push(&token, db_ref, &session).await.err();
+        (pull_err, push_err)
+    })
+    .await;
+    // Checked even after a timeout: whatever landed before it is real.
+    if visible_hosts(db_ref) != before {
+        if let Err(e) = app.emit(HOSTS_CHANGED_EVENT, ()) {
+            eprintln!("[hosts-sync] emit {HOSTS_CHANGED_EVENT}: {e}");
+        }
+    }
+    let (pull_err, push_err) =
+        outcome.map_err(|_| format!("timed out after {}s", SYNC_BUDGET.as_secs()))?;
     match (pull_err, push_err) {
         (None, None) => Ok(()),
         (Some(p), None) => Err(format!("pull failed: {p}")),
         (None, Some(p)) => Err(format!("push failed: {p}")),
         (Some(a), Some(b)) => Err(format!("pull failed: {a}; push failed: {b}")),
     }
+}
+
+/// Pull the account's device list once shortly after launch, then wake
+/// the status poller so newly pulled devices get a live dot. Call once
+/// from app setup. A no-op when signed out.
+pub fn spawn_startup_host_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    tauri::async_runtime::spawn(async move {
+        // Let startup IO settle first.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Err(error) = try_sync_with_app(&app).await {
+            eprintln!("[hosts-sync] startup sync failed: {error}");
+        }
+        #[cfg(unix)]
+        crate::hosts_inventory::request_poll();
+    });
+}
+
+/// Whether a pulled row may be stored. Tombstones are always applied —
+/// a deleted row is never probed — but a live row with a target `ssh`
+/// could read as an option is dropped, leaving any local copy as it was.
+fn accept_server_host(host: &ServerHost) -> bool {
+    host.deleted_at.is_some()
+        || crate::commands::hosts::validate_ssh_target(&host.ssh_target).is_ok()
 }
 
 fn valid_token(db: &DatabaseStore) -> Option<String> {
@@ -110,14 +206,15 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// Pull server state into the local DB. Idempotent. Rows that exist on
 /// the server but not locally are inserted; rows that exist locally
 /// AND on the server (matched by `server_id`) are updated in place;
-/// purely-local rows (no `server_id` yet) are untouched.
+/// purely-local rows (no `server_id` yet) are untouched, and so are
+/// rows with unpushed changes (`upsert_host_from_server` skips them).
 ///
 /// We never delete a local row purely because the server lacks it —
 /// that's the symmetry of the design: local creates wait for the next
 /// push to learn their `server_id`. A row whose `server_id` is non-null
 /// but missing from the server response is treated as a server-side
 /// deletion the local hasn't observed yet.
-pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
+async fn pull(token: &str, db: &DatabaseStore, session: &SyncSession<'_>) -> Result<(), String> {
     let base = api_base_url();
     let client = reqwest::Client::new();
     let resp = client
@@ -136,16 +233,25 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
         return Err(format!("API error: {}", resp.status()));
     }
     let body: ListHostsResponse = resp.json().await.map_err(|e| format!("Parse: {e}"))?;
+    session.commit(|| apply_server_hosts(db, &body.hosts))?
+}
 
+/// Fold one `GET /api/hosts` response into the local DB. Split from
+/// `pull` so the merge rules are testable without a server.
+fn apply_server_hosts(db: &DatabaseStore, hosts: &[ServerHost]) -> Result<(), String> {
     // Index local rows by server_id so we know which local rows were
     // covered by the server response. Any local row with a server_id
     // NOT in the response was deleted server-side and should be
     // tombstoned locally.
     let local = db.list_hosts_for_sync();
     let server_ids: std::collections::HashSet<String> =
-        body.hosts.iter().map(|h| h.id.clone()).collect();
+        hosts.iter().map(|h| h.id.clone()).collect();
 
-    for h in &body.hosts {
+    for h in hosts {
+        if !accept_server_host(h) {
+            eprintln!("[hosts-sync] skipping {}: unsafe SSH target", h.id);
+            continue;
+        }
         db.upsert_host_from_server(
             &h.id,
             &h.name,
@@ -159,10 +265,11 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
     // Server-side deletion sweep: if a local row has a server_id that
     // the server no longer returns, it was deleted elsewhere. Mark it
     // tombstoned locally so it disappears from `list_hosts`. We don't
-    // mark it dirty — there's nothing to push.
+    // mark it dirty — there's nothing to push. A row with unpushed
+    // changes is left to its push, which settles the conflict.
     for local_row in &local {
         if let Some(sid) = &local_row.server_id {
-            if !server_ids.contains(sid) && local_row.deleted_at.is_none() {
+            if !server_ids.contains(sid) && local_row.deleted_at.is_none() && !local_row.dirty {
                 eprintln!(
                     "[hosts-sync] server no longer has {sid}; tombstoning locally"
                 );
@@ -190,19 +297,23 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
 /// independently so a single failed PATCH doesn't strand other dirty
 /// rows; the failure is logged and the row stays dirty for the next
 /// sync to retry.
-pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
+async fn push(token: &str, db: &DatabaseStore, session: &SyncSession<'_>) -> Result<(), String> {
     let base = api_base_url();
     let client = reqwest::Client::new();
-    let dirty = db.list_dirty_hosts();
+    // Read under the session guard, so every row sent with this token
+    // existed while its account was signed in.
+    let dirty = session.commit(|| db.list_dirty_hosts())?;
     let mut any_failed = false;
 
     for row in &dirty {
+        // A failed row is skipped, but a replaced session ends the run.
+        session.ensure_current()?;
         let result = if row.deleted_at.is_some() {
-            push_delete(&client, &base, token, row).await
+            push_delete(&client, &base, token, row, db, session).await
         } else if row.server_id.is_none() {
-            push_insert(&client, &base, token, row, db).await
+            push_insert(&client, &base, token, row, db, session).await
         } else {
-            push_update(&client, &base, token, row, db).await
+            push_update(&client, &base, token, row, db, session).await
         };
         if let Err(error) = result {
             eprintln!(
@@ -216,7 +327,7 @@ pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
 
     // Once all in-flight tombstones have been ack'd by the server, the
     // local row can be physically removed.
-    db.purge_acknowledged_deletes()?;
+    session.commit(|| db.purge_acknowledged_deletes())??;
 
     if any_failed {
         Err("one or more host pushes failed; see logs".into())
@@ -231,6 +342,7 @@ async fn push_insert(
     token: &str,
     row: &crate::database::HostRecord,
     db: &DatabaseStore,
+    session: &SyncSession<'_>,
 ) -> Result<(), String> {
     let body = HostUpsertBody {
         name: &row.name,
@@ -247,8 +359,31 @@ async fn push_insert(
         return Err(format!("API error: {}", resp.status()));
     }
     let parsed: OneHostResponse = resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    db.mark_host_synced(row.id, Some(&parsed.host.id))?;
-    Ok(())
+    session.commit(|| db.mark_host_synced(row, Some(&parsed.host.id)))?
+}
+
+/// Whether the account's device list is reachable and lacks `server_id`.
+async fn account_lacks_host(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    server_id: &str,
+) -> bool {
+    let Ok(resp) = client
+        .get(format!("{base}/api/hosts"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    match resp.json::<ListHostsResponse>().await {
+        Ok(list) => !list.hosts.iter().any(|host| host.id == server_id),
+        Err(_) => false,
+    }
 }
 
 async fn push_update(
@@ -257,6 +392,7 @@ async fn push_update(
     token: &str,
     row: &crate::database::HostRecord,
     db: &DatabaseStore,
+    session: &SyncSession<'_>,
 ) -> Result<(), String> {
     let server_id = row
         .server_id
@@ -273,11 +409,35 @@ async fn push_update(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        // A server without the hosts API answers 404 too (see `pull`);
+        // keep the edit for a later push unless the account's list
+        // exists and no longer has this device.
+        session.ensure_current()?;
+        if !account_lacks_host(client, base, token, server_id).await {
+            return Err(format!("API error: {}", resp.status()));
+        }
+        // Removed on another device before this edit reached the
+        // account. The pull leaves dirty rows alone, so settle it here:
+        // the removal wins, as it does for a clean row.
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        return session.commit(|| {
+            eprintln!("[hosts-sync] server no longer has {server_id}; dropping the local edit");
+            db.mark_host_synced(row, None)?;
+            db.upsert_host_from_server(
+                server_id,
+                &row.name,
+                &row.ssh_target,
+                &row.created_at,
+                &now,
+                Some(&now),
+            )
+        })?;
+    }
     if !resp.status().is_success() {
         return Err(format!("API error: {}", resp.status()));
     }
-    db.mark_host_synced(row.id, None)?;
-    Ok(())
+    session.commit(|| db.mark_host_synced(row, None))?
 }
 
 async fn push_delete(
@@ -285,12 +445,14 @@ async fn push_delete(
     base: &str,
     token: &str,
     row: &crate::database::HostRecord,
+    db: &DatabaseStore,
+    session: &SyncSession<'_>,
 ) -> Result<(), String> {
     // A row that was created and deleted entirely while offline (no
-    // server_id) has nothing to push — just let it be purged locally.
-    let server_id = match &row.server_id {
-        Some(sid) => sid,
-        None => return Ok(()),
+    // server_id) has nothing to push — clear dirty so the purge that
+    // follows removes it locally.
+    let Some(server_id) = &row.server_id else {
+        return session.commit(|| db.mark_host_synced(row, None))?;
     };
     let resp = client
         .delete(format!("{base}/api/hosts/{server_id}"))
@@ -298,26 +460,336 @@ async fn push_delete(
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
-    if !resp.status().is_success() {
+    // 404 = already gone server-side, treat as success.
+    if !resp.status().is_success() && resp.status().as_u16() != 404 {
         return Err(format!("API error: {}", resp.status()));
     }
-    Ok(())
+    // Acknowledged, so the purge that follows can drop the tombstone.
+    // The pull leaves dirty rows alone, so nothing else clears it.
+    session.commit(|| db.mark_host_synced(row, None))?
 }
 
-/// Foreground sync: pull then push, with the SYNC_IN_PROGRESS guard.
-/// Used by Settings → Account's "Sync now" button (when we add one)
-/// and by the auth-check path that runs once at startup.
-#[allow(dead_code)]
-pub async fn sync_hosts(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    if SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return Ok(()); // another sync is in flight, skip
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::save_token;
+    use serial_test::serial;
+
+    fn server_host(ssh_target: &str, deleted_at: Option<&str>) -> ServerHost {
+        ServerHost {
+            id: "srv-1".into(),
+            name: "zeus".into(),
+            ssh_target: ssh_target.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: deleted_at.map(Into::into),
+        }
     }
-    let result = async {
-        pull(token, db).await?;
-        push(token, db).await?;
-        Ok(())
+
+    #[test]
+    fn pull_drops_option_like_targets_but_keeps_tombstones() {
+        assert!(accept_server_host(&server_host("deus@zeus", None)));
+        assert!(accept_server_host(&server_host("homelab", None)));
+        assert!(!accept_server_host(&server_host("-oProxyCommand=touch /tmp/x", None)));
+        assert!(!accept_server_host(&server_host("user@host -p 22", None)));
+        assert!(!accept_server_host(&server_host("", None)));
+        assert!(
+            accept_server_host(&server_host("-oProxyCommand=x", Some("2026-01-01"))),
+            "a deletion still applies so the local copy goes away"
+        );
     }
-    .await;
-    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-    result
+
+    fn synced(db: &DatabaseStore, name: &str, target: &str, server_id: &str) -> i64 {
+        let host = db.insert_host(name, target).unwrap();
+        db.mark_host_synced(&host, Some(server_id)).unwrap();
+        host.id
+    }
+
+    fn row(db: &DatabaseStore, id: i64) -> crate::database::HostRecord {
+        db.list_hosts_for_sync().into_iter().find(|h| h.id == id).unwrap()
+    }
+
+    #[test]
+    fn pull_keeps_unpushed_edits_and_removals() {
+        let db = DatabaseStore::new_in_memory();
+        let edited = synced(&db, "box", "u@typo", "srv-1");
+        let removed = synced(&db, "old", "u@old", "srv-2");
+        let edited_gone = synced(&db, "lab", "u@lab", "srv-3");
+        let clean_gone = synced(&db, "spare", "u@spare", "srv-4");
+        db.update_host(edited, "box", "u@fixed").unwrap();
+        db.delete_host(removed).unwrap();
+        db.update_host(edited_gone, "lab-renamed", "u@lab").unwrap();
+
+        // The account still has the old copies of the first two and no
+        // longer has the last two.
+        let mut first = server_host("u@typo", None);
+        first.name = "box".into();
+        let mut second = server_host("u@old", None);
+        second.id = "srv-2".into();
+        second.name = "old".into();
+        apply_server_hosts(&db, &[first, second]).unwrap();
+
+        let edited = row(&db, edited);
+        assert_eq!(edited.ssh_target, "u@fixed", "the fix is not reverted");
+        assert!(edited.dirty, "and still goes up with the push");
+        let removed = row(&db, removed);
+        assert!(removed.deleted_at.is_some(), "a removed device is not resurrected");
+        assert!(removed.dirty, "and its removal still goes up");
+        let edited_gone = row(&db, edited_gone);
+        assert!(edited_gone.deleted_at.is_none() && edited_gone.dirty, "left to its push");
+        assert!(
+            row(&db, clean_gone).deleted_at.is_some(),
+            "a clean row the account dropped is still tombstoned"
+        );
+    }
+
+    #[test]
+    fn visible_hosts_tracks_list_changes_but_not_poller_stamps() {
+        let db = DatabaseStore::new_in_memory();
+        let host = db.insert_host("box", "u@box").unwrap();
+        let fresh = visible_hosts(&db);
+        db.record_host_seen(host.id, "2026-08-27T10:00:00Z", Some(1)).unwrap();
+        assert_eq!(visible_hosts(&db), fresh, "a poll tick is not a list change");
+
+        db.mark_host_synced(&host, Some("srv-1")).unwrap();
+        let uploaded = visible_hosts(&db);
+        assert_ne!(uploaded, fresh, "a first upload sets server_id and clears dirty");
+
+        let mut renamed = server_host("u@box", None);
+        renamed.name = "renamed-elsewhere".into();
+        apply_server_hosts(&db, &[renamed]).unwrap();
+        assert_ne!(visible_hosts(&db), uploaded, "a rename pulled from the account");
+
+        apply_server_hosts(&db, &[]).unwrap();
+        assert!(visible_hosts(&db).is_empty(), "a removal pulled from the account");
+    }
+
+    const UNEXPIRED: &str = "2099-01-01T00:00:00Z";
+
+    fn signed_in_app(token: &str) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AuthState::default());
+        save_token(&app.state::<DatabaseStore>(), token, UNEXPIRED).unwrap();
+        app
+    }
+
+    /// Sign out and into another account.
+    fn switch_account(app: &tauri::AppHandle<tauri::test::MockRuntime>) {
+        let db = app.state::<DatabaseStore>();
+        app.state::<AuthState>()
+            .replace_session(|| save_token(&db, "token-b", UNEXPIRED))
+            .unwrap();
+    }
+
+    /// Sign out and into another account, then add a device as that account.
+    fn switch_account_and_add_device(app: &tauri::AppHandle<tauri::test::MockRuntime>) {
+        switch_account(app);
+        app.state::<DatabaseStore>().insert_host("b-box", "u@b-box").unwrap();
+    }
+
+    fn created_host_body() -> &'static str {
+        r#"{"host":{"id":"srv-b","name":"b-box","sshTarget":"u@b-box",
+            "createdAt":"","updatedAt":"","deletedAt":null}}"#
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_sync_uses_the_account_signed_in_when_it_runs() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let app = signed_in_app("token-a");
+        let handle = app.handle().clone();
+
+        // Another sync holds the queue while this one is requested.
+        let running = SYNC_LOCK.lock().await;
+        let queued = try_sync_with_app(&handle);
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err(),
+            "waits its turn"
+        );
+        switch_account_and_add_device(&handle);
+
+        let with_old_token = server
+            .mock("POST", "/api/hosts")
+            .match_header("authorization", "Bearer token-a")
+            .expect(0)
+            .create_async()
+            .await;
+        let list = server
+            .mock("GET", "/api/hosts")
+            .match_header("authorization", "Bearer token-b")
+            .with_body(r#"{"hosts":[]}"#)
+            .create_async()
+            .await;
+        let upload = server
+            .mock("POST", "/api/hosts")
+            .match_header("authorization", "Bearer token-b")
+            .with_body(created_host_body())
+            .create_async()
+            .await;
+        drop(running);
+        let result = queued.await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        result.unwrap();
+        with_old_token.assert_async().await;
+        list.assert_async().await;
+        upload.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_account_switch_mid_sync_stops_the_old_accounts_run() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let app = signed_in_app("token-a");
+        let handle = app.handle().clone();
+
+        // The switch lands while account A's device list is in flight.
+        let switcher = handle.clone();
+        let list = server
+            .mock("GET", "/api/hosts")
+            .match_header("authorization", "Bearer token-a")
+            .with_body_from_request(move |_| {
+                switch_account_and_add_device(&switcher);
+                br#"{"hosts":[{"id":"srv-a","name":"a-box","sshTarget":"u@a-box",
+                    "createdAt":"","updatedAt":"","deletedAt":null}]}"#
+                    .to_vec()
+            })
+            .create_async()
+            .await;
+        let upload = server
+            .mock("POST", "/api/hosts")
+            .with_body(created_host_body())
+            .expect(0)
+            .create_async()
+            .await;
+        let result = try_sync_with_app(&handle).await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        assert!(result.is_err(), "the run reports it stopped");
+        list.assert_async().await;
+        upload.assert_async().await;
+        let names: Vec<String> = handle
+            .state::<DatabaseStore>()
+            .list_hosts()
+            .into_iter()
+            .map(|h| h.name)
+            .collect();
+        assert_eq!(names, ["b-box"], "account A's list is not merged into B's");
+    }
+
+    /// Sync as account A, two device changes pending, while the user
+    /// switches to account B before A answers the first `method` request
+    /// on `/api/hosts…`. Asserts the run stops there: it reports the
+    /// switch and sends nothing more with A's token (the pull's GET and
+    /// that one request are all A's server sees). Returns every local row.
+    async fn sync_answered_after_account_switch(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        method: &str,
+        status: usize,
+        body: &'static str,
+    ) -> Vec<crate::database::HostRecord> {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let handle = app.handle().clone();
+        let list = server
+            .mock("GET", "/api/hosts")
+            .match_header("authorization", "Bearer token-a")
+            .with_body(r#"{"hosts":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let switcher = handle.clone();
+        let in_flight = server
+            .mock(method, mockito::Matcher::Regex("^/api/hosts".into()))
+            .match_header("authorization", "Bearer token-a")
+            .with_status(status)
+            .with_body_from_request(move |_| {
+                switch_account(&switcher);
+                body.as_bytes().to_vec()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let result = try_sync_with_app(&handle).await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        assert!(result.is_err(), "the run reports it stopped");
+        list.assert_async().await;
+        in_flight.assert_async().await;
+        handle.state::<DatabaseStore>().list_hosts_for_sync()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_upload_acknowledged_after_an_account_switch_is_not_recorded() {
+        let app = signed_in_app("token-a");
+        let db = app.state::<DatabaseStore>();
+        db.insert_host("box", "u@box").unwrap();
+        db.insert_host("lab", "u@lab").unwrap();
+
+        let rows = sync_answered_after_account_switch(
+            &app,
+            "POST",
+            200,
+            r#"{"host":{"id":"srv-a","name":"box","sshTarget":"u@box",
+                "createdAt":"","updatedAt":"","deletedAt":null}}"#,
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            // Stamped with A's id and marked clean, B's next pull would
+            // tombstone the device instead of uploading it.
+            assert_eq!(row.server_id, None, "{} has no id from account A", row.name);
+            assert!(row.dirty, "{} still goes up for account B", row.name);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_edit_acknowledged_after_an_account_switch_stays_pending() {
+        for status in [200, 404] {
+            let app = signed_in_app("token-a");
+            let db = app.state::<DatabaseStore>();
+            let first = synced(&db, "box", "u@box", "srv-1");
+            let second = synced(&db, "lab", "u@lab", "srv-2");
+            db.update_host(first, "box-renamed", "u@box").unwrap();
+            db.update_host(second, "lab-renamed", "u@lab").unwrap();
+
+            // A 404 would otherwise ask A's list whether the device is
+            // gone and drop the edit.
+            let rows = sync_answered_after_account_switch(&app, "PATCH", status, "{}").await;
+
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert!(row.name.ends_with("-renamed"), "{status}: the edit is kept");
+                assert!(row.deleted_at.is_none(), "{status}: {} is not removed", row.name);
+                assert!(row.dirty, "{status}: {} still goes up", row.name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_removal_acknowledged_after_an_account_switch_stays_pending() {
+        let app = signed_in_app("token-a");
+        let db = app.state::<DatabaseStore>();
+        let first = synced(&db, "box", "u@box", "srv-1");
+        let second = synced(&db, "lab", "u@lab", "srv-2");
+        db.delete_host(first).unwrap();
+        db.delete_host(second).unwrap();
+
+        let rows = sync_answered_after_account_switch(&app, "DELETE", 200, "").await;
+
+        assert_eq!(rows.len(), 2, "neither tombstone is purged");
+        for row in rows {
+            assert!(row.deleted_at.is_some() && row.dirty, "{} still goes up", row.name);
+        }
+    }
 }

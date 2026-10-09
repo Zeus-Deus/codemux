@@ -265,9 +265,7 @@ export function WorkspaceHoverCardBody({
   const host = isRemote
     ? (hosts.find((h) => h.id === workspace.host_id) ?? null)
     : null;
-  const location = isRemote
-    ? `${host?.name ?? "Another device"}${workspace.attach_only ? " · in place" : ""}`
-    : "This device";
+  const location = isRemote ? (host?.name ?? "Another device") : "This device";
 
   // The worktree checkout is the path the user actually works in; remote_cwd
   // is the real path on the host for an attach-in-place workspace.

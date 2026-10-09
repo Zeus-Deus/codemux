@@ -111,6 +111,7 @@ impl CodexAgentProvider {
             codex_home: self.config.codex_home.clone(),
             client_info: self.config.client_info.clone(),
             mcp_registry: self.config.mcp_registry.clone(),
+            remote: None,
         }
     }
 
@@ -208,6 +209,10 @@ impl AgentProvider for CodexAgentProvider {
             dead.shutdown().await;
         }
 
+        let spawn = CodexSpawnConfig {
+            remote: input.remote,
+            ..self.spawn_config()
+        };
         let session = CodexSession::spawn_and_initialize(
             thread_id.clone(),
             input.cwd,
@@ -218,7 +223,7 @@ impl AgentProvider for CodexAgentProvider {
             input.resume_cursor.clone(),
             input.env,
             input.workspace_id,
-            self.spawn_config(),
+            spawn,
             self.event_tx.clone(),
             input.recorded_usage_baseline,
         )

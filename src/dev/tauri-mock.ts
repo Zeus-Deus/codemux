@@ -1,4 +1,9 @@
-import type { AgentChatSessionRecord, LocalChatSession } from "@/tauri/commands";
+import type {
+  AgentChatSessionRecord,
+  HostStatusView,
+  HostView,
+  LocalChatSession,
+} from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 /**
  * Dev-only Tauri runtime shim.
@@ -3441,6 +3446,97 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+// ── Devices (SSH hosts) ─────────────────────────────────────────────
+//
+// Mutable so Settings → Devices can add, rename, set up and remove devices
+// end to end. Reachability is what the inventory poller last saw: zeus is
+// up with Remote Control serving, pandora has been unreachable for two
+// days, and nas answers SSH but has no helper — the "Needs setup" state.
+
+const mockHosts: HostView[] = [
+  { id: 1, server_id: "srv-pandora", name: "pandora", ssh_target: "deus@pandora" },
+  { id: 2, server_id: "srv-zeus", name: "zeus", ssh_target: "deus@zeus" },
+  { id: 3, server_id: "srv-nas", name: "nas", ssh_target: "deus@nas" },
+].map((host) => ({
+  ...host,
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+  dirty: false,
+}));
+
+const mockHostStatus = new Map<number, HostStatusView>([
+  [1, {
+    host_id: 1,
+    probed: true,
+    reachable: false,
+    last_seen_at: "2026-08-25T18:00:00Z",
+    last_error: "unreachable: connection timed out",
+    disk_bytes: null,
+    remote_control_serving: false,
+  }],
+  [2, {
+    host_id: 2,
+    probed: true,
+    reachable: true,
+    last_seen_at: "2026-08-27T18:44:00Z",
+    last_error: null,
+    disk_bytes: 4_402_341_478,
+    remote_control_serving: true,
+  }],
+  [3, {
+    host_id: 3,
+    probed: true,
+    reachable: true,
+    last_seen_at: "2026-08-27T18:44:00Z",
+    last_error: "codemux-remote is not installed on this host",
+    disk_bytes: null,
+    remote_control_serving: false,
+  }],
+]);
+
+/** Devices with codemux-remote installed. */
+const mockInstalledHosts = new Set<number>([1, 2]);
+
+const MOCK_REMOTE_VERSION = "0.23.1";
+const MOCK_REMOTE_HOME = "/home/deus";
+
+function mockHostStatusRows(): HostStatusView[] {
+  return mockHosts.map((host) => ({
+    ...(mockHostStatus.get(host.id) ?? {
+      host_id: host.id,
+      probed: false,
+      reachable: false,
+      last_seen_at: null,
+      last_error: null,
+      disk_bytes: null,
+      remote_control_serving: false,
+    }),
+  }));
+}
+
+function findMockHost(id: unknown): HostView {
+  const host = mockHosts.find((h) => h.id === Number(id));
+  if (!host) throw `Host not found: ${String(id)}`;
+  return host;
+}
+
+/** What a finished install leaves behind: the helper is there and the
+ *  device answers cleanly. Pushed like a poller round. */
+function markMockHostInstalled(id: number): void {
+  mockInstalledHosts.add(id);
+  const status = mockHostStatus.get(id);
+  if (status) {
+    mockHostStatus.set(id, {
+      ...status,
+      probed: true,
+      reachable: true,
+      last_error: null,
+      last_seen_at: new Date().toISOString(),
+    });
+  }
+  emitEvent("hosts-status-changed", mockHostStatusRows());
+}
+
 const handlers: Record<string, Handler> = {
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
@@ -5338,73 +5434,15 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
 
-  // ── Hosts (remote devices) ──
+  // ── Devices (SSH hosts) ──
   //
-  // Seed one host so the Settings → Hosts detail pane (Test connection,
-  // Reinstall agent, Edit/Remove) renders in the browser dev runtime.
-  // The mutating commands echo back plausible payloads — nothing here
-  // touches a real SSH target.
-  hosts_list: () => [
-    {
-      id: 1,
-      server_id: "srv-pandora",
-      name: "pandora",
-      ssh_target: "deus@pandora",
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-01T00:00:00Z",
-      dirty: false,
-    },
-    {
-      id: 2,
-      server_id: "srv-zeus",
-      name: "zeus",
-      ssh_target: "deus@zeus",
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-01T00:00:00Z",
-      dirty: false,
-    },
-    {
-      id: 3,
-      server_id: "srv-nas",
-      name: "nas",
-      ssh_target: "deus@nas",
-      created_at: "2026-01-01T00:00:00Z",
-      updated_at: "2026-01-01T00:00:00Z",
-      dirty: false,
-    },
-  ],
-  // Reachability as the inventory poller last saw it: zeus is up with
-  // Remote Control serving, pandora has been unreachable for two days, and
-  // nas answers SSH but has no host agent — the degraded state.
-  hosts_status_list: () => [
-    {
-      host_id: 1,
-      probed: true,
-      reachable: false,
-      last_seen_at: "2026-08-25T18:00:00Z",
-      last_error: "unreachable: connection timed out",
-      disk_bytes: null,
-      remote_control_serving: false,
-    },
-    {
-      host_id: 2,
-      probed: true,
-      reachable: true,
-      last_seen_at: "2026-08-27T18:44:00Z",
-      last_error: null,
-      disk_bytes: 4_402_341_478,
-      remote_control_serving: true,
-    },
-    {
-      host_id: 3,
-      probed: true,
-      reachable: true,
-      last_seen_at: "2026-08-27T18:44:00Z",
-      last_error: "codemux-remote is not installed on this host",
-      disk_bytes: null,
-      remote_control_serving: false,
-    },
-  ],
+  // Backed by the mutable `mockHosts` state above. Nothing here touches a
+  // real SSH target; install and test take a moment so the Add device
+  // step list is visible in the browser.
+  hosts_list: () => mockHosts.map((host) => ({ ...host })),
+  hosts_status_list: () => mockHostStatusRows(),
+  get_local_device_name: () => "ai-node",
+  hosts_ssh_config_hosts: () => ["homelab", "deus@zeus", "pi@raspberrypi.local"],
   // Every requested id qualifies; the last one has no measurable size so
   // the chip's "~X GB" fragment sums only the known ones.
   workspaces_worktree_sizes: (a) => {
@@ -5413,37 +5451,92 @@ const handlers: Record<string, Handler> = {
       ids.map((id, i) => [id, i === ids.length - 1 ? null : 120_000_000 + i * 37_000_000]),
     );
   },
-  hosts_add: (a) => ({
-    id: Date.now(),
-    server_id: null,
-    name: String(a.name ?? "new-device"),
-    ssh_target: String(a.sshTarget ?? "user@host"),
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-    dirty: true,
-  }),
-  hosts_update: (a) => ({
-    id: Number(a.id ?? 1),
-    server_id: null,
-    name: String(a.name ?? "homelab"),
-    ssh_target: String(a.sshTarget ?? "deus@homelab.local"),
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-    dirty: true,
-  }),
-  hosts_delete: () => undefined,
-  hosts_test_connection: () => ({
-    ok: true,
-    message: "Connected. codemux-remote v0.9.5 is installed (Linux x86_64)",
-    needs_install: false,
-    uname: null,
-  }),
-  hosts_reinstall_remote: () => ({
-    ok: true,
-    message:
-      "codemux-remote v0.9.5 reinstalled on pandora — daemon restarted; " +
-      "the next push uses the fresh binary.",
-  }),
+  // A new device answers SSH but has no helper yet, so Add device walks
+  // through the install step.
+  hosts_add: (a) => {
+    const now = new Date().toISOString();
+    const host: HostView = {
+      id: Math.max(0, ...mockHosts.map((h) => h.id)) + 1,
+      server_id: null,
+      name: String(a.name ?? "new-device").trim(),
+      ssh_target: String(a.sshTarget ?? "user@host").trim(),
+      created_at: now,
+      updated_at: now,
+      dirty: true,
+    };
+    mockHosts.push(host);
+    mockHostStatus.set(host.id, {
+      host_id: host.id,
+      probed: true,
+      reachable: true,
+      last_seen_at: now,
+      last_error: "codemux-remote is not installed on this host",
+      disk_bytes: null,
+      remote_control_serving: false,
+    });
+    return { ...host };
+  },
+  hosts_update: (a) => {
+    const host = findMockHost(a.id);
+    host.name = String(a.name ?? host.name).trim();
+    host.ssh_target = String(a.sshTarget ?? host.ssh_target).trim();
+    host.updated_at = new Date().toISOString();
+    host.dirty = true;
+    return { ...host };
+  },
+  hosts_delete: (a) => {
+    const id = findMockHost(a.id).id;
+    mockHosts.splice(mockHosts.findIndex((h) => h.id === id), 1);
+    mockHostStatus.delete(id);
+    mockInstalledHosts.delete(id);
+    return undefined;
+  },
+  hosts_test_connection: async (a) => {
+    const host = findMockHost(a.id);
+    await new Promise((r) => setTimeout(r, 400));
+    if (mockHostStatus.get(host.id)?.reachable === false) {
+      return {
+        ok: false,
+        message: `ssh: connect to host ${host.ssh_target.split("@").pop()} port 22: Connection timed out`,
+        needs_install: false,
+        uname: null,
+      };
+    }
+    if (!mockInstalledHosts.has(host.id)) {
+      return {
+        ok: false,
+        message: "Reachable, but codemux-remote isn't installed yet (Linux x86_64)",
+        needs_install: true,
+        uname: "Linux x86_64",
+      };
+    }
+    return {
+      ok: true,
+      message: `Connected. codemux-remote v${MOCK_REMOTE_VERSION} is installed (Linux x86_64)`,
+      needs_install: false,
+      uname: null,
+    };
+  },
+  hosts_bootstrap_install: async (a) => {
+    const host = findMockHost(a.id);
+    await new Promise((r) => setTimeout(r, 1200));
+    markMockHostInstalled(host.id);
+    return {
+      ok: true,
+      message: `codemux-remote v${MOCK_REMOTE_VERSION} installed on ${host.name}`,
+    };
+  },
+  hosts_reinstall_remote: async (a) => {
+    const host = findMockHost(a.id);
+    await new Promise((r) => setTimeout(r, 1200));
+    markMockHostInstalled(host.id);
+    return {
+      ok: true,
+      message:
+        `codemux-remote v${MOCK_REMOTE_VERSION} reinstalled on ${host.name} — daemon restarted; ` +
+        "the next push uses the fresh binary.",
+    };
+  },
 
   // ── Web Remote Access ──
   //
@@ -6080,6 +6173,39 @@ const handlers: Record<string, Handler> = {
       root.cwd = cwd;
       root.provider = chat.provider;
       root.thread_id = chat.thread_id;
+    }
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    emitAppState();
+    return { workspace_id: ws.workspace_id, cwd, adopted: false };
+  },
+  // A thread that runs on a device: the checkout and worktree live there,
+  // and the local workspace is an attach-only window onto that path.
+  create_workspace_on_host: (a) => {
+    const projectPath = a.projectPath == null ? null : String(a.projectPath);
+    const branch = a.branch == null ? "main" : String(a.branch);
+    const projectName = projectPath?.split("/").filter(Boolean).pop() ?? null;
+    const cwd = projectName
+      ? `${MOCK_REMOTE_HOME}/.codemux/worktrees/${projectName}/${branch}`
+      : MOCK_REMOTE_HOME;
+    const ws = buildWorktreeWorkspace(projectPath ?? cwd, projectName ? branch : "Home");
+    ws.cwd = cwd;
+    ws.project_root = projectPath;
+    ws.worktree_path = null;
+    ws.git_branch = projectName ? branch : null;
+    ws.workspace_kind = projectName ? (a.newBranch ? "worktree" : "main") : null;
+    ws.host_id = Number(a.hostId);
+    ws.attach_only = true;
+    ws.remote_cwd = cwd;
+    const root = ws.surfaces[0].root;
+    if (root.kind === "agent_chat") {
+      root.cwd = cwd;
+      const chat = a.initialChat as
+        | { provider: AgentChatProviderKind; thread_id: string }
+        | undefined;
+      if (chat) {
+        root.provider = chat.provider;
+        root.thread_id = chat.thread_id;
+      }
     }
     appState = { ...appState, workspaces: [...appState.workspaces, ws] };
     emitAppState();

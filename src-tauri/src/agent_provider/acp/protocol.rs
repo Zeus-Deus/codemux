@@ -35,29 +35,23 @@ pub fn initialize_params(client_name: &str) -> Value {
 /// `authMethods` and is not the browser flow. Older CLIs without that metadata
 /// fall back to an advertised API key or cached login. We never select (or
 /// silently bypass) the browser default from an invisible child process.
-pub fn grok_auth_method(initialize: &Value, env: &HashMap<String, String>) -> Option<String> {
+///
+/// `ambient_api_key` says whether the environment the agent runs in exports
+/// a non-empty `XAI_API_KEY` that `env` doesn't set: Codemux's own for a
+/// local agent ([`local_xai_api_key_set`]), the device's login environment
+/// for one on a device — never this computer's, which a device doesn't
+/// inherit. Only older CLIs read it; see [`grok_auth_reads_ambient_api_key`].
+pub fn grok_auth_method(
+    initialize: &Value,
+    env: &HashMap<String, String>,
+    ambient_api_key: bool,
+) -> Option<String> {
     let has_api_key = env
         .get("XAI_API_KEY")
         .map(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            std::env::var("XAI_API_KEY").is_ok_and(|value| !value.trim().is_empty())
-        });
-    let methods = initialize
-        .get("authMethods")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|method| method.get("id").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .collect::<HashSet<_>>();
-
-    let advertised_default = initialize
-        .pointer("/_meta/defaultAuthMethodId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty());
-    if let Some(default_id) = advertised_default {
+        .unwrap_or(ambient_api_key);
+    let methods = grok_auth_methods(initialize);
+    if let Some(default_id) = grok_default_auth_method(initialize) {
         return (methods.contains(default_id) && !is_grok_browser_auth(default_id))
             .then(|| default_id.to_string());
     }
@@ -72,6 +66,42 @@ pub fn grok_auth_method(initialize: &Value, env: &HashMap<String, String>) -> Op
         return Some("cached_token".into());
     }
     None
+}
+
+/// Whether [`grok_auth_method`]'s choice depends on `ambient_api_key`: an
+/// older CLI (no advertised default) that offers API-key auth, with no key
+/// in `env`. Lets a caller skip asking a device about its environment when
+/// the answer can't change the method.
+pub fn grok_auth_reads_ambient_api_key(initialize: &Value, env: &HashMap<String, String>) -> bool {
+    grok_default_auth_method(initialize).is_none()
+        && !env.contains_key("XAI_API_KEY")
+        && grok_auth_methods(initialize).contains("xai.api_key")
+}
+
+/// Whether Codemux's own environment exports a non-empty `XAI_API_KEY`,
+/// which a local Grok agent inherits.
+pub fn local_xai_api_key_set() -> bool {
+    std::env::var("XAI_API_KEY").is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn grok_auth_methods(initialize: &Value) -> HashSet<&str> {
+    initialize
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|method| method.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+fn grok_default_auth_method(initialize: &Value) -> Option<&str> {
+    initialize
+        .pointer("/_meta/defaultAuthMethodId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
 }
 
 fn is_grok_browser_auth(method_id: &str) -> bool {
@@ -483,7 +513,7 @@ mod tests {
         });
         let env = HashMap::from([("XAI_API_KEY".into(), "secret".into())]);
         assert_eq!(
-            grok_auth_method(&initialized, &env).as_deref(),
+            grok_auth_method(&initialized, &env, true).as_deref(),
             Some("cached_token")
         );
     }
@@ -499,7 +529,7 @@ mod tests {
         });
         let env = HashMap::from([("XAI_API_KEY".into(), "secret".into())]);
         assert_eq!(
-            grok_auth_method(&initialized, &env).as_deref(),
+            grok_auth_method(&initialized, &env, true).as_deref(),
             Some("xai.api_key")
         );
     }
@@ -511,7 +541,7 @@ mod tests {
         });
         let env = HashMap::from([("XAI_API_KEY".into(), "stale-secret".into())]);
         assert_eq!(
-            grok_auth_method(&initialized, &env).as_deref(),
+            grok_auth_method(&initialized, &env, true).as_deref(),
             Some("cached_token")
         );
     }
@@ -526,7 +556,7 @@ mod tests {
             "_meta": { "defaultAuthMethodId": "enterprise_sso_token" }
         });
         assert_eq!(
-            grok_auth_method(&initialized, &HashMap::new()).as_deref(),
+            grok_auth_method(&initialized, &HashMap::new(), true).as_deref(),
             Some("enterprise_sso_token")
         );
     }
@@ -542,7 +572,7 @@ mod tests {
             "_meta": { "defaultAuthMethodId": "grok.com" }
         });
         let env = HashMap::from([("XAI_API_KEY".into(), "secret".into())]);
-        assert_eq!(grok_auth_method(&initialized, &env), None);
+        assert_eq!(grok_auth_method(&initialized, &env, true), None);
     }
 
     #[test]
@@ -551,6 +581,50 @@ mod tests {
             "authMethods": [{"id": "cached_token"}],
             "_meta": { "defaultAuthMethodId": "removed_by_policy" }
         });
-        assert_eq!(grok_auth_method(&initialized, &HashMap::new()), None);
+        assert_eq!(grok_auth_method(&initialized, &HashMap::new(), true), None);
+    }
+
+    #[test]
+    fn grok_legacy_api_key_follows_the_agents_own_environment() {
+        let initialized = json!({
+            "authMethods": [{"id": "grok.com"}, {"id": "xai.api_key"}]
+        });
+        // Nothing in the env sent to the agent, and none where it runs (a
+        // device ignores whatever this computer exports): no API-key auth.
+        assert_eq!(grok_auth_method(&initialized, &HashMap::new(), false), None);
+        // A device whose login environment exports the key gets it.
+        assert_eq!(
+            grok_auth_method(&initialized, &HashMap::new(), true).as_deref(),
+            Some("xai.api_key")
+        );
+        // A key in the env sent to the agent counts on its own.
+        let env = HashMap::from([("XAI_API_KEY".into(), "device-secret".into())]);
+        assert_eq!(
+            grok_auth_method(&initialized, &env, false).as_deref(),
+            Some("xai.api_key")
+        );
+    }
+
+    #[test]
+    fn grok_reads_the_ambient_key_only_when_it_can_change_the_method() {
+        let legacy = json!({
+            "authMethods": [{"id": "cached_token"}, {"id": "xai.api_key"}]
+        });
+        assert!(grok_auth_reads_ambient_api_key(&legacy, &HashMap::new()));
+        // A key sent along decides on its own.
+        let env = HashMap::from([("XAI_API_KEY".into(), "secret".into())]);
+        assert!(!grok_auth_reads_ambient_api_key(&legacy, &env));
+        // API-key auth hidden by policy.
+        let no_api_key = json!({ "authMethods": [{"id": "cached_token"}] });
+        assert!(!grok_auth_reads_ambient_api_key(
+            &no_api_key,
+            &HashMap::new()
+        ));
+        // Current CLIs name their default themselves.
+        let current = json!({
+            "authMethods": [{"id": "cached_token"}, {"id": "xai.api_key"}],
+            "_meta": { "defaultAuthMethodId": "cached_token" }
+        });
+        assert!(!grok_auth_reads_ambient_api_key(&current, &HashMap::new()));
     }
 }

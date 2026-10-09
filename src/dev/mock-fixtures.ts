@@ -884,6 +884,11 @@ const wsLedgerRates = makeWorkspace({
   git_additions: 128,
   git_deletions: 19,
   git_changed_files: 4,
+  // Runs on the zeus device (mock host id 2), so the sidebar shows a
+  // remote thread.
+  host_id: 2,
+  attach_only: true,
+  remote_cwd: "/home/deus/.codemux/worktrees/ledger-api/feat-fx-rates-cache",
 });
 
 const siteRoot = `${PROJECTS}/personal-site`;

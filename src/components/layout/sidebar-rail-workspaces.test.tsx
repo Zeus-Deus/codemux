@@ -21,8 +21,10 @@ vi.mock("@/tauri/commands", () => ({
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Per-test device list; reset in `beforeEach`.
+let hosts: { id: number; name: string }[] = [];
 vi.mock("@/stores/hosts-store", () => ({
-  useHosts: () => [],
+  useHosts: () => hosts,
 }));
 
 // App store: a plain object driven per-test. The rail derives everything
@@ -150,6 +152,7 @@ beforeEach(() => {
   activeWorkspaceId = "";
   pendingActiveWorkspaceId = null;
   wsCounter = 0;
+  hosts = [];
 });
 
 afterEach(async () => {
@@ -327,6 +330,26 @@ describe("SidebarRailWorkspaces", () => {
     expect(dotIn("ws-3")).toHaveClass("bg-status-open");
     // Idle workspace carries no dot.
     expect(dotIn("ws-4")).toBeNull();
+  });
+
+  it("marks a device thread with the device it runs on", async () => {
+    hosts = [{ id: 7, name: "zeus" }];
+    workspaces = [
+      makeWorkspace({ title: "Local" }),
+      makeWorkspace({ title: "On zeus", host_id: 7 }),
+    ];
+    const { container } = await renderRail();
+
+    const glyph = container
+      .querySelector('[data-rail-ws="ws-2"]')!
+      .querySelector('[aria-label="Runs on zeus"]');
+    expect(glyph).toHaveAttribute("role", "img");
+    expect(glyph).toHaveAttribute("title", "Runs on zeus");
+    expect(
+      container
+        .querySelector('[data-rail-ws="ws-1"]')!
+        .querySelector('[aria-label^="Runs on"]'),
+    ).toBeNull();
   });
 
   it("marks the active workspace's button with the neutral selection fill", async () => {

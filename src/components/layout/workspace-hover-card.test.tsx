@@ -438,10 +438,10 @@ describe("WorkspaceHoverCardBody — location, mute, path", () => {
     expect(screen.getByText("Another device")).toHaveClass("text-status-remote");
   });
 
-  it("marks an attach-in-place workspace as running on the host", () => {
+  it("names the device for a thread that runs there in place", () => {
     hosts = [{ id: 3, name: "beelink" } as HostView];
     renderBody(makeWorkspace({ host_id: 3, attach_only: true }));
-    expect(valueFor("Location")).toBe("beelink · in place");
+    expect(valueFor("Location")).toBe("beelink");
   });
 
   it("shows the muted row only when notifications are muted", () => {

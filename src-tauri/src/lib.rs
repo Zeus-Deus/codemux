@@ -1050,17 +1050,16 @@ fn build_core_app<R: tauri::Runtime>(
 
             control::spawn_control_server(app.handle().clone());
 
-            // Background host-upgrade poller. ~5s after app setup it
-            // walks every registered SSH host, version-checks its
+            // Startup pass of the device upgrader. ~5s after app setup
+            // it walks every registered device, version-checks its
             // codemux-remote against the one this build ships, and
-            // silently re-bootstraps any host that's behind. So when
-            // the user updates Codemux on the desktop, their hosts
-            // catch up on their own — no Test/Push click required.
-            // Safe to run on every app start: cheap when versions
-            // match (one SSH probe), idempotent re-provision on
-            // upgrade, never installs codemux-remote where it isn't
-            // already present (that still requires the Install
-            // button's consent).
+            // quietly upgrades any device that's behind. The inventory
+            // poller below repeats that whenever it sees an outdated
+            // device later (e.g. one that was offline now), so devices
+            // catch up with the desktop on their own. Never downgrades
+            // a newer device, never kills its terminals, never installs
+            // where codemux-remote isn't already present (that still
+            // takes the user's Connect / Set up again).
             #[cfg(unix)]
             crate::hosts_upgrade::spawn(app.handle().clone());
 
@@ -1076,6 +1075,11 @@ fn build_core_app<R: tauri::Runtime>(
             // keep their existing explicit push/pull.
             #[cfg(unix)]
             crate::hosts_inventory::spawn(app.handle().clone());
+
+            // Pull the account's device list once at startup so a freshly
+            // signed-in computer sees devices added elsewhere without
+            // editing one first. No-op when signed out.
+            crate::hosts_sync::spawn_startup_host_sync(app.handle().clone());
 
             // Resolve the bundled claude-agent sidecar and pin the path via
             // env var so the adapter (which has no AppHandle access at
@@ -2705,6 +2709,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::hosts_test_connection,
             commands::hosts_bootstrap_install,
             commands::hosts_reinstall_remote,
+            commands::get_local_device_name,
+            commands::hosts_ssh_config_hosts,
+            commands::remote_workspace::create_workspace_on_host,
             commands::set_workspace_host,
             commands::workspace_push_to_host,
             commands::workspace_pull_back,

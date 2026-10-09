@@ -243,7 +243,7 @@ interface Props {
   zone1Override?: React.ReactNode;
   /** Thread Scope redesign — optional slot rendered BELOW the composer
    *  card (inside the same shared chat column), under the footer.
-   *  The draft surface uses this for `ThreadScopeRow` (location ·
+   *  The draft surface uses this for `ThreadScopeRow` (device ·
    *  checkout · from-branch + the centered scope hint). `undefined`
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
