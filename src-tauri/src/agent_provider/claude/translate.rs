@@ -1625,7 +1625,22 @@ fn translate_result(
         .get("subtype")
         .and_then(|v| v.as_str())
         .unwrap_or("success");
+    // The SDK reports API failures (signed out, invalid key, no credit,
+    // overloaded) as a `success` result with `is_error: true` and the error
+    // text in `result`. Reading only the subtype would settle those turns as
+    // a clean success.
+    let api_error = subtype == "success"
+        && msg.get("is_error").and_then(|v| v.as_bool()) == Some(true);
     let status = match subtype {
+        "success" if api_error => TurnStatus::Error {
+            subtype: "api_error".into(),
+            message: msg
+                .get("result")
+                .and_then(|v| v.as_str())
+                .map(|text| text.trim().chars().take(200).collect::<String>())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "API error".to_string()),
+        },
         "success" => TurnStatus::Success,
         "error_max_turns" => TurnStatus::MaxTurns,
         "error_max_budget_usd" => TurnStatus::MaxBudget,
@@ -2353,6 +2368,44 @@ mod tests {
             }
             _ => panic!("expected TurnCompleted"),
         }
+    }
+
+    #[test]
+    fn result_success_with_is_error_emits_api_error() {
+        let long = "Invalid API key · Please run /login ".repeat(20);
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "turn_id": "t",
+            "is_error": true,
+            "result": long,
+            "usage": {},
+            "modelUsage": {}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        let Some(ProviderRuntimeEvent::TurnCompleted { status, .. }) = events
+            .iter()
+            .find(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+        else {
+            panic!("expected TurnCompleted");
+        };
+        match status {
+            TurnStatus::Error { subtype, message } => {
+                assert_eq!(subtype, "api_error");
+                assert!(message.starts_with("Invalid API key"));
+                assert_eq!(message.chars().count(), 200);
+            }
+            other => panic!("expected api_error, got {other:?}"),
+        }
+
+        // `is_error: false` (and an absent flag) stays a plain success.
+        let ok = json!({"type": "result", "subtype": "success", "turn_id": "t", "is_error": false, "result": "done"});
+        assert!(matches!(
+            translate_sdk_message(&tid(), &ok)
+                .iter()
+                .find(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })),
+            Some(ProviderRuntimeEvent::TurnCompleted { status: TurnStatus::Success, .. })
+        ));
     }
 
     #[test]
