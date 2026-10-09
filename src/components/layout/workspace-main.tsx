@@ -10,6 +10,7 @@ import {
   clampRightPanelWidth,
   maxRightPanelWidth,
   renderedRightPanelWidth,
+  RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
 import { resizeKeyAction } from "@/lib/resize-keys";
@@ -72,6 +73,7 @@ function RightPanelResizer({
   rowWidth: number;
 }) {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
+  const resetRightPanelWidth = useUIStore((s) => s.resetRightPanelWidth);
   const handleRef = useRef<HTMLDivElement>(null);
   const rafId = useRef(0);
 
@@ -163,11 +165,13 @@ function RightPanelResizer({
       onPointerDown={startResize}
       onKeyDown={handleKeyDown}
       onDoubleClick={() => {
-        // Back to the stored default as is: the drag minimum is for moving
-        // the seam, not for the default width.
-        const width = useUIStore.getInitialState().rightPanelWidth;
-        setRightPanelWidth(width);
-        dbSetUiState("right_panel_width", String(width)).catch(console.error);
+        // Back to the default as is: the drag minimum is for moving the
+        // seam, not for the default width.
+        resetRightPanelWidth();
+        dbSetUiState(
+          "right_panel_width",
+          String(RIGHT_PANEL_DEFAULT_WIDTH),
+        ).catch(console.error);
       }}
       role="separator"
       tabIndex={0}

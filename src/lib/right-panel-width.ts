@@ -38,6 +38,13 @@
  */
 export const RIGHT_PANEL_MIN_WIDTH = 360;
 
+/**
+ * Width a fresh install opens the panel at, and what double-clicking the seam
+ * returns to. It sits below {@link RIGHT_PANEL_MIN_WIDTH}, which bounds drags
+ * and key presses, so resetting must not go through the drag setter.
+ */
+export const RIGHT_PANEL_DEFAULT_WIDTH = 320;
+
 /** The panel's share of the content row when the fraction rule binds. */
 export const RIGHT_PANEL_MAX_FRACTION = 0.75;
 

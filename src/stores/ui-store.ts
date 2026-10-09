@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MAX_STORED_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
@@ -237,6 +238,8 @@ interface UIStore {
   setSidebarWidth: (width: number) => void;
   setSidebarOpen: (open: boolean) => void;
   setRightPanelWidth: (width: number) => void;
+  /** Back to the default width, which sits below the drag minimum. */
+  resetRightPanelWidth: () => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
@@ -303,7 +306,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
       sidebarOpen: true,
-      rightPanelWidth: 320,
+      rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
       fileSearchTarget: "editor",
@@ -545,6 +548,9 @@ export const useUIStore = create<UIStore>()(
             Math.min(RIGHT_PANEL_MAX_STORED_WIDTH, width),
           ),
         }),
+
+      resetRightPanelWidth: () =>
+        set({ rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH }),
 
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
 

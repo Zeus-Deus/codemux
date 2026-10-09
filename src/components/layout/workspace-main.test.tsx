@@ -22,6 +22,7 @@ const state = {
   rightPanelWidth: 320,
   rowWidths: [] as number[],
   panelWidths: [] as number[],
+  panelResets: 0,
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
@@ -109,10 +110,12 @@ vi.mock("@/stores/ui-store", () => ({
         rightPanelRowWidth: 0,
         rightPanelMaximized: state.rightPanelMaximized,
         setRightPanelWidth: (width: number) => state.panelWidths.push(width),
+        resetRightPanelWidth: () => {
+          state.panelResets += 1;
+        },
       }),
     ),
     {
-      getInitialState: () => ({ rightPanelWidth: 320 }),
       getState: () => ({
         setRightPanelWidth: vi.fn(),
         setRightPanelRowWidth: (width: number) => state.rowWidths.push(width),
@@ -190,6 +193,7 @@ beforeEach(() => {
   state.rightPanelWidth = 320;
   state.rowWidths = [];
   state.panelWidths = [];
+  state.panelResets = 0;
 });
 
 afterEach(cleanup);
@@ -591,7 +595,9 @@ describe("WorkspaceMain right panel resizer keyboard and reset", () => {
     state.rightPanelTabs = { "ws-1": "files" };
     const { getByRole } = render(<WorkspaceMain />);
     fireEvent.doubleClick(getByRole("separator", { name: "Resize right panel" }));
-    // The stored default as is: the drag minimum does not raise it.
-    expect(state.panelWidths).toEqual([320]);
+    // The default as is: the clamping drag setter is not involved.
+    expect(state.panelResets).toBe(1);
+    expect(state.panelWidths).toEqual([]);
+    expect(dbSetUiState).toHaveBeenLastCalledWith("right_panel_width", "320");
   });
 });

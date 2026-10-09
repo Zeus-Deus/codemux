@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { RIGHT_PANEL_MIN_WIDTH } from "@/lib/right-panel-width";
+import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+} from "@/lib/right-panel-width";
 import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 
@@ -264,6 +267,15 @@ describe("ui-store — onboarding state", () => {
     it("still refuses a width below the panel minimum", () => {
       useUIStore.getState().setRightPanelWidth(10);
       expect(useUIStore.getState().rightPanelWidth).toBe(RIGHT_PANEL_MIN_WIDTH);
+    });
+
+    it("resets to the default width, below the drag minimum", () => {
+      useUIStore.getState().setRightPanelWidth(900);
+      useUIStore.getState().resetRightPanelWidth();
+      expect(useUIStore.getState().rightPanelWidth).toBe(
+        RIGHT_PANEL_DEFAULT_WIDTH,
+      );
+      expect(RIGHT_PANEL_DEFAULT_WIDTH).toBeLessThan(RIGHT_PANEL_MIN_WIDTH);
     });
 
     it("persists the left sidebar width", () => {
