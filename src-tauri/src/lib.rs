@@ -1838,11 +1838,10 @@ fn build_core_app<R: tauri::Runtime>(
             // workspace, so active and inactive rows share one cadence and one
             // preserve/write/clear decision matrix.
             //
-            // Sequential per tick on purpose — each branch PR query is a
-            // subprocess fork, and we'd rather take ~Nx longer than slam
-            // `gh` with N parallel children. Provider subprocess helpers own
-            // hard kill+reap deadlines; awaiting the blocking task itself
-            // prevents a timed-out task from overlapping the next workspace.
+            // Provider classification and auth stay sequential. GitHub siblings
+            // then share bounded lightweight branch batches; other providers use
+            // their existing per-workspace lookup. Await each blocking owner so
+            // a slow tick cannot overlap the next one.
             //
             // Skips a workspace whose provider CLI is missing or logged
             // out. The probe is per *instance* (product + host) rather
@@ -1893,6 +1892,7 @@ fn build_core_app<R: tauri::Runtime>(
                     let mut refreshed = 0usize;
                     let mut skipped_unsupported = 0usize;
                     let mut skipped_unauthenticated = 0usize;
+                    let mut github_targets = Vec::new();
 
                     for (workspace_id, cwd) in workspaces {
                         let path = std::path::PathBuf::from(&cwd);
@@ -1916,6 +1916,9 @@ fn build_core_app<R: tauri::Runtime>(
                             // not clear a last-known provider/PR pill.
                             Ok(Err(_)) | Err(_) => continue,
                         };
+                        if !github::workspace_pr_poll_target_is_current(
+                            &state.workspace_provider_poll_targets(), &workspace_id, &cwd,
+                        ) { continue; }
                         changed |= state.update_workspace_provider_kind(
                             &workspace_id,
                             git_provider::provider_kind_field(&detected),
@@ -1981,6 +1984,11 @@ fn build_core_app<R: tauri::Runtime>(
                             continue;
                         }
 
+                        if provider.kind() == git_provider::ProviderKind::GitHub {
+                            github_targets.push((workspace_id, cwd, path));
+                            continue;
+                        }
+
                         let path_for_pr = path.clone();
                         let provider_for_pr = provider.clone();
                         let queued_at = std::time::Instant::now();
@@ -1993,6 +2001,9 @@ fn build_core_app<R: tauri::Runtime>(
                         })
                         .await;
 
+                        if !github::workspace_pr_poll_target_is_current(
+                            &state.workspace_provider_poll_targets(), &workspace_id, &cwd,
+                        ) { continue; }
                         match pr_result {
                             Ok(lookup) => {
                                 if let Err(e) = &lookup {
@@ -2033,6 +2044,56 @@ fn build_core_app<R: tauri::Runtime>(
                                     "[codemux::pr-poll] join error for {workspace_id}: {e}"
                                 );
                             }
+                        }
+                    }
+
+                    // GitHub siblings are resolved together after classification
+                    // and the per-instance auth gate. Other providers keep their
+                    // existing bounded per-workspace lookup.
+                    if !github_targets.is_empty() {
+                        let paths = github_targets
+                            .iter()
+                            .map(|(_, _, path)| path.clone())
+                            .collect::<Vec<_>>();
+                        let queued_at = std::time::Instant::now();
+                        let batch = tokio::task::spawn_blocking(move || {
+                            diagnostics::record_perf_timing("background.pr-poll.queue-delay", queued_at.elapsed());
+                            github::get_workspace_prs_batch(&paths)
+                        })
+                        .await;
+                        match batch {
+                            Ok(results) if results.len() == github_targets.len() => {
+                                for ((workspace_id, cwd, _), lookup) in github_targets.into_iter().zip(results) {
+                                    // Deleted, moved or newly remote-attached
+                                    // workspace? This tick's path cannot write.
+                                    if !github::workspace_pr_poll_target_is_current(
+                                        &state.workspace_provider_poll_targets(),
+                                        &workspace_id,
+                                        &cwd,
+                                    ) {
+                                        continue;
+                                    }
+                                    if let Err(error) = &lookup {
+                                        eprintln!("[codemux::pr-poll] workspace PR lookup failed for {workspace_id}: {error}");
+                                    }
+                                    match github::workspace_prs_outcome(lookup) {
+                                        github::WorkspacePrsOutcome::Write(prs) => {
+                                            changed |=
+                                                state.update_workspace_prs(&workspace_id, workspace_pr_rows(prs));
+                                            refreshed += 1;
+                                        }
+                                        github::WorkspacePrsOutcome::Clear => {
+                                            changed |= state.update_workspace_prs(&workspace_id, Vec::new());
+                                            refreshed += 1;
+                                        }
+                                        github::WorkspacePrsOutcome::Preserve => {}
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                eprintln!("[codemux::pr-poll] invalid GitHub batch result count; preserving PRs")
+                            }
+                            Err(error) => eprintln!("[codemux::pr-poll] GitHub batch join error: {error}"),
                         }
                     }
 

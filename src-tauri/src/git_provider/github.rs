@@ -1,9 +1,8 @@
 //! GitHub adapter — thin delegation to `crate::github` / `crate::github_cache`.
 //!
-//! Deliberately logic-free. Every method forwards to the function the
-//! corresponding caller already used, including the choice of cached vs
-//! uncached wrapper, so routing a call site through the trait cannot
-//! change what GitHub users observe.
+//! Most methods preserve the existing cached/uncached read choice. Selected
+//! branch detail hydrates the lightweight association row; background polling
+//! keeps the cheaper discovery path.
 
 use std::path::Path;
 
@@ -17,6 +16,41 @@ use crate::github::{
 use crate::github_cache;
 
 pub struct GitHubProvider;
+
+// Keep the selected-detail contract independently testable without CLI or
+// process-wide authentication state. Polling continues to use lightweight rows.
+fn hydrate_branch_detail(
+    lookup: Result<Option<PullRequestInfo>, String>,
+    fetch: impl FnOnce(u32) -> Result<PullRequestInfo, String>,
+) -> Result<Option<PullRequestInfo>, String> {
+    let Some(selected) = lookup? else {
+        return Ok(None);
+    };
+    let detail = fetch(selected.number)?;
+    // The two reads resolve mutable local remote/account configuration.
+    // Never attach another repository's same-number PR to this selection.
+    // A newer head SHA is valid metadata, not a different branch identity.
+    let owner_matches = selected
+        .head_repository_owner
+        .as_deref()
+        .is_none_or(|expected| {
+            detail
+                .head_repository_owner
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(expected))
+        });
+    if detail.number != selected.number
+        || detail.url != selected.url
+        || detail.head_branch != selected.head_branch
+        || !owner_matches
+    {
+        return Err(
+            "Selected branch PR identity changed while loading details; refresh and try again."
+                .into(),
+        );
+    }
+    Ok(Some(detail))
+}
 
 impl SourceControlProvider for GitHubProvider {
     fn kind(&self) -> ProviderKind {
@@ -51,7 +85,10 @@ impl SourceControlProvider for GitHubProvider {
     }
 
     fn branch_pull_request(&self, repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
-        github::get_branch_pr(repo_path)
+        // The selected review surface needs full detail; polling does not.
+        hydrate_branch_detail(github::get_branch_pr(repo_path), |number| {
+            github::get_pull_request(repo_path, number)
+        })
     }
 
     fn workspace_pull_request(&self, repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
@@ -192,11 +229,7 @@ impl SourceControlProvider for GitHubProvider {
     /// caller re-anchors pending notes against whatever comes back, so a
     /// stale body here would move notes onto lines that no longer exist.
     /// React Query holds it client-side keyed by head sha instead.
-    fn pull_request_review_diff(
-        &self,
-        repo_path: &Path,
-        number: u32,
-    ) -> Result<String, String> {
+    fn pull_request_review_diff(&self, repo_path: &Path, number: u32) -> Result<String, String> {
         github::get_pr_review_diff(repo_path, number)
     }
 
@@ -354,5 +387,91 @@ mod tests {
             GitHubProvider.fork_pr_fetch_refspec(42, "pr-42"),
             Some("pull/42/head:pr-42".to_string())
         );
+    }
+    fn branch_row() -> PullRequestInfo {
+        serde_json::from_value(serde_json::json!({
+            "number": 42, "url": "https://github.example.test/fixture/repo/pull/42",
+            "state": "OPEN", "title": "Fixture", "head_branch": "feature",
+            "head_repository_owner": "fork-owner", "head_ref_oid": "before"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn selected_branch_detail_hydrates_author_body_and_review_metadata() {
+        let selected = branch_row();
+        let mut full = selected.clone();
+        full.author = Some("fixture-author".into());
+        full.body = Some("Full description".into());
+        full.mergeable = Some("MERGEABLE".into());
+        full.review_decision = Some("APPROVED".into());
+        full.changed_files = Some(8);
+        full.head_ref_oid = Some("newer-head".into());
+        let detail = hydrate_branch_detail(Ok(Some(selected)), |number| {
+            assert_eq!(number, 42);
+            Ok(full)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(detail.author.as_deref(), Some("fixture-author"));
+        assert_eq!(detail.body.as_deref(), Some("Full description"));
+        assert_eq!(detail.mergeable.as_deref(), Some("MERGEABLE"));
+        assert_eq!(detail.review_decision.as_deref(), Some("APPROVED"));
+        assert_eq!(detail.changed_files, Some(8));
+        assert_eq!(detail.head_ref_oid.as_deref(), Some("newer-head"));
+    }
+
+    #[test]
+    fn branch_empty_or_lookup_failure_never_fetches_details() {
+        assert!(hydrate_branch_detail(Ok(None), |_| panic!("no branch PR"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            hydrate_branch_detail(Err("lookup unavailable".into()), |_| panic!(
+                "lookup failed"
+            ))
+            .unwrap_err(),
+            "lookup unavailable"
+        );
+    }
+
+    #[test]
+    fn selected_branch_hydration_errors_do_not_return_partial_success() {
+        assert_eq!(
+            hydrate_branch_detail(
+                Ok(Some(branch_row())),
+                |_| Err("details unavailable".into())
+            )
+            .unwrap_err(),
+            "details unavailable"
+        );
+    }
+
+    #[test]
+    fn selected_branch_detail_rejects_changed_identity() {
+        for change in 0..5 {
+            let selected = branch_row();
+            let mut full = selected.clone();
+            match change {
+                0 => full.number = 43,
+                1 => full.url = "https://github.example.test/fixture/other/pull/42".into(),
+                2 => full.head_branch = Some("other".into()),
+                3 => full.head_repository_owner = Some("other-owner".into()),
+                _ => full.head_repository_owner = None,
+            }
+            assert!(hydrate_branch_detail(Ok(Some(selected)), |_| Ok(full))
+                .unwrap_err()
+                .contains("identity"));
+        }
+    }
+
+    #[test]
+    fn selected_branch_detail_matches_owner_case_insensitively() {
+        let selected = branch_row();
+        let mut full = selected.clone();
+        full.head_repository_owner = Some("FORK-OWNER".into());
+        assert!(hydrate_branch_detail(Ok(Some(selected)), |_| Ok(full))
+            .unwrap()
+            .is_some());
     }
 }

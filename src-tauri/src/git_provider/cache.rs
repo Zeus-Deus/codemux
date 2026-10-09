@@ -1,13 +1,8 @@
 //! TTL cache primitive shared by non-GitHub provider adapters.
 //!
-//! `crate::github_cache` is the same idea specialised to GitHub: one
-//! static per query shape, keyed by repository path, holding a value
-//! for a fixed TTL. Rather than widen those statics — which would mean
-//! touching the GitHub read path — this generalises the *primitive* and
-//! lets each adapter own its own statics. The TTLs are re-exported from
-//! `github_cache` so the two families cannot drift apart: a user
-//! switching a workspace from one product to the other should not see a
-//! different staleness window.
+//! These adapters own their parsed-value caches and TTLs. GitHub uses its
+//! credential-aware native coordinator instead of layering another cache
+//! above it. Keep the existing non-GitHub staleness windows unchanged.
 //!
 //! Keys are strings built by the caller and must include the repository
 //! path (issue and merge-request numbers are per-project, so a bare
@@ -22,7 +17,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub use crate::github_cache::{DETAIL_TTL, LIST_TTL};
+pub const LIST_TTL: Duration = Duration::from_secs(60);
+pub const DETAIL_TTL: Duration = Duration::from_secs(300);
 
 struct CacheEntry<V> {
     value: V,

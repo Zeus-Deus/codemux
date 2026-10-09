@@ -1,21 +1,26 @@
 //! One process-wide budget for every GitHub read, including background jobs.
 //!
-//! The lock deliberately spans the subprocess: reads cannot stampede a cold
-//! quota probe, duplicate a cache miss, or keep launching after a refusal.
-//! Mutations remain available and invalidate reads without lifting a pause.
+//! Reserve quota and coalesce equal reads under a short-lived lock; perform
+//! HTTP/CLI work outside it with bounded concurrency. A cold account has one
+//! quota probe, and refreshes/writes fence late results without lifting pauses.
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::git_provider::exec::{TimedFailure, TimedOutput};
+
+#[path = "github_http.rs"]
+mod http;
 
 const PROBE_TTL: Duration = Duration::from_secs(60);
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HOSTS: usize = 128;
+const MAX_PARALLEL_READS: usize = 4;
+const MAX_BACKGROUND_READS: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 enum Bucket {
@@ -28,6 +33,7 @@ struct Quota {
     limit: u64,
     remaining: u64,
     reset: u64,
+    observed_remaining: u64,
 }
 
 #[derive(Clone)]
@@ -47,6 +53,47 @@ struct HostState {
     probe_failures: u32,
     core_pause_until: u64,
     graphql_pause_until: u64,
+    probe_running: bool,
+    core_debt: ChargeDebt,
+    graphql_debt: ChargeDebt,
+    probe_boundary: Option<(ChargeDebt, ChargeDebt, u64)>,
+}
+
+/// Fixed-size per-account ledger: cache eviction cannot forgive a charge.
+#[derive(Clone, Copy, Default)]
+struct ChargeDebt {
+    confirmed: u64,
+    uncertain: u64,
+    uncertain_until: u64,
+}
+
+impl ChargeDebt {
+    fn total(self) -> u64 {
+        self.confirmed.saturating_add(self.uncertain)
+    }
+
+    fn add(&mut self, cost: u64, confirmed: bool, reset: u64) {
+        if confirmed {
+            self.confirmed = self.confirmed.saturating_add(cost);
+        } else if cost > 0 {
+            self.uncertain = self.uncertain.saturating_add(cost);
+            // A timeout completing after its admitted epoch needs a new
+            // epoch established before we can choose a safe reset boundary.
+            let until = if reset > epoch() { reset } else { u64::MAX };
+            self.uncertain_until = self.uncertain_until.max(until);
+        }
+    }
+
+    fn reconcile(&mut self, boundary: Self, started: u64, reset: u64) {
+        self.confirmed = self.confirmed.saturating_sub(boundary.confirmed);
+        if self.uncertain_until == boundary.uncertain_until {
+            if boundary.uncertain_until == u64::MAX {
+                self.uncertain_until = reset;
+            } else if started >= boundary.uncertain_until && reset > boundary.uncertain_until {
+                self.uncertain = self.uncertain.saturating_sub(boundary.uncertain);
+            }
+        }
+    }
 }
 
 struct Entry {
@@ -54,15 +101,143 @@ struct Entry {
     result: Result<String, String>,
     failures: u32,
     scope: u64,
+    validator: Option<String>,
 }
 
 #[derive(Default)]
 struct Coordinator {
     hosts: HashMap<(String, Option<u64>), HostState>,
     reads: HashMap<((String, Option<u64>), u64), Entry>,
+    inflight: HashMap<ReadKey, InFlight>,
 }
 
 static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
+static READ_CHANGED: OnceLock<Condvar> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    // Scheduling-only hooks for public fresh-read races; no transport is mocked.
+    static FRESH_BOUNDARY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static READ_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+struct Executed {
+    result: Result<String, String>,
+    headers: Option<reqwest::header::HeaderMap>,
+    not_modified: bool,
+}
+
+impl Executed {
+    fn plain(result: Result<String, String>) -> Self {
+        Self {
+            result,
+            headers: None,
+            not_modified: false,
+        }
+    }
+}
+
+#[cfg(test)]
+fn run_read_with(
+    host: &str,
+    identity: Option<u64>,
+    path: &Path,
+    args: &[&str],
+    deadline: Instant,
+    execute: impl FnMut(&[&str], Option<&str>) -> Executed,
+) -> Result<String, String> {
+    run_read_mode(host, identity, path, args, deadline, false, None, execute)
+}
+
+fn run_read_mode(
+    host: &str,
+    identity: Option<u64>,
+    path: &Path,
+    args: &[&str],
+    deadline: Instant,
+    fresh: bool,
+    declared_cost: Option<u64>,
+    mut execute: impl FnMut(&[&str], Option<&str>) -> Executed,
+) -> Result<String, String> {
+    // Local Git resolution stays outside the shared state lock too.
+    let key = read_key(path, args);
+    let scope = scope_key(path, args);
+    let changed = READ_CHANGED.get_or_init(Condvar::new);
+    if fresh {
+        // Fence both the cache and pre-boundary admission in one lock, using
+        // the exact context/credential/key that the ensuing read will use.
+        lock_until(deadline)?.invalidate_key(&((host.to_string(), identity), key));
+        #[cfg(test)]
+        FRESH_BOUNDARY_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+    loop {
+        let mut coordinator = lock_until(deadline)?;
+        let admission = if let Some(cost) = declared_cost {
+            coordinator.prepare_with_cost(
+                host,
+                identity,
+                key,
+                scope,
+                args,
+                foreground_read(args),
+                cost,
+            )
+        } else {
+            coordinator.prepare(host, identity, key, scope, args, foreground_read(args))
+        };
+        match admission {
+            Admission::Complete(result) => return result,
+            Admission::Probe => {
+                drop(coordinator);
+                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(&["api", "rate_limit", "--hostname", host], None)
+                }))
+                .unwrap_or_else(|_| Executed::plain(Err("GitHub quota worker panicked".into())));
+                COORDINATOR
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .map_err(|_| "GitHub budget lock poisoned")?
+                    .probe_finished(host, identity, output);
+                changed.notify_all();
+            }
+            Admission::Read(plan) => {
+                drop(coordinator);
+                let measured: Vec<&str> = plan.args.iter().map(String::as_str).collect();
+                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(&measured, plan.validator.as_deref())
+                }))
+                .unwrap_or_else(|_| Executed::plain(Err("GitHub read worker panicked".into())));
+                let result = COORDINATOR
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .map_err(|_| "GitHub budget lock poisoned")?
+                    .finish(plan, args, output);
+                changed.notify_all();
+                return result;
+            }
+            Admission::Wait => {
+                #[cfg(test)]
+                READ_WAIT_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                let (_guard, waited) = changed
+                    .wait_timeout(coordinator, time_left(deadline)?)
+                    .map_err(|_| "GitHub budget lock poisoned")?;
+                if waited.timed_out() {
+                    return Err("GitHub read timed out".into());
+                }
+            }
+        }
+    }
+}
 
 fn epoch() -> u64 {
     SystemTime::now()
@@ -335,6 +510,15 @@ fn repository_scope(args: &[&str]) -> Option<String> {
     None
 }
 
+fn foreground_read(args: &[&str]) -> bool {
+    // Keep one transport slot for explicitly selected detail/check/diff work.
+    // Priority changes concurrency only, never the reserved quota floor.
+    matches!(
+        (args.first().copied(), args.get(1).copied()),
+        (Some("pr" | "issue"), Some("view" | "checks" | "diff"))
+    )
+}
+
 fn ttl(args: &[&str]) -> Duration {
     let seconds = match (args.first().copied(), args.get(1).copied()) {
         (Some("pr"), Some("checks")) => 30,
@@ -398,6 +582,7 @@ fn parse_snapshot(raw: String) -> Result<Snapshot, String> {
             limit,
             remaining,
             reset,
+            observed_remaining: remaining,
         })
     };
     let core = read("core")?;
@@ -449,48 +634,130 @@ fn record_refusal(state: &mut HostState, message: &str, now: u64) {
     state.snapshot = None;
 }
 
+type HostKey = (String, Option<u64>);
+type ReadKey = (HostKey, u64);
+
+struct InFlight {
+    scope: u64,
+    selected: Bucket,
+    cost: u64,
+    core_cost: u64,
+    core_reset: u64,
+    graphql_reset: u64,
+    foreground: bool,
+    superseded: bool,
+}
+
+struct ReadPlan {
+    key: ReadKey,
+    args: Vec<String>,
+    validator: Option<String>,
+    previous: Option<String>,
+}
+
+enum Admission {
+    Complete(Result<String, String>),
+    Probe,
+    Read(ReadPlan),
+    Wait,
+}
+
 impl Coordinator {
-    fn read(
+    fn invalidate_key(&mut self, key: &ReadKey) {
+        if self
+            .reads
+            .get(key)
+            .is_some_and(|entry| entry.result.is_ok())
+        {
+            self.reads.remove(key);
+        }
+        if let Some(flight) = self.inflight.get_mut(key) {
+            flight.superseded = true;
+        }
+    }
+
+    fn invalidate_scope(&mut self, account: &HostKey, scope: u64) {
+        self.reads.retain(|(key, _), entry| {
+            key != account || entry.scope != scope || entry.result.is_err()
+        });
+        for (_, flight) in self
+            .inflight
+            .iter_mut()
+            .filter(|(key, flight)| &key.0 == account && flight.scope == scope)
+        {
+            flight.superseded = true;
+        }
+    }
+
+    fn prepare(
         &mut self,
         host: &str,
         identity: Option<u64>,
-        path: &Path,
+        key: u64,
+        scope: u64,
         args: &[&str],
-        mut execute: impl FnMut(&[&str]) -> Result<String, String>,
-    ) -> Result<String, String> {
+        foreground: bool,
+    ) -> Admission {
+        self.prepare_with_cost(
+            host,
+            identity,
+            key,
+            scope,
+            args,
+            foreground,
+            estimated_cost(args),
+        )
+    }
+
+    fn prepare_with_cost(
+        &mut self,
+        host: &str,
+        identity: Option<u64>,
+        key: u64,
+        scope: u64,
+        args: &[&str],
+        foreground: bool,
+        declared_cost: u64,
+    ) -> Admission {
         let host_key = (host.to_string(), identity);
         if !self.hosts.contains_key(&host_key) && self.hosts.len() >= MAX_HOSTS {
-            // Never discard a live cooldown to make room for another host.
-            return Err("GitHub budget coordinator has too many active accounts".into());
+            return Admission::Complete(Err(
+                "GitHub budget coordinator has too many active accounts".into(),
+            ));
         }
         let now = epoch();
-        let state = self.hosts.entry(host_key.clone()).or_default();
+        let key = (host_key.clone(), key);
+        let selected = bucket(args);
         let diagnostic = args.first() == Some(&"api") && args.get(1) == Some(&"rate_limit");
+        let state = self.hosts.entry(host_key.clone()).or_default();
         if state.pause_until > now {
-            if diagnostic {
-                if let Some(snapshot) = &state.snapshot {
-                    return Ok(snapshot.raw.clone());
-                }
-            }
-            return Err(quota_pause(host, state.pause_until));
+            return Admission::Complete(if diagnostic {
+                state
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.raw.clone())
+                    .ok_or_else(|| quota_pause(host, state.pause_until))
+            } else {
+                Err(quota_pause(host, state.pause_until))
+            });
         }
-        let key = (host_key.clone(), read_key(path, args));
         if !diagnostic {
-            if let Some(entry) = self.reads.get(&key) {
-                if entry.expires > Instant::now() {
-                    return entry.result.clone();
-                }
+            if let Some(entry) = self
+                .reads
+                .get(&key)
+                .filter(|entry| entry.expires > Instant::now())
+            {
+                return Admission::Complete(entry.result.clone());
             }
         }
         let state = self.hosts.get_mut(&host_key).unwrap();
-        let selected = bucket(args);
         if diagnostic && (state.core_pause_until > now || state.graphql_pause_until > now) {
             if let Some(snapshot) = &state.snapshot {
-                return Ok(snapshot.raw.clone());
+                return Admission::Complete(Ok(snapshot.raw.clone()));
             }
         }
         if !diagnostic {
-            let primary_pause = match selected {
+            let paused = match selected {
                 Bucket::Core => state.core_pause_until,
                 Bucket::Graphql => state.graphql_pause_until,
             }
@@ -499,8 +766,8 @@ impl Coordinator {
             } else {
                 0
             });
-            if primary_pause > now {
-                return Err(quota_pause(host, primary_pause));
+            if paused > now {
+                return Admission::Complete(Err(quota_pause(host, paused)));
             }
         }
         if let Some((at, message)) = &state.probe_error {
@@ -508,150 +775,373 @@ impl Coordinator {
                 (60_u64 << state.probe_failures.saturating_sub(1).min(4)).min(900),
             );
             if at.elapsed() < delay {
-                return Err(message.clone());
+                return Admission::Complete(Err(message.clone()));
             }
         }
-        let needs_probe = state.snapshot.as_ref().is_none_or(|s| {
-            s.fetched.elapsed() >= PROBE_TTL
+        let needs_probe = state.snapshot.as_ref().is_none_or(|snapshot| {
+            snapshot.fetched.elapsed() >= PROBE_TTL
                 || match selected {
-                    Bucket::Core => s.core.reset,
-                    Bucket::Graphql => s.graphql.reset,
+                    Bucket::Core => snapshot.core.reset,
+                    Bucket::Graphql => snapshot.graphql.reset,
                 } <= now
         });
+        if needs_probe && state.probe_running {
+            return Admission::Wait;
+        }
+        if self.inflight.contains_key(&key) {
+            return Admission::Wait;
+        }
+        let probes = self
+            .hosts
+            .values()
+            .filter(|state| state.probe_running)
+            .count();
+        let background = self
+            .inflight
+            .values()
+            .filter(|read| !read.foreground)
+            .count()
+            + probes;
+        if self.inflight.len() + probes >= MAX_PARALLEL_READS
+            || (!foreground && background >= MAX_BACKGROUND_READS)
+        {
+            return Admission::Wait;
+        }
+        let state = self.hosts.get_mut(&host_key).unwrap();
         if needs_probe {
-            let probe =
-                execute(&["api", "rate_limit", "--hostname", host]).and_then(parse_snapshot);
-            match probe {
-                Ok(snapshot) => {
-                    state.snapshot = Some(snapshot);
-                    state.probe_error = None;
-                    state.probe_failures = 0;
-                }
-                Err(mut message) => {
-                    if refusal(&message) {
-                        record_refusal(state, &message, now);
-                        message = quota_pause(host, state.pause_until);
+            state.probe_running = true;
+            state.probe_boundary = Some((state.core_debt, state.graphql_debt, now));
+            return Admission::Probe;
+        }
+        if diagnostic {
+            return Admission::Complete(Ok(state.snapshot.as_ref().unwrap().raw.clone()));
+        }
+        let snapshot = state.snapshot.as_mut().unwrap();
+        let cost = declared_cost;
+        let core_cost = if uses_core_too(args) { 2 } else { 0 };
+        let quota = match selected {
+            Bucket::Core => snapshot.core,
+            Bucket::Graphql => snapshot.graphql,
+        };
+        let floor = quota.limit.div_ceil(10);
+        if quota.remaining < cost || quota.remaining.saturating_sub(cost) < floor {
+            if quota.remaining > floor {
+                return Admission::Complete(Err(format!("GitHub read needs {cost} estimated points but only {} are available above the 10% reserve", quota.remaining - floor)));
+            }
+            match selected {
+                Bucket::Core => state.core_pause_until = quota.reset,
+                Bucket::Graphql => state.graphql_pause_until = quota.reset,
+            }
+            return Admission::Complete(Err(quota_pause(host, quota.reset)));
+        }
+        let core_floor = snapshot.core.limit.div_ceil(10);
+        if core_cost > 0
+            && (snapshot.core.remaining < core_cost
+                || snapshot.core.remaining.saturating_sub(core_cost) < core_floor)
+        {
+            if snapshot.core.remaining > core_floor {
+                return Admission::Complete(Err(
+                    "GitHub repository lookup cannot fit above the 10% core reserve".into(),
+                ));
+            }
+            state.core_pause_until = snapshot.core.reset;
+            return Admission::Complete(Err(quota_pause(host, snapshot.core.reset)));
+        }
+        match selected {
+            Bucket::Core => snapshot.core.remaining -= cost,
+            Bucket::Graphql => snapshot.graphql.remaining -= cost,
+        }
+        snapshot.core.remaining = snapshot.core.remaining.saturating_sub(core_cost);
+        let mut measured: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        if args.first() == Some(&"api") && args.get(1) == Some(&"graphql") {
+            if let Some(query) = graphql_document(args).filter(|query| !query.contains("rateLimit"))
+            {
+                if let Some(end) = query.rfind('}') {
+                    let metered = format!(
+                        "{} rateLimit {{ cost limit remaining resetAt }} {}",
+                        &query[..end],
+                        &query[end..]
+                    );
+                    if let Some(index) = args.iter().position(|arg| arg.contains("query=")) {
+                        let prefix = &args[index][..args[index].find("query=").unwrap()];
+                        measured[index] = format!("{prefix}query={metered}");
                     }
-                    state.probe_error = Some((Instant::now(), message.clone()));
-                    state.probe_failures = state.probe_failures.saturating_add(1);
-                    return Err(message);
                 }
             }
         }
-        if diagnostic {
-            return Ok(state.snapshot.as_ref().unwrap().raw.clone());
+        let validator = self
+            .reads
+            .get(&key)
+            .and_then(|entry| entry.validator.clone());
+        let previous = self
+            .reads
+            .get(&key)
+            .and_then(|entry| entry.result.as_ref().ok().cloned());
+        self.inflight.insert(
+            key.clone(),
+            InFlight {
+                scope,
+                selected,
+                cost,
+                core_cost,
+                core_reset: snapshot.core.reset,
+                graphql_reset: snapshot.graphql.reset,
+                foreground,
+                superseded: false,
+            },
+        );
+        Admission::Read(ReadPlan {
+            key,
+            args: measured,
+            validator,
+            previous,
+        })
+    }
+
+    fn probe_finished(&mut self, host: &str, identity: Option<u64>, output: Executed) {
+        let state = self.hosts.get_mut(&(host.to_string(), identity)).unwrap();
+        state.probe_running = false;
+        let boundary = state.probe_boundary.take();
+        match output.result.and_then(parse_snapshot) {
+            Ok(snapshot) => {
+                let core = snapshot.core;
+                let graphql = snapshot.graphql;
+                if let Some((core_debt, graphql_debt, started)) = boundary {
+                    if state
+                        .snapshot
+                        .as_ref()
+                        .is_none_or(|old| core.reset >= old.core.reset)
+                    {
+                        state.core_debt.reconcile(core_debt, started, core.reset);
+                    }
+                    if state
+                        .snapshot
+                        .as_ref()
+                        .is_none_or(|old| graphql.reset >= old.graphql.reset)
+                    {
+                        state
+                            .graphql_debt
+                            .reconcile(graphql_debt, started, graphql.reset);
+                    }
+                }
+                // A probe runs outside the lock: merge its observations rather
+                // than replacing reservations or replies received meanwhile.
+                if state.snapshot.is_none() {
+                    state.snapshot = Some(snapshot);
+                } else {
+                    state.snapshot.as_mut().unwrap().fetched = snapshot.fetched;
+                }
+                state.probe_error = None;
+                state.probe_failures = 0;
+                let account = (host.to_string(), identity);
+                self.observe(
+                    &account,
+                    Bucket::Core,
+                    core.limit,
+                    core.remaining,
+                    core.reset,
+                );
+                self.observe(
+                    &account,
+                    Bucket::Graphql,
+                    graphql.limit,
+                    graphql.remaining,
+                    graphql.reset,
+                );
+            }
+            Err(mut message) => {
+                if refusal(&message) {
+                    record_refusal(state, &message, epoch());
+                    message = quota_pause(host, state.pause_until);
+                }
+                state.probe_error = Some((Instant::now(), message));
+                state.probe_failures = state.probe_failures.saturating_add(1);
+            }
         }
-        let snapshot = state.snapshot.as_mut().unwrap();
+    }
+
+    fn observe(
+        &mut self,
+        host: &HostKey,
+        selected: Bucket,
+        limit: u64,
+        remaining: u64,
+        reset: u64,
+    ) -> bool {
+        if limit == 0 || remaining > limit || reset == 0 {
+            return false;
+        }
+        let reserved = self
+            .inflight
+            .iter()
+            .filter(|(key, _)| &key.0 == host)
+            .map(|(_, read)| match selected {
+                Bucket::Core => {
+                    read.core_cost
+                        + if matches!(read.selected, Bucket::Core) {
+                            read.cost
+                        } else {
+                            0
+                        }
+                }
+                Bucket::Graphql => {
+                    if matches!(read.selected, Bucket::Graphql) {
+                        read.cost
+                    } else {
+                        0
+                    }
+                }
+            })
+            .sum::<u64>();
+        let Some(state) = self.hosts.get_mut(host) else {
+            return false;
+        };
+        let debt = match selected {
+            Bucket::Core => state.core_debt.total(),
+            Bucket::Graphql => state.graphql_debt.total(),
+        };
+        let Some(snapshot) = state.snapshot.as_mut() else {
+            return false;
+        };
         let quota = match selected {
             Bucket::Core => &mut snapshot.core,
             Bucket::Graphql => &mut snapshot.graphql,
         };
-        let cost = estimated_cost(args);
-        if quota.remaining.saturating_sub(cost) < quota.limit.div_ceil(10) {
-            let reset = quota.reset;
-            match selected {
-                Bucket::Core => state.core_pause_until = reset,
-                Bucket::Graphql => state.graphql_pause_until = reset,
+        if reset < quota.reset {
+            return false;
+        }
+        let observed_remaining = if reset == quota.reset {
+            quota.observed_remaining.min(remaining)
+        } else {
+            remaining
+        };
+        *quota = Quota {
+            limit,
+            remaining: observed_remaining
+                .saturating_sub(reserved)
+                .saturating_sub(debt),
+            reset,
+            observed_remaining,
+        };
+        if let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&snapshot.raw) {
+            let resource = match selected {
+                Bucket::Core => "core",
+                Bucket::Graphql => "graphql",
             };
-            return Err(quota_pause(host, reset));
+            raw["resources"][resource] =
+                serde_json::json!({"limit": limit, "remaining": quota.remaining, "reset": reset});
+            snapshot.raw = raw.to_string();
         }
-        quota.remaining = quota.remaining.saturating_sub(cost);
-        if uses_core_too(args) {
-            let core = &mut snapshot.core;
-            if core.remaining.saturating_sub(2) < core.limit.div_ceil(10) {
-                state.core_pause_until = core.reset;
-                return Err(quota_pause(host, core.reset));
-            }
-            core.remaining = core.remaining.saturating_sub(2);
-        }
-        let mut measured: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        if args.first() == Some(&"api") && args.get(1) == Some(&"graphql") {
-            if let Some(query) = graphql_document(args) {
-                if !query.contains("rateLimit") {
-                    if let Some(end) = query.rfind('}') {
-                        let metered = format!(
-                            "{} rateLimit {{ cost limit remaining resetAt }} {}",
-                            &query[..end],
-                            &query[end..]
-                        );
-                        if let Some(index) = args.iter().position(|a| a.contains("query=")) {
-                            let prefix = &args[index][..args[index].find("query=").unwrap()];
-                            measured[index] = format!("{prefix}query={metered}");
-                        }
+        true
+    }
+
+    fn finish(
+        &mut self,
+        plan: ReadPlan,
+        args: &[&str],
+        output: Executed,
+    ) -> Result<String, String> {
+        let flight = self
+            .inflight
+            .remove(&plan.key)
+            .expect("admitted GitHub read");
+        let host_key = &plan.key.0;
+        let host = &host_key.0;
+        let mut core_observed = false;
+        let mut graphql_observed = false;
+        if let Some(headers) = &output.headers {
+            let number = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
+            let resource = headers
+                .get("x-ratelimit-resource")
+                .and_then(|value| value.to_str().ok());
+            if let (Some(resource), Some(limit), Some(remaining), Some(reset)) = (
+                resource,
+                number("x-ratelimit-limit"),
+                number("x-ratelimit-remaining"),
+                number("x-ratelimit-reset"),
+            ) {
+                if let Some(selected) = match resource {
+                    "core" => Some(Bucket::Core),
+                    "graphql" => Some(Bucket::Graphql),
+                    _ => None,
+                } {
+                    let observed = self.observe(host_key, selected, limit, remaining, reset);
+                    match selected {
+                        Bucket::Core => core_observed |= observed,
+                        Bucket::Graphql => graphql_observed |= observed,
                     }
                 }
             }
         }
-        let measured: Vec<&str> = measured.iter().map(String::as_str).collect();
-        let mut result = execute(&measured);
-        let state = self.hosts.get_mut(&host_key).unwrap();
+        let validator = output
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("etag"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| {
+                output
+                    .not_modified
+                    .then(|| plan.validator.clone())
+                    .flatten()
+            });
+        let mut result = output.result;
+        if output.not_modified {
+            result = plan
+                .previous
+                .ok_or_else(|| "GitHub returned an unexpected conditional response".to_string());
+        }
+        if let Ok(raw) = &result {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+                let live = &value["data"]["rateLimit"];
+                if let (Some(limit), Some(remaining), Some(reset), Some(_)) = (
+                    live["limit"].as_u64(),
+                    live["remaining"].as_u64(),
+                    live["resetAt"]
+                        .as_str()
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .and_then(|date| u64::try_from(date.timestamp()).ok()),
+                    live["cost"].as_u64(),
+                ) {
+                    graphql_observed |=
+                        self.observe(host_key, Bucket::Graphql, limit, remaining, reset);
+                }
+            }
+        }
+        let state = self.hosts.get_mut(host_key).unwrap();
+        // Returned rows are not quota evidence: CLI context resolution and
+        // nested reads may already have spent the full admission estimate.
+        if !core_observed {
+            let cost =
+                flight
+                    .core_cost
+                    .saturating_add(if matches!(flight.selected, Bucket::Core) {
+                        flight.cost
+                    } else {
+                        0
+                    });
+            state.core_debt.add(cost, result.is_ok(), flight.core_reset);
+        }
+        if !graphql_observed && matches!(flight.selected, Bucket::Graphql) {
+            state
+                .graphql_debt
+                .add(flight.cost, result.is_ok(), flight.graphql_reset);
+        }
         if let Err(message) = &result {
             if refusal(message) {
                 record_refusal(state, message, epoch());
                 result = Err(quota_pause(host, state.pause_until));
             }
-        } else if state.pause_until <= now {
+        } else {
             state.refusals = 0;
         }
-        if let (Ok(raw), Some(snapshot)) = (&result, state.snapshot.as_mut()) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-                let live = &value["data"]["rateLimit"];
-                if let (Some(limit), Some(remaining), Some(reset), Some(_cost)) = (
-                    live["limit"].as_u64().filter(|n| *n > 0),
-                    live["remaining"].as_u64(),
-                    live["resetAt"]
-                        .as_str()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .and_then(|d| u64::try_from(d.timestamp()).ok()),
-                    live["cost"].as_u64(),
-                ) {
-                    if remaining <= limit {
-                        snapshot.graphql = Quota {
-                            limit,
-                            remaining,
-                            reset,
-                        };
-                        if let Ok(mut raw) =
-                            serde_json::from_str::<serde_json::Value>(&snapshot.raw)
-                        {
-                            raw["resources"]["graphql"] = serde_json::json!({"limit": limit, "remaining": remaining, "reset": reset});
-                            snapshot.raw = raw.to_string();
-                        }
-                    }
-                } else if args.get(1) == Some(&"list") {
-                    if let Some(rows) = value.as_array() {
-                        let fields = flag(args, &["--json"]).unwrap_or("");
-                        let nested = [
-                            "statusCheckRollup",
-                            "latestReviews",
-                            "reviewRequests",
-                            "comments",
-                        ]
-                        .iter()
-                        .filter(|f| fields.contains(**f))
-                        .count() as u64;
-                        let actual_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-                        let used = actual_rows
-                            .max(1)
-                            .div_ceil(100)
-                            .saturating_mul(4)
-                            .saturating_add(actual_rows.saturating_mul(nested.max(1)));
-                        let q = match selected {
-                            Bucket::Core => &mut snapshot.core,
-                            Bucket::Graphql => &mut snapshot.graphql,
-                        };
-                        q.remaining = q
-                            .remaining
-                            .saturating_add(cost.saturating_sub(used))
-                            .min(q.limit);
-                    }
-                }
-            }
+        if flight.superseded && result.is_ok() {
+            return Err("GitHub read was superseded by a refresh or write; try again".into());
         }
         let failures = if result.is_err() {
             self.reads
-                .get(&key)
-                .map_or(1, |e| e.failures.saturating_add(1))
+                .get(&plan.key)
+                .map_or(1, |entry| entry.failures.saturating_add(1))
         } else {
             0
         };
@@ -660,38 +1150,87 @@ impl Coordinator {
         } else {
             ttl(args)
         };
-        let size = result.as_ref().map_or_else(|e| e.len(), |s| s.len());
-        self.reads
-            .retain(|_, e| e.expires > Instant::now() || e.failures > 0);
-        let bytes: usize = self
-            .reads
-            .values()
-            .map(|e| e.result.as_ref().map_or_else(|s| s.len(), |s| s.len()))
-            .sum();
+        let size = result
+            .as_ref()
+            .map_or_else(|error| error.len(), |body| body.len());
+        self.reads.retain(|_, entry| {
+            entry.expires > Instant::now() || entry.failures > 0 || entry.validator.is_some()
+        });
         if size <= MAX_ENTRY_BYTES {
-            if self.reads.len() >= MAX_CACHE_ENTRIES || bytes + size > MAX_CACHE_BYTES {
-                if let Some(oldest) = self
+            while !self.reads.is_empty()
+                && (self.reads.len() >= MAX_CACHE_ENTRIES
+                    || self.cache_bytes().saturating_add(size) > MAX_CACHE_BYTES)
+            {
+                let oldest = self
                     .reads
                     .iter()
-                    .min_by_key(|(_, e)| e.expires)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.reads.remove(&oldest);
-                }
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone())
+                    .unwrap();
+                self.reads.remove(&oldest);
             }
-            if bytes + size <= MAX_CACHE_BYTES && self.reads.len() < MAX_CACHE_ENTRIES {
+            if self.reads.len() < MAX_CACHE_ENTRIES
+                && self.cache_bytes().saturating_add(size) <= MAX_CACHE_BYTES
+            {
                 self.reads.insert(
-                    key,
+                    plan.key,
                     Entry {
                         expires: Instant::now() + expiry,
                         result: result.clone(),
                         failures,
-                        scope: scope_key(path, args),
+                        scope: flight.scope,
+                        validator,
                     },
                 );
             }
         }
         result
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.reads
+            .values()
+            .map(|entry| {
+                entry
+                    .result
+                    .as_ref()
+                    .map_or_else(|error| error.len(), |body| body.len())
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn read(
+        &mut self,
+        host: &str,
+        identity: Option<u64>,
+        path: &Path,
+        args: &[&str],
+        mut execute: impl FnMut(&[&str]) -> Result<String, String>,
+    ) -> Result<String, String> {
+        loop {
+            match self.prepare(
+                host,
+                identity,
+                read_key(path, args),
+                scope_key(path, args),
+                args,
+                false,
+            ) {
+                Admission::Complete(result) => return result,
+                Admission::Probe => self.probe_finished(
+                    host,
+                    identity,
+                    Executed::plain(execute(&["api", "rate_limit", "--hostname", host])),
+                ),
+                Admission::Read(plan) => {
+                    let measured: Vec<&str> = plan.args.iter().map(String::as_str).collect();
+                    let output = Executed::plain(execute(&measured));
+                    return self.finish(plan, args, output);
+                }
+                Admission::Wait => return Err("GitHub read is already running".into()),
+            }
+        }
     }
 
     fn mutation_result(
@@ -702,12 +1241,13 @@ impl Coordinator {
     ) {
         let key = (host.to_string(), identity);
         if result.is_ok() {
-            self.reads.retain(|(h, _), _| h != &key);
+            self.reads.retain(|(account, _), _| account != &key);
+            for (_, flight) in self.inflight.iter_mut().filter(|(read, _)| read.0 == key) {
+                flight.superseded = true;
+            }
         } else if let Err(message) = result {
-            if refusal(message) {
-                if self.hosts.contains_key(&key) || self.hosts.len() < MAX_HOSTS {
-                    record_refusal(self.hosts.entry(key).or_default(), message, epoch());
-                }
+            if refusal(message) && (self.hosts.contains_key(&key) || self.hosts.len() < MAX_HOSTS) {
+                record_refusal(self.hosts.entry(key).or_default(), message, epoch());
             }
         }
     }
@@ -772,8 +1312,124 @@ fn output_result(args: &[&str], output: TimedOutput) -> Result<String, String> {
     Ok(output.stdout.trim_end().to_string())
 }
 
+/// API errors are never retried through gh: that would double-charge quota
+/// and make a refusal on one transport invisible to other surfaces.
+fn execute_api(
+    host: &str,
+    token: &str,
+    args: &[&str],
+    timeout: Duration,
+    validator: Option<&str>,
+) -> Executed {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    let request = match http::parse_request(host, args, None) {
+        Ok(request) => request,
+        Err(error) => return Executed::plain(Err(error)),
+    };
+    let client = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| "Could not initialize GitHub HTTP client".to_string())
+    });
+    let response = match client
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|client| http::send(client, request, token, timeout, validator))
+    {
+        Ok(response) => response,
+        Err(error) => return Executed::plain(Err(error)),
+    };
+    api_response(args, response)
+}
+
+fn api_response(args: &[&str], response: http::Response) -> Executed {
+    let not_modified = response.status == 304;
+    let graphql = args.get(1) == Some(&"graphql");
+    let error_message = || {
+        let message = serde_json::from_str::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|value| {
+                value["message"].as_str().map(str::to_owned).or_else(|| {
+                    value["errors"]
+                        .as_array()
+                        .and_then(|errors| errors.first())
+                        .and_then(|error| error["message"].as_str())
+                        .map(str::to_owned)
+                })
+            })
+            .unwrap_or_else(|| "request rejected".into());
+        let mut error = format!(
+            "GitHub API read failed (HTTP {}): {}",
+            response.status,
+            message.chars().take(512).collect::<String>()
+        );
+        if let Some(retry) = response
+            .headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+        {
+            error.push_str(&format!("; Retry-After: {retry}"));
+        }
+        if response.status == 429 {
+            error.push_str("; rate limit exceeded");
+        }
+        error
+    };
+    let result = if not_modified {
+        Ok(String::new())
+    } else if !(200..300).contains(&response.status) {
+        Err(error_message())
+    } else if graphql {
+        match serde_json::from_str::<serde_json::Value>(&response.body) {
+            Ok(value)
+                if value["errors"]
+                    .as_array()
+                    .is_some_and(|errors| !errors.is_empty()) =>
+            {
+                Err(error_message())
+            }
+            Ok(_) => Ok(response.body.trim_end().to_owned()),
+            Err(_) => Err("Invalid GitHub GraphQL response".into()),
+        }
+    } else {
+        Ok(response.body.trim_end().to_owned())
+    };
+    Executed {
+        result,
+        headers: Some(response.headers),
+        not_modified,
+    }
+}
+
 pub fn run(path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     run_inner(path, args, timeout, None)
+}
+
+/// Only trusted, statically bounded query builders may declare their cost.
+/// Unknown/nested GraphQL still uses the conservative generic estimate.
+pub(crate) fn run_bounded_graphql(
+    path: &Path,
+    args: &[&str],
+    cost: u64,
+    timeout: Duration,
+) -> Result<String, String> {
+    if args.first() != Some(&"api")
+        || args.get(1) != Some(&"graphql")
+        || !is_read(args, None)
+        || args.contains(&"--paginate")
+        || !(1..=200).contains(&cost)
+    {
+        return Err("Invalid bounded GitHub read".into());
+    }
+    run_inner_with_cost(path, args, timeout, None, false, Some(cost))
+}
+
+/// Revalidate a changing resource without discarding a cached failure or
+/// relaxing the account's cooldown. Used by the live review-diff surface.
+pub fn run_fresh(path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    run_inner_mode(path, args, timeout, None, true)
 }
 
 /// A deliberate refresh can bypass successful reads for this repository.
@@ -790,10 +1446,7 @@ pub fn invalidate_read_cache(path: &Path) -> Result<(), String> {
         .get_or_init(|| Mutex::new(Coordinator::default()))
         .lock()
         .map_err(|_| "GitHub budget lock poisoned")?
-        .reads
-        .retain(|(key, _), entry| {
-            key != &host_key || entry.scope != scope || entry.result.is_err()
-        });
+        .invalidate_scope(&host_key, scope);
     Ok(())
 }
 
@@ -812,18 +1465,67 @@ fn run_inner(
     timeout: Duration,
     stdin: Option<&str>,
 ) -> Result<String, String> {
+    run_inner_mode(path, args, timeout, stdin, false)
+}
+
+fn run_inner_mode(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdin: Option<&str>,
+    fresh: bool,
+) -> Result<String, String> {
+    run_inner_with_cost(path, args, timeout, stdin, fresh, None)
+}
+
+fn run_inner_with_cost(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdin: Option<&str>,
+    fresh: bool,
+    declared_cost: Option<u64>,
+) -> Result<String, String> {
     let deadline = Instant::now() + timeout;
     if stdin.is_none() && is_read(args, None) && args.contains(&"--paginate") {
-        return run_paginated(path, args, timeout);
+        return run_paginated(path, args, timeout, fresh);
     }
     let (host, pinned) = context(path, args)?;
-    let identity = crate::github::gh_credential_identity(&host);
+    let token = if args.first() == Some(&"api") && is_read(args, stdin) {
+        crate::github::gh_api_token(&host)
+    } else {
+        None
+    };
+    // Bind the request and cache identity to the SAME credential snapshot.
+    let identity = if let Some(token) = &token {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hash);
+        Some(hash.finish())
+    } else {
+        crate::github::gh_credential_identity(&host)
+    };
     let pinned: Vec<&str> = pinned.iter().map(String::as_str).collect();
     if is_read(args, stdin) {
         let path: PathBuf = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        lock_until(deadline)?.read(&host, identity, &path, &pinned, |a| {
-            execute(&path, a, time_left(deadline)?, None)
-        })
+        run_read_mode(
+            &host,
+            identity,
+            &path,
+            &pinned,
+            deadline,
+            fresh,
+            declared_cost,
+            |a, validator| match time_left(deadline) {
+                Ok(remaining) => {
+                    if let Some(token) = &token {
+                        execute_api(&host, token, a, remaining, validator)
+                    } else {
+                        Executed::plain(execute(&path, a, remaining, None))
+                    }
+                }
+                Err(error) => Executed::plain(Err(error)),
+            },
+        )
     } else {
         let result = execute(path, &pinned, time_left(deadline)?, stdin);
         COORDINATOR
@@ -866,7 +1568,12 @@ fn lock_until(deadline: Instant) -> Result<std::sync::MutexGuard<'static, Coordi
 /// gh's automatic pagination can spend an arbitrary number of requests in a
 /// single subprocess. Admit, meter and cache each page instead. Incomplete
 /// reads are errors so callers retain their last complete result.
-fn run_paginated(path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+fn run_paginated(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    fresh: bool,
+) -> Result<String, String> {
     const MAX_PAGES: usize = 20;
     let deadline = Instant::now() + timeout;
     let base: Vec<String> = args
@@ -892,7 +1599,7 @@ fn run_paginated(path: &Path, args: &[&str], timeout: Duration) -> Result<String
             endpoint.push_str(&format!("{join}per_page=100&page={page}"));
         }
         let request: Vec<&str> = request.iter().map(String::as_str).collect();
-        let raw = run_inner(path, &request, time_left(deadline)?, None)?;
+        let raw = run_inner_mode(path, &request, time_left(deadline)?, None, fresh)?;
         let value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|_| "Invalid GitHub paginated response")?;
         if graphql {
@@ -1018,6 +1725,820 @@ fn run_with_stdin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_query_cost_cannot_be_used_for_writes_or_unbounded_reads() {
+        let path = Path::new("/nonexistent-bounded-query-fixture");
+        let query = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        for cost in [0, 201] {
+            assert!(
+                run_bounded_graphql(path, &query, cost, Duration::from_secs(1))
+                    .unwrap_err()
+                    .contains("Invalid bounded")
+            );
+        }
+        for args in [
+            vec!["pr", "view", "42"],
+            vec!["api", "repos/fixture/repo"],
+            vec!["api", "graphql", "-f", "query=mutation { writeSomething }"],
+            vec![
+                "api",
+                "graphql",
+                "--paginate",
+                "-f",
+                "query=query { viewer { login } }",
+            ],
+        ] {
+            assert!(run_bounded_graphql(path, &args, 2, Duration::from_secs(1))
+                .unwrap_err()
+                .contains("Invalid bounded"));
+        }
+    }
+
+    #[test]
+    fn lightweight_bounded_queries_fit_without_spending_the_reserve() {
+        let mut c = Coordinator::default();
+        let host = "bounded-budget.example.test";
+        let account = (host.to_string(), None);
+        c.hosts.entry(account.clone()).or_default().snapshot =
+            Some(parse_snapshot(quota(4999, 699)).unwrap());
+        let args = [
+            "api",
+            "graphql",
+            "-f",
+            "query=query { repository { pullRequests(first:100) { nodes { number } } } }",
+        ];
+        // Large, unknown reads remain denied, without falsely drying up this
+        // entire resource for the bounded discovery owner.
+        assert!(matches!(
+            c.prepare(host, None, 1, 1, &args, false),
+            Admission::Complete(Err(_))
+        ));
+        let admitted = c.prepare_with_cost(host, None, 2, 1, &args, false, 2);
+        assert!(
+            matches!(admitted, Admission::Read(_)),
+            "bounded flat discovery was charged as a nested 200-point query"
+        );
+        assert_eq!(
+            c.hosts[&account]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .graphql
+                .remaining,
+            697
+        );
+        assert!(
+            c.hosts[&account]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .graphql
+                .remaining
+                >= 500
+        );
+        let snapshot = c
+            .hosts
+            .get_mut(&account)
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap();
+        snapshot.graphql.remaining = 500;
+        assert!(matches!(
+            c.prepare_with_cost(host, None, 3, 1, &args, false, 2),
+            Admission::Complete(Err(_))
+        ));
+    }
+
+    #[test]
+    fn overlapping_probe_preserves_reservations_and_newer_observations() {
+        let args = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        for completed_during_probe in [false, true] {
+            let mut c = Coordinator::default();
+            let host = "probe-overlap.example.test";
+            let account = (host.to_string(), None);
+            let raw = quota(4999, 700);
+            c.hosts.entry(account.clone()).or_default().snapshot =
+                Some(parse_snapshot(raw.clone()).unwrap());
+            let a = match c.prepare(host, None, 1, 1, &args, false) {
+                Admission::Read(plan) => plan,
+                _ => panic!("first read must be admitted"),
+            };
+            c.hosts
+                .get_mut(&account)
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .fetched = Instant::now() - PROBE_TTL;
+            assert!(matches!(
+                c.prepare(host, None, 2, 2, &args, false),
+                Admission::Probe
+            ));
+            if completed_during_probe {
+                let reset = c.hosts[&account].snapshot.as_ref().unwrap().graphql.reset;
+                let date = chrono::DateTime::from_timestamp(reset as i64, 0)
+                    .unwrap()
+                    .to_rfc3339();
+                c.finish(
+                    a,
+                    &args,
+                    Executed::plain(Ok(serde_json::json!({"data":{"rateLimit":{
+                        "limit":5000,"remaining":500,"cost":200,"resetAt":date
+                    }}})
+                    .to_string())),
+                )
+                .unwrap();
+            }
+            // The probe was sampled before A's charge and arrived later.
+            c.probe_finished(host, None, Executed::plain(Ok(raw)));
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                500,
+                "a late probe must not replace either a live reservation or newer metering"
+            );
+            assert!(
+                matches!(
+                    c.prepare(host, None, 2, 2, &args, false),
+                    Admission::Complete(Err(_))
+                ),
+                "the second 200-point read must not spend the 500-point reserve"
+            );
+        }
+    }
+
+    fn metered_output(resource: &str, remaining: u64, reset: u64) -> Executed {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("x-ratelimit-resource", resource.to_string()),
+            ("x-ratelimit-limit", "5000".to_string()),
+            ("x-ratelimit-remaining", remaining.to_string()),
+            ("x-ratelimit-reset", reset.to_string()),
+        ] {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        Executed {
+            result: Ok("[]".into()),
+            headers: Some(headers),
+            not_modified: false,
+        }
+    }
+
+    #[test]
+    fn delayed_metering_cannot_forgive_completed_unobserved_reads() {
+        let graphql = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        let cli = ["pr", "list", "--limit", "192", "--json", "number"];
+        assert_eq!(estimated_cost(&cli), 200);
+        for kind in ["timeout", "unmetered-api", "unmetered-cli"] {
+            let mut c = Coordinator::default();
+            let host = "charge-debt.example.test";
+            let account = (host.to_string(), None);
+            let snapshot = parse_snapshot(quota(4999, 900)).unwrap();
+            let reset = snapshot.graphql.reset;
+            c.hosts.entry(account.clone()).or_default().snapshot = Some(snapshot);
+            let a_args = if kind == "unmetered-cli" {
+                &cli[..]
+            } else {
+                &graphql[..]
+            };
+            let a = match c.prepare(host, None, 1, 1, a_args, false) {
+                Admission::Read(plan) => plan,
+                _ => panic!("A not admitted"),
+            };
+            let b = match c.prepare(host, None, 2, 2, &graphql, false) {
+                Admission::Read(plan) => plan,
+                _ => panic!("B not admitted"),
+            };
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                500
+            );
+            let a_result = if kind == "timeout" {
+                Err("transport timed out".into())
+            } else {
+                Ok("[]".into())
+            };
+            let _ = c.finish(a, a_args, Executed::plain(a_result));
+            // B's 700-point report was sampled before A was charged.
+            c.finish(b, &graphql, metered_output("graphql", 700, reset))
+                .unwrap();
+            assert_eq!(c.hosts[&account].snapshot.as_ref().unwrap().graphql.remaining, 500,
+                "{kind}: completed reads without quota evidence must keep their conservative charge");
+            assert!(
+                matches!(
+                    c.prepare(host, None, 3, 3, &graphql, false),
+                    Admission::Complete(Err(_))
+                ),
+                "{kind}: C must not consume the reserve"
+            );
+            if kind == "unmetered-cli" {
+                c.observe(&account, Bucket::Core, 5000, 4999, reset);
+                assert_eq!(
+                    c.hosts[&account].snapshot.as_ref().unwrap().core.remaining,
+                    4997,
+                    "the unobserved CLI repository lookup also keeps its charge"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probes_reconcile_only_preboundary_confirmed_charges_not_uncertain_timeouts() {
+        let args = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        for timeout in [false, true] {
+            let mut c = Coordinator::default();
+            let host = "debt-probe.example.test";
+            let account = (host.to_string(), None);
+            c.hosts.entry(account.clone()).or_default().snapshot =
+                Some(parse_snapshot(quota(4999, 1100)).unwrap());
+            let admit =
+                |c: &mut Coordinator, key| match c.prepare(host, None, key, key, &args, false) {
+                    Admission::Read(plan) => plan,
+                    _ => panic!("read not admitted"),
+                };
+            let a = admit(&mut c, 1);
+            let _ = c.finish(
+                a,
+                &args,
+                Executed::plain(if timeout {
+                    Err("timeout".into())
+                } else {
+                    Ok("[]".into())
+                }),
+            );
+            let b = admit(&mut c, 2);
+            c.hosts
+                .get_mut(&account)
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .fetched = Instant::now() - PROBE_TTL;
+            assert!(matches!(
+                c.prepare(host, None, 3, 3, &args, false),
+                Admission::Probe
+            ));
+            // B completes after the probe boundary; a pre-B sample cannot reconcile it.
+            c.finish(b, &args, Executed::plain(Ok("[]".into())))
+                .unwrap();
+            c.probe_finished(host, None, Executed::plain(Ok(quota(4999, 900))));
+            let expected = if timeout { 500 } else { 700 };
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                expected,
+                "fresh probes reconcile confirmed preboundary completions only"
+            );
+            // Another same-epoch probe now includes B, but cannot settle an uncertain A.
+            c.hosts
+                .get_mut(&account)
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .fetched = Instant::now() - PROBE_TTL;
+            assert!(matches!(
+                c.prepare(host, None, 4, 4, &args, false),
+                Admission::Probe
+            ));
+            c.probe_finished(host, None, Executed::plain(Ok(quota(4999, 700))));
+            assert_eq!(
+                c.hosts[&account]
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .graphql
+                    .remaining,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_charge_survives_cache_eviction_and_read_headers_until_a_safe_probe_epoch() {
+        let mut c = Coordinator::default();
+        let host = "safe-epoch.example.test";
+        let account = (host.to_string(), None);
+        let args = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        c.hosts.entry(account.clone()).or_default().snapshot =
+            Some(parse_snapshot(quota(4999, 900)).unwrap());
+        let a = match c.prepare(host, None, 1, 1, &args, false) {
+            Admission::Read(plan) => plan,
+            _ => panic!("not admitted"),
+        };
+        assert!(c
+            .finish(a, &args, Executed::plain(Err("timeout".into())))
+            .is_err());
+        c.reads.clear();
+        let reset = c.hosts[&account].snapshot.as_ref().unwrap().graphql.reset;
+        c.observe(&account, Bucket::Graphql, 5000, 900, reset);
+        assert_eq!(
+            c.hosts[&account]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .graphql
+                .remaining,
+            700
+        );
+        // Advancing a quota timestamp, like fetched above, avoids a clock sleep.
+        let past_reset = epoch() - 1;
+        let state = c.hosts.get_mut(&account).unwrap();
+        state.graphql_debt.uncertain_until = past_reset;
+        state.snapshot.as_mut().unwrap().graphql.reset = past_reset;
+        assert!(matches!(
+            c.prepare(host, None, 2, 2, &args, false),
+            Admission::Probe
+        ));
+        c.probe_finished(host, None, Executed::plain(Ok(quota(4999, 4999))));
+        assert_eq!(
+            c.hosts[&account]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .graphql
+                .remaining,
+            4999,
+            "only a probe begun after the protected reset can settle old uncertainty"
+        );
+        assert_eq!(c.hosts[&account].graphql_debt.total(), 0);
+    }
+
+    #[test]
+    fn timeout_completing_across_reset_requires_an_established_then_safe_epoch() {
+        let mut c = Coordinator::default();
+        let host = "cross-epoch.example.test";
+        let account = (host.to_string(), None);
+        let args = ["api", "graphql", "-f", "query=query { viewer { login } }"];
+        c.hosts.entry(account.clone()).or_default().snapshot =
+            Some(parse_snapshot(quota(4999, 900)).unwrap());
+        let a = match c.prepare(host, None, 1, 1, &args, false) {
+            Admission::Read(plan) => plan,
+            _ => panic!("not admitted"),
+        };
+        c.inflight.get_mut(&a.key).unwrap().graphql_reset = epoch() - 1;
+        assert!(c
+            .finish(a, &args, Executed::plain(Err("timeout".into())))
+            .is_err());
+        c.hosts
+            .get_mut(&account)
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .fetched = Instant::now() - PROBE_TTL;
+        assert!(matches!(
+            c.prepare(host, None, 2, 2, &args, false),
+            Admission::Probe
+        ));
+        let raw = quota(4999, 900);
+        let next_reset = parse_snapshot(raw.clone()).unwrap().graphql.reset;
+        c.probe_finished(host, None, Executed::plain(Ok(raw)));
+        assert_eq!(
+            c.hosts[&account]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .graphql
+                .remaining,
+            700
+        );
+        assert_eq!(c.hosts[&account].graphql_debt.uncertain_until, next_reset);
+        c.hosts
+            .get_mut(&account)
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .fetched = Instant::now() - PROBE_TTL;
+        assert!(matches!(
+            c.prepare(host, None, 3, 3, &args, false),
+            Admission::Probe
+        ));
+        c.probe_finished(host, None, Executed::plain(Ok(quota(4999, 900))));
+        assert_eq!(
+            c.hosts[&account]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .graphql
+                .remaining,
+            700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_read_requires_postboundary_work() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("CODEMUX_BUDGET_FRESH_FIXTURE").is_none() {
+            // PATH, HOME and credential isolation apply to this child only.
+            let fixture = tempfile::tempdir().unwrap();
+            let gh = fixture.path().join("gh");
+            std::fs::write(&gh, "#!/bin/sh\ncase \"$1\" in auth|config) exit 1;; pr) printf 'read\\n' >> calls; printf fresh;; *) exit 99;; esac\n").unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "github_budget::tests::fresh_read_requires_postboundary_work",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("CODEMUX_BUDGET_FRESH_FIXTURE", fixture.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        fixture.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("HOME", fixture.path())
+                .env("GH_CONFIG_DIR", fixture.path());
+            for key in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+                "GH_HOST",
+                "GH_REPO",
+            ] {
+                child.env_remove(key);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "public fresh-read fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("CODEMUX_BUDGET_FRESH_FIXTURE").unwrap());
+        let schedules = if std::env::var_os("CODEMUX_BUDGET_FRESH_WINDOW_FIRST").is_some() {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for finish_in_window in schedules {
+            let path = root.join(if finish_in_window {
+                "window"
+            } else {
+                "inflight"
+            });
+            std::fs::create_dir(&path).unwrap();
+            let host = if finish_in_window {
+                "fresh-window.example.test"
+            } else {
+                "fresh-inflight.example.test"
+            };
+            let repo = format!("{host}/fixture/repo");
+            let args = ["pr", "list", "--limit", "1", "--repo", &repo];
+            let (resolved, pinned) = context(&path, &args).unwrap();
+            let identity = crate::github::gh_credential_identity(&resolved);
+            let pinned: Vec<&str> = pinned.iter().map(String::as_str).collect();
+            let account = (resolved.clone(), identity);
+            let key = read_key(&path, &pinned);
+            let a = {
+                let mut c = lock_until(Instant::now() + Duration::from_secs(3)).unwrap();
+                c.hosts.entry(account.clone()).or_default().snapshot =
+                    Some(parse_snapshot(quota(4999, 4999)).unwrap());
+                match c.prepare(
+                    &resolved,
+                    identity,
+                    key,
+                    scope_key(&path, &pinned),
+                    &pinned,
+                    false,
+                ) {
+                    Admission::Read(plan) => plan,
+                    _ => panic!("A not admitted"),
+                }
+            };
+            let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+            let fresh = std::thread::scope(|threads| {
+                let b = threads.spawn(|| {
+                    FRESH_BOUNDARY_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            boundary_tx.send(()).unwrap();
+                            if finish_in_window {
+                                resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                            }
+                        }))
+                    });
+                    READ_WAIT_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            wait_tx.send(()).unwrap();
+                        }))
+                    });
+                    run_fresh(&path, &args, Duration::from_secs(3))
+                });
+                boundary_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if !finish_in_window {
+                    wait_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                let _ = lock_until(Instant::now() + Duration::from_secs(2))
+                    .unwrap()
+                    .finish(a, &pinned, Executed::plain(Ok("old response".into())));
+                READ_CHANGED.get_or_init(Condvar::new).notify_all();
+                if finish_in_window {
+                    resume_tx.send(()).unwrap();
+                }
+                b.join().unwrap()
+            });
+            assert_eq!(fresh, Ok("fresh".into()),
+                "fresh must neither coalesce with nor reuse pre-boundary work (window={finish_in_window})");
+            assert_eq!(
+                std::fs::read_to_string(path.join("calls")).unwrap(),
+                "read\n"
+            );
+            let failure = {
+                let mut c = lock_until(Instant::now() + Duration::from_secs(2)).unwrap();
+                c.reads.remove(&(account.clone(), key));
+                let plan = match c.prepare(&resolved, identity, key, 1, &pinned, false) {
+                    Admission::Read(plan) => plan,
+                    _ => panic!("failure read not admitted"),
+                };
+                c.finish(
+                    plan,
+                    &pinned,
+                    Executed::plain(Err("offline fixture".into())),
+                )
+                .unwrap_err()
+            };
+            assert_eq!(
+                run_fresh(&path, &args, Duration::from_secs(2)),
+                Err(failure)
+            );
+            lock_until(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                .hosts
+                .get_mut(&account)
+                .unwrap()
+                .pause_until = epoch() + 120;
+            assert!(run_fresh(&path, &args, Duration::from_secs(2))
+                .unwrap_err()
+                .contains("paused"));
+            assert_eq!(
+                std::fs::read_to_string(path.join("calls")).unwrap(),
+                "read\n",
+                "fresh must not bypass failed cache or cooldown"
+            );
+        }
+    }
+
+    #[test]
+    fn native_responses_keep_headers_and_reject_partial_graphql_or_rate_refusals() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "120".parse().unwrap());
+        let output = api_response(
+            &["api", "repos/fixture/repo"],
+            http::Response {
+                status: 429,
+                headers: headers.clone(),
+                body: r#"{"message":"slow down"}"#.into(),
+            },
+        );
+        let message = output.result.unwrap_err();
+        assert!(refusal(&message));
+        let now = epoch();
+        assert_eq!(retry_epoch(&message, now), Some(now + 120));
+        assert_eq!(output.headers.unwrap()["retry-after"], "120");
+        let partial = api_response(
+            &["api", "graphql"],
+            http::Response {
+                status: 200,
+                headers: headers.clone(),
+                body: r#"{"data":{"repository":null},"errors":[{"message":"Unavailable"}]}"#.into(),
+            },
+        );
+        assert!(partial.result.unwrap_err().contains("Unavailable"));
+        let unchanged = api_response(
+            &["api", "repos/fixture/repo"],
+            http::Response {
+                status: 304,
+                headers: headers.clone(),
+                body: String::new(),
+            },
+        );
+        assert!(unchanged.not_modified);
+        assert_eq!(unchanged.result.unwrap(), "");
+        let success = api_response(
+            &["api", "repos/fixture/repo"],
+            http::Response {
+                status: 200,
+                headers,
+                body: "[1,2]\n".into(),
+            },
+        );
+        assert_eq!(success.result.unwrap(), "[1,2]");
+    }
+
+    #[test]
+    fn foreground_reads_keep_the_same_quota_reserve() {
+        let mut c = Coordinator::default();
+        let host = "foreground-reserve.example.test";
+        c.hosts.entry((host.into(), None)).or_default().snapshot =
+            Some(parse_snapshot(quota(4999, 699)).unwrap());
+        let args = [
+            "api",
+            "graphql",
+            "-f",
+            "query=query { reviewThreads(first:50) { nodes { id } } }",
+        ];
+        assert!(
+            matches!(
+                c.prepare(host, None, 1, 1, &args, true),
+                Admission::Complete(Err(_))
+            ),
+            "foreground admission must not spend the reserved 10%"
+        );
+    }
+
+    #[test]
+    fn refresh_fences_a_late_success_but_keeps_errors_and_other_repositories() {
+        let mut c = Coordinator::default();
+        let host = "refresh-race.example.test";
+        let account = (host.to_string(), Some(7));
+        c.hosts.entry(account.clone()).or_default().snapshot =
+            Some(parse_snapshot(quota(4999, 4999)).unwrap());
+        let args = ["api", "repos/fixture/repo", "--hostname", host];
+        let plan = match c.prepare(host, Some(7), 1, 10, &args, false) {
+            Admission::Read(plan) => plan,
+            _ => panic!("read was not admitted"),
+        };
+        for (key, scope, result) in [
+            (2, 10, Err("network failure".into())),
+            (3, 20, Ok("neighbor".into())),
+        ] {
+            c.reads.insert(
+                (account.clone(), key),
+                Entry {
+                    expires: Instant::now() + Duration::from_secs(60),
+                    result,
+                    failures: 0,
+                    scope,
+                    validator: None,
+                },
+            );
+        }
+        c.invalidate_scope(&account, 10);
+        assert!(
+            c.finish(plan, &args, Executed::plain(Ok("old response".into())))
+                .is_err(),
+            "a pre-refresh success must not repopulate the cache"
+        );
+        assert!(!c.reads.contains_key(&(account.clone(), 1)));
+        assert!(c.reads[&(account.clone(), 2)].result.is_err());
+        assert_eq!(c.reads[&(account, 3)].result.as_ref().unwrap(), "neighbor");
+    }
+
+    #[test]
+    fn header_metering_reuses_conditional_data_and_never_increases_from_an_older_reply() {
+        let mut c = Coordinator::default();
+        let host = "metering.example.test";
+        let account = (host.to_string(), Some(7));
+        let args = ["api", "repos/fixture/repo", "--hostname", host];
+        let mut snapshot = parse_snapshot(quota(4999, 4999)).unwrap();
+        // Keep one epoch for every observation in this test.
+        let reset = snapshot.core.reset;
+        snapshot.core.remaining = 4999;
+        c.hosts.entry(account.clone()).or_default().snapshot = Some(snapshot);
+        let admit = |c: &mut Coordinator, key| match c.prepare(host, Some(7), key, 1, &args, false)
+        {
+            Admission::Read(plan) => plan,
+            _ => panic!("read was not admitted"),
+        };
+        let first = admit(&mut c, 1);
+        let second = admit(&mut c, 2);
+        let response = |remaining: u64, conditional| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (name, value) in [
+                ("x-ratelimit-resource", "core".to_string()),
+                ("x-ratelimit-limit", "5000".to_string()),
+                ("x-ratelimit-remaining", remaining.to_string()),
+                ("x-ratelimit-reset", reset.to_string()),
+                ("etag", "\"fixture\"".into()),
+            ] {
+                headers.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            Executed {
+                result: Ok(if conditional {
+                    "".into()
+                } else {
+                    "[42]".into()
+                }),
+                headers: Some(headers),
+                not_modified: conditional,
+            }
+        };
+        assert_eq!(
+            c.finish(second, &args, response(4997, false)).unwrap(),
+            "[42]"
+        );
+        assert_eq!(
+            c.hosts[&account].snapshot.as_ref().unwrap().core.remaining,
+            4997 - estimated_cost(&args)
+        );
+        c.finish(first, &args, response(4998, false)).unwrap();
+        assert_eq!(
+            c.hosts[&account].snapshot.as_ref().unwrap().core.remaining,
+            4997,
+            "late headers must not put spent quota back"
+        );
+        c.reads.get_mut(&(account.clone(), 1)).unwrap().expires = Instant::now();
+        let conditional = admit(&mut c, 1);
+        assert_eq!(conditional.validator.as_deref(), Some("\"fixture\""));
+        assert_eq!(
+            c.finish(conditional, &args, response(4997, true)).unwrap(),
+            "[42]"
+        );
+    }
+
+    #[test]
+    fn slow_read_does_not_hold_up_an_unrelated_repository() {
+        for (index, same_host) in [false, true].into_iter().enumerate() {
+            let host = format!("concurrency-{index}.example.test");
+            let neighbor = if same_host {
+                host.clone()
+            } else {
+                format!("neighbor-{index}.example.test")
+            };
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|threads| {
+                threads.spawn(move || {
+                    run_read_with(
+                        &host,
+                        Some(1),
+                        Path::new("/fixture"),
+                        &["api", "repos/fixture/slow", "--hostname", &host],
+                        Instant::now() + Duration::from_secs(2),
+                        |args, _| {
+                            if args.get(1) == Some(&"rate_limit") {
+                                return Executed::plain(Ok(quota(4999, 4999)));
+                            }
+                            started_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                            Executed::plain(Ok("slow".into()))
+                        },
+                    )
+                    .unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                threads.spawn(move || {
+                    let result = run_read_with(
+                        &neighbor,
+                        Some(1),
+                        Path::new("/fixture"),
+                        &["api", "repos/fixture/fast", "--hostname", &neighbor],
+                        Instant::now() + Duration::from_secs(2),
+                        |args, _| {
+                            Executed::plain(Ok(if args.get(1) == Some(&"rate_limit") {
+                                quota(4999, 4999)
+                            } else {
+                                "fast".into()
+                            }))
+                        },
+                    );
+                    done_tx.send(result).unwrap();
+                });
+                let completed = done_rx.recv_timeout(Duration::from_millis(200));
+                release_tx.send(()).unwrap();
+                assert_eq!(
+                    completed.ok(),
+                    Some(Ok("fast".into())),
+                    "an unrelated read waited behind a slow request (same host: {same_host})"
+                );
+            });
+        }
+    }
+
     fn quota(core: u64, graphql: u64) -> String {
         format!(
             r#"{{"resources":{{"core":{{"limit":5000,"remaining":{core},"reset":{reset}}},"graphql":{{"limit":5000,"remaining":{graphql},"reset":{reset}}}}}}}"#,

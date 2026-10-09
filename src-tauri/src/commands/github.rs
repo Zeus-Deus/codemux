@@ -493,9 +493,22 @@ pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body:
 /// `get_github_pr_diff_by_path` is capped, because a reviewer writing
 /// notes has to be looking at all of it.
 #[tauri::command]
-pub async fn get_pr_review_diff(path: String, pr_number: u32) -> Result<String, String> {
+pub async fn get_pr_review_diff(
+    path: String,
+    pr_number: u32,
+    expected_head_sha: Option<String>,
+) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        provider_for(&path, Operation::ListRead)?.pull_request_review_diff(Path::new(&path), pr_number)
+        let provider = provider_for(&path, Operation::ListRead)?;
+        if provider.kind() == git_provider::ProviderKind::GitHub {
+            crate::github::get_pr_review_diff_for_head(
+                Path::new(&path),
+                pr_number,
+                expected_head_sha.as_deref(),
+            )
+        } else {
+            provider.pull_request_review_diff(Path::new(&path), pr_number)
+        }
     })
     .await
     .map_err(|e| format!("get_pr_review_diff task join failed: {e}"))?

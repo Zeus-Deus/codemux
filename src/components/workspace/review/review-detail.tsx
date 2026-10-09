@@ -183,6 +183,9 @@ export interface ReviewDetailProps {
    *  polls are healthy. Content is never blanked either way. */
   staleAgeMs: number | null;
   onRefresh: () => void;
+  /** Explicit refresh clears native successful reads first. Mutations
+   * use onRefresh because the host already invalidates after writes. */
+  onManualRefresh?: () => void;
   /** Absent on surfaces with no Changes pane to open. */
   onOpenChanges?: () => void;
 }
@@ -217,6 +220,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     gitDirtyFiles,
     staleAgeMs,
     onRefresh,
+    onManualRefresh = onRefresh,
     onOpenChanges,
   } = props;
 
@@ -266,14 +270,16 @@ export function ReviewDetail(props: ReviewDetailProps) {
   // Fetched for the Code tab, and also whenever notes are pending even
   // if you're reading Summary: a force-push has to be able to tell you
   // how many of your notes stopped matching without you going looking.
-  // Keyed on the head sha, so a rewrite refetches by itself.
+  // Keyed AND fetched against the head SHA. Native rejects a changed head
+  // before/after fetching: concurrent detail refreshes must never put a
+  // new patch into an old-head cache entry or re-anchor notes against it.
   const pollingActive = usePrPollingActive();
   const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
   const canFetch = pollingActive && !paused;
   const needsDiff = activeTab === "code" || lineDrafts.length > 0;
   const diffQuery = useQuery({
     queryKey: ["pr", "review-diff", cwd, pr.number, pr.head_ref_oid],
-    queryFn: () => getPrReviewDiff(cwd, pr.number),
+    queryFn: () => getPrReviewDiff(cwd, pr.number, pr.head_ref_oid),
     enabled: canFetch && needsDiff,
     refetchOnWindowFocus: false,
     retry: prQueryRetry,
@@ -848,7 +854,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
                   label: "Refresh",
                   onClick: () => {
                     acknowledgeForcePush();
-                    onRefresh();
+                    onManualRefresh();
                   },
                   emphasis: "strong" as const,
                 },
@@ -949,7 +955,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         tone: "muted",
         // Stale and labelled beats blank: the content above stays put.
         message: <>Showing data from {shortAge(staleAgeMs)} ago</>,
-        actions: [{ label: "Retry now", onClick: onRefresh }],
+        actions: [{ label: "Retry now", onClick: onManualRefresh }],
       });
     }
 
@@ -976,6 +982,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     copyDraft,
     switchToDefaultBranch,
     onRefresh,
+    onManualRefresh,
     onOpenChanges,
     openPrPath,
     pull,
@@ -1058,7 +1065,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
               }
             : undefined
         }
-        onRefresh={onRefresh}
+        onRefresh={onManualRefresh}
       />
 
       <ReviewTabStrip

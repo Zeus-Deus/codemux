@@ -13,13 +13,15 @@ use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-struct RestorePath(Option<OsString>);
+struct RestoreEnvironment(Vec<(&'static str, Option<OsString>)>);
 
-impl Drop for RestorePath {
+impl Drop for RestoreEnvironment {
     fn drop(&mut self) {
-        match &self.0 {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
@@ -27,12 +29,52 @@ impl Drop for RestorePath {
 struct FakeGh {
     root: tempfile::TempDir,
     log: PathBuf,
-    _restore_path: RestorePath,
+    _restore_environment: RestoreEnvironment,
 }
 
 impl FakeGh {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        let restore = RestoreEnvironment(
+            [
+                "PATH",
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "GH_CONFIG_DIR",
+                "GH_HOST",
+                "GH_REPO",
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+                "CODEMUX_TEST_LAYOUT_PATH",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        // No ambient selection override may route synthetic credentials to
+        // a real API host. Keep profile/config discovery private as well.
+        for (key, _) in &restore.0 {
+            if *key != "PATH" {
+                std::env::remove_var(key);
+            }
+        }
+        std::env::set_var("HOME", root.path());
+        for (key, directory) in [
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+            ("GH_CONFIG_DIR", "gh"),
+        ] {
+            let directory = root.path().join(directory);
+            fs::create_dir(&directory).unwrap();
+            std::env::set_var(key, directory);
+        }
         let bin = root.path().join("bin");
         fs::create_dir(&bin).unwrap();
         let log = root.path().join("calls");
@@ -42,7 +84,11 @@ printf '%s\t%s\n' "$PWD" "$*" >> '@LOG@'
 mode=healthy
 if [ -f .fake-gh-mode ]; then mode=$(cat .fake-gh-mode); fi
 case "$1 $2" in
-  'auth token') printf 'fixture-token'; exit 0 ;;
+  'auth token')
+    # Only the local auth-status control has a token. All repository/API
+    # hosts exercise tokenless CLI fallback, never real HTTP credentials.
+    case "$*" in *'--hostname github.com') printf 'fixture-token'; exit 0 ;; esac
+    exit 1 ;;
   'auth status') printf 'Logged in to github.com account mock-user\n'; exit 0 ;;
   'config get') printf 'mock-user'; exit 0 ;;
   'api user') printf '{"login":"mock-user"}'; exit 0 ;;
@@ -78,6 +124,13 @@ case "$1 $2" in
   'repo view') printf 'mock/repo'; exit 0 ;;
   'issue view') printf '{"number":1,"title":"Issue","state":"OPEN","url":"https://example.test/issue/1"}'; exit 0 ;;
   'api graphql')
+    case "$*" in *b0:pullRequests*)
+      sleep 0.05
+      title=before
+      if [ -f .fake-gh-title ]; then title=$(cat .fake-gh-title); fi
+      printf '{"data":{"repository":{"b0":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"number":42,"url":"https://github.com/mock/repo/pull/42","state":"OPEN","title":"%s","headRefName":"feature","baseRefName":"main","isDraft":false,"headRepositoryOwner":{"login":"mock"},"updatedAt":"2026-09-29T00:00:00Z"}]}}}}' "$title"
+      exit 0 ;;
+    esac
     if [ "$mode" = slow-pages ]; then
       case "$*" in *endCursor=next-page*) exec sleep 30 ;; esac
       sleep 0.1
@@ -119,7 +172,7 @@ exit 99
         Self {
             root,
             log,
-            _restore_path: RestorePath(previous),
+            _restore_environment: restore,
         }
     }
 
@@ -245,7 +298,7 @@ fn github_polling_budget_coalesces_reads_and_pauses_every_surface() {
         assert_eq!(github::get_workspace_prs(&shared).unwrap()[0].pr.number, 42);
     }
     assert_eq!(
-        fake.count(&shared, "pr list "),
+        fake.count(&shared, "api graphql "),
         1,
         "all branch association callers must share a cached response"
     );
@@ -264,19 +317,25 @@ fn github_polling_budget_coalesces_reads_and_pauses_every_surface() {
     );
     assert_eq!(fake.count(&shared, "pr close "), 1);
     assert_eq!(
-        fake.count(&shared, "pr list "),
+        fake.count(&shared, "api graphql "),
         2,
         "writes must invalidate branch reads"
     );
 
-    // Reserve both API resources before the first PR request, so another
-    // application using the same account retains the final 10% of quota.
+    // Reserve each resource for reads that actually use it. Explicit
+    // GraphQL discovery has no REST repository lookup; porcelain still does.
     for (name, mode) in [
         ("reserve-core", "reserve-core"),
         ("reserve-graphql", "reserve-graphql"),
     ] {
         let repo = fake.repo(name, &format!("github-{name}.example.test"), mode);
-        assert!(github::get_branch_pr(&repo).is_err());
+        if mode == "reserve-core" {
+            assert_eq!(github::get_branch_pr(&repo).unwrap().unwrap().number, 42);
+            assert_eq!(fake.count(&repo, "api graphql "), 1);
+        } else {
+            assert!(github::get_branch_pr(&repo).is_err());
+            assert_eq!(fake.count(&repo, "api graphql "), 0);
+        }
         assert!(github::list_prs_overview(&repo).is_err());
         assert_eq!(fake.count(&repo, "api rate_limit"), 1);
         assert_eq!(
@@ -358,7 +417,7 @@ fn github_polling_budget_coalesces_reads_and_pauses_every_surface() {
         "before"
     );
     assert_eq!(
-        fake.count(&same_repo, "pr list "),
+        fake.count(&same_repo, "api graphql "),
         0,
         "sibling checkouts must share explicit branch reads"
     );
@@ -376,9 +435,9 @@ fn github_polling_budget_coalesces_reads_and_pauses_every_surface() {
         github::get_branch_pr(&other_repo).unwrap().unwrap().title,
         "before"
     );
-    assert_eq!(fake.count(&refresh, "pr list "), 2);
+    assert_eq!(fake.count(&refresh, "api graphql "), 2);
     assert_eq!(
-        fake.count(&other_repo, "pr list "),
+        fake.count(&other_repo, "api graphql "),
         1,
         "refresh must preserve other repository caches"
     );
@@ -388,7 +447,7 @@ fn github_polling_budget_coalesces_reads_and_pauses_every_surface() {
     github_budget::invalidate_read_cache(&failed).unwrap();
     assert!(github::get_branch_pr(&failed).is_err());
     assert_eq!(
-        fake.count(&failed, "pr list "),
+        fake.count(&failed, "api graphql "),
         1,
         "manual refresh must preserve retry backoff for failed reads"
     );
@@ -422,7 +481,7 @@ fn github_polling_budget_coalesces_reads_and_pauses_every_surface() {
     );
     let error = github::get_pr_review_threads(&pagination_reserve, 42).unwrap_err();
     assert!(
-        error.contains("rate limit"),
+        error.contains("reserve"),
         "unexpected pagination failure: {error}"
     );
     assert_eq!(

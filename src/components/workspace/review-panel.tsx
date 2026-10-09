@@ -40,6 +40,7 @@ import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
 import { CreatePrForm } from "./review/create-pr-form";
 import { ReviewDetail } from "./review/review-detail";
+import { usePrRefresh } from "./review/use-pr-refresh";
 import { ReviewThreads } from "./review/review-threads";
 import { IncomingPrsView } from "./review/incoming-prs-view";
 import {
@@ -363,12 +364,19 @@ export function ReviewPanel({ workspace }: Props) {
 
   // Helper to invalidate every PR query for this workspace at once.
   const invalidatePrQueries = useCallback(() => {
-    queryClient.invalidateQueries({
+    return queryClient.invalidateQueries({
       predicate: (q) =>
         q.queryKey[0] === "pr" &&
-        q.queryKey[2] === workspace.workspace_id,
+        ((q.queryKey[2] === workspace.workspace_id &&
+          (q.queryKey[3] === prNumber || q.queryKey[1] === "branch-info")) ||
+          (q.queryKey[2] === cwd && q.queryKey[3] === prNumber)),
     });
-  }, [queryClient, workspace.workspace_id]);
+  }, [queryClient, workspace.workspace_id, cwd, prNumber]);
+  const refresh = usePrRefresh(
+    cwd,
+    JSON.stringify([workspace.workspace_id, prNumber, workspace.git_branch, provider.kind]),
+    invalidatePrQueries,
+  );
 
   const openChangesPane = useCallback(() => {
     useUIStore.getState().setRightPanelTab(workspace.workspace_id, "changes");
@@ -425,7 +433,7 @@ export function ReviewPanel({ workspace }: Props) {
       <RepoUnreachableState
         repoSlug={repoSlugFromUrl(workspace.pr_url)}
         provider={provider}
-        onRetry={invalidatePrQueries}
+        onRetry={refresh}
       />
     );
   }
@@ -457,6 +465,7 @@ export function ReviewPanel({ workspace }: Props) {
         gitDirtyFiles={workspace.git_changed_files ?? 0}
         staleAgeMs={staleAgeMs}
         onRefresh={invalidatePrQueries}
+        onManualRefresh={refresh}
         onOpenChanges={openChangesPane}
       />
     );
