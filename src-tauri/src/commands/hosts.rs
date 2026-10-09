@@ -710,10 +710,13 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
             &remote_path_str,
         );
         // Chat sessions don't follow the workspace on their own: stop them
-        // before the copy so none keeps editing these files, and the next
-        // send starts each one wherever the workspace then runs (the host
-        // once this succeeds), resuming its conversation.
-        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
+        // before the copy so none keeps editing these files, and hold new
+        // ones off until the workspace runs on the host with its
+        // conversations there. The next send then starts each one where the
+        // workspace runs (the host once this succeeds), resuming its
+        // conversation. Every outcome releases the gate.
+        let migration =
+            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
         let result = crate::ssh::push_workspace(opts).await;
         let outcome = match result {
             crate::ssh::PushResult::Pushed { rsync_summary, .. } => {
@@ -862,6 +865,9 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
                         ),
                     }
                 }
+                // host_id names the host and the conversations are there:
+                // chats may start again, on the host.
+                drop(migration);
 
                 // Close any pre-existing sessions on this workspace's
                 // remote daemon BEFORE respawning. The daemon process
@@ -1140,9 +1146,11 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         candidate_sources.dedup();
 
         // Same as push: stop the workspace's chat sessions before copying
-        // it back, so none keeps editing the host copy and the next send
-        // starts each one on this computer once this succeeds.
-        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
+        // it back, so none keeps editing the host copy, and hold new ones
+        // off until host_id is cleared, so the next send starts each one on
+        // this computer once this succeeds. Every outcome releases the gate.
+        let migration =
+            crate::commands::agent_chat::begin_workspace_migration(&app, &workspace_id).await;
 
         // Try each candidate; only a "remote path missing" outcome is
         // worth retrying the next one — success / rsync error / host
@@ -1284,6 +1292,9 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
                 // again and the next pane spawn uses the local
                 // pty-daemon.
                 app_state.set_workspace_host_id(&workspace_id, None)?;
+                // The conversations came back above: chats may start again,
+                // here.
+                drop(migration);
                 // Forget the cached tunneled client BEFORE shutting
                 // down the supervisor — order matters because the
                 // cached client holds a socket that the supervisor

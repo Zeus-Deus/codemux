@@ -940,12 +940,14 @@ pub async fn agent_chat_start_session<R: Runtime>(
         }
     }
     // The device comes from the pane's workspace, never from the caller.
-    let device = {
-        let workspace = app
-            .try_state::<AppStateStore>()
-            .and_then(|state| state.workspace_id_for_pane(&pane_id));
-        device_for_workspace(&app, workspace.as_deref())?
-    };
+    // Resolved only once a push / pull of that workspace has finished, and
+    // the gate stays held until the session has started there, so a move
+    // can't begin in between (see `migration_gate_for`).
+    let workspace = app
+        .try_state::<AppStateStore>()
+        .and_then(|state| state.workspace_id_for_pane(&pane_id));
+    let placement = wait_for_workspace_placement(workspace.as_deref()).await;
+    let device = device_for_workspace(&app, workspace.as_deref())?;
     if device.is_some() {
         ensure_provider_runs_on_devices(provider)?;
     }
@@ -1235,6 +1237,8 @@ pub async fn agent_chat_start_session<R: Runtime>(
         &session.thread_id.0,
         device.as_ref().map(|device| device.remote.host_id),
     );
+    // The session runs where its workspace does; a move from here on stops it.
+    drop(placement);
     let state: State<'_, AppStateStore> = app.state();
     // Providers are expected to honour the requested thread id; re-claim if
     // one ever mints its own so the pane follows the session that exists.
@@ -2094,6 +2098,43 @@ fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Per-workspace gate between push / pull and chat session starts.
+///
+/// A move stops the workspace's chats before copying it, but a send or a new
+/// pane during the copy would otherwise place its session from the
+/// still-current `host_id`, start it on the machine being left, and keep
+/// editing there after the move succeeds. Push / pull hold the gate for
+/// writing from before they stop the chats until the destination is
+/// committed ([`begin_workspace_migration`]); every session start holds it
+/// for reading from resolving its placement until the provider has started
+/// ([`wait_for_workspace_placement`]), so it waits out a move and then starts
+/// where the workspace runs.
+///
+/// Lock order: this gate, then a thread's [`resume_lock_for`] lock. A move
+/// takes resume locks while it holds the gate, so waiting for the gate with
+/// a resume lock held would deadlock. Never take the gate twice in one task
+/// either: it is write-preferring, so a second read queued behind a waiting
+/// move never returns.
+fn migration_gate_for(workspace_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>> = OnceLock::new();
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(workspace_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Wait out any push / pull of `workspace_id`, then keep the next one from
+/// starting until the guard drops. `None` (a thread with no workspace) has
+/// nothing to wait for.
+async fn wait_for_workspace_placement(
+    workspace_id: Option<&str>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+    Some(migration_gate_for(workspace_id?).read_owned().await)
+}
+
 /// The machine each live chat session runs on, by thread: `None` for this
 /// computer, `Some(host_id)` for a device. Recorded when a session starts,
 /// because the session keeps running where it began while push / pull move
@@ -2121,18 +2162,11 @@ fn session_moved(thread_id: &str, host_now: Option<i64>) -> bool {
         .is_some_and(|started_on| *started_on != host_now)
 }
 
-/// [`session_moved`] against the thread's workspace: its pane's, else the
-/// one its persisted row names. Looked up only for a recorded session, and
-/// a thread whose workspace is gone is left alone: there is nowhere better
-/// to run it.
-fn live_session_moved<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
-    if !session_hosts().lock().unwrap().contains_key(thread_id) {
-        return false;
-    }
-    let Some(state) = app.try_state::<AppStateStore>() else {
-        return false;
-    };
-    let workspace = state
+/// The workspace a thread runs in: its pane's, else the one its persisted
+/// row names.
+fn thread_workspace_id<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Option<String> {
+    let state = app.try_state::<AppStateStore>()?;
+    state
         .agent_chat_pane_id_for_thread(thread_id)
         .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
         .or_else(|| {
@@ -2140,8 +2174,21 @@ fn live_session_moved<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
                 .get_agent_chat_session(thread_id)
                 .map(|record| record.workspace_id)
         })
-        .and_then(|workspace_id| state.find_workspace(&workspace_id));
-    workspace.is_some_and(|ws| session_moved(thread_id, ws.host_id))
+}
+
+/// [`session_moved`] against the thread's workspace ([`thread_workspace_id`]).
+/// Looked up only for a recorded session, and a thread whose workspace is
+/// gone is left alone: there is nowhere better to run it.
+fn live_session_moved<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
+    if !session_hosts().lock().unwrap().contains_key(thread_id) {
+        return false;
+    }
+    let Some(state) = app.try_state::<AppStateStore>() else {
+        return false;
+    };
+    thread_workspace_id(app, thread_id)
+        .and_then(|workspace_id| state.find_workspace(&workspace_id))
+        .is_some_and(|ws| session_moved(thread_id, ws.host_id))
 }
 
 /// Stop a live session that runs on another machine than its workspace now
@@ -2171,14 +2218,32 @@ async fn stop_moved_session<R: Runtime>(
     Ok(())
 }
 
+/// Start moving a workspace to another machine (push / pull): close its
+/// migration gate ([`migration_gate_for`]), then stop its live chats.
+///
+/// Until the returned guard drops no chat session in the workspace starts,
+/// so none can begin on the machine being left. Hold it until the new
+/// `host_id` is committed and the conversations have travelled with the
+/// files; dropping it on failure lets chats start where the workspace still
+/// runs.
+pub async fn begin_workspace_migration<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    let gate = migration_gate_for(workspace_id).write_owned().await;
+    stop_workspace_chat_sessions(app, workspace_id).await;
+    gate
+}
+
 /// Stop every live chat session in a workspace that push / pull is about to
 /// move to another machine, and wait for them. Done before the copy, so no
 /// agent keeps editing the files being copied and each provider's session
 /// files are final when they travel with it. The next send rebuilds each
 /// session where the workspace runs then, resuming its conversation where
-/// the provider can. Threads that start meanwhile are caught by the moved
-/// check in [`ensure_live_session`].
-pub async fn stop_workspace_chat_sessions<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
+/// the provider can. Runs under the migration gate, so no thread starts
+/// meanwhile; the moved check in [`ensure_live_session`] still catches a
+/// session that outlives a move.
+async fn stop_workspace_chat_sessions<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
     let threads = app
         .try_state::<AppStateStore>()
         .and_then(|state| state.find_workspace(workspace_id))
@@ -2390,6 +2455,12 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         return Ok(());
     }
 
+    // Wait out a push / pull of the thread's workspace, and keep the next
+    // one from starting until the rebuild below has placed the session (see
+    // `migration_gate_for`). Taken before the resume lock: that is the lock
+    // order.
+    let _placement =
+        wait_for_workspace_placement(thread_workspace_id(app, &thread_id.0).as_deref()).await;
     // Serialize the check→rebuild across concurrent callers on the same
     // thread so two auto-resumes can't each spawn a sidecar (see
     // `resume_locks`). Held for the whole rebuild below.
@@ -2420,7 +2491,8 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
 
     // Resolve the pane from the thread. An orphaned thread (no pane) still
     // runs where its workspace lives, so fall back to the persisted row's
-    // workspace for the device.
+    // workspace for the device. Read under the migration gate, so this is
+    // where the workspace runs once any move has finished.
     let (pane_id, pane_workspace) = {
         let state: State<'_, AppStateStore> = app.state();
         let pane_id = state.agent_chat_pane_id_for_thread(&thread_id.0);
@@ -9378,6 +9450,160 @@ mod tests {
             .unwrap()
             .contains("other-workspace-thread"));
         assert!(!session_hosts().lock().unwrap().contains_key(thread));
+    }
+
+    /// Give `workspace` an absolute folder on its device, so a session can
+    /// start there without asking the device over SSH where `~` is.
+    fn set_device_dir(state: &AppStateStore, workspace: &str, dir: &str) {
+        let mut snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.workspace_id.0 == workspace)
+            .unwrap()
+            .remote_cwd = Some(dir.to_string());
+        state.replace_snapshot(snapshot);
+    }
+
+    /// Let spawned tasks run until they block.
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A send while push copies the workspace must not restart its chat on
+    /// this computer, which the workspace is leaving: it waits for the push
+    /// and then starts the session on the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_send_during_push_starts_its_chat_on_the_host() {
+        let thread = "migrating-push-send";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+        let host_id = handle.state::<DatabaseStore>().list_hosts()[0].id;
+        set_device_dir(&handle.state::<AppStateStore>(), &workspace, "/srv/repo");
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, None);
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        let send = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await
+            }
+        });
+        settle().await;
+        assert!(!send.is_finished(), "the send waits out the copy");
+        assert!(provider.started_on.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, Some(host_id))
+            .unwrap();
+        drop(migration);
+        send.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![Some(host_id)]);
+    }
+
+    /// Same during pull: the send waits, then starts the chat on this
+    /// computer instead of on the host the workspace is leaving.
+    #[tokio::test]
+    async fn a_send_during_pull_starts_its_chat_here() {
+        let thread = "migrating-pull-send";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let handle = app.handle().clone();
+        let host_id = handle.state::<DatabaseStore>().list_hosts()[0].id;
+        set_device_dir(&handle.state::<AppStateStore>(), &workspace, "/srv/repo");
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, Some(host_id));
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        let send = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await
+            }
+        });
+        settle().await;
+        assert!(!send.is_finished(), "the send waits out the copy");
+        assert!(provider.started_on.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, None)
+            .unwrap();
+        drop(migration);
+        send.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+    }
+
+    /// A failed move leaves the workspace where it was, and a send waiting
+    /// on it starts the chat there.
+    #[tokio::test]
+    async fn a_send_after_a_failed_move_starts_where_the_workspace_still_runs() {
+        let thread = "migrating-failed-send";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let send = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into())).await
+            }
+        });
+        settle().await;
+        assert!(!send.is_finished());
+        drop(migration);
+        send.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+    }
+
+    /// An explicit start (a new pane, or a restart) during push waits for it
+    /// too, then places the session on the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_start_during_push_starts_on_the_host() {
+        let thread = "migrating-push-start";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        app.manage(ObservabilityStore::default());
+        let handle = app.handle().clone();
+        let host_id = handle.state::<DatabaseStore>().list_hosts()[0].id;
+        set_device_dir(&handle.state::<AppStateStore>(), &workspace, "/srv/repo");
+        let pane = handle
+            .state::<AppStateStore>()
+            .agent_chat_pane_id_for_thread(thread)
+            .unwrap();
+        let input: StartSessionInput = serde_json::from_value(json!({
+            "thread_id": thread,
+            "cwd": "/tmp",
+            "additional_directories": [],
+        }))
+        .unwrap();
+
+        let migration = begin_workspace_migration(&handle, &workspace).await;
+        let start = tokio::spawn({
+            let handle = handle.clone();
+            async move { agent_chat_start_session(handle, pane, ProviderKind::Codex, input, None).await }
+        });
+        settle().await;
+        assert!(!start.is_finished(), "the start waits out the copy");
+        assert!(provider.started_on.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, Some(host_id))
+            .unwrap();
+        drop(migration);
+        start.await.unwrap().unwrap();
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![Some(host_id)]);
     }
 
     // ── runs_on_device ──

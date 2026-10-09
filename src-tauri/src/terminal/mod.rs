@@ -1364,9 +1364,11 @@ pub(crate) fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(St
 }
 
 /// [`workspace_pty_env`] for a process running in `device_dir`, an absolute
-/// directory on the workspace's device. Chat sessions resolve where they run
-/// there before spawning, so they name it exactly; terminals pass `None`
-/// and get the directory the remote daemon starts them in.
+/// directory on the workspace's device. Chat sessions and terminals resolve
+/// where they run there (with the device's `$HOME`) before spawning, so they
+/// name it exactly: env values reach the process verbatim, so a `~` path
+/// would name a directory no shell can `cd` into. `None` falls back to the
+/// unresolved directory [`env_paths`] derives, which may start with `~`.
 pub(crate) fn workspace_pty_env_at(
     ws: &crate::state::WorkspaceSnapshot,
     device_dir: Option<&str>,
@@ -1433,8 +1435,12 @@ pub(crate) fn device_workspace_dir(ws: &crate::state::WorkspaceSnapshot) -> Stri
     path.to_string_lossy().into_owned()
 }
 
+/// [`workspace_pty_env_at`] for a terminal hydration plan. Daemon-backed
+/// terminals of a device workspace pass the absolute directory they start in
+/// there, so this agrees with the snapshot twin given the same directory.
 pub(crate) fn hydration_workspace_pty_env(
     ws: &crate::state::PtyHydrationWorkspace,
+    device_dir: Option<&str>,
 ) -> Vec<(String, String)> {
     let paths = env_paths(
         &EnvPathFields {
@@ -1448,7 +1454,7 @@ pub(crate) fn hydration_workspace_pty_env(
             remote_root: ws.remote_root.as_deref(),
             remote_cwd: ws.remote_cwd.as_deref(),
         },
-        None,
+        device_dir,
     );
     workspace_pty_env_from_fields(
         &ws.workspace_id,
@@ -5182,8 +5188,11 @@ mod tests {
             remote_root: ws.remote_root.clone(),
             attach_only: ws.attach_only,
         };
+        // Its terminals start in its absolute host path.
         let hydrated: std::collections::HashMap<_, _> =
-            hydration_workspace_pty_env(&hydration).into_iter().collect();
+            hydration_workspace_pty_env(&hydration, ws.remote_cwd.as_deref())
+                .into_iter()
+                .collect();
         assert_eq!(hydrated, m);
     }
 
@@ -5228,14 +5237,14 @@ mod tests {
             }
         };
 
-        // Terminals: the directory the remote daemon starts them in.
+        // Unresolved: the conventional path a push put it in, never expanded
+        // with this computer's home.
         let m = env_map(&ws);
         no_local_paths(&m);
         assert_eq!(
             m["CODEMUX_WORKSPACE_PATH"],
             "~/.codemux/worktrees/app/feat-x"
         );
-        assert_eq!(m["CODEMUX_ROOT_PATH"], "~/.codemux/worktrees/app/feat-x");
         let hydration = crate::state::PtyHydrationWorkspace {
             workspace_id: ws.workspace_id.0.clone(),
             title: ws.title.clone(),
@@ -5249,12 +5258,10 @@ mod tests {
             remote_root: ws.remote_root.clone(),
             attach_only: ws.attach_only,
         };
-        let hydrated: std::collections::HashMap<_, _> = hydration_workspace_pty_env(&hydration)
-            .into_iter()
-            .collect();
-        assert_eq!(hydrated, m);
 
-        // A chat session: the absolute directory it resolved on the device.
+        // Terminals and chat sessions: the absolute directory they resolved
+        // on the device, so `cd "$CODEMUX_WORKSPACE_PATH"` works there. Both
+        // twins agree given the same directory.
         let device_dir = "/home/deus/.codemux/worktrees/app/feat-x";
         let m: std::collections::HashMap<_, _> = workspace_pty_env_at(&ws, Some(device_dir))
             .into_iter()
@@ -5263,6 +5270,14 @@ mod tests {
         assert_eq!(m["CODEMUX_WORKSPACE_PATH"], device_dir);
         assert_eq!(m["CODEMUX_ROOT_PATH"], device_dir);
         assert!(m["CODEMUX_AGENT_CONTEXT"].contains(&format!("Project root: {device_dir}")));
+        for (key, value) in &m {
+            assert!(!value.contains("~/"), "{key}={value}");
+        }
+        let hydrated: std::collections::HashMap<_, _> =
+            hydration_workspace_pty_env(&hydration, Some(device_dir))
+                .into_iter()
+                .collect();
+        assert_eq!(hydrated, m);
 
         // Pulled back: this computer's paths again.
         ws.host_id = None;
