@@ -292,7 +292,7 @@ describe("HostsSection — Add device", () => {
     const dialog = await openAddDialog();
     await screen.findByText("SSH deus@zeus");
     fireEvent.change(within(dialog).getByLabelText("SSH host"), {
-      target: { value: "Deus@Zeus" },
+      target: { value: " deus@zeus " },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: "Connect" }));
 
@@ -301,6 +301,23 @@ describe("HostsSection — Add device", () => {
     expect(mocked.hostsAdd).not.toHaveBeenCalled();
     expect(mocked.hostsUpdate).not.toHaveBeenCalled();
     expect(mocked.hostsTestConnection).toHaveBeenCalledWith(1);
+  });
+
+  it("adds a target whose SSH user differs only in case as a new device", async () => {
+    backendHosts = [makeHost({ name: "server", ssh_target: "alice@server" })];
+    mocked.hostsTestConnection.mockResolvedValue(READY);
+
+    const dialog = await openAddDialog();
+    await screen.findByText("SSH alice@server");
+    fireEvent.change(within(dialog).getByLabelText("SSH host"), {
+      target: { value: "Alice@server" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("server is ready"));
+    expect(mocked.hostsAdd).toHaveBeenCalledWith("server", "Alice@server");
+    expect(mocked.hostsUpdate).not.toHaveBeenCalled();
+    expect(mocked.hostsTestConnection).toHaveBeenCalledWith(7);
   });
 
   it("renames the matching device when a name is typed", async () => {
@@ -363,11 +380,18 @@ describe("HostsSection — Add device", () => {
 
   it("offers ssh config hosts that are not added yet", async () => {
     backendHosts = [makeHost()];
-    mocked.hostsSshConfigHosts.mockResolvedValue(["homelab", "deus@zeus", "pi@raspberrypi.local"]);
+    mocked.hostsSshConfigHosts.mockResolvedValue([
+      "homelab",
+      "deus@zeus",
+      "Deus@zeus",
+      "pi@raspberrypi.local",
+    ]);
 
     const dialog = await openAddDialog();
     const chip = await within(dialog).findByRole("button", { name: "homelab" });
     expect(within(dialog).queryByRole("button", { name: "deus@zeus" })).toBeNull();
+    // A different SSH user on the same host is still offered.
+    expect(within(dialog).getByRole("button", { name: "Deus@zeus" })).toBeInTheDocument();
 
     fireEvent.click(chip);
     expect(within(dialog).getByLabelText("SSH host")).toHaveValue("homelab");

@@ -270,6 +270,29 @@ pub async fn remote_home(ssh_target: &str) -> Result<String, String> {
     Ok(home)
 }
 
+/// What [`env_var_set_script`] prints when the variable is set.
+const ENV_VAR_SET_MARKER: &str = "CODEMUX_ENV_VAR_SET";
+
+/// Print [`ENV_VAR_SET_MARKER`] when `name` is non-empty in the `sh -l`
+/// environment [`remote_exec_script`] starts providers in. The value itself
+/// is never printed.
+fn env_var_set_script(name: &str) -> Result<String, String> {
+    if !is_env_key(name) {
+        return Err(format!("invalid environment variable name {name:?}"));
+    }
+    let inner = format!("if [ -n \"${{{name}:-}}\" ]; then echo {ENV_VAR_SET_MARKER}; fi");
+    Ok(format!("exec sh -lc {}", sh_quote(&inner)))
+}
+
+/// Whether `name` is set to a non-empty value in the environment a provider
+/// started on the host gets. Only the answer crosses the wire, never the
+/// value; login shells may print banners, so the marker is matched by line.
+pub async fn remote_env_var_set(ssh_target: &str, name: &str) -> Result<bool, String> {
+    let script = env_var_set_script(name)?;
+    let stdout = run_remote(ssh_target, &script, Duration::from_secs(15)).await?;
+    Ok(stdout.lines().any(|line| line.trim() == ENV_VAR_SET_MARKER))
+}
+
 type ProgramCache = Mutex<HashMap<(String, String), Option<String>>>;
 
 fn program_cache() -> &'static ProgramCache {
@@ -396,6 +419,30 @@ mod tests {
         assert_eq!(sh_path("/srv/x"), "'/srv/x'");
         assert_eq!(expand_remote_tilde("~/w", "/home/u/"), "/home/u/w");
         assert_eq!(expand_remote_tilde("/abs", "/home/u"), "/abs");
+    }
+
+    #[test]
+    fn env_var_set_script_reports_presence_without_the_value() {
+        let script = env_var_set_script("CODEMUX_TEST_PROBE_KEY").unwrap();
+        let run = |value: Option<&str>| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(&script)
+                .env_remove("CODEMUX_TEST_PROBE_KEY");
+            if let Some(value) = value {
+                cmd.env("CODEMUX_TEST_PROBE_KEY", value);
+            }
+            String::from_utf8(cmd.output().unwrap().stdout).unwrap()
+        };
+        let set = run(Some("very-secret"));
+        assert!(
+            set.lines().any(|line| line.trim() == ENV_VAR_SET_MARKER),
+            "{set}"
+        );
+        assert!(!set.contains("very-secret"));
+        assert!(!run(Some("")).contains(ENV_VAR_SET_MARKER));
+        assert!(!run(None).contains(ENV_VAR_SET_MARKER));
+        assert!(env_var_set_script("BAD NAME; rm -rf ~").is_err());
     }
 
     #[test]

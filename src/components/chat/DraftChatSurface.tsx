@@ -217,9 +217,13 @@ function DraftChatSurfaceInner({
 
   // A draft can outlive its device (removed here or on another machine).
   // Fall back to this device once the list has loaded cleanly, rather than
-  // sending to a device that no longer exists.
+  // sending to a device that no longer exists. A retry in flight after a
+  // failed load clears the error but still holds the failed load's empty
+  // list, so wait for it to settle before reading the list as complete.
   const hosts = useHostsStore((s) => s.hosts);
-  const hostsUsable = useHostsStore((s) => s.loaded && s.error === null);
+  const hostsUsable = useHostsStore(
+    (s) => s.loaded && !s.loading && s.error === null,
+  );
   useEffect(() => {
     if (draft.hostId == null || !hostsUsable) return;
     if (!hosts.some((h) => h.id === draft.hostId)) {

@@ -2152,7 +2152,7 @@ mod workspace_identity {
             .expect("create_agent_chat_pane");
 
         let caller_env = HashMap::from([("KEEP_ME".to_string(), "1".to_string())]);
-        let (env, workspace_id) = pane_workspace_context(&state, &pane.0, Some(caller_env));
+        let (env, workspace_id) = pane_workspace_context(&state, &pane.0, Some(caller_env), None);
 
         assert_eq!(
             workspace_id.as_deref(),
@@ -2168,7 +2168,10 @@ mod workspace_identity {
         assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("1"));
 
         // An orphaned pane injects nothing and names no workspace.
-        assert_eq!(pane_workspace_context(&state, "pane-orphan", None), (None, None));
+        assert_eq!(
+            pane_workspace_context(&state, "pane-orphan", None, None),
+            (None, None)
+        );
     }
 
     #[test]

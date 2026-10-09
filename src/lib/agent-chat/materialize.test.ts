@@ -49,6 +49,7 @@ vi.mock("@/tauri/commands", () => ({
 
 import {
   autoNameWorkspace,
+  DEVICE_SKILLS_UNSUPPORTED,
   materializeAndSend,
   materializeWithPreset,
   type MaterializeActions,
@@ -1369,20 +1370,62 @@ describe("materializeAndSend", () => {
       );
     });
 
-    it("keeps the resolved skill selection instead of relisting skills locally", async () => {
+    it("refuses skills before creating anything on the device", async () => {
       const actions = makeActions();
       actions.refreshSkillSelection = vi.fn();
       const draft = makeDraft({ hostId: 2 });
 
-      await materializeAndSend(
+      const result = await materializeAndSend(
         draft, "/review this", "/home/user", actions,
         { skillIds: ["skill-a"], text: "review this" },
       );
 
+      expect(result).toEqual({ success: false, error: DEVICE_SKILLS_UNSUPPORTED });
+      expect(actions.markSendFailed).toHaveBeenCalledWith("draft-1", DEVICE_SKILLS_UNSUPPORTED);
+      // Nothing was created or shown, so nothing needs rolling back.
+      expect(actions.appendUserMessage).not.toHaveBeenCalled();
+      expect(createWorkspaceOnHost).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      expect(agentChatSendTurn).not.toHaveBeenCalled();
       expect(actions.refreshSkillSelection).not.toHaveBeenCalled();
+    });
+
+    it("refuses skills for an existing workspace that lives on a device", async () => {
+      useAppStore.setState({
+        appState: {
+          schema_version: 1,
+          active_workspace_id: "ws-existing",
+          workspaces: [{ workspace_id: "ws-existing", cwd: "/home/deus/foo", host_id: 2 }],
+        } as never,
+      });
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "existing_workspace", workspaceId: "ws-existing" },
+      });
+
+      const result = await materializeAndSend(
+        draft, "/review this", "/home/deus/foo", actions,
+        { skillIds: ["skill-a"], text: "review this" },
+      );
+
+      expect(result).toEqual({ success: false, error: DEVICE_SKILLS_UNSUPPORTED });
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      expect(agentChatSendTurn).not.toHaveBeenCalled();
+    });
+
+    it("sends a device thread whose message names no skill", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({ hostId: 2 });
+
+      const result = await materializeAndSend(
+        draft, "review this", "/home/user", actions,
+        { skillIds: [], text: "review this" },
+      );
+
+      expect(result.success).toBe(true);
       expect(agentChatSendTurn).toHaveBeenCalledWith(
         "claude",
-        expect.objectContaining({ skill_ids: ["skill-a"] }),
+        expect.objectContaining({ skill_ids: [] }),
       );
     });
 
@@ -1580,7 +1623,7 @@ describe("materializeWithPreset", () => {
 
       const result = await materializeWithPreset(
         draft, preset, "fix the login bug", actions,
-        { skillIds: ["skill-a"], text: "fix the login bug" },
+        { skillIds: [], text: "fix the login bug" },
       );
 
       expect(result.success).toBe(true);
@@ -1607,8 +1650,28 @@ describe("materializeWithPreset", () => {
       expect(actions.refreshSkillSelection).not.toHaveBeenCalled();
       expect(agentChatSendTurn).toHaveBeenCalledWith(
         "claude",
-        expect.objectContaining({ skill_ids: ["skill-a"] }),
+        expect.objectContaining({ skill_ids: [] }),
       );
+    });
+
+    it("a chat preset with skills fails before creating anything on the device", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        hostId: 2,
+      });
+
+      const result = await materializeWithPreset(
+        draft, makePreset({ kind: "chat_agent", commands: [] }), "/review fix it", actions,
+        { skillIds: ["skill-a"], text: "fix it" },
+      );
+
+      expect(result).toEqual({ success: false, error: DEVICE_SKILLS_UNSUPPORTED });
+      expect(actions.markSendFailed).toHaveBeenCalledWith("draft-1", DEVICE_SKILLS_UNSUPPORTED);
+      expect(createWorkspaceOnHost).not.toHaveBeenCalled();
+      expect(activateWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      expect(agentChatSendTurn).not.toHaveBeenCalled();
     });
 
     it("a terminal preset fails instead of running on this machine", async () => {

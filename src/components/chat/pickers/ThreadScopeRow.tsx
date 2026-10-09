@@ -29,6 +29,7 @@ import {
   useHomeDir,
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
+import { useHosts } from "@/stores/hosts-store";
 import { checkIsGitRepo, listBranchesDetailed } from "@/tauri/commands";
 import type { BranchDetail, WorkspaceSnapshot } from "@/tauri/types";
 
@@ -93,7 +94,9 @@ export interface ThreadScopeRowProps {
  * (`Composer`'s `belowComposerSlot`, attached flush via `SCOPE_STRIP`):
  * device · checkout on the left, "from ⑂ branch" on the right. With a
  * device picked, the checkout and branch controls describe what to
- * create on that device (its own checkout of the project's remote).
+ * create on that device (its own checkout of the project's remote); in
+ * its current checkout the branch is the device's, so the pill gives way
+ * to a label naming that checkout.
  * The project itself is picked in the new-thread headline
  * (`ChatHomeLanding`), which stays on screen whenever this row is
  * interactive, so the strip doesn't repeat it.
@@ -212,14 +215,18 @@ export function ThreadScopeRow({
           </div>
           {projectPath !== null && projectIsGit && (
             <div className="flex shrink-0 items-center gap-1.5">
-              <BranchControl
-                projectPath={projectPath}
-                checkoutMode={checkoutMode}
-                baseBranch={baseBranch}
-                disabled={disabled}
-                onChangeCheckoutMode={onChangeCheckoutMode}
-                onChangeBaseBranch={onChangeBaseBranch}
-              />
+              {hostId !== null && checkoutMode === "current" ? (
+                <DeviceCheckoutLabel hostId={hostId} />
+              ) : (
+                <BranchControl
+                  projectPath={projectPath}
+                  checkoutMode={checkoutMode}
+                  baseBranch={baseBranch}
+                  disabled={disabled}
+                  onChangeCheckoutMode={onChangeCheckoutMode}
+                  onChangeBaseBranch={onChangeBaseBranch}
+                />
+              )}
             </div>
           )}
         </div>
@@ -336,6 +343,29 @@ function CheckoutControl({
         )}
       </PopoverContent>
     </Popover>
+  );
+}
+
+// ── Device checkout label ──
+
+/** Stands in for the branch pill when the thread works in a device's
+ *  current checkout. The branch there is whatever the device has checked
+ *  out, which this machine can't read before the thread starts; the local
+ *  HEAD would name a branch the agent never works on. A new worktree keeps
+ *  the branch pill: the device bases it on `origin/<base>`. */
+function DeviceCheckoutLabel({ hostId }: { hostId: number }) {
+  const deviceName =
+    useHosts().find((h) => h.id === hostId)?.name ?? "the device";
+  return (
+    <span
+      className="inline-flex h-6 shrink-0 items-center gap-1.5 px-2 text-label font-medium text-muted-foreground"
+      title={`Works on the branch checked out on ${deviceName}`}
+    >
+      <GitBranch className="size-3" />
+      <span className="max-w-[200px] truncate">
+        {deviceName}&apos;s checkout
+      </span>
+    </span>
   );
 }
 

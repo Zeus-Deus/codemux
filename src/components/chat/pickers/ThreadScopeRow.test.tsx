@@ -225,6 +225,36 @@ describe("ThreadScopeRow", () => {
       expect(onChangeHostId).toHaveBeenCalledWith(2);
       expect(screen.getByText("Current checkout")).toBeInTheDocument();
     });
+
+    it("names the device's checkout instead of this machine's branch in its current checkout", async () => {
+      vi.mocked(listBranchesDetailed).mockResolvedValue([
+        branch("main"),
+        branch("feature-x", { is_head: true }),
+      ]);
+      currentHosts = [host(2, "zeus")];
+      const { onChangeBaseBranch } = renderRow({
+        hostId: 2,
+        checkoutMode: "current",
+        baseBranch: "feature-x",
+      });
+
+      expect(screen.getByText("zeus's checkout")).toBeInTheDocument();
+      expect(screen.queryByText("feature-x")).toBeNull();
+      expect(screen.queryByText(/^from$/)).toBeNull();
+      // Read-only: the device's branch can't be picked from here.
+      expect(screen.getByText("zeus's checkout").closest("button")).toBeNull();
+      // This machine's branches are never read for it.
+      await Promise.resolve();
+      expect(listBranchesDetailed).not.toHaveBeenCalled();
+      expect(onChangeBaseBranch).not.toHaveBeenCalled();
+    });
+
+    it("keeps the base-branch pill for a new worktree on a device", () => {
+      currentHosts = [host(2, "zeus")];
+      renderRow({ hostId: 2, checkoutMode: "worktree", baseBranch: "develop" });
+      expect(screen.getByText("develop")).toBeInTheDocument();
+      expect(screen.queryByText("zeus's checkout")).toBeNull();
+    });
   });
 
   describe("project target — current checkout", () => {

@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::ssh::exec::codemux_remote_command;
+
 /// Outcome of a single probe attempt. Serializable so it can cross
 /// the Tauri IPC boundary for the "Test connection" button result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +44,8 @@ pub enum ProbeOutcome {
         /// - A 0-byte file executes as an empty shell script: exit 0,
         ///   no output → the probe emits a bare `CMR: ` line.
         /// - A truncated ELF fails to exec (exit 126, "Exec format
-        ///   error"); the probe command's `2>/dev/null || printf
-        ///   'BROKEN\n'` fallback swallows the noise and emits
+        ///   error"); the probe command's `|| printf 'BROKEN\n'`
+        ///   fallback (stderr discarded) swallows the noise and emits
         ///   `CMR: BROKEN` (keeping ssh's exit status 0 so we still
         ///   parse stdout instead of reporting Unreachable).
         ///
@@ -100,49 +102,33 @@ pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
         // (it can arrive via account sync) is a hostname, never a flag.
         "--".into(),
         ssh_target.into(),
-        // Combined probe: print `uname -sm` then call
-        // `codemux-remote version` if available. The remote-side
-        // `printf` separates the two with a sentinel so the laptop
-        // can split.
-        //
-        // The `$HOME/.local/bin/codemux-remote` fallback exists because
-        // bootstrap installs there, but a non-interactive SSH shell
-        // (which is what `ssh user@host 'cmd'` runs) typically does NOT
-        // source `~/.profile` — so `~/.local/bin` is missing from PATH
-        // on most distros (Arch, Ubuntu, Debian, Fedora). Without the
-        // fallback, `command -v` returns nothing immediately after a
-        // successful install and the UI re-shows the install button on
-        // every subsequent "Test connection" press. Mirrors the same
-        // fix applied in `commands::hosts::ensure_remote_binary_current`
-        // and the supervisor's tunnel-spawn command.
-        //
-        // Both version invocations carry `2>/dev/null || printf 'BROKEN\n'`
-        // (issue #133): a truncated ELF fails to exec with exit 126
-        // ("cannot execute binary file: Exec format error"), and because
-        // the version invocation is the LAST statement of its `if`
-        // branch, that 126 would become the whole remote command's exit
-        // status — ssh exits 126 and `probe_host` takes the
-        // `!status.success()` path, reporting `Unreachable` with raw
-        // exec noise instead of ever reaching `parse_probe_stdout`. The
-        // `|| printf` fallback turns exec failure into a `CMR: BROKEN`
-        // line and printf's exit 0, so the probe stays Reachable and
-        // the parser classifies present-but-broken (→ "Install to
-        // repair"). `2>/dev/null` keeps the shell's exec-error noise
-        // out of the stream. The genuinely-absent branch
-        // (`NOT_INSTALLED`) is untouched.
-        // The `~/.local/bin` copy is checked first: it is the one bootstrap
-        // installs and every device command runs (`codemux_remote_command`),
-        // so an older copy elsewhere on PATH must not decide the version.
-        "printf 'UNAME: ' ; uname -sm ; \
-         if [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
-           printf 'CMR: ' ; \"$HOME/.local/bin/codemux-remote\" version 2>/dev/null || printf 'BROKEN\\n' ; \
-         elif command -v codemux-remote >/dev/null 2>&1 ; then \
-           printf 'CMR: ' ; codemux-remote version 2>/dev/null || printf 'BROKEN\\n' ; \
-         else \
-           printf 'CMR: NOT_INSTALLED\\n' ; \
-         fi"
-            .into(),
+        probe_script(),
     ]
+}
+
+/// The probe's remote command: print `uname -sm`, then the version of the
+/// `codemux-remote` every device command runs. The `UNAME:` / `CMR:`
+/// sentinels let the laptop split the two.
+///
+/// The helper is found by `codemux_remote_command`, the resolver inventory,
+/// the live-session check and every device command share: the
+/// `~/.local/bin` copy bootstrap installs comes first (non-interactive SSH
+/// shells usually lack that directory on PATH), so the version reported is
+/// the one those commands run, never an older copy elsewhere on PATH.
+///
+/// The version call carries `|| printf 'BROKEN\n'` (issue #133): a helper
+/// that fails to run (a truncated ELF exits 126) prints `CMR: BROKEN` and
+/// the command still exits 0, so `probe_host` parses stdout and reports
+/// present-but-broken ("Install to repair") instead of `Unreachable`. The
+/// subshell therefore fails only when the resolver finds no helper, which
+/// prints `CMR: NOT_INSTALLED`. `2>/dev/null` keeps the resolver's message
+/// and exec noise out of the stream.
+fn probe_script() -> String {
+    format!(
+        "printf 'UNAME: ' ; uname -sm ; printf 'CMR: ' ; \
+         ( {} ) 2>/dev/null || printf 'NOT_INSTALLED\\n'",
+        codemux_remote_command("version || printf 'BROKEN\\n'")
+    )
 }
 
 /// Run the probe. Returns one of the three outcomes; never panics,
@@ -260,53 +246,118 @@ mod tests {
         assert!(argv.last().unwrap().contains("codemux-remote"));
     }
 
+    /// Install a fake `codemux-remote` in `dir` running `body`.
+    fn fake_helper(dir: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("codemux-remote");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A helper that reports `version` and echoes other subcommands
+    /// after `label`, so a test can tell which copy ran.
+    fn working_helper(version: &str, label: &str) -> String {
+        format!(
+            "if [ \"$1\" = version ]; then \
+               echo '{{\"name\":\"codemux-remote\",\"version\":\"{version}\"}}'; \
+             else echo \"{label} $*\"; fi"
+        )
+    }
+
+    /// Run `script` under `sh` the way a device would: `home` is `$HOME`
+    /// and `path_dir` is the only non-system directory on PATH.
+    fn run_on_device(
+        script: &str,
+        home: &std::path::Path,
+        path_dir: &std::path::Path,
+    ) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", home)
+            .env("PATH", format!("{}:/usr/bin:/bin", path_dir.display()))
+            .output()
+            .unwrap()
+    }
+
+    fn probe_on_device(home: &std::path::Path, path_dir: &std::path::Path) -> ProbeOutcome {
+        let output = run_on_device(&probe_script(), home, path_dir);
+        // Every outcome exits 0, or `probe_host` reports Unreachable
+        // instead of parsing stdout (issue #133).
+        assert!(output.status.success(), "{output:?}");
+        parse_probe_stdout(&String::from_utf8(output.stdout).unwrap())
+    }
+
     #[test]
-    fn build_probe_argv_falls_back_to_home_local_bin() {
-        // Bootstrap installs to ~/.local/bin/codemux-remote, but a
-        // non-interactive ssh shell typically doesn't have that dir on
-        // PATH (it's added by ~/.profile, which only login shells
-        // source). Without an explicit fallback, `command -v` returns
-        // nothing immediately after a successful install and the UI
-        // re-shows the install button on every "Test" press.
-        //
-        // Lock in BOTH the PATH lookup AND the absolute-path fallback
-        // so a future refactor doesn't silently drop either branch.
-        let argv = build_probe_argv("zeus@10.0.0.5", 8);
-        let cmd = argv.last().unwrap();
-        assert!(
-            cmd.contains("command -v codemux-remote"),
-            "PATH lookup must remain (fast path when binary is on PATH)"
-        );
-        assert!(
-            cmd.contains("$HOME/.local/bin/codemux-remote"),
-            "absolute-path fallback must remain (covers the common case \
-             where ~/.local/bin isn't on the non-interactive PATH)"
-        );
-        // The fallback must run the binary, not just stat it — otherwise
-        // we'd report "installed" for a 0-byte file or a half-uploaded
-        // binary that doesn't actually execute.
-        assert!(
-            cmd.contains("\"$HOME/.local/bin/codemux-remote\" version"),
-            "fallback must invoke the binary's version subcommand"
-        );
-        // BOTH version invocations must carry the `|| printf 'BROKEN`
-        // failure fallback (issue #133). Without it, a truncated ELF
-        // exec-fails with exit 126 as the LAST statement of its branch,
-        // that 126 becomes the whole remote command's (and ssh's) exit
-        // status, and probe_host reports `Unreachable` with raw exec
-        // noise — parse_probe_stdout is never reached, so the
-        // present-but-broken classification (and the Install-to-repair
-        // path) can never fire.
-        assert!(
-            cmd.contains("codemux-remote version 2>/dev/null || printf 'BROKEN"),
-            "PATH-lookup branch must tolerate exec failure: {cmd}"
-        );
-        assert!(
-            cmd.contains(
-                "\"$HOME/.local/bin/codemux-remote\" version 2>/dev/null || printf 'BROKEN"
-            ),
-            "absolute-path fallback branch must tolerate exec failure: {cmd}"
-        );
+    fn probe_reports_the_helper_device_commands_run() {
+        // Bootstrap installs a current helper to ~/.local/bin, which
+        // non-interactive SSH shells usually lack on PATH; an older copy
+        // sits on PATH. The version check must describe the copy that
+        // inventory, the live-session check and every device command run
+        // (`codemux_remote_command`), not the one PATH would pick.
+        let device = tempfile::tempdir().unwrap();
+        let home = device.path().join("home");
+        let path_dir = device.path().join("path");
+        fake_helper(&home.join(".local/bin"), &working_helper("0.9.0", "local"));
+        fake_helper(&path_dir, &working_helper("0.1.0", "path"));
+
+        match probe_on_device(&home, &path_dir) {
+            ProbeOutcome::Reachable {
+                codemux_remote_version,
+                uname,
+                binary_present_but_broken,
+            } => {
+                assert_eq!(codemux_remote_version.as_deref(), Some("0.9.0"));
+                assert!(uname.is_some());
+                assert!(!binary_present_but_broken);
+            }
+            other => panic!("expected Reachable, got {other:?}"),
+        }
+        let listed = run_on_device(&codemux_remote_command("workspace list"), &home, &path_dir);
+        assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "local workspace list");
+
+        // With only the PATH copy installed, that copy answers both.
+        std::fs::remove_file(home.join(".local/bin/codemux-remote")).unwrap();
+        assert!(matches!(
+            probe_on_device(&home, &path_dir),
+            ProbeOutcome::Reachable { codemux_remote_version: Some(v), .. } if v == "0.1.0"
+        ));
+        let listed = run_on_device(&codemux_remote_command("workspace list"), &home, &path_dir);
+        assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "path workspace list");
+    }
+
+    #[test]
+    fn probe_tells_a_missing_helper_from_a_broken_one() {
+        let device = tempfile::tempdir().unwrap();
+        let home = device.path().join("home");
+        let path_dir = device.path().join("path");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        match probe_on_device(&home, &path_dir) {
+            ProbeOutcome::Reachable {
+                codemux_remote_version,
+                binary_present_but_broken,
+                ..
+            } => {
+                assert!(codemux_remote_version.is_none());
+                assert!(!binary_present_but_broken, "absent, so the UI offers Install");
+            }
+            other => panic!("expected Reachable, got {other:?}"),
+        }
+
+        // A helper that fails to run, like a truncated ELF (exit 126).
+        fake_helper(&home.join(".local/bin"), "echo 'Exec format error' >&2; exit 126");
+        match probe_on_device(&home, &path_dir) {
+            ProbeOutcome::Reachable {
+                codemux_remote_version,
+                binary_present_but_broken,
+                ..
+            } => {
+                assert!(codemux_remote_version.is_none());
+                assert!(binary_present_but_broken, "present, so the UI offers Install to repair");
+            }
+            other => panic!("expected Reachable, got {other:?}"),
+        }
     }
 
     #[test]

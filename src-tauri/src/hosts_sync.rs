@@ -29,16 +29,19 @@
 //! - A pulled row whose `sshTarget` would not be a safe single ssh
 //!   argument is skipped: targets reach `ssh` argv, and the account is
 //!   not trusted to have validated them.
+//! - A run reads the token only once it holds the queue, and stops if
+//!   that session is replaced mid-run (`SyncSession`), so a sign-out or
+//!   account switch never sends one account's devices with another
+//!   account's token or merges its list into theirs.
 //!
 //! Failure mode policy: a failed push leaves the row dirty and logs
 //! once. We do not surface the error to the user via toast — they
 //! already see the host in the UI, the sync indicator in Settings →
 //! Account tells them when it last completed.
 
-use crate::auth::{api_base_url, is_token_expired, load_token};
+use crate::auth::{api_base_url, is_token_expired, load_token, AuthState};
 use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
@@ -74,13 +77,6 @@ struct HostUpsertBody<'a> {
     ssh_target: &'a str,
 }
 
-/// Guard against concurrent sync attempts. Foreground sync + the
-/// fire-and-forget sync each Tauri host CRUD command triggers could
-/// otherwise overlap and double-push the same row. Skipping when one
-/// is already in flight is correct: the in-flight one already sees
-/// the latest dirty rows.
-static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
 /// Queues `try_sync_with_app` runs. Two overlapping runs (the startup
 /// pull racing the sync a device edit triggers) would both POST the same
 /// new row and leave the account with a duplicate device; queued, the
@@ -105,23 +101,48 @@ fn visible_hosts(db: &DatabaseStore) -> Vec<(i64, Option<String>, String, String
         .collect()
 }
 
+/// The signed-in session a sync run works for. Local writes made from
+/// the account's answers, and the read of what to upload with its
+/// token, happen only while that session is still current: after a
+/// sign-out or account switch the run stops instead of mixing accounts.
+struct SyncSession<'a> {
+    auth: &'a AuthState,
+    generation: u64,
+}
+
+impl SyncSession<'_> {
+    fn commit<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+        self.auth
+            .commit_if_session_current(self.generation, commit)
+            .ok_or_else(|| "the signed-in account changed during sync".to_string())
+    }
+}
+
 /// Convenience wrapper used by Tauri commands. Resolves the database
 /// + token from the app state and calls `try_sync`. Returns Ok(()) if
 /// the user isn't signed in (sync isn't an error in that case).
 pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    let db = app.state::<DatabaseStore>();
-    let token = match valid_token(&db) {
-        Some(t) => t,
-        None => return Ok(()),
-    };
+    // Queue before reading the token: a run that waited out a sign-out
+    // or account switch must sync whoever is signed in now, not upload
+    // the new account's devices with the old account's token.
     let _queued = SYNC_LOCK.lock().await;
+    let db = app.state::<DatabaseStore>();
+    let auth = app.state::<AuthState>();
+    let (generation, token) = auth.session_snapshot(|| valid_token(&db));
+    let Some(token) = token else {
+        return Ok(());
+    };
+    let session = SyncSession {
+        auth: &auth,
+        generation,
+    };
     // Clone-by-value the Arc/State so we can drop the State borrow
     // before awaiting (Tauri's State is not Send across awaits).
     let db_ref: &DatabaseStore = &db;
     let before = visible_hosts(db_ref);
     let outcome = tokio::time::timeout(SYNC_BUDGET, async {
-        let pull_err = pull(&token, db_ref).await.err();
-        let push_err = push(&token, db_ref).await.err();
+        let pull_err = pull(&token, db_ref, &session).await.err();
+        let push_err = push(&token, db_ref, &session).await.err();
         (pull_err, push_err)
     })
     .await;
@@ -184,7 +205,7 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// push to learn their `server_id`. A row whose `server_id` is non-null
 /// but missing from the server response is treated as a server-side
 /// deletion the local hasn't observed yet.
-pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
+async fn pull(token: &str, db: &DatabaseStore, session: &SyncSession<'_>) -> Result<(), String> {
     let base = api_base_url();
     let client = reqwest::Client::new();
     let resp = client
@@ -203,7 +224,7 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
         return Err(format!("API error: {}", resp.status()));
     }
     let body: ListHostsResponse = resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-    apply_server_hosts(db, &body.hosts)
+    session.commit(|| apply_server_hosts(db, &body.hosts))?
 }
 
 /// Fold one `GET /api/hosts` response into the local DB. Split from
@@ -267,10 +288,12 @@ fn apply_server_hosts(db: &DatabaseStore, hosts: &[ServerHost]) -> Result<(), St
 /// independently so a single failed PATCH doesn't strand other dirty
 /// rows; the failure is logged and the row stays dirty for the next
 /// sync to retry.
-pub async fn push(token: &str, db: &DatabaseStore) -> Result<(), String> {
+async fn push(token: &str, db: &DatabaseStore, session: &SyncSession<'_>) -> Result<(), String> {
     let base = api_base_url();
     let client = reqwest::Client::new();
-    let dirty = db.list_dirty_hosts();
+    // Read under the session guard, so every row sent with this token
+    // existed while its account was signed in.
+    let dirty = session.commit(|| db.list_dirty_hosts())?;
     let mut any_failed = false;
 
     for row in &dirty {
@@ -431,27 +454,11 @@ async fn push_delete(
     db.mark_host_synced(row, None)
 }
 
-/// Foreground sync: pull then push, with the SYNC_IN_PROGRESS guard.
-/// Used by Settings → Account's "Sync now" button (when we add one)
-/// and by the auth-check path that runs once at startup.
-#[allow(dead_code)]
-pub async fn sync_hosts(token: &str, db: &DatabaseStore) -> Result<(), String> {
-    if SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return Ok(()); // another sync is in flight, skip
-    }
-    let result = async {
-        pull(token, db).await?;
-        push(token, db).await?;
-        Ok(())
-    }
-    .await;
-    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::save_token;
+    use serial_test::serial;
 
     fn server_host(ssh_target: &str, deleted_at: Option<&str>) -> ServerHost {
         ServerHost {
@@ -540,5 +547,119 @@ mod tests {
 
         apply_server_hosts(&db, &[]).unwrap();
         assert!(visible_hosts(&db).is_empty(), "a removal pulled from the account");
+    }
+
+    const UNEXPIRED: &str = "2099-01-01T00:00:00Z";
+
+    fn signed_in_app(token: &str) -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AuthState::default());
+        save_token(&app.state::<DatabaseStore>(), token, UNEXPIRED).unwrap();
+        app
+    }
+
+    /// Sign out and into another account, then add a device as that account.
+    fn switch_account_and_add_device(app: &tauri::AppHandle<tauri::test::MockRuntime>) {
+        let db = app.state::<DatabaseStore>();
+        app.state::<AuthState>()
+            .replace_session(|| save_token(&db, "token-b", UNEXPIRED))
+            .unwrap();
+        db.insert_host("b-box", "u@b-box").unwrap();
+    }
+
+    fn created_host_body() -> &'static str {
+        r#"{"host":{"id":"srv-b","name":"b-box","sshTarget":"u@b-box",
+            "createdAt":"","updatedAt":"","deletedAt":null}}"#
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_sync_uses_the_account_signed_in_when_it_runs() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let app = signed_in_app("token-a");
+        let handle = app.handle().clone();
+
+        // Another sync holds the queue while this one is requested.
+        let running = SYNC_LOCK.lock().await;
+        let queued = try_sync_with_app(&handle);
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err(),
+            "waits its turn"
+        );
+        switch_account_and_add_device(&handle);
+
+        let with_old_token = server
+            .mock("POST", "/api/hosts")
+            .match_header("authorization", "Bearer token-a")
+            .expect(0)
+            .create_async()
+            .await;
+        let list = server
+            .mock("GET", "/api/hosts")
+            .match_header("authorization", "Bearer token-b")
+            .with_body(r#"{"hosts":[]}"#)
+            .create_async()
+            .await;
+        let upload = server
+            .mock("POST", "/api/hosts")
+            .match_header("authorization", "Bearer token-b")
+            .with_body(created_host_body())
+            .create_async()
+            .await;
+        drop(running);
+        let result = queued.await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        result.unwrap();
+        with_old_token.assert_async().await;
+        list.assert_async().await;
+        upload.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_account_switch_mid_sync_stops_the_old_accounts_run() {
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let app = signed_in_app("token-a");
+        let handle = app.handle().clone();
+
+        // The switch lands while account A's device list is in flight.
+        let switcher = handle.clone();
+        let list = server
+            .mock("GET", "/api/hosts")
+            .match_header("authorization", "Bearer token-a")
+            .with_body_from_request(move |_| {
+                switch_account_and_add_device(&switcher);
+                br#"{"hosts":[{"id":"srv-a","name":"a-box","sshTarget":"u@a-box",
+                    "createdAt":"","updatedAt":"","deletedAt":null}]}"#
+                    .to_vec()
+            })
+            .create_async()
+            .await;
+        let upload = server
+            .mock("POST", "/api/hosts")
+            .with_body(created_host_body())
+            .expect(0)
+            .create_async()
+            .await;
+        let result = try_sync_with_app(&handle).await;
+        std::env::remove_var("CODEMUX_API_URL");
+
+        assert!(result.is_err(), "the run reports it stopped");
+        list.assert_async().await;
+        upload.assert_async().await;
+        let names: Vec<String> = handle
+            .state::<DatabaseStore>()
+            .list_hosts()
+            .into_iter()
+            .map(|h| h.name)
+            .collect();
+        assert_eq!(names, ["b-box"], "account A's list is not merged into B's");
     }
 }

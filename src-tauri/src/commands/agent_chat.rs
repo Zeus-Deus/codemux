@@ -644,10 +644,13 @@ pub fn dev_agent_chat_spawn_test_pane<R: Runtime>(
 /// * entries already present in `existing` are never overwritten — an env
 ///   value the caller explicitly supplied always wins over the workspace
 ///   default.
+/// * a session on a device names paths there, never this computer's:
+///   `device_dir` is the absolute directory it runs in on the device.
 fn workspace_env_overlay(
     ws: Option<&crate::state::WorkspaceSnapshot>,
     pane_id: &str,
     existing: Option<HashMap<String, String>>,
+    device_dir: Option<&str>,
 ) -> Option<HashMap<String, String>> {
     let Some(ws) = ws else {
         return existing;
@@ -677,7 +680,7 @@ fn workspace_env_overlay(
         ));
         defaults.push(("BROWSER".to_string(), "codemux browser open".to_string()));
     }
-    defaults.extend(crate::terminal::workspace_pty_env(ws));
+    defaults.extend(crate::terminal::workspace_pty_env_at(ws, device_dir));
 
     for (key, val) in defaults {
         // Insert-if-absent so a caller-provided entry always wins.
@@ -695,11 +698,13 @@ fn workspace_env_overlay(
 /// from the IPC caller. An orphaned pane (no workspace) yields `existing`
 /// untouched and `None`. Shared by `agent_chat_start_session` and the
 /// `ensure_live_session` rebuild so the two session-minting paths stay in
-/// lockstep.
+/// lockstep. `device_dir` is where a device session runs (see
+/// [`workspace_env_overlay`]).
 pub fn pane_workspace_context(
     state: &AppStateStore,
     pane_id: &str,
     existing: Option<HashMap<String, String>>,
+    device_dir: Option<&std::path::Path>,
 ) -> (Option<HashMap<String, String>>, Option<String>) {
     let workspace_id = state.workspace_id_for_pane(pane_id);
     let snapshot = state.snapshot();
@@ -707,7 +712,12 @@ pub fn pane_workspace_context(
         .as_ref()
         .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
     (
-        workspace_env_overlay(ws, pane_id, existing),
+        workspace_env_overlay(
+            ws,
+            pane_id,
+            existing,
+            device_dir.and_then(std::path::Path::to_str),
+        ),
         ws.map(|w| w.workspace_id.0.clone()),
     )
 }
@@ -736,48 +746,13 @@ fn device_workspace(
         .ok_or_else(|| {
             format!("This thread's device (id {host_id}) is no longer configured on this computer")
         })?;
-    // The directory the workspace's terminals use: its explicit host path,
-    // the in-place path of an attach-only workspace, or where a push put it.
-    let cwd = match ws
-        .remote_cwd
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-    {
-        Some(remote_cwd) => remote_cwd.to_string(),
-        None if ws.attach_only => ws.cwd.clone(),
-        None => {
-            let project_name = ws
-                .project_root
-                .as_deref()
-                .and_then(|root| std::path::Path::new(root).file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or("workspace");
-            // Same rule as `workspace_push_to_host`: a repo root lands in
-            // the projects tree, a worktree in the per-branch worktrees tree.
-            let is_root =
-                ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
-            let path = if is_root {
-                crate::workspace_paths::conventional_remote_root_path_keyed(
-                    ws.project_uid.as_deref(),
-                    project_name,
-                )
-            } else {
-                crate::workspace_paths::conventional_remote_path_keyed(
-                    ws.project_uid.as_deref(),
-                    project_name,
-                    ws.git_branch.as_deref().unwrap_or("main"),
-                )
-            };
-            path.to_string_lossy().into_owned()
-        }
-    };
     Ok(Some(DeviceWorkspace {
         remote: crate::agent_provider::types::RemoteSpawnTarget {
             host_id,
             ssh_target: host.ssh_target.clone(),
             host_name: host.name.clone(),
         },
-        cwd,
+        cwd: crate::terminal::device_workspace_dir(ws),
     }))
 }
 
@@ -1123,7 +1098,21 @@ pub async fn agent_chat_start_session<R: Runtime>(
             })
     };
     if pane_already_runs_thread && impl_.has_session(&input.thread_id).await {
-        return Ok(input.thread_id);
+        let host_now = device.as_ref().map(|device| device.remote.host_id);
+        if !session_moved(&requested_thread_id, host_now) {
+            return Ok(input.thread_id);
+        }
+        // Its workspace moved to another machine since (push / pull): stop
+        // it, serialized with an auto-resume rebuild, and start it there.
+        let resume_lock = resume_lock_for(&requested_thread_id);
+        let _resume_guard = resume_lock.lock().await;
+        if impl_.has_session(&input.thread_id).await {
+            if !session_moved(&requested_thread_id, host_now) {
+                // A rebuild already put it there.
+                return Ok(input.thread_id);
+            }
+            stop_moved_session(&app, impl_.as_ref(), &input.thread_id).await?;
+        }
     }
     // Run the provider on the workspace's device, in its folder there.
     if let Some(device) = device.as_ref() {
@@ -1199,7 +1188,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // workspace) injects nothing, matching the terminal path's behavior.
     {
         let state: State<'_, AppStateStore> = app.state();
-        let (env, workspace_id) = pane_workspace_context(&state, &pane_id, input.env.take());
+        let (env, workspace_id) = pane_workspace_context(
+            &state,
+            &pane_id,
+            input.env.take(),
+            device.as_ref().map(|_| input.cwd.as_path()),
+        );
         input.env = env;
         input.workspace_id = workspace_id;
     }
@@ -1237,6 +1231,10 @@ pub async fn agent_chat_start_session<R: Runtime>(
             return Err(provider_err(error));
         }
     };
+    record_session_host(
+        &session.thread_id.0,
+        device.as_ref().map(|device| device.remote.host_id),
+    );
     let state: State<'_, AppStateStore> = app.state();
     // Providers are expected to honour the requested thread id; re-claim if
     // one ever mints its own so the pane follows the session that exists.
@@ -2096,6 +2094,120 @@ fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// The machine each live chat session runs on, by thread: `None` for this
+/// computer, `Some(host_id)` for a device. Recorded when a session starts,
+/// because the session keeps running where it began while push / pull move
+/// its workspace to another machine.
+fn session_hosts() -> &'static Mutex<HashMap<String, Option<i64>>> {
+    static HOSTS: OnceLock<Mutex<HashMap<String, Option<i64>>>> = OnceLock::new();
+    HOSTS.get_or_init(Default::default)
+}
+
+fn record_session_host(thread_id: &str, host_id: Option<i64>) {
+    session_hosts()
+        .lock()
+        .unwrap()
+        .insert(thread_id.to_string(), host_id);
+}
+
+/// Whether the live session of `thread_id` runs somewhere other than
+/// `host_now`, the machine its workspace runs on now. A session this
+/// process never recorded is left alone.
+fn session_moved(thread_id: &str, host_now: Option<i64>) -> bool {
+    session_hosts()
+        .lock()
+        .unwrap()
+        .get(thread_id)
+        .is_some_and(|started_on| *started_on != host_now)
+}
+
+/// [`session_moved`] against the thread's workspace: its pane's, else the
+/// one its persisted row names. Looked up only for a recorded session, and
+/// a thread whose workspace is gone is left alone: there is nowhere better
+/// to run it.
+fn live_session_moved<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
+    if !session_hosts().lock().unwrap().contains_key(thread_id) {
+        return false;
+    }
+    let Some(state) = app.try_state::<AppStateStore>() else {
+        return false;
+    };
+    let workspace = state
+        .agent_chat_pane_id_for_thread(thread_id)
+        .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
+        .or_else(|| {
+            app.try_state::<DatabaseStore>()?
+                .get_agent_chat_session(thread_id)
+                .map(|record| record.workspace_id)
+        })
+        .and_then(|workspace_id| state.find_workspace(&workspace_id));
+    workspace.is_some_and(|ws| session_moved(thread_id, ws.host_id))
+}
+
+/// Stop a live session that runs on another machine than its workspace now
+/// does, so the caller starts it again there. The thread stays, but its
+/// in-flight run ends here, so its run tracking goes too: the `Closed`
+/// event that would clear it can be lost (see [`shutdown_agent_chat_threads`]).
+async fn stop_moved_session<R: Runtime>(
+    app: &AppHandle<R>,
+    impl_: &dyn AgentProvider,
+    thread_id: &ThreadId,
+) -> Result<(), String> {
+    eprintln!(
+        "[codemux::agent_chat] stopping thread={}: its workspace is moving to another machine",
+        thread_id.0
+    );
+    if let Some(tracker) = app.try_state::<SubagentTracker>() {
+        tracker.clear_thread(&thread_id.0);
+    }
+    if let Some(activity) = app.try_state::<RunActivityTracker>() {
+        activity.clear_thread(&thread_id.0);
+    }
+    match impl_.stop_session(thread_id.clone()).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {}
+        Err(error) => return Err(provider_err(error)),
+    }
+    session_hosts().lock().unwrap().remove(&thread_id.0);
+    Ok(())
+}
+
+/// Stop every live chat session in a workspace that push / pull is about to
+/// move to another machine, and wait for them. Done before the copy, so no
+/// agent keeps editing the files being copied and each provider's session
+/// files are final when they travel with it. The next send rebuilds each
+/// session where the workspace runs then, resuming its conversation where
+/// the provider can. Threads that start meanwhile are caught by the moved
+/// check in [`ensure_live_session`].
+pub async fn stop_workspace_chat_sessions<R: Runtime>(app: &AppHandle<R>, workspace_id: &str) {
+    let threads = app
+        .try_state::<AppStateStore>()
+        .and_then(|state| state.find_workspace(workspace_id))
+        .map(|ws| crate::state::collect_agent_chat_threads(&ws.surfaces))
+        .unwrap_or_default();
+    let Some(registry) = app.try_state::<ProviderRegistry>() else {
+        return;
+    };
+    for (kind, thread_id) in threads {
+        let Some(impl_) = registry.get(kind).await else {
+            continue;
+        };
+        let thread_id = ThreadId(thread_id);
+        // Wait out a rebuild already under way, so its session is stopped
+        // too rather than coming up after this pass.
+        let resume_lock = resume_lock_for(&thread_id.0);
+        let _resume_guard = resume_lock.lock().await;
+        if !impl_.has_session(&thread_id).await {
+            continue;
+        }
+        if let Err(error) = stop_moved_session(app, impl_.as_ref(), &thread_id).await {
+            eprintln!(
+                "[codemux::agent_chat] failed to stop {kind:?} thread={} before moving its workspace: {error}",
+                thread_id.0
+            );
+        }
+    }
+}
+
 // Stop must also cancel a send waiting for lazy resume, before a provider turn
 // exists. Keep the final enqueue and interrupt ordered, without holding this
 // gate during startup (which may wait behind another chat's approval).
@@ -2272,8 +2384,9 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider_kind).await?;
     // Fast path: a live session already exists, so no need to serialize
-    // — this is the common case (every send after the first).
-    if impl_.has_session(thread_id).await {
+    // — this is the common case (every send after the first). Unless its
+    // workspace moved to another machine since the session started.
+    if impl_.has_session(thread_id).await && !live_session_moved(app, &thread_id.0) {
         return Ok(());
     }
 
@@ -2285,7 +2398,12 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     // Re-check under the lock: another task may have rebuilt the session
     // while we were waiting to acquire it.
     if impl_.has_session(thread_id).await {
-        return Ok(());
+        if !live_session_moved(app, &thread_id.0) {
+            return Ok(());
+        }
+        // Push / pull moved the workspace: rebuild the session where it is
+        // now, resuming the conversation like any other rebuild.
+        stop_moved_session(app, impl_.as_ref(), thread_id).await?;
     }
 
     // No live session — try to rebuild from the persisted row.
@@ -2300,24 +2418,20 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         return Ok(());
     };
 
-    // Rebuild the workspace env overlay and owning workspace id so the
-    // resumed agent's browser / CLI subprocesses and MCP dispatches route
-    // to its OWN workspace, exactly like `agent_chat_start_session`
-    // (`pane_workspace_context`). Resolve the pane from the thread; an
-    // orphaned thread (no pane) injects nothing.
-    let (env, workspace_id) = {
+    // Resolve the pane from the thread. An orphaned thread (no pane) still
+    // runs where its workspace lives, so fall back to the persisted row's
+    // workspace for the device.
+    let (pane_id, pane_workspace) = {
         let state: State<'_, AppStateStore> = app.state();
-        match state.agent_chat_pane_id_for_thread(&thread_id.0) {
-            Some(pane_id) => pane_workspace_context(&state, &pane_id, None),
-            None => (None, None),
-        }
+        let pane_id = state.agent_chat_pane_id_for_thread(&thread_id.0);
+        let workspace = pane_id
+            .as_deref()
+            .and_then(|pane_id| state.workspace_id_for_pane(pane_id));
+        (pane_id, workspace)
     };
-
-    // An orphaned thread still runs where its workspace lives, so fall back
-    // to the persisted row's workspace for the device.
     let device = device_for_workspace(
         app,
-        Some(workspace_id.as_deref().unwrap_or(&record.workspace_id)),
+        Some(pane_workspace.as_deref().unwrap_or(&record.workspace_id)),
     )?;
     let (cwd, remote) = match device.as_ref() {
         Some(device) => {
@@ -2336,6 +2450,23 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
             None,
         ),
+    };
+
+    // Rebuild the workspace env overlay and owning workspace id so the
+    // resumed agent's browser / CLI subprocesses and MCP dispatches route
+    // to its OWN workspace, exactly like `agent_chat_start_session`
+    // (`pane_workspace_context`). An orphaned thread injects nothing.
+    let (env, workspace_id) = match pane_id {
+        Some(pane_id) => {
+            let state: State<'_, AppStateStore> = app.state();
+            pane_workspace_context(
+                &state,
+                &pane_id,
+                None,
+                device.as_ref().map(|_| cwd.as_path()),
+            )
+        }
+        None => (None, None),
     };
 
     // Build the resume cursor from the persisted id, but for Claude run a
@@ -2433,7 +2564,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         .start_session(build_input(resume_cursor.clone()))
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => {}
         Err(err)
             if resume_cursor.is_some()
                 && !require_original
@@ -2451,10 +2582,11 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
                 .start_session(build_input(None))
                 .await
                 .map_err(provider_err)?;
-            Ok(())
         }
-        Err(err) => Err(provider_err(err)),
+        Err(err) => return Err(provider_err(err)),
     }
+    record_session_host(&thread_id.0, remote.as_ref().map(|remote| remote.host_id));
+    Ok(())
 }
 
 /// Command-layer input for [`agent_chat_send_turn`].
@@ -8859,7 +8991,7 @@ mod tests {
     #[test]
     fn workspace_env_overlay_injects_workspace_surface() {
         let ws = test_workspace("ws-123");
-        let env = workspace_env_overlay(Some(&ws), "pane-7", None)
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, None)
             .expect("a resolved workspace must yield an env map");
 
         assert_eq!(env["CODEMUX"], "1");
@@ -8884,7 +9016,7 @@ mod tests {
         existing.insert("BROWSER".to_string(), "custom-browser".to_string());
         existing.insert("MY_VAR".to_string(), "keep-me".to_string());
 
-        let env = workspace_env_overlay(Some(&ws), "pane-7", Some(existing))
+        let env = workspace_env_overlay(Some(&ws), "pane-7", Some(existing), None)
             .expect("a resolved workspace must yield an env map");
 
         // Caller-provided entries win over the workspace defaults …
@@ -8898,12 +9030,12 @@ mod tests {
     #[test]
     fn workspace_env_overlay_no_workspace_injects_nothing() {
         // Orphaned pane, no existing env → stays None (no injection).
-        assert!(workspace_env_overlay(None, "pane-7", None).is_none());
+        assert!(workspace_env_overlay(None, "pane-7", None, None).is_none());
 
         // Orphaned pane WITH a caller env → returned untouched.
         let mut existing = HashMap::new();
         existing.insert("MY_VAR".to_string(), "keep-me".to_string());
-        let env = workspace_env_overlay(None, "pane-7", Some(existing))
+        let env = workspace_env_overlay(None, "pane-7", Some(existing), None)
             .expect("caller env must be preserved");
         assert_eq!(env.len(), 1);
         assert_eq!(env["MY_VAR"], "keep-me");
@@ -8914,7 +9046,7 @@ mod tests {
     fn workspace_env_overlay_skips_the_browser_on_a_device() {
         let mut ws = test_workspace("ws-remote");
         ws.host_id = Some(3);
-        let env = workspace_env_overlay(Some(&ws), "pane-7", None).unwrap();
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, None).unwrap();
         assert!(!env.contains_key("BROWSER"));
         assert!(!env.contains_key("CODEMUX_BROWSER_CMD"));
         assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-remote");
@@ -9017,6 +9149,235 @@ mod tests {
             ensure_provider_runs_on_devices(ProviderKind::OpenCode),
             Err("unsupported: OpenCode can't run on another device yet".to_string())
         );
+    }
+
+    /// A push keeps this computer's paths on the workspace; a chat running
+    /// on the device must still be told the directory it runs in there.
+    #[test]
+    fn workspace_env_overlay_names_the_device_folder_of_a_pushed_workspace() {
+        let mut ws = test_workspace("ws-pushed");
+        ws.host_id = Some(3);
+        let local = "/home/user/projects/repo";
+        let device_dir = "/home/deus/.codemux/worktrees/repo/feat-my-feature";
+
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, Some(device_dir)).unwrap();
+        assert_eq!(env["CODEMUX_WORKSPACE_PATH"], device_dir);
+        assert_eq!(env["CODEMUX_ROOT_PATH"], device_dir);
+        for (key, value) in &env {
+            assert!(!value.contains(local), "{key}={value}");
+        }
+
+        // Without a resolved directory it names where the push put it.
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None, None).unwrap();
+        assert_eq!(
+            env["CODEMUX_WORKSPACE_PATH"],
+            "~/.codemux/worktrees/repo/feat-my-feature"
+        );
+        assert!(!env["CODEMUX_AGENT_CONTEXT"].contains(local));
+    }
+
+    // ── sessions follow their workspace between machines ──
+
+    #[test]
+    fn a_session_moved_once_its_workspace_runs_elsewhere() {
+        record_session_host("moved-on-device", Some(3));
+        assert!(!session_moved("moved-on-device", Some(3)));
+        assert!(session_moved("moved-on-device", None), "pulled back");
+        assert!(session_moved("moved-on-device", Some(4)), "another device");
+
+        record_session_host("moved-local", None);
+        assert!(!session_moved("moved-local", None));
+        assert!(session_moved("moved-local", Some(3)), "pushed");
+
+        // A session this process never started is left alone.
+        assert!(!session_moved("moved-unrecorded", Some(3)));
+    }
+
+    /// Tracks only which threads are live and where each session started.
+    #[derive(Default)]
+    struct PlacementProvider {
+        live: Mutex<std::collections::HashSet<String>>,
+        stopped: Mutex<Vec<String>>,
+        started_on: Mutex<Vec<Option<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for PlacementProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+        fn capabilities(&self) -> crate::agent_provider::ProviderCapabilities {
+            unimplemented!()
+        }
+        async fn start_session(
+            &self,
+            input: StartSessionInput,
+        ) -> Result<crate::agent_provider::ProviderSession, ProviderError> {
+            self.started_on
+                .lock()
+                .unwrap()
+                .push(input.remote.map(|remote| remote.host_id));
+            self.live.lock().unwrap().insert(input.thread_id.0.clone());
+            Ok(crate::agent_provider::ProviderSession {
+                thread_id: input.thread_id,
+                provider: ProviderKind::Codex,
+                session_id: crate::agent_provider::ProviderSessionId("session".into()),
+                status: SessionStatus::Ready,
+                resume_cursor: None,
+            })
+        }
+        async fn send_turn(
+            &self,
+            _input: SendTurnInput,
+        ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+            unimplemented!()
+        }
+        async fn interrupt_turn(
+            &self,
+            _thread_id: ThreadId,
+            _turn_id: Option<TurnId>,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn respond_to_request(
+            &self,
+            _thread_id: ThreadId,
+            _request_id: RequestId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn set_model(
+            &self,
+            _thread_id: ThreadId,
+            _model: String,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn set_permission_mode(
+            &self,
+            _thread_id: ThreadId,
+            _mode: String,
+        ) -> Result<(), ProviderError> {
+            unimplemented!()
+        }
+        async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+            self.stopped.lock().unwrap().push(thread_id.0.clone());
+            self.live.lock().unwrap().remove(&thread_id.0);
+            Ok(())
+        }
+        async fn list_sessions(
+            &self,
+        ) -> Result<Vec<crate::agent_provider::ProviderSession>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn has_session(&self, thread_id: &ThreadId) -> bool {
+            self.live.lock().unwrap().contains(&thread_id.0)
+        }
+        fn event_stream(&self) -> crate::agent_provider::ProviderEventStream {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    /// A chat pane bound to `thread` in the active workspace (on `host_id`),
+    /// its persisted row, and `provider` registered for Codex.
+    async fn placement_app(
+        thread: &str,
+        host_id: Option<i64>,
+        provider: Arc<PlacementProvider>,
+    ) -> (tauri::App<tauri::test::MockRuntime>, String) {
+        let db = DatabaseStore::new_in_memory();
+        let host = db.insert_host("ai-node", "deus@ai-node").unwrap();
+        let state = AppStateStore::default();
+        let workspace = state.snapshot().active_workspace_id.0;
+        state
+            .create_agent_chat_pane(
+                &workspace,
+                Some(ProviderKind::Codex),
+                None,
+                None,
+                Some(thread.to_string()),
+            )
+            .unwrap();
+        state
+            .set_workspace_host_id(&workspace, host_id.map(|_| host.id))
+            .unwrap();
+        db.upsert_agent_chat_session(thread, &workspace, Some("/tmp"), "codex")
+            .unwrap();
+        let registry = ProviderRegistry::new();
+        registry.set_codex(provider).await;
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(state);
+        app.manage(registry);
+        (app, workspace)
+    }
+
+    /// Pulling a workspace back must not leave its chat editing the device
+    /// copy: the next send stops that session and starts it on this
+    /// computer, while sends to a session that hasn't moved stay untouched.
+    #[tokio::test]
+    async fn a_pulled_workspace_restarts_its_device_chat_here() {
+        let thread = "moved-pull-thread";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, Some(1), provider.clone()).await;
+        let handle = app.handle().clone();
+        let host_id = handle
+            .state::<AppStateStore>()
+            .find_workspace(&workspace)
+            .unwrap()
+            .host_id;
+        // A session running on the device, where the workspace is.
+        provider.live.lock().unwrap().insert(thread.to_string());
+        record_session_host(thread, host_id);
+
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert!(provider.stopped.lock().unwrap().is_empty());
+
+        handle
+            .state::<AppStateStore>()
+            .set_workspace_host_id(&workspace, None)
+            .unwrap();
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        assert_eq!(*provider.started_on.lock().unwrap(), vec![None]);
+
+        // Now it runs where the workspace does.
+        ensure_live_session(&handle, ProviderKind::Codex, &ThreadId(thread.into()))
+            .await
+            .unwrap();
+        assert_eq!(provider.stopped.lock().unwrap().len(), 1);
+        assert_eq!(provider.started_on.lock().unwrap().len(), 1);
+    }
+
+    /// Push / pull stop the workspace's live chats before copying it.
+    #[tokio::test]
+    async fn moving_a_workspace_stops_its_live_chats() {
+        let thread = "moved-push-thread";
+        let provider = Arc::new(PlacementProvider::default());
+        let (app, workspace) = placement_app(thread, None, provider.clone()).await;
+        let handle = app.handle().clone();
+        provider.live.lock().unwrap().insert(thread.to_string());
+        provider
+            .live
+            .lock()
+            .unwrap()
+            .insert("other-workspace-thread".into());
+        record_session_host(thread, None);
+
+        stop_workspace_chat_sessions(&handle, &workspace).await;
+
+        assert_eq!(*provider.stopped.lock().unwrap(), vec![thread.to_string()]);
+        assert!(provider
+            .live
+            .lock()
+            .unwrap()
+            .contains("other-workspace-thread"));
+        assert!(!session_hosts().lock().unwrap().contains_key(thread));
     }
 
     // ── runs_on_device ──

@@ -198,6 +198,14 @@ export async function materializeAndSend(
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
+  // The backend refuses skills on a device thread, so fail before creating
+  // anything rather than after the workspace and session exist. The caller
+  // keeps the draft text, skill tokens included.
+  if (sendsSkillsToDevice(draft, skillBodies)) {
+    actions.markSendFailed(draft.draftId, DEVICE_SKILLS_UNSUPPORTED);
+    return { success: false, error: DEVICE_SKILLS_UNSUPPORTED };
+  }
+
   // Instant feedback (Bug 2 fix): seed the pre-minted thread slice and
   // append the optimistic user bubble BEFORE any workspace/session work.
   // The thread id is pre-minted so the slice can exist now; the draft
@@ -318,7 +326,7 @@ export async function materializeAndSend(
   let exactSkillSelection =
     skillBodies && typeof skillBodies === "object" ? skillBodies : null;
   // Skill rebinding lists skills on this machine, which can't see a
-  // device's paths — device threads keep the selection as resolved.
+  // device's paths. A device thread carries no skills (refused above).
   if (exactSkillSelection && actions.refreshSkillSelection && hostId === null) {
     try {
       exactSkillSelection = await actions.refreshSkillSelection(
@@ -501,6 +509,11 @@ export async function materializeWithPreset(
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
+  // Same refusal as the composer send: skills can't reach a device thread.
+  if (preset.kind === "chat_agent" && sendsSkillsToDevice(draft, skillBodies)) {
+    actions.markSendFailed(draft.draftId, DEVICE_SKILLS_UNSUPPORTED);
+    return { success: false, error: DEVICE_SKILLS_UNSUPPORTED };
+  }
 
   // 1. Resolve the target workspace. Same branching as
   //    `materializeAndSend`: device → created on the device; home →
@@ -586,7 +599,7 @@ export async function materializeWithPreset(
     let exactSkills =
       skillBodies && typeof skillBodies === "object" ? skillBodies : null;
     // Skill rebinding lists skills on this machine, which can't see a
-    // device's paths — device threads keep the selection as resolved.
+    // device's paths. A device thread carries no skills (refused above).
     if (exactSkills && actions.refreshSkillSelection && hostId === null) {
       try {
         exactSkills = await actions.refreshSkillSelection(exactSkills, cwd);
@@ -793,6 +806,31 @@ export function draftHostId(draft: ChatDraft): number | null {
   return draft.hostId != null && draft.target.kind !== "existing_workspace"
     ? draft.hostId
     : null;
+}
+
+export const DEVICE_SKILLS_UNSUPPORTED =
+  "Skills aren't available for threads on another device yet. Remove the skill from your message and try again.";
+
+/** Whether the first turn would carry skills to a thread that runs on
+ *  another device: one the send creates there, or an existing workspace
+ *  that lives there. Skills resolve against files on this computer, so
+ *  the backend rejects them for device threads. */
+function sendsSkillsToDevice(
+  draft: ChatDraft,
+  skillBodies: string | ResolvedSkillSelection | null,
+): boolean {
+  const skillIds =
+    skillBodies && typeof skillBodies === "object" ? skillBodies.skillIds : [];
+  if (skillIds.length === 0) return false;
+  if (draftHostId(draft) !== null) return true;
+  if (draft.target.kind !== "existing_workspace") return false;
+  const workspaceId = draft.target.workspaceId;
+  return (
+    useAppStore
+      .getState()
+      .appState?.workspaces.find((w) => w.workspace_id === workspaceId)
+      ?.host_id != null
+  );
 }
 
 /** Create a draft's workspace on device `hostId`, shared by the composer

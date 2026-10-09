@@ -29,9 +29,10 @@
 //!    added that reads the daemon's SQLite registry and prints
 //!    `{"host_id":"…","workspaces":[…]}` on stdout, plus the host facts
 //!    the Devices page shows (`disk_bytes`, `remote_control_serving`).
-//!    The same `~/.local/bin/codemux-remote` PATH fallback the probe
-//!    uses applies here, because non-interactive SSH on Arch/Ubuntu/etc.
-//!    doesn't source `~/.profile`.
+//!    It resolves the helper like the probe does: the
+//!    `~/.local/bin/codemux-remote` bootstrap installs comes first,
+//!    because non-interactive SSH on Arch/Ubuntu/etc. doesn't source
+//!    `~/.profile` and an older copy on PATH must not shadow it.
 //! 3. Reconcile the result into `workspaces_sync` (only for hosts that
 //!    have synced their identity, `server_id`):
 //!    - Each remote workspace gets a sibling-only row keyed by
@@ -116,6 +117,7 @@ use crate::database::{DatabaseStore, HostRecord};
 use crate::hosts_status::{HostFacts, HostStatusStore, Observation, HOSTS_STATUS_CHANGED_EVENT};
 use crate::hosts_upgrade::{auto_upgrade_for, is_older, AutoUpgrade};
 use crate::remote::host_status::{DISK_WALK_BUDGET, SKIP_DISK_ENV};
+use crate::ssh::exec::codemux_remote_command;
 use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 
 /// How often the poller runs after the first 5-second warm-up.
@@ -549,17 +551,16 @@ async fn fetch_inventory(ssh_target: &str, walk_disk: bool) -> Result<String, St
 
 /// Build the argv for the inventory SSH call. Extracted so unit
 /// tests can lock in the exact flags + remote command (especially
-/// the `$HOME/.local/bin/codemux-remote` fallback — losing that on
-/// Arch/Ubuntu/etc. would silently break the poller for every user
-/// who installed via Settings → Hosts → Install, because
-/// non-interactive SSH shells don't put `~/.local/bin` on PATH).
+/// which `codemux-remote` runs: the `~/.local/bin` copy bootstrap
+/// installs, which non-interactive SSH shells on Arch/Ubuntu/etc.
+/// don't have on PATH).
 pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64, walk_disk: bool) -> Vec<String> {
-    // An env prefix rather than a flag: a daemon that predates the
+    // An env variable rather than a flag: a daemon that predates the
     // disk walk ignores the variable instead of rejecting the command.
     let env_prefix = if walk_disk {
         String::new()
     } else {
-        format!("{SKIP_DISK_ENV}=1 ")
+        format!("export {SKIP_DISK_ENV}=1 ; ")
     };
     vec![
         "-o".into(),
@@ -571,21 +572,10 @@ pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64, walk_disk: bool
         // Ends option parsing: a target can never be read as a flag.
         "--".into(),
         ssh_target.into(),
-        // Same PATH-fallback story as the probe (see ssh/probe.rs):
-        // bootstrap installs to ~/.local/bin, but non-interactive
-        // SSH typically doesn't have that dir on PATH. Without the
-        // absolute-path fallback the poller silently degrades to
-        // "no inventory" the moment a user installs via the desktop's
-        // Install button.
-        format!(
-            "if command -v codemux-remote >/dev/null 2>&1 ; then \
-               {env_prefix}codemux-remote workspace list ; \
-             elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
-               {env_prefix}\"$HOME/.local/bin/codemux-remote\" workspace list ; \
-             else \
-               echo 'CMR_MISSING' >&2 ; exit 1 ; \
-             fi"
-        ),
+        // The helper the probe's version check inspects: the
+        // `~/.local/bin` copy wins over PATH, so an older copy on PATH
+        // can't answer for a device the probe just reported current.
+        format!("{env_prefix}{}", codemux_remote_command("workspace list")),
     ]
 }
 
@@ -1077,10 +1067,10 @@ mod tests {
 
     #[test]
     fn build_inventory_argv_has_path_fallback_and_batch_mode() {
-        // The PATH + ~/.local/bin/codemux-remote fallback is the
-        // entire reason this poller works on a freshly-installed
-        // host — losing it would silently break the feature for
-        // every user who installed via Settings → Hosts → Install.
+        // The ~/.local/bin/codemux-remote lookup is the entire reason
+        // this poller works on a freshly-installed host — losing it
+        // would silently break the feature for every user who
+        // installed via Settings → Hosts → Install.
         let argv = build_inventory_argv("user@10.0.0.7", 15, true);
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=15"));
@@ -1111,10 +1101,26 @@ mod tests {
     fn build_inventory_argv_skips_disk_walk_via_env_prefix() {
         let argv = build_inventory_argv("user@10.0.0.7", 15, false);
         let cmd = argv.last().unwrap();
-        // Both branches of the PATH fallback carry the prefix, so the
-        // walk is skipped regardless of where the binary was found.
-        assert!(cmd.contains("CODEMUX_SKIP_DISK=1 codemux-remote workspace list"));
-        assert!(cmd.contains("CODEMUX_SKIP_DISK=1 \"$HOME/.local/bin/codemux-remote\" workspace list"));
+        // Exported ahead of the lookup, so the walk is skipped
+        // regardless of where the binary was found.
+        assert!(
+            cmd.starts_with("export CODEMUX_SKIP_DISK=1 ; if "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn inventory_runs_the_helper_the_version_check_inspects() {
+        // The probe's version check prefers ~/.local/bin; if inventory
+        // preferred PATH, an older copy there would answer for a device
+        // the probe reported current.
+        for walk_disk in [true, false] {
+            let cmd = build_inventory_argv("user@10.0.0.7", 15, walk_disk).pop().unwrap();
+            let local = cmd.find("$HOME/.local/bin/codemux-remote").unwrap();
+            let path = cmd.find("command -v codemux-remote").unwrap();
+            assert!(local < path, "~/.local/bin must be checked before PATH: {cmd}");
+            assert!(cmd.ends_with("\"$CMR\" workspace list"), "{cmd}");
+        }
     }
 
     // ── parse ──────────────────────────────────────────────────

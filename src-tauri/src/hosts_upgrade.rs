@@ -48,6 +48,7 @@ use crate::database::{DatabaseStore, HostRecord};
 use crate::ssh::bootstrap::{
     bootstrap_remote, provision_serve, BootstrapOptions, BootstrapResult, UPLOAD_DEADLINE,
 };
+use crate::ssh::exec::codemux_remote_command;
 use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 use crate::ssh::sidecar::RuntimeRefresh;
 
@@ -441,13 +442,7 @@ async fn check_and_upgrade<R: Runtime>(
 ///   can't reach has nothing to lose by restarting.
 async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
     use std::process::Stdio;
-    // Mirror the PATH fallback every other SSH call site uses: non-interactive
-    // SSH shells often don't have ~/.local/bin on PATH.
-    let cmd_str = "if command -v codemux-remote >/dev/null 2>&1 ; then \
-                     codemux-remote serve status ; \
-                   elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
-                     \"$HOME/.local/bin/codemux-remote\" serve status ; \
-                   fi";
+    let cmd_str = live_sessions_script();
     let output = tokio::time::timeout(Duration::from_secs(12), async {
         tokio::process::Command::new("ssh")
             .args([
@@ -457,8 +452,9 @@ async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
                 "ConnectTimeout=10",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
+                "--",
                 ssh_target,
-                cmd_str,
+                &cmd_str,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -480,6 +476,15 @@ async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Ask the helper this upgrade just installed, not an older copy elsewhere
+/// on PATH: one whose `serve status` predates `live_terminals` would answer
+/// "unknown", and the daemon would restart under the user's live sessions.
+/// The `~/.local/bin` copy also covers non-interactive SSH shells, which
+/// usually don't have that directory on PATH.
+fn live_sessions_script() -> String {
+    codemux_remote_command("serve status")
 }
 
 // ── Claude runtime ─────────────────────────────────────────────────
@@ -663,5 +668,16 @@ mod tests {
             auto_upgrade_for(&reachable(None), target),
             AutoUpgrade::Nothing
         ));
+    }
+
+    #[test]
+    fn live_session_check_asks_the_helper_just_installed() {
+        // The upgrade installs to ~/.local/bin; an older copy on PATH must
+        // not answer whether restarting the daemon would end live work.
+        let script = live_sessions_script();
+        let local = script.find("$HOME/.local/bin/codemux-remote").unwrap();
+        let path = script.find("command -v codemux-remote").unwrap();
+        assert!(local < path, "~/.local/bin must be checked before PATH: {script}");
+        assert!(script.ends_with("\"$CMR\" serve status"), "{script}");
     }
 }

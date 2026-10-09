@@ -709,6 +709,11 @@ pub async fn workspace_push_to_host<R: tauri::Runtime>(
             &local_worktree,
             &remote_path_str,
         );
+        // Chat sessions don't follow the workspace on their own: stop them
+        // before the copy so none keeps editing these files, and the next
+        // send starts each one wherever the workspace then runs (the host
+        // once this succeeds), resuming its conversation.
+        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
         let result = crate::ssh::push_workspace(opts).await;
         let outcome = match result {
             crate::ssh::PushResult::Pushed { rsync_summary, .. } => {
@@ -1133,6 +1138,11 @@ pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
         }
         // De-dup while preserving order (uid-keyed == basename when no uid).
         candidate_sources.dedup();
+
+        // Same as push: stop the workspace's chat sessions before copying
+        // it back, so none keeps editing the host copy and the next send
+        // starts each one on this computer once this succeeds.
+        crate::commands::agent_chat::stop_workspace_chat_sessions(&app, &workspace_id).await;
 
         // Try each candidate; only a "remote path missing" outcome is
         // worth retrying the next one — success / rsync error / host

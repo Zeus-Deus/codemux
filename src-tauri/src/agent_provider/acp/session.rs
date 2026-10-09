@@ -23,8 +23,9 @@ use crate::json_rpc_child::{
 };
 
 use super::protocol::{
-    config_id_for, config_options, current_model_id, grok_auth_method, grok_model_effort_catalog,
-    initialize_params, looks_unauthenticated, option_by_id, resolve_boolean_value,
+    config_id_for, config_options, current_model_id, grok_auth_method,
+    grok_auth_reads_ambient_api_key, grok_model_effort_catalog, initialize_params,
+    local_xai_api_key_set, looks_unauthenticated, option_by_id, resolve_boolean_value,
     resolve_effort_value, resolve_select_value, session_id, set_config_params, set_model_params,
     ConfigKind, GrokModelEffortCatalog,
 };
@@ -410,12 +411,38 @@ impl AcpSession {
                 .await;
             let auth_method = match dialect {
                 AcpDialect::Cursor => "cursor_login".to_string(),
-                // This computer's XAI_API_KEY says nothing about a device.
-                AcpDialect::Grok => grok_auth_method(&initialized, &child_env, remote.is_none())
-                    .ok_or_else(|| ProviderError::NotAuthenticated {
-                        provider: ProviderKind::Grok,
-                        hint: auth_hint(dialect, device),
-                    })?,
+                AcpDialect::Grok => {
+                    // Older CLIs pick API-key auth only when the agent's own
+                    // environment has the key. This computer's says nothing
+                    // about a device, so ask the device (its answer, never
+                    // the value), and only when it can change the method.
+                    let ambient_api_key =
+                        grok_auth_reads_ambient_api_key(&initialized, &child_env)
+                            && match remote.as_ref() {
+                                None => local_xai_api_key_set(),
+                                #[cfg(unix)]
+                                Some(remote) => crate::ssh::exec::remote_env_var_set(
+                                    &remote.ssh_target,
+                                    "XAI_API_KEY",
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                    eprintln!(
+                                        "[codemux::acp] couldn't check {} for XAI_API_KEY: {error}",
+                                        remote.host_name
+                                    );
+                                    false
+                                }),
+                                #[cfg(not(unix))]
+                                Some(_) => false,
+                            };
+                    grok_auth_method(&initialized, &child_env, ambient_api_key).ok_or_else(
+                        || ProviderError::NotAuthenticated {
+                            provider: ProviderKind::Grok,
+                            hint: auth_hint(dialect, device),
+                        },
+                    )?
+                }
             };
             let auth_params = if dialect.is_grok() {
                 json!({ "methodId": auth_method, "_meta": { "headless": true } })

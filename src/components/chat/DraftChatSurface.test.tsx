@@ -63,6 +63,8 @@ vi.mock("@/tauri/commands", () => ({
   listMcpServers: vi.fn().mockResolvedValue([]),
   MCP_STATUS_CHANGED_EVENT: "mcp-status-changed",
   MCP_CODEMUX_SELF_ID: "codemux-self",
+  // The device list; tests that drive a reload override it.
+  hostsList: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/lib/agent-chat/materialize", () => ({
@@ -206,7 +208,7 @@ import { DraftChatSurface } from "./DraftChatSurface";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { toast } from "@/lib/toast";
-import { agentChatGetSessionContext, listSkills, listChatSlashCommands, type Skill } from "@/tauri/commands";
+import { agentChatGetSessionContext, hostsList, type HostView, listSkills, listChatSlashCommands, type Skill } from "@/tauri/commands";
 import { useSkillsStore } from "@/stores/skills-store";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -1609,6 +1611,39 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 9 });
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].hostId).toBe(9);
+    });
+
+    it("keeps the device while a retry after a failed load is in flight", async () => {
+      useHostsStore.setState({ hosts: [], loaded: true, error: "db down" });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 9 });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      let finishRetry: (hosts: HostView[]) => void = () => {};
+      vi.mocked(hostsList).mockImplementationOnce(
+        () => new Promise((resolve) => (finishRetry = resolve)),
+      );
+      renderSurface();
+
+      // The retry clears the error but still holds the failed load's
+      // empty list.
+      let retry: Promise<void> = Promise.resolve();
+      act(() => {
+        retry = useHostsStore.getState().refresh();
+      });
+      expect(useHostsStore.getState()).toMatchObject({
+        hosts: [],
+        loading: true,
+        error: null,
+      });
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].hostId).toBe(9);
+
+      await act(async () => {
+        finishRetry([host(9, "zeus")]);
+        await retry;
+      });
       expect(useChatDraftStore.getState().draftsById[draft.draftId].hostId).toBe(9);
     });
   });

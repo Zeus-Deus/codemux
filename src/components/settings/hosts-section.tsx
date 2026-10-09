@@ -524,13 +524,16 @@ function AddDeviceForm({
   }, []);
 
   const sshTarget = target.trim();
+  // Targets are compared exactly: the SSH user is a case-sensitive account
+  // name and a config alias is matched as written, so `Alice@server` is a
+  // different device from `alice@server`. Only the chip search ignores case.
   const query = sshTarget.toLowerCase();
-  const taken = new Set(hosts.map((h) => h.ssh_target.toLowerCase()));
+  const taken = new Set(hosts.map((h) => h.ssh_target.trim()));
   const matches = suggestions
-    .filter((s) => {
-      const lower = s.toLowerCase();
-      return !taken.has(lower) && lower !== query && lower.includes(query);
-    })
+    .filter(
+      (s) =>
+        !taken.has(s) && s !== sshTarget && s.toLowerCase().includes(query),
+    )
     .slice(0, 8);
 
   const connect = async () => {
@@ -553,8 +556,8 @@ function AddDeviceForm({
       mark("save", "running");
       // A device already saved for this target (say, from an attempt the
       // dialog was closed on) continues setup instead of being added twice.
-      // Same case-insensitive match the suggestion chips use.
-      const existing = hosts.find((h) => h.ssh_target.toLowerCase() === query);
+      // Same exact match the suggestion chips use.
+      const existing = hosts.find((h) => h.ssh_target.trim() === sshTarget);
       let host: HostView;
       if (existing) {
         // Its name only changes when one is typed.
