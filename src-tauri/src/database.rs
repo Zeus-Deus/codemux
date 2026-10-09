@@ -1,4 +1,5 @@
 pub mod async_questions;
+pub mod delegated_tasks;
 pub mod hermes;
 pub(crate) mod local_sessions;
 
@@ -8,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -1108,6 +1109,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     }
 
     async_questions::create_schema(conn)?;
+    delegated_tasks::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

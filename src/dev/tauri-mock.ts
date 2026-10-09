@@ -36,6 +36,17 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { addonMockHandlers } from "./addon-mock";
+import {
+  delegationScenarioFromSearch,
+  mockDelegatedChild,
+  mockDelegatedChildParent,
+  mockDelegatedChildTranscript,
+  stopMockDelegatedChild,
+  stopMockDelegationParent,
+  streamDelegatedTask,
+  type DelegatedTaskOptions,
+  type MockDelegatedChild,
+} from "./delegation-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
@@ -145,6 +156,28 @@ let appState: AppStateSnapshot = createSeedAppState();
 const sessionImportFixture = new URLSearchParams(window.location.search).get("fixture") === "session-import";
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
+}
+// `?mockScenario=delegation…`: the seeded chat starts empty, as a Claude chat
+// in Full access, and plays the delegation flow once its channel attaches.
+const delegationScenario = delegationScenarioFromSearch(window.location.search);
+let delegationScenarioStarted = false;
+if (delegationScenario) {
+  const asClaude = (node: PaneNodeSnapshot): PaneNodeSnapshot =>
+    node.kind === "split"
+      ? { ...node, children: node.children.map(asClaude) }
+      : node.kind === "agent_chat" && node.thread_id === MOCK_CHAT_THREAD_ID
+        ? { ...node, provider: "claude" }
+        : node;
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((workspace) => ({
+      ...workspace,
+      surfaces: workspace.surfaces.map((surface) => ({
+        ...surface,
+        root: asClaude(surface.root),
+      })),
+    })),
+  };
 }
 const mockLocalSessions: LocalChatSession[] = [
   { source_id: "claude:synthetic-parser", provider: "claude", title: "Fix the parser edge case", cwd: "/demo/parser", last_active_at: "2026-09-29T10:00:00Z", message_count: 2, already_imported: false },
@@ -1042,7 +1075,8 @@ const FEATURE_FLAGS: FeatureFlags = {
 
 const SYNCED_SETTINGS: UserSettings = {
   appearance: {
-    theme: "system",
+    // `?mockTheme=graphite-light` (any theme id) for light-scheme screenshots.
+    theme: new URLSearchParams(location.search).get("mockTheme") ?? "system",
     shell_font: null,
     typography_mode: "simple",
     interface_font_family: null,
@@ -1517,6 +1551,9 @@ const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 function mockThreadPayloads(threadId: string): string[] {
   const imported = mockImportedPayloads.get(threadId);
   if (imported) return imported;
+  const delegated = mockDelegatedChildTranscript(threadId);
+  if (delegated) return delegated;
+  if (delegationScenario && threadId === MOCK_CHAT_THREAD_ID) return [];
   // Under a stress fixture the generated threads AND the seeded thread serve
   // the synthetic transcript — hydration cost is one of the things being
   // measured, and the curated 520-turn showcase is not that profile.
@@ -2863,6 +2900,95 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   });
 }
 
+/** The chat in the active workspace's focused pane, else the seeded one. */
+function activeMockChatThreadId(): string {
+  const workspace = findWorkspace(appState.active_workspace_id);
+  const surface = workspace?.surfaces.find(
+    (candidate) => candidate.surface_id === workspace.active_surface_id,
+  );
+  const pane = surface
+    ? leafPaneNodes(surface.root).find((node) => node.pane_id === surface.active_pane_id)
+    : undefined;
+  return (pane?.kind === "agent_chat" && pane.thread_id) || MOCK_CHAT_THREAD_ID;
+}
+
+let mockDelegatedTabSeq = 0;
+
+/** Mirror of the backend's `create_background_chat_tab`: the child's chat
+ *  tab lands after the parent's tab and its earlier delegated children,
+ *  and focus stays where it was. */
+function openMockDelegatedTab(parentThreadId: string, child: MockDelegatedChild): void {
+  if (findChatPaneLocation(child.threadId)) return;
+  const location = findChatPaneLocation(parentThreadId);
+  if (!location) return;
+  const { workspace, surface: parentSurface } = location;
+  const n = ++mockDelegatedTabSeq;
+  const title = `${child.label} · ${child.title}`;
+  const parentRoot = parentSurface.root;
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: `pane-delegated-${n}`,
+    title,
+    thread_id: child.threadId,
+    provider: child.provider,
+    cwd: parentRoot.kind === "agent_chat" ? parentRoot.cwd : null,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: `surface-delegated-${n}`,
+    title,
+    root: pane,
+    active_pane_id: pane.pane_id,
+  };
+  const tab: TabSnapshot = {
+    tab_id: `tab-delegated-${n}`,
+    kind: "terminal",
+    title,
+    surface_id: surface.surface_id,
+    browser_id: null,
+    icon: null,
+  };
+  const tabs = [...workspace.tabs];
+  const parentIndex = tabs.findIndex(
+    (candidate) => candidate.surface_id === parentSurface.surface_id,
+  );
+  // After the parent's earlier children too, so tabs read in the order the
+  // tasks were handed off, like the card.
+  const isSiblingTab = (candidate: TabSnapshot) => {
+    const root = workspace.surfaces.find(
+      (s) => s.surface_id === candidate.surface_id,
+    )?.root;
+    return (
+      root?.kind === "agent_chat" &&
+      root.thread_id != null &&
+      mockDelegatedChildParent(root.thread_id) === parentThreadId
+    );
+  };
+  let at = parentIndex + 1;
+  while (at < tabs.length && isSiblingTab(tabs[at])) at += 1;
+  tabs.splice(at, 0, tab);
+  const next = { ...workspace, tabs, surfaces: [...workspace.surfaces, surface] };
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((candidate) =>
+      candidate === workspace ? next : candidate,
+    ),
+  };
+  emitAppState();
+}
+
+/** Script the cross-provider delegation flow (see `delegation-mock.ts`) on
+ *  the active chat, or on `threadId` when given. */
+function streamMockDelegatedTask(
+  opts: DelegatedTaskOptions = {},
+  threadId: string = activeMockChatThreadId(),
+) {
+  return streamDelegatedTask(
+    { emit: emitChatEvent, openChildTab: openMockDelegatedTab },
+    threadId,
+    opts,
+  );
+}
+
 // Expose the stream triggers for browser-console / automation use.
 (
   window as unknown as {
@@ -2870,6 +2996,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       threadId: string;
       streamReply: typeof streamMockChatReply;
       streamSubagents: typeof streamMockSubagents;
+      streamDelegatedTask: typeof streamMockDelegatedTask;
       streamBackgroundWait: typeof streamMockBackgroundWait;
       streamWorkLog: typeof streamMockWorkLog;
       streamRunStalled: typeof streamMockRunStalled;
@@ -2882,6 +3009,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   threadId: MOCK_CHAT_THREAD_ID,
   streamReply: streamMockChatReply,
   streamSubagents: streamMockSubagents,
+  streamDelegatedTask: streamMockDelegatedTask,
   streamBackgroundWait: streamMockBackgroundWait,
   streamWorkLog: streamMockWorkLog,
   streamRunStalled: streamMockRunStalled,
@@ -4274,6 +4402,26 @@ const handlers: Record<string, Handler> = {
   agent_chat_get_session: (a) => {
     const threadId = a.threadId as string;
     if (mockImportedRecords.has(threadId)) return mockImportedRecords.get(threadId);
+    // A delegated child's row holds what the backend wrote at hand-off:
+    // the requested model and effort, the task title, full access.
+    const delegated = mockDelegatedChild(threadId);
+    if (delegated || (delegationScenario && threadId === MOCK_CHAT_THREAD_ID)) {
+      const provider = delegated?.provider ?? "claude";
+      return {
+        thread_id: threadId,
+        sdk_session_id: `sdk-${threadId}`,
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider,
+        title: delegated?.title ?? "agent-chat-demo",
+        created_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        model: delegated ? delegated.model : "claude-opus-4-8",
+        effort: delegated?.effort ?? null,
+        context_window: null,
+        permission_mode: provider === "codex" ? "danger-full-access" : "bypassPermissions",
+      };
+    }
     if (threadId === MOCK_CHAT_THREAD_ID) {
       return {
         thread_id: MOCK_CHAT_THREAD_ID,
@@ -4515,6 +4663,11 @@ const handlers: Record<string, Handler> = {
   },
   agent_chat_interrupt_turn: (a) => {
     const { threadId } = a as { threadId: string };
+    // Before touching the provider, the backend reads the interrupt as
+    // "stop this task quietly" on a delegated child, and as "stop every
+    // running task, report nothing" on its parent.
+    if (stopMockDelegatedChild(threadId)) return true;
+    stopMockDelegationParent(threadId);
     return interruptMockChatTurn(threadId);
   },
   // The composer strip's monitoring Stop. Mirrors the real backend closely
@@ -4672,6 +4825,18 @@ const handlers: Record<string, Handler> = {
     });
     seedPendingAskQuestion(threadId);
     seedAsyncQuestion(threadId);
+    if (
+      delegationScenario &&
+      !delegationScenarioStarted &&
+      threadId === MOCK_CHAT_THREAD_ID
+    ) {
+      delegationScenarioStarted = true;
+      // Past the empty hydrate, so the first event lands on a mounted pane.
+      window.setTimeout(
+        () => streamMockDelegatedTask(delegationScenario, threadId),
+        400,
+      );
+    }
     return generation;
   },
   detach_agent_chat_output: (a) => {

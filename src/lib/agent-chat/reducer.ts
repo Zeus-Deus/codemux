@@ -8,6 +8,7 @@ import type {
   WorkflowSnapshot,
 } from "@/tauri/events";
 
+import { isDelegatedId, isDelegatedRow } from "./delegation";
 import { runtimeNoticeFromWarning } from "./runtime-notice";
 import {
   appendTranscriptItem,
@@ -586,6 +587,10 @@ function capSubagentItems(items: ChatViewItem[]): ChatViewItem[] {
  * trailing `subagent_run` card when it is the transcript tail (one card
  * per contiguous spawn group per turn); otherwise a fresh card is opened.
  * Returns the (possibly new) messages array plus the card / sub indices.
+ *
+ * Cross-provider delegations and native subagents never share a card: a
+ * delegation renders as its own transcript card while native runs fold
+ * into the work log, so a card is always all one or all the other.
  */
 function locateOrCreateSubagent(
   state: ChatThreadState,
@@ -618,7 +623,12 @@ function locateOrCreateSubagent(
   const tailIndex = sealed.length - 1;
   const tail = sealed[tailIndex];
   const view = newSubagentView(subagentId, now());
-  if (tail && tail.kind === "subagent_run") {
+  const delegated = isDelegatedId(subagentId);
+  if (
+    tail &&
+    tail.kind === "subagent_run" &&
+    tail.subagents.every((sub) => isDelegatedRow(sub) === delegated)
+  ) {
     const nextCard: SubagentRunItem = {
       ...tail,
       subagents: [...tail.subagents, view],
@@ -1005,7 +1015,14 @@ function hasLiveDelegatedWork(messages: ChatViewItem[]): boolean {
     }
     if (item.kind !== "subagent_run") continue;
     for (const sub of item.subagents) {
-      if (isRunning(sub) && !sub.backgroundTask && !isMonitorTask(sub)) {
+      // A cross-provider delegation reports back in a later turn of its
+      // own, so the parent's turn settles normally around it.
+      if (
+        isRunning(sub) &&
+        !sub.backgroundTask &&
+        !isMonitorTask(sub) &&
+        !isDelegatedRow(sub)
+      ) {
         return true;
       }
     }

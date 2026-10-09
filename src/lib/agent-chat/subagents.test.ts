@@ -996,6 +996,19 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
     expect(waves.map((w) => w.prompt)).toEqual(["Fix the flaky test"]);
   });
 
+  it("names the delegated-results turn instead of leaking its raw prompt", () => {
+    const waves = subagentWaves([
+      user("u1", 0, "have codex implement it, then review it"),
+      card("c1", 1, [sub("delegate:t1")]),
+      user("u2", 2, "[Codemux: delegated task results]\n<task id=\"t1\">"),
+      card("c2", 3, [sub("delegate:t2")]),
+    ]);
+    expect(subagentHistoryGroups(waves).map((g) => [g.promptId, g.prompt])).toEqual([
+      ["u2", "Delegated results"],
+      ["u1", "have codex implement it, then review it"],
+    ]);
+  });
+
   it("walks the transcript in seq order, not array order", () => {
     const waves = subagentWaves([
       card("c1", 1, [sub("a")]),

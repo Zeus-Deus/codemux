@@ -59,6 +59,10 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // before it waits for the user); the composer strip always offers a
   // manual Resume either way.
   "agents.auto_resume_usage_limit": "true",
+  // Whether Full-access Claude and Codex chats get the `delegate_task`
+  // tool, which hands a task to another installed agent in a tab beside the
+  // chat. Read by the backend when it lists and runs the tool.
+  "agents.cross_provider_delegation": "true",
 };
 
 /** Color palette variant. */
@@ -180,6 +184,12 @@ export const selectChatCodeWrap = (s: SettingsStore): boolean =>
 export const selectAutoResumeUsageLimit = (s: SettingsStore): boolean =>
   (s.settings["agents.auto_resume_usage_limit"] ??
     SETTINGS_DEFAULTS["agents.auto_resume_usage_limit"]!) !== "false";
+
+/** Whether chats may delegate tasks to other installed agents. Default
+ *  on; it only acts when the user asks for another agent. */
+export const selectCrossProviderDelegation = (s: SettingsStore): boolean =>
+  (s.settings["agents.cross_provider_delegation"] ??
+    SETTINGS_DEFAULTS["agents.cross_provider_delegation"]!) !== "false";
 
 /** Whether agent orbs follow the current activity. Default on; off pins
  *  every orb to the neutral working state. */

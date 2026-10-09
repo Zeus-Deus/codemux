@@ -939,10 +939,11 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // finish later only become visible to the agent on the next
     // session start (Stage 4 polish will wire `setMcpServers` for
     // dynamic registration).
-    {
-        use crate::mcp::registry::McpRegistry;
+    //
+    // Skipped when no registry is managed (headless tests): priming spawns
+    // the `codemux mcp` child from the current executable.
+    if let Some(mcp_registry) = app.try_state::<crate::mcp::registry::McpRegistry>() {
         use std::time::Duration;
-        let mcp_registry: State<'_, McpRegistry> = app.state();
         let registry = mcp_registry.inner().clone_handle();
         let project_path = input.cwd.clone();
         const MCP_PRIME_BUDGET: Duration = Duration::from_secs(8);
@@ -1021,7 +1022,9 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // An explicit rebind (provider handoff / New Chat on a live pane) leaves
     // the previous thread's CLI child running with no pane pointing at it.
     // Callers already stop it themselves and `stop_session` is idempotent,
-    // so this is a best-effort backstop against an orphaned process.
+    // so this is a best-effort backstop against an orphaned process. It is
+    // also what closes the old thread's delegated tasks: a chat that left its
+    // pane can no longer receive their reports.
     if let (Some(previous_provider), Some(previous_thread)) = claim.previous.clone() {
         if previous_thread != session.thread_id.0 {
             shutdown_agent_chat_threads(&app, vec![(previous_provider, previous_thread)]);
@@ -1909,7 +1912,7 @@ impl HermesSendGate {
 /// duplicated here as a cheap `&'static str` rather than building the full
 /// capabilities bundle (which allocates the model list) just to read one
 /// field. OpenCode has no permission modes, so it stays `None`.
-fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
+pub(super) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
@@ -1940,7 +1943,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
 /// user explicitly picked a mode). OpenCode's fallback is `None`, so a
 /// `None` request stays `None` — it has no permission modes and there is
 /// nothing to heal.
-fn resolve_start_permission_mode(
+pub(super) fn resolve_start_permission_mode(
     provider: ProviderKind,
     requested: Option<String>,
 ) -> Option<String> {
@@ -2386,6 +2389,10 @@ pub enum TurnOrigin {
     /// NOT count as user activity, or the scheduler's own dispatch would
     /// reset the attempt cap it is bounded by.
     UsageResume,
+    /// Cross-provider delegation: a delegated child's task, or a parent's
+    /// round of results. Not user activity either — it must not start a new
+    /// delegation round or forget a pending usage resume.
+    Delegation,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
@@ -2409,9 +2416,12 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if origin == TurnOrigin::User {
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
+        // A user message starts a new delegation round for this chat.
+        super::delegation::on_user_turn(&app, &input.thread_id.0);
     }
-    // Resume callers already hold this lock. User sends disarm immediately,
-    // then wait for any already-claimed resume to finish dispatching.
+    // Resume and delegation callers already hold this lock. User sends
+    // disarm immediately, then wait for any already-claimed resume to finish
+    // dispatching.
     let _activity_guard = if origin == TurnOrigin::User {
         Some(
             super::usage_resume::activity_lock(&input.thread_id.0)
@@ -3518,6 +3528,9 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 ) -> Result<bool, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Before the lock: a delegated child's starter holds it while it starts,
+    // and the task must read Stopped at once rather than after the start.
+    super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
@@ -3736,7 +3749,10 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
         .respond_to_request(thread_id.clone(), request_id.clone(), decision)
         .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            super::delegation::on_request_answered(&app, &thread_id.0, &request_id.0);
+            Ok(())
+        }
         // A provider can lose the callback between the liveness check and
         // the response, or a recovered external session may no longer know
         // the request. Persist one terminal failure so remount/hydration
@@ -4181,6 +4197,10 @@ pub async fn agent_chat_stop_session<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // A restart in place: a delegated child's task stops quietly, a
+    // parent's tasks keep running (New Chat / history pick rebinds the
+    // pane afterwards, and that rebind is what stops them).
+    super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Restart);
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
@@ -4229,6 +4249,7 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     for (_, thread_id) in &threads {
         tracker.clear_thread(thread_id);
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
+        super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Close);
     }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -5754,16 +5775,28 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // and PaneNode borders reflect chat agents exactly like terminal
     // agents (whose status flows in through hooks.rs). This is the whole
     // reason chat workspaces previously showed no status dot.
-    let tracker: State<'_, SubagentTracker> = app.state();
-    publish_pane_status(app, &tracker, &event);
+    //
+    // A delegated task's card is the exception: it reports another chat's
+    // work, so it must not hold this pane's status, settle its turn or count
+    // as liveness for the stall watchdog.
+    let delegated_card = matches!(
+        &event,
+        ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if super::delegation::is_delegated_row(&subagent.subagent_id)
+    );
+    if !delegated_card {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        publish_pane_status(app, &tracker, &event);
 
-    // Record last-activity for the stall watchdog. Keyed on the event's
-    // thread; thread-less events (global warnings) and the transient
-    // `RunStalled` itself are no-ops inside the tracker.
-    if let Some(activity_thread) = thread_id_for_event(&event) {
-        let activity: State<'_, RunActivityTracker> = app.state();
-        activity.record(&activity_thread.0, &event, SystemTime::now());
+        // Record last-activity for the stall watchdog. Keyed on the event's
+        // thread; thread-less events (global warnings) and the transient
+        // `RunStalled` itself are no-ops inside the tracker.
+        if let Some(activity_thread) = thread_id_for_event(&event) {
+            let activity: State<'_, RunActivityTracker> = app.state();
+            activity.record(&activity_thread.0, &event, SystemTime::now());
+        }
     }
+    super::delegation::observe(app, &event, persisted_id);
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
@@ -7075,7 +7108,8 @@ impl RunActivityTracker {
 
     /// Snapshot the threads that have been mid-turn and silent for at
     /// least `threshold`, with how long (seconds) each has been silent.
-    fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
+    /// Public so integration tests can see which threads would stall.
+    pub fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
         let threads = self.threads.lock().expect("activity tracker poisoned");
         threads
             .iter()

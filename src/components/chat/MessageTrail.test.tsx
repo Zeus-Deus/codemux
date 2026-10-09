@@ -3,6 +3,7 @@ import type * as React from "react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
+import { DELEGATION_RESULTS_PREFIX } from "@/lib/agent-chat/delegation";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import type { LegendListRef } from "@legendapp/list/react";
 
@@ -131,6 +132,18 @@ describe("MessageTrail", () => {
     fireEvent.mouseEnter(button);
     expect(screen.getByText("Question number 2 about the transcript")).toBeInTheDocument();
     expect(screen.getByText("Reply to question 2")).toBeInTheDocument();
+  });
+
+  it("lists the delegated results turn as 'Delegated results', not its raw text", () => {
+    renderTrail([
+      ...turns(2),
+      userMsg(4, `${DELEGATION_RESULTS_PREFIX}\nCodemux posted this message, not the user.`),
+      assistantMsg(5, "Codex finished."),
+    ]);
+    const button = screen.getByRole("button", { name: "Jump to turn 3: Delegated results" });
+    fireEvent.mouseEnter(button);
+    expect(screen.getByText("Delegated results")).toBeInTheDocument();
+    expect(screen.queryByText(/Codemux posted this message/)).toBeNull();
   });
 
   it("immediately expands the hovered tick and its nearest neighbors", () => {

@@ -433,6 +433,10 @@ fn build_core_app<R: tauri::Runtime>(
         // forward_event → publish_pane_status. See agent_chat.rs.
         .manage(commands::agent_chat::SubagentTracker::default())
         .manage(commands::agent_chat::RunActivityTracker::default())
+        // Cross-provider delegation's in-memory task map. Managed here, not
+        // in the gated setup task, so its forward_event / stop hooks can
+        // always `try_state` it and return at once.
+        .manage(commands::delegation::DelegationState::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -1136,6 +1140,15 @@ fn build_core_app<R: tauri::Runtime>(
                             registry_handle.state();
                         let mcp_registry = mcp_registry.inner().clone();
 
+                        // Delegated tasks the last run left open become
+                        // Stopped, and their children's usage resumes are
+                        // cancelled — before the resume scheduler's first
+                        // tick below can restart any of them.
+                        commands::delegation::drain_journal(&registry_handle);
+                        mcp_registry.set_host_tools(std::sync::Arc::new(
+                            commands::delegation::DelegationHost::new(registry_handle.clone()),
+                        ));
+
                         let mut claude_config =
                             agent_provider::claude::ClaudeProviderConfig::default();
                         claude_config.mcp_registry = Some(mcp_registry.clone());
@@ -1251,6 +1264,9 @@ fn build_core_app<R: tauri::Runtime>(
                             registry_handle.clone(),
                         )
                         .await;
+                        // Delegation backstop: finalizes children whose turn
+                        // end was lost and retries due result deliveries.
+                        commands::delegation::spawn_sweep(registry_handle.clone());
                     });
                 }
             }

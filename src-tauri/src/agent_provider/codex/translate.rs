@@ -647,6 +647,7 @@ fn subagent_snapshot(subagent_id: &str, status: SubagentStatus) -> SubagentSnaps
         // `None` reads as ordinary agent work everywhere downstream.
         task_kind: None,
         model: None,
+        effort: None,
         status,
         activity: None,
         result_text: None,

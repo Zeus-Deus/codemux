@@ -239,6 +239,10 @@ pub(crate) struct CodexSession {
     /// session's workspace — the registry's shared MCP child cannot
     /// learn the caller from its env.
     workspace_id: Option<String>,
+    /// This session as a host-tool caller. Its permission mode is the one
+    /// the session started with: Codex cannot change mode mid-session, and
+    /// the host tools it lists are fixed at `thread/start`.
+    host_caller: crate::mcp::registry::HostCaller,
 }
 
 impl CodexSession {
@@ -326,12 +330,20 @@ impl CodexSession {
                 message: format!("initialized notification failed: {e}"),
             })?;
 
+        let host_caller = crate::mcp::registry::HostCaller {
+            thread_id: thread_id.0.clone(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: workspace_id.clone(),
+            permission_mode: permission_mode.clone(),
+        };
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
+        // Host tools are decided here too, from the mode the session starts
+        // in, so a Codex chat only ever lists what it could actually use.
         let dynamic_tools = match spawn.mcp_registry.as_ref() {
             Some(registry) => {
-                let tools = if spawn.codex_home.is_none() {
+                let mut tools = if spawn.codex_home.is_none() {
                     registry
                         .list_all_tools_excluding_source(
                             crate::mcp::McpConfigSource::CodexUser,
@@ -340,6 +352,7 @@ impl CodexSession {
                 } else {
                     registry.list_all_tools().await
                 };
+                tools.extend(registry.host_tools(&host_caller));
                 Some(
                     tools
                         .into_iter()
@@ -547,6 +560,7 @@ impl CodexSession {
             dead: Arc::new(AtomicBool::new(false)),
             recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
             workspace_id,
+            host_caller,
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -1677,6 +1691,7 @@ fn spawn_incoming_requests_task(
                         let result = handle_dynamic_tool_call(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
+                            Some(&session.host_caller),
                             params,
                         )
                         .await;
@@ -1707,33 +1722,40 @@ fn spawn_incoming_requests_task(
 async fn handle_dynamic_tool_call(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
+    host_caller: Option<&crate::mcp::registry::HostCaller>,
     raw: Value,
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
-    let (success, result) = match (registry, parsed) {
-        (Some(registry), Ok(call)) => match registry
-            .dispatch_tool_call(&registry_tool_name(&call.tool), call.arguments, workspace_id)
-            .await
-        {
-            Ok(result) => {
-                let success = !result
-                    .get("isError")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                (success, result)
+    let dispatched = match (registry, parsed) {
+        (Some(registry), Ok(call)) => {
+            let name = registry_tool_name(&call.tool);
+            // Host tools answer synchronously (no provider waits), which
+            // matters here: this request loop handles approvals too.
+            let host =
+                host_caller.and_then(|caller| registry.host_call(caller, &name, &call.arguments));
+            match host {
+                Some(result) => Ok(result),
+                None => {
+                    registry
+                        .dispatch_tool_call(&name, call.arguments, workspace_id)
+                        .await
+                }
             }
-            Err(message) => (
-                false,
-                json!({ "content": [{ "type": "text", "text": message }] }),
-            ),
-        },
-        (None, _) => (
+        }
+        (None, _) => Err("Codemux MCP registry is unavailable".to_string()),
+        (_, Err(error)) => Err(format!("invalid dynamic tool call: {error}")),
+    };
+    let (success, result) = match dispatched {
+        Ok(result) => {
+            let success = !result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (success, result)
+        }
+        Err(message) => (
             false,
-            json!({ "content": [{ "type": "text", "text": "Codemux MCP registry is unavailable" }] }),
-        ),
-        (_, Err(error)) => (
-            false,
-            json!({ "content": [{ "type": "text", "text": format!("invalid dynamic tool call: {error}") }] }),
+            json!({ "content": [{ "type": "text", "text": message }] }),
         ),
     };
 
@@ -2086,6 +2108,7 @@ mod tests {
         let response = handle_dynamic_tool_call(
             Some(&registry),
             Some("ws-42"),
+            None,
             json!({
                 "threadId": "thread",
                 "turnId": "turn",
@@ -2104,6 +2127,7 @@ mod tests {
     #[tokio::test]
     async fn dynamic_tool_call_without_registry_returns_failed_response() {
         let response = handle_dynamic_tool_call(
+            None,
             None,
             None,
             json!({

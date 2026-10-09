@@ -56,6 +56,10 @@ fn publish<R: Runtime>(
         resolution: resolution.clone(),
     };
     publish_attention(app);
+    // Resolutions reach clients here, not through `forward_event`, so tell
+    // delegation directly: a delegated child waiting on this question is
+    // working again (or done) once it is answered or dismissed.
+    super::delegation::observe(app, &event, Some(row_id));
     fan_out_to_thread_channels(
         app,
         thread_id,

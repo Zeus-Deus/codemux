@@ -338,7 +338,16 @@ impl ClaudeSession {
             // server. Tools added after session start aren't visible
             // until the chat is restarted (Stage 4 polish will add a
             // `setMcpServers` push path so dynamic refreshes work).
-            mcp_tools: collect_mcp_tools(spawn.mcp_registry.as_ref()).await,
+            mcp_tools: collect_mcp_tools(
+                spawn.mcp_registry.as_ref(),
+                &crate::mcp::registry::HostCaller {
+                    thread_id: thread_id.0.clone(),
+                    provider: crate::agent_provider::ProviderKind::Claude,
+                    workspace_id: input.workspace_id.clone(),
+                    permission_mode: input.permission_mode.clone(),
+                },
+            )
+            .await,
         };
         let params_value = serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
             message: "failed to serialize start-session params".into(),
@@ -765,6 +774,16 @@ impl ClaudeSession {
             },
         });
         Ok(turn_id)
+    }
+
+    /// This session as a host-tool caller, with its current permission mode.
+    async fn host_caller(&self) -> crate::mcp::registry::HostCaller {
+        crate::mcp::registry::HostCaller {
+            thread_id: self.thread_id.0.clone(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: self.workspace_id.clone(),
+            permission_mode: self.state.lock().await.permission_mode.clone(),
+        }
     }
 
     /// Whether the child-exit watchdog has declared this session's sidecar
@@ -1294,7 +1313,8 @@ async fn push_mcp_refresh(
     session: &Arc<ClaudeSession>,
     registry: &crate::mcp::registry::McpRegistry,
 ) {
-    let tools = collect_shared_tools_for_claude(registry).await;
+    let caller = session.host_caller().await;
+    let tools = collect_shared_tools_for_claude(registry, &caller).await;
     let entries: Vec<super::protocol::McpToolEntry> = tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1336,11 +1356,12 @@ async fn push_mcp_refresh(
 /// just doesn't register the in-process MCP server.
 async fn collect_mcp_tools(
     registry: Option<&crate::mcp::registry::McpRegistry>,
+    caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<super::protocol::McpToolEntry> {
     let Some(registry) = registry else {
         return Vec::new();
     };
-    let tools = collect_shared_tools_for_claude(registry).await;
+    let tools = collect_shared_tools_for_claude(registry, caller).await;
     tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1353,16 +1374,22 @@ async fn collect_mcp_tools(
         .collect()
 }
 
+/// The single choke point for the tools a Claude session sees, at start and
+/// on every live refresh: the shared registry surface plus the host tools
+/// Codemux serves to this particular chat.
 async fn collect_shared_tools_for_claude(
     registry: &crate::mcp::registry::McpRegistry,
+    caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<crate::mcp::runtime::McpTool> {
-    registry
+    let mut tools = registry
         .list_all_tools_excluding_sources(&[
             crate::mcp::McpConfigSource::ClaudeUser,
             crate::mcp::McpConfigSource::ClaudeLocal,
             crate::mcp::McpConfigSource::ClaudeProject,
         ])
-        .await
+        .await;
+    tools.extend(registry.host_tools(caller));
+    tools
 }
 
 /// Format a tool result payload the way Anthropic's MCP SDK expects:
@@ -1417,6 +1444,14 @@ async fn handle_mcp_tool_call(
             .await;
         return;
     };
+
+    // Host tools first. The caller carries the LIVE permission mode, so a
+    // Plan/Ask pill flipped after the session started is honoured.
+    let caller = session.host_caller().await;
+    if let Some(result) = registry.host_call(&caller, &prefixed_name, &arguments) {
+        let _ = session.sidecar.respond(req.id, Ok(result)).await;
+        return;
+    }
 
     match registry
         .dispatch_tool_call(&prefixed_name, arguments, session.workspace_id.as_deref())
