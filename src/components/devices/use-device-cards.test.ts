@@ -147,6 +147,22 @@ describe("describeStatus", () => {
     expect(describeStatus(status(1, { probed: false }), NOW).tone).toBe("checking");
   });
 
+  it("reads a device updating itself as updating, not as needing setup", () => {
+    expect(
+      describeStatus(
+        status(1, {
+          reachable: true,
+          last_error: "Updating Codemux on this device to v0.23.1",
+        }),
+        NOW,
+      ),
+    ).toEqual({
+      tone: "updating",
+      label: "updating…",
+      detail: "Updating Codemux on this device to v0.23.1",
+    });
+  });
+
   it("labels online, degraded, last-seen, and never-reached hosts", () => {
     expect(describeStatus(status(1, { reachable: true }), NOW)).toEqual({
       tone: "online",

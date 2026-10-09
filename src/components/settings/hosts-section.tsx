@@ -1,781 +1,805 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-  Cloud,
-  Cpu,
-  Laptop,
-  Loader2,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Server,
-  Trash2,
-  X,
   Check,
+  Loader2,
+  Minus,
+  Monitor,
+  MoreHorizontal,
+  Plus,
+  Server,
+  X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  describeStatus,
+  type DeviceTone,
+} from "@/components/devices/use-device-cards";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import {
   hostsAdd,
   hostsBootstrapInstall,
   hostsDelete,
-  hostsList,
   hostsReinstallRemote,
+  hostsSshConfigHosts,
   hostsTestConnection,
   hostsUpdate,
+  type HostStatusView,
   type HostTestResult,
   type HostView,
 } from "@/tauri/commands";
-import { useHostsStore } from "@/stores/hosts-store";
-import { Eyebrow } from "@/components/ui/eyebrow";
+import { useHosts, useHostsStore } from "@/stores/hosts-store";
+import { useHostStatusStore, useHostStatuses } from "@/stores/host-status-store";
+import { useLocalDeviceName } from "@/stores/local-device-store";
+import { useAddDeviceDialogStore } from "@/stores/add-device-dialog-store";
+import { SettingsCard, SubsectionHeader } from "./settings-primitives";
 
 /**
- * Settings → Hosts (Step 2 of cloud-push).
+ * Settings → Devices: this machine, plus every other machine Codemux can run
+ * threads on over SSH. The list and reachability come from the shared hosts
+ * and host-status stores, so this page, the composer's device picker and the
+ * sidebar always agree.
  *
- * Mirrors the shape of superset-sh's `/settings/hosts` route:
- * sidebar listing on the left grouped by Online/Offline (today
- * everything sits in Offline because SSH transport ships in 2d),
- * detail pane on the right with name + SSH target + Test connection
- * + Remove. "Add host" lives at the bottom of the sidebar.
- *
- * SSH credentials are never part of any payload. Auth happens at the
- * OS level via the user's `~/.ssh/config`, agent, and known_hosts.
- *
- * Online/offline today is a placeholder — `hostsTestConnection`
- * returns a "not implemented yet" message in 2a. The component is
- * already structured around the eventual real probe.
+ * SSH credentials are never part of any payload. Auth happens at the OS
+ * level via the user's `~/.ssh/config`, agent, and known_hosts.
  */
-/**
- * The "kind" the user picks from the chips in Add Device. Drives only
- * the placeholder hints on the form below — never stored, never sent
- * to the server. The point is to make a first-time user understand
- * that their home machine counts just as much as a paid VPS.
- */
-type DeviceKind = "home" | "always-on" | "cloud";
 
-const DEVICE_KINDS: Array<{
-  id: DeviceKind;
-  label: string;
-  icon: typeof Laptop;
-  namePlaceholder: string;
-  sshPlaceholder: string;
-  hint: string;
-}> = [
-  {
-    id: "home",
-    label: "Home desktop",
-    icon: Laptop,
-    namePlaceholder: "home-mac",
-    sshPlaceholder: "you@192.168.1.10",
-    hint: "Already SSH into it from this device? You're set — paste the same user@host string you use in your terminal.",
-  },
-  {
-    id: "always-on",
-    label: "Always-on box",
-    icon: Cpu,
-    namePlaceholder: "pi",
-    sshPlaceholder: "pi@raspberrypi.local",
-    hint: "Best for keeping work running after you close your laptop. Pi, mini-PC, NAS, anything reachable over SSH.",
-  },
-  {
-    id: "cloud",
-    label: "Cloud server",
-    icon: Cloud,
-    namePlaceholder: "vps-fra",
-    sshPlaceholder: "ubuntu@5.5.5.5",
-    hint: "Anything ssh accepts. Your keys + config in ~/.ssh/ are used as-is.",
-  },
-];
+/** A connection test run from this page, and the poller row it was taken
+ *  against. */
+interface DeviceTest {
+  result: HostTestResult;
+  observed: HostStatusView | undefined;
+}
+
+type RecordTest = (hostId: number, result: HostTestResult) => void;
+
+const STATUS_LABEL: Record<DeviceTone, string> = {
+  online: "Connected",
+  updating: "Updating…",
+  attention: "Needs setup",
+  offline: "Offline",
+  checking: "Checking…",
+};
+
+const STATUS_DOT: Record<DeviceTone, string> = {
+  online: "bg-status-open",
+  updating: "bg-status-remote motion-safe:animate-pulse",
+  attention: "bg-status-working",
+  offline: "bg-muted-foreground/60",
+  checking: "bg-muted-foreground/40",
+};
+
+function isReady(result: HostTestResult): boolean {
+  return result.ok && !result.needs_install;
+}
+
+/**
+ * How a row reads. The background poller only visits devices that have
+ * synced to the account, and a test run here is not folded into its store,
+ * so the latest test stands in until the poller reports something newer.
+ */
+function deviceStatus(
+  status: HostStatusView | undefined,
+  test: DeviceTest | undefined,
+): { tone: DeviceTone; detail: string | null } {
+  if (test && (!status?.probed || status === test.observed)) {
+    if (isReady(test.result)) return { tone: "online", detail: null };
+    return {
+      tone: test.result.needs_install ? "attention" : "offline",
+      detail: test.result.message,
+    };
+  }
+  const summary = describeStatus(status ?? null, Date.now());
+  return { tone: summary.tone, detail: summary.detail };
+}
+
+/** Re-read both device stores after a change, so every surface sees it. */
+function refreshDevices(): Promise<unknown> {
+  return Promise.all([
+    useHostsStore.getState().refresh(),
+    useHostStatusStore.getState().refresh(),
+  ]);
+}
+
+function errorMessage(err: unknown): string {
+  if (typeof err === "string") return err;
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** The name a device gets when the user leaves Name empty:
+ *  `deus@zeus.local` → `zeus`. IP addresses stay whole. */
+export function defaultDeviceName(sshTarget: string): string {
+  const trimmed = sshTarget.trim();
+  const host = trimmed.slice(trimmed.lastIndexOf("@") + 1);
+  if (/^[\d.]+$/.test(host) || host.includes(":")) return host;
+  return host.split(".")[0] || host;
+}
 
 export function HostsSection() {
-  const [hosts, setHosts] = useState<HostView[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const hosts = useHosts();
+  const loaded = useHostsStore((s) => s.loaded);
+  const loadError = useHostsStore((s) => s.error);
+  const statuses = useHostStatuses();
+  const localName = useLocalDeviceName();
+  const setAddOpen = useAddDeviceDialogStore((s) => s.setOpen);
 
-  // Add-host form draft. `null` means the form isn't open.
-  // The "kind" the user picked from the chips. Drives the placeholder
-  // hints in the form — purely cosmetic, never stored or pushed.
-  // Reset to `null` whenever the draft is closed.
-  const [draftKind, setDraftKind] = useState<DeviceKind | null>(null);
-  const [draft, setDraft] = useState<{ name: string; ssh_target: string } | null>(
-    null,
-  );
+  const [tests, setTests] = useState<Record<number, DeviceTest>>({});
+  const [busy, setBusy] = useState<Record<number, "testing" | "setup">>({});
+  const [renaming, setRenaming] = useState<HostView | null>(null);
+  const [removing, setRemoving] = useState<HostView | null>(null);
 
-  // Edit mode for an existing host's fields. Keyed by host id so we
-  // can have at most one row in edit mode at a time.
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editDraft, setEditDraft] = useState<{ name: string; ssh_target: string }>(
-    { name: "", ssh_target: "" },
-  );
-
-  // Per-host connection-test results. Cleared on host edit/delete.
-  const [testResults, setTestResults] = useState<Record<number, HostTestResult>>(
-    {},
-  );
-  const [testingId, setTestingId] = useState<number | null>(null);
-  const [installingId, setInstallingId] = useState<number | null>(null);
-  const [reinstallingId, setReinstallingId] = useState<number | null>(null);
-
-  const reload = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const fresh = await hostsList();
-      setHosts(fresh);
-      // Keep selection stable across reloads when possible.
-      if (fresh.length > 0 && selectedId === null) {
-        setSelectedId(fresh[0].id);
-      } else if (fresh.length === 0) {
-        setSelectedId(null);
-      } else if (selectedId !== null && !fresh.find((h) => h.id === selectedId)) {
-        setSelectedId(fresh[0]?.id ?? null);
-      }
-    } catch (err) {
-      setError(typeof err === "string" ? err : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [selectedId]);
-
-  useEffect(() => {
-    void reload();
-    // Intentionally not depending on `reload` — we only want this on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const recordTest = useCallback<RecordTest>((hostId, result) => {
+    const observed = useHostStatusStore.getState().statuses[hostId];
+    setTests((prev) => ({ ...prev, [hostId]: { result, observed } }));
   }, []);
 
-  const selected = useMemo(
-    () => hosts.find((h) => h.id === selectedId) ?? null,
-    [hosts, selectedId],
-  );
-
-  const handleAdd = useCallback(async () => {
-    if (!draft) return;
-    const name = draft.name.trim();
-    const sshTarget = draft.ssh_target.trim();
-    if (!name || !sshTarget) {
-      setError("Device name and SSH target are both required.");
-      return;
-    }
-    try {
-      const created = await hostsAdd(name, sshTarget);
-      setHosts((prev) => [...prev, created].sort(byNameInsensitive));
-      setSelectedId(created.id);
-      setDraft(null);
-      setError(null);
-      // Invalidate the shared store so other surfaces (DevicePicker,
-      // workspace context menu submenus) see the new host immediately
-      // without a per-component refetch.
-      void useHostsStore.getState().refresh();
-    } catch (err) {
-      setError(typeof err === "string" ? err : String(err));
-    }
-  }, [draft]);
-
-  const handleStartEdit = useCallback((host: HostView) => {
-    setEditingId(host.id);
-    setEditDraft({ name: host.name, ssh_target: host.ssh_target });
-    // Clear stale test result — the connection test was for the
-    // old target.
-    setTestResults((prev) => {
+  const setHostBusy = (hostId: number, state: "testing" | "setup" | null) =>
+    setBusy((prev) => {
       const next = { ...prev };
-      delete next[host.id];
+      if (state) next[hostId] = state;
+      else delete next[hostId];
       return next;
     });
-  }, []);
 
-  const handleSaveEdit = useCallback(async () => {
-    if (editingId === null) return;
-    const name = editDraft.name.trim();
-    const sshTarget = editDraft.ssh_target.trim();
-    if (!name || !sshTarget) {
-      setError("Device name and SSH target are both required.");
-      return;
-    }
+  const testConnection = async (host: HostView) => {
+    setHostBusy(host.id, "testing");
     try {
-      const updated = await hostsUpdate(editingId, name, sshTarget);
-      setHosts((prev) =>
-        prev.map((h) => (h.id === editingId ? updated : h)).sort(byNameInsensitive),
-      );
-      setEditingId(null);
-      setError(null);
-      void useHostsStore.getState().refresh();
+      const result = await hostsTestConnection(host.id);
+      recordTest(host.id, result);
+      if (isReady(result)) {
+        toast.success(`${host.name} is connected`);
+      } else if (result.needs_install) {
+        toast.warning(`${host.name} needs setup`, {
+          description: "Choose Set up again to install the Codemux helper.",
+        });
+      } else {
+        toast.error(`Couldn't reach ${host.name}`, { description: result.message });
+      }
     } catch (err) {
-      setError(typeof err === "string" ? err : String(err));
+      recordTest(host.id, { ok: false, message: errorMessage(err) });
+      toast.error(`Couldn't reach ${host.name}`, { description: errorMessage(err) });
+    } finally {
+      setHostBusy(host.id, null);
     }
-  }, [editingId, editDraft]);
+  };
 
-  const handleCancelEdit = useCallback(() => {
-    setEditingId(null);
-  }, []);
+  // Probe first. A missing, broken or out-of-date helper is installed over
+  // in place (the probe's uname picks the binary), which leaves the
+  // device's running terminals alone. The forced reinstall restarts its
+  // terminal daemon, so it's only the fallback: no uname to go on, or a
+  // repair of a device that already reports ready.
+  const setUpAgain = async (host: HostView) => {
+    setHostBusy(host.id, "setup");
+    try {
+      const probe = await hostsTestConnection(host.id);
+      recordTest(host.id, probe);
+      if (!probe.ok && !probe.needs_install) {
+        toast.error(`Couldn't reach ${host.name}`, { description: probe.message });
+        return;
+      }
+      const install =
+        probe.needs_install && probe.uname
+          ? await hostsBootstrapInstall(host.id, probe.uname)
+          : await hostsReinstallRemote(host.id);
+      if (!install.ok) {
+        toast.error(`Couldn't set up ${host.name}`, { description: install.message });
+        return;
+      }
+      await refreshDevices();
+      const check = await hostsTestConnection(host.id);
+      recordTest(host.id, check);
+      if (isReady(check)) {
+        toast.success(`${host.name} is ready`);
+      } else {
+        toast.error(`Couldn't set up ${host.name}`, { description: check.message });
+      }
+    } catch (err) {
+      toast.error(`Couldn't set up ${host.name}`, { description: errorMessage(err) });
+    } finally {
+      setHostBusy(host.id, null);
+    }
+  };
 
-  const handleDelete = useCallback(async (host: HostView) => {
-    const confirmed = window.confirm(
-      `Remove "${host.name}" from your devices? Your SSH config and keys are not affected.`,
-    );
-    if (!confirmed) return;
+  const rename = async (host: HostView, name: string) => {
+    await hostsUpdate(host.id, name, host.ssh_target);
+    await refreshDevices();
+  };
+
+  const remove = async (host: HostView) => {
     try {
       await hostsDelete(host.id);
-      setHosts((prev) => prev.filter((h) => h.id !== host.id));
-      setTestResults((prev) => {
+      setTests((prev) => {
         const next = { ...prev };
         delete next[host.id];
         return next;
       });
-      if (selectedId === host.id) {
-        setSelectedId(null);
-      }
-      void useHostsStore.getState().refresh();
+      await refreshDevices();
     } catch (err) {
-      setError(typeof err === "string" ? err : String(err));
+      toast.error(`Couldn't remove ${host.name}`, { description: errorMessage(err) });
     }
-  }, [selectedId]);
-
-  const handleTestConnection = useCallback(async (host: HostView) => {
-    setTestingId(host.id);
-    try {
-      const result = await hostsTestConnection(host.id);
-      setTestResults((prev) => ({ ...prev, [host.id]: result }));
-    } catch (err) {
-      setTestResults((prev) => ({
-        ...prev,
-        [host.id]: {
-          ok: false,
-          message: typeof err === "string" ? err : String(err),
-        },
-      }));
-    } finally {
-      setTestingId(null);
-    }
-  }, []);
-
-  const handleInstallRemote = useCallback(
-    async (host: HostView, uname: string) => {
-      // The "always auto-install" preference (set via the checkbox
-      // below) skips the consent prompt for power users. Stored in
-      // localStorage so it persists per-device — installing the
-      // helper is a per-device decision (different machines may
-      // have different SSH key access).
-      const autoInstall =
-        localStorage.getItem("codemux.hosts.autoInstallRemote") === "1";
-      const consented =
-        autoInstall ||
-        window.confirm(
-          `Install codemux-remote on ${host.name}?\n\n` +
-            `Codemux Remote is a small helper (~8 MB) that runs in your ` +
-            `user account on the host and lets your laptop run agents ` +
-            `there. No root access required. Source: github.com/Zeus-Deus/codemux\n\n` +
-            `Tip: enable "Always install automatically" in Settings → Hosts ` +
-            `to skip this prompt on new hosts.`,
-        );
-      if (!consented) return;
-      setInstallingId(host.id);
-      try {
-        const result = await hostsBootstrapInstall(host.id, uname);
-        // Surface the install result alongside the test result so the
-        // user sees "installed" then can press Test again to verify.
-        setTestResults((prev) => ({
-          ...prev,
-          [host.id]: {
-            ok: result.ok,
-            message: result.message,
-            needs_install: !result.ok && prev[host.id]?.needs_install,
-            uname: prev[host.id]?.uname ?? uname,
-          },
-        }));
-      } catch (err) {
-        setTestResults((prev) => ({
-          ...prev,
-          [host.id]: {
-            ok: false,
-            message: typeof err === "string" ? err : String(err),
-          },
-        }));
-      } finally {
-        setInstallingId(null);
-      }
-    },
-    [],
-  );
-
-  // Force a fresh codemux-remote onto the host and restart its daemon.
-  // The dev-workflow escape hatch (issue #24): rebuilding the agent
-  // keeps the version string the same, so the push-time version check
-  // skips the upgrade and the host keeps running the stale binary. This
-  // re-uploads the freshly built bits unconditionally, so the next push
-  // uses them — no manual scp + pkill needed. Unlike Install, this needs
-  // no prior Test connection: the backend re-probes the uname itself.
-  const handleReinstallRemote = useCallback(async (host: HostView) => {
-    setReinstallingId(host.id);
-    try {
-      const result = await hostsReinstallRemote(host.id);
-      if (result.ok) {
-        toast.success("Agent reinstalled", { description: result.message });
-      } else {
-        toast.error("Reinstall failed", { description: result.message });
-      }
-    } catch (err) {
-      toast.error("Reinstall failed", {
-        description: typeof err === "string" ? err : String(err),
-      });
-    } finally {
-      setReinstallingId(null);
-    }
-  }, []);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
-        <Loader2 className="mr-2 size-4 animate-spin" />
-        Loading hosts…
-      </div>
-    );
-  }
+  };
 
   return (
-    <div className="flex h-full min-h-[420px] gap-6">
-      {/* Sidebar */}
-      <div className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
-        <div className="mb-3 flex items-end justify-between gap-2">
-          <Eyebrow>
-            Hosts
-          </Eyebrow>
-          <span className="text-label text-muted-foreground/60 tabular-nums">
-            {hosts.length}
-          </span>
+    <div>
+      <SubsectionHeader title="This machine" />
+      <SettingsCard className="flex items-center gap-3 px-4 py-3">
+        <Monitor className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+        <div className="min-w-0">
+          <p className="truncate text-body font-medium text-foreground">
+            {localName ?? "This machine"}
+          </p>
+          <p className="text-label text-muted-foreground/80">
+            This computer · always available
+          </p>
         </div>
+      </SettingsCard>
 
-        {hosts.length === 0 && !draft && (
-          <div className="rounded-lg border border-dashed border-border/60 p-3 text-body-sm text-muted-foreground/80 leading-relaxed">
-            No remote hosts yet. Add one to push workspaces from your laptop to a
-            server you can SSH into.
-          </div>
+      <SubsectionHeader
+        className="mt-8"
+        title="Devices"
+        action={
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="text-muted-foreground"
+            onClick={() => setAddOpen(true)}
+          >
+            <Plus />
+            Add device
+          </Button>
+        }
+      />
+      <SettingsCard className="p-0">
+        {!loaded ? (
+          <p className="flex items-center gap-2 px-4 py-3 text-body-sm text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" aria-hidden />
+            Loading devices…
+          </p>
+        ) : hosts.length === 0 ? (
+          <p className="px-4 py-4 text-body-sm leading-relaxed text-muted-foreground/80">
+            {loadError
+              ? `Couldn't load devices: ${loadError}`
+              : "No devices yet. Add a home server, a desktop, or a cloud VM — anything you can SSH into."}
+          </p>
+        ) : (
+          <ul className="divide-y divide-border/40">
+            {hosts.map((host) => (
+              <DeviceRow
+                key={host.id}
+                host={host}
+                status={deviceStatus(statuses[host.id], tests[host.id])}
+                busy={busy[host.id] ?? null}
+                onTest={() => void testConnection(host)}
+                onSetUp={() => void setUpAgain(host)}
+                onRename={() => setRenaming(host)}
+                onRemove={() => setRemoving(host)}
+              />
+            ))}
+          </ul>
         )}
+      </SettingsCard>
 
-        <ul className="space-y-px">
-          {hosts.map((host) => {
-            const result = testResults[host.id];
-            const isOnline = result?.ok === true;
-            return (
-              <li key={host.id}>
-                <button
-                  type="button"
-                  onClick={() => setSelectedId(host.id)}
-                  className={cn(
-                    "group/host flex w-full items-center gap-2.5 rounded-md px-2.5 h-8 text-left text-body transition-colors duration-150",
-                    selectedId === host.id
-                      ? "bg-muted text-foreground"
-                      : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
-                  )}
-                >
-                  <span
-                    aria-hidden
-                    className={cn(
-                      "size-1.5 shrink-0 rounded-full transition-colors duration-150",
-                      isOnline ? "bg-success" : "bg-muted-foreground/40",
-                    )}
-                  />
-                  <span className="min-w-0 flex-1 truncate">{host.name}</span>
-                  {host.dirty && (
-                    <span
-                      title="Pending sync"
-                      className="size-1.5 shrink-0 rounded-full bg-warning"
-                    />
-                  )}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+      <AddDeviceDialog hosts={hosts} onTested={recordTest} />
 
-        <div className="mt-4 pt-4 border-t border-border/40">
-          {draft ? (
-            <div className="space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
-              {/* Device-kind chips. Picking one pre-fills the
-                  placeholder hints in the form below — cosmetic
-                  only, never stored. Helps a first-time user
-                  understand "device" works for their home Mac just
-                  as well as a cloud VPS. */}
-              <div className="space-y-1.5">
-                <Label className="text-label text-muted-foreground/85 font-normal">
-                  What kind of device?
-                </Label>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {DEVICE_KINDS.map((kind) => (
-                    <button
-                      key={kind.id}
-                      type="button"
-                      onClick={() => setDraftKind(kind.id)}
-                      className={cn(
-                        "flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors duration-150",
-                        draftKind === kind.id
-                          ? "border-status-remote/40 bg-status-remote/10 text-foreground"
-                          : "border-border/60 bg-background/40 text-muted-foreground hover:border-border hover:bg-muted/30 hover:text-foreground",
-                      )}
-                    >
-                      <kind.icon
-                        className={cn(
-                          "size-4",
-                          draftKind === kind.id
-                            ? "text-status-remote"
-                            : "text-muted-foreground/70",
-                        )}
-                      />
-                      <span className="text-label font-medium leading-tight">
-                        {kind.label}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
+      <Dialog
+        open={renaming !== null}
+        onOpenChange={(open) => {
+          if (!open) setRenaming(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-sm">
+          {renaming && (
+            <RenameDeviceForm
+              host={renaming}
+              onRename={rename}
+              onDone={() => setRenaming(null)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="host-add-name" className="text-label text-muted-foreground/85 font-normal">
-                  Name
-                </Label>
-                <Input
-                  id="host-add-name"
-                  placeholder={
-                    draftKind
-                      ? DEVICE_KINDS.find((k) => k.id === draftKind)
-                          ?.namePlaceholder ?? "homelab"
-                      : "homelab"
-                  }
-                  value={draft.name}
-                  onChange={(e) =>
-                    setDraft({ ...draft, name: e.target.value })
-                  }
-                  autoFocus
-                  className="h-8 text-body"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="host-add-target" className="text-label text-muted-foreground/85 font-normal">
-                  SSH target
-                </Label>
-                <Input
-                  id="host-add-target"
-                  placeholder={
-                    draftKind
-                      ? DEVICE_KINDS.find((k) => k.id === draftKind)
-                          ?.sshPlaceholder ?? "user@host"
-                      : "user@host"
-                  }
-                  value={draft.ssh_target}
-                  onChange={(e) =>
-                    setDraft({ ...draft, ssh_target: e.target.value })
-                  }
-                  className="h-8 text-body font-mono"
-                />
-                <p className="text-label text-muted-foreground/70 leading-relaxed">
-                  {draftKind
-                    ? DEVICE_KINDS.find((k) => k.id === draftKind)?.hint
-                    : "Anything ssh accepts. Your keys + config in ~/.ssh/ are used as-is."}
-                </p>
-              </div>
-              <div className="flex justify-end gap-1.5 pt-1">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setDraft(null);
-                    setDraftKind(null);
-                    setError(null);
-                  }}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="sm"
-                  onClick={handleAdd}
-                >
-                  Add
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+      <AlertDialog
+        open={removing !== null}
+        onOpenChange={(open) => {
+          if (!open) setRemoving(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove {removing?.name}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Codemux forgets this device. Nothing on it is deleted, and your
+              SSH config and keys stay as they are.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
               onClick={() => {
-                setDraft({ name: "", ssh_target: "" });
-                setDraftKind(null);
+                if (removing) void remove(removing);
               }}
             >
-              <Plus className="size-3.5" />
-              Add device
-            </Button>
-          )}
-
-          {/* "Always auto-install codemux-remote on new hosts" —
-              skips the consent modal on subsequent installs. Stored
-              in localStorage because it's a per-device decision
-              (different machines may have different SSH key
-              access). */}
-          <AutoInstallToggle />
-        </div>
-      </div>
-
-      {/* Detail */}
-      <div className="flex-1 min-w-0">
-        {error && (
-          <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-body-sm text-destructive leading-relaxed">
-            {error}
-          </div>
-        )}
-
-        {!selected ? (
-          <div className="flex h-full items-center justify-center text-center">
-            <div className="space-y-3">
-              <div className="mx-auto size-12 rounded-full bg-muted/40 border border-border/40 flex items-center justify-center">
-                <Server className="size-5 text-muted-foreground/60" />
-              </div>
-              <p className="text-body text-muted-foreground/80">
-                Select a host from the list, or add a new one.
-              </p>
-            </div>
-          </div>
-        ) : editingId === selected.id ? (
-          <div className="space-y-5">
-            <div className="space-y-1.5">
-              <Label htmlFor="host-edit-name" className="text-body font-medium text-foreground">Name</Label>
-              <Input
-                id="host-edit-name"
-                value={editDraft.name}
-                onChange={(e) =>
-                  setEditDraft({ ...editDraft, name: e.target.value })
-                }
-                autoFocus
-                className="h-9 text-body"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="host-edit-target" className="text-body font-medium text-foreground">SSH target</Label>
-              <Input
-                id="host-edit-target"
-                value={editDraft.ssh_target}
-                onChange={(e) =>
-                  setEditDraft({ ...editDraft, ssh_target: e.target.value })
-                }
-                className="h-9 text-body font-mono"
-              />
-            </div>
-            <div className="flex justify-end gap-1.5 pt-2">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={handleCancelEdit}
-              >
-                <X className="size-3.5" />
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                onClick={handleSaveEdit}
-              >
-                <Check className="size-3.5" />
-                Save
-              </Button>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-6">
-            <div>
-              <div className="mb-1 flex items-center gap-2">
-                <h3 className="text-body-lg font-semibold tracking-tight text-foreground">{selected.name}</h3>
-                {selected.dirty && (
-                  <Eyebrow className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-warning">
-                    Pending sync
-                  </Eyebrow>
-                )}
-              </div>
-              <p className="select-text font-mono text-body-sm text-muted-foreground/85">
-                {selected.ssh_target}
-              </p>
-            </div>
-
-            <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-body font-medium text-foreground">Test connection</p>
-                  <p className="text-body-sm text-muted-foreground/75 leading-relaxed mt-0.5">
-                    Probes SSH reachability and the remote codemux-remote helper.
-                  </p>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="shrink-0"
-                  disabled={testingId === selected.id}
-                  onClick={() => void handleTestConnection(selected)}
-                >
-                  {testingId === selected.id ? (
-                    <>
-                      <Loader2 className="size-3.5 animate-spin" />
-                      Testing…
-                    </>
-                  ) : (
-                    "Test now"
-                  )}
-                </Button>
-              </div>
-              {testResults[selected.id] && (
-                <div className="space-y-2.5 pt-3 border-t border-border/40">
-                  <div className="flex items-start gap-2">
-                    <span
-                      className={cn(
-                        "size-1.5 rounded-full shrink-0 mt-1.5",
-                        testResults[selected.id].ok ? "bg-success" : "bg-muted-foreground/50",
-                      )}
-                    />
-                    <p
-                      className={cn(
-                        "text-body-sm leading-relaxed",
-                        testResults[selected.id].ok
-                          ? "text-success"
-                          : "text-muted-foreground/85",
-                      )}
-                    >
-                      {testResults[selected.id].message}
-                    </p>
-                  </div>
-                  {testResults[selected.id].needs_install &&
-                    testResults[selected.id].uname && (
-                      <Button
-                        type="button"
-                        variant="secondary"
-                        size="sm"
-                        disabled={installingId === selected.id}
-                        onClick={() =>
-                          void handleInstallRemote(
-                            selected,
-                            testResults[selected.id].uname as string,
-                          )
-                        }
-                      >
-                        {installingId === selected.id ? (
-                          <>
-                            <Loader2 className="mr-1.5 size-3.5 animate-spin" />
-                            Installing…
-                          </>
-                        ) : (
-                          "Install codemux-remote on this host"
-                        )}
-                      </Button>
-                    )}
-                </div>
-              )}
-            </div>
-
-            {/* Reinstall agent — dev-workflow escape hatch (issue #24).
-                The push-time version check skips the upgrade when the
-                version string is unchanged (which it always is across
-                local rebuilds), so this re-uploads the freshly built
-                codemux-remote and restarts its daemon unconditionally. */}
-            <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-body font-medium text-foreground">Reinstall agent</p>
-                  <p className="text-body-sm text-muted-foreground/75 leading-relaxed mt-0.5">
-                    Re-upload codemux-remote and restart it on the host. Use after
-                    rebuilding the agent locally — pushes skip the update when the
-                    version string is unchanged.
-                  </p>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="shrink-0"
-                  disabled={reinstallingId === selected.id}
-                  onClick={() => void handleReinstallRemote(selected)}
-                >
-                  {reinstallingId === selected.id ? (
-                    <>
-                      <Loader2 className="size-3.5 animate-spin" />
-                      Reinstalling…
-                    </>
-                  ) : (
-                    <>
-                      <RefreshCw className="size-3.5" />
-                      Reinstall
-                    </>
-                  )}
-                </Button>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between pt-4 border-t border-border/40">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => handleStartEdit(selected)}
-              >
-                <Pencil className="size-3.5" />
-                Edit
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                onClick={() => void handleDelete(selected)}
-              >
-                <Trash2 className="size-3.5" />
-                Remove
-              </Button>
-            </div>
-          </div>
-        )}
-      </div>
+              Remove
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
 
-function byNameInsensitive(a: HostView, b: HostView): number {
-  return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+function DeviceRow({
+  host,
+  status,
+  busy,
+  onTest,
+  onSetUp,
+  onRename,
+  onRemove,
+}: {
+  host: HostView;
+  status: { tone: DeviceTone; detail: string | null };
+  busy: "testing" | "setup" | null;
+  onTest: () => void;
+  onSetUp: () => void;
+  onRename: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <li className="flex items-center gap-3 px-4 py-2.5">
+      <Server className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-body font-medium text-foreground">{host.name}</p>
+        <p
+          className="flex min-w-0 items-center gap-1.5 text-label text-muted-foreground/80"
+          title={status.detail ?? undefined}
+        >
+          <span className="truncate">SSH {host.ssh_target}</span>
+          <span aria-hidden>·</span>
+          {busy ? (
+            <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+          ) : (
+            <span
+              aria-hidden
+              className={cn("size-1.5 shrink-0 rounded-full", STATUS_DOT[status.tone])}
+            />
+          )}
+          <span className="shrink-0">
+            {busy === "testing"
+              ? "Testing…"
+              : busy === "setup"
+                ? "Setting up…"
+                : STATUS_LABEL[status.tone]}
+          </span>
+        </p>
+      </div>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="text-muted-foreground"
+            aria-label={`More actions for ${host.name}`}
+          >
+            <MoreHorizontal />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-auto min-w-40">
+          <DropdownMenuItem disabled={busy !== null} onSelect={onTest}>
+            Test connection
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={busy !== null} onSelect={onSetUp}>
+            Set up again
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={onRename}>Rename…</DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" onSelect={onRemove}>
+            Remove…
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>
+  );
 }
 
-const AUTO_INSTALL_KEY = "codemux.hosts.autoInstallRemote";
+// ── Add device ──────────────────────────────────────────────────
 
-function AutoInstallToggle() {
-  const [enabled, setEnabled] = useState(false);
-  useEffect(() => {
-    setEnabled(localStorage.getItem(AUTO_INSTALL_KEY) === "1");
-  }, []);
+type StepId = "save" | "ssh" | "install" | "ready";
+type StepState = "pending" | "running" | "done" | "skipped" | "failed";
+
+const STEPS: { id: StepId; label: string }[] = [
+  { id: "save", label: "Save device" },
+  { id: "ssh", label: "Connect over SSH" },
+  { id: "install", label: "Install Codemux helper" },
+  { id: "ready", label: "Ready" },
+];
+
+const PENDING_STEPS: Record<StepId, StepState> = {
+  save: "pending",
+  ssh: "pending",
+  install: "pending",
+  ready: "pending",
+};
+
+/** Bound to the shared store so the composer's device picker can open it
+ *  straight from "Add device…". */
+function AddDeviceDialog({
+  hosts,
+  onTested,
+}: {
+  hosts: readonly HostView[];
+  onTested: RecordTest;
+}) {
+  const open = useAddDeviceDialogStore((s) => s.open);
+  const setOpen = useAddDeviceDialogStore((s) => s.setOpen);
   return (
-    <label className="mt-3 flex items-start gap-2 text-body-sm text-muted-foreground/85 cursor-pointer leading-relaxed select-none hover:text-foreground transition-colors duration-150">
-      <input
-        type="checkbox"
-        className="mt-0.5 size-3 shrink-0 accent-foreground"
-        checked={enabled}
-        onChange={(e) => {
-          const next = e.target.checked;
-          setEnabled(next);
-          if (next) {
-            localStorage.setItem(AUTO_INSTALL_KEY, "1");
-          } else {
-            localStorage.removeItem(AUTO_INSTALL_KEY);
-          }
-        }}
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent className="sm:max-w-md">
+        <AddDeviceForm hosts={hosts} onTested={onTested} onDone={() => setOpen(false)} />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Lives inside the dialog content, so it unmounts on close and every open
+ * starts fresh. Clicking Connect is the consent to install the helper.
+ */
+function AddDeviceForm({
+  hosts,
+  onTested,
+  onDone,
+}: {
+  hosts: readonly HostView[];
+  onTested: RecordTest;
+  onDone: () => void;
+}) {
+  const [target, setTarget] = useState("");
+  const [name, setName] = useState("");
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [steps, setSteps] = useState<Record<StepId, StepState> | null>(null);
+  const [failure, setFailure] = useState<{ message: string; sshHint: boolean } | null>(
+    null,
+  );
+  const [running, setRunning] = useState(false);
+  // Kept after a failed attempt so Retry reuses the device instead of
+  // adding it twice.
+  const [saved, setSaved] = useState<HostView | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  // The flow spans several awaits; once this form unmounts (the dialog
+  // closed) it must not start another step or close a newly opened dialog.
+  const alive = useRef(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    hostsSshConfigHosts()
+      .then((list) => {
+        if (!cancelled) setSuggestions(list);
+      })
+      .catch(() => {
+        // Suggestions are a convenience; typing a target still works.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const sshTarget = target.trim();
+  const query = sshTarget.toLowerCase();
+  const taken = new Set(hosts.map((h) => h.ssh_target.toLowerCase()));
+  const matches = suggestions
+    .filter((s) => {
+      const lower = s.toLowerCase();
+      return !taken.has(lower) && lower !== query && lower.includes(query);
+    })
+    .slice(0, 8);
+
+  const connect = async () => {
+    if (!sshTarget || running) return;
+    const deviceName = name.trim() || defaultDeviceName(sshTarget);
+    const progress = { ...PENDING_STEPS };
+    let step: StepId = "save";
+    const mark = (id: StepId, state: StepState) => {
+      progress[id] = state;
+      if (alive.current) setSteps({ ...progress });
+    };
+    const fail = (message: string) => {
+      mark(step, "failed");
+      if (alive.current) setFailure({ message, sshHint: step === "ssh" });
+    };
+
+    setRunning(true);
+    setFailure(null);
+    try {
+      mark("save", "running");
+      // A device already saved for this target (say, from an attempt the
+      // dialog was closed on) continues setup instead of being added twice.
+      // Same case-insensitive match the suggestion chips use.
+      const existing = hosts.find((h) => h.ssh_target.toLowerCase() === query);
+      let host: HostView;
+      if (existing) {
+        // Its name only changes when one is typed.
+        const wanted = name.trim() || existing.name;
+        host =
+          wanted === existing.name
+            ? existing
+            : await hostsUpdate(existing.id, wanted, existing.ssh_target);
+      } else if (!saved) {
+        host = await hostsAdd(deviceName, sshTarget);
+      } else if (saved.ssh_target !== sshTarget || saved.name !== deviceName) {
+        // A retry after fixing a typo updates the device it already saved.
+        host = await hostsUpdate(saved.id, deviceName, sshTarget);
+      } else {
+        host = saved;
+      }
+      // Only a device this dialog added is rewritten on a later retry.
+      if (alive.current && !existing) setSaved(host);
+      void refreshDevices();
+      mark("save", "done");
+      if (!alive.current) return;
+
+      step = "ssh";
+      mark("ssh", "running");
+      const probe = await hostsTestConnection(host.id);
+      onTested(host.id, probe);
+      if (!probe.ok && !probe.needs_install) return fail(probe.message);
+      mark("ssh", "done");
+      if (!alive.current) return;
+
+      step = "install";
+      if (probe.needs_install) {
+        mark("install", "running");
+        const install = probe.uname
+          ? await hostsBootstrapInstall(host.id, probe.uname)
+          : await hostsReinstallRemote(host.id);
+        if (!install.ok) return fail(install.message);
+        mark("install", "done");
+      } else {
+        mark("install", "skipped");
+      }
+      if (!alive.current) return;
+
+      step = "ready";
+      mark("ready", "running");
+      await refreshDevices();
+      const check = await hostsTestConnection(host.id);
+      onTested(host.id, check);
+      if (!isReady(check)) return fail(check.message);
+      mark("ready", "done");
+      toast.success(`${host.name} is ready`);
+      // `onDone` closes whichever dialog is open now, which may be a new
+      // one opened after this one was closed mid-run.
+      if (alive.current) onDone();
+    } catch (err) {
+      fail(errorMessage(err));
+    } finally {
+      if (alive.current) setRunning(false);
+    }
+  };
+
+  return (
+    <form
+      className="grid gap-4"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void connect();
+      }}
+    >
+      <DialogHeader>
+        <DialogTitle>Add device</DialogTitle>
+        <DialogDescription className="text-body-sm leading-relaxed">
+          Run threads on another machine you can reach over SSH. Your keys and
+          ~/.ssh/config are used as-is.
+        </DialogDescription>
+      </DialogHeader>
+
+      <div className="grid gap-1.5">
+        <Label htmlFor="add-device-target" className="text-body-sm">
+          SSH host
+        </Label>
+        <Input
+          id="add-device-target"
+          ref={inputRef}
+          value={target}
+          onChange={(e) => setTarget(e.target.value)}
+          placeholder="user@host or an ~/.ssh/config alias"
+          autoComplete="off"
+          spellCheck={false}
+          autoFocus
+          disabled={running}
+          className="font-mono"
+        />
+        {!running && matches.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+            <span className="text-label text-muted-foreground/70">From your SSH config</span>
+            {matches.map((suggestion) => (
+              <button
+                key={suggestion}
+                type="button"
+                onClick={() => {
+                  setTarget(suggestion);
+                  inputRef.current?.focus();
+                }}
+                className="rounded-sm border border-border/60 bg-surface-1 px-1.5 py-0.5 font-mono text-label text-muted-foreground transition-colors duration-100 hover:bg-surface-2 hover:text-foreground"
+              >
+                {suggestion}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="grid gap-1.5">
+        <Label htmlFor="add-device-name" className="text-body-sm">
+          Name <span className="font-normal text-muted-foreground/70">optional</span>
+        </Label>
+        <Input
+          id="add-device-name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={sshTarget ? defaultDeviceName(sshTarget) : "homelab"}
+          autoComplete="off"
+          disabled={running}
+        />
+      </div>
+
+      {steps ? (
+        <ol className="grid gap-1.5" aria-live="polite">
+          {STEPS.map(({ id, label }) => (
+            <li key={id} data-state={steps[id]} className="flex items-start gap-2">
+              <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center">
+                <StepIcon state={steps[id]} />
+              </span>
+              <div className="min-w-0">
+                <p
+                  className={cn(
+                    "text-body-sm",
+                    steps[id] === "pending" ? "text-muted-foreground/70" : "text-foreground",
+                  )}
+                >
+                  {label}
+                  {steps[id] === "skipped" && (
+                    <span className="text-muted-foreground/70"> · already installed</span>
+                  )}
+                </p>
+                {steps[id] === "failed" && failure && (
+                  <div className="mt-0.5 space-y-0.5 text-label leading-relaxed">
+                    <p className="select-text text-destructive">{failure.message}</p>
+                    {failure.sshHint && (
+                      <p className="text-muted-foreground/80">
+                        Make sure{" "}
+                        <code className="font-mono text-foreground">ssh {sshTarget}</code>{" "}
+                        works from a terminal without a password prompt.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="text-label leading-relaxed text-muted-foreground/80">
+          If the small Codemux helper is missing, Connect installs it in your
+          user account. No root needed.
+        </p>
+      )}
+
+      <DialogFooter>
+        <Button type="submit" disabled={!sshTarget || running}>
+          {running && <Loader2 className="animate-spin" aria-hidden />}
+          {running ? "Connecting…" : failure ? "Retry" : "Connect"}
+        </Button>
+      </DialogFooter>
+    </form>
+  );
+}
+
+function StepIcon({ state }: { state: StepState }) {
+  switch (state) {
+    case "running":
+      return <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-hidden />;
+    case "done":
+      return <Check className="size-3.5 text-status-open" aria-hidden />;
+    case "skipped":
+      return <Minus className="size-3.5 text-muted-foreground/60" aria-hidden />;
+    case "failed":
+      return <X className="size-3.5 text-destructive" aria-hidden />;
+    default:
+      return <span aria-hidden className="size-1.5 rounded-full bg-muted-foreground/40" />;
+  }
+}
+
+function RenameDeviceForm({
+  host,
+  onRename,
+  onDone,
+}: {
+  host: HostView;
+  onRename: (host: HostView, name: string) => Promise<void>;
+  onDone: () => void;
+}) {
+  const [name, setName] = useState(host.name);
+  const [saving, setSaving] = useState(false);
+  const trimmed = name.trim();
+
+  const submit = async () => {
+    if (!trimmed || trimmed === host.name) return onDone();
+    setSaving(true);
+    try {
+      await onRename(host, trimmed);
+      onDone();
+    } catch (err) {
+      toast.error(`Couldn't rename ${host.name}`, { description: errorMessage(err) });
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form
+      className="grid gap-4"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+    >
+      <DialogHeader>
+        <DialogTitle>Rename device</DialogTitle>
+        <DialogDescription className="text-body-sm">
+          <span className="font-mono">{host.ssh_target}</span>
+        </DialogDescription>
+      </DialogHeader>
+      <Input
+        aria-label="Device name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        autoFocus
+        disabled={saving}
       />
-      <span>
-        Always install codemux-remote automatically when missing
-      </span>
-    </label>
+      <DialogFooter>
+        <Button type="submit" disabled={!trimmed || saving}>
+          Save
+        </Button>
+      </DialogFooter>
+    </form>
   );
 }

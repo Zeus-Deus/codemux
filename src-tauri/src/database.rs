@@ -1551,20 +1551,30 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Clear the dirty flag on a host after a successful push. Optionally
-    /// stamp `server_id` if this was the first upload.
-    pub fn mark_host_synced(&self, id: i64, server_id: Option<&str>) -> Result<(), String> {
+    /// Record a successful push of `pushed`, stamping `server_id` if this
+    /// was the first upload. The dirty flag clears only while the row
+    /// still holds what was sent: an edit or delete made while the
+    /// request was in flight stays dirty for the next push, instead of
+    /// being reverted by the next pull.
+    pub fn mark_host_synced(&self, pushed: &HostRecord, server_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        if let Some(sid) = server_id {
-            conn.execute(
-                "UPDATE hosts SET dirty = 0, server_id = ?1 WHERE id = ?2",
-                params![sid, id],
-            )
-            .map_err(|e| format!("Failed to mark host synced: {e}"))?;
-        } else {
-            conn.execute("UPDATE hosts SET dirty = 0 WHERE id = ?1", params![id])
-                .map_err(|e| format!("Failed to mark host synced: {e}"))?;
-        }
+        conn.execute(
+            "UPDATE hosts
+             SET server_id = COALESCE(?1, server_id),
+                 dirty = CASE
+                     WHEN name IS ?2 AND ssh_target IS ?3 AND deleted_at IS ?4 THEN 0
+                     ELSE dirty
+                 END
+             WHERE id = ?5",
+            params![
+                server_id,
+                pushed.name,
+                pushed.ssh_target,
+                pushed.deleted_at,
+                pushed.id
+            ],
+        )
+        .map_err(|e| format!("Failed to mark host synced: {e}"))?;
         Ok(())
     }
 
@@ -1587,6 +1597,11 @@ impl DatabaseStore {
     /// server. The UPDATE names its columns so the local-only
     /// observation columns (`last_seen_at`, `disk_bytes`,
     /// `disk_measured_at`) survive every pull.
+    ///
+    /// A local row with unpushed changes (`dirty = 1`) is left alone:
+    /// the server copy predates the user's edit or delete, and the next
+    /// push sends it. Checked here, under the connection lock, so an
+    /// edit that lands mid-pull is covered too.
     pub fn upsert_host_from_server(
         &self,
         server_id: &str,
@@ -1603,11 +1618,23 @@ impl DatabaseStore {
                 "UPDATE hosts
                  SET name = ?1, ssh_target = ?2, created_at = ?3, updated_at = ?4,
                      deleted_at = ?5, dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?6",
+                 WHERE user_id = 'local' AND server_id = ?6 AND dirty = 0",
                 params![name, ssh_target, created_at, updated_at, deleted_at, server_id],
             )
             .map_err(|e| format!("Failed to update host from server: {e}"))?;
-        if updated == 0 {
+        if updated > 0 {
+            return Ok(());
+        }
+        // Nothing updated: either the row is new to this install, or it
+        // exists with local changes pending. Only the former is inserted.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosts WHERE user_id = 'local' AND server_id = ?1)",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to look up host from server: {e}"))?;
+        if !exists {
             conn.execute(
                 "INSERT INTO hosts (user_id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty)
                  VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, 0)",
@@ -8789,7 +8816,7 @@ mod tests {
     fn hosts_update_marks_dirty() {
         let db = init_test_database();
         let h = db.insert_host("orig", "old@host").unwrap();
-        db.mark_host_synced(h.id, Some("srv-1")).unwrap();
+        db.mark_host_synced(&h, Some("srv-1")).unwrap();
         // After mark_synced, the row should be clean.
         let clean = db.list_hosts().into_iter().find(|x| x.id == h.id).unwrap();
         assert!(!clean.dirty);
@@ -8857,7 +8884,7 @@ mod tests {
         assert_eq!(row.disk_measured_at.as_deref(), Some("2026-08-27T10:00:00Z"));
 
         // Observations never dirty the row: nothing here is worth a push.
-        db.mark_host_synced(h.id, Some("srv-1")).unwrap();
+        db.mark_host_synced(&h, Some("srv-1")).unwrap();
         db.record_host_seen(h.id, "2026-08-27T10:02:00Z", Some(1)).unwrap();
         assert!(!find().dirty);
 
@@ -8881,7 +8908,8 @@ mod tests {
         // The facts go with the row once the tombstone is purged; no
         // separate cleanup is needed.
         db.delete_host(h.id).unwrap();
-        db.mark_host_synced(h.id, None).unwrap();
+        let tombstone = db.list_hosts_for_sync().into_iter().find(|r| r.id == h.id).unwrap();
+        db.mark_host_synced(&tombstone, None).unwrap();
         db.purge_acknowledged_deletes().unwrap();
         assert!(db.list_hosts_for_sync().iter().all(|r| r.id != h.id));
     }
@@ -8897,7 +8925,7 @@ mod tests {
         let db = init_test_database();
         let dirty = db.insert_host("a", "u@a").unwrap();
         let clean = db.insert_host("b", "u@b").unwrap();
-        db.mark_host_synced(clean.id, Some("srv-b")).unwrap();
+        db.mark_host_synced(&clean, Some("srv-b")).unwrap();
 
         let only_dirty = db.list_dirty_hosts();
         assert_eq!(only_dirty.len(), 1);
@@ -8913,7 +8941,8 @@ mod tests {
         db.purge_acknowledged_deletes().unwrap();
         assert_eq!(db.list_hosts_for_sync().len(), 1);
         // After mark_synced: tombstone is acknowledged, NOW purge.
-        db.mark_host_synced(h.id, Some("srv-t")).unwrap();
+        let tombstone = db.list_hosts_for_sync().remove(0);
+        db.mark_host_synced(&tombstone, Some("srv-t")).unwrap();
         db.purge_acknowledged_deletes().unwrap();
         assert!(db.list_hosts_for_sync().is_empty());
     }
@@ -8972,6 +9001,56 @@ mod tests {
     }
 
     #[test]
+    fn hosts_pull_keeps_unpushed_edits_and_deletes() {
+        // Sync pulls before it pushes, so the server copy a pull sees
+        // predates any local change still waiting to go up.
+        let db = init_test_database();
+        let edited = db.insert_host("typo", "u@baad").unwrap();
+        db.mark_host_synced(&edited, Some("srv-e")).unwrap();
+        let removed = db.insert_host("gone", "u@gone").unwrap();
+        db.mark_host_synced(&removed, Some("srv-r")).unwrap();
+
+        db.update_host(edited.id, "fixed", "u@good").unwrap();
+        db.delete_host(removed.id).unwrap();
+        for (sid, name, target) in [("srv-e", "typo", "u@baad"), ("srv-r", "gone", "u@gone")] {
+            db.upsert_host_from_server(sid, name, target, "t0", "t0", None)
+                .unwrap();
+        }
+
+        let rows = db.list_hosts_for_sync();
+        assert_eq!(rows.len(), 2, "a skipped row must not be re-inserted");
+        let edited_row = rows.iter().find(|r| r.id == edited.id).unwrap();
+        assert_eq!(edited_row.ssh_target, "u@good", "the fix survives the pull");
+        assert!(edited_row.dirty, "and is still pushed afterwards");
+        let removed_row = rows.iter().find(|r| r.id == removed.id).unwrap();
+        assert!(removed_row.deleted_at.is_some(), "a removed device stays removed");
+        assert!(removed_row.dirty);
+
+        // Once pushed, the server copy applies again.
+        db.mark_host_synced(edited_row, None).unwrap();
+        db.upsert_host_from_server("srv-e", "renamed-elsewhere", "u@good", "t0", "t1", None)
+            .unwrap();
+        let row = db.list_hosts().into_iter().find(|r| r.id == edited.id).unwrap();
+        assert_eq!(row.name, "renamed-elsewhere");
+        assert!(!row.dirty);
+    }
+
+    #[test]
+    fn hosts_mark_synced_keeps_edits_made_while_in_flight() {
+        let db = init_test_database();
+        let pushed = db.insert_host("box", "u@old").unwrap();
+        // The user edits the row while its POST is in flight.
+        db.update_host(pushed.id, "box", "u@new").unwrap();
+        db.mark_host_synced(&pushed, Some("srv-1")).unwrap();
+        let row = db.list_hosts_for_sync().remove(0);
+        assert_eq!(row.server_id.as_deref(), Some("srv-1"), "the next push must PATCH, not POST again");
+        assert!(row.dirty, "the newer edit still needs pushing");
+
+        db.mark_host_synced(&row, None).unwrap();
+        assert!(!db.list_hosts_for_sync()[0].dirty);
+    }
+
+    #[test]
     fn hosts_local_and_remote_coexist_until_paired() {
         // Realistic scenario: user adds a host on their laptop while
         // offline. Meanwhile their desktop synced a different host.
@@ -8991,7 +9070,7 @@ mod tests {
         let list = db.list_hosts();
         assert_eq!(list.len(), 2);
         // Pretend the local row got pushed; mark it synced.
-        db.mark_host_synced(local.id, Some("srv-laptop")).unwrap();
+        db.mark_host_synced(&local, Some("srv-laptop")).unwrap();
         // Now both rows have distinct server_ids.
         let mut sids: Vec<String> = db
             .list_hosts()

@@ -6,6 +6,7 @@ import {
   agentChatStartSession,
   applyPreset,
   createEmptyWorkspace,
+  createWorkspaceOnHost,
   createWorktreeWorkspaceResult,
   generateBranchName,
   generateRandomBranchName,
@@ -121,6 +122,7 @@ export type MaterializeResult =
 /** Phases surfaced through `materializeAndSend`'s `onPhase` hook so the
  *  draft surface can advance a status line as the real work progresses. */
 export type MaterializePhase =
+  | "creating-on-host"
   | "creating-worktree"
   | "creating-workspace"
   | "starting-session"
@@ -211,9 +213,18 @@ export async function materializeAndSend(
     clientNonce,
     imageDisplaySources,
   );
-  onPhase(worktreeProjectPath ? "creating-worktree" : "creating-workspace");
+  const hostId = draftHostId(draft);
+  onPhase(
+    hostId !== null
+      ? "creating-on-host"
+      : worktreeProjectPath
+        ? "creating-worktree"
+        : "creating-workspace",
+  );
 
-  // 1. Resolve the target workspace. A `"worktree"` checkout mode
+  // 1. Resolve the target workspace. A device target wins outright: the
+  //    device creates the checkout (or worktree) itself. Otherwise a
+  //    `"worktree"` checkout mode
   //    takes priority over the target-kind switch below: instead of
   //    reusing/creating a workspace on the project's existing
   //    checkout, it creates a brand-new sibling worktree (deferred
@@ -235,7 +246,23 @@ export async function materializeAndSend(
   let workspaceId: string;
   let effectiveCwd = cwd;
   try {
-    if (draft.checkoutMode === "worktree" && worktreeProjectPath) {
+    if (hostId !== null) {
+      const created = await createDraftWorkspaceOnHost(
+        draft,
+        hostId,
+        text,
+        options.background ? false : undefined,
+      );
+      workspaceId = created.workspaceId;
+      if (!created.cwd) {
+        const message =
+          "Timed out resolving the workspace on the device. Please send again.";
+        actions.removeUserMessageByNonce(draft.threadId, clientNonce);
+        actions.markSendFailed(draft.draftId, message);
+        return { success: false, error: message };
+      }
+      effectiveCwd = created.cwd;
+    } else if (draft.checkoutMode === "worktree" && worktreeProjectPath) {
       const created = await createDeferredWorktree(
         worktreeProjectPath,
         draft.worktreeName ?? "",
@@ -290,7 +317,9 @@ export async function materializeAndSend(
 
   let exactSkillSelection =
     skillBodies && typeof skillBodies === "object" ? skillBodies : null;
-  if (exactSkillSelection && actions.refreshSkillSelection) {
+  // Skill rebinding lists skills on this machine, which can't see a
+  // device's paths — device threads keep the selection as resolved.
+  if (exactSkillSelection && actions.refreshSkillSelection && hostId === null) {
     try {
       exactSkillSelection = await actions.refreshSkillSelection(
         exactSkillSelection,
@@ -463,31 +492,58 @@ export async function materializeWithPreset(
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
+  const hostId = draftHostId(draft);
+  // A terminal preset spawns its PTY on this machine and can't reach a
+  // device yet. Refuse rather than quietly running it here.
+  if (hostId !== null && preset.kind !== "chat_agent") {
+    const message =
+      "Terminal presets can't run on a device yet. Send from the composer instead.";
+    actions.markSendFailed(draft.draftId, message);
+    return { success: false, error: message };
+  }
+
   // 1. Resolve the target workspace. Same branching as
-  //    `materializeAndSend`: home → fresh workspace at $HOME with a
-  //    message-derived title; project → create empty; existing → use
-  //    as-is.
+  //    `materializeAndSend`: device → created on the device; home →
+  //    fresh workspace at $HOME with a message-derived title; project →
+  //    create empty; existing → use as-is.
   let workspaceId: string;
+  // The session's cwd on the device, when the workspace was created there.
+  let hostCwd: string | null = null;
   try {
-    switch (draft.target.kind) {
-      case "home": {
-        const created = await createHomeRootedWorkspace(
-          initialPrompt,
-          preset.kind === "chat_agent" ? initialChatForDraft(draft) : undefined,
+    if (hostId !== null) {
+      const created = await createDraftWorkspaceOnHost(
+        draft,
+        hostId,
+        initialPrompt,
+      );
+      workspaceId = created.workspaceId;
+      if (!created.cwd) {
+        throw new Error(
+          "Timed out resolving the workspace on the device. Please try again.",
         );
-        workspaceId = created;
-        break;
       }
-      case "project":
-        workspaceId = await createProjectWorkspace(
-          draft.target.projectPath,
-          initialPrompt,
-          preset.kind === "chat_agent" ? initialChatForDraft(draft) : undefined,
-        );
-        break;
-      case "existing_workspace":
-        workspaceId = draft.target.workspaceId;
-        break;
+      hostCwd = created.cwd;
+    } else {
+      switch (draft.target.kind) {
+        case "home": {
+          const created = await createHomeRootedWorkspace(
+            initialPrompt,
+            preset.kind === "chat_agent" ? initialChatForDraft(draft) : undefined,
+          );
+          workspaceId = created;
+          break;
+        }
+        case "project":
+          workspaceId = await createProjectWorkspace(
+            draft.target.projectPath,
+            initialPrompt,
+            preset.kind === "chat_agent" ? initialChatForDraft(draft) : undefined,
+          );
+          break;
+        case "existing_workspace":
+          workspaceId = draft.target.workspaceId;
+          break;
+      }
     }
   } catch (err) {
     const message = errorMessage(err);
@@ -515,18 +571,23 @@ export async function materializeWithPreset(
     // preset rather than composer Enter. The Rust `apply_preset`
     // command explicitly rejects `ChatAgent` presets; all the work
     // happens here in the frontend.
-    let cwd: string;
+    // `sourceCwd` is the draft's local location, which keys the composer's
+    // provider commands; `cwd` is where the session runs.
+    let sourceCwd: string;
     try {
-      cwd = await resolveCwdForTarget(draft);
+      sourceCwd = await resolveCwdForTarget(draft);
     } catch (err) {
       const message = errorMessage(err);
       actions.markSendFailed(draft.draftId, message);
       return { success: false, error: message };
     }
+    const cwd = hostCwd ?? sourceCwd;
 
     let exactSkills =
       skillBodies && typeof skillBodies === "object" ? skillBodies : null;
-    if (exactSkills && actions.refreshSkillSelection) {
+    // Skill rebinding lists skills on this machine, which can't see a
+    // device's paths — device threads keep the selection as resolved.
+    if (exactSkills && actions.refreshSkillSelection && hostId === null) {
       try {
         exactSkills = await actions.refreshSkillSelection(exactSkills, cwd);
       } catch (err) {
@@ -602,7 +663,7 @@ export async function materializeWithPreset(
             draft.effort,
             typeof skillBodies === "string" ? skillBodies : null,
             null,
-            selectProviderCommands(draft.provider, cwd, draft.threadId)(useProviderCommandsStore.getState()).commands,
+            selectProviderCommands(draft.provider, sourceCwd, draft.threadId)(useProviderCommandsStore.getState()).commands,
           ),
           display_text: prompt,
           skill_ids: exactSkills?.skillIds ?? [],
@@ -723,6 +784,58 @@ export function effectivePermissionMode(draft: ChatDraft): string | null {
 function initialChatForDraft(draft: ChatDraft): InitialChatPane {
   useProviderRuntimeIntent.getState().observe(draft.provider);
   return { provider: draft.provider, thread_id: draft.threadId };
+}
+
+/** The device a draft's first send creates its workspace on, or `null`
+ *  for this machine. An existing workspace already lives wherever it
+ *  lives, so the draft's device choice doesn't apply to it. */
+export function draftHostId(draft: ChatDraft): number | null {
+  return draft.hostId != null && draft.target.kind !== "existing_workspace"
+    ? draft.hostId
+    : null;
+}
+
+/** Create a draft's workspace on device `hostId`, shared by the composer
+ *  send and the preset launch so both build the same request.
+ *
+ *  The device clones the project from its git remote on first use and
+ *  works in its own checkout (or a new worktree in it), so the session
+ *  cwd is a path on the device — the backend returns it as the
+ *  workspace's cwd. `cwd` is `null` when it never resolved; callers fail
+ *  the launch rather than start a session somewhere else. */
+async function createDraftWorkspaceOnHost(
+  draft: ChatDraft,
+  hostId: number,
+  firstMessage: string,
+  select?: boolean,
+): Promise<{ workspaceId: string; cwd: string | null }> {
+  const projectPath =
+    draft.target.kind === "project" ? draft.target.projectPath : null;
+  const newBranch = projectPath !== null && draft.checkoutMode === "worktree";
+  const created = await createWorkspaceOnHost({
+    hostId,
+    projectPath,
+    branch: newBranch
+      ? await resolveWorktreeBranchName(
+          projectPath,
+          draft.worktreeName ?? "",
+          firstMessage,
+        )
+      : null,
+    newBranch,
+    baseBranch: draft.baseBranch || null,
+    initialChat: initialChatForDraft(draft),
+    ...(select === false ? { select: false } : {}),
+  });
+  const workspaceId = created.workspaceId;
+  const cwd = created.cwd ?? (await waitForWorkspaceCwd(workspaceId));
+  // A new worktree is named after its branch; otherwise name the
+  // workspace after the first message, like the local paths do.
+  if (cwd && !newBranch) {
+    if (projectPath) autoNameWorkspace(workspaceId, projectPath, firstMessage);
+    else await applyFirstMessageTitle(workspaceId, firstMessage);
+  }
+  return { workspaceId, cwd };
 }
 
 /** Create a fresh workspace rooted at the cached `$HOME`, then rename
@@ -908,8 +1021,7 @@ async function applyFirstMessageTitle(
   });
 }
 
-/** Thread Scope redesign — create the sibling worktree a `"worktree"`
- *  checkout mode defers to submit time.
+/** Branch name for a deferred worktree, local or on a device.
  *
  *  Naming order matches the design's "like the CLI does" promise:
  *   1. The user's typed name (trimmed), if non-empty — used verbatim.
@@ -918,7 +1030,29 @@ async function applyFirstMessageTitle(
  *      no API key, empty result) falls through to (3) rather than
  *      aborting the send.
  *   3. `generateRandomBranchName(projectPath)` — the existing
- *      adjective-noun random-name fallback.
+ *      adjective-noun random-name fallback. */
+export async function resolveWorktreeBranchName(
+  projectPath: string,
+  worktreeName: string,
+  firstMessage: string,
+): Promise<string> {
+  const typed = worktreeName.trim();
+  if (typed) return typed;
+  let name = "";
+  try {
+    name = (await generateBranchName(firstMessage, projectPath)).trim();
+  } catch (err) {
+    console.warn(
+      "[materialize] generateBranchName failed, falling back to a random name:",
+      errorMessage(err),
+    );
+  }
+  return name || (await generateRandomBranchName(projectPath));
+}
+
+/** Thread Scope redesign — create the sibling worktree a `"worktree"`
+ *  checkout mode defers to submit time, named by
+ *  `resolveWorktreeBranchName`.
  *
  *  Errors from `createWorktreeWorkspace` itself propagate to the
  *  caller's try/catch — no local handling needed here.
@@ -934,21 +1068,11 @@ export async function createDeferredWorktree(
   initialChat?: InitialChatPane,
   select?: boolean,
 ): Promise<WorkspaceCreateResult> {
-  let name = worktreeName.trim();
-  if (!name) {
-    try {
-      name = (await generateBranchName(firstMessage, projectPath)).trim();
-    } catch (err) {
-      console.warn(
-        "[materialize] generateBranchName failed, falling back to a random name:",
-        errorMessage(err),
-      );
-      name = "";
-    }
-    if (!name) {
-      name = await generateRandomBranchName(projectPath);
-    }
-  }
+  const name = await resolveWorktreeBranchName(
+    projectPath,
+    worktreeName,
+    firstMessage,
+  );
   // Returns `{ workspaceId, cwd }`: `cwd` is non-null when the backend
   // carries it (letting first-send callers skip `waitForWorkspaceCwd`),
   // null on older backends (callers fall back to the poll).

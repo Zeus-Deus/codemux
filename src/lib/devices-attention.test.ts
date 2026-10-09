@@ -41,6 +41,22 @@ describe("computeDevicesIndicator", () => {
     ).toEqual({ dot: null, tooltip: "Devices — 1 offline" });
   });
 
+  it("counts a device updating itself as online, without the amber dot", () => {
+    expect(
+      computeDevicesIndicator({
+        hosts: [zeus],
+        statuses: {
+          1: status(1, {
+            reachable: true,
+            last_error: "Updating Codemux on this device to v0.23.1",
+          }),
+        },
+        divergedRows: [],
+        transferError: null,
+      }),
+    ).toEqual({ dot: "green", tooltip: "Devices — 1 online" });
+  });
+
   it("goes green and counts only reachable devices", () => {
     expect(
       computeDevicesIndicator({

@@ -144,7 +144,7 @@ vi.mock("@/stores/picker-favorites-store", () => ({
   ),
 }));
 
-// Stub ThreadScopeRow — the real one owns three popovers (location /
+// Stub ThreadScopeRow — the real one owns three popovers (device /
 // checkout / branch) each with their own store subscriptions and
 // Tauri round-trips; DraftChatSurface tests care about DISPATCH (what
 // gets wired to the draft store / materializeAndSend), not about the
@@ -152,9 +152,9 @@ vi.mock("@/stores/picker-favorites-store", () => ({
 // stub records the most recently passed props so individual tests can
 // invoke the callbacks directly to exercise the dispatch logic.
 type ThreadScopeRowStubProps = {
-  target: import("@/stores/chat-draft-store").ChatDraft["target"];
-  onChangeTarget: (t: import("@/stores/chat-draft-store").DraftTarget) => void;
   projectPath: string | null;
+  hostId: number | null;
+  onChangeHostId: (hostId: number | null) => void;
   checkoutMode: "current" | "worktree";
   worktreeName: string;
   baseBranch: string;
@@ -172,14 +172,33 @@ vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
     return (
       <button
         data-testid="thread-scope-row-stub"
-        data-target-kind={props.target.kind}
         data-project-path={props.projectPath ?? ""}
         data-checkout-mode={props.checkoutMode}
         data-base-branch={props.baseBranch}
+        data-host-id={props.hostId ?? ""}
       >
         scope:{props.projectPath ?? "home"}
       </button>
     );
+  },
+}));
+
+// The headline's project picker — the real popover's project list is
+// covered by ProjectScopePopover.test.tsx. The stub renders the trigger
+// and records the wiring.
+type ProjectScopePopoverStubProps = {
+  trigger: import("react").ReactElement;
+  onChangeTarget: (t: import("@/stores/chat-draft-store").DraftTarget) => void;
+  isHome: boolean;
+  activeProjectPath: string | null;
+};
+const lastProjectScopePopoverProps: {
+  current: ProjectScopePopoverStubProps | null;
+} = { current: null };
+vi.mock("@/components/chat/pickers/ProjectScopePopover", () => ({
+  ProjectScopePopover: (props: ProjectScopePopoverStubProps) => {
+    lastProjectScopePopoverProps.current = props;
+    return <span data-testid="project-scope-popover-stub">{props.trigger}</span>;
   },
 }));
 
@@ -195,6 +214,8 @@ import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import { __resetHostsStoreForTests, useHostsStore } from "@/stores/hosts-store";
+import { host } from "@/components/devices/host-fixtures.test-utils";
 
 afterEach(() => cleanup());
 
@@ -230,6 +251,8 @@ function resetStores() {
     enableLazyWorkspaceCreation: false,
   });
   lastThreadScopeRowProps.current = null;
+  lastProjectScopePopoverProps.current = null;
+  __resetHostsStoreForTests();
 }
 
 function renderSurface() {
@@ -270,6 +293,31 @@ function narrowsComposerColumn(token: string): boolean {
 
 function columnNarrowingClasses(className: string): string[] {
   return className.split(/\s+/).filter(Boolean).filter(narrowsComposerColumn);
+}
+
+/** An active, project-rooted sidebar workspace — the context the home-draft
+ *  seed effect and submit salvage re-target to. */
+function seedActiveProjectWorkspace(overrides: Record<string, unknown> = {}) {
+  useAppStore.setState({
+    appState: {
+      schema_version: 1,
+      active_workspace_id: "ws-active",
+      workspaces: [
+        {
+          workspace_id: "ws-active",
+          title: "active",
+          workspace_type: "standard",
+          cwd: "/projects/active",
+          project_root: "/projects/active",
+          git_branch: "main",
+          worktree_path: null,
+          tabs: [],
+          surfaces: [],
+          ...overrides,
+        },
+      ],
+    } as never,
+  });
 }
 
 describe("DraftChatSurface", () => {
@@ -360,7 +408,7 @@ describe("DraftChatSurface", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { container, getByText } = renderSurface();
-      expect(getByText("What should we do today?")).toBeInTheDocument();
+      expect(getByText("What should we work on?")).toBeInTheDocument();
       expect(container.querySelector("textarea")).not.toBeNull();
     });
 
@@ -392,7 +440,7 @@ describe("DraftChatSurface", () => {
         const { queryByTestId, getByText } = renderSurface();
         expect(queryByTestId("draft-surface-header")).toBeNull();
         // The landing itself still renders.
-        expect(getByText("What should we do today?")).toBeInTheDocument();
+        expect(getByText("What should we work on?")).toBeInTheDocument();
       } finally {
         useFeatureFlags.setState({ enableAgentChat: false });
       }
@@ -481,12 +529,11 @@ describe("DraftChatSurface", () => {
       expect(alert.textContent).toContain("boom");
     });
 
-    it("renders the ThreadScopeRow stub below the composer for home drafts, targeting home with no project", () => {
+    it("renders the ThreadScopeRow stub below the composer for home drafts, with no project", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { getByTestId } = renderSurface();
       const stub = getByTestId("thread-scope-row-stub");
-      expect(stub.dataset.targetKind).toBe("home");
       expect(stub.dataset.projectPath).toBe("");
     });
 
@@ -535,9 +582,8 @@ describe("DraftChatSurface", () => {
       // Seeding effect reads the hydrated appHomeDir from useAppStore
       // (set via resetStores) and flips target home → existing_workspace
       // on the first effect pass. The ThreadScopeRow stub now reports
-      // the resolved project path instead of the bare "home" target.
+      // the resolved project path instead of no project.
       const stub = await findByTestId("thread-scope-row-stub");
-      expect(stub.dataset.targetKind).toBe("existing_workspace");
       expect(stub.dataset.projectPath).toBe("/projects/whatsapp-intake-bot");
       // Store is persistently flipped to existing_workspace so the
       // send path reuses the active workspace rather than creating a
@@ -589,9 +635,9 @@ describe("DraftChatSurface", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { findByTestId } = renderSurface();
-      // Stub stays targeted at "home" — the draft remains home.
+      // Stub stays without a project — the draft remains home.
       const stub = await findByTestId("thread-scope-row-stub");
-      expect(stub.dataset.targetKind).toBe("home");
+      expect(stub.dataset.projectPath).toBe("");
       const after = useChatDraftStore.getState().draftsById[draft.draftId];
       expect(after?.target).toEqual({ kind: "home" });
     });
@@ -603,7 +649,6 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { getByTestId } = renderSurface();
       const stub = getByTestId("thread-scope-row-stub");
-      expect(stub.dataset.targetKind).toBe("project");
       expect(stub.dataset.projectPath).toBe("/projects/foo");
       // checkoutMode / baseBranch default from `makeDraft` — the row
       // reads them straight off the draft, no local component state.
@@ -659,7 +704,6 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { getByTestId } = renderSurface();
       const stub = getByTestId("thread-scope-row-stub");
-      expect(stub.dataset.targetKind).toBe("existing_workspace");
       // Scoped to the workspace's project_root, NOT its cwd.
       expect(stub.dataset.projectPath).toBe("/projects/foo");
     });
@@ -1181,17 +1225,19 @@ describe("DraftChatSurface", () => {
       });
     }
 
-    it("project draft → onChangeTarget with existing_workspace updates the draft target", () => {
+    it("project draft → the headline picker's onChangeTarget with existing_workspace updates the draft target", () => {
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastThreadScopeRowProps.current).not.toBeNull();
-      lastThreadScopeRowProps.current!.onChangeTarget({
-        kind: "existing_workspace",
-        workspaceId: "ws-foo-feat",
-      });
+      expect(lastProjectScopePopoverProps.current).not.toBeNull();
+      act(() =>
+        lastProjectScopePopoverProps.current!.onChangeTarget({
+          kind: "existing_workspace",
+          workspaceId: "ws-foo-feat",
+        }),
+      );
       const next = useChatDraftStore.getState().draftsById[draft.draftId];
       expect(next.target).toEqual({
         kind: "existing_workspace",
@@ -1251,7 +1297,7 @@ describe("DraftChatSurface", () => {
       // No workspace in app-state matches the draft's workspaceId →
       // existingWorkspaceProjectRoot resolves to null. Unlike the old
       // zone1Override (which hid the row entirely), ThreadScopeRow
-      // always renders — it just shows the location control only,
+      // always renders — it just shows the device control only,
       // internally, since `projectPath` is null.
       const draft = useChatDraftStore
         .getState()
@@ -1268,20 +1314,6 @@ describe("DraftChatSurface", () => {
       expect(lastThreadScopeRowProps.current!.projectPath).toBeNull();
     });
 
-    it("existing_workspace draft passes the draftTarget through to the row", () => {
-      seedAppStateWithFooFeat();
-      const draft = useChatDraftStore
-        .getState()
-        .getOrCreateProjectDraft("/projects/foo");
-      const target = {
-        kind: "existing_workspace" as const,
-        workspaceId: "ws-foo-feat",
-      };
-      useChatDraftStore.getState().updateDraftTarget(draft.draftId, target);
-      useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      renderSurface();
-      expect(lastThreadScopeRowProps.current!.target).toEqual(target);
-    });
 
     it("draft.promoting disables the row", () => {
       const draft = useChatDraftStore
@@ -1291,6 +1323,293 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
       expect(lastThreadScopeRowProps.current!.disabled).toBe(true);
+    });
+  });
+
+  describe("headline", () => {
+    it("names the project, with the project picker on the name", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container, getByRole } = renderSurface();
+      expect(container.querySelector("h1")?.textContent).toBe(
+        "What should we build in foo?",
+      );
+      expect(getByRole("button", { name: "foo" })).toBeInTheDocument();
+      expect(lastProjectScopePopoverProps.current).toMatchObject({
+        isHome: false,
+        activeProjectPath: "/projects/foo",
+      });
+      act(() =>
+        lastProjectScopePopoverProps.current!.onChangeTarget({
+          kind: "project",
+          projectPath: "/projects/bar",
+        }),
+      );
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].target,
+      ).toEqual({ kind: "project", projectPath: "/projects/bar" });
+    });
+
+    it("names an existing workspace's project and switches projects from it", () => {
+      seedActiveProjectWorkspace();
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-active",
+      });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      expect(container.querySelector("h1")?.textContent).toBe(
+        "What should we build in active?",
+      );
+      expect(lastProjectScopePopoverProps.current).toMatchObject({
+        isHome: false,
+        activeProjectPath: "/projects/active",
+      });
+      act(() =>
+        lastProjectScopePopoverProps.current!.onChangeTarget({
+          kind: "project",
+          projectPath: "/projects/bar",
+        }),
+      );
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].target,
+      ).toEqual({ kind: "project", projectPath: "/projects/bar" });
+    });
+
+    it("a home draft picks its project from the 'No project' link under the headline", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container, getByRole, getByTestId } = renderSurface();
+      expect(container.querySelector("h1")?.textContent).toBe(
+        "What should we work on?",
+      );
+      expect(getByTestId("project-scope-popover-stub")).toContainElement(
+        getByRole("button", { name: "No project" }),
+      );
+      expect(lastProjectScopePopoverProps.current).toMatchObject({
+        isHome: true,
+        activeProjectPath: null,
+      });
+      act(() =>
+        lastProjectScopePopoverProps.current!.onChangeTarget({
+          kind: "project",
+          projectPath: "/projects/bar",
+        }),
+      );
+      expect(container.querySelector("h1")?.textContent).toBe(
+        "What should we build in bar?",
+      );
+    });
+
+    it("'or start without a project' sticks to home even with a project workspace active", () => {
+      seedActiveProjectWorkspace();
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { getByRole, container } = renderSurface();
+      fireEvent.click(getByRole("button", { name: "or start without a project" }));
+      const next = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(next.target).toEqual({ kind: "home" });
+      expect(next.lockedToHome).toBe(true);
+      expect(container.querySelector("h1")?.textContent).toBe(
+        "What should we work on?",
+      );
+    });
+  });
+
+  describe("picking Home", () => {
+    it("sticks even with a project workspace active in the sidebar", () => {
+      seedActiveProjectWorkspace();
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      act(() =>
+        lastProjectScopePopoverProps.current!.onChangeTarget({ kind: "home" }),
+      );
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].target,
+      ).toEqual({ kind: "home" });
+    });
+  });
+
+  describe("device", () => {
+    it("passes the draft's device to the row and persists a pick", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { getByTestId } = renderSurface();
+      expect(lastThreadScopeRowProps.current!.hostId).toBeNull();
+      act(() => lastThreadScopeRowProps.current!.onChangeHostId(2));
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].hostId).toBe(2);
+      expect(getByTestId("thread-scope-row-stub").dataset.hostId).toBe("2");
+    });
+
+    it("an existing workspace shows its own device; picking another starts a new workspace for its project", () => {
+      seedActiveProjectWorkspace({ host_id: 3 });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-active",
+      });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      expect(lastThreadScopeRowProps.current!.hostId).toBe(3);
+
+      act(() => lastThreadScopeRowProps.current!.onChangeHostId(2));
+      const next = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(next.target).toEqual({ kind: "project", projectPath: "/projects/active" });
+      expect(next.hostId).toBe(2);
+      expect(lastThreadScopeRowProps.current!.hostId).toBe(2);
+    });
+
+    it("a new worktree from a device workspace is created on that device", async () => {
+      seedActiveProjectWorkspace({ host_id: 3, cwd: "/home/deus/work/active" });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-active",
+      });
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, {
+        checkoutMode: "worktree",
+      });
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "fix it");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const { container, findByText } = renderSurface();
+
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      const sent = vi.mocked(materializeAndSend).mock.calls[0][0];
+      expect(sent.target).toEqual({ kind: "project", projectPath: "/projects/active" });
+      expect(sent.hostId).toBe(3);
+      expect(await findByText("Setting up on the device…")).toBeInTheDocument();
+      // The stored draft keeps its target, so a retry takes the same path.
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].target).toEqual({
+        kind: "existing_workspace",
+        workspaceId: "ws-active",
+      });
+    });
+
+    it("the current checkout of a device workspace sends into that workspace", async () => {
+      seedActiveProjectWorkspace({ host_id: 3, cwd: "/home/deus/work/active" });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-active",
+      });
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, {
+        checkoutMode: "current",
+      });
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "fix it");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const { container } = renderSurface();
+
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      const call = vi.mocked(materializeAndSend).mock.calls[0];
+      expect(call[0].target).toEqual({ kind: "existing_workspace", workspaceId: "ws-active" });
+      expect(call[2]).toBe("/home/deus/work/active");
+      expect(call[8]).toBeNull();
+    });
+
+    it("changing the location of a device workspace draft keeps its device", () => {
+      seedActiveProjectWorkspace({ host_id: 3 });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-active",
+      });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      expect(lastThreadScopeRowProps.current!.hostId).toBe(3);
+
+      act(() =>
+        lastProjectScopePopoverProps.current!.onChangeTarget({
+          kind: "project",
+          projectPath: "/projects/bar",
+        }),
+      );
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].hostId).toBe(3);
+      expect(lastThreadScopeRowProps.current!.hostId).toBe(3);
+    });
+
+    it("a home draft on a device is not re-targeted to the active local workspace", async () => {
+      seedActiveProjectWorkspace();
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 2 });
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "check disk");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const { container, findByText } = renderSurface();
+
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId].target,
+      ).toEqual({ kind: "home" });
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      const sent = vi.mocked(materializeAndSend).mock.calls[0][0];
+      expect(sent.target).toEqual({ kind: "home" });
+      expect(sent.hostId).toBe(2);
+      // No device list loaded, so the status line falls back to a generic name.
+      expect(await findByText("Setting up on the device…")).toBeInTheDocument();
+    });
+
+    it("names the device in the pending status line", async () => {
+      useHostsStore.setState({ hosts: [host(2, "zeus")], loaded: true, error: null });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 2 });
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const { container, findByText } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      expect(await findByText("Setting up on zeus…")).toBeInTheDocument();
+    });
+
+    it("drops a device that no longer exists once the device list has loaded", async () => {
+      useHostsStore.setState({ hosts: [host(2, "zeus")], loaded: true, error: null });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 9 });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      await vi.waitFor(() =>
+        expect(
+          useChatDraftStore.getState().draftsById[draft.draftId].hostId,
+        ).toBeNull(),
+      );
+    });
+
+    it("keeps the device while the device list failed to load", () => {
+      useHostsStore.setState({ hosts: [], loaded: true, error: "db down" });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 9 });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].hostId).toBe(9);
     });
   });
 

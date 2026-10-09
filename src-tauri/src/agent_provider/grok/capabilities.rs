@@ -126,7 +126,7 @@ pub async fn probe_grok_health(binary_path: &Path) -> Result<GrokHealthProbe, Ha
         let version = string_at_pointer(&initialize, "/_meta/agentVersion");
         // `grok_auth_method` accepts only an advertised non-browser method,
         // including future headless methods selected by the CLI itself.
-        let method_id = grok_auth_method(&initialize, &HashMap::new());
+        let method_id = grok_auth_method(&initialize, &HashMap::new(), true);
         let Some(method_id) = method_id else {
             return Ok(GrokHealthProbe {
                 authenticated: false,

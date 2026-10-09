@@ -96,6 +96,9 @@ pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
         // security default.
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
+        // `--` ends option parsing, so a target that starts with `-`
+        // (it can arrive via account sync) is a hostname, never a flag.
+        "--".into(),
         ssh_target.into(),
         // Combined probe: print `uname -sm` then call
         // `codemux-remote version` if available. The remote-side
@@ -127,11 +130,14 @@ pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
         // repair"). `2>/dev/null` keeps the shell's exec-error noise
         // out of the stream. The genuinely-absent branch
         // (`NOT_INSTALLED`) is untouched.
+        // The `~/.local/bin` copy is checked first: it is the one bootstrap
+        // installs and every device command runs (`codemux_remote_command`),
+        // so an older copy elsewhere on PATH must not decide the version.
         "printf 'UNAME: ' ; uname -sm ; \
-         if command -v codemux-remote >/dev/null 2>&1 ; then \
-           printf 'CMR: ' ; codemux-remote version 2>/dev/null || printf 'BROKEN\\n' ; \
-         elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
+         if [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
            printf 'CMR: ' ; \"$HOME/.local/bin/codemux-remote\" version 2>/dev/null || printf 'BROKEN\\n' ; \
+         elif command -v codemux-remote >/dev/null 2>&1 ; then \
+           printf 'CMR: ' ; codemux-remote version 2>/dev/null || printf 'BROKEN\\n' ; \
          else \
            printf 'CMR: NOT_INSTALLED\\n' ; \
          fi"
@@ -245,8 +251,11 @@ mod tests {
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=8"));
         assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
-        assert!(argv.iter().any(|a| a == "zeus@10.0.0.5"));
+        // The target follows `--` so it can never be read as an option.
+        let dd = argv.iter().position(|a| a == "--").expect("`--` before the target");
+        assert_eq!(argv[dd + 1], "zeus@10.0.0.5");
         // The remote command must be the LAST positional arg.
+        assert_eq!(argv.len(), dd + 3);
         assert!(argv.last().unwrap().contains("uname -sm"));
         assert!(argv.last().unwrap().contains("codemux-remote"));
     }

@@ -1,9 +1,9 @@
 //! Background host-inventory poller.
 //!
-//! Sister task to `hosts_upgrade.rs`. Where the upgrade poller keeps
-//! every host's `codemux-remote` binary at the same version as the
-//! desktop app, this poller keeps every host's *workspace inventory*
-//! visible to the user's account.
+//! Sister task to `hosts_upgrade.rs`. Where that module keeps every
+//! host's `codemux-remote` binary at the same version as the desktop app
+//! (and this poller is one of its triggers), this poller keeps every
+//! host's *workspace inventory* visible to the user's account.
 //!
 //! ## Why this exists
 //!
@@ -16,11 +16,15 @@
 //! desktop ever knew about it — so no desktop ever published it to the
 //! cloud, so no other device ever saw it.
 //!
-//! This poller closes that gap. On a 60-second cadence, for every
-//! configured host that has synced its identity (`server_id`):
+//! This poller closes that gap. On a 60-second cadence (sooner when
+//! `request_poll` wakes it), for every configured host, all at once so
+//! one dead host doesn't hold up the rest:
 //!
 //! 1. Probe the host is reachable AND has the right `codemux-remote`
-//!    binary installed (re-using `ssh::probe::probe_host`).
+//!    binary installed (re-using `ssh::probe::probe_host`). A working
+//!    helper older than this build is upgraded in the background
+//!    (`hosts_upgrade::auto_upgrade_for`), and the card says "Updating"
+//!    meanwhile; a current one gets its Claude runtime checked.
 //! 2. SSH and run `codemux-remote workspace list` — a thin CLI we
 //!    added that reads the daemon's SQLite registry and prints
 //!    `{"host_id":"…","workspaces":[…]}` on stdout, plus the host facts
@@ -28,7 +32,8 @@
 //!    The same `~/.local/bin/codemux-remote` PATH fallback the probe
 //!    uses applies here, because non-interactive SSH on Arch/Ubuntu/etc.
 //!    doesn't source `~/.profile`.
-//! 3. Reconcile the result into `workspaces_sync`:
+//! 3. Reconcile the result into `workspaces_sync` (only for hosts that
+//!    have synced their identity, `server_id`):
 //!    - Each remote workspace gets a sibling-only row keyed by
 //!      `(host_server_id, origin_uid=remote_workspace.id)`.
 //!    - Repeated polls UPDATE in place (the row's cloud `server_id`
@@ -53,14 +58,25 @@
 //!
 //! - host offline / SSH refused / probe timed out → recorded as
 //!   unreachable with the reason, continue
-//! - host reachable but binary missing, inventory failed or timed out
-//!   → recorded as seen-with-error (the card stays "online"), continue
-//!   (we don't try to install it; that's the user's explicit consent
-//!   in Settings → Hosts)
-//! - host has no `server_id` yet (host record hasn't synced to the
-//!   account) → skipped entirely, not even probed: we'd have no stable
+//! - host reachable but binary missing, damaged or outdated → recorded
+//!   as seen-with-error (the card asks for setup), continue (we don't
+//!   try to install it; that's the user's explicit consent in Settings
+//!   → Devices). An outdated binary is upgraded in the background, at
+//!   most once per ~10 minutes after a failed attempt, and still answers
+//!   `workspace list` meanwhile, so its workspaces and facts are read as
+//!   usual.
+//! - host reachable with a current binary but the inventory failed or
+//!   timed out → logged, and the host still counts as online with the
+//!   facts from its last good read: setup wouldn't fix a dropped
+//!   session or a slow walk
+//! - host removed or re-pointed at another target while its probe ran
+//!   → the result is dropped; it describes the old target, and the
+//!   edit already probed the new one
+//! - host has no `server_id` yet (signed out, or the host record hasn't
+//!   synced to the account) → probed and its status recorded like any
+//!   other, but its inventory is not reconciled: we'd have no stable
 //!   identity to tag the rows with, and the host_sync loop is the one
-//!   in charge of fixing that. Its card reads "not checked yet".
+//!   in charge of fixing that.
 //! - JSON parse failure → log the host + the first 200 chars of
 //!   stdout, continue
 //! - daemon predates the host facts → they are simply absent from the
@@ -88,13 +104,17 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
+use futures_util::FutureExt;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::process::Command;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use crate::database::{DatabaseStore, HostRecord};
 use crate::hosts_status::{HostFacts, HostStatusStore, Observation, HOSTS_STATUS_CHANGED_EVENT};
+use crate::hosts_upgrade::{auto_upgrade_for, is_older, AutoUpgrade};
 use crate::remote::host_status::{DISK_WALK_BUDGET, SKIP_DISK_ENV};
 use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 
@@ -117,6 +137,11 @@ const INVENTORY_BUDGET: Duration = Duration::from_secs(20);
 /// walk is the one expensive piece of the envelope.
 const DISK_REFRESH_SECS: i64 = 5 * 60;
 
+/// Wakes the poll loop before its next tick. A request that arrives
+/// while a pass is running leaves a permit, so the loop runs again
+/// right after it.
+static POLL_REQUESTS: Notify = Notify::const_new();
+
 /// Spawn the background inventory poller. Must be called once during
 /// app setup. Like `hosts_upgrade`, it delays a few seconds so the
 /// app's initial paint isn't competing with us for resources.
@@ -127,22 +152,99 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>) {
         // is mid-upgrade has already become consistent before we
         // start polling its registry. Otherwise we'd race against
         // the upgrade and might briefly see an empty/half-migrated
-        // inventory.
+        // inventory. `request_poll` doesn't cut this short.
         tokio::time::sleep(Duration::from_secs(12)).await;
         loop {
+            // Requests made before this pass starts are served by it.
+            let _ = POLL_REQUESTS.notified().now_or_never();
             run_once(&app).await;
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                _ = POLL_REQUESTS.notified() => {}
+            }
         }
     });
 }
 
-/// The hosts a tick may touch: only those that have synced their
-/// identity. Without a `server_id` we can't tag inventory rows with a
-/// stable cross-device host identity, and any rows we created would
-/// never match up against `WorkspaceSnapshot.host_id` on this device or
-/// any other — so we don't open a connection to such a host at all.
-pub fn hosts_to_poll(hosts: &[HostRecord]) -> Vec<&HostRecord> {
-    hosts.iter().filter(|h| h.server_id.is_some()).collect()
+/// Ask the poller for a pass now rather than at the next tick, e.g.
+/// after the host sync pulled devices this install hasn't seen.
+pub fn request_poll() {
+    POLL_REQUESTS.notify_one();
+}
+
+/// Probe one host now and push its status to the UI, so a device that
+/// was just added or edited doesn't wait for the next tick.
+pub async fn refresh_host<R: Runtime>(app: AppHandle<R>, host_id: i64) {
+    let Some(db) = app.try_state::<DatabaseStore>() else {
+        return;
+    };
+    let Some(host) = db.list_hosts().into_iter().find(|h| h.id == host_id) else {
+        return;
+    };
+    let status = app.state::<HostStatusStore>();
+    if observe_host(&app, &db, &status, &host).await {
+        emit_status(&app, &db, &status);
+    }
+}
+
+/// Record what a connection test or install learned about a host and
+/// push it to the UI at once.
+pub(crate) fn record_observation<R: Runtime>(
+    app: &AppHandle<R>,
+    host_id: i64,
+    observation: &Observation,
+) {
+    let (Some(db), Some(status)) = (
+        app.try_state::<DatabaseStore>(),
+        app.try_state::<HostStatusStore>(),
+    ) else {
+        return;
+    };
+    status.apply(host_id, observation);
+    if !matches!(observation, Observation::Unreachable { .. }) {
+        if let Err(e) = db.record_host_seen(host_id, &Utc::now().to_rfc3339(), None) {
+            eprintln!("[hosts_inventory] persist status for host {host_id}: {e}");
+        }
+    }
+    emit_status(app, &db, &status);
+}
+
+/// What a probe alone says about a host. Shared with the connection
+/// test so a device reads the same in Settings, the picker and here.
+/// A helper that is missing, broken or older than this build needs setup
+/// before threads can run there. A newer one, from a newer desktop
+/// sharing the device, already does everything this build asks of it.
+pub(crate) fn probe_observation(outcome: &ProbeOutcome) -> Observation {
+    let ours = env!("CARGO_PKG_VERSION");
+    match outcome {
+        ProbeOutcome::Unreachable { reason } => Observation::Unreachable {
+            reason: reason.clone(),
+        },
+        ProbeOutcome::Reachable {
+            codemux_remote_version: Some(version),
+            ..
+        } if !is_older(version, ours) => Observation::Alive,
+        ProbeOutcome::Reachable {
+            codemux_remote_version: Some(version),
+            ..
+        } => Observation::Degraded {
+            reason: format!(
+                "Codemux on this device is out of date (v{version}, this app is v{ours})"
+            ),
+            facts: None,
+        },
+        ProbeOutcome::Reachable {
+            binary_present_but_broken: true,
+            ..
+        } => Observation::Degraded {
+            reason: "Codemux on this device is damaged and needs to be set up again".into(),
+            facts: None,
+        },
+        ProbeOutcome::Reachable { .. } => Observation::Degraded {
+            reason: "Codemux isn't set up on this device yet".into(),
+            facts: None,
+        },
+    }
 }
 
 /// Whether this tick should ask the host to walk its workspace
@@ -162,74 +264,133 @@ pub fn disk_walk_due(disk_measured_at: Option<&str>, now: DateTime<Utc>) -> bool
 /// One pass over every configured host. Public so tests / debug
 /// surfaces can drive a single cycle without the loop.
 pub async fn run_once<R: Runtime>(app: &AppHandle<R>) {
-    let hosts = match app.try_state::<DatabaseStore>() {
-        Some(state) => state.list_hosts(),
-        None => {
-            eprintln!(
-                "[hosts_inventory] database state unavailable; skipping inventory poll"
-            );
-            return;
-        }
+    let Some(db) = app.try_state::<DatabaseStore>() else {
+        eprintln!("[hosts_inventory] database state unavailable; skipping inventory poll");
+        return;
     };
+    let hosts = db.list_hosts();
     if hosts.is_empty() {
         return;
     }
-
-    let db = app.state::<DatabaseStore>();
     let status = app.state::<HostStatusStore>();
-    let mut any_changed = false;
-    for host in hosts_to_poll(&hosts) {
-        let server_id = host
-            .server_id
-            .as_deref()
-            .expect("hosts_to_poll only yields synced hosts");
-        let now = Utc::now();
-        let walk_disk = disk_walk_due(host.disk_measured_at.as_deref(), now);
-        let observation = match poll_one_host(&host.ssh_target, server_id, &db, walk_disk).await {
-            Ok(poll) => {
-                if poll.stats.changed() {
-                    eprintln!(
-                        "[hosts_inventory] {} synced ({} discovered, {} updated, {} disappeared)",
-                        host.name, poll.stats.inserted, poll.stats.updated, poll.stats.soft_deleted
-                    );
-                }
-                Observation::Reachable { facts: poll.facts }
-            }
-            Err(PollError::Unreachable(reason)) => {
-                eprintln!("[hosts_inventory] {} unreachable: {reason}", host.name);
-                Observation::Unreachable { reason }
-            }
-            Err(PollError::Degraded(reason)) => {
-                eprintln!("[hosts_inventory] {} skipped: {reason}", host.name);
-                Observation::Degraded { reason }
-            }
-        };
+    // Concurrent, so one offline host's probe timeout doesn't delay
+    // every other card.
+    let changed = join_all(
+        hosts
+            .iter()
+            .map(|host| observe_host(app, &db, &status, host)),
+    )
+    .await;
+    if changed.contains(&true) {
+        emit_status(app, &db, &status);
+    }
+}
 
-        if status.apply(host.id, &observation) {
-            any_changed = true;
+/// Poll one host and record the outcome, then start what the probe calls
+/// for: an upgrade of an older helper, or a check of a current device's
+/// Claude runtime. Returns whether its card would look different.
+async fn observe_host<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    status: &HostStatusStore,
+    host: &HostRecord,
+) -> bool {
+    let now = Utc::now();
+    let walk_disk = disk_walk_due(host.disk_measured_at.as_deref(), now);
+    // Step 1: probe so we don't spend the inventory budget on a host
+    // that's offline or doesn't have the binary.
+    let probe = probe_host(ProbeOptions::new(&host.ssh_target)).await;
+    let (observation, seen_disk) = poll_one_host(host, db, &probe, walk_disk).await;
+    // Only for the target this probe reached; a device removed or
+    // re-pointed meanwhile was already probed at its new target.
+    let follow_up = match current_record(db, host) {
+        Some(_) => auto_upgrade_for(&probe, &host.ssh_target),
+        None => AutoUpgrade::Nothing,
+    };
+    let observation = if follow_up.updating() {
+        updating(observation)
+    } else {
+        observation
+    };
+    let changed = record_poll(db, status, host, &observation, seen_disk, now);
+    follow_up.start(app, host);
+    changed
+}
+
+/// While the helper is being upgraded the card says so, rather than
+/// asking the user to set the device up. The frontend keys "Updating…" off
+/// this text's "Updating Codemux" prefix (`isUpdating` in
+/// `src/lib/devices-attention.ts`).
+fn updating(observation: Observation) -> Observation {
+    match observation {
+        Observation::Degraded { facts, .. } => Observation::Degraded {
+            reason: format!(
+                "Updating Codemux on this device to v{}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            facts,
+        },
+        other => other,
+    }
+}
+
+/// The host's record as it is now, if it is still configured with the
+/// target `host` was read with. A probe can take seconds; a device
+/// removed or re-pointed meanwhile has already been probed at its new
+/// target (`refresh_host`), and what this probe saw belongs to the old
+/// one.
+fn current_record(db: &DatabaseStore, host: &HostRecord) -> Option<HostRecord> {
+    db.list_hosts()
+        .into_iter()
+        .find(|h| h.id == host.id && h.ssh_target == host.ssh_target)
+}
+
+/// Fold one poll's outcome into the live status and the host's row,
+/// unless the device changed while it ran. Returns whether its card
+/// would look different.
+fn record_poll(
+    db: &DatabaseStore,
+    status: &HostStatusStore,
+    host: &HostRecord,
+    observation: &Observation,
+    seen_disk: Option<u64>,
+    now: DateTime<Utc>,
+) -> bool {
+    if current_record(db, host).is_none() {
+        return false;
+    }
+    match observation {
+        Observation::Unreachable { reason } => {
+            eprintln!("[hosts_inventory] {} unreachable: {reason}", host.name);
         }
-        // The host answered: stamp last_seen_at (and the disk figure
-        // when the envelope carried one) on its row. A new disk number
-        // changes the card even though the live bits didn't move.
-        let seen_disk = match &observation {
-            Observation::Unreachable { .. } => continue,
-            Observation::Degraded { .. } => None,
-            Observation::Reachable { facts } => facts.disk_bytes,
-        };
-        if seen_disk.is_some() && seen_disk != host.disk_bytes {
-            any_changed = true;
+        Observation::Degraded { reason, .. } => {
+            eprintln!("[hosts_inventory] {} needs attention: {reason}", host.name);
         }
-        if let Err(e) = db.record_host_seen(host.id, &now.to_rfc3339(), seen_disk) {
-            eprintln!("[hosts_inventory] persist status for {}: {e}", host.name);
-        }
+        Observation::Reachable { .. } | Observation::Alive => {}
     }
 
-    if any_changed {
-        // Re-read so the payload carries the columns just stamped.
-        let payload = status.views_for(&db.list_hosts());
-        if let Err(e) = app.emit(HOSTS_STATUS_CHANGED_EVENT, payload) {
-            eprintln!("[hosts_inventory] emit {HOSTS_STATUS_CHANGED_EVENT}: {e}");
-        }
+    let mut changed = status.apply(host.id, observation);
+    if matches!(observation, Observation::Unreachable { .. }) {
+        return changed;
+    }
+    // The host answered: stamp last_seen_at (and the disk figure when
+    // the envelope carried one) on its row. A new disk number changes
+    // the card even though the live bits didn't move.
+    if seen_disk.is_some() && seen_disk != host.disk_bytes {
+        changed = true;
+    }
+    if let Err(e) = db.record_host_seen(host.id, &now.to_rfc3339(), seen_disk) {
+        eprintln!("[hosts_inventory] persist status for {}: {e}", host.name);
+    }
+    changed
+}
+
+/// Send every host's current status to the UI.
+fn emit_status<R: Runtime>(app: &AppHandle<R>, db: &DatabaseStore, status: &HostStatusStore) {
+    // Re-read so the payload carries the columns just stamped.
+    let payload = status.views_for(&db.list_hosts());
+    if let Err(e) = app.emit(HOSTS_STATUS_CHANGED_EVENT, payload) {
+        eprintln!("[hosts_inventory] emit {HOSTS_STATUS_CHANGED_EVENT}: {e}");
     }
 }
 
@@ -250,61 +411,99 @@ impl PollStats {
     }
 }
 
-/// Everything one successful tick learned about a host.
-struct HostPoll {
-    stats: PollStats,
-    facts: HostFacts,
-}
-
-/// Why a tick fell short, split by what the Devices card should say.
-enum PollError {
-    /// SSH never connected.
-    Unreachable(String),
-    /// SSH connected but the tick could not complete (binary missing,
-    /// fetch failed or timed out, output unparseable).
-    Degraded(String),
-}
-
+/// One host's tick after its probe: what its card should say and, when
+/// the envelope carried one, a fresh disk figure.
 async fn poll_one_host(
-    ssh_target: &str,
-    host_server_id: &str,
+    host: &HostRecord,
     db: &DatabaseStore,
+    outcome: &ProbeOutcome,
     walk_disk: bool,
-) -> Result<HostPoll, PollError> {
-    // Step 1: probe so we don't spend the inventory budget on a
-    // host that's offline or doesn't have the binary. Re-uses the
-    // same fallback-aware command the test-connection flow uses.
-    match probe_host(ProbeOptions::new(ssh_target)).await {
+) -> (Observation, Option<u64>) {
+    let probed = probe_observation(outcome);
+    // An outdated helper still answers `workspace list`, so its
+    // workspaces stay visible while the card asks for setup.
+    let installed = matches!(
+        outcome,
         ProbeOutcome::Reachable {
             codemux_remote_version: Some(_),
             ..
-        } => {}
-        ProbeOutcome::Reachable {
-            codemux_remote_version: None,
-            ..
-        } => {
-            return Err(PollError::Degraded(
-                "codemux-remote missing on this host (use Settings → Hosts → Install)".into(),
-            ));
         }
-        ProbeOutcome::Unreachable { reason } => {
-            return Err(PollError::Unreachable(reason));
-        }
+    );
+    if !installed {
+        return (probed, None);
     }
 
     // Step 2: fetch the envelope (inventory + host facts) in one session.
-    let stdout = fetch_inventory(ssh_target, walk_disk)
-        .await
-        .map_err(PollError::Degraded)?;
-    let parsed = parse_inventory_json(&stdout)
-        .map_err(|e| PollError::Degraded(format!("parse inventory: {e}")))?;
+    let parsed = match fetch_inventory(&host.ssh_target, walk_disk).await.and_then(|stdout| {
+        parse_inventory_json(&stdout).map_err(|e| format!("parse inventory: {e}"))
+    }) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            // The probe already answered, so the host is up and the probe
+            // alone says whether it needs setup. A failed read (a dropped
+            // second session, a timeout) isn't something setup would fix;
+            // the facts from the last good read stand.
+            eprintln!("[hosts_inventory] {} inventory failed: {reason}", host.name);
+            return (probed, None);
+        }
+    };
 
     // Step 3: reconcile.
-    let stats = reconcile_host_inventory(db, host_server_id, &parsed);
-    Ok(HostPoll {
-        stats,
-        facts: parsed.facts(),
-    })
+    let stats = reconcile_if_current(db, host, &parsed);
+    if stats.changed() {
+        eprintln!(
+            "[hosts_inventory] {} synced ({} discovered, {} updated, {} disappeared)",
+            host.name, stats.inserted, stats.updated, stats.soft_deleted
+        );
+    }
+    (with_inventory_facts(probed, &parsed), parsed.disk_bytes)
+}
+
+/// Combine the probe's verdict with what the envelope reported. An
+/// outdated helper still needs setup, but the facts it reports (a
+/// running Remote Control server) are as true as a current one's.
+fn with_inventory_facts(probed: Observation, inventory: &InventoryEnvelope) -> Observation {
+    match probed {
+        Observation::Alive => Observation::Reachable {
+            facts: inventory.facts(),
+        },
+        Observation::Degraded { reason, .. } => Observation::Degraded {
+            reason,
+            facts: Some(inventory.facts()),
+        },
+        other => other,
+    }
+}
+
+/// Reconcile an inventory read from `host`'s target, unless the device
+/// was removed or re-pointed while it was fetched: those rows belong to
+/// whatever machine the old target reached. Tags rows with the current
+/// `server_id`, which the host sync may have assigned meanwhile.
+fn reconcile_if_current(
+    db: &DatabaseStore,
+    host: &HostRecord,
+    inventory: &InventoryEnvelope,
+) -> PollStats {
+    match current_record(db, host) {
+        Some(current) => apply_inventory(db, current.server_id.as_deref(), inventory),
+        None => PollStats::default(),
+    }
+}
+
+/// Reconcile a host's inventory only once it has synced its identity.
+/// Without a `server_id` there is no stable cross-device tag for the
+/// rows, and they would never match `WorkspaceSnapshot.host_id` on this
+/// device or any other, so an unsynced host is probed for its status
+/// but writes no rows until the host sync assigns one.
+pub fn apply_inventory(
+    db: &DatabaseStore,
+    host_server_id: Option<&str>,
+    inventory: &InventoryEnvelope,
+) -> PollStats {
+    match host_server_id {
+        Some(server_id) => reconcile_host_inventory(db, server_id, inventory),
+        None => PollStats::default(),
+    }
 }
 
 /// SSH into the host and capture `codemux-remote workspace list`
@@ -369,6 +568,8 @@ pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64, walk_disk: bool
         format!("ConnectTimeout={timeout_secs}"),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
+        // Ends option parsing: a target can never be read as a flag.
+        "--".into(),
         ssh_target.into(),
         // Same PATH-fallback story as the probe (see ssh/probe.rs):
         // bootstrap installs to ~/.local/bin, but non-interactive
@@ -665,32 +866,192 @@ mod tests {
         }
     }
 
-    fn host(id: i64, server_id: Option<&str>) -> HostRecord {
-        HostRecord {
-            id,
-            server_id: server_id.map(Into::into),
-            name: format!("host-{id}"),
-            ssh_target: format!("user@host-{id}"),
-            created_at: String::new(),
-            updated_at: String::new(),
-            deleted_at: None,
-            dirty: false,
-            last_seen_at: None,
-            disk_bytes: None,
-            disk_measured_at: None,
+    fn reachable(version: Option<&str>, broken: bool) -> ProbeOutcome {
+        ProbeOutcome::Reachable {
+            codemux_remote_version: version.map(Into::into),
+            uname: Some("Linux x86_64".into()),
+            binary_present_but_broken: broken,
         }
     }
 
-    // ── host selection / disk cadence ───────────────────────────
+    // ── status / reconcile gating / disk cadence ────────────────
 
     #[test]
-    fn hosts_without_server_id_are_never_polled() {
-        // The no-network rule: an unsynced host gets no probe and no
-        // SSH session. Its card shows "not checked yet" until the host
-        // sync loop assigns a server_id.
-        let hosts = vec![host(1, None), host(2, Some("srv-2")), host(3, None)];
-        let polled: Vec<i64> = hosts_to_poll(&hosts).iter().map(|h| h.id).collect();
-        assert_eq!(polled, vec![2]);
+    #[serial]
+    fn hosts_without_server_id_get_status_but_write_no_rows() {
+        // Every host is probed so its dot is live even when signed out,
+        // but only a synced host's inventory lands in workspaces_sync:
+        // without a server_id the rows would have no cross-device tag.
+        let db = fresh_db();
+        let envelope = make_envelope(vec![make_remote("uid-1", "alpha", Some("main"))]);
+
+        let unsynced = apply_inventory(&db, None, &envelope);
+        assert!(!unsynced.changed());
+        assert!(db.list_workspaces_sync_for_sync().is_empty());
+
+        let synced = apply_inventory(&db, Some("srv-2"), &envelope);
+        assert_eq!(synced.inserted, 1);
+        assert_eq!(db.list_remote_discovered_for_host("srv-2").len(), 1);
+    }
+
+    #[test]
+    fn probe_observation_maps_each_outcome() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(probe_observation(&reachable(Some(ours), false)), Observation::Alive);
+        assert_eq!(
+            probe_observation(&reachable(Some("999.0.0"), false)),
+            Observation::Alive,
+            "a newer helper from a newer desktop works here and is never downgraded"
+        );
+        assert_eq!(
+            probe_observation(&ProbeOutcome::Unreachable {
+                reason: "Connection refused".into()
+            }),
+            Observation::Unreachable {
+                reason: "Connection refused".into()
+            }
+        );
+        let Observation::Degraded { reason, facts: None } =
+            probe_observation(&reachable(Some("0.0.1"), false))
+        else {
+            panic!("an outdated helper needs setup");
+        };
+        assert!(reason.contains("out of date") && reason.contains("v0.0.1"), "{reason}");
+        let Observation::Degraded { reason, .. } = probe_observation(&reachable(None, false)) else {
+            panic!("a missing helper needs setup");
+        };
+        assert!(reason.contains("isn't set up"), "{reason}");
+        let Observation::Degraded { reason, .. } = probe_observation(&reachable(None, true)) else {
+            panic!("a broken helper needs setup");
+        };
+        assert!(reason.contains("damaged"), "{reason}");
+    }
+
+    #[test]
+    fn an_upgrading_helper_says_so_instead_of_asking_for_setup() {
+        let facts = Some(HostFacts {
+            disk_bytes: Some(3),
+            remote_control_serving: Some(true),
+        });
+        let outdated = Observation::Degraded {
+            reason: "out of date".into(),
+            facts,
+        };
+        let Observation::Degraded {
+            reason,
+            facts: kept,
+        } = updating(outdated)
+        else {
+            panic!("still not ready until the upgrade lands");
+        };
+        assert!(reason.starts_with("Updating Codemux"), "{reason}");
+        assert_eq!(kept, facts, "the envelope's facts stand");
+        let down = Observation::Unreachable {
+            reason: "down".into(),
+        };
+        assert_eq!(updating(down.clone()), down);
+        assert_eq!(updating(Observation::Alive), Observation::Alive);
+    }
+
+    #[test]
+    fn outdated_helper_keeps_the_facts_its_envelope_reported() {
+        let mut envelope = make_envelope(Vec::new());
+        envelope.remote_control_serving = Some(true);
+        envelope.disk_bytes = Some(9);
+
+        let outdated = probe_observation(&reachable(Some("0.0.1"), false));
+        let Observation::Degraded { reason, facts } = with_inventory_facts(outdated, &envelope)
+        else {
+            panic!("an outdated helper still needs setup");
+        };
+        assert!(reason.contains("out of date"), "{reason}");
+        assert_eq!(facts, Some(envelope.facts()));
+        assert_eq!(
+            with_inventory_facts(Observation::Alive, &envelope),
+            Observation::Reachable {
+                facts: envelope.facts()
+            }
+        );
+
+        let status = HostStatusStore::default();
+        let outdated = probe_observation(&reachable(Some("0.0.1"), false));
+        status.apply(1, &with_inventory_facts(outdated, &envelope));
+        assert!(
+            status.get(1).unwrap().remote_control_serving,
+            "a running server shows even before the helper is upgraded"
+        );
+    }
+
+    #[test]
+    fn failed_inventory_read_on_a_current_helper_stays_online() {
+        // A failed read returns the probe's own verdict. For a current
+        // helper that is `Alive`: online, no setup prompt, and the facts
+        // from the last good read stand.
+        let db = fresh_db();
+        let host = db.insert_host("box", "u@box").unwrap();
+        let status = HostStatusStore::default();
+        let facts = HostFacts {
+            disk_bytes: Some(1),
+            remote_control_serving: Some(true),
+        };
+        record_poll(&db, &status, &host, &Observation::Reachable { facts }, Some(1), Utc::now());
+
+        let probed = probe_observation(&reachable(Some(env!("CARGO_PKG_VERSION")), false));
+        record_poll(&db, &status, &host, &probed, None, Utc::now());
+        let live = status.get(host.id).unwrap();
+        assert!(live.reachable);
+        assert!(live.last_error.is_none(), "not 'Needs setup'");
+        assert!(live.remote_control_serving);
+        let row = db.list_hosts().into_iter().find(|h| h.id == host.id).unwrap();
+        assert_eq!(row.disk_bytes, Some(1), "the last disk figure stands");
+    }
+
+    #[test]
+    fn poll_results_for_a_removed_or_re_pointed_host_are_dropped() {
+        let db = fresh_db();
+        let status = HostStatusStore::default();
+        let down = Observation::Unreachable {
+            reason: "old target timed out".into(),
+        };
+
+        let edited = db.insert_host("box", "u@typo").unwrap();
+        db.update_host(edited.id, "box", "u@fixed").unwrap();
+        status.apply(edited.id, &Observation::Alive);
+        assert!(
+            !record_poll(&db, &status, &edited, &down, None, Utc::now()),
+            "a probe of the old target is not news"
+        );
+        assert!(status.get(edited.id).unwrap().reachable, "the fresh result stands");
+
+        let removed = db.insert_host("gone", "u@gone").unwrap();
+        db.delete_host(removed.id).unwrap();
+        assert!(!record_poll(&db, &status, &removed, &Observation::Alive, None, Utc::now()));
+        assert!(status.get(removed.id).is_none(), "no status for a removed device");
+
+        let current = db.insert_host("lab", "u@lab").unwrap();
+        assert!(record_poll(&db, &status, &current, &down, None, Utc::now()));
+        assert!(!status.get(current.id).unwrap().reachable);
+    }
+
+    #[test]
+    #[serial]
+    fn inventory_is_reconciled_only_for_the_target_it_was_read_from() {
+        let db = fresh_db();
+        let envelope = make_envelope(vec![make_remote("uid-1", "alpha", Some("main"))]);
+
+        // Re-pointed mid-fetch: the rows belong to the old machine.
+        let edited = db.insert_host("box", "u@old").unwrap();
+        db.mark_host_synced(&edited, Some("srv-box")).unwrap();
+        let snapshot = db.list_hosts().into_iter().find(|h| h.id == edited.id).unwrap();
+        db.update_host(edited.id, "box", "u@new").unwrap();
+        assert!(!reconcile_if_current(&db, &snapshot, &envelope).changed());
+        assert!(db.list_remote_discovered_for_host("srv-box").is_empty());
+
+        // Synced mid-fetch: the rows take the server_id it was just given.
+        let fresh = db.insert_host("lab", "u@lab").unwrap();
+        db.mark_host_synced(&fresh, Some("srv-lab")).unwrap();
+        assert_eq!(reconcile_if_current(&db, &fresh, &envelope).inserted, 1);
+        assert_eq!(db.list_remote_discovered_for_host("srv-lab").len(), 1);
     }
 
     #[test]
@@ -724,7 +1085,8 @@ mod tests {
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=15"));
         assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
-        assert!(argv.iter().any(|a| a == "user@10.0.0.7"));
+        let dd = argv.iter().position(|a| a == "--").expect("`--` before the target");
+        assert_eq!(argv[dd + 1], "user@10.0.0.7");
         let cmd = argv.last().unwrap();
         assert!(
             cmd.contains("command -v codemux-remote"),

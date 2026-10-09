@@ -40,7 +40,9 @@ vi.mock("@/tauri/commands", () => ({
   workspacePullBack: vi.fn().mockResolvedValue({ ok: true, message: "" }),
 }));
 
-vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
+// Per-test device list; reset in `beforeEach`.
+let hosts: { id: number; name: string }[] = [];
+vi.mock("@/stores/hosts-store", () => ({ useHosts: () => hosts }));
 
 // These tests exercise the row's actions and appearance. Keep userEvent's
 // incidental pointer/focus events from starting real Radix hover timers that
@@ -161,6 +163,7 @@ function metaLine(container: HTMLElement) {
 
 beforeEach(() => {
   vi.mocked(activateWorkspace).mockClear();
+  hosts = [];
   useSidebarDensityStore.setState({
     statusSince: {},
     settledAt: {},
@@ -839,6 +842,37 @@ describe("SidebarInboxCard — running-process indicator", () => {
     });
     expect(trailing.contains(indicator)).toBe(true);
     expect(trailing.firstElementChild).toBe(indicator);
+  });
+});
+
+describe("SidebarInboxCard — device label", () => {
+  it("names the device at the right end of the meta line", () => {
+    hosts = [{ id: 7, name: "zeus" }];
+    const { container } = renderCard({
+      workspace: makeWorkspace({ host_id: 7, git_branch: "feat/remote" }),
+    });
+    const line = metaLine(container);
+    const label = within(line).getByRole("img", { name: "Runs on zeus" });
+
+    expect(label).toHaveAttribute("title", "Runs on zeus");
+    expect(label).toHaveTextContent("zeus");
+    // In the trailing cluster, after the PR chip; the branch still leads.
+    expect(line.lastElementChild?.contains(label)).toBe(true);
+    expect(line.firstElementChild).toHaveTextContent("feat/remote");
+  });
+
+  it("falls back to a neutral name before the device list loads", () => {
+    renderCard({ workspace: makeWorkspace({ host_id: 7 }) });
+    expect(
+      screen.getByRole("img", { name: "Runs on Another device" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows nothing on a local card", () => {
+    hosts = [{ id: 7, name: "zeus" }];
+    const { container } = renderCard();
+    expect(screen.queryByRole("img", { name: /^Runs on/ })).toBeNull();
+    expect(metaLine(container).firstElementChild).toHaveTextContent("main");
   });
 });
 

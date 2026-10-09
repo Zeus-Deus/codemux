@@ -261,6 +261,7 @@ pub struct PtyHydrationWorkspace {
     pub project_uid: Option<String>,
     pub host_id: Option<i64>,
     pub remote_cwd: Option<String>,
+    pub remote_root: Option<String>,
     pub attach_only: bool,
 }
 
@@ -633,6 +634,14 @@ pub struct WorkspaceSnapshot {
     /// snapshots deserialize as `None`.
     #[serde(default)]
     pub remote_cwd: Option<String>,
+    /// The project's checkout **on its host** for an attach-in-place
+    /// workspace. Terminal and agent env name it as the project root there
+    /// (falling back to `remote_cwd`) instead of `project_root`, which for
+    /// a thread started on a device stays this computer's path so the
+    /// sidebar groups it with the local project. `None` elsewhere.
+    /// Additive; old snapshots deserialize as `None`.
+    #[serde(default)]
+    pub remote_root: Option<String>,
     /// True when this workspace is operated **in place on its host with no
     /// local copy of the files**. Created by `workspace_open_on_host`. The
     /// `cwd`/`worktree_path` are host paths that do not exist on this
@@ -979,6 +988,26 @@ pub struct InitialChatPane {
     pub thread_id: String,
 }
 
+/// Where an attach-in-place workspace lives and how it is labelled. See
+/// [`AppStateStore::create_remote_attach_workspace`].
+#[derive(Debug, Clone)]
+pub struct RemoteAttachWorkspace {
+    pub title: String,
+    pub host_id: i64,
+    /// The workspace's directory on the host.
+    pub remote_cwd: String,
+    /// False for a host's home directory, which is not a checkout.
+    pub is_git: bool,
+    pub git_branch: Option<String>,
+    pub project_root: Option<String>,
+    /// The project's checkout on the host, which env names as the root
+    /// there. A device thread's `project_root` is this computer's path, so
+    /// this is what keeps env on the device. `None` means `remote_cwd`.
+    pub remote_root: Option<String>,
+    pub project_uid: Option<String>,
+    pub workspace_kind: Option<String>,
+}
+
 pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
 }
@@ -1146,6 +1175,7 @@ fn build_pty_hydration_plan(
         project_uid: workspace.project_uid.clone(),
         host_id: workspace.host_id,
         remote_cwd: workspace.remote_cwd.clone(),
+        remote_root: workspace.remote_root.clone(),
         attach_only: workspace.attach_only,
     };
     let sessions = collect_terminal_sessions(&workspace.surfaces)
@@ -1879,6 +1909,7 @@ impl AppStateStore {
             surfaces: vec![],
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -1969,6 +2000,7 @@ impl AppStateStore {
             // cleared to None on successful pull.
             host_id: Some(host_id),
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             // Adoption is not activity. This workspace has a history — it
@@ -2044,6 +2076,7 @@ impl AppStateStore {
             surfaces: vec![],
             host_id: Some(host_id),
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             // Same as [`create_synced_workspace_shell`]: an adopted root
@@ -2083,40 +2116,123 @@ impl AppStateStore {
         workspace_kind: Option<String>,
     ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
+        Self::create_remote_attach_workspace_locked(
+            &mut snapshot,
+            RemoteAttachWorkspace {
+                title,
+                host_id,
+                remote_cwd,
+                is_git: true,
+                git_branch,
+                // A host workspace's project root, as the host reported it,
+                // so it is also the root on the host.
+                remote_root: project_root.clone(),
+                project_root,
+                project_uid,
+                workspace_kind,
+            },
+            None,
+        )
+    }
+
+    /// Create the attach-in-place workspace a thread started on a device
+    /// runs in. With `initial_chat` its first pane is that thread's agent
+    /// chat, published atomically like [`Self::materialize_chat_workspace`];
+    /// without one it gets the single terminal of
+    /// [`Self::create_remote_attach_workspace`]. `select = false` keeps the
+    /// current selection.
+    pub fn create_remote_workspace_with_selection(
+        &self,
+        spec: RemoteAttachWorkspace,
+        initial_chat: Option<InitialChatPane>,
+        select: bool,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            Self::create_remote_attach_workspace_locked(snapshot, spec, initial_chat)
+        })
+    }
+
+    fn create_remote_attach_workspace_locked(
+        snapshot: &mut AppStateSnapshot,
+        spec: RemoteAttachWorkspace,
+        initial_chat: Option<InitialChatPane>,
+    ) -> WorkspaceId {
+        let RemoteAttachWorkspace {
+            title,
+            host_id,
+            remote_cwd,
+            is_git,
+            git_branch,
+            project_root,
+            remote_root,
+            project_uid,
+            workspace_kind,
+        } = spec;
         let workspace_id = WorkspaceId(next_id("workspace"));
-        let surface_id = SurfaceId(next_id("surface"));
-        let session_id = SessionId(next_id("session"));
-        let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
-        // A single shell session whose cwd is the host directory. The
-        // daemon-backed spawn path re-derives the effective cwd from
-        // `remote_cwd`, so this value is informational, but we keep it
-        // consistent so the UI shows the right path.
-        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
-            session_id: session_id.clone(),
-            title: format!("Terminal {base_terminal_index}"),
-            shell: None,
-            cwd: remote_cwd.clone(),
-            cols: 80,
-            rows: 24,
-            state: TerminalSessionState::Starting,
-            last_message: Some("Preparing shell session".into()),
-            exit_code: None,
-            original_command: None,
-            adapter_captures: Default::default(),
-        });
+        // A chat workspace starts empty; the chat pane below becomes its
+        // first tab.
+        let (tabs, active_tab_id, active_surface_id, surfaces) = if initial_chat.is_some() {
+            (
+                Vec::new(),
+                String::new(),
+                SurfaceId(String::new()),
+                Vec::new(),
+            )
+        } else {
+            let surface_id = SurfaceId(next_id("surface"));
+            let session_id = SessionId(next_id("session"));
+            let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
-        let pane_id = PaneId(next_id("pane"));
-        let root = PaneNodeSnapshot::Terminal {
-            pane_id: pane_id.clone(),
-            session_id: session_id.clone(),
-            title: "Terminal".into(),
+            // A single shell session whose cwd is the host directory. The
+            // daemon-backed spawn path re-derives the effective cwd from
+            // `remote_cwd`, so this value is informational, but we keep it
+            // consistent so the UI shows the right path.
+            snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+                session_id: session_id.clone(),
+                title: format!("Terminal {base_terminal_index}"),
+                shell: None,
+                cwd: remote_cwd.clone(),
+                cols: 80,
+                rows: 24,
+                state: TerminalSessionState::Starting,
+                last_message: Some("Preparing shell session".into()),
+                exit_code: None,
+                original_command: None,
+                adapter_captures: Default::default(),
+            });
+
+            let pane_id = PaneId(next_id("pane"));
+            let root = PaneNodeSnapshot::Terminal {
+                pane_id: pane_id.clone(),
+                session_id,
+                title: "Terminal".into(),
+            };
+            let default_tab_id = next_id("tab");
+            (
+                vec![TabSnapshot {
+                    tab_id: default_tab_id.clone(),
+                    kind: TabKind::Terminal,
+                    title: "Terminal".into(),
+                    surface_id: Some(surface_id.clone()),
+                    browser_id: None,
+                    icon: None,
+                }],
+                default_tab_id,
+                surface_id.clone(),
+                vec![SurfaceSnapshot {
+                    surface_id,
+                    title: "Main Surface".into(),
+                    active_pane_id: pane_id,
+                    root,
+                }],
+            )
         };
-        let default_tab_id = next_id("tab");
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
-            is_git: true,
+            is_git,
             title,
             workspace_type: WorkspaceType::Standard,
             // `cwd` is a host path that does not exist on this device. It
@@ -2147,24 +2263,13 @@ impl AppStateStore {
             pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
-            tabs: vec![TabSnapshot {
-                tab_id: default_tab_id.clone(),
-                kind: TabKind::Terminal,
-                title: "Terminal".into(),
-                surface_id: Some(surface_id.clone()),
-                browser_id: None,
-                icon: None,
-            }],
-            active_tab_id: default_tab_id,
-            active_surface_id: surface_id.clone(),
-            surfaces: vec![SurfaceSnapshot {
-                surface_id,
-                title: "Main Surface".into(),
-                active_pane_id: pane_id,
-                root,
-            }],
+            tabs,
+            active_tab_id,
+            active_surface_id,
+            surfaces,
             host_id: Some(host_id),
-            remote_cwd: Some(remote_cwd),
+            remote_cwd: Some(remote_cwd.clone()),
+            remote_root,
             attach_only: true,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -2175,6 +2280,20 @@ impl AppStateStore {
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != workspace_id);
+
+        if let Some(chat) = initial_chat {
+            // The pane's cwd is the host path too: the provider is spawned
+            // there over SSH.
+            Self::create_chat_pane_locked(
+                snapshot,
+                &workspace_id.0,
+                Some(chat.provider),
+                Some(remote_cwd),
+                None,
+                Some(chat.thread_id),
+            )
+            .expect("new workspace accepts its initial chat pane");
+        }
         workspace_id
     }
 
@@ -2327,6 +2446,7 @@ impl AppStateStore {
             }],
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -6244,6 +6364,7 @@ fn default_app_state() -> AppStateSnapshot {
             }],
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -7767,6 +7888,8 @@ mod tests {
         assert_eq!(w.git_branch.as_deref(), Some("feature/y"));
         assert_eq!(w.project_uid.as_deref(), Some("uid-svc"));
         assert_eq!(w.workspace_kind.as_deref(), Some("worktree"));
+        // The host's project root is the root env names on the host.
+        assert_eq!(w.remote_root.as_deref(), Some("/home/agent/svc"));
         // It opens ready-to-use: one terminal surface, and it's active.
         assert_eq!(w.surfaces.len(), 1, "a single terminal pane to attach");
         assert!(matches!(
@@ -7783,6 +7906,96 @@ mod tests {
             !store.all_workspace_cwds().contains_key(&wid.0),
             "attach_only workspaces are skipped by the git enrichment sweep"
         );
+    }
+
+    fn device_thread_spec() -> RemoteAttachWorkspace {
+        RemoteAttachWorkspace {
+            title: "feat-x".into(),
+            host_id: 4,
+            remote_cwd: "/home/deus/.codemux/worktrees/app/feat-x".into(),
+            is_git: true,
+            git_branch: Some("feat-x".into()),
+            project_root: Some("/home/zeus/projects/app".into()),
+            remote_root: Some("/home/deus/.codemux/projects/app-1a2b3c4d".into()),
+            project_uid: Some("uid-app".into()),
+            workspace_kind: Some("worktree".into()),
+        }
+    }
+
+    #[test]
+    fn device_thread_workspace_opens_on_its_chat_pane() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let sessions_before = store.snapshot().terminal_sessions.len();
+        let wid = store.create_remote_workspace_with_selection(
+            device_thread_spec(),
+            Some(InitialChatPane {
+                provider: ProviderKind::Codex,
+                thread_id: "thread-1".into(),
+            }),
+            true,
+        );
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        assert!(w.attach_only);
+        assert_eq!(w.host_id, Some(4));
+        assert_eq!(w.remote_cwd.as_deref(), Some(w.cwd.as_str()));
+        // Groups under the local project in the sidebar.
+        assert_eq!(w.project_root.as_deref(), Some("/home/zeus/projects/app"));
+        // The device checkout is kept for env on the device, and reaches
+        // the terminal hydration plan.
+        assert_eq!(
+            w.remote_root.as_deref(),
+            Some("/home/deus/.codemux/projects/app-1a2b3c4d")
+        );
+        assert_eq!(
+            build_pty_hydration_plan(&snap, w).workspace.remote_root,
+            w.remote_root
+        );
+        assert_eq!(
+            snap.terminal_sessions.len(),
+            sessions_before,
+            "a chat thread starts without a terminal"
+        );
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.surfaces.len(), 1);
+        match &w.surfaces[0].root {
+            PaneNodeSnapshot::AgentChat {
+                thread_id,
+                provider,
+                cwd,
+                ..
+            } => {
+                assert_eq!(thread_id.as_deref(), Some("thread-1"));
+                assert_eq!(*provider, Some(ProviderKind::Codex));
+                assert_eq!(
+                    cwd.as_deref(),
+                    Some("/home/deus/.codemux/worktrees/app/feat-x")
+                );
+            }
+            other => panic!("expected the agent chat pane, got {other:?}"),
+        }
+        assert_eq!(snap.active_workspace_id, wid);
+    }
+
+    #[test]
+    fn device_thread_workspace_can_skip_selection_and_fall_back_to_a_terminal() {
+        let store = AppStateStore::default();
+        let current = store.snapshot().active_workspace_id;
+        let mut spec = device_thread_spec();
+        spec.is_git = false;
+        let wid = store.create_remote_workspace_with_selection(spec, None, false);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.active_workspace_id, current, "selection is kept");
+        let w = workspace_by_id(&snap, &wid);
+        assert!(!w.is_git);
+        assert!(matches!(
+            w.surfaces[0].root,
+            PaneNodeSnapshot::Terminal { .. }
+        ));
     }
 
     #[test]

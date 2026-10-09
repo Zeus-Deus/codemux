@@ -42,6 +42,28 @@ export function SubsectionHeader({
   );
 }
 
+/** Calm grouped surface for things like environment-variable lists,
+ *  test-connection panels, info banners. Subtle border, very soft
+ *  bg — should never compete with content inside it. */
+export function SettingsCard({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "rounded-lg border border-border/60 bg-muted/30 p-4",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
 /** Segmented control — a bordered pill of mutually-exclusive options
  *  with a neutral foreground-filled active segment (the design system's
  *  "white is the baseline" rule for toggles/selection).

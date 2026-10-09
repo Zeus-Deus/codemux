@@ -34,6 +34,10 @@ use tokio::time::timeout;
 /// host — silent corruption. See `plausible_remote_binary`.
 pub(crate) const MIN_PLAUSIBLE_REMOTE_BINARY_BYTES: u64 = 1024 * 1024;
 
+/// Upper bound for streaming a binary to a host. The Claude runtime is
+/// ~100 MB, which takes minutes on a slow uplink.
+pub(crate) const UPLOAD_DEADLINE: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BootstrapResult {
@@ -265,9 +269,15 @@ pub async fn bootstrap_remote<R: tauri::Runtime>(opts: BootstrapOptions<'_, R>) 
     // is to drive the upload through the remote login shell (which
     // expands `~` correctly) and to bundle mkdir/chmod into the same
     // shell session, halving SSH connection overhead.
-    if let Err(reason) =
-        ssh_upload_executable(opts.ssh_target, opts.remote_install_path, &local_binary, opts.timeout)
-            .await
+    // The upload deadline covers streaming too, so give slow links room
+    // beyond the bootstrap's own timeout.
+    if let Err(reason) = ssh_upload_executable(
+        opts.ssh_target,
+        opts.remote_install_path,
+        &local_binary,
+        opts.timeout.max(UPLOAD_DEADLINE),
+    )
+    .await
     {
         return BootstrapResult::UploadFailed { reason };
     }
@@ -671,64 +681,76 @@ fn upload_script(remote_path: &str, expected_len: u64) -> String {
 ///    on flaky networks.
 ///
 /// `remote_path` may contain `~/` — the remote shell expands it.
-async fn ssh_upload_executable(
+///
+/// `deadline` bounds the whole upload, streaming included; see
+/// [`UPLOAD_DEADLINE`].
+pub(crate) async fn ssh_upload_executable(
     ssh_target: &str,
     remote_path: &str,
     local_binary: &std::path::Path,
     deadline: Duration,
 ) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-
-    // Stream the source into ssh stdin. `tokio::fs::read` slurps the
-    // whole binary into memory — for a ~16 MB codemux-remote that's
-    // fine; the alternative (copy in chunks) doesn't measurably help.
-    let bytes = tokio::fs::read(local_binary)
+    // Stream from the file instead of reading it into memory: the Claude
+    // runtime uploaded through here is ~100 MB.
+    let mut source = tokio::fs::File::open(local_binary)
         .await
         .map_err(|e| format!("read {}: {e}", local_binary.display()))?;
+    let len = source
+        .metadata()
+        .await
+        .map_err(|e| format!("read {}: {e}", local_binary.display()))?
+        .len();
 
     // Refuse an empty source outright. An empty file would trivially
     // satisfy the remote `[ … -eq 0 ]` size check, defeating the whole
     // guard — never even attempt the upload. Belt-and-braces on top of
     // the ≥1 MB plausibility gate in `bundled_binary_path` (issue #133).
-    if bytes.is_empty() {
+    if len == 0 {
         return Err(format!(
             "refusing to upload empty binary {} (0 bytes)",
             local_binary.display()
         ));
     }
 
-    let script = upload_script(remote_path, bytes.len() as u64);
+    let script = upload_script(remote_path, len);
 
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(ssh_target)
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // A timed-out upload drops the child; don't leave ssh streaming.
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("ssh spawn failed: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ssh stdin unavailable".to_string())?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(&bytes).await {
-            // The stream failed partway. The remote `wc -c` check is
-            // the real backstop against a truncated install, but don't
-            // leave the ssh child (and its remote shell) running —
-            // kill it so we don't dangle a half-written tmpfile.
-            let _ = child.kill().await;
-            return Err(format!("failed to stream binary: {e}"));
-        }
-        // `stdin` drops here, closing the pipe so `cat` sees EOF and
-        // exits 0, letting the chained size check + `chmod` + `mv` run.
-    }
-
-    let out = timeout(deadline, child.wait_with_output())
+    let upload = async move {
+        let streamed = tokio::io::copy(&mut source, &mut stdin).await;
+        // Closing the pipe sends `cat` EOF so the chained size check,
+        // `chmod` and `mv` run. After a partial stream the size check is
+        // the backstop that keeps the truncated file out of place.
+        drop(stdin);
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("ssh failed: {e}"))?;
+        Ok::<_, String>((streamed, out))
+    };
+    let (streamed, out) = timeout(deadline, upload)
         .await
-        .map_err(|_| "operation timed out".to_string())?
-        .map_err(|e| format!("ssh failed: {e}"))?;
+        .map_err(|_| "operation timed out".to_string())??;
+    // Prefer the remote's reason: a stream that broke because the remote
+    // side failed (mkdir, auth, …) is better explained by its stderr.
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -737,6 +759,7 @@ async fn ssh_upload_executable(
             stderr
         });
     }
+    streamed.map_err(|e| format!("failed to stream binary: {e}"))?;
     Ok(())
 }
 

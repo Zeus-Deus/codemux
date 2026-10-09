@@ -1,5 +1,12 @@
 import type { HostStatusView, HostView } from "@/tauri/commands";
 
+/** The device is bringing its Codemux helper up to this build on its own
+ *  (`hosts_inventory.rs` sets this detail while it runs). Nothing for the
+ *  user to do, so it isn't "needs setup". */
+export function isUpdating(status: HostStatusView): boolean {
+  return status.last_error?.startsWith("Updating Codemux") ?? false;
+}
+
 /**
  * What the sidebar's Devices entry should say about the account's other
  * machines, reduced to one dot and one sentence.
@@ -72,9 +79,10 @@ export function computeDevicesIndicator({
       continue;
     }
     // Reachable but degraded: SSH answers, yet the host can't take part
-    // (no host agent, inventory failed). Worth the amber dot — pushing
-    // there would fail, and only setup fixes it.
-    if (status.last_error) {
+    // (helper missing, damaged or out of date). Worth the amber dot —
+    // pushing there would fail, and only setup fixes it. A device updating
+    // itself fixes itself, so it counts as online.
+    if (status.last_error && !isUpdating(status)) {
       return { dot: "amber", tooltip: `Devices — ${host.name}: ${status.last_error}` };
     }
     online += 1;

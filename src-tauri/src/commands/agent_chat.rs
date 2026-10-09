@@ -668,12 +668,15 @@ fn workspace_env_overlay(
             ws.workspace_id.0.clone(),
         ),
         ("CODEMUX_PANE_ID".to_string(), pane_id.to_string()),
-        (
+    ];
+    // A device has no `codemux browser` to route to, only `codemux-remote`.
+    if ws.host_id.is_none() {
+        defaults.push((
             "CODEMUX_BROWSER_CMD".to_string(),
             "codemux browser".to_string(),
-        ),
-        ("BROWSER".to_string(), "codemux browser open".to_string()),
-    ];
+        ));
+        defaults.push(("BROWSER".to_string(), "codemux browser open".to_string()));
+    }
     defaults.extend(crate::terminal::workspace_pty_env(ws));
 
     for (key, val) in defaults {
@@ -707,6 +710,221 @@ pub fn pane_workspace_context(
         workspace_env_overlay(ws, pane_id, existing),
         ws.map(|w| w.workspace_id.0.clone()),
     )
+}
+
+/// A workspace that lives on a device: the configured host its provider
+/// processes run on, and its working directory there (may start with `~`).
+#[derive(Debug, Clone, PartialEq)]
+struct DeviceWorkspace {
+    remote: crate::agent_provider::types::RemoteSpawnTarget,
+    cwd: String,
+}
+
+/// The device `ws` lives on, or `None` for a local workspace. Fails closed
+/// when the device is no longer configured so the thread never quietly
+/// falls back to running on this computer.
+fn device_workspace(
+    ws: &crate::state::WorkspaceSnapshot,
+    hosts: &[crate::database::HostRecord],
+) -> Result<Option<DeviceWorkspace>, String> {
+    let Some(host_id) = ws.host_id else {
+        return Ok(None);
+    };
+    let host = hosts
+        .iter()
+        .find(|host| host.id == host_id)
+        .ok_or_else(|| {
+            format!("This thread's device (id {host_id}) is no longer configured on this computer")
+        })?;
+    // The directory the workspace's terminals use: its explicit host path,
+    // the in-place path of an attach-only workspace, or where a push put it.
+    let cwd = match ws
+        .remote_cwd
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        Some(remote_cwd) => remote_cwd.to_string(),
+        None if ws.attach_only => ws.cwd.clone(),
+        None => {
+            let project_name = ws
+                .project_root
+                .as_deref()
+                .and_then(|root| std::path::Path::new(root).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace");
+            // Same rule as `workspace_push_to_host`: a repo root lands in
+            // the projects tree, a worktree in the per-branch worktrees tree.
+            let is_root =
+                ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
+            let path = if is_root {
+                crate::workspace_paths::conventional_remote_root_path_keyed(
+                    ws.project_uid.as_deref(),
+                    project_name,
+                )
+            } else {
+                crate::workspace_paths::conventional_remote_path_keyed(
+                    ws.project_uid.as_deref(),
+                    project_name,
+                    ws.git_branch.as_deref().unwrap_or("main"),
+                )
+            };
+            path.to_string_lossy().into_owned()
+        }
+    };
+    Ok(Some(DeviceWorkspace {
+        remote: crate::agent_provider::types::RemoteSpawnTarget {
+            host_id,
+            ssh_target: host.ssh_target.clone(),
+            host_name: host.name.clone(),
+        },
+        cwd,
+    }))
+}
+
+/// [`device_workspace`] for a workspace id from the pane binding or the
+/// thread's persisted row — never from the IPC caller.
+fn device_for_workspace<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: Option<&str>,
+) -> Result<Option<DeviceWorkspace>, String> {
+    let (Some(workspace_id), Some(state)) = (workspace_id, app.try_state::<AppStateStore>()) else {
+        return Ok(None);
+    };
+    let snapshot = state.snapshot();
+    let Some(ws) = snapshot
+        .workspaces
+        .iter()
+        .find(|ws| ws.workspace_id.0 == workspace_id && ws.host_id.is_some())
+    else {
+        return Ok(None);
+    };
+    let hosts = app
+        .try_state::<DatabaseStore>()
+        .map(|db| db.list_hosts())
+        .unwrap_or_default();
+    device_workspace(ws, &hosts)
+}
+
+/// Refuse providers that can't run on a device yet: Hermes needs a local
+/// profile install, and OpenCode runs one shared local server.
+fn ensure_provider_runs_on_devices(provider: ProviderKind) -> Result<(), String> {
+    let name = match provider {
+        ProviderKind::Hermes => "Hermes",
+        ProviderKind::OpenCode => "OpenCode",
+        ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::Grok => {
+            return Ok(())
+        }
+    };
+    Err(format!(
+        "unsupported: {name} can't run on another device yet"
+    ))
+}
+
+/// Ready a device for a provider session and return the absolute working
+/// directory there. Claude also needs Codemux's runtime installed on it.
+async fn prepare_device_session(
+    provider: ProviderKind,
+    device: &DeviceWorkspace,
+) -> Result<std::path::PathBuf, String> {
+    #[cfg(unix)]
+    {
+        let target = &device.remote.ssh_target;
+        let cwd = if device.cwd == "~" || device.cwd.starts_with("~/") {
+            let home = crate::ssh::exec::remote_home(target)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Couldn't reach {} over SSH: {error}",
+                        device.remote.host_name
+                    )
+                })?;
+            crate::ssh::exec::expand_remote_tilde(&device.cwd, &home)
+        } else {
+            device.cwd.clone()
+        };
+        if provider == ProviderKind::Claude {
+            crate::ssh::sidecar::ensure_claude_sidecar(target).await?;
+        }
+        Ok(std::path::PathBuf::from(cwd))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, device);
+        Err("Threads on another device need macOS or Linux on this computer".into())
+    }
+}
+
+/// Whether a thread lives on a device. Local-only work (git checkpoints,
+/// skill files, hook and command probes) can't see a device's files.
+///
+/// The thread's own workspace decides when there is one (its persisted row
+/// or bound pane). Callers that only know a folder fall back to the path,
+/// but a path counts as a device's only when no local workspace and not the
+/// local home use it: a device folder can share its path with a local one
+/// (same user name on both machines). Anything else is local.
+fn runs_on_device(
+    state: &AppStateStore,
+    db: Option<&DatabaseStore>,
+    thread_id: Option<&str>,
+    cwd: Option<&str>,
+) -> bool {
+    let thread_workspace = thread_id.and_then(|thread_id| {
+        db.and_then(|db| db.get_agent_chat_session(thread_id))
+            .map(|record| record.workspace_id)
+            .or_else(|| {
+                state
+                    .agent_chat_pane_id_for_thread(thread_id)
+                    .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
+            })
+    });
+    let local_home = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+    workspace_runs_on_device(
+        &state.snapshot().workspaces,
+        thread_workspace.as_deref(),
+        cwd,
+        local_home.as_deref(),
+    )
+}
+
+/// [`runs_on_device`] once the thread's workspace (if any) is known.
+fn workspace_runs_on_device(
+    workspaces: &[crate::state::WorkspaceSnapshot],
+    thread_workspace: Option<&str>,
+    cwd: Option<&str>,
+    local_home: Option<&str>,
+) -> bool {
+    if let Some(workspace_id) = thread_workspace {
+        return workspaces
+            .iter()
+            .any(|ws| ws.workspace_id.0 == workspace_id && ws.host_id.is_some());
+    }
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    if local_home == Some(cwd) {
+        return false;
+    }
+    let mut on_device = false;
+    for ws in workspaces {
+        let uses_path = ws.cwd == cwd
+            || ws.remote_cwd.as_deref() == Some(cwd)
+            || ws.worktree_path.as_deref() == Some(cwd);
+        if !uses_path {
+            continue;
+        }
+        if ws.host_id.is_none() {
+            return false;
+        }
+        on_device = true;
+    }
+    on_device
+}
+
+fn thread_runs_on_device<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> bool {
+    app.try_state::<AppStateStore>().is_some_and(|state| {
+        let db = app.try_state::<DatabaseStore>();
+        runs_on_device(&state, db.as_deref(), Some(thread_id), None)
+    })
 }
 
 fn should_recover_persisted_resume_cursor(
@@ -746,12 +964,17 @@ pub async fn agent_chat_start_session<R: Runtime>(
             crate::local_session_import::require_live_session(&app, &thread)?;
         }
     }
+    // The device comes from the pane's workspace, never from the caller.
+    let device = {
+        let workspace = app
+            .try_state::<AppStateStore>()
+            .and_then(|state| state.workspace_id_for_pane(&pane_id));
+        device_for_workspace(&app, workspace.as_deref())?
+    };
+    if device.is_some() {
+        ensure_provider_runs_on_devices(provider)?;
+    }
     if provider == ProviderKind::Hermes {
-        let state: State<'_, AppStateStore> = app.state();
-        let workspace = state.workspace_id_for_pane(&pane_id);
-        if state.snapshot().workspaces.iter().any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some()) {
-            return Err("unsupported: Hermes v1 runs on local workspaces only".into());
-        }
         // A new chat binds the caller's profile; an existing binding is host-owned.
         let db: State<'_, DatabaseStore> = app.state();
         if db.hermes_binding(&input.thread_id.0)?.is_none() {
@@ -861,8 +1084,10 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // pick / restart). If the CLI's on-disk session JSONL is confirmed
     // gone, drop the cursor so the session starts fresh instead of wedging
     // on a dead id, and best-effort clear the persisted column. Codex /
-    // OpenCode carry their own cursor shapes and are untouched.
-    if provider == ProviderKind::Claude {
+    // OpenCode carry their own cursor shapes and are untouched. A device
+    // keeps its session files there, so this computer can't judge them; the
+    // runtime falls back to a fresh session on a stale resume by itself.
+    if provider == ProviderKind::Claude && device.is_none() {
         if let Some(stale) = input
             .resume_cursor
             .as_ref()
@@ -900,6 +1125,11 @@ pub async fn agent_chat_start_session<R: Runtime>(
     if pane_already_runs_thread && impl_.has_session(&input.thread_id).await {
         return Ok(input.thread_id);
     }
+    // Run the provider on the workspace's device, in its folder there.
+    if let Some(device) = device.as_ref() {
+        input.cwd = prepare_device_session(provider, device).await?;
+    }
+    input.remote = device.as_ref().map(|device| device.remote.clone());
     // Claim the pane BEFORE anything spawns. Desktop and remote clients
     // share one backend, so between "create pane" and "start session" a
     // second client can mount the pane and auto-start its own thread on it.
@@ -938,8 +1168,9 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // registered with whatever has come up so far; servers that
     // finish later only become visible to the agent on the next
     // session start (Stage 4 polish will wire `setMcpServers` for
-    // dynamic registration).
-    {
+    // dynamic registration). A session on a device gets none of this
+    // computer's tools, so there is nothing to start for it.
+    if device.is_none() {
         use crate::mcp::registry::McpRegistry;
         use std::time::Duration;
         let mcp_registry: State<'_, McpRegistry> = app.state();
@@ -2069,20 +2300,6 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         return Ok(());
     };
 
-    if provider_kind == ProviderKind::Hermes {
-        let state: State<'_, AppStateStore> = app.state();
-        if state.snapshot().workspaces.iter().any(|w| w.workspace_id.0 == record.workspace_id && w.host_id.is_some()) {
-            return Err("unsupported: Hermes v1 runs on local workspaces only".into());
-        }
-    }
-
-    let cwd = record
-        .cwd
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
     // Rebuild the workspace env overlay and owning workspace id so the
     // resumed agent's browser / CLI subprocesses and MCP dispatches route
     // to its OWN workspace, exactly like `agent_chat_start_session`
@@ -2096,13 +2313,43 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         }
     };
 
+    // An orphaned thread still runs where its workspace lives, so fall back
+    // to the persisted row's workspace for the device.
+    let device = device_for_workspace(
+        app,
+        Some(workspace_id.as_deref().unwrap_or(&record.workspace_id)),
+    )?;
+    let (cwd, remote) = match device.as_ref() {
+        Some(device) => {
+            ensure_provider_runs_on_devices(provider_kind)?;
+            (
+                prepare_device_session(provider_kind, device).await?,
+                Some(device.remote.clone()),
+            )
+        }
+        None => (
+            record
+                .cwd
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+            None,
+        ),
+    };
+
     // Build the resume cursor from the persisted id, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
     // skip the cursor and start fresh rather than wedging the rebuild on a
     // dead id. Best-effort clear the column so no later rebuild reuses it.
-    // Codex / OpenCode carry their own cursor shapes and are untouched.
+    // Codex / OpenCode carry their own cursor shapes and are untouched, and
+    // a device's session files aren't on this computer to check.
     let resume_cursor = match record.sdk_session_id.as_ref() {
-        Some(id) if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) => {
+        Some(id)
+            if provider_kind == ProviderKind::Claude
+                && device.is_none()
+                && claude_session_file_missing(id) =>
+        {
             eprintln!(
                 "[codemux::agent_chat] dropping stale resume cursor for thread={} \
                  (Claude session file for {id} is gone); starting fresh",
@@ -2169,6 +2416,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         additional_directories: vec![],
         env: env.clone(),
         workspace_id: workspace_id.clone(),
+        remote: remote.clone(),
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     };
@@ -2402,6 +2650,11 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
     }
+    // Skills resolve against files on this computer; a device thread's
+    // files are on the device.
+    if !input.skill_ids.is_empty() && thread_runs_on_device(&app, &input.thread_id.0) {
+        return Err("Skills aren't available for threads on another device yet".into());
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let hermes_gate = (provider == ProviderKind::Hermes).then(|| hermes_send_gate(&input.thread_id.0));
@@ -2463,8 +2716,11 @@ pub async fn send_turn_with_origin<R: Runtime>(
     let (saved_images, image_inputs) =
         finalize_chat_images(&thread_id_for_persist, &input.images).await?;
     let db: State<'_, DatabaseStore> = app.state();
+    // Checkpoints snapshot the repo with local git, which can't reach a
+    // device thread's files.
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled()
         && impl_.capabilities().supports_conversation_rollback
+        && !thread_runs_on_device(&app, &thread_id_for_persist)
     {
             db.get_agent_chat_session(&thread_id_for_persist)
                 .and_then(|session| {
@@ -3368,6 +3624,8 @@ pub async fn agent_chat_prime_mcp<R: Runtime>(app: AppHandle<R>) -> Result<(), S
             .workspaces
             .iter()
             .find(|w| w.workspace_id == snapshot.active_workspace_id)
+            // A device workspace's project config isn't on this computer.
+            .filter(|w| w.host_id.is_none())
             .map(|w| std::path::PathBuf::from(&w.cwd))
             .filter(|p| !p.as_os_str().is_empty())
     };
@@ -4067,8 +4325,19 @@ pub async fn agent_chat_hooks(
     update: Option<crate::agent_provider::codex::hooks::HookUpdate>,
     registry: tauri::State<'_, ProviderRegistry>,
     observability: tauri::State<'_, ObservabilityStore>,
+    state: tauri::State<'_, AppStateStore>,
+    db: tauri::State<'_, DatabaseStore>,
 ) -> Result<crate::agent_provider::codex::hooks::HooksList, String> {
     feature_flag_on(&observability)?;
+    // Hook discovery reads and writes the folder on this computer.
+    if runs_on_device(
+        &state,
+        Some(db.inner()),
+        thread_id.as_ref().map(|thread| thread.0.as_str()),
+        cwd.as_deref(),
+    ) {
+        return Err("Hooks aren't available for threads on another device yet".into());
+    }
     let directory = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => std::path::PathBuf::from(cwd),
         None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?,
@@ -4103,6 +4372,8 @@ pub async fn list_chat_slash_commands(
     force: Option<bool>,
     thread_id: Option<ThreadId>,
     registry: tauri::State<'_, ProviderRegistry>,
+    state: tauri::State<'_, AppStateStore>,
+    db: tauri::State<'_, DatabaseStore>,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     let cwd = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => cwd,
@@ -4114,8 +4385,28 @@ pub async fn list_chat_slash_commands(
                 .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err);
         }
     }
+    let on_device = runs_on_device(
+        &state,
+        Some(db.inner()),
+        thread_id.as_ref().map(|thread| thread.0.as_str()),
+        Some(cwd.as_str()),
+    );
     match provider {
+        // The harvest runs this computer's `claude` in the folder, which
+        // only exists on the device and would list this computer's
+        // commands. The composer still accepts typed `/commands`.
+        ProviderKind::Claude if on_device => Ok(Vec::new()),
         ProviderKind::Claude => slash_cache.get_or_harvest_with_refresh(&cwd, force.unwrap_or(false)).await,
+        // The probe would spawn a local `grok` in a folder that only exists
+        // on the device; serve what a session there already published.
+        ProviderKind::Grok if on_device => {
+            Ok(acp_slash_cache
+                .cached(
+                    crate::agent_provider::acp::session::AcpDialect::Grok,
+                    std::path::Path::new(&cwd),
+                )
+                .await)
+        }
         ProviderKind::Grok => {
             let binary_path = which::which("grok").map_err(|_| {
                 crate::agent_provider::grok::capabilities::HarvestError::NotInstalled {
@@ -8557,6 +8848,7 @@ mod tests {
             surfaces: Vec::new(),
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: None,
@@ -8616,6 +8908,231 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env["MY_VAR"], "keep-me");
         assert!(!env.contains_key("CODEMUX_WORKSPACE_ID"));
+    }
+
+    #[test]
+    fn workspace_env_overlay_skips_the_browser_on_a_device() {
+        let mut ws = test_workspace("ws-remote");
+        ws.host_id = Some(3);
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None).unwrap();
+        assert!(!env.contains_key("BROWSER"));
+        assert!(!env.contains_key("CODEMUX_BROWSER_CMD"));
+        assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-remote");
+    }
+
+    // ── device workspaces ──
+
+    fn test_host(id: i64) -> crate::database::HostRecord {
+        crate::database::HostRecord {
+            id,
+            server_id: None,
+            name: "ai-node".to_string(),
+            ssh_target: "deus@ai-node".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            dirty: false,
+            last_seen_at: None,
+            disk_bytes: None,
+            disk_measured_at: None,
+        }
+    }
+
+    #[test]
+    fn device_workspace_is_none_for_local_workspaces() {
+        let ws = test_workspace("ws-local");
+        assert_eq!(device_workspace(&ws, &[test_host(3)]), Ok(None));
+    }
+
+    #[test]
+    fn device_workspace_fails_closed_without_the_host() {
+        let mut ws = test_workspace("ws-remote");
+        ws.host_id = Some(9);
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]),
+            Err("This thread's device (id 9) is no longer configured on this computer".to_string())
+        );
+    }
+
+    #[test]
+    fn device_workspace_uses_the_folder_on_the_device() {
+        let mut ws = test_workspace("ws-remote");
+        ws.host_id = Some(3);
+        ws.attach_only = true;
+        ws.cwd = "/home/deus/.codemux/worktrees/repo/feat".to_string();
+        let device = device_workspace(&ws, &[test_host(3)]).unwrap().unwrap();
+        assert_eq!(device.cwd, ws.cwd);
+        assert_eq!(
+            device.remote,
+            crate::agent_provider::types::RemoteSpawnTarget {
+                host_id: 3,
+                ssh_target: "deus@ai-node".to_string(),
+                host_name: "ai-node".to_string(),
+            }
+        );
+
+        // An explicit host path wins over the local-looking cwd.
+        ws.remote_cwd = Some("/srv/checkouts/repo".to_string());
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "/srv/checkouts/repo"
+        );
+
+        // A pushed workspace runs where the push put it, like its terminals.
+        ws.remote_cwd = None;
+        ws.attach_only = false;
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "~/.codemux/worktrees/repo/feat-my-feature"
+        );
+
+        // A pushed repo root lands in the projects tree, not a worktree.
+        ws.workspace_kind = Some("main".to_string());
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "~/.codemux/projects/repo"
+        );
+        ws.worktree_path = Some("/home/user/.codemux/worktrees/repo/main".to_string());
+        assert_eq!(
+            device_workspace(&ws, &[test_host(3)]).unwrap().unwrap().cwd,
+            "~/.codemux/worktrees/repo/feat-my-feature"
+        );
+    }
+
+    #[test]
+    fn only_device_capable_providers_run_on_devices() {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Cursor,
+            ProviderKind::Grok,
+        ] {
+            assert!(ensure_provider_runs_on_devices(provider).is_ok());
+        }
+        assert_eq!(
+            ensure_provider_runs_on_devices(ProviderKind::Hermes),
+            Err("unsupported: Hermes can't run on another device yet".to_string())
+        );
+        assert_eq!(
+            ensure_provider_runs_on_devices(ProviderKind::OpenCode),
+            Err("unsupported: OpenCode can't run on another device yet".to_string())
+        );
+    }
+
+    // ── runs_on_device ──
+
+    const HOME: &str = "/home/zeus";
+    const DEVICE_PROJECT: &str = "/home/zeus/.codemux/projects/app";
+
+    fn device_ws(id: &str, cwd: &str) -> crate::state::WorkspaceSnapshot {
+        let mut ws = test_workspace(id);
+        ws.host_id = Some(3);
+        ws.cwd = cwd.to_string();
+        ws.remote_cwd = Some(cwd.to_string());
+        ws
+    }
+
+    /// [`workspace_runs_on_device`] over `workspaces`, from this computer
+    /// whose home is [`HOME`].
+    fn on_device(
+        workspaces: &[crate::state::WorkspaceSnapshot],
+        thread_workspace: Option<&str>,
+        cwd: Option<&str>,
+    ) -> bool {
+        workspace_runs_on_device(workspaces, thread_workspace, cwd, Some(HOME))
+    }
+
+    #[test]
+    fn a_thread_runs_where_its_workspace_lives() {
+        let workspaces = [
+            device_ws("ws-remote", DEVICE_PROJECT),
+            test_workspace("ws-local"),
+        ];
+        assert!(on_device(&workspaces, Some("ws-remote"), None));
+        // The thread's workspace decides, whatever folder the caller passes.
+        assert!(!on_device(
+            &workspaces,
+            Some("ws-local"),
+            Some(DEVICE_PROJECT)
+        ));
+        // Without a thread, a folder only a device workspace uses is the
+        // device's.
+        assert!(on_device(&workspaces, None, Some(DEVICE_PROJECT)));
+        assert!(!on_device(&workspaces, None, None));
+    }
+
+    #[test]
+    fn a_local_folder_with_the_same_path_as_a_device_folder_stays_local() {
+        // Same user name on both machines: a local worktree and a device
+        // worktree of the same branch share their path.
+        let path = "/home/zeus/.codemux/worktrees/app/feat";
+        let mut local = test_workspace("ws-local");
+        local.cwd = "/home/zeus/projects/app".to_string();
+        local.worktree_path = Some(path.to_string());
+        let workspaces = [device_ws("ws-remote", path), local];
+        assert!(!on_device(&workspaces, None, Some(path)));
+        let reversed = [workspaces[1].clone(), workspaces[0].clone()];
+        assert!(!on_device(&reversed, None, Some(path)));
+    }
+
+    #[test]
+    fn the_local_home_is_never_a_device_folder() {
+        // A device Home workspace whose home has the same path as this one.
+        let workspaces = [device_ws("ws-device-home", HOME)];
+        assert!(!on_device(&workspaces, None, Some(HOME)));
+        // Its own threads still run on the device.
+        assert!(on_device(&workspaces, Some("ws-device-home"), Some(HOME)));
+    }
+
+    /// The Claude and Grok `/` menus for a device folder never run this
+    /// computer's CLI there: they show no provider commands rather than an
+    /// error or this computer's commands.
+    #[tokio::test]
+    async fn device_slash_menus_do_not_probe_this_computer() {
+        let app = tauri::test::mock_app();
+        app.manage(Arc::new(
+            crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache::new(),
+        ));
+        app.manage(Arc::new(
+            crate::agent_provider::acp::slash_commands::AcpSlashCommandCache::new(),
+        ));
+        app.manage(Arc::new(
+            crate::agent_provider::opencode::OpenCodeServerManager::new(),
+        ));
+        app.manage(ProviderRegistry::new());
+        app.manage(AppStateStore::default());
+        app.manage(DatabaseStore::new_in_memory());
+        let handle = app.handle().clone();
+        let device_cwd = "/srv/codemux-device-only/app";
+        let state: State<'_, AppStateStore> = handle.state();
+        state.create_remote_attach_workspace(
+            "app".to_string(),
+            3,
+            device_cwd.to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        for provider in [ProviderKind::Claude, ProviderKind::Grok] {
+            let commands = list_chat_slash_commands(
+                provider,
+                Some(device_cwd.to_string()),
+                handle.state(),
+                handle.state(),
+                handle.state(),
+                None,
+                None,
+                handle.state(),
+                handle.state(),
+                handle.state(),
+            )
+            .await;
+            assert!(
+                commands.as_ref().is_ok_and(|commands| commands.is_empty()),
+                "{provider:?}: {commands:?}"
+            );
+        }
     }
 
     // ── should_persist_event policy ──

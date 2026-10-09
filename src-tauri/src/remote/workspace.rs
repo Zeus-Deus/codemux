@@ -129,6 +129,12 @@ impl WorkspaceStore {
             .map_err(|e| WorkspaceError::Io(format!("create workspaces root: {e}")))?;
 
         let conn = Connection::open(db_path).map_err(|e| WorkspaceError::Db(e.to_string()))?;
+        // One-shot CLI calls (`project ensure`, `worktree create`) write to
+        // this database while `serve` holds it open. Wait out a concurrent
+        // writer instead of failing with SQLITE_BUSY. Set first: switching
+        // the journal mode below needs the lock too.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| WorkspaceError::Db(e.to_string()))?;
         // Reasonable defaults for a single-process daemon.
         conn.execute_batch(
             "
@@ -349,6 +355,17 @@ impl WorkspaceStore {
             out.push(row.map_err(|e| WorkspaceError::Db(e.to_string()))?);
         }
         Ok(out)
+    }
+
+    /// The earliest-registered workspace at exactly `path`, if any. Lets
+    /// re-running a create for the same checkout reuse its row instead of
+    /// registering a duplicate.
+    pub fn find_by_path(&self, path: &str) -> Result<Option<Workspace>, WorkspaceError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|w| w.path == path)
+            .min_by(|a, b| a.created_at.cmp(&b.created_at)))
     }
 
     pub fn close(&self, id: &str) -> Result<(), WorkspaceError> {
@@ -814,6 +831,31 @@ mod tests {
         );
         // Boot sweep is then a no-op (already collapsed).
         assert_eq!(store.normalize_main_workspaces().unwrap(), 0);
+    }
+
+    #[test]
+    fn find_by_path_returns_the_earliest_row_for_that_path() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert!(store.find_by_path("/tmp/wt").unwrap().is_none());
+        let a = store.create(Some("a".into()), "/tmp/wt".into(), None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        store.create(Some("b".into()), "/tmp/wt".into(), None, None).unwrap();
+        store.create(Some("c".into()), "/tmp/other".into(), None, None).unwrap();
+        assert_eq!(store.find_by_path("/tmp/wt").unwrap().unwrap().id, a.id);
+    }
+
+    #[test]
+    fn open_sets_a_busy_timeout_for_concurrent_writers() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let timeout: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
     }
 
     #[test]

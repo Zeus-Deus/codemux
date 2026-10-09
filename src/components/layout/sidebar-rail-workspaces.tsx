@@ -11,12 +11,13 @@ import { useHosts } from "@/stores/hosts-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
+import { workspaceDeviceName } from "./sidebar-inbox-card";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
-import { Pin } from "lucide-react";
+import { Pin, Server } from "lucide-react";
 import {
   buildSidebarDraftCatalog,
   SidebarRailDrafts,
@@ -35,10 +36,13 @@ function RailWorkspaceItem({
   workspace,
   repo,
   isActive,
+  deviceName,
 }: {
   workspace: WorkspaceSnapshot;
   repo: RailItemRepo;
   isActive: boolean;
+  /** The device this thread runs on, or null for this machine. */
+  deviceName: string | null;
 }) {
   const { customColor, imageUrl, imageVersion } = useProjectAppearance(
     repo.path,
@@ -111,6 +115,18 @@ function RailWorkspaceItem({
               aria-label="Pinned workspace"
               className="absolute bottom-0.5 left-0.5 size-3 rounded-sm bg-sidebar p-px text-muted-foreground"
             />
+          )}
+          {/* The corner opposite the pin, so a device thread still reads as
+              one while collapsed. */}
+          {deviceName && (
+            <span
+              role="img"
+              aria-label={`Runs on ${deviceName}`}
+              title={`Runs on ${deviceName}`}
+              className="absolute bottom-0.5 right-0.5 flex size-3 rounded-sm bg-sidebar p-px text-muted-foreground"
+            >
+              <Server aria-hidden className="size-full" />
+            </span>
           )}
           {status && (
             <span
@@ -244,6 +260,7 @@ export function SidebarRailWorkspaces() {
             workspace={ws}
             repo={repo}
             isActive={ws.workspace_id === activeWorkspaceId}
+            deviceName={workspaceDeviceName(ws.host_id, hosts)}
           />
         );
       })}

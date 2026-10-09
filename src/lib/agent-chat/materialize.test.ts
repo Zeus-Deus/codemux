@@ -23,6 +23,11 @@ vi.mock("@/tauri/commands", () => ({
   createWorktreeWorkspaceResult: vi
     .fn()
     .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null, adopted: false }),
+  createWorkspaceOnHost: vi.fn().mockResolvedValue({
+    workspaceId: "ws-device",
+    cwd: "/home/deus/.codemux/workspaces/foo/main",
+    adopted: false,
+  }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
@@ -55,6 +60,7 @@ import {
   agentChatStartSession,
   applyPreset,
   createEmptyWorkspace,
+  createWorkspaceOnHost,
   createWorktreeWorkspaceResult,
   generateBranchName,
   generateRandomBranchName,
@@ -140,6 +146,11 @@ describe("materializeAndSend", () => {
       .mockResolvedValue("random-branch");
     vi.mocked(getHomeDir).mockClear().mockResolvedValue("/home/user");
     vi.mocked(renameWorkspace).mockClear().mockResolvedValue(undefined);
+    vi.mocked(createWorkspaceOnHost).mockClear().mockResolvedValue({
+      workspaceId: "ws-device",
+      cwd: "/home/deus/.codemux/workspaces/foo/main",
+      adopted: false,
+    });
     // Stage C home-branch reads homeDir from the app-store cache.
     useAppStore.setState({ homeDir: "/home/user", appState: null });
   });
@@ -1253,6 +1264,168 @@ describe("materializeAndSend", () => {
       expect(agentChatSendTurn).not.toHaveBeenCalled();
     });
   });
+
+  describe("device target", () => {
+    it("creates a home thread on the device and runs the session at its path", async () => {
+      vi.mocked(createWorkspaceOnHost).mockResolvedValueOnce({
+        workspaceId: "ws-device",
+        cwd: "/home/deus",
+        adopted: false,
+      });
+      const actions = makeActions();
+      const onPhase = vi.fn();
+      const draft = makeDraft({ hostId: 2, checkoutMode: "worktree" });
+
+      const result = await materializeAndSend(
+        draft, "check disk usage", "/home/user", actions,
+        null, null, [], [], null, onPhase,
+      );
+
+      expect(result.success).toBe(true);
+      expect(onPhase.mock.calls[0][0]).toBe("creating-on-host");
+      expect(createWorkspaceOnHost).toHaveBeenCalledWith({
+        hostId: 2,
+        projectPath: null,
+        branch: null,
+        newBranch: false,
+        baseBranch: null,
+        initialChat: { provider: "claude", thread_id: draft.threadId },
+      });
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).toHaveBeenCalledWith(
+        "ws-device", "claude", "/home/deus", null, draft.threadId,
+      );
+      const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(startInput.cwd).toBe("/home/deus");
+      // Home threads are titled from the first message.
+      expect(renameWorkspace).toHaveBeenCalledWith("ws-device", expect.any(String));
+    });
+
+    it("creates a named worktree on the device for a project worktree draft", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        hostId: 2,
+        checkoutMode: "worktree",
+        worktreeName: "",
+        baseBranch: "main",
+      });
+
+      const result = await materializeAndSend(
+        draft, "fix the login bug", "/projects/foo", actions,
+        null, null, [], [], "/projects/foo", undefined, { background: true },
+      );
+
+      expect(result.success).toBe(true);
+      expect(generateBranchName).toHaveBeenCalledWith("fix the login bug", "/projects/foo");
+      expect(createWorkspaceOnHost).toHaveBeenCalledWith({
+        hostId: 2,
+        projectPath: "/projects/foo",
+        branch: "ai-named-branch",
+        newBranch: true,
+        baseBranch: "main",
+        initialChat: { provider: "claude", thread_id: draft.threadId },
+        select: false,
+      });
+      // Nothing is created on this machine.
+      expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(startInput.cwd).toBe("/home/deus/.codemux/workspaces/foo/main");
+    });
+
+    it("works in the device's checkout for a current-checkout draft", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        hostId: 2,
+        checkoutMode: "current",
+        worktreeName: "ignored",
+      });
+
+      await materializeAndSend(draft, "hello", "/projects/foo", actions);
+
+      expect(createWorkspaceOnHost).toHaveBeenCalledWith(
+        expect.objectContaining({ projectPath: "/projects/foo", branch: null, newBranch: false }),
+      );
+      // Named after the first message, like a local current-checkout thread.
+      await flushAutoName();
+      expect(renameWorkspace).toHaveBeenCalledWith("ws-device", "ai-named-branch");
+    });
+
+    it("ignores the device for an existing workspace", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "existing_workspace", workspaceId: "ws-existing" },
+        hostId: 2,
+      });
+
+      const result = await materializeAndSend(draft, "hello", "/projects/foo", actions);
+
+      expect(result.success).toBe(true);
+      expect(createWorkspaceOnHost).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).toHaveBeenCalledWith(
+        "ws-existing", "claude", "/projects/foo", null, draft.threadId,
+      );
+    });
+
+    it("keeps the resolved skill selection instead of relisting skills locally", async () => {
+      const actions = makeActions();
+      actions.refreshSkillSelection = vi.fn();
+      const draft = makeDraft({ hostId: 2 });
+
+      await materializeAndSend(
+        draft, "/review this", "/home/user", actions,
+        { skillIds: ["skill-a"], text: "review this" },
+      );
+
+      expect(actions.refreshSkillSelection).not.toHaveBeenCalled();
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "claude",
+        expect.objectContaining({ skill_ids: ["skill-a"] }),
+      );
+    });
+
+    it("fails the send when the device workspace never reports a path", async () => {
+      vi.useFakeTimers();
+      vi.mocked(createWorkspaceOnHost).mockResolvedValueOnce({
+        workspaceId: "ws-device",
+        cwd: null,
+        adopted: false,
+      });
+      const actions = makeActions();
+      const draft = makeDraft({ hostId: 2 });
+
+      const promise = materializeAndSend(draft, "hello", "/home/user", actions);
+      await vi.advanceTimersByTimeAsync(6_000);
+      const result = await promise;
+      vi.useRealTimers();
+
+      expect(result.success).toBe(false);
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        "draft-1",
+        expect.stringContaining("device"),
+      );
+      expect(actions.removeUserMessageByNonce).toHaveBeenCalled();
+      expect(agentChatStartSession).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a device setup error as a send failure", async () => {
+      vi.mocked(createWorkspaceOnHost).mockRejectedValueOnce(
+        "Couldn't clone github.com/acme/foo on zeus",
+      );
+      const actions = makeActions();
+      const draft = makeDraft({ hostId: 2 });
+
+      const result = await materializeAndSend(draft, "hello", "/home/user", actions);
+
+      expect(result).toEqual({
+        success: false,
+        error: "Couldn't clone github.com/acme/foo on zeus",
+      });
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // ── materializeWithPreset ──
@@ -1381,6 +1554,106 @@ describe("materializeWithPreset", () => {
       // The workspace was created but not rolled back (locked policy).
       expect(createEmptyWorkspace).toHaveBeenCalled();
       expect(activateWorkspace).toHaveBeenCalled();
+    });
+  });
+
+  describe("device target", () => {
+    beforeEach(() => {
+      vi.mocked(createWorkspaceOnHost).mockClear().mockResolvedValue({
+        workspaceId: "ws-device",
+        cwd: "/home/deus/.codemux/workspaces/foo/fix-login",
+        adopted: false,
+      });
+      vi.mocked(generateBranchName).mockClear().mockResolvedValue("fix-login");
+    });
+
+    it("a chat preset creates the workspace on the device and runs the session there", async () => {
+      const actions = makeActions();
+      actions.refreshSkillSelection = vi.fn();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        hostId: 2,
+        checkoutMode: "worktree",
+        baseBranch: "main",
+      });
+      const preset = makePreset({ kind: "chat_agent", commands: [] });
+
+      const result = await materializeWithPreset(
+        draft, preset, "fix the login bug", actions,
+        { skillIds: ["skill-a"], text: "fix the login bug" },
+      );
+
+      expect(result.success).toBe(true);
+      // The same request the composer send builds.
+      expect(createWorkspaceOnHost).toHaveBeenCalledWith({
+        hostId: 2,
+        projectPath: "/projects/foo",
+        branch: "fix-login",
+        newBranch: true,
+        baseBranch: "main",
+        initialChat: { provider: "claude", thread_id: draft.threadId },
+      });
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).toHaveBeenCalledWith(
+        "ws-device",
+        "claude",
+        "/home/deus/.codemux/workspaces/foo/fix-login",
+        null,
+        draft.threadId,
+      );
+      const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(startInput.cwd).toBe("/home/deus/.codemux/workspaces/foo/fix-login");
+      // Skills are not relisted on this machine for a device thread.
+      expect(actions.refreshSkillSelection).not.toHaveBeenCalled();
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "claude",
+        expect.objectContaining({ skill_ids: ["skill-a"] }),
+      );
+    });
+
+    it("a terminal preset fails instead of running on this machine", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        hostId: 2,
+      });
+      const preset = makePreset({ kind: "cli" });
+
+      const result = await materializeWithPreset(draft, preset, "ship it", actions);
+
+      expect(result.success).toBe(false);
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        "draft-1",
+        expect.stringContaining("device"),
+      );
+      expect(createWorkspaceOnHost).not.toHaveBeenCalled();
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(applyPreset).not.toHaveBeenCalled();
+    });
+
+    it("fails when the device workspace never reports a path", async () => {
+      vi.useFakeTimers();
+      vi.mocked(createWorkspaceOnHost).mockResolvedValueOnce({
+        workspaceId: "ws-device",
+        cwd: null,
+        adopted: false,
+      });
+      const actions = makeActions();
+      const draft = makeDraft({ target: { kind: "project", projectPath: "/projects/foo" }, hostId: 2 });
+
+      const promise = materializeWithPreset(
+        draft, makePreset({ kind: "chat_agent" }), "hello", actions,
+      );
+      await vi.advanceTimersByTimeAsync(6_000);
+      const result = await promise;
+      vi.useRealTimers();
+
+      expect(result.success).toBe(false);
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        "draft-1",
+        expect.stringContaining("device"),
+      );
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
     });
   });
 

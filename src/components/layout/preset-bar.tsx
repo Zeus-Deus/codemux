@@ -37,6 +37,7 @@ import { RunButton } from "./run-button";
 import { cn } from "@/lib/utils";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
+import { draftHostId } from "@/lib/agent-chat/materialize";
 import {
   useChatDraftStore,
   type DraftId,
@@ -250,6 +251,10 @@ function PresetBarImpl({
 
   const inDraftMode = draftId != null;
   const isHomeDraft = inDraftMode && activeDraft?.target.kind === "home";
+  // A draft headed for a device: chat presets start there, but CLI presets
+  // run in a local terminal, so they're disabled rather than run here.
+  const isDeviceDraft =
+    inDraftMode && activeDraft != null && draftHostId(activeDraft) !== null;
 
   // Thread Scope redesign — a Home draft has no project, so the whole
   // bar doesn't belong here: CLI presets need project context and a
@@ -257,13 +262,14 @@ function PresetBarImpl({
   // being composed. Previously this rendered a fully-disabled bar
   // (see `isPresetDisabled` / `presetDisabledTooltip` below, now
   // unreachable dead code kept for the other draft/workspace modes'
-  // shared logic); now it doesn't render at all. Picking a project via
-  // the new Thread Scope location control flips the target away from
-  // `home` and the bar reappears enabled.
+  // shared logic); now it doesn't render at all. Picking a project from
+  // the new-thread headline flips the target away from `home` and the
+  // bar reappears enabled.
   if (isHomeDraft) return null;
 
-  function isPresetDisabled(_preset: TerminalPreset): boolean {
+  function isPresetDisabled(preset: TerminalPreset): boolean {
     if (disabled) return true;
+    if (isDeviceDraft && preset.kind !== "chat_agent") return true;
     // On a Home draft every preset is disabled: CLI presets need
     // project context (launching `claude` at ~ is useless), and a
     // Chat Agent click here would spawn a duplicate chat on top of
@@ -276,6 +282,9 @@ function PresetBarImpl({
 
   function presetDisabledTooltip(preset: TerminalPreset): string | null {
     if (disabled) return null;
+    if (isDeviceDraft && preset.kind !== "chat_agent") {
+      return "Terminal presets can't run on a device yet.";
+    }
     if (isHomeDraft) {
       if (preset.kind === "chat_agent") {
         return "You're already in a chat — pick a project to add another.";
@@ -532,7 +541,11 @@ function PresetButton({
 
   return (
     <Tooltip>
-      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      {/* A disabled button gets no pointer events, so a wrapper carries the
+          hover that explains why it's disabled. */}
+      <TooltipTrigger asChild>
+        {disabled ? <span className="inline-flex">{button}</span> : button}
+      </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4} className="text-label">
         {tooltip}
       </TooltipContent>

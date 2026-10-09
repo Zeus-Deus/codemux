@@ -73,6 +73,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         recorded_usage_baseline: None,
         env: None,
         workspace_id: None,
+        remote: None,
         extra: serde_json::Value::Null,
     }
 }
@@ -1443,6 +1444,7 @@ mod auto_resume {
                 recorded_usage_baseline: None,
                 env: None,
                 workspace_id: None,
+                remote: None,
                 extra: Value::Null,
             })
             .await

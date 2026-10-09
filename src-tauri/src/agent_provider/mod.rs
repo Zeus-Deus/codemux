@@ -44,3 +44,17 @@ pub use types::{
     ProviderSession, ProviderSessionId, RequestId, SendOutcome, SendTurnInput, SessionStatus,
     StartSessionInput, ThreadId, TurnDispatchCheckpoint, TurnId, TurnStartResult, UsageBaseline,
 };
+
+/// The MCP registry a session publishes tools from and runs tool calls
+/// through. A session on a device gets none: whatever runs on the far end of
+/// the SSH link must not be able to drive this computer's terminals, git or
+/// MCP servers through Codemux's tools.
+pub(crate) fn local_tool_registry(
+    registry: Option<&crate::mcp::registry::McpRegistry>,
+    remote: Option<&types::RemoteSpawnTarget>,
+) -> Option<crate::mcp::registry::McpRegistry> {
+    match remote {
+        Some(_) => None,
+        None => registry.cloned(),
+    }
+}

@@ -19,6 +19,7 @@ pub mod permissions;
 pub mod presets;
 pub mod provider_updates;
 pub mod project_files;
+pub mod remote_workspace;
 pub mod settings_sync;
 pub mod skills;
 pub mod skills_sync;

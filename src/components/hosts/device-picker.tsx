@@ -1,179 +1,224 @@
-import { useMemo } from "react";
+import { useState } from "react";
 
-import { Check, ChevronDown, Monitor, Server } from "lucide-react";
+import { Check, ChevronDown, Monitor, Plus, Server, Settings2 } from "lucide-react";
 
+import { focusCmdkOnOpen } from "@/components/chat/pickers/focus-cmdk-root";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  describeStatus,
+  type DeviceTone,
+} from "@/components/devices/use-device-cards";
+import { Command, CommandItem, CommandList } from "@/components/ui/command";
+import { Eyebrow } from "@/components/ui/eyebrow";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { useAddDeviceDialogStore } from "@/stores/add-device-dialog-store";
+import { useHostStatuses } from "@/stores/host-status-store";
 import { useHosts } from "@/stores/hosts-store";
+import { useLocalDeviceName } from "@/stores/local-device-store";
+import { useUIStore } from "@/stores/ui-store";
 
-/**
- * Compact "where will this run" picker. Mirrors the shape of
- * superset-sh's DevicePicker pill (the only place in their UI that
- * solves the same UX problem we have): a ~140px button showing the
- * current selection, opening a dropdown with "Local Device" at the
- * top and a submenu of remote hosts below.
- *
- * The current selection model uses `host_id: number | null` where
- * `null` means "local." This matches the Rust workspace struct's
- * `host_id: Option<i64>` field exactly and removes the need for a
- * sentinel string for the local entry.
- *
- * Usage: drop into any surface where "which host" is the user's
- * choice. The new-workspace dialog and the chat new-session flow
- * both use this same component so the experience stays identical.
- */
+// Same geometry as the scope strip's other controls (ThreadScopeRow's
+// GHOST_BTN and the location picker's rows), so the device control reads as
+// one more item in that strip rather than a foreign pill.
+const TRIGGER =
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+// One quiet line per device, like the strip's other popovers: name, an
+// inline check when selected, and its status on the right. The SSH address
+// lives in the row's tooltip.
+const ROW =
+  "flex h-8 w-full items-center gap-2.5 rounded-lg px-2 text-left text-label font-medium text-foreground data-selected:bg-surface-2";
 
-export interface DevicePickerProps {
-  /** Selected host id. `null` means "Local Device". */
-  hostId: number | null;
-  /** Fires whenever the user picks a new device. `null` means local. */
-  onSelectHostId: (hostId: number | null) => void;
-  /** Optional className passthrough so callers can adjust the trigger. */
-  className?: string;
-  /** Optional override label for the local entry. Defaults to
-   *  "Local Device" matching superset's terminology. Some surfaces
-   *  may want "This device" instead. */
-  localLabel?: string;
-  /** When true, the trigger renders compact-only (no label, icon
-   *  only). Useful in tight headers. Off by default. */
-  iconOnly?: boolean;
-}
+const TONE_LABEL: Record<DeviceTone, string> = {
+  online: "Online",
+  updating: "Updating…",
+  attention: "Needs setup",
+  offline: "Offline",
+  checking: "Checking…",
+};
 
-/**
- * Online-indicator dot. Local is "tautologically online" — the app
- * itself is the local host, so we don't draw a dot for it. Remote
- * hosts get either an emerald dot (reachable, last-test succeeded)
- * or a muted dot (not yet tested, or last test failed). The
- * reachability info lands when SSH transport ships in 2d; for now
- * every remote host shows as offline-style.
- */
-function OnlineDot({ online }: { online: boolean }) {
+const TONE_DOT: Record<DeviceTone, string> = {
+  online: "bg-status-open",
+  updating: "bg-status-remote motion-safe:animate-pulse",
+  attention: "bg-status-working",
+  offline: "bg-muted-foreground/60",
+  checking: "bg-muted-foreground/40",
+};
+
+/** The accent check. Wrapped so the highlighted row's icon recolouring
+ *  (which targets the item's direct `svg` children) leaves it alone. */
+function SelectedMark() {
   return (
-    <span
-      aria-hidden
-      className={cn(
-        "inline-block size-1.5 shrink-0 rounded-full",
-        online ? "bg-status-open" : "bg-muted-foreground/60",
-      )}
-    />
+    <span className="flex shrink-0 text-accent-ember" aria-label="Selected">
+      <Check className="size-3.5" />
+    </span>
   );
 }
 
+export interface DevicePickerProps {
+  /** Selected device (`HostView.id`); `null` means this device. */
+  hostId: number | null;
+  onSelectHostId: (hostId: number | null) => void;
+  disabled?: boolean;
+}
+
+/**
+ * "Where does this thread run?" — the first control in the new-thread scope
+ * strip. Lists this device and every configured SSH device with its live
+ * status. Always rendered, even with no devices configured, so adding one is
+ * a click away from the composer.
+ */
 export function DevicePicker({
   hostId,
   onSelectHostId,
-  className,
-  localLabel = "Local Device",
-  iconOnly = false,
+  disabled,
 }: DevicePickerProps) {
-  // Single shared cache across every DevicePicker + workspace
-  // context menu instance. First read kicks off the lazy load;
-  // subsequent reads (anywhere in the tree) hand back the cached
-  // list. See `src/stores/hosts-store.ts`.
+  const [open, setOpen] = useState(false);
   const hosts = useHosts();
+  const statuses = useHostStatuses();
+  const localName = useLocalDeviceName();
+  const setShowSettings = useUIStore((s) => s.setShowSettings);
 
-  const selectedHost = useMemo(
-    () => hosts.find((h) => h.id === hostId) ?? null,
-    [hosts, hostId],
-  );
-  const isLocal = hostId === null || !selectedHost;
-  const label = isLocal ? localLabel : selectedHost.name;
+  const selected =
+    hostId === null ? null : (hosts.find((h) => h.id === hostId) ?? null);
+  // An id the list doesn't know (not loaded yet, failed to load, or deleted
+  // elsewhere) still sends to that device, so it must not read as this one.
+  const unavailable = hostId !== null && selected === null;
+  const label = selected
+    ? selected.name
+    : unavailable
+      ? "Device unavailable"
+      : (localName ?? "This device");
+
+  const select = (next: number | null) => {
+    setOpen(false);
+    onSelectHostId(next);
+  };
+
+  const openDeviceSettings = () => {
+    setOpen(false);
+    if (hosts.length === 0) useAddDeviceDialogStore.getState().setOpen(true);
+    setShowSettings(true, "hosts");
+  };
+
+  // Read once per render; the status store's event keeps `statuses` fresh,
+  // and a stale "last seen" age isn't shown in this compact list.
+  const now = Date.now();
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
         <button
           type="button"
+          disabled={disabled}
           aria-label={`Device: ${label}`}
-          title={label}
-          // Class string is intentionally identical to
-          // `ProjectPicker`'s trigger so the row of pills looks
-          // uniform. Don't reformat into separate string literals —
-          // the previous attempt diverged enough that the pill
-          // rendered taller than its neighbors. Match-by-string is
-          // the most reliable diff guard.
-          className={cn(
-            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground",
-            className,
-          )}
+          title={
+            selected
+              ? `Runs on ${selected.name}`
+              : unavailable
+                ? "Runs on a device that isn't available"
+                : "Runs on this device"
+          }
+          className={TRIGGER}
         >
-          {isLocal ? (
-            <Monitor className="size-3.5" />
+          {selected ? (
+            <Server className="size-3.5 text-status-remote" />
+          ) : unavailable ? (
+            <Server className="size-3.5 text-muted-foreground" />
           ) : (
-            <Server className="size-3.5" />
+            <Monitor className="size-3.5 text-muted-foreground" />
           )}
-          {!iconOnly && (
-            // Match the project picker's label shape exactly —
-            // `max-w-[120px] truncate`, no flex-1. flex-1 was
-            // letting the pill stretch wider than its content, so
-            // the icon + label spacing read differently than the
-            // neighboring project/branch pills.
-            <span className="max-w-[120px] truncate">{label}</span>
-          )}
-          {!isLocal && (
-            <OnlineDot
-              online={Boolean(selectedHost && !selectedHost.dirty)}
-            />
-          )}
-          {!iconOnly && (
-            <ChevronDown className="size-3 opacity-40" />
-          )}
+          <span className="max-w-[120px] truncate">{label}</span>
+          <ChevronDown className="size-3 opacity-45" />
         </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-64">
-        <DropdownMenuItem onSelect={() => onSelectHostId(null)}>
-          <Monitor className="size-3.5" />
-          <span className="flex-1">{localLabel}</span>
-          {isLocal && <Check className="size-3.5" />}
-        </DropdownMenuItem>
-        {hosts.length > 0 && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger>
-                <Server className="size-3.5" />
-                <span>Other Hosts</span>
-              </DropdownMenuSubTrigger>
-              <DropdownMenuSubContent className="w-64">
-                {hosts.map((host) => {
-                  const isSelected = hostId === host.id;
-                  // Until the SSH probe lands (2d), we render every
-                  // remote host as "offline-style" — they're
-                  // configured but unverified. The dirty flag also
-                  // means "hasn't reached the cloud yet," which is
-                  // a useful signal of "this host is still being
-                  // set up."
-                  const isOnline = false;
-                  return (
-                    <DropdownMenuItem
-                      key={host.id}
-                      onSelect={() => onSelectHostId(host.id)}
-                    >
-                      <Server className="size-3.5" />
-                      <span className="min-w-0 flex-1 truncate">
-                        {host.name}
-                      </span>
-                      <OnlineDot online={isOnline} />
-                      {isSelected && (
-                        <Check className="ml-auto size-3.5 shrink-0" />
-                      )}
-                    </DropdownMenuItem>
-                  );
-                })}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          </>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
+      </PopoverTrigger>
+      <PopoverContent
+        className="flex max-h-[var(--radix-popover-content-available-height)] w-[244px] flex-col p-1.5"
+        align="start"
+        side="top"
+        collisionPadding={10}
+        onOpenAutoFocus={focusCmdkOnOpen}
+      >
+        <Command loop className="bg-transparent">
+          <Eyebrow className="px-2 pb-1 pt-1">Run on</Eyebrow>
+          <CommandList
+            className="max-h-[260px] min-h-0 flex-1 overflow-y-auto thin-scrollbar"
+            onWheel={(e) => e.stopPropagation()}
+          >
+            <CommandItem
+              value="this-device"
+              onSelect={() => select(null)}
+              showCheckmark={false}
+              className={ROW}
+              title="Runs on this computer"
+            >
+              <Monitor className="size-3.5 text-muted-foreground" />
+              <span className="min-w-0 truncate">{localName ?? "This device"}</span>
+              {hostId === null && <SelectedMark />}
+              <span className="ml-auto shrink-0 text-caption text-muted-foreground/70">
+                this device
+              </span>
+            </CommandItem>
+            {hosts.length > 0 && (
+              <div aria-hidden className="mx-2 my-1 h-px bg-border/60" />
+            )}
+            {hosts.map((host) => {
+              const tone = describeStatus(statuses[host.id] ?? null, now).tone;
+              const isSelected = selected?.id === host.id;
+              return (
+                <CommandItem
+                  key={host.id}
+                  value={`device-${host.id}`}
+                  onSelect={() => select(host.id)}
+                  showCheckmark={false}
+                  className={ROW}
+                  title={`SSH ${host.ssh_target} · ${TONE_LABEL[tone]}`}
+                  data-host-id={host.id}
+                >
+                  <Server
+                    className={cn(
+                      "size-3.5",
+                      tone === "online" ? "text-muted-foreground" : "text-muted-foreground/50",
+                    )}
+                  />
+                  <span
+                    className={cn(
+                      "min-w-0 truncate",
+                      tone === "online" ? "text-foreground" : "text-muted-foreground",
+                    )}
+                  >
+                    {host.name}
+                  </span>
+                  {isSelected && <SelectedMark />}
+                  <span className="ml-auto flex shrink-0 items-center gap-1.5 text-caption text-muted-foreground/70">
+                    <span
+                      aria-hidden
+                      className={cn("size-1.5 rounded-full", TONE_DOT[tone])}
+                    />
+                    {TONE_LABEL[tone].toLowerCase()}
+                  </span>
+                </CommandItem>
+              );
+            })}
+          </CommandList>
+        </Command>
+        <div aria-hidden className="mx-2 my-1 h-px bg-border/60" />
+        <button
+          type="button"
+          onClick={openDeviceSettings}
+          className="flex h-8 w-full items-center gap-2.5 rounded-lg px-2 text-left text-label text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+        >
+          {hosts.length === 0 ? (
+            <Plus className="size-3.5" />
+          ) : (
+            <Settings2 className="size-3.5" />
+          )}
+          {hosts.length === 0 ? "Add a device…" : "Manage devices…"}
+        </button>
+      </PopoverContent>
+    </Popover>
   );
 }

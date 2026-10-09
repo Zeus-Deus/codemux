@@ -13,7 +13,8 @@
 //! the happy path is "create a new branch off `base` and check it out."
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Result of a successful worktree creation.
 #[derive(Debug, Clone)]
@@ -24,6 +25,8 @@ pub struct CreatedWorktree {
     pub repo_root: PathBuf,
     /// The branch the worktree is checked out on.
     pub branch: String,
+    /// False when an existing worktree for the same branch was reused.
+    pub created: bool,
 }
 
 /// Run `git -C <dir> <args>`, returning trimmed stdout on success or a
@@ -285,6 +288,7 @@ pub fn create_worktree(
             worktree_path,
             repo_root,
             branch: branch.to_string(),
+            created: false,
         });
     }
 
@@ -335,7 +339,167 @@ pub fn create_worktree(
         worktree_path,
         repo_root,
         branch: branch.to_string(),
+        created: true,
     })
+}
+
+/// True when `branch` exists locally or on `origin`. Freshens
+/// `origin/<branch>` first (best-effort, time-capped) so a branch pushed
+/// from another device is found, and `git worktree add <path> <branch>`
+/// can then create a local branch tracking it.
+pub fn branch_exists(repo_root: &Path, branch: &str) -> bool {
+    let local = format!("refs/heads/{branch}");
+    if run_git(repo_root, &["rev-parse", "--verify", "--quiet", &local]).is_ok() {
+        return true;
+    }
+    fetch_origin_branch(repo_root, branch);
+    let remote = format!("refs/remotes/origin/{branch}");
+    run_git(repo_root, &["rev-parse", "--verify", "--quiet", &remote]).is_ok()
+}
+
+/// `git check-ref-format --branch`: whether git accepts `branch` as a new
+/// branch name.
+pub fn is_valid_branch_name(repo_root: &Path, branch: &str) -> bool {
+    !branch.starts_with('-') && run_git(repo_root, &["check-ref-format", "--branch", branch]).is_ok()
+}
+
+/// Wall-clock cap for cloning a project onto this host, https retry
+/// included. Generous on purpose: a first clone of a large repo over a
+/// slow link takes minutes. The desktop's wait on `project ensure` is
+/// sized from it.
+pub const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Cap for `git remote set-head origin --auto`, one round trip to origin.
+/// `project ensure` runs it after a clone, so the desktop's wait adds it.
+pub const ORIGIN_HEAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `git clone -- <url> <target>` for a caller with nobody at the keyboard:
+/// credential, passphrase and host-key prompts fail fast instead of
+/// hanging, and the clone is killed after `timeout`. Errors carry the tail
+/// of git's stderr on one line.
+pub fn clone_repo(url: &str, target: &Path, timeout: Duration) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--quiet", "--"]).arg(url).arg(target);
+    if let Some(parent) = target.parent() {
+        cmd.current_dir(parent);
+    }
+    non_interactive(&mut cmd, target.parent());
+    run_capped(cmd, timeout).map(|_| ())
+}
+
+/// Point `refs/remotes/origin/HEAD` at the remote's default branch when it
+/// isn't set yet. A fresh clone sets it; an rsynced or hand-made checkout
+/// may not, and default-branch resolution reads it first. Best-effort.
+pub fn ensure_origin_head(repo_root: &Path) {
+    if run_git(repo_root, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).is_ok() {
+        return;
+    }
+    let has_origin = run_git(repo_root, &["remote"])
+        .map(|out| out.lines().any(|r| r.trim() == "origin"))
+        .unwrap_or(false);
+    if !has_origin {
+        return;
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_root)
+        .args(["remote", "set-head", "origin", "--auto"]);
+    non_interactive(&mut cmd, Some(repo_root));
+    let _ = run_capped(cmd, ORIGIN_HEAD_TIMEOUT);
+}
+
+/// Never prompt. Over ssh that means BatchMode, and accepting a forge's
+/// host key on first contact (a fresh device has never seen github.com).
+/// A user's own ssh command (env, or `core.sshCommand` as seen from
+/// `config_dir`) wins, since `GIT_SSH_COMMAND` would override it.
+fn non_interactive(cmd: &mut Command, config_dir: Option<&Path>) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || {
+            let mut probe = Command::new("git");
+            if let Some(dir) = config_dir {
+                probe.current_dir(dir);
+            }
+            probe
+                .args(["config", "--get", "core.sshCommand"])
+                .output()
+                .map(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
+                .unwrap_or(false)
+        };
+    if !user_ssh {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+        );
+    }
+}
+
+/// Run `cmd` to completion, or kill it (and anything it spawned, such as
+/// ssh) after `timeout`. Returns trimmed stdout, or the tail of stderr.
+fn run_capped(mut cmd: Command, timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
+    // Own process group, so a timeout can take down git's helpers too.
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't run git: {e}"))?;
+
+    // Drain both pipes on threads: a chatty git must not block on a full
+    // pipe while we poll for its exit.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                // SAFETY: plain syscall; the group id is the child's pid
+                // because of `process_group(0)` above.
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    match status {
+        Some(status) if status.success() => Ok(stdout.trim().to_string()),
+        Some(status) => Err(stderr_tail(&stderr).unwrap_or_else(|| format!("git exited with {status}"))),
+        None => Err(format!("git timed out after {}s", timeout.as_secs())),
+    }
+}
+
+/// The last few lines of `stderr` on one line, for error messages that
+/// must stay single-line. `None` when stderr is blank.
+pub fn stderr_tail(stderr: &str) -> Option<String> {
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 400;
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let tail = lines[lines.len().saturating_sub(MAX_LINES)..].join(" ");
+    let count = tail.chars().count();
+    if count <= MAX_CHARS {
+        return Some(tail);
+    }
+    Some(format!("…{}", tail.chars().skip(count - MAX_CHARS).collect::<String>()))
 }
 
 #[cfg(test)]
@@ -404,6 +568,8 @@ mod tests {
         let again = create_worktree(home.path(), repo.path(), "feature-x", true, Some("main"))
             .expect("reuse worktree");
         assert_eq!(again.worktree_path, created.worktree_path);
+        assert!(created.created, "first call creates the worktree");
+        assert!(!again.created, "second call reports the reuse");
     }
 
     #[test]

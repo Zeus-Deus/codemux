@@ -11,6 +11,8 @@
 //! only sends `name` + `ssh_target`; auth is the OS's job
 //! (`~/.ssh/config`, agent, keys).
 
+mod ssh_config;
+
 use crate::database::{DatabaseStore, HostRecord};
 use crate::hosts_status::{HostStatusStore, HostStatusView};
 use serde::{Deserialize, Serialize};
@@ -46,6 +48,48 @@ pub fn hosts_list(db: State<'_, DatabaseStore>) -> Vec<HostView> {
     db.list_hosts().into_iter().map(Into::into).collect()
 }
 
+/// Reject an SSH target `ssh` could read as an option or as more than
+/// one argument. The check lives in the Unix-only `ssh::exec`; Windows
+/// reaches no devices yet but still syncs the device list, so it applies
+/// the same rule rather than accept a target other devices drop.
+pub(crate) fn validate_ssh_target(target: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        crate::ssh::exec::validate_ssh_target(target)
+    }
+    #[cfg(not(unix))]
+    {
+        if target.is_empty() {
+            return Err("SSH target is empty".into());
+        }
+        if target.starts_with('-') {
+            return Err("SSH target can't start with '-'".into());
+        }
+        if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("SSH target can't contain spaces or control characters".into());
+        }
+        Ok(())
+    }
+}
+
+/// Trim and check what the user typed for a device. Shared by add and
+/// edit so both enforce the same rules.
+fn validate_host_fields(name: &str, ssh_target: &str) -> Result<(String, String), String> {
+    let name = name.trim();
+    let ssh_target = ssh_target.trim();
+    if name.is_empty() {
+        return Err("Device name can't be empty".into());
+    }
+    if name.len() > 200 {
+        return Err("Device name is too long (max 200 characters)".into());
+    }
+    if ssh_target.len() > 500 {
+        return Err("SSH target is too long (max 500 characters)".into());
+    }
+    validate_ssh_target(ssh_target)?;
+    Ok((name.to_string(), ssh_target.to_string()))
+}
+
 #[tauri::command]
 pub fn hosts_add<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -53,21 +97,11 @@ pub fn hosts_add<R: tauri::Runtime>(
     name: String,
     ssh_target: String,
 ) -> Result<HostView, String> {
-    let name = name.trim().to_string();
-    let ssh_target = ssh_target.trim().to_string();
-    if name.is_empty() {
-        return Err("Host name cannot be empty".into());
-    }
-    if ssh_target.is_empty() {
-        return Err("SSH target cannot be empty".into());
-    }
-    if name.len() > 200 {
-        return Err("Host name is too long (max 200 chars)".into());
-    }
-    if ssh_target.len() > 500 {
-        return Err("SSH target is too long (max 500 chars)".into());
-    }
+    let (name, ssh_target) = validate_host_fields(&name, &ssh_target)?;
     let record = db.insert_host(&name, &ssh_target)?;
+    // Probe right away so the new device's dot doesn't wait for a poll.
+    #[cfg(unix)]
+    tauri::async_runtime::spawn(crate::hosts_inventory::refresh_host(app.clone(), record.id));
     schedule_background_sync(app);
     Ok(record.into())
 }
@@ -80,15 +114,11 @@ pub fn hosts_update<R: tauri::Runtime>(
     name: String,
     ssh_target: String,
 ) -> Result<HostView, String> {
-    let name = name.trim().to_string();
-    let ssh_target = ssh_target.trim().to_string();
-    if name.is_empty() {
-        return Err("Host name cannot be empty".into());
-    }
-    if ssh_target.is_empty() {
-        return Err("SSH target cannot be empty".into());
-    }
+    let (name, ssh_target) = validate_host_fields(&name, &ssh_target)?;
     let record = db.update_host(id, &name, &ssh_target)?;
+    // A new target makes the current status stale.
+    #[cfg(unix)]
+    tauri::async_runtime::spawn(crate::hosts_inventory::refresh_host(app.clone(), record.id));
     schedule_background_sync(app);
     Ok(record.into())
 }
@@ -106,17 +136,42 @@ pub fn hosts_delete<R: tauri::Runtime>(
     Ok(())
 }
 
-/// One status row per configured host, in `hosts_list` order. Hosts the
-/// poller hasn't probed yet (including unsynced hosts, which it never
-/// touches) come back `probed: false` with whatever `last_seen_at` /
-/// `disk_bytes` the row remembers, so the Devices page can render every
-/// card from this one call.
+/// One status row per configured host, in `hosts_list` order. Hosts not
+/// probed yet this session come back `probed: false` with whatever
+/// `last_seen_at` / `disk_bytes` the row remembers, so the Devices page
+/// can render every card from this one call.
 #[tauri::command]
 pub fn hosts_status_list(
     db: State<'_, DatabaseStore>,
     status: State<'_, HostStatusStore>,
 ) -> Vec<HostStatusView> {
     status.views_for(&db.list_hosts())
+}
+
+/// This machine's name ("ai-node"), shown as the local device in the
+/// device picker.
+#[tauri::command]
+pub fn get_local_device_name() -> String {
+    crate::web_remote::registration::device_name()
+}
+
+/// Host aliases from `~/.ssh/config` and the files it includes, offered
+/// as suggestions when adding a device. Wildcard patterns and names that
+/// aren't usable SSH targets are left out; no config means no
+/// suggestions.
+#[tauri::command]
+pub async fn hosts_ssh_config_hosts() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    tokio::task::spawn_blocking(move || {
+        ssh_config::config_hosts(&home)
+            .into_iter()
+            .filter(|alias| validate_ssh_target(alias).is_ok())
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Assign (or clear) the host a workspace runs on. Used by the
@@ -146,10 +201,10 @@ fn interpret_github_probe(stdout: &str) -> String {
     let git_ok = stdout.contains("GIT_OK");
     let gh_ok = stdout.contains("GH_OK");
     if !git_ok {
-        " · ⚠ git not found — automations on this host need git installed"
+        " · ⚠ git not found — automations on this device need git installed"
             .to_string()
     } else if !gh_ok {
-        " · ⚠ gh not signed in — run `gh auth login` on this host for \
+        " · ⚠ gh not signed in — run `gh auth login` on this device for \
          PR/issue automations"
             .to_string()
     } else {
@@ -162,20 +217,17 @@ fn interpret_github_probe(stdout: &str) -> String {
 /// the probe itself could not run.
 #[cfg(unix)]
 async fn probe_host_github(ssh_target: &str) -> String {
-    let output = tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(ssh_target)
-        .arg(
-            "git --version >/dev/null 2>&1 && echo GIT_OK; \
-             gh auth status >/dev/null 2>&1 && echo GH_OK",
-        )
-        .output()
-        .await;
+    // The trailing `true` keeps a signed-out `gh` from reading as an ssh
+    // failure, which would drop the git finding too.
+    let output = crate::ssh::exec::run_remote(
+        ssh_target,
+        "git --version >/dev/null 2>&1 && echo GIT_OK; \
+         gh auth status >/dev/null 2>&1 && echo GH_OK; true",
+        std::time::Duration::from_secs(15),
+    )
+    .await;
     match output {
-        Ok(out) => interpret_github_probe(&String::from_utf8_lossy(&out.stdout)),
+        Ok(stdout) => interpret_github_probe(&stdout),
         Err(_) => String::new(),
     }
 }
@@ -191,12 +243,16 @@ async fn probe_host_github(ssh_target: &str) -> String {
 /// - unreachable → display the SSH error verbatim so the user can
 ///   debug their `~/.ssh/config` / network / key access
 ///
+/// Every test also updates the device's live status and tells the UI,
+/// so status dots match the result without waiting for the poller.
+///
 /// Unix-only — the underlying `ssh::probe` module is `#[cfg(unix)]`.
 /// On Windows we return a clear "not yet implemented" message; the
 /// rest of the UI degrades gracefully because the daemon path is
 /// also disabled on Windows.
 #[tauri::command]
-pub async fn hosts_test_connection(
+pub async fn hosts_test_connection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
 ) -> Result<HostTestResult, String> {
@@ -206,12 +262,17 @@ pub async fn hosts_test_connection(
         .list_hosts()
         .into_iter()
         .find(|h| h.id == id)
-        .ok_or_else(|| format!("Host not found: {id}"))?;
+        .ok_or_else(|| format!("Device not found: {id}"))?;
 
     #[cfg(unix)]
     {
         use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
         let outcome = probe_host(ProbeOptions::new(&host.ssh_target)).await;
+        crate::hosts_inventory::record_observation(
+            &app,
+            host.id,
+            &crate::hosts_inventory::probe_observation(&outcome),
+        );
         Ok(match outcome {
             ProbeOutcome::Reachable {
                 codemux_remote_version: Some(version),
@@ -230,14 +291,16 @@ pub async fn hosts_test_connection(
                 // install). Without this, an upgraded Codemux would
                 // silently keep using stale codemux-remote on every
                 // host the user never explicitly pushed to.
+                // A newer helper (from a newer desktop sharing the
+                // device) is never downgraded.
                 let our_version = env!("CARGO_PKG_VERSION");
-                let upgrade_available = version != our_version;
+                let upgrade_available = crate::hosts_upgrade::is_older(&version, our_version);
                 let uname_suffix = uname.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
                 if upgrade_available {
                     HostTestResult {
                         ok: true,
                         message: format!(
-                            "codemux-remote v{version} on host, v{our_version} bundled — \
+                            "codemux-remote v{version} on the device, v{our_version} bundled — \
                              Install to upgrade{uname_suffix}{github_note}"
                         ),
                         needs_install: true,
@@ -298,7 +361,7 @@ pub async fn hosts_test_connection(
     }
     #[cfg(not(unix))]
     {
-        let _ = host;
+        let _ = (app, host);
         Ok(HostTestResult {
             ok: false,
             message: "SSH transport is Unix-only for now. Windows support \
@@ -349,6 +412,9 @@ pub async fn hosts_bootstrap_install<R: tauri::Runtime>(
         use crate::ssh::bootstrap::{
             bootstrap_remote, BootstrapOptions, BootstrapResult,
         };
+        // Waits out a background upgrade of this device: two uploads at
+        // once would share its temp file.
+        let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
         let outcome = bootstrap_remote(
             BootstrapOptions::new(&host.ssh_target, uname.trim())
                 .with_app(&app),
@@ -412,6 +478,7 @@ pub async fn hosts_bootstrap_install<R: tauri::Runtime>(
                     }
                 };
 
+                mark_host_ready(&app, host.id);
                 HostBootstrapResult {
                     ok: true,
                     message: format!(
@@ -460,6 +527,18 @@ pub struct HostBootstrapResult {
     pub message: String,
 }
 
+/// After a successful install the device is ready: show it online now,
+/// then read its facts and workspaces in the background.
+#[cfg(unix)]
+fn mark_host_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, host_id: i64) {
+    crate::hosts_inventory::record_observation(
+        app,
+        host_id,
+        &crate::hosts_status::Observation::Alive,
+    );
+    tauri::async_runtime::spawn(crate::hosts_inventory::refresh_host(app.clone(), host_id));
+}
+
 /// Force-reinstall `codemux-remote` on a host regardless of the version
 /// already installed there, and restart its pty-daemon so the fresh
 /// binary takes effect immediately.
@@ -489,14 +568,17 @@ pub async fn hosts_reinstall_remote<R: tauri::Runtime>(
     #[cfg(unix)]
     {
         Ok(match force_reinstall_remote_binary(&app, &host).await {
-            Ok(version) => HostBootstrapResult {
-                ok: true,
-                message: format!(
-                    "codemux-remote v{version} reinstalled on {} — daemon restarted; \
-                     the next push uses the fresh binary.",
-                    host.name
-                ),
-            },
+            Ok(version) => {
+                mark_host_ready(&app, host.id);
+                HostBootstrapResult {
+                    ok: true,
+                    message: format!(
+                        "codemux-remote v{version} reinstalled on {} — daemon restarted; \
+                         the next push uses the fresh binary.",
+                        host.name
+                    ),
+                }
+            }
             Err(reason) => HostBootstrapResult {
                 ok: false,
                 message: format!("Reinstall failed: {reason}"),
@@ -1507,51 +1589,59 @@ async fn pull_claude_projects(
 /// the same socket without an "address in use" conflict.
 ///
 /// Returns Ok on either "already current, nothing to do" or "updated
-/// successfully." Returns Err only when the bootstrap attempt itself
-/// failed (network down, no bundled binary for the target uname, etc.).
-/// Caller decides whether to propagate or warn-and-continue.
+/// successfully." Returns Err when the host can't be reached or the
+/// bootstrap attempt itself failed (no bundled binary for the target
+/// uname, upload failed, etc.). Caller decides whether to propagate or
+/// warn-and-continue. Installs the binary on a host that lacks it, so
+/// call it only from flows the user started on that device.
 #[cfg(unix)]
-async fn ensure_remote_binary_current<R: tauri::Runtime>(
+pub(crate) async fn ensure_remote_binary_current<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
 ) -> Result<(), String> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
     // Step 1: probe the installed binary's version.
-    let probe = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(&host.ssh_target)
-        .arg("$HOME/.local/bin/codemux-remote --version 2>/dev/null || echo MISSING")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("version probe: spawn ssh: {e}"))?;
-    let stdout = String::from_utf8_lossy(&probe.stdout).trim().to_string();
-    // `codemux-remote --version` prints `codemux-remote X.Y.Z` to stdout.
-    let remote_version = stdout
-        .strip_prefix("codemux-remote ")
-        .map(|s| s.trim().to_string());
+    let stdout = crate::ssh::exec::run_remote(
+        &host.ssh_target,
+        "$HOME/.local/bin/codemux-remote --version 2>/dev/null || echo MISSING",
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .map_err(|e| format!("version probe: {e}"))?;
+    // `codemux-remote --version` prints `codemux-remote X.Y.Z` to stdout,
+    // possibly after a login banner.
+    let remote_version = stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("codemux-remote ")
+            .map(|v| v.trim().to_string())
+    });
     let our_version = env!("CARGO_PKG_VERSION");
-    if remote_version.as_deref() == Some(our_version) {
-        eprintln!(
-            "[hosts] {} already has codemux-remote {our_version} — skipping bootstrap",
-            host.name
-        );
-        return Ok(());
+    match remote_version.as_deref() {
+        // Current, or newer from a newer desktop sharing the device: it has
+        // everything this build uses, and replacing it would downgrade it.
+        Some(version) if !crate::hosts_upgrade::is_older(version, our_version) => {
+            return Ok(());
+        }
+        // Older: the gentle upgrade swaps the binary without killing the
+        // device's terminals and restarts `serve` only when it is idle.
+        Some(version) => {
+            eprintln!(
+                "[hosts] {} has codemux-remote {version}, upgrading to {our_version}",
+                host.name
+            );
+            return crate::hosts_upgrade::upgrade_host(app, host)
+                .await
+                .map(|_| ());
+        }
+        None => {}
     }
     eprintln!(
-        "[hosts] {} needs bootstrap: remote_version={:?} our_version={our_version}",
-        host.name, remote_version
+        "[hosts] {} has no working codemux-remote, installing {our_version}",
+        host.name
     );
 
-    // Version differs — re-upload + restart. Shared with the manual
-    // "Reinstall agent" button (`hosts_reinstall_remote`), which runs
-    // the same steps but skips the version check above.
+    // Missing or broken: nothing is running from it, so a full reinstall is
+    // safe. Shared with the manual "Set up again" (`hosts_reinstall_remote`),
+    // which runs the same steps without the version check above.
     force_reinstall_remote_binary(app, host).await.map(|_| ())
 }
 
@@ -1569,26 +1659,29 @@ async fn ensure_remote_binary_current<R: tauri::Runtime>(
 /// verify the bundled binary → restart the headless `serve` daemon.
 /// Returns the reported version on success.
 #[cfg(unix)]
-async fn force_reinstall_remote_binary<R: tauri::Runtime>(
+pub(crate) async fn force_reinstall_remote_binary<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
 ) -> Result<String, String> {
-    use std::process::Stdio;
-    use tokio::process::Command;
+    use crate::ssh::exec::run_remote;
+    use std::time::Duration;
+
+    // Waits out a background upgrade of this device: two uploads at once
+    // would share its temp file.
+    let _device = crate::hosts_upgrade::claim_device(&host.ssh_target).await;
 
     // Step 1: figure out the remote uname so we can pick the right
-    // bundled binary.
-    let uname_output = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(&host.ssh_target)
-        .arg("uname -s -m")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    // bundled binary. The last line wins over any login banner.
+    let uname_output = run_remote(&host.ssh_target, "uname -s -m", Duration::from_secs(20))
         .await
-        .map_err(|e| format!("uname probe: spawn ssh: {e}"))?;
-    let uname = String::from_utf8_lossy(&uname_output.stdout).trim().to_string();
+        .map_err(|e| format!("uname probe: {e}"))?;
+    let uname = uname_output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .last()
+        .unwrap_or_default()
+        .to_string();
     if uname.is_empty() {
         return Err("uname probe returned empty string".into());
     }
@@ -1600,13 +1693,12 @@ async fn force_reinstall_remote_binary<R: tauri::Runtime>(
     // pattern only matches the SSH-spawned pty-daemon — user-launched
     // `codemux-remote mcp` or `serve` invocations are spared. `serve`
     // is restarted via systemctl in step 4 instead.
-    let _ = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(&host.ssh_target)
-        .arg("pkill -f 'codemux-remote pty-daemon' 2>/dev/null || true")
-        .status()
-        .await;
+    let _ = run_remote(
+        &host.ssh_target,
+        "pkill -f 'codemux-remote pty-daemon' 2>/dev/null || true",
+        Duration::from_secs(20),
+    )
+    .await;
 
     // Step 3: bootstrap (upload binary + verify version).
     use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
@@ -1756,7 +1848,32 @@ fn terminate_workspace_sessions<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::interpret_github_probe;
+    use super::{interpret_github_probe, validate_host_fields};
+
+    #[test]
+    fn host_fields_are_trimmed_and_checked() {
+        assert_eq!(
+            validate_host_fields("  zeus ", " deus@zeus "),
+            Ok(("zeus".to_string(), "deus@zeus".to_string()))
+        );
+        assert_eq!(
+            validate_host_fields("homelab", "ssh://deus@zeus:2222"),
+            Ok(("homelab".to_string(), "ssh://deus@zeus:2222".to_string()))
+        );
+        assert!(validate_host_fields("   ", "deus@zeus").unwrap_err().contains("name"));
+        assert!(validate_host_fields(&"x".repeat(201), "deus@zeus").is_err());
+        assert!(validate_host_fields("zeus", &"x".repeat(501)).is_err());
+        assert!(validate_host_fields("zeus", "  ").is_err());
+    }
+
+    #[test]
+    fn host_fields_reject_targets_ssh_would_read_as_options() {
+        // Targets reach `ssh` argv; a leading `-` would be parsed as a
+        // flag (`-oProxyCommand=…` runs a local command).
+        assert!(validate_host_fields("evil", "-oProxyCommand=x").is_err());
+        let err = validate_host_fields("zeus", "deus@zeus -p 2222").unwrap_err();
+        assert!(err.contains("spaces"), "{err}");
+    }
 
     #[test]
     fn github_probe_reports_ready_when_git_and_gh_are_present() {

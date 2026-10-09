@@ -1157,6 +1157,10 @@ export interface WorkspaceSnapshot {
    *  "open on host" / attach-in-place workspaces (terminals spawn here
    *  on the remote). `null`/undefined for local + pushed workspaces. */
   remote_cwd?: string | null;
+  /** The project's checkout ON ITS HOST for an attach-in-place
+   *  workspace. A thread started on a device keeps this computer's path in
+   *  `project_root` for sidebar grouping. `null`/undefined elsewhere. */
+  remote_root?: string | null;
   /** True when this workspace is operated in place on its host with no
    *  local copy of the files (`cwd` is a host path). The UI shows a
    *  host badge and offers only "Close (detach)" — never delete/push.

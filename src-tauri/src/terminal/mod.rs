@@ -1360,12 +1360,20 @@ pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
 /// (see `crate::commands::agent_chat::workspace_env_overlay`), keeping the
 /// terminal and chat surfaces in lockstep.
 pub(crate) fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, String)> {
+    let (project_root, worktree_path) = env_root_and_worktree(
+        ws.host_id.is_some() && ws.attach_only,
+        &ws.cwd,
+        ws.project_root.as_deref(),
+        ws.worktree_path.as_deref(),
+        ws.remote_root.as_deref(),
+        ws.remote_cwd.as_deref(),
+    );
     workspace_pty_env_from_fields(
         &ws.workspace_id.0,
         &ws.title,
         &ws.cwd,
-        ws.project_root.as_deref(),
-        ws.worktree_path.as_deref(),
+        project_root,
+        worktree_path,
         ws.git_branch.as_deref(),
     )
 }
@@ -1373,14 +1381,45 @@ pub(crate) fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(St
 pub(crate) fn hydration_workspace_pty_env(
     ws: &crate::state::PtyHydrationWorkspace,
 ) -> Vec<(String, String)> {
+    let (project_root, worktree_path) = env_root_and_worktree(
+        ws.host_id.is_some() && ws.attach_only,
+        &ws.cwd,
+        ws.project_root.as_deref(),
+        ws.worktree_path.as_deref(),
+        ws.remote_root.as_deref(),
+        ws.remote_cwd.as_deref(),
+    );
     workspace_pty_env_from_fields(
         &ws.workspace_id,
         &ws.title,
         &ws.cwd,
-        ws.project_root.as_deref(),
-        ws.worktree_path.as_deref(),
+        project_root,
+        worktree_path,
         ws.git_branch.as_deref(),
     )
+}
+
+/// The project root and worktree the env and agent context name. A
+/// workspace running in place on a host (`on_host`) may keep this
+/// computer's `project_root` for sidebar grouping, which doesn't exist
+/// there: its root is the host checkout (`remote_root`), and a directory
+/// other than that checkout is its worktree. Workspaces opened on a host
+/// before `remote_root` existed have none; their `project_root` is already
+/// the host's repo root, so it is used, then the directory they run in.
+fn env_root_and_worktree<'a>(
+    on_host: bool,
+    cwd: &'a str,
+    project_root: Option<&'a str>,
+    worktree_path: Option<&'a str>,
+    remote_root: Option<&'a str>,
+    remote_cwd: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if !on_host {
+        return (project_root, worktree_path);
+    }
+    let dir = remote_cwd.unwrap_or(cwd);
+    let root = remote_root.or(project_root).unwrap_or(dir);
+    (Some(root), (dir != root).then_some(dir))
 }
 
 fn workspace_pty_env_from_fields(
@@ -4868,6 +4907,7 @@ mod tests {
             surfaces: Vec::new(),
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: None,
@@ -4978,6 +5018,84 @@ mod tests {
         assert!(!ctx.contains("Your worktree:"));
         assert!(ctx.contains("Your branch: main"));
         assert!(ctx.contains("codemux browser"));
+    }
+
+    /// A worktree thread on a device: `project_root` is this computer's
+    /// path, kept for sidebar grouping only.
+    fn device_thread_workspace() -> crate::state::WorkspaceSnapshot {
+        let mut ws = test_workspace(
+            "ws-dev",
+            "feat-x",
+            "/home/deus/.codemux/worktrees/app/feat-x",
+            Some("feat-x"),
+            None,
+            Some("/home/zeus/projects/app"),
+        );
+        ws.host_id = Some(4);
+        ws.attach_only = true;
+        ws.remote_cwd = Some(ws.cwd.clone());
+        ws.remote_root = Some("/home/deus/.codemux/projects/app-1a2b3c4d".into());
+        ws
+    }
+
+    #[test]
+    fn pty_env_on_a_device_names_the_device_checkout() {
+        let ws = device_thread_workspace();
+        let m = env_map(&ws);
+
+        assert_eq!(
+            m["CODEMUX_ROOT_PATH"],
+            "/home/deus/.codemux/projects/app-1a2b3c4d"
+        );
+        assert_eq!(
+            m["CODEMUX_WORKSPACE_PATH"],
+            "/home/deus/.codemux/worktrees/app/feat-x"
+        );
+        let ctx = &m["CODEMUX_AGENT_CONTEXT"];
+        assert!(!ctx.contains("/home/zeus/projects/app"), "{ctx}");
+        assert!(ctx.contains("Your working directory: /home/deus/.codemux/worktrees/app/feat-x"));
+        assert!(ctx.contains(
+            "Original repo (reference only): /home/deus/.codemux/projects/app-1a2b3c4d"
+        ));
+
+        // Terminals hydrate through the twin, which must agree.
+        let hydration = crate::state::PtyHydrationWorkspace {
+            workspace_id: ws.workspace_id.0.clone(),
+            title: ws.title.clone(),
+            cwd: ws.cwd.clone(),
+            git_branch: ws.git_branch.clone(),
+            worktree_path: ws.worktree_path.clone(),
+            project_root: ws.project_root.clone(),
+            project_uid: ws.project_uid.clone(),
+            host_id: ws.host_id,
+            remote_cwd: ws.remote_cwd.clone(),
+            remote_root: ws.remote_root.clone(),
+            attach_only: ws.attach_only,
+        };
+        let hydrated: std::collections::HashMap<_, _> =
+            hydration_workspace_pty_env(&hydration).into_iter().collect();
+        assert_eq!(hydrated, m);
+    }
+
+    #[test]
+    fn pty_env_on_a_device_falls_back_to_the_remote_cwd() {
+        // A device checkout thread runs at its own root.
+        let mut ws = device_thread_workspace();
+        ws.remote_root = Some(ws.cwd.clone());
+        let m = env_map(&ws);
+        assert_eq!(m["CODEMUX_ROOT_PATH"], ws.cwd);
+        assert!(m["CODEMUX_AGENT_CONTEXT"]
+            .contains("Project root: /home/deus/.codemux/worktrees/app/feat-x"));
+
+        // Opened on a host before `remote_root` existed: its project_root is
+        // already the host's repo root.
+        ws.remote_root = None;
+        ws.project_root = Some("/home/deus/src/app".into());
+        assert_eq!(env_map(&ws)["CODEMUX_ROOT_PATH"], "/home/deus/src/app");
+
+        // Nothing recorded: the directory it runs in.
+        ws.project_root = None;
+        assert_eq!(env_map(&ws)["CODEMUX_ROOT_PATH"], ws.cwd);
     }
 
     #[test]

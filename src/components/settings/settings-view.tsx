@@ -159,7 +159,7 @@ import { ArchiveSection } from "./archive-section";
 import { InterfaceSection } from "./interface-section";
 import { HostsSection } from "./hosts-section";
 import { SourceControlSection } from "./source-control-section";
-import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
+import { SegmentedControl, SettingsCard, SubsectionHeader } from "./settings-primitives";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
@@ -210,28 +210,6 @@ function SectionGroup({
 }) {
   return (
     <section className={cn("mt-10 first:mt-0", className)}>{children}</section>
-  );
-}
-
-/** Calm grouped surface for things like environment-variable lists,
- *  test-connection panels, info banners. Subtle border, very soft
- *  bg — should never compete with content inside it. */
-function SettingsCard({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div
-      className={cn(
-        "rounded-lg border border-border/60 bg-muted/30 p-4",
-        className,
-      )}
-    >
-      {children}
-    </div>
   );
 }
 
@@ -2138,7 +2116,7 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Devices"
-              description="Any machine you can SSH into — a home desktop, an always-on box, a cloud server. Push a workspace to any device, pull it back from any device. SSH credentials stay on your machine; only the device name and SSH target sync across your account."
+              description="Run threads on your other machines — a home server, a desktop, a cloud VM. Codemux connects over SSH and sets everything up for you."
             />
             <HostsSection />
           </div>

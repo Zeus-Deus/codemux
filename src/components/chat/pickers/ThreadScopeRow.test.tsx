@@ -5,6 +5,8 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type { BranchDetail, WorkspaceSnapshot } from "@/tauri/types";
+import type { HostView } from "@/tauri/commands";
+import { host } from "@/components/devices/host-fixtures.test-utils";
 
 // ── App-store mock — keep
 // the real grouping helper, stub the store hooks against a
@@ -56,18 +58,18 @@ vi.mock("@/stores/app-store", async () => {
   };
 });
 
+let currentHosts: HostView[] = [];
 vi.mock("@/stores/hosts-store", () => ({
-  useHosts: () => [],
+  useHosts: () => currentHosts,
 }));
-
-const mockOpenProject = vi.fn();
-vi.mock("@/hooks/use-project-actions", () => ({
-  useProjectActions: () => ({ openProject: mockOpenProject }),
+vi.mock("@/stores/host-status-store", () => ({
+  useHostStatuses: () => ({}),
+}));
+vi.mock("@/stores/local-device-store", () => ({
+  useLocalDeviceName: () => "ai-node",
 }));
 
 vi.mock("@/tauri/commands", () => ({
-  dbGetUiState: vi.fn().mockResolvedValue(null),
-  dbSetUiState: vi.fn().mockResolvedValue(undefined),
   listBranchesDetailed: vi.fn(),
   // Probe fallback used by ThreadScopeRow when no workspace row carries
   // the project's `is_git` flag. Defaults to true (git repo) so the
@@ -77,46 +79,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { ThreadScopeRow, type ThreadScopeRowProps } from "./ThreadScopeRow";
-import {
-  dbGetUiState,
-  dbSetUiState,
-  listBranchesDetailed,
-} from "@/tauri/commands";
-import {
-  SETTLED_UI_STATE_KEY,
-  __resetSidebarInboxStoreForTests,
-  type SettledEntry,
-  type SnoozeEntry,
-} from "@/stores/sidebar-inbox-store";
-import { SETTLED_COLLAPSED_COUNT } from "./project-scope-list";
-
-/** Seed the persisted sidebar-inbox blob the picker loads on mount. Keyed so
- *  the per-project avatar reads (same command, different keys) still get null. */
-function seedInbox(opts: {
-  settled?: SettledEntry[];
-  snoozed?: SnoozeEntry[];
-  activity?: Record<string, number>;
-}) {
-  const blob = JSON.stringify({
-    settled: opts.settled ?? [],
-    snoozed: opts.snoozed ?? [],
-    keepActive: [],
-    activity: opts.activity ?? {},
-  });
-  vi.mocked(dbGetUiState).mockImplementation((key: string) =>
-    Promise.resolve(key === SETTLED_UI_STATE_KEY ? blob : null),
-  );
-}
-
-/** Project roots listed in the open "Run in" popover, in DOM order. Reads the
- *  row's `data-project-path` rather than its text, which is prefixed by the
- *  avatar's initial glyph. Excludes the pinned Home row and the "Show N more"
- *  affordance, neither of which carries the attribute. */
-function listedProjects(): string[] {
-  return Array.from(
-    document.querySelectorAll<HTMLElement>("[data-project-path]"),
-  ).map((el) => el.dataset.projectPath ?? "");
-}
+import { listBranchesDetailed } from "@/tauri/commands";
 
 afterEach(() => cleanup());
 
@@ -133,36 +96,30 @@ function branch(name: string, overrides: Partial<BranchDetail> = {}): BranchDeta
   };
 }
 
-function renderRow(
-  overrides: Partial<ThreadScopeRowProps> & {
-    draftTarget?: import("@/stores/chat-draft-store").DraftTarget;
-  } = {},
-) {
-  const onChangeTarget = vi.fn();
+function renderRow(overrides: Partial<ThreadScopeRowProps> = {}) {
   const onChangeCheckoutMode = vi.fn();
   const onChangeWorktreeName = vi.fn();
   const onChangeBaseBranch = vi.fn();
-  const { draftTarget, checkoutMode, worktreeName, baseBranch, ...rest } =
-    overrides;
+  const onChangeHostId = vi.fn();
   const props: ThreadScopeRowProps = {
-    target: draftTarget ?? { kind: "project", projectPath: "/projects/foo" },
-    onChangeTarget,
     projectPath: "/projects/foo",
-    checkoutMode: checkoutMode ?? "current",
-    worktreeName: worktreeName ?? "",
-    baseBranch: baseBranch ?? "main",
+    hostId: null,
+    onChangeHostId,
+    checkoutMode: "current",
+    worktreeName: "",
+    baseBranch: "main",
     onChangeCheckoutMode,
     onChangeWorktreeName,
     onChangeBaseBranch,
-    ...rest,
+    ...overrides,
   };
   const utils = render(<ThreadScopeRow {...props} />);
   return {
     ...utils,
-    onChangeTarget,
     onChangeCheckoutMode,
     onChangeWorktreeName,
     onChangeBaseBranch,
+    onChangeHostId,
   };
 }
 
@@ -185,9 +142,9 @@ function renderControlled(
     const [baseBranch, setBaseBranch] = useState(initial.baseBranch ?? "");
     return (
       <ThreadScopeRow
-        target={{ kind: "project", projectPath: "/projects/foo" }}
-        onChangeTarget={vi.fn()}
         projectPath="/projects/foo"
+        hostId={null}
+        onChangeHostId={vi.fn()}
         checkoutMode={checkoutMode}
         worktreeName=""
         baseBranch={baseBranch}
@@ -210,32 +167,72 @@ function renderControlled(
 describe("ThreadScopeRow", () => {
   beforeEach(() => {
     currentWorkspaces = [];
-    __resetSidebarInboxStoreForTests();
-    vi.mocked(dbGetUiState).mockReset().mockResolvedValue(null);
-    vi.mocked(dbSetUiState).mockReset().mockResolvedValue(undefined);
-    mockOpenProject.mockReset().mockResolvedValue({ success: false });
+    currentHosts = [];
     vi.mocked(listBranchesDetailed).mockReset().mockResolvedValue([
       branch("main", { last_commit_unix: NOW - 3600 }),
       branch("develop", { last_commit_unix: NOW - 86400 }),
     ]);
   });
 
+  // The project is picked in the new-thread headline, so the strip never
+  // carries its own project picker.
   describe("home target", () => {
-    it("renders only the location control — no checkout/branch controls", () => {
-      renderRow({ draftTarget: { kind: "home" }, projectPath: null });
-      expect(screen.getByText("Home")).toBeInTheDocument();
+    it("renders only the device control — no project, checkout, or branch controls", () => {
+      const { container } = renderRow({ projectPath: null });
+      expect(
+        screen.getByRole("button", { name: "Device: ai-node" }),
+      ).toBeInTheDocument();
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+      expect(screen.queryByText("Home")).toBeNull();
       expect(screen.queryByText("Current checkout")).toBeNull();
       expect(screen.queryByText("New worktree")).toBeNull();
       expect(screen.queryByText(/^from$/)).toBeNull();
+      // No dangling separator after the lone device control.
+      expect(container.textContent).not.toContain("·");
+    });
+  });
+
+  describe("device control", () => {
+    it("leads the strip with this machine's name, ahead of the checkout control", () => {
+      renderRow();
+      const device = screen.getByRole("button", { name: "Device: ai-node" });
+      const checkout = screen.getByText("Current checkout").closest("button")!;
+      expect(
+        device.compareDocumentPosition(checkout) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it("shows the picked device's name", () => {
+      currentHosts = [host(2, "zeus")];
+      renderRow({ hostId: 2 });
+      expect(
+        screen.getByRole("button", { name: "Device: zeus" }),
+      ).toBeInTheDocument();
+    });
+
+    it("picking a device reports its id and keeps the checkout controls", async () => {
+      const user = userEvent.setup();
+      currentHosts = [host(2, "zeus")];
+      const { onChangeHostId } = renderRow();
+      await user.click(screen.getByRole("button", { name: "Device: ai-node" }));
+      const row = await waitFor(() => {
+        const el = document.querySelector<HTMLElement>('[data-host-id="2"]');
+        expect(el).not.toBeNull();
+        return el!;
+      });
+      await user.click(row);
+      expect(onChangeHostId).toHaveBeenCalledWith(2);
+      expect(screen.getByText("Current checkout")).toBeInTheDocument();
     });
   });
 
   describe("project target — current checkout", () => {
-    it("renders location, checkout, and branch controls", () => {
+    it("renders checkout and branch controls, without a project picker", () => {
       renderRow();
-      expect(screen.getByText("foo")).toBeInTheDocument();
       expect(screen.getByText("Current checkout")).toBeInTheDocument();
       expect(screen.getByText("main")).toBeInTheDocument();
+      expect(screen.queryByText("foo")).toBeNull();
     });
 
     it("renders the worktree checkout control when checkoutMode is 'worktree'", () => {
@@ -244,454 +241,9 @@ describe("ThreadScopeRow", () => {
     });
 
     it("hides checkout/branch controls when projectPath hasn't resolved yet", () => {
-      renderRow({
-        draftTarget: {
-          kind: "existing_workspace",
-          workspaceId: "ws-not-here",
-        },
-        projectPath: null,
-      });
+      renderRow({ projectPath: null });
       expect(screen.queryByText("Current checkout")).toBeNull();
       expect(screen.queryByText(/^from$/)).toBeNull();
-    });
-  });
-
-  describe("location control", () => {
-    it("selecting Home from the location popover calls onChangeTarget({kind: 'home'})", async () => {
-      const user = userEvent.setup();
-      const { onChangeTarget } = renderRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      await user.click(screen.getByText("Home directory (~)"));
-      expect(onChangeTarget).toHaveBeenCalledWith({ kind: "home" });
-    });
-
-    it("lists known projects and selecting one calls onChangeTarget({kind:'project', projectPath})", async () => {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-bar",
-          cwd: "/projects/bar",
-          project_root: "/projects/bar",
-        }),
-      ];
-      const user = userEvent.setup();
-      const { onChangeTarget } = renderRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      await user.click(screen.getByText("bar"));
-      expect(onChangeTarget).toHaveBeenCalledWith({
-        kind: "project",
-        projectPath: "/projects/bar",
-      });
-    });
-
-    it("'Open another project…' calls openProject and forwards the picked path", async () => {
-      mockOpenProject.mockResolvedValue({
-        success: true,
-        path: "/projects/opened",
-        name: "opened",
-      });
-      const user = userEvent.setup();
-      const { onChangeTarget } = renderRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Open another project…");
-      await user.click(screen.getByText("Open another project…"));
-      await waitFor(() => expect(mockOpenProject).toHaveBeenCalled());
-      expect(onChangeTarget).toHaveBeenCalledWith({
-        kind: "project",
-        projectPath: "/projects/opened",
-      });
-    });
-  });
-
-  describe("location control — type-to-filter", () => {
-    /** Three sibling projects, so a query has something to narrow. */
-    function seedProjects() {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-bar",
-          cwd: "/projects/bar",
-          project_root: "/projects/bar",
-        }),
-        makeWs({
-          workspace_id: "ws-codemux",
-          cwd: "/projects/codemux",
-          project_root: "/projects/codemux",
-        }),
-        makeWs({
-          workspace_id: "ws-site",
-          cwd: "/projects/codemux-sitev2",
-          project_root: "/projects/codemux-sitev2",
-        }),
-      ];
-    }
-
-    async function openPicker() {
-      const user = userEvent.setup();
-      const rendered = renderRow();
-      await user.click(screen.getByText("foo"));
-      const input = await screen.findByPlaceholderText("Search projects…");
-      return { user, input, ...rendered };
-    }
-
-    it("focuses the search input when the popover opens", async () => {
-      seedProjects();
-      const { input } = await openPicker();
-      await waitFor(() => expect(input).toHaveFocus());
-    });
-
-    it("types straight into the focused input — no click needed first", async () => {
-      seedProjects();
-      const { user, input } = await openPicker();
-      // Deliberately NO click: keystrokes go wherever focus already is.
-      // The popover's open-autofocus must land on the input itself — cmdk's
-      // root only handles navigation keys, so if focus sat anywhere else
-      // these printable keystrokes would go nowhere.
-      await user.keyboard("codemux");
-      expect(input).toHaveValue("codemux");
-      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
-      expect(screen.getByText("codemux")).toBeInTheDocument();
-    });
-
-    it("narrows the list to fuzzy matches and hides the rest", async () => {
-      seedProjects();
-      const { user } = await openPicker();
-      await user.keyboard("codemux");
-      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
-      expect(screen.getByText("codemux")).toBeInTheDocument();
-      expect(screen.getByText("codemux-sitev2")).toBeInTheDocument();
-      expect(screen.queryByText("Home directory (~)")).toBeNull();
-    });
-
-    it("switches to path matching once the query contains a slash", async () => {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-a",
-          cwd: "/work/alpha/app",
-          project_root: "/work/alpha/app",
-        }),
-        makeWs({
-          workspace_id: "ws-b",
-          cwd: "/work/beta/app",
-          project_root: "/work/beta/app",
-        }),
-      ];
-      const { user, onChangeTarget } = await openPicker();
-      await user.keyboard("beta/");
-      await user.keyboard("{Enter}");
-      expect(onChangeTarget).toHaveBeenCalledWith({
-        kind: "project",
-        projectPath: "/work/beta/app",
-      });
-    });
-
-    it("does not let long paths defeat name filtering", async () => {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-deep",
-          cwd: "/home/user/dev/scratch/bar",
-          project_root: "/home/user/dev/scratch/bar",
-        }),
-        makeWs({
-          workspace_id: "ws-vexis",
-          cwd: "/projects/vexis",
-          project_root: "/projects/vexis",
-        }),
-      ];
-      const { user } = await openPicker();
-      // "ve" is a subsequence of `/home/user/dev/…` — name-only
-      // matching is what keeps that row out.
-      await user.keyboard("ve");
-      await waitFor(() => expect(screen.getByText("vexis")).toBeInTheDocument());
-      expect(screen.queryByText("bar")).toBeNull();
-    });
-
-    it("does not let a query grazing the shared path prefix match every row", async () => {
-      // Every row's path starts with "/projects/" — because a slash-less
-      // query matches display names only, typing the shared prefix must
-      // match NOTHING rather than everything at the same score.
-      seedProjects();
-      const { user } = await openPicker();
-      await user.keyboard("projects");
-      await waitFor(() => expect(listedProjects()).toEqual([]));
-      expect(screen.getByText(/No projects match/)).toBeInTheDocument();
-    });
-
-    it("matches on scattered characters, not just prefixes", async () => {
-      seedProjects();
-      const { user } = await openPicker();
-      await user.keyboard("cdx");
-      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
-      expect(screen.getByText("codemux")).toBeInTheDocument();
-    });
-
-    it("Enter picks the top match without touching the mouse", async () => {
-      seedProjects();
-      const { user, onChangeTarget } = await openPicker();
-      await user.keyboard("codemux");
-      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
-      await user.keyboard("{Enter}");
-      expect(onChangeTarget).toHaveBeenCalledWith({
-        kind: "project",
-        projectPath: "/projects/codemux",
-      });
-    });
-
-    it("arrow keys move the highlight before Enter commits", async () => {
-      seedProjects();
-      const { user, onChangeTarget } = await openPicker();
-      await user.keyboard("codemux");
-      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
-      await user.keyboard("{ArrowDown}{Enter}");
-      expect(onChangeTarget).toHaveBeenCalledWith({
-        kind: "project",
-        projectPath: "/projects/codemux-sitev2",
-      });
-    });
-
-    it("keeps Home reachable by name", async () => {
-      seedProjects();
-      const { user, onChangeTarget } = await openPicker();
-      await user.keyboard("home");
-      await waitFor(() => expect(screen.queryByText("codemux")).toBeNull());
-      await user.keyboard("{Enter}");
-      expect(onChangeTarget).toHaveBeenCalledWith({ kind: "home" });
-    });
-
-    it("shows an empty state but keeps the open-project escape hatch", async () => {
-      seedProjects();
-      const { user } = await openPicker();
-      await user.keyboard("zzzz");
-      await waitFor(() =>
-        expect(screen.getByText(/No projects match/)).toBeInTheDocument(),
-      );
-      expect(screen.getByText("Open another project…")).toBeInTheDocument();
-    });
-
-    it("resets the query so the next open starts from the full list", async () => {
-      seedProjects();
-      const { user } = await openPicker();
-      await user.keyboard("codemux");
-      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
-      await user.keyboard("{Escape}");
-      await user.click(screen.getByText("foo"));
-      expect(await screen.findByText("bar")).toBeInTheDocument();
-    });
-  });
-
-  // The picker lists every project that has a live workspace, which on a
-  // long-lived install is a lot of projects — settling a workspace parks its
-  // sidebar card but closes nothing, so it stays a valid "Run in" target
-  // forever. These cover the sectioning that keeps that list legible.
-  describe("location picker — Active / Settled sections", () => {
-    function projectWs(name: string, id?: string) {
-      return makeWs({
-        workspace_id: id ?? `ws-${name}`,
-        cwd: `/projects/${name}`,
-        project_root: `/projects/${name}`,
-      });
-    }
-
-    async function openPicker() {
-      const user = userEvent.setup();
-      renderRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      return user;
-    }
-
-    it("stays a flat, heading-free list when nothing is settled", async () => {
-      currentWorkspaces = [projectWs("foo"), projectWs("bar")];
-      await openPicker();
-      expect(screen.queryByText("Active")).toBeNull();
-      expect(screen.queryByText(/Settled/)).toBeNull();
-    });
-
-    it("splits settled projects into their own labelled section", async () => {
-      currentWorkspaces = [projectWs("foo"), projectWs("bar")];
-      seedInbox({ settled: [{ id: "ws-bar", at: 1_000 }] });
-      await openPicker();
-      await waitFor(() => expect(screen.getByText("Active")).toBeInTheDocument());
-      // The heading says the part a bare "Settled" label would leave the user
-      // guessing about — these projects are parked, not closed.
-      expect(screen.getByText(/still open/)).toBeInTheDocument();
-      expect(screen.getByText("bar")).toBeInTheDocument();
-    });
-
-    it("keeps a project Active while any of its worktrees is unsettled", async () => {
-      currentWorkspaces = [
-        projectWs("foo"),
-        projectWs("bar", "ws-bar-main"),
-        projectWs("bar", "ws-bar-wt"),
-      ];
-      seedInbox({ settled: [{ id: "ws-bar-wt", at: 1_000 }] });
-      await openPicker();
-      await waitFor(() => expect(screen.getByText("bar")).toBeInTheDocument());
-      expect(screen.queryByText(/still open/)).toBeNull();
-    });
-
-    it("parks a project whose every workspace is snoozed — snooze folds into the partition", async () => {
-      currentWorkspaces = [projectWs("foo"), projectWs("napping")];
-      seedInbox({
-        snoozed: [{ id: "ws-napping", at: 1_000, until: 999_999_999 }],
-      });
-      await openPicker();
-      // The fully-snoozed project must not read as Active: it lands in the
-      // parked section alongside settled projects.
-      await waitFor(() => expect(screen.getByText("Active")).toBeInTheDocument());
-      expect(screen.getByText(/still open/)).toBeInTheDocument();
-      expect(screen.getByText("napping")).toBeInTheDocument();
-      expect(listedProjects()).toEqual([
-        "/projects/foo",
-        "/projects/napping",
-      ]);
-    });
-
-    it("orders Active projects most-recently-active first", async () => {
-      currentWorkspaces = [
-        projectWs("stale"),
-        projectWs("foo"),
-        projectWs("fresh"),
-      ];
-      seedInbox({
-        activity: { "ws-stale": 1_000, "ws-foo": 5_000, "ws-fresh": 9_000 },
-      });
-      await openPicker();
-      await waitFor(() =>
-        expect(listedProjects()).toEqual([
-          "/projects/fresh",
-          "/projects/foo",
-          "/projects/stale",
-        ]),
-      );
-    });
-
-    it("collapses a long settled tail behind 'Show N more'", async () => {
-      const settledCount = SETTLED_COLLAPSED_COUNT + 3;
-      currentWorkspaces = [
-        projectWs("foo"),
-        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
-      ];
-      seedInbox({
-        settled: Array.from({ length: settledCount }, (_, i) => ({
-          id: `ws-old${i}`,
-          at: 1_000 + i,
-        })),
-      });
-      const user = await openPicker();
-      const showMore = await screen.findByText(
-        `Show ${settledCount - SETTLED_COLLAPSED_COUNT} more`,
-      );
-      // foo (active) + the collapsed settled head.
-      expect(listedProjects()).toHaveLength(1 + SETTLED_COLLAPSED_COUNT);
-      await user.click(showMore);
-      await waitFor(() =>
-        expect(listedProjects()).toHaveLength(1 + settledCount),
-      );
-    });
-
-    it("never hides the targeted project in the collapsed settled tail", async () => {
-      const settledCount = SETTLED_COLLAPSED_COUNT + 3;
-      // Newest-settled first, so "foo" (settled longest ago) lands last.
-      currentWorkspaces = [
-        projectWs("foo"),
-        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
-      ];
-      seedInbox({
-        settled: [
-          ...Array.from({ length: settledCount }, (_, i) => ({
-            id: `ws-old${i}`,
-            at: 5_000 + i,
-          })),
-          { id: "ws-foo", at: 1_000 },
-        ],
-      });
-      await openPicker();
-      await waitFor(() => expect(listedProjects()).toContain("/projects/foo"));
-      expect(listedProjects()).toHaveLength(SETTLED_COLLAPSED_COUNT + 1);
-    });
-
-    it("search reaches a project buried in the collapsed settled tail", async () => {
-      const settledCount = SETTLED_COLLAPSED_COUNT + 4;
-      currentWorkspaces = [
-        projectWs("foo"),
-        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
-      ];
-      seedInbox({
-        settled: Array.from({ length: settledCount }, (_, i) => ({
-          id: `ws-old${i}`,
-          at: 1_000 + i,
-        })),
-      });
-      const user = await openPicker();
-      // Settled sorts newest-settled first, so the EARLIEST-settled project
-      // (old0) is the one that falls into the hidden tail.
-      const buried = "old0";
-      await waitFor(() =>
-        expect(listedProjects()).not.toContain(`/projects/${buried}`),
-      );
-      await user.type(screen.getByPlaceholderText("Search projects…"), buried);
-      await waitFor(() =>
-        expect(listedProjects()).toEqual([`/projects/${buried}`]),
-      );
-      // The "Show N more" affordance must not leak into search results —
-      // a non-empty query reveals the whole section instead.
-      expect(screen.queryByText(/Show \d+ more/)).toBeNull();
-    });
-
-    it("selecting a settled project does not un-settle it (first send resurfaces it)", async () => {
-      currentWorkspaces = [projectWs("foo"), projectWs("bar")];
-      seedInbox({ settled: [{ id: "ws-bar", at: 1_000 }] });
-      const user = await openPicker();
-      await waitFor(() => expect(screen.getByText("bar")).toBeInTheDocument());
-      await user.click(screen.getByText("bar"));
-      expect(vi.mocked(dbSetUiState)).not.toHaveBeenCalled();
-    });
-
-    it("only loads avatars for rows on screen, not every known project", async () => {
-      const settledCount = SETTLED_COLLAPSED_COUNT + 5;
-      currentWorkspaces = [
-        projectWs("foo"),
-        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
-      ];
-      seedInbox({
-        settled: Array.from({ length: settledCount }, (_, i) => ({
-          id: `ws-old${i}`,
-          at: 1_000 + i,
-        })),
-      });
-      const user = await openPicker();
-      await waitFor(() =>
-        expect(listedProjects()).toHaveLength(1 + SETTLED_COLLAPSED_COUNT),
-      );
-
-      const avatarKeys = () =>
-        new Set(
-          vi
-            .mocked(dbGetUiState)
-            .mock.calls.map(([key]) => key)
-            .filter((key) => key.startsWith("project.color:")),
-        );
-      // Only the active row + the collapsed settled head — the buried tail
-      // costs nothing until it is revealed.
-      expect(avatarKeys().size).toBe(1 + SETTLED_COLLAPSED_COUNT);
-      expect(avatarKeys()).not.toContain(
-        `project.color:/projects/old${settledCount - 1 - SETTLED_COLLAPSED_COUNT}`,
-      );
-
-      await user.click(
-        screen.getByText(`Show ${settledCount - SETTLED_COLLAPSED_COUNT} more`),
-      );
-      await waitFor(() => expect(avatarKeys().size).toBe(1 + settledCount));
-    });
-
-    it("keeps 'Open another project…' reachable outside the scrolling list", async () => {
-      currentWorkspaces = Array.from({ length: 20 }, (_, i) => projectWs(`p${i}`))
-        .concat(projectWs("foo"));
-      await openPicker();
-      const action = screen.getByText("Open another project…");
-      expect(action).toBeInTheDocument();
-      expect(action.closest("[data-slot='command-list']")).toBeNull();
     });
   });
 
@@ -829,7 +381,8 @@ describe("ThreadScopeRow", () => {
       );
       const onChangeBaseBranch = vi.fn();
       const shared = {
-        onChangeTarget: vi.fn(),
+        hostId: null,
+        onChangeHostId: vi.fn(),
         checkoutMode: "current",
         worktreeName: "",
         baseBranch: "",
@@ -839,22 +392,14 @@ describe("ThreadScopeRow", () => {
       } satisfies Partial<ThreadScopeRowProps>;
 
       const { rerender } = render(
-        <ThreadScopeRow
-          {...shared}
-          target={{ kind: "project", projectPath: "/projects/foo" }}
-          projectPath="/projects/foo"
-        />,
+        <ThreadScopeRow {...shared} projectPath="/projects/foo" />,
       );
       await waitFor(() => {
         expect(onChangeBaseBranch).toHaveBeenLastCalledWith("foo-head");
       });
 
       rerender(
-        <ThreadScopeRow
-          {...shared}
-          target={{ kind: "project", projectPath: "/projects/bar" }}
-          projectPath="/projects/bar"
-        />,
+        <ThreadScopeRow {...shared} projectPath="/projects/bar" />,
       );
       await waitFor(() => {
         expect(onChangeBaseBranch).toHaveBeenLastCalledWith("bar-head");

@@ -30,10 +30,12 @@
 #![cfg(unix)]
 
 pub mod bootstrap;
+pub mod exec;
 pub mod opencode_db_sync;
 pub mod probe;
 pub mod push;
 pub mod registry;
+pub mod sidecar;
 pub mod tunnel;
 pub mod tunnel_supervisor;
 
