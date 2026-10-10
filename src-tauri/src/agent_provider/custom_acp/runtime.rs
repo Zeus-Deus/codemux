@@ -141,6 +141,7 @@ struct State {
     queued: VecDeque<Queued>,
     prose: String,
     thoughts: String,
+    output_bytes: [usize; 2],
     tools: HashSet<String>,
 }
 struct Session {
@@ -152,6 +153,9 @@ struct Session {
     // Accessed under the binding owner. Only catalog updates are deferred;
     // callbacks stay live and inactive-turn load history remains suppressed.
     startup_catalog_updates: Mutex<Option<Vec<SequencedNotification>>>,
+    // A mutation ACK and notifications share wire authority, not task order.
+    // Access under binding; control admits just one mutation RPC at a time.
+    mutation_catalog_updates: Mutex<Option<Vec<SequencedNotification>>>,
     catalog_sequence: AtomicU64,
     state: Mutex<State>,
     control: Mutex<()>,
@@ -159,6 +163,8 @@ struct Session {
     barrier: mpsc::Sender<oneshot::Sender<()>>,
     #[cfg(test)]
     prompt_settled_gate: Mutex<()>,
+    #[cfg(test)]
+    startup_mode_gate: Option<Arc<start_command_tests::StartupModeGate>>,
     cancel: Notify,
     ended: AtomicBool,
     durable: AtomicBool,
@@ -484,6 +490,7 @@ impl Session {
             caps: Mutex::new(Negotiation::default()),
             binding: Mutex::new(binding),
             startup_catalog_updates: Mutex::new(Some(Vec::new())),
+            mutation_catalog_updates: Mutex::new(None),
             catalog_sequence: AtomicU64::new(0),
             state: Mutex::new(State {
                 status: SessionStatus::Starting,
@@ -493,6 +500,7 @@ impl Session {
                 queued: VecDeque::new(),
                 prose: String::new(),
                 thoughts: String::new(),
+                output_bytes: [0; 2],
                 tools: HashSet::new(),
             }),
             control: Mutex::new(()),
@@ -500,6 +508,8 @@ impl Session {
             barrier,
             #[cfg(test)]
             prompt_settled_gate: Mutex::new(()),
+            #[cfg(test)]
+            startup_mode_gate: start_command_tests::STARTUP_MODE_GATE.with(|gate| gate.borrow().clone()),
             cancel: Notify::new(),
             ended: AtomicBool::new(false),
             durable: AtomicBool::new(false),
@@ -532,17 +542,37 @@ impl Session {
                 if text(&response,"sessionId").is_some_and(|reported|reported != native) {return Err(protocol("ACP resumed session identity changed"));}
                 native
             },None=>text(&response,"sessionId").ok_or_else(||protocol("ACP new session did not return a native session ID"))?.to_owned()};
-            let startup_updates={
+            let catalog={
                 let mut binding=session.binding.lock().await;
                 let catalog=catalog_from(&binding.agent_id,&session.launch.agent.name,&caps,&response).map_err(protocol)?;
                 binding.session_id=Some(native);
-                if sequence > session.catalog_sequence.load(Ordering::SeqCst) {
-                    binding.catalog=catalog;
-                    session.catalog_sequence.store(sequence,Ordering::SeqCst);
-                }
-                session.startup_catalog_updates.lock().await.take().unwrap_or_default()
+                catalog
             };
-            for update in startup_updates {session.notification(update).await;}
+            // Retain startup deferral until all reader-ordered updates and C
+            // have settled. Earlier modes use their wire-effective catalog;
+            // later arrivals cannot overtake replay or spend a fresh budget.
+            let mut response_catalog=Some(catalog);
+            let mut processed=0;
+            loop {
+                let updates={
+                    let _binding=session.binding.lock().await;
+                    let mut pending=session.startup_catalog_updates.lock().await;
+                    let updates=pending.as_ref().expect("startup owns deferral")[processed..].to_vec();
+                    processed+=updates.len();
+                    if updates.is_empty() && response_catalog.is_none() {
+                        *pending=None;
+                        break;
+                    }
+                    updates
+                };
+                for update in updates {
+                    if response_catalog.is_some() && sequence < update.sequence {
+                        session.install_startup_catalog(response_catalog.take().unwrap(),sequence).await;
+                    }
+                    session.notification_owned(update,true).await;
+                }
+                if let Some(catalog)=response_catalog.take() {session.install_startup_catalog(catalog,sequence).await;}
+            }
             session.drain().await?;
             if let Some(model)=legacy_model {session.set_model(model).await?;}
             // Restore exact persisted intent, model first because its change can replace controls.
@@ -577,16 +607,29 @@ impl Session {
         }
         Ok(session)
     }
+    async fn install_startup_catalog(&self, catalog: AcpCatalog, sequence: u64) {
+        let mut binding = self.binding.lock().await;
+        if sequence > self.catalog_sequence.load(Ordering::SeqCst) {
+            binding.catalog = catalog;
+            self.catalog_sequence.store(sequence, Ordering::SeqCst);
+            binding.reconcile_config_values();
+        }
+    }
     async fn request(&self, method: &str, params: Value) -> Result<Value, ProviderError> {
         self.request_ordered(method, params).await.map(|(value, _)| value)
     }
     async fn request_ordered(&self, method: &str, params: Value) -> Result<(Value, u64), ProviderError> {
+        self.request_ordered_for_turn(method, params, None).await
+    }
+    async fn request_ordered_for_turn(&self, method: &str, params: Value, turn: Option<&TurnId>) -> Result<(Value, u64), ProviderError> {
         if !self.alive() {
             return Err(ProviderError::SessionClosed {
                 thread_id: self.thread.clone(),
             });
         }
-        let response = tokio::time::timeout(RPC_TIMEOUT, self.child.request_with_sequence(method, params, RPC_TIMEOUT)).await;
+        let response = tokio::time::timeout(RPC_TIMEOUT, self.child.request_with_sequence_guarded(method, params, RPC_TIMEOUT, || async {
+            match turn { Some(turn) => self.turn_admitted(turn).await, None => true }
+        })).await;
         let response = response.unwrap_or_else(|_| {
             Err(RpcChildError::Timeout {
                 method: method.into(),
@@ -595,6 +638,7 @@ impl Session {
         });
         match response {
             Ok(value) => Ok(value),
+            Err(RpcChildError::CancelledBeforeWrite) => Err(invalid("ACP turn cancelled before configuration")),
             Err(error) => {
                 let exposed = if self.child.is_alive() {
                     rpc_error(method, &error)
@@ -724,8 +768,89 @@ impl Session {
         self.publish_catalog().await?;
         Ok(self.binding.lock().await.catalog.clone())
     }
+    async fn apply_mode(&self, mode: &str, sequence: u64) -> Result<(), ProviderError> {
+        {
+            let mut binding = self.binding.lock().await;
+            let options: Vec<_> = binding.catalog.config_options.iter()
+                .filter(|o| o.category.as_deref() == Some("mode")).collect();
+            // Agents may send legacy modes without advertising a host control.
+            // Those remain non-actionable; never infer permission policy.
+            if options.is_empty() { return Ok(()); }
+            for option in options { validate_value(option, &json!(mode)).map_err(protocol)?; }
+            if sequence <= self.catalog_sequence.load(Ordering::SeqCst) { return Ok(()); }
+            for option in &mut binding.catalog.config_options {
+                if option.category.as_deref() == Some("mode") { option.current_value = json!(mode); }
+            }
+            self.catalog_sequence.store(sequence, Ordering::SeqCst);
+            binding.reconcile_config_values();
+        }
+        self.publish_catalog().await
+    }
+    // Caller owns control. Retain notification routing/callback responsiveness,
+    // but replay catalog mutations around C at their actual reader positions.
+    async fn catalog_request(&self, method: &str, params: Value, base: &AcpCatalog, legacy_model: Option<&str>, turn: Option<&TurnId>) -> Result<AcpCatalog, ProviderError> {
+        let mut response = self.request_ordered_for_turn(method, params, turn).await;
+        let mut invalid_ack = false;
+        if response.is_ok() { self.drain().await?; }
+        if let Ok((value, _)) = &response {
+            let valid_shape = if legacy_model.is_some() { value.is_object() }
+                else { value.get("configOptions").is_some_and(Value::is_array) };
+            let caps = self.caps.lock().await.clone();
+            // Intrinsic sparse ACK checks still use request-era membership,
+            // independent of later retirement or notification validation.
+            if !valid_shape {
+                invalid_ack = true;
+                response = Err(protocol("ACP configuration response was invalid"));
+            } else if let Err(error) = Self::parse_catalog_update(base, &caps, value, legacy_model) {
+                invalid_ack = true;
+                response = Err(error);
+            }
+        }
+        let (mut acknowledgement, mut result) = match response {
+            Ok(value) => (Some(value), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        let mut processed = 0;
+        loop {
+            let updates = {
+                let _binding = self.binding.lock().await;
+                let mut pending = self.mutation_catalog_updates.lock().await;
+                // Retain processed entries until settlement so the 64-update
+                // budget covers the whole RPC, including replay-time arrivals.
+                let updates = pending.as_ref().expect("catalog RPC owns deferral")[processed..].to_vec();
+                processed += updates.len();
+                if updates.is_empty() && acknowledgement.is_none() {
+                    *pending = None;
+                    break;
+                }
+                updates
+            };
+            for update in updates {
+                if acknowledgement.as_ref().is_some_and(|(_, sequence)| *sequence < update.sequence) {
+                    let (value, sequence) = acknowledgement.take().unwrap();
+                    result = self.apply_catalog(&value, sequence, legacy_model, Some(base)).await.map(|_| ());
+                    invalid_ack |= result.is_err();
+                }
+                self.notification_owned(update, true).await;
+            }
+            if let Some((value, sequence)) = acknowledgement.take() {
+                result = self.apply_catalog(&value, sequence, legacy_model, Some(base)).await.map(|_| ());
+                invalid_ack |= result.is_err();
+            }
+        }
+        if invalid_ack { self.fail("ACP configuration response was invalid").await; }
+        result?;
+        if !self.alive() { return Err(protocol("ACP transport ended during configuration")); }
+        // A request/validation failure has no ACK, but valid unsolicited
+        // catalog traffic remains authoritative even when the mutation fails.
+        Ok(self.binding.lock().await.catalog.clone())
+    }
     async fn set_config(&self, id: &str, value: Value) -> Result<AcpCatalog, ProviderError> {
         let _control = self.control.lock().await;
+        self.set_config_locked(id, value, None).await
+    }
+    // Caller owns control; internal turn overrides must not re-enter the gate.
+    async fn set_config_locked(&self, id: &str, value: Value, turn: Option<&TurnId>) -> Result<AcpCatalog, ProviderError> {
         if !self.alive() {
             return Err(ProviderError::SessionClosed {
                 thread_id: self.thread.clone(),
@@ -740,34 +865,23 @@ impl Session {
                 .find(|o| o.id == id)
                 .ok_or_else(|| invalid("ACP configuration option is not advertised"))?;
             validate_value(o, &value).map_err(invalid)?;
+            self.check_override_owner(turn).await?;
             (
                 b.session_id
                     .clone()
                     .ok_or_else(|| protocol("ACP session identity is unavailable"))?,
                 o.kind.clone(),
-                b.catalog.clone(),
+                {
+                    *self.mutation_catalog_updates.lock().await = Some(Vec::new());
+                    b.catalog.clone()
+                },
             )
         };
         let mut params = json!({"sessionId":native,"configId":id,"value":value});
         if kind == "boolean" {
             params["type"] = json!("boolean");
         }
-        let (response, sequence) = self.request_ordered("session/set_config_option", params).await?;
-        self.drain().await?;
-        if !response.get("configOptions").is_some_and(Value::is_array) {
-            self.fail("ACP set_config_option returned an invalid catalog")
-                .await;
-            return Err(protocol(
-                "ACP set_config_option returned an invalid catalog",
-            ));
-        }
-        let catalog = match self.apply_catalog(&response, sequence, None, Some(&response_base)).await {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                self.fail("ACP configuration response was invalid").await;
-                return Err(error);
-            }
-        };
+        let catalog = self.catalog_request("session/set_config_option", params, &response_base, None, turn).await?;
         // Save the acknowledged intent, not merely a requested value.
         {
             let mut b = self.binding.lock().await;
@@ -782,6 +896,10 @@ impl Session {
         Ok(catalog)
     }
     async fn set_model(&self, model: String) -> Result<(), ProviderError> {
+        let _control = self.control.lock().await;
+        self.set_model_locked(model, None).await
+    }
+    async fn set_model_locked(&self, model: String, turn: Option<&TurnId>) -> Result<(), ProviderError> {
         let selector = {
             let b = self.binding.lock().await;
             if !b.catalog.capabilities.models.iter().any(|m| m.id == model) {
@@ -792,45 +910,44 @@ impl Session {
             semantic_option(&b.catalog.config_options, "model").map(|o| o.id.clone())
         };
         if let Some(id) = selector {
-            self.set_config(&id, json!(model)).await?;
+            self.set_config_locked(&id, json!(model), turn).await?;
             return Ok(());
         }
-        let _control = self.control.lock().await;
         let (native, response_base) = {
             let binding = self.binding.lock().await;
             if !binding.catalog.capabilities.models.iter().any(|m| m.id == model) {
                 return Err(invalid("ACP model is not advertised"));
             }
-            (binding.session_id.clone().ok_or_else(|| protocol("ACP session identity unavailable"))?, binding.catalog.clone())
+            let native = binding.session_id.clone().ok_or_else(|| protocol("ACP session identity unavailable"))?;
+            self.check_override_owner(turn).await?;
+            *self.mutation_catalog_updates.lock().await = Some(Vec::new());
+            (native, binding.catalog.clone())
         };
-        let (response, sequence) = self
-            .request_ordered(
+        self.catalog_request(
                 "session/set_model",
                 json!({"sessionId":native,"modelId":model}),
+                &response_base,
+                Some(&model),
+                turn,
             )
             .await?;
-        self.drain().await?;
-        if !response.is_object() {
-            self.fail("ACP set_model response was invalid").await;
-            return Err(protocol("ACP set_model response was invalid"));
-        }
-        if let Err(error) = self.apply_catalog(&response, sequence, Some(&model), Some(&response_base)).await {
-            self.fail("ACP model response was invalid").await;
-            return Err(error);
-        }
         // Legacy model intent cannot masquerade as a config ID. Native resume
         // restores it; subsequent startup model changes remain explicitly validated.
         self.publish_catalog().await?;
         Ok(())
     }
     async fn set_effort(&self, value: String) -> Result<(), ProviderError> {
+        let _control = self.control.lock().await;
+        self.set_effort_locked(value, None).await
+    }
+    async fn set_effort_locked(&self, value: String, turn: Option<&TurnId>) -> Result<(), ProviderError> {
         let id = {
             let b = self.binding.lock().await;
             semantic_option(&b.catalog.config_options, "thought_level")
                 .map(|o| o.id.clone())
                 .ok_or_else(|| invalid("ACP agent did not advertise a reasoning control"))?
         };
-        self.set_config(&id, json!(value)).await?;
+        self.set_config_locked(&id, json!(value), turn).await?;
         Ok(())
     }
     async fn answer(&self, id: Value, value: Result<Value, RpcError>) -> bool {
@@ -1064,6 +1181,9 @@ impl Session {
         Ok(())
     }
     async fn notification(&self, incoming: SequencedNotification) {
+        self.notification_owned(incoming, false).await;
+    }
+    async fn notification_owned(&self, incoming: SequencedNotification, replay: bool) {
         if self.ended.load(Ordering::SeqCst) {
             return;
         }
@@ -1080,9 +1200,10 @@ impl Session {
             if binding.session_id.as_deref().is_some_and(|id| Some(id) != text(&incoming.notification.params, "sessionId")) {
                 return;
             }
-            if incoming.notification.params.pointer("/update/sessionUpdate").and_then(Value::as_str) == Some("config_option_update") {
+            if matches!(incoming.notification.params.pointer("/update/sessionUpdate").and_then(Value::as_str), Some("config_option_update" | "current_mode_update")) {
                 let mut startup = self.startup_catalog_updates.lock().await;
-                if let Some(updates) = startup.as_mut() {
+                if !replay && startup.is_some() {
+                    let updates = startup.as_mut().unwrap();
                     if updates.len() >= PENDING_LIMIT {
                         drop(startup);
                         drop(binding);
@@ -1091,6 +1212,20 @@ impl Session {
                         updates.push(incoming);
                     }
                     return;
+                }
+                drop(startup);
+                let mut mutation = self.mutation_catalog_updates.lock().await;
+                if !replay {
+                    if let Some(updates) = mutation.as_mut() {
+                        if updates.len() >= PENDING_LIMIT {
+                            drop(mutation);
+                            drop(binding);
+                            self.fail("ACP mutation catalog stream overflowed").await;
+                        } else {
+                            updates.push(incoming);
+                        }
+                        return;
+                    }
                 }
             }
             binding.session_id.clone()
@@ -1122,20 +1257,19 @@ impl Session {
             return;
         }
         if kind == "current_mode_update" {
+            #[cfg(test)]
+            if replay {
+                if let Some(gate) = &self.startup_mode_gate {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             let Some(mode) = text(update, "currentModeId") else {
                 self.fail("ACP mode update is malformed").await;
                 return;
             };
-            {
-                let mut b = self.binding.lock().await;
-                for option in &mut b.catalog.config_options {
-                    if option.category.as_deref() == Some("mode") {
-                        option.current_value = json!(mode);
-                    }
-                }
-            }
-            if self.publish_catalog().await.is_err() {
-                self.fail("ACP catalog persistence failed").await;
+            if self.apply_mode(mode, sequence).await.is_err() {
+                self.fail("ACP mode update is malformed").await;
             }
             return;
         }
@@ -1156,16 +1290,24 @@ impl Session {
                     return;
                 };
                 let thinking = kind == "agent_thought_chunk";
+                if (thinking && !s.prose.is_empty()) || (!thinking && !s.thoughts.is_empty()) {
+                    self.flush_segments(&mut s, &turn);
+                }
+                // Segment completion must not reset the original per-kind
+                // whole-turn output budget.
+                let index = usize::from(thinking);
+                let bytes = s.output_bytes[index].saturating_add(chunk.len());
+                if bytes > PROMPT_LIMIT {
+                    drop(s);
+                    self.fail("ACP assistant output limit exceeded").await;
+                    return;
+                }
+                s.output_bytes[index] = bytes;
                 let buffer = if thinking {
                     &mut s.thoughts
                 } else {
                     &mut s.prose
                 };
-                if buffer.len().saturating_add(chunk.len()) > PROMPT_LIMIT {
-                    drop(s);
-                    self.fail("ACP assistant output limit exceeded").await;
-                    return;
-                }
                 buffer.push_str(chunk);
                 self.emit(ProviderRuntimeEvent::ContentDelta {
                     thread_id: self.thread.clone(),
@@ -1185,6 +1327,7 @@ impl Session {
                     return;
                 };
                 if kind == "tool_call" && s.tools.insert(id.into()) {
+                    self.flush_segments(&mut s, &turn);
                     self.emit(ProviderRuntimeEvent::ItemCompleted {
                         thread_id: self.thread.clone(),
                         turn_id: turn.clone(),
@@ -1197,6 +1340,7 @@ impl Session {
                     });
                 }
                 if matches!(text(update, "status"), Some("completed" | "failed")) {
+                    self.flush_segments(&mut s, &turn);
                     self.emit(ProviderRuntimeEvent::ItemCompleted {
                         thread_id: self.thread.clone(),
                         turn_id: turn,
@@ -1253,6 +1397,11 @@ impl Session {
         }
     }
     fn flush(&self, state: &mut State, turn: &TurnId) {
+        self.flush_segments(state, turn);
+        state.tools.clear();
+        state.output_bytes = [0; 2];
+    }
+    fn flush_segments(&self, state: &mut State, turn: &TurnId) {
         for (thinking, value) in [
             (true, std::mem::take(&mut state.thoughts)),
             (false, std::mem::take(&mut state.prose)),
@@ -1270,7 +1419,6 @@ impl Session {
                 });
             }
         }
-        state.tools.clear();
     }
     async fn fail(&self, message: &str) {
         let _callbacks = self.callbacks.lock().await;
@@ -1424,11 +1572,8 @@ impl Session {
         {
             return Err(invalid("ACP per-turn model is not advertised"));
         }
-        if let Some(value) = &input.effort_override {
-            let option = semantic_option(&b.catalog.config_options, "thought_level")
-                .ok_or_else(|| invalid("ACP reasoning control is not advertised"))?;
-            validate_value(option, &json!(value)).map_err(invalid)?;
-        }
+        // Reasoning membership is model-dependent. set_effort validates against
+        // the acknowledged model's replacement catalog in the dispatch worker.
         Ok(())
     }
     async fn send(
@@ -1483,76 +1628,141 @@ impl Session {
             queued_id: None,
         })
     }
+    async fn turn_admitted(&self, turn: &TurnId) -> bool {
+        let state = self.state.lock().await;
+        self.alive() && state.active.as_ref() == Some(turn) && !state.interrupted
+    }
+    async fn check_override_owner(&self, turn: Option<&TurnId>) -> Result<(), ProviderError> {
+        if let Some(turn) = turn {
+            if !self.turn_admitted(turn).await { return Err(invalid("ACP turn cancelled before configuration")); }
+        }
+        Ok(())
+    }
+    async fn admission_cancelled(&self, turn: &TurnId) {
+        loop {
+            let cancelled = self.cancel.notified();
+            tokio::pin!(cancelled);
+            // Register before checking state: interrupt publishes its flag
+            // before notifying. Old notify_one permits are not turn authority.
+            cancelled.as_mut().enable();
+            if !self.turn_admitted(turn).await { return; }
+            cancelled.await;
+        }
+    }
     async fn worker(self: Arc<Self>, mut turn: TurnId, mut input: SendTurnInput) {
         loop {
-            if let Some(checkpoint) = &input.turn_checkpoint {
-                checkpoint.prepare().await;
+            if self.turn_admitted(&turn).await {
+                if let Some(checkpoint) = &input.turn_checkpoint {
+                    checkpoint.prepare().await;
+                }
             }
+            // Own configuration and dispatch together. External mutations may
+            // not overlap an admitted prompt, and internal overrides use the
+            // same gate without recursive locking. Stop/interrupt never wait
+            // for this mutex, so a slow setter cannot disable cancellation.
+            let control = tokio::select! {
+                biased;
+                _ = self.admission_cancelled(&turn) => None,
+                control = self.control.lock() => Some(control),
+            };
             let configured = async {
+                self.check_override_owner(Some(&turn)).await?;
                 self.validate_turn(&input).await?;
                 if let Some(model) = input.model_override.clone() {
-                    self.set_model(model).await?;
+                    self.check_override_owner(Some(&turn)).await?;
+                    self.set_model_locked(model, Some(&turn)).await?;
                 }
                 if let Some(effort) = input.effort_override.clone() {
-                    self.set_effort(effort).await?;
+                    self.check_override_owner(Some(&turn)).await?;
+                    self.set_effort_locked(effort, Some(&turn)).await?;
                 }
                 Ok::<(), ProviderError>(())
             }
             .await;
             let mut transport_failed = false;
-            let result = if configured.is_err() {
-                if let Some(checkpoint) = &input.turn_checkpoint {
-                    checkpoint.abort().await;
-                }
-                Err(protocol("ACP turn configuration could not be applied"))
-            } else if !self.alive() || self.state.lock().await.interrupted {
+            let result = if control.is_none() || !self.turn_admitted(&turn).await {
                 if let Some(checkpoint) = &input.turn_checkpoint {
                     checkpoint.abort().await;
                 }
                 Ok(json!({"stopReason":"cancelled"}))
+            } else if configured.is_err() {
+                if let Some(checkpoint) = &input.turn_checkpoint {
+                    checkpoint.abort().await;
+                }
+                Err(protocol("ACP turn configuration could not be applied"))
             } else {
                 self.status(SessionStatus::Running {
                     active_turn: turn.clone(),
                 })
                 .await;
-                if let Some(checkpoint) = &input.turn_checkpoint {
-                    checkpoint.commit().await;
+                if self.turn_admitted(&turn).await {
+                    if let Some(checkpoint) = &input.turn_checkpoint {
+                        checkpoint.commit().await;
+                    }
                 }
                 let native = self.binding.lock().await.session_id.clone().unwrap();
+                // Status, checkpoint commit and binding reads can all yield.
+                // Recheck before issuing the first prompt byte, just as for
+                // every still-unsent override. Already-wired RPCs settle owned.
+                if !self.turn_admitted(&turn).await {
+                    if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.abort().await; }
+                    Ok(json!({"stopReason":"cancelled"}))
+                } else {
                 let mut prompt = vec![json!({"type":"text","text":input.text})];
                 for image in &input.images {
                     prompt.push(json!({"type":"image","mimeType":image.media_type,"data":base64::engine::general_purpose::STANDARD.encode(&image.data)}));
                 }
-                let request = self.child.request_with_timeout(
+                let admitted = AtomicBool::new(false);
+                let request = self.child.request_with_sequence_guarded(
                     "session/prompt",
                     json!({"sessionId":native,"prompt":prompt}),
                     Duration::from_secs(24 * 60 * 60),
+                    || async {
+                        let allowed = self.turn_admitted(&turn).await;
+                        // Set only under the acquired writer, on successful
+                        // exact-turn admission. A revoked unsent prompt needs
+                        // neither a frame nor a session/cancel notification.
+                        if allowed { admitted.store(true, Ordering::SeqCst); }
+                        allowed
+                    },
                 );
                 tokio::pin!(request);
-                // Poll the prompt first so cancellation never precedes its stdin
-                // write. Spawn the cancel write to keep that request polled while
-                // it owns JsonRpcChild's FIFO writer lock.
+                // Keep an admitted request polled through cancellation, even
+                // while its partial frame owns the FIFO stdin writer.
                 let cancel_at = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
                 tokio::pin!(cancel_at);
-                let mut sent_cancel = false;
+                let mut cancellation_seen = false;
                 loop {
                     tokio::select! {
                         biased;
-                        response=&mut request=>break match response {Ok(value)=>Ok(value),Err(e)=>{
-                            transport_failed = !matches!(e,RpcChildError::RpcError(_)) || !self.child.is_alive();
-                            Err(if self.child.is_alive() { rpc_error("session/prompt",&e) } else { protocol("ACP prompt transport failed") })
-                        }},
+                        response=&mut request=>break match response {
+                            Ok((value, _))=>Ok(value),
+                            Err(RpcChildError::CancelledBeforeWrite)=>{
+                                if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.abort().await; }
+                                Ok(json!({"stopReason":"cancelled"}))
+                            },
+                            Err(e)=>{
+                                transport_failed = !matches!(e,RpcChildError::RpcError(_)) || !self.child.is_alive();
+                                Err(if self.child.is_alive() { rpc_error("session/prompt",&e) } else { protocol("ACP prompt transport failed") })
+                            }
+                        },
                         _=self.cancel.notified()=>{
                             if self.state.lock().await.interrupted || self.ended.load(Ordering::SeqCst) {
-                                if !sent_cancel {sent_cancel=true;cancel_at.as_mut().reset(tokio::time::Instant::now()+CANCEL_TIMEOUT);
-                                    let child=self.child.clone();let native=native.clone();tokio::spawn(async move {let _=tokio::time::timeout(CANCEL_TIMEOUT,child.notify("session/cancel",json!({"sessionId":native}))).await;});
+                                if !cancellation_seen {
+                                    cancellation_seen=true;
+                                    cancel_at.as_mut().reset(tokio::time::Instant::now()+CANCEL_TIMEOUT);
+                                    if admitted.load(Ordering::SeqCst) {
+                                        let child=self.child.clone();let native=native.clone();tokio::spawn(async move {let _=tokio::time::timeout(CANCEL_TIMEOUT,child.notify("session/cancel",json!({"sessionId":native}))).await;});
+                                    }
                                 }
                             }
                         },
                         _=&mut cancel_at=>{transport_failed=true;break Err(protocol("ACP prompt did not settle after cancellation"));}
                     }
                 }
+                }
             };
+            drop(control);
             // The pinned request is now dropped; teardown cannot deadlock on
             // the stdin writer mutex held by an unpolled request future.
             #[cfg(test)]

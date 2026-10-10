@@ -8,22 +8,260 @@ import { Composer } from "./Composer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useCustomAcp, acpCatalogKey } from "@/stores/custom-acp-store";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
+import { CustomAcpModels } from "./pickers/CustomAcpModels";
 import { agentChatStartSession, agentChatStopSession } from "@/tauri/commands";
 import type { AcpThreadCatalog } from "@/tauri/custom-acp";
 import { useAppStore } from "@/stores/app-store";
-const { invoke, channels } = vi.hoisted(() => ({ invoke: vi.fn(), channels: [] as { onmessage: (payload: AgentChatEventPayload) => void }[] }));
+const { invoke, channels, listeners } = vi.hoisted(() => ({ invoke: vi.fn(), channels: [] as { onmessage: (payload: AgentChatEventPayload) => void }[], listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke, Channel: class { constructor(public onmessage: (payload: AgentChatEventPayload) => void) { channels.push(this); } } }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}), emit: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, callback: (event: { payload: unknown }) => void) => { listeners.set(name, callback); return () => listeners.delete(name); }), emit: vi.fn() }));
 const agent = { id: "stable-agent", name: "Local", executable: "cli", args: [], environment: {}, enabled: true, auth_method: null, revision: "r" };
 const catalog = { agent_id: agent.id, agent_name: agent.name, capabilities: { models: [], effort_granularity: "per_session" as const, effort_label_map: {}, permission_modes: [], default_permission_mode: null, permission_granularity: "per_session" as const }, config_options: [], current_model: null, supports_images: false, supports_resume: true, auth_methods: [] };
 const props = (): ComponentProps<typeof Composer> => ({ threadId: "draft-thread", draft: "hello", cwd: "/repo", provider: "acp", model: null, permissionMode: null, effort: null, contextWindow: null, activeModel: null, effortLabelMap: {}, permissionModes: null, ultrathinkInBodyText: false, streaming: false, sessionReady: true, showProviderPicker: true, mode: "default", onDraftChange: vi.fn(), onSubmit: vi.fn(), onStop: vi.fn(), onProviderModelChange: vi.fn(), onModelChange: vi.fn(), onPermissionModeChange: vi.fn(), onEffortChange: vi.fn(), onContextWindowChange: vi.fn(), onModeActivate: vi.fn(), onModeRemove: vi.fn() });
 beforeEach(() => {
   useAppStore.setState({ appState: null });
-  useCustomAcp.setState({ agents: [agent], selections: { "draft-thread": agent.id }, bindings: {}, catalogs: { [acpCatalogKey(agent.id, agent.revision)]: catalog }, threadCatalogs: {}, restored: {}, errors: {}, busy: {}, live: {} });
-  invoke.mockReset(); channels.length = 0;
+  useCustomAcp.setState({ agents: [agent], selections: { "draft-thread": agent.id }, bindings: {}, catalogs: { [acpCatalogKey(agent.id, agent.revision)]: catalog }, threadCatalogs: {}, restored: {}, reads: {}, errors: {}, busy: {}, live: {} });
+  invoke.mockReset(); channels.length = 0; listeners.clear();
   invoke.mockImplementation(async (cmd: string) => cmd === "acp_agents" ? [agent] : cmd === "acp_binding" ? null : cmd === "agent_chat_provider_health" ? { status: "ready", installed: true, message: null, version: null } : cmd === "list_chat_provider_capabilities" ? catalog.capabilities : []);
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+it("F3: successful manual catalog refresh recovers every mounted consumer after initial failure", async () => {
+  const binding = { thread_id: "draft-thread", agent_id: agent.id, revision: agent.revision, cwd: "/repo", session_id: "raw", catalog, config_values: {} };
+  let available = false;
+  let resolveRead!: (value: AcpThreadCatalog) => void;
+  invoke.mockImplementation(async (cmd: string) => {
+    if (cmd === "acp_agents") return [agent];
+    if (cmd === "acp_binding") return binding;
+    if (cmd === "acp_thread_catalog") {
+      if (!available) throw new Error("catalog read unavailable");
+      return new Promise<AcpThreadCatalog>(r => { resolveRead = r; });
+    }
+    return [];
+  });
+  const p = props();
+  const { container } = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const textarea = container.querySelector("textarea")!;
+  await waitFor(() => expect(screen.getAllByText(/catalog read unavailable/)).toHaveLength(2));
+  expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  available = true;
+  fireEvent.click(screen.getByRole("button", { name: "Refresh session controls" }));
+  await waitFor(() => expect(resolveRead).toBeTypeOf("function"));
+  expect(screen.getAllByText(/catalog read unavailable/)).toHaveLength(2);
+  fireEvent.keyDown(textarea, { key: "Enter" });
+  expect(p.onSubmit).not.toHaveBeenCalled();
+  await act(async () => resolveRead({ catalog, live: false }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  expect(screen.queryByText(/catalog read unavailable/)).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Refresh session controls" })).not.toBeDisabled();
+  fireEvent.keyDown(textarea, { key: "Enter" });
+  expect(p.onSubmit).toHaveBeenCalledOnce();
+  expect(useCustomAcp.getState().live["draft-thread"]).toBe(false);
+  expect(container.querySelector("textarea")).toBe(textarea);
+});
+it.each(["enabled", "revision"] as const)("F3: retries failed initial reads after an authoritative definition %s update", async change => {
+  const binding = { thread_id: "draft-thread", agent_id: agent.id, revision: agent.revision, cwd: "/repo", session_id: "raw", catalog, config_values: {} };
+  let changed = false;
+  let resolveRead!: (value: AcpThreadCatalog) => void;
+  let reads = 0;
+  invoke.mockImplementation(async (cmd: string) => {
+    if (cmd === "acp_agents") return [{ ...agent, enabled: change === "enabled" ? changed : true, revision: change === "revision" && !changed ? "edited" : agent.revision }];
+    if (cmd === "acp_binding") return binding;
+    if (cmd === "acp_thread_catalog") {
+      reads++;
+      if (!changed) throw new Error("saved agent unavailable");
+      return new Promise<AcpThreadCatalog>(r => { resolveRead = r; });
+    }
+    return [];
+  });
+  const p = props();
+  render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  await waitFor(() => expect(screen.getAllByText(/saved agent unavailable/)).toHaveLength(2));
+  const initialReads = reads;
+  changed = true;
+  await act(async () => useCustomAcp.getState().loadAgents(true));
+  await waitFor(() => expect(resolveRead).toBeTypeOf("function"));
+  expect(reads).toBe(initialReads + 1);
+  expect(screen.getAllByText(/saved agent unavailable/)).toHaveLength(2);
+  expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  await act(async () => resolveRead({ catalog, live: false }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  expect(screen.queryByText(/saved agent unavailable/)).not.toBeInTheDocument();
+  await act(async () => useCustomAcp.getState().loadAgents(true));
+  expect(reads).toBe(initialReads + 1);
+});
+it.each((["enabled", "revision"] as const).flatMap(change => [false, true].map(retryFails => ({ change, retryFails }))))
+("P2: repair $change before initial rejection reaches both consumers with one bounded retry (retryFails=$retryFails)", async ({ change, retryFails }) => {
+  const binding = { thread_id: "draft-thread", agent_id: agent.id, revision: agent.revision, cwd: "/repo", session_id: "raw", catalog, config_values: {} };
+  const pending: { resolve: (value: AcpThreadCatalog) => void; reject: (reason: Error) => void }[] = [];
+  let repaired = false;
+  invoke.mockImplementation(async (cmd: string) => {
+    if (cmd === "acp_agents") return [{ ...agent, enabled: change === "enabled" ? repaired : true, revision: change === "revision" && !repaired ? "old-definition" : agent.revision }];
+    if (cmd === "acp_binding") return binding;
+    if (cmd === "acp_thread_catalog") return new Promise<AcpThreadCatalog>((resolve, reject) => pending.push({ resolve, reject }));
+    return [];
+  });
+  const p = props();
+  const content = <TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>;
+  const view = render(content);
+  const textarea = view.container.querySelector("textarea")!;
+  try {
+    await waitFor(() => expect(pending).toHaveLength(1));
+    expect(useCustomAcp.getState().reads["draft-thread"].error).toBeNull();
+    repaired = true;
+    await act(async () => useCustomAcp.getState().loadAgents(true));
+    expect(pending).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    await act(async () => pending[0].reject(new Error("initial catalog before repair failed")));
+    expect(pending).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(screen.getAllByText(/initial catalog before repair failed/)).toHaveLength(2);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    expect(p.onSubmit).not.toHaveBeenCalled();
+    await act(async () => useCustomAcp.getState().loadAgents(true));
+    expect(pending).toHaveLength(2);
+    if (retryFails) {
+      await act(async () => pending[1].reject(new Error("repair retry failed")));
+      expect(screen.getAllByText(/repair retry failed/)).toHaveLength(2);
+      expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+      await act(async () => { await useCustomAcp.getState().loadAgents(true); await useCustomAcp.getState().loadAgents(true); });
+      expect(pending).toHaveLength(2);
+      const refresh = screen.getByRole("button", { name: "Refresh session controls" });
+      expect(refresh).not.toBeDisabled();
+      fireEvent.click(refresh);
+      await act(async () => pending[2].resolve({ catalog, live: false }));
+    } else await act(async () => pending[1].resolve({ catalog, live: false }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+    expect(screen.queryByText(/catalog before repair failed|repair retry failed/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh session controls" })).not.toBeDisabled();
+    expect(useCustomAcp.getState().live["draft-thread"]).toBe(false);
+    expect(view.container.querySelector("textarea")).toBe(textarea);
+    expect(pending).toHaveLength(retryFails ? 3 : 2);
+    await act(async () => useCustomAcp.getState().loadAgents(true));
+    expect(pending).toHaveLength(retryFails ? 3 : 2);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_start_session" || cmd === "acp_probe")).toBe(false);
+  } finally {
+    await act(async () => { for (const read of pending) read.resolve({ catalog, live: false }); });
+  }
+});
+
+it.each((["enabled", "revision"] as const).flatMap(change => [false, true].map(retryFails => ({ change, retryFails }))))
+("FE2 Composer: native repair after catalog handoff stays bounded ($change, retryFails=$retryFails)", async ({ change, retryFails }) => {
+  const binding = { thread_id: "draft-thread", agent_id: agent.id, revision: agent.revision, cwd: "/repo", session_id: "raw", catalog, config_values: {} };
+  const pending: { resolve: (value: AcpThreadCatalog) => void; reject: (reason: Error) => void }[] = [];
+  let repaired = false;
+  invoke.mockImplementation(async cmd => {
+    if (cmd === "acp_agents") return [{ ...agent, enabled: change === "enabled" ? repaired : true, revision: change === "revision" && !repaired ? "before-repair" : agent.revision }];
+    if (cmd === "acp_binding") return binding;
+    if (cmd === "acp_thread_catalog") return new Promise<AcpThreadCatalog>((resolve, reject) => pending.push({ resolve, reject }));
+    return [];
+  });
+  const p = props();
+  const view = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const textarea = view.container.querySelector("textarea")!;
+  try {
+    await waitFor(() => expect(pending).toHaveLength(1));
+    act(() => listeners.get("custom_acp_catalog_changed")!({ payload: { thread_id: p.threadId } }));
+    expect(pending).toHaveLength(2);
+    repaired = true;
+    act(() => listeners.get("custom_acp_changed")!({ payload: null }));
+    await waitFor(() => expect(useCustomAcp.getState().agents?.[0]).toMatchObject(agent));
+    expect(useCustomAcp.getState().reads["draft-thread"].error).toBeNull();
+    await act(async () => pending[0].reject(new Error("obsolete initial failure")));
+    expect(pending).toHaveLength(2);
+    await act(async () => pending[1].reject(new Error("latest before repair failed")));
+    expect(pending).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(screen.getAllByText(/^Error: latest before repair failed$/)).toHaveLength(2);
+    expect(screen.getAllByText(/Custom agent updates unavailable: Error: latest before repair failed/)).toHaveLength(1);
+    act(() => { fireEvent.keyDown(textarea, { key: "Enter" }); fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true }); });
+    expect(p.onSubmit).not.toHaveBeenCalled();
+    if (retryFails) await act(async () => pending[2].reject(new Error("one repair retry failed")));
+    else await act(async () => pending[2].resolve({ catalog, live: false }));
+    expect(screen.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(retryFails);
+    if (retryFails) expect(screen.getAllByText(/one repair retry failed/)).toHaveLength(2);
+    expect(screen.getAllByText(/Custom agent updates unavailable: Error: latest before repair failed/)).toHaveLength(retryFails ? 1 : 2);
+    await act(async () => { await useCustomAcp.getState().loadAgents(true); await useCustomAcp.getState().loadAgents(true); });
+    expect(pending).toHaveLength(3);
+    expect(view.container.querySelector("textarea")).toBe(textarea);
+    expect(textarea.value).toBe("hello");
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_binding")).toHaveLength(1);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_start_session" || cmd === "acp_probe")).toBe(false);
+  } finally { await act(async () => { for (const read of pending) read.resolve({ catalog, live: false }); }); }
+});
+
+it.each([false, true])("FE3 Composer: latest listing completes delayed binding before submit (bound=%s)", async bound => {
+  const binding = { thread_id: "draft-thread", agent_id: agent.id, revision: agent.revision, cwd: "/repo", session_id: "raw", catalog, config_values: {} };
+  let rejectList!: (reason: Error) => void;
+  let restoreBinding!: (value: typeof binding | null) => void;
+  let resolveCatalog!: (value: AcpThreadCatalog) => void;
+  let lists = 0;
+  invoke.mockImplementation(async cmd => {
+    if (cmd === "acp_agents") return ++lists === 1 ? new Promise((_, reject) => { rejectList = reject; }) : [agent];
+    if (cmd === "acp_binding") return new Promise<typeof binding | null>(resolve => { restoreBinding = resolve; });
+    if (cmd === "acp_thread_catalog") return new Promise<AcpThreadCatalog>(resolve => { resolveCatalog = resolve; });
+    if (cmd === "acp_probe") return catalog;
+    return [];
+  });
+  useCustomAcp.setState({ catalogs: {} });
+  const p = props();
+  const view = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const textarea = view.container.querySelector("textarea")!;
+  try {
+    await waitFor(() => expect(restoreBinding).toBeTypeOf("function"));
+    act(() => listeners.get("custom_acp_changed")!({ payload: null }));
+    await waitFor(() => expect(lists).toBe(2));
+    await act(async () => {});
+    await act(async () => rejectList(new Error("obsolete list failure")));
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => { fireEvent.keyDown(textarea, { key: "Enter" }); fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true }); });
+    expect(p.onSubmit).not.toHaveBeenCalled();
+    await act(async () => restoreBinding(bound ? binding : null));
+    if (bound) {
+      expect(resolveCatalog).toBeTypeOf("function");
+      expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+      await act(async () => resolveCatalog({ catalog, live: false }));
+    }
+    expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled();
+    expect(screen.queryByText(/obsolete list failure/)).not.toBeInTheDocument();
+    if (!bound) {
+      fireEvent.click(screen.getByRole("button", { name: "Probe saved agent" }));
+      await waitFor(() => expect(invoke).toHaveBeenCalledWith("acp_probe", { agentId: agent.id, cwd: null }));
+      expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled();
+    }
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_binding")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_thread_catalog")).toHaveLength(bound ? 1 : 0);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_start_session")).toBe(false);
+    expect(view.container.querySelector("textarea")).toBe(textarea);
+  } finally { await act(async () => { restoreBinding(bound ? binding : null); resolveCatalog?.({ catalog, live: false }); }); }
+});
+
+it("F3: deferred null binding and explicit model probe retain the fresh selection's ready sentinel", async () => {
+  useCustomAcp.setState({ catalogs: {} });
+  let restoreNull!: (value: null) => void;
+  let resolveProbe!: (value: typeof catalog) => void;
+  invoke.mockImplementation(async (cmd: string) => {
+    if (cmd === "acp_agents") return [agent];
+    if (cmd === "acp_binding") return new Promise<null>(r => { restoreNull = r; });
+    if (cmd === "acp_probe") return new Promise<typeof catalog>(r => { resolveProbe = r; });
+    return [];
+  });
+  const p = props();
+  const { container } = render(<TooltipProvider><Composer {...p} /><CustomAcpModels threadId={p.threadId} model={null} onSelect={vi.fn()} /></TooltipProvider>);
+  const textarea = container.querySelector("textarea")!;
+  expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  await act(async () => restoreNull(null));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  expect(screen.getByRole("button", { name: "Use agent default" })).not.toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Probe saved agent" }));
+  await waitFor(() => expect(resolveProbe).toBeTypeOf("function"));
+  expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled();
+  await act(async () => resolveProbe(catalog));
+  expect(screen.getByRole("button", { name: "Use agent default" })).not.toBeDisabled();
+  expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled();
+  expect(container.querySelector("textarea")).toBe(textarea);
+  expect(invoke.mock.calls.some(([cmd]) => cmd === "acp_thread_catalog" || cmd === "agent_chat_start_session")).toBe(false);
+});
 function SubscribedComposer(p: ComponentProps<typeof Composer>) {
   useAgentChatEvents(p.threadId ?? null, () => {});
   return <TooltipProvider><Composer {...p} /></TooltipProvider>;

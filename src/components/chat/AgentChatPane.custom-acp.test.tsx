@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { AgentChatPane } from "./AgentChatPane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
@@ -13,7 +13,7 @@ import { materializeAndSend, materializeWithPreset, type MaterializeActions } fr
 import type { ChatDraft } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 
-const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(async () => () => {}) }));
+const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn<(name: string, callback: any) => Promise<() => void>>(async () => () => {}) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke, convertFileSrc: (p: string) => p, Channel: class { id = 1; constructor(public onmessage: (payload: unknown) => void) {} } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen, emit: vi.fn() }));
 // Replace only virtual layout; the pane, Composer, picker, stores, history
@@ -43,7 +43,7 @@ const pane = { kind: "agent_chat" as const, pane_id: "pane-acp", thread_id: reco
 beforeEach(() => {
   useAgentChatStore.setState({ threads: {} });
   useAppStore.setState({ homeDir: "/test-home", appState: { active_workspace_id: "ws", workspaces: [{ workspace_id: "ws", cwd: "/repo", project_root: "/repo", surfaces: [{ root: pane }] }] } as never });
-  useCustomAcp.setState({ agents: null, selections: {}, bindings: {}, catalogs: {}, threadCatalogs: {}, restored: {}, errors: {}, busy: {}, live: {} });
+  useCustomAcp.setState({ agents: null, selections: {}, bindings: {}, catalogs: {}, threadCatalogs: {}, restored: {}, reads: {}, errors: {}, busy: {}, live: {} });
   useProviderRuntimeIntent.getState().reset();
   useProviderRuntimeIntent.getState().observe("acp");
   invoke.mockReset();
@@ -181,6 +181,336 @@ it("paints only the authoritative catalog after the actual model setter wrapper 
   expect(screen.queryByLabelText("Old effort")).not.toBeInTheDocument();
   expect(useCustomAcp.getState().threadCatalogs[record.thread_id]).toEqual(updated);
   expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_update_session_config")).toEqual([]);
+});
+
+it.each([false, true])("F4: synchronously blocks duplicate model clicks and Enter (ctrl=%s) through catalog readback", async ctrlKey => {
+  const fallback = modelTransport();
+  let acknowledge!: () => void;
+  let readback!: (value: AcpCatalog) => void;
+  let accepted = false;
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "agent_chat_set_model") { await new Promise<void>(r => { acknowledge = r; }); accepted = true; return; }
+    if (cmd === "acp_thread_catalog" && accepted) return new Promise<AcpCatalog>(r => { readback = r; }).then(catalog => ({ catalog, live: true }));
+    return fallback(cmd, args);
+  });
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "unsent text");
+  const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+  const choice = await screen.findByRole("button", { name: "model B" });
+  await waitFor(() => expect(choice).not.toBeDisabled());
+  const textarea = container.querySelector("textarea")!;
+  act(() => {
+    // No await or React commit between setter admission and keyboard submit.
+    fireEvent.click(choice);
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey });
+    fireEvent.click(choice);
+    expect(useCustomAcp.getState().busy[record.thread_id]).toBe(true);
+  });
+  await act(async () => {});
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_set_model")).toHaveLength(1);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+  expect(useAgentChatStore.getState().threads[record.thread_id].inputDraft).toBe("unsent text");
+  expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  await act(async () => acknowledge());
+  expect(useCustomAcp.getState().busy[record.thread_id]).toBe(true);
+  expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  fireEvent.keyDown(textarea, { key: "Enter", ctrlKey });
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+  expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model A");
+  await act(async () => readback({ ...modelCatalog, current_model: "model B", config_options: [] }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  expect(useCustomAcp.getState().busy[record.thread_id]).toBe(false);
+  expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model B");
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+});
+it.each(["setter", "readback"] as const)("F4: releases the owned gate after deferred %s failure without optimistic model or effort", async stage => {
+  const fallback = modelTransport();
+  let rejectSetter!: (reason: Error) => void;
+  let acknowledge!: () => void;
+  let rejectRead!: (reason: Error) => void;
+  let accepted = false;
+  let recovered = false;
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "agent_chat_set_model") { await new Promise<void>((resolve, reject) => { acknowledge = resolve; rejectSetter = reject; }); accepted = true; return; }
+    if (cmd === "acp_thread_catalog" && accepted && !recovered) return new Promise((_, reject) => { rejectRead = reject; });
+    return fallback(cmd, args);
+  });
+  const { toast } = await import("@/lib/toast");
+  const error = vi.spyOn(toast, "error");
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "retain draft");
+  render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+  const choice = await screen.findByRole("button", { name: "model B" });
+  await waitFor(() => expect(choice).not.toBeDisabled());
+  fireEvent.click(choice);
+  expect(useCustomAcp.getState().busy[record.thread_id]).toBe(true);
+  expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  if (stage === "setter") await act(async () => rejectSetter(new Error("setter refused model")));
+  else {
+    await act(async () => acknowledge());
+    expect(useCustomAcp.getState().busy[record.thread_id]).toBe(true);
+    await act(async () => rejectRead(new Error("catalog discovery failed")));
+  }
+  await waitFor(() => expect(error).toHaveBeenCalledWith(expect.stringContaining(stage === "setter" ? "setter refused model" : "catalog discovery failed")));
+  expect(useCustomAcp.getState().busy[record.thread_id]).toBe(false);
+  expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model A");
+  expect(useAgentChatStore.getState().threads[record.thread_id].effort).toBe(record.effort);
+  expect(useCustomAcp.getState().threadCatalogs[record.thread_id]).toEqual(modelCatalog);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+  expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_update_session_config")).toHaveLength(0);
+  if (stage === "readback") {
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    const refresh = await screen.findByRole("button", { name: "Refresh session controls" });
+    expect(refresh).not.toBeDisabled();
+    recovered = true;
+    fireEvent.click(refresh);
+  }
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  expect(useAgentChatStore.getState().threads[record.thread_id].inputDraft).toBe("retain draft");
+  error.mockRestore();
+});
+it.each((["model", "config"] as const).flatMap(kind => [false, true].flatMap(ctrlKey => ["success", "failure"].map(outcome => ({ kind, ctrlKey, outcome })))))
+("P1: $kind obsolete rejection keeps Pane/Composer admission through latest $outcome (ctrl=$ctrlKey)", async ({ kind, ctrlKey, outcome }) => {
+  const fallback = modelTransport();
+  const pending: { resolve: (value: { catalog: AcpCatalog; live: boolean }) => void; reject: (error: Error) => void }[] = [];
+  let acknowledge!: () => void;
+  let catalogChanged!: (event: { payload: { thread_id: string } }) => void;
+  let accepted = false;
+  listen.mockImplementation(async (name: string, callback: typeof catalogChanged) => {
+    if (name === "custom_acp_catalog_changed") catalogChanged = callback;
+    return () => {};
+  });
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "agent_chat_set_model" || cmd === "acp_set_config") {
+      await new Promise<void>(resolve => { acknowledge = resolve; }); accepted = true; return modelCatalog;
+    }
+    if (cmd === "acp_thread_catalog" && accepted) return new Promise<{ catalog: AcpCatalog; live: boolean }>((resolve, reject) => pending.push({ resolve, reject }));
+    return fallback(cmd, args);
+  });
+  const { toast } = await import("@/lib/toast");
+  const error = vi.spyOn(toast, "error");
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "retain racing draft");
+  const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+  fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
+  const controls = within(await screen.findByRole("dialog"));
+  const choice = await controls.findByRole("button", { name: "model B" });
+  const config = controls.getByLabelText("Old effort");
+  await waitFor(() => expect(choice).not.toBeDisabled());
+  const textarea = container.querySelector("textarea")!;
+  const mutationCalls = () => invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_set_model" || cmd === "acp_set_config");
+  try {
+    act(() => {
+      if (kind === "model") fireEvent.click(choice);
+      else fireEvent.change(config, { target: { value: "ultrathink" } });
+      fireEvent.keyDown(textarea, { key: "Enter", ctrlKey });
+      fireEvent.click(choice);
+      fireEvent.change(config, { target: { value: "ultrathink" } });
+    });
+    expect(mutationCalls()).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+    await act(async () => acknowledge());
+    expect(pending).toHaveLength(1);
+    act(() => catalogChanged({ payload: { thread_id: record.thread_id } }));
+    expect(pending).toHaveLength(2);
+    await act(async () => pending[0].reject(new Error("obsolete mutation read failed")));
+    expect(useCustomAcp.getState().busy[record.thread_id]).toBe(true);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(useCustomAcp.getState().reads[record.thread_id].error).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: "Enter", ctrlKey });
+      await expect(useCustomAcp.getState().setModel(record.thread_id, "racing/model")).rejects.toThrow(/Wait/);
+      await expect(useCustomAcp.getState().setConfig(record.thread_id, "racing/config", true)).rejects.toThrow(/Wait/);
+    });
+    expect(mutationCalls()).toHaveLength(1);
+    expect(useCustomAcp.getState().busy[record.thread_id]).toBe(true);
+    expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model A");
+    if (outcome === "success") {
+      await act(async () => pending[1].resolve({ catalog: { ...modelCatalog, current_model: "model B", config_options: [] }, live: true }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+      expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model B");
+      expect(screen.queryByLabelText("Old effort")).not.toBeInTheDocument();
+      expect(error).not.toHaveBeenCalled();
+    } else {
+      await act(async () => pending[1].reject(new Error("latest authoritative read failed")));
+      expect(useCustomAcp.getState().reads[record.thread_id]).toEqual({ ready: false, error: "Error: latest authoritative read failed" });
+      expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+      if (kind === "model") expect(error).toHaveBeenCalledWith(expect.stringContaining("latest authoritative read failed"));
+      else expect(controls.getByRole("alert")).toHaveTextContent("latest authoritative read failed");
+      expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model A");
+      expect(useAgentChatStore.getState().threads[record.thread_id].effort).toBe(record.effort);
+      const refresh = controls.getByRole("button", { name: "Refresh session controls" });
+      expect(refresh).not.toBeDisabled();
+      fireEvent.click(refresh);
+      await act(async () => pending[2].resolve({ catalog: modelCatalog, live: true }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+    }
+    expect(useCustomAcp.getState().busy[record.thread_id]).toBe(false);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+    expect(useAgentChatStore.getState().threads[record.thread_id].inputDraft).toBe("retain racing draft");
+  } finally {
+    await act(async () => { for (const read of pending) read.resolve({ catalog: modelCatalog, live: true }); });
+    error.mockRestore();
+    listen.mockImplementation(async () => () => {});
+  }
+});
+
+it("P2: native definition repair before initial rejection recovers the actual Pane and Composer", async () => {
+  const fallback = modelTransport();
+  const pending: { resolve: (value: { catalog: AcpCatalog; live: boolean }) => void; reject: (error: Error) => void }[] = [];
+  let enabled = false;
+  let definitionsChanged!: (event: { payload: null }) => void;
+  listen.mockImplementation(async (name: string, callback: typeof definitionsChanged) => {
+    if (name === "custom_acp_changed") definitionsChanged = callback;
+    return () => {};
+  });
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "acp_agents") return [{ ...agent, enabled }];
+    if (cmd === "acp_thread_catalog") return new Promise<{ catalog: AcpCatalog; live: boolean }>((resolve, reject) => pending.push({ resolve, reject }));
+    return fallback(cmd, args);
+  });
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "retain repaired draft");
+  const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  try {
+    await waitFor(() => expect(pending).toHaveLength(1));
+    await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+    const textarea = container.querySelector("textarea")!;
+    enabled = true;
+    act(() => definitionsChanged({ payload: null }));
+    await waitFor(() => expect(useCustomAcp.getState().agents?.[0].enabled).toBe(true));
+    await act(async () => pending[0].reject(new Error("initial disabled read failed")));
+    expect(pending).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => {
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    });
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+    await act(async () => pending[1].resolve({ catalog: modelCatalog, live: false }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+    expect(screen.getByTestId("multi-provider-model-picker-trigger")).not.toBeDisabled();
+    expect(useCustomAcp.getState().reads[record.thread_id]).toEqual({ ready: true, error: null });
+    expect(useCustomAcp.getState().live[record.thread_id]).toBe(false);
+    expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model A");
+    expect(useAgentChatStore.getState().threads[record.thread_id].inputDraft).toBe("retain repaired draft");
+    expect(container.querySelector("textarea")).toBe(textarea);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_binding")).toHaveLength(1);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_start_session" || cmd === "acp_probe")).toBe(false);
+  } finally {
+    await act(async () => { for (const read of pending) read.resolve({ catalog: modelCatalog, live: false }); });
+    listen.mockImplementation(async () => () => {});
+  }
+});
+
+it("FE2 Pane: native catalog handoff retains the definition repair and exactly one trailing read", async () => {
+  const fallback = modelTransport();
+  const pending: { resolve: (value: { catalog: AcpCatalog; live: boolean }) => void; reject: (error: Error) => void }[] = [];
+  let enabled = false;
+  let catalogChanged!: (event: { payload: { thread_id: string } }) => void;
+  let definitionsChanged!: (event: { payload: null }) => void;
+  listen.mockImplementation(async (name: string, callback: typeof definitionsChanged) => {
+    if (name === "custom_acp_changed") definitionsChanged = callback;
+    if (name === "custom_acp_catalog_changed") catalogChanged = callback as unknown as typeof catalogChanged;
+    return () => {};
+  });
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "acp_agents") return [{ ...agent, enabled }];
+    if (cmd === "acp_thread_catalog") return new Promise<{ catalog: AcpCatalog; live: boolean }>((resolve, reject) => pending.push({ resolve, reject }));
+    return fallback(cmd, args);
+  });
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "retain repaired draft");
+  const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  try {
+    await waitFor(() => expect(pending).toHaveLength(1));
+    await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+    const textarea = container.querySelector("textarea")!;
+    act(() => catalogChanged({ payload: { thread_id: record.thread_id } }));
+    expect(pending).toHaveLength(2);
+    enabled = true;
+    act(() => definitionsChanged({ payload: null }));
+    await waitFor(() => expect(useCustomAcp.getState().agents?.[0].enabled).toBe(true));
+    await act(async () => pending[0].reject(new Error("initial disabled read failed")));
+    expect(pending).toHaveLength(2);
+    await act(async () => pending[1].reject(new Error("latest pre-repair read failed")));
+    expect(pending).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => {
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    });
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+    await act(async () => pending[2].resolve({ catalog: modelCatalog, live: false }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+    expect(screen.getByTestId("multi-provider-model-picker-trigger")).not.toBeDisabled();
+    expect(useCustomAcp.getState().reads[record.thread_id]).toEqual({ ready: true, error: null });
+    expect(useCustomAcp.getState().live[record.thread_id]).toBe(false);
+    expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model A");
+    expect(useAgentChatStore.getState().threads[record.thread_id].inputDraft).toBe("retain repaired draft");
+    expect(container.querySelector("textarea")).toBe(textarea);
+    await act(async () => { await useCustomAcp.getState().loadAgents(true); await useCustomAcp.getState().loadAgents(true); });
+    expect(pending).toHaveLength(3);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_binding")).toHaveLength(1);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_start_session" || cmd === "acp_probe")).toBe(false);
+  } finally {
+    await act(async () => { for (const read of pending) read.resolve({ catalog: modelCatalog, live: false }); });
+    listen.mockImplementation(async () => () => {});
+  }
+});
+
+it("FE3 Pane: repaired settled listing cannot be stranded by an obsolete rejection before binding", async () => {
+  const fallback = modelTransport();
+  let rejectList!: (reason: Error) => void;
+  let restoreBinding!: (value: typeof binding) => void;
+  let resolveCatalog!: (value: { catalog: AcpCatalog; live: boolean }) => void;
+  let definitionsChanged!: (event: { payload: null }) => void;
+  let lists = 0;
+  listen.mockImplementation(async (name: string, callback: typeof definitionsChanged) => {
+    if (name === "custom_acp_changed") definitionsChanged = callback;
+    return () => {};
+  });
+  invoke.mockImplementation(async (cmd: string, args?: Record<string, any>) => {
+    if (cmd === "acp_agents") return ++lists === 1 ? new Promise((_, reject) => { rejectList = reject; }) : [agent];
+    if (cmd === "acp_binding") return new Promise<typeof binding>(resolve => { restoreBinding = resolve; });
+    if (cmd === "acp_thread_catalog") return new Promise<{ catalog: AcpCatalog; live: boolean }>(resolve => { resolveCatalog = resolve; });
+    return fallback(cmd, args);
+  });
+  useAgentChatStore.getState().ensureThread(record.thread_id);
+  useAgentChatStore.getState().setInputDraft(record.thread_id, "retain listing-race draft");
+  const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  try {
+    await waitFor(() => expect(restoreBinding).toBeTypeOf("function"));
+    await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+    const textarea = container.querySelector("textarea")!;
+    act(() => definitionsChanged({ payload: null }));
+    await waitFor(() => expect(useCustomAcp.getState().agents?.[0].id).toBe(agent.id));
+    await act(async () => rejectList(new Error("obsolete initial list failed")));
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => { fireEvent.keyDown(textarea, { key: "Enter" }); fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true }); });
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_chat_send_turn")).toHaveLength(0);
+    await act(async () => restoreBinding({ ...binding, catalog: modelCatalog }));
+    expect(resolveCatalog).toBeTypeOf("function");
+    expect(useCustomAcp.getState().bindings[record.thread_id]?.session_id).toBe(rawSessionId);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    await act(async () => resolveCatalog({ catalog: { ...modelCatalog, current_model: "model B", config_options: [] }, live: false }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
+    expect(screen.queryByText(/obsolete initial list failed/)).not.toBeInTheDocument();
+    expect(useAgentChatStore.getState().threads[record.thread_id].model).toBe("model B");
+    expect(useAgentChatStore.getState().threads[record.thread_id].inputDraft).toBe("retain listing-race draft");
+    expect(container.querySelector("textarea")).toBe(textarea);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_binding")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "acp_thread_catalog")).toHaveLength(1);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "agent_chat_start_session" || cmd === "acp_probe")).toBe(false);
+  } finally {
+    await act(async () => { restoreBinding(binding); resolveCatalog?.({ catalog: modelCatalog, live: false }); });
+    listen.mockImplementation(async () => () => {});
+  }
 });
 
 it("preserves Claude ultrathink prompt semantics through the same real pane send path", async () => {

@@ -2966,7 +2966,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (!threadId) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
       if (provider === "acp") {
-        void agentChatSetModel(provider, threadId, next).then(() => useCustomAcp.getState().refreshThread(threadId)).then(catalog => setStoreModel(threadId, catalog.current_model)).catch(err => toast.error(`Failed to change custom agent model: ${formatProviderError(err)}`));
+        if (useCustomAcp.getState().busy[threadId]) return;
+        void useCustomAcp.getState().setModel(threadId, next).then(catalog => setStoreModel(threadId, catalog.current_model)).catch(err => toast.error(`Failed to change custom agent model: ${formatProviderError(err)}`));
         return;
       }
       const previous = useAgentChatStore.getState().threads[threadId];

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import threading
 from typing import Any
 
 mode = os.environ.get("FAKE_ACP_MODE", "resume")
@@ -13,6 +14,7 @@ prompt_id = None
 callback_id = None
 selected_model = "default"
 selected_effort = " A effort "
+selected_mode = " A mode "
 
 def ordered_catalog(model):
     effort = " D effort " if model == " D model " else " C effort "
@@ -135,6 +137,46 @@ def ownership_startup(request_id, method):
     record({"fixture_wire": messages})
     os.write(1, ("\n".join(json.dumps(m) for m in messages) + "\n").encode())
 
+def coupled_catalog():
+    options = dynamic_configs()
+    if "legacy" in mode:
+        options = options[1:]
+    modes = [" A mode ", " Y mode "] if "new-value" not in mode or selected_model != "default" else [" A mode "]
+    options.append({"id": "coupled mode", "name": "Mode", "category": "mode", "type": "select",
+                    "currentValue": selected_mode, "options": [{"value": v, "name": v} for v in modes]})
+    value: dict[str, Any] = {"configOptions": options}
+    if "legacy" in mode:
+        value["models"] = {"currentModelId": selected_model, "availableModels": [{"modelId": v, "name": v} for v in ["default", "vendor:model [1m]"]]}
+    return value
+
+def coupled_change(request_id):
+    global selected_model, selected_effort, selected_mode
+    # The callback gates the real pump; both wire messages then use one write.
+    if "overflow" in mode:
+        messages = [{"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id,
+                     "update": {"sessionUpdate": "current_mode_update", "currentModeId": " Y mode "}}} for _ in range(65)]
+        record({"fixture_burst": messages})
+        for message in messages:
+            send(message)
+    if "foreign" in mode:
+        messages = [{"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "foreign native ID",
+                     "update": {"sessionUpdate": "current_mode_update", "currentModeId": " unadvertised foreign mode "}}} for _ in range(65)]
+        messages.append({"jsonrpc": "2.0", "method": "session/update", "params": {
+                         "update": {"sessionUpdate": "current_mode_update", "currentModeId": " unadvertised missing mode "}}})
+        record({"fixture_burst": messages})
+        for message in messages:
+            send(message)
+    ownership_barrier()
+    selected_model, selected_effort = "vendor:model [1m]", " B effort "
+    response = {"jsonrpc": "2.0", "id": request_id, "result": coupled_catalog()}
+    notification = {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id,
+                    "update": {"sessionUpdate": "current_mode_update", "currentModeId": True if "malformed" in mode else " unadvertised mode " if "invalid" in mode else " Y mode "}}}
+    messages = [notification, response] if "before" in mode else [response, notification]
+    if "before" not in mode:
+        selected_mode = " Y mode "
+    record({"fixture_wire": messages, "fixture_state": {"model": selected_model, "effort": selected_effort, "mode": selected_mode}})
+    os.write(1, ("\n".join(json.dumps(v) for v in messages) + "\n").encode())
+
 def dynamic_configs():
     effort_id = "effort A" if selected_model == "default" else "effort B"
     if mode == "dynamic-values":
@@ -161,6 +203,11 @@ def result(request_id, value):
     send({"jsonrpc": "2.0", "id": request_id, "result": value})
 
 def configs() -> list[dict[str, Any]]:
+    if mode in ("review4-slow-model", "ownership-held-control"):
+        return dynamic_configs()
+    if mode.startswith("review2-"):
+        return [{"id": "opaque mode selector", "name": "Mode", "category": "mode", "type": "select", "currentValue": selected_mode,
+                 "options": [{"value": v, "name": v} for v in [" A mode ", " B mode ", " C mode ", " D mode "]]}]
     if mode.startswith("dynamic-"):
         return dynamic_configs()
     if mode == "no-model":
@@ -179,7 +226,7 @@ def configs() -> list[dict[str, Any]]:
     return options
 
 record({"launch_argv": sys.argv[1:], "launch_env": os.environ.get("FAKE_LITERAL")})
-if mode.startswith("ownership-"):
+if mode.startswith(("ownership-", "review", "renewed-", "dynamic-renewed-")):
     record({"owned_pid": os.getpid()})
 recovered = False
 for line in sys.stdin:
@@ -203,7 +250,58 @@ for line in sys.stdin:
         assert mode == "auth", "No implicit authentication allowed"
         assert params == {"methodId": "exact-auth ID"}
         result(request_id, {})
+    elif method == "fixture/callback":
+        send({"jsonrpc": "2.0", "id": "writer admission callback", "method": "fixture/unsupported", "params": {}})
+        result(request_id, {})
     elif method in ("session/new", "session/resume", "session/load"):
+        if mode.startswith("renewed-startup-"):
+            def startup_mode(value):
+                return {"configOptions": [{"id": "startup mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": value,
+                        "options": [{"value": value, "name": value}]}]}
+            if method == "session/new" and "-new-" not in mode:
+                result(request_id, {"sessionId": native_id, "configOptions": []})
+                continue
+            if method != "session/new":
+                assert params["sessionId"] == native_id
+            messages = [
+                {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "config_option_update", **startup_mode(" Y mode ")}}},
+                {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "current_mode_update", "currentModeId": True if "malformed" in mode else " invalid mode " if "invalid" in mode else " Y mode "}}},
+            ]
+            record({"fixture_wire": messages})
+            for message in messages:
+                send(message)
+            ownership_barrier()
+            result(request_id, {"sessionId": native_id, **startup_mode(" Y mode " if "replay" in mode else " Z mode ")})
+            if "replay" in mode:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(log_path + ".later"):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.005)
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "config_option_update", **startup_mode(" Z mode ")}}})
+                ownership_barrier()
+                with open(log_path + ".later-ready", "w", encoding="utf-8") as ready:
+                    ready.write("ready")
+            continue
+        if mode.startswith("ownership-coupled-"):
+            if method != "session/new":
+                assert params["sessionId"] == native_id
+                recovered = True
+                with open(log_path, encoding="utf-8") as log:
+                    for entry in log:
+                        state = json.loads(entry).get("fixture_state")
+                        if state:
+                            selected_model, selected_effort, selected_mode = state["model"], state["effort"], state["mode"]
+            value = coupled_catalog()
+            value["sessionId"] = native_id
+            result(request_id, value)
+            continue
+        if mode == "review2-startup":
+            value = {"sessionId": native_id, "configOptions": configs()}
+            messages = [{"jsonrpc": "2.0", "id": request_id, "result": value},
+                        {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "current_mode_update", "currentModeId": " B mode "}}}]
+            record({"fixture_wire": messages})
+            os.write(1, ("\n".join(json.dumps(v) for v in messages) + "\n").encode())
+            continue
         if mode.startswith("ownership-queue-"):
             ownership_startup(request_id, method)
             continue
@@ -261,6 +359,8 @@ for line in sys.stdin:
         if method == "session/load":
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "historical replay MUST NOT duplicate"}}}})
         response_value: dict[str, Any] = {"configOptions": configs()}
+        if mode == "renewed-writer-legacy":
+            response_value = sparse_legacy_catalog(selected_model)
         if mode.startswith("ordered-"):
             response_value = ordered_catalog(selected_model)
         if mode == "invalid-ack-legacy":
@@ -268,7 +368,60 @@ for line in sys.stdin:
         if method == "session/new":
             response_value["sessionId"] = native_id
         result(request_id, response_value)
+    elif method == "session/set_config_option" and mode.startswith("ownership-coupled-"):
+        if params["configId"] == "model selector" and not recovered:
+            coupled_change(request_id)
+        else:
+            if params["configId"] == "coupled mode":
+                selected_mode = params["value"]
+            result(request_id, coupled_catalog())
+    elif method == "session/set_model" and mode.startswith("ownership-coupled-"):
+        if not recovered:
+            coupled_change(request_id)
+        else:
+            assert params["modelId"] == selected_model
+            result(request_id, coupled_catalog())
     elif method == "session/set_config_option":
+        if mode == "ownership-held-control" and os.path.exists(log_path + ".release"):
+            if params["configId"] == "model selector":
+                selected_model = params["value"]
+                selected_effort = " A effort " if selected_model == "default" else " B effort "
+            else:
+                selected_effort = params["value"]
+            result(request_id, {"configOptions": configs()})
+            continue
+        if mode in ("review4-slow-model", "ownership-held-control"):
+            assert params["configId"] == "model selector"
+            if mode == "ownership-held-control":
+                ownership_barrier()
+            requested_model = params["value"]
+            with open(log_path + ".ready", "w", encoding="utf-8") as ready:
+                ready.write("ready")
+            def delayed_model_ack(rid, model_id):
+                global selected_model, selected_effort
+                deadline = time.monotonic() + 10
+                while not os.path.exists(log_path + ".release"):
+                    if time.monotonic() > deadline: os._exit(29)
+                    time.sleep(0.005)
+                selected_model = model_id
+                selected_effort = " B effort "
+                record({"fixture_model_ack": model_id})
+                result(rid, {"configOptions": configs()})
+            threading.Thread(target=delayed_model_ack, args=(request_id, requested_model), daemon=True).start()
+            continue
+        if mode.startswith("review2-"):
+            assert params["configId"] == "opaque mode selector"
+            selected_mode = params["value"]
+            response = {"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": configs()}}
+            if selected_mode == " C mode " and mode in ("review2-before", "review2-after"):
+                notification = {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "current_mode_update", "currentModeId": " D mode "}}}
+                messages = [notification, response] if mode == "review2-before" else [response, notification]
+                if mode == "review2-after": selected_mode = " D mode "
+                record({"fixture_wire": messages})
+                os.write(1, ("\n".join(json.dumps(v) for v in messages) + "\n").encode())
+            else:
+                send(response)
+            continue
         if mode.startswith("ownership-sparse-"):
             assert params["configId"] == "owned effort"
             if recovered:
@@ -320,6 +473,48 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "config_option_update", "configOptions": options}}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "current_mode_update", "currentModeId": "agent"}}})
     elif method == "session/prompt":
+        if mode == "review4-slow-model":
+            record({"fixture_prompt_model": selected_model})
+        if mode == "dynamic-review5-queue":
+            with open(log_path, encoding="utf-8") as recorded:
+                first = sum(json.loads(entry).get("method") == "session/prompt" for entry in recorded) == 1
+            if first:
+                with open(log_path + ".ready", "w", encoding="utf-8") as ready:
+                    ready.write("ready")
+                deadline = time.monotonic() + 10
+                while not os.path.exists(log_path + ".release"):
+                    assert time.monotonic() < deadline, "test did not release first prompt"
+                    time.sleep(0.005)
+        if mode in ("review2-cold", "review2-invalid"):
+            selected_mode = " B mode " if mode == "review2-cold" else " unadvertised mode "
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "current_mode_update", "currentModeId": selected_mode}}})
+            result(request_id, {"stopReason": "end_turn"})
+            continue
+        if mode.startswith("review1-budget-"):
+            thinking = mode.endswith("thought")
+            for _ in range(129):
+                for kind, value in [("agent_thought_chunk" if thinking else "agent_message_chunk", "x" * 131072),
+                                    ("agent_message_chunk" if thinking else "agent_thought_chunk", "boundary")]:
+                    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id,
+                          "update": {"sessionUpdate": kind, "content": {"type": "text", "text": value}}}})
+            result(request_id, {"stopReason": "end_turn"})
+            continue
+        if mode in ("review1-tools", "review1-alternating"):
+            def chunk(kind, value):
+                return {"sessionUpdate": kind, "content": {"type": "text", "text": value}}
+            updates = [chunk("agent_message_chunk", "Before."),
+                       {"sessionUpdate": "tool_call", "toolCallId": "ordered-tool", "title": "Synthetic tool", "rawInput": {}, "status": "in_progress"},
+                       {"sessionUpdate": "tool_call_update", "toolCallId": "ordered-tool", "rawOutput": "result", "status": "completed"},
+                       chunk("agent_message_chunk", "After."),
+                       # An already-known tool ID must not become a new use when
+                       # text segment completion occurs between updates.
+                       {"sessionUpdate": "tool_call", "toolCallId": "ordered-tool", "title": "Synthetic tool", "rawInput": {}, "status": "in_progress"}]
+            if mode == "review1-alternating":
+                updates += [chunk("agent_thought_chunk", "Thought1."), chunk("agent_message_chunk", "Text2."), chunk("agent_thought_chunk", "Thought2.")]
+            for update in updates:
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": update}})
+            result(request_id, {"stopReason": "end_turn"})
+            continue
         if mode == "dynamic-notify-retired":
             selected_model = "vendor:model [1m]"
             selected_effort = " B effort "
@@ -343,8 +538,11 @@ for line in sys.stdin:
             # Same process, wrong session: MUST be cancelled without a UI approval.
             send({"jsonrpc": "2.0", "id": "wrong session", "method": "session/request_permission", "params": {"sessionId": "foreign native ID", "options": options, "toolCall": {"toolCallId": "foreign"}}})
             send({"jsonrpc": "2.0", "id": callback_id, "method": "session/request_permission", "params": {"sessionId": native_id, "options": options, "toolCall": {"toolCallId": "real-tool"}}})
-        elif mode == "hold":
+        elif mode in ("hold", "renewed-prompt-hold"):
             prompt_id = request_id
+            if mode == "renewed-prompt-hold":
+                with open(log_path + ".ready", "w", encoding="utf-8") as ready:
+                    ready.write("complete prompt frame received; ACK waits for cancel")
         else:
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": native_id, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "tail chunk"}}}})
             result(request_id, {"stopReason": "end_turn"})
@@ -359,6 +557,9 @@ for line in sys.stdin:
             ownership_change(request_id, True)
     elif method == "session/set_model" and mode == "ordered-legacy":
         ordered_reply(request_id, params["modelId"])
+    elif method == "session/set_model" and mode == "renewed-writer-legacy":
+        selected_model = params["modelId"]
+        result(request_id, sparse_legacy_catalog(selected_model))
     elif method == "session/set_model" and mode.startswith("final-sparse-"):
         if params["modelId"] == "vendor:model [1m]":
             acknowledgement = {}
@@ -383,7 +584,7 @@ for line in sys.stdin:
     elif method == "session/cancel":
         # Permission-mode fixture deliberately does NOT settle from cancel alone:
         # client must immediately answer its pending permission callback.
-        if mode == "hold" and prompt_id is not None:
+        if mode in ("hold", "renewed-prompt-hold") and prompt_id is not None:
             result(prompt_id, {"stopReason": "cancelled"})
             prompt_id = None
     elif method == "session/close":

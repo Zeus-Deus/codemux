@@ -75,12 +75,18 @@ impl DatabaseStore {
             if count >= 64 { return Err("At most 64 custom ACP agents may be configured.".into()); }
         }
         let old_agent = previous.as_ref().map(|(raw, _)| decode_definition(raw)).transpose()?;
-        let old_environment = previous.as_ref().map(|(_, raw)| decode_environment(raw)).transpose()?.unwrap_or_default();
+        let old_environment = match previous.as_ref().map(|(_, raw)| decode_environment(raw)).transpose() {
+            Ok(value) => value,
+            Err(error) if input.environment.values().any(Option::is_none) => return Err(error),
+            // Complete replacement/removal needs no old values. Unknown launch
+            // equivalence deliberately rotates the revision below.
+            Err(_) => None,
+        };
         let mut environment = HashMap::new();
         for (name, value) in &input.environment {
             let value = match value {
                 Some(value) => value.clone(),
-                None => old_environment.get(name).cloned().ok_or_else(|| "Cannot retain an environment variable that was not previously saved.".to_string())?,
+                None => old_environment.as_ref().and_then(|old| old.get(name)).cloned().ok_or_else(|| "Cannot retain an environment variable that was not previously saved.".to_string())?,
             };
             environment.insert(name.clone(), value);
         }
@@ -91,7 +97,7 @@ impl DatabaseStore {
             enabled: input.enabled, auth_method: input.auth_method.clone(),
         }.validate()?;
         let launch_unchanged = old_agent.as_ref().is_some_and(|old| {
-            old.executable == input.executable && old.args == input.args && old.auth_method == input.auth_method && old_environment == environment
+            old.executable == input.executable && old.args == input.args && old.auth_method == input.auth_method && old_environment.as_ref() == Some(&environment)
         });
         let agent = AcpAgent {
             id: input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -228,6 +234,43 @@ mod tests {
         let mut edit = input(); edit.id = Some(old.id.clone());
         assert!(db.save_acp_agent(edit).is_err());
         assert!(db.acp_launch_config(&old.id).is_err());
+    }
+    #[test]
+    fn review7_full_replacement_repairs_unreadable_environment_without_rebinding() {
+        for invalid_json in [false, true] {
+            for clear in [false, true] {
+                let db = init_test_database();
+                let old = db.save_acp_agent(input()).unwrap();
+                let binding = AcpBinding { thread_id: "repair-thread".into(), agent_id: old.id.clone(), revision: old.revision.clone(), cwd: "unused".into(), session_id: Some("native".into()), catalog: crate::agent_provider::custom_acp::catalog::catalog_from(&old.id, "repair", &Default::default(), &serde_json::json!({})).unwrap(), config_values: HashMap::new() };
+                db.save_acp_binding(&binding).unwrap();
+                let corrupt = if invalid_json { crate::auth::encrypt_data(b"not JSON").unwrap() } else { b"unreadable ciphertext".to_vec() };
+                db.conn.lock().unwrap().execute("UPDATE custom_acp_agents SET environment=?2 WHERE id=?1", params![old.id, corrupt]).unwrap();
+                let mut edit = input(); edit.id = Some(old.id.clone());
+                edit.environment = if clear { BTreeMap::new() } else { [("PUBLIC_SETTING".into(), Some("replacement".into()))].into() };
+                let repaired = db.save_acp_agent(edit);
+                assert!(repaired.is_ok(), "complete replacement needs no old secret: {:?}", repaired.as_ref().err());
+                let repaired = repaired.unwrap();
+                assert_eq!(repaired.id, old.id);
+                assert_ne!(repaired.revision, old.revision, "unknown launch equivalence must rotate revision");
+                let launch = db.acp_launch_config(&old.id).unwrap();
+                assert_eq!(launch.environment.len(), usize::from(!clear));
+                if !clear { assert_eq!(launch.environment["PUBLIC_SETTING"], "replacement"); }
+                assert_eq!(serde_json::to_value(db.acp_binding("repair-thread").unwrap().unwrap()).unwrap(), serde_json::to_value(binding).unwrap());
+                assert!(!serde_json::to_string(&db.acp_agents().unwrap()).unwrap().contains("replacement"));
+            }
+        }
+    }
+    #[test]
+    fn review7_retaining_unreadable_secret_rejects_without_mutation() {
+        let db = init_test_database(); let old = db.save_acp_agent(input()).unwrap();
+        db.conn.lock().unwrap().execute("UPDATE custom_acp_agents SET environment=?2 WHERE id=?1", params![old.id, b"unreadable ciphertext".to_vec()]).unwrap();
+        let before: (String, Vec<u8>) = db.conn.lock().unwrap().query_row("SELECT definition,environment FROM custom_acp_agents WHERE id=?1", [&old.id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let mut edit = input(); edit.id = Some(old.id.clone()); edit.environment.insert("TOKEN".into(), None);
+        let error = db.save_acp_agent(edit).err().expect("retaining unreadable secret must reject");
+        assert!(error.contains("cannot be decrypted"));
+        let after: (String, Vec<u8>) = db.conn.lock().unwrap().query_row("SELECT definition,environment FROM custom_acp_agents WHERE id=?1", [&old.id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(before, after);
+        assert!(!error.contains("synthetic-secret"));
     }
     #[test]
     fn acp_disabled_instances_cannot_launch() {

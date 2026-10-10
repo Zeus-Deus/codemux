@@ -767,12 +767,8 @@ pub async fn agent_chat_start_session<R: Runtime>(
         if binding.as_ref().is_some_and(|binding| selected.is_some_and(|id| id != binding.agent_id)) {
             return Err("This chat is bound to another ACP instance. Start a new chat to change the harness.".into());
         }
-        let id = binding.as_ref().map(|binding| binding.agent_id.as_str()).or(selected)
+        binding.as_ref().map(|binding| binding.agent_id.as_str()).or(selected)
             .ok_or_else(|| "Select a custom ACP agent before starting this chat.".to_string())?;
-        let config = db.acp_launch_config(id)?;
-        if binding.as_ref().is_some_and(|binding| binding.revision != config.agent.revision) {
-            return Err("This ACP launch configuration changed. Restore it or start a new chat; the existing conversation will not be replaced.".into());
-        }
         // Persistent instance configuration owns the launch environment;
         // only the host-owned workspace overlay may vary per conversation.
         input.env = None;
@@ -933,7 +929,28 @@ pub async fn agent_chat_start_session<R: Runtime>(
             })
     };
     if pane_already_runs_thread && impl_.has_session(&input.thread_id).await {
+        if provider == ProviderKind::Acp {
+            let acp: State<'_, Arc<crate::agent_provider::custom_acp::GenericAcpProvider>> = app.state();
+            let db: State<'_, DatabaseStore> = app.state();
+            let exact_cwd = db.acp_binding(&input.thread_id.0)?.is_some_and(|b| b.cwd == input.cwd.to_string_lossy());
+            if !exact_cwd || acp.live_catalog(&input.thread_id).await.is_none() {
+                return Err("The live ACP process does not match this durable workspace binding.".into());
+            }
+        }
         return Ok(input.thread_id);
+    }
+    // Launch eligibility belongs only to new/rebuilt processes. A live child
+    // deliberately keeps its admitted revision even after definition edits.
+    if provider == ProviderKind::Acp {
+        let db: State<'_, DatabaseStore> = app.state();
+        let binding = db.acp_binding(&input.thread_id.0)?;
+        let selected = input.extra.get("acp_agent_id").and_then(serde_json::Value::as_str);
+        let id = binding.as_ref().map(|b| b.agent_id.as_str()).or(selected)
+            .ok_or_else(|| "Select a custom ACP agent before starting this chat.".to_string())?;
+        let config = db.acp_launch_config(id)?;
+        if binding.as_ref().is_some_and(|b| b.revision != config.agent.revision) {
+            return Err("This ACP launch configuration changed. Restore it or start a new chat; the existing conversation will not be replaced.".into());
+        }
     }
     // Claim the pane BEFORE anything spawns. Desktop and remote clients
     // share one backend, so between "create pane" and "start session" a

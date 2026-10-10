@@ -48,6 +48,7 @@ import {
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
 import { useAppStore } from "@/stores/app-store";
 import { useCustomAcpThread } from "@/hooks/use-custom-acp-thread";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 import { isChatModeSupported } from "@/lib/agent-chat/mode-compatibility";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
@@ -2686,6 +2687,9 @@ export function Composer({
     [],
   );
   const submit = useCallback((background = false) => {
+    // Read admission synchronously: a picker click may precede React's
+    // subscribed busy-state commit in the same event batch.
+    if (provider === "acp" && threadId && useCustomAcp.getState().busy[threadId]) return;
     if (remoteDisconnected || (provider === "acp" && (!acp.ready || acp.busy || !customAgentsAllowed || unsupportedAcpImages))) return;
     const action = allSlashItems.find((item) => item.id.startsWith("composer:") && item.command.toLowerCase() === draft.trim().toLowerCase());
     if (action) {
@@ -2711,7 +2715,7 @@ export function Composer({
     }, SEND_HOLD_MS);
     if (background && onBackgroundSubmit) onBackgroundSubmit();
     else onSubmit();
-  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems, provider, acp.ready, acp.busy, customAgentsAllowed, unsupportedAcpImages]);
+  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems, provider, threadId, acp.ready, acp.busy, customAgentsAllowed, unsupportedAcpImages]);
 
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's

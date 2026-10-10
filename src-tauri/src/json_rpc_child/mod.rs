@@ -166,6 +166,8 @@ pub enum RpcChildError {
     RpcError(RpcError),
     /// The handle has already been shut down.
     AlreadyShutdown,
+    /// The opt-in caller withdrew authority before any request byte was written.
+    CancelledBeforeWrite,
 }
 
 impl std::fmt::Display for RpcChildError {
@@ -195,6 +197,7 @@ impl std::fmt::Display for RpcChildError {
             Self::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
             Self::RpcError(err) => write!(f, "{err}"),
             Self::AlreadyShutdown => write!(f, "rpc child has already been shut down"),
+            Self::CancelledBeforeWrite => write!(f, "request cancelled before writing"),
         }
     }
 }
@@ -281,12 +284,38 @@ struct ExitInfo {
     stderr_tail: String,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CallbackWriteGate {
+    pub held: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub request_waiting: tokio::sync::Notify,
+    pub cancel_waiting: tokio::sync::Notify,
+}
+
+/// Scheduling only: park one actual prompt after the writer owner releases,
+/// but before admission. No turn flags or transport results are synthesized.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PromptWriteGate {
+    pub request_waiting: tokio::sync::Notify,
+    pub held: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub partial: bool,
+    pub partial_written: tokio::sync::Notify,
+    pub finish_frame: tokio::sync::Notify,
+}
+
 /// Handle to a running JSON-RPC child.
 ///
 /// Cheaply shareable — all internal state is `Arc`-guarded — so adapters can
 /// wrap the handle in an `Arc` and hand it to background tasks freely.
 pub struct JsonRpcChild {
     writer: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
+    #[cfg(test)]
+    pub(crate) callback_write_gate: Mutex<Option<(Value, Arc<CallbackWriteGate>)>>,
+    #[cfg(test)]
+    pub(crate) prompt_write_gate: Mutex<Option<Arc<PromptWriteGate>>>,
     #[cfg(test)]
     pub(crate) reader_gate: Arc<tokio::sync::Mutex<()>>,
     pending: Arc<Mutex<PendingMap>>,
@@ -587,6 +616,10 @@ impl JsonRpcChild {
             exit_info,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            callback_write_gate: Mutex::new(None),
+            #[cfg(test)]
+            prompt_write_gate: Mutex::new(None),
         })
     }
 
@@ -615,6 +648,16 @@ impl JsonRpcChild {
         params: Value,
         timeout: Duration,
     ) -> Result<(Value, u64), RpcChildError> {
+        self.request_with_sequence_guarded(method, params, timeout, || async { true }).await
+    }
+
+    /// Opt-in authority check under the acquired writer, before the first byte.
+    /// Once admitted, retain the ordinary owned write/response future: cancellation
+    /// must not abandon a partially written frame or its ACK settlement.
+    pub(crate) async fn request_with_sequence_guarded<G, F>(
+        &self, method: &str, params: Value, timeout: Duration, admit: G,
+    ) -> Result<(Value, u64), RpcChildError>
+    where G: FnOnce() -> F, F: std::future::Future<Output = bool> {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(self.exit_or_shutdown());
         }
@@ -639,7 +682,7 @@ impl JsonRpcChild {
             "method": method,
             "params": params,
         });
-        if let Err(err) = self.write_line(&request).await {
+        if let Err(err) = self.write_line_guarded(&request, admit).await {
             // Roll back the pending entry so it does not leak.
             if let Ok(mut map) = self.pending.lock() {
                 map.remove(id);
@@ -760,12 +803,55 @@ impl JsonRpcChild {
     }
 
     async fn write_line(&self, value: &Value) -> Result<(), RpcChildError> {
+        self.write_line_guarded(value, || async { true }).await
+    }
+    async fn write_line_guarded<G, F>(&self, value: &Value, admit: G) -> Result<(), RpcChildError>
+    where G: FnOnce() -> F, F: std::future::Future<Output = bool> {
+        #[cfg(test)]
+        let schedule = self.callback_write_gate.lock().unwrap().clone();
+        #[cfg(test)]
+        let prompt_schedule = if value["method"] == "session/prompt" {
+            self.prompt_write_gate.lock().unwrap().take()
+        } else { None };
+        #[cfg(test)]
+        if let Some(gate) = &prompt_schedule { gate.request_waiting.notify_one(); }
+        #[cfg(test)]
+        if let Some((_, gate)) = &schedule {
+            if matches!(value["method"].as_str(), Some("session/set_config_option" | "session/set_model")) {
+                gate.request_waiting.notify_one();
+            }
+            if value["method"] == "session/cancel" { gate.cancel_waiting.notify_one(); }
+        }
         let mut guard = self.writer.lock().await;
+        #[cfg(test)]
+        if let Some(gate) = &prompt_schedule {
+            gate.held.notify_one();
+            gate.release.notified().await;
+        }
+        #[cfg(test)]
+        if let Some((id, gate)) = schedule {
+            if value.get("method").is_none() && value["id"] == id {
+                gate.held.notify_one();
+                gate.release.notified().await;
+            }
+        }
         let writer = guard.as_mut().ok_or(RpcChildError::AlreadyShutdown)?;
         let mut line = serde_json::to_vec(value).map_err(|err| {
             RpcChildError::ProtocolError(format!("failed to encode outgoing message: {err}"))
         })?;
         line.push(b'\n');
+        if !admit().await { return Err(RpcChildError::CancelledBeforeWrite); }
+        #[cfg(test)]
+        if let Some(gate) = &prompt_schedule {
+            if gate.partial {
+                // A real prefix of the owned frame reaches ChildStdin. Park
+                // only scheduling, retaining the same writer and request.
+                writer.write_all(&line[..1]).await.map_err(RpcChildError::IoError)?;
+                gate.partial_written.notify_one();
+                gate.finish_frame.notified().await;
+                line.drain(..1);
+            }
+        }
         writer.write_all(&line).await.map_err(RpcChildError::IoError)?;
         writer.flush().await.map_err(RpcChildError::IoError)?;
         Ok(())
@@ -784,6 +870,91 @@ impl JsonRpcChild {
             }
         }
         RpcChildError::AlreadyShutdown
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/helpers/custom_acp_python.rs"]
+mod test_python;
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use serde_json::json;
+    async fn peer(strict: bool, pause_read: bool) -> (JsonRpcChild, tempfile::TempDir, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SpawnConfig {
+            program: test_python::executable().into(),
+            args: vec!["-I".into(), "-u".into(), "-c".into(), r#"import json,os,sys,time
+print(json.dumps({'jsonrpc':'2.0','method':'ready','params':{'pid':os.getpid()}}),flush=True)
+if sys.argv[1]=='pause':
+    deadline=time.monotonic()+10
+    while not os.path.exists('read') and time.monotonic()<deadline: time.sleep(.005)
+for line in sys.stdin:
+    q=json.loads(line)
+    print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':{'bytes':len(q['params'].get('text',''))}}),flush=True)
+"#.into(), if pause_read { "pause" } else { "read" }.into()],
+            cwd: Some(dir.path().to_owned()),
+            env: HashMap::from([("HOME".into(),dir.path().to_string_lossy().into_owned()),("TMPDIR".into(),dir.path().to_string_lossy().into_owned())]),
+            default_timeout: Duration::from_secs(4),
+        };
+        let child = if strict { JsonRpcChild::spawn_strict(config).await } else { JsonRpcChild::spawn(config).await }.unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(2), child.notifications().recv()).await.unwrap().unwrap();
+        (child, dir, ready.params["pid"].as_u64().unwrap())
+    }
+    fn reaped(pid: u64) {
+        #[cfg(target_os = "linux")]
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+    async fn writer_admission(strict: bool) {
+        let (child, _dir, pid) = peer(strict, false).await;
+        let writer = child.writer.lock().await;
+        let admitted = AtomicBool::new(true);
+        let request = child.request_with_sequence_guarded("guarded", json!({}), Duration::from_secs(4), || async { admitted.load(Ordering::SeqCst) });
+        tokio::pin!(request);
+        assert!(futures_util::poll!(&mut request).is_pending());
+        assert_eq!(child.pending.lock().unwrap().inner.len(), 1);
+        admitted.store(false, Ordering::SeqCst);
+        drop(writer);
+        let denied = request.await;
+        assert!(matches!(denied, Err(RpcChildError::CancelledBeforeWrite)));
+        assert!(child.pending.lock().unwrap().inner.is_empty(), "denied request must release exact correlation ID");
+        assert!(child.transport_failures().borrow().is_none(), "local admission denial is not transport health");
+        // Ordinary built-ins ignore the unrelated revoked authority and still
+        // write/settle with their original numeric correlation, on either mode.
+        let default = child.request("default", json!({"text":"ok"})).await.unwrap();
+        assert_eq!(default["bytes"], json!(2));
+        let accepted = child.request_with_sequence_guarded("accepted", json!({"text":"yes"}), Duration::from_secs(4), || async { true }).await.unwrap();
+        assert_eq!(accepted.0["bytes"], json!(3));
+        assert!(child.pending.lock().unwrap().inner.is_empty());
+        child.shutdown().await.unwrap();
+        reaped(pid);
+    }
+    #[tokio::test]
+    async fn renewed_guarded_denial_leaves_tolerant_default_requests_unchanged() { writer_admission(false).await; }
+    #[tokio::test]
+    async fn renewed_guarded_denial_leaves_strict_default_requests_unchanged() { writer_admission(true).await; }
+    #[tokio::test]
+    async fn renewed_guarded_partial_write_keeps_owned_frame_after_revocation() {
+        let (child, dir, pid) = peer(true, true).await;
+        let admitted = AtomicBool::new(true);
+        let checked = AtomicBool::new(false);
+        let request = child.request_with_sequence_guarded("large", json!({"text":"x".repeat(4 * 1024 * 1024)}), Duration::from_secs(4), || async {
+            checked.store(true, Ordering::SeqCst);
+            admitted.load(Ordering::SeqCst)
+        });
+        tokio::pin!(request);
+        assert!(futures_util::poll!(&mut request).is_pending(), "actual nonreading stdin must block the owned frame");
+        assert!(checked.load(Ordering::SeqCst));
+        assert!(child.writer.try_lock().is_err(), "frame already owns writer, not merely its queue");
+        admitted.store(false, Ordering::SeqCst);
+        std::fs::write(dir.path().join("read"), b"release").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(4), request).await.unwrap().unwrap();
+        assert_eq!(result.0["bytes"], json!(4 * 1024 * 1024), "revocation after admission must retain whole frame and ACK");
+        assert!(child.pending.lock().unwrap().inner.is_empty());
+        child.shutdown().await.unwrap();
+        reaped(pid);
     }
 }
 
