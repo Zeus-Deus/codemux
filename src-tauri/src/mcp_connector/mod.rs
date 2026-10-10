@@ -173,7 +173,7 @@ pub fn validate_caller<R: Runtime>(
                 "Grant is expired, revoked or bound to another resource",
             )
         })?;
-    if caller.principal != format!("mcp:{id}")
+    if caller.principal != format!("mcp-client:{}", grant.client_id)
         || parse_access(&grant.access).map_err(|e| ControlError::new("invalid_grant", e))?
             != caller.access
     {
@@ -544,7 +544,7 @@ mod tests {
         assert!(validate_caller(app.handle(), &ControlCaller::trusted()).is_ok());
         assert!(validate_caller(
             app.handle(),
-            &ControlCaller::outside("missing".into(), ControlAccess::ReadOnly)
+            &ControlCaller::outside("missing-client".into(), "missing".into(), ControlAccess::ReadOnly)
         )
         .is_err());
         for origin in [

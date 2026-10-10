@@ -295,22 +295,25 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
         json!({"request_id":request.outside_handle,"turn_id":request.turn_id,"request_kind":request.request_kind})
     ).collect()).unwrap_or_default();
     let queued = observed.as_ref().map(|view|view.queued_ids.clone()).unwrap_or_default();
-    let busy = active || !pending.is_empty() || !queued.is_empty()
+    let uncertain_queued = app.state::<DatabaseStore>().control_unresolved_queued_ids(&target.thread_id)?
+        .into_iter().filter(|id| !runtime_live || !queued.contains(id)).collect::<Vec<_>>();
+    let busy = active || !pending.is_empty() || !queued.is_empty() || !uncertain_queued.is_empty()
         || observed.as_ref().is_some_and(|view|matches!(view.phase.as_str(),"starting"|"running"|"waiting_approval"));
     let phase = if !pending.is_empty() { "waiting_approval" }
+    else if !uncertain_queued.is_empty() && !active && queued.is_empty() { "needs_attention" }
     else if let Some(view) = observed.as_ref().filter(|view|view.phase != "unknown") { view.phase.as_str() }
     else if active { "running" } else if let Some(event) = terminal {
-        match event["status"]["kind"].as_str() { Some("success") => "completed", Some("interrupted") => "interrupted", _ => "error" }
+        super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).0
     } else if runtime_live { "ready" } else { "unknown" };
     let last_turn = observed.as_ref().and_then(|view|view.last_turn.clone()).or_else(||terminal.map(|event|
-        json!({"type":"turn_completed","turn_id":event["turn_id"],"status":{"kind":event["status"]["kind"]}})));
+        json!({"type":"turn_completed","turn_id":event["turn_id"],"status":{"kind":super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1}})));
     let settled = !busy && matches!(phase,"completed"|"interrupted"|"error") && last_turn.is_some();
     let turn_id = observed.as_ref().and_then(|view|view.turn_id.clone()).or_else(||terminal.and_then(|event|event["turn_id"].as_str().map(str::to_owned)));
     Ok(json!({
         "workspace_id":target.workspace_id,"thread_id":target.thread_id,"provider":provider,
         "pane_id":app.state::<AppStateStore>().agent_chat_pane_id_for_thread(&record.thread_id),
         "runtime_live":runtime_live,"phase":phase,"settled":settled,
-        "turn_id":turn_id,"pending_approvals":pending,"queued_ids":queued,"last_turn":last_turn,
+        "turn_id":turn_id,"pending_approvals":pending,"queued_ids":queued,"uncertain_queued_ids":uncertain_queued,"last_turn":last_turn,
         "imported_snapshot":record.imported_from.is_some(),
     }))
 }
@@ -503,7 +506,7 @@ pub(crate) async fn thread_wait<R: Runtime>(app: &AppHandle<R>, caller: &Control
             ),
         };
         if settled || tokio::time::Instant::now() >= deadline {
-            let selected_turn = selected.map(|event|json!({"turn_id":event["turn_id"],"outcome":event["status"]["kind"]}));
+            let selected_turn = selected.map(|event|json!({"turn_id":event["turn_id"],"outcome":super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1}));
             return Ok(json!({"timed_out":!settled,"settled":settled,"status":status,"selected_turn":selected_turn}));
         }
         tokio::time::sleep_until((tokio::time::Instant::now()+std::time::Duration::from_millis(100)).min(deadline)).await;

@@ -4,6 +4,8 @@ use rusqlite::{params, OptionalExtension};
 
 pub const MAX_CLIENTS: i64 = 256;
 pub const UNAPPROVED_CLIENT_TTL_MS: i64 = 600_000;
+// Registration metadata survives short-lived tokens, but is not bearer authority.
+pub const APPROVED_CLIENT_RETENTION_MS: i64 = 7 * 86_400_000;
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_mcp_config (
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -13,7 +15,8 @@ CREATE TABLE IF NOT EXISTS agent_mcp_clients (
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL,
     redirects_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    approved_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS agent_mcp_grants (
     id TEXT PRIMARY KEY NOT NULL,
@@ -73,13 +76,56 @@ fn grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpGrant> {
 }
 const GRANT_SELECT: &str = "SELECT g.id,g.client_id,c.name,g.redirect_uri,g.resource,g.access,g.created_at,g.expires_at FROM agent_mcp_grants g JOIN agent_mcp_clients c ON c.id=g.client_id";
 
+pub(super) fn migrate(conn: &rusqlite::Connection) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    let has_marker: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_mcp_clients') WHERE name='approved_at')",
+        [], |r| r.get(0),
+    ).map_err(|e| e.to_string())?;
+    if !has_marker {
+        tx.execute(
+            "ALTER TABLE agent_mcp_clients ADD COLUMN approved_at INTEGER",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        // Only a persisted grant proves earlier owner consent. Preserve its
+        // historical time; never invent approval for anonymous registrations.
+        tx.execute("UPDATE agent_mcp_clients SET approved_at=(SELECT MAX(g.created_at) FROM agent_mcp_grants g WHERE g.client_id=agent_mcp_clients.id)", [])
+            .map_err(|e| e.to_string())?;
+    }
+    // Preserve only legacy receipt owners that still have an exact persisted
+    // grant-to-registration mapping and no competing receipt for the stable key.
+    // Missing mappings/collisions stay untouched; never guess or merge receipts.
+    tx.execute(
+        "UPDATE agent_control_operations SET principal=(
+            SELECT 'mcp-client:' || g.client_id FROM agent_mcp_grants g
+            WHERE agent_control_operations.principal='mcp:' || g.id
+         ) WHERE id IN (
+            SELECT o.id FROM agent_control_operations o JOIN agent_mcp_grants g
+                ON o.principal='mcp:' || g.id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agent_control_operations sibling
+                WHERE sibling.id<>o.id AND sibling.request_key=o.request_key
+                  AND (sibling.principal='mcp-client:' || g.client_id
+                    OR sibling.principal IN (
+                        SELECT 'mcp:' || peer.id FROM agent_mcp_grants peer
+                        WHERE peer.client_id=g.client_id
+                    ))
+            )
+         )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
 fn prune_clients(conn: &rusqlite::Connection, now: i64, protected: &str) -> Result<(), String> {
     conn.execute(
         "DELETE FROM agent_mcp_grants WHERE revoked=1 OR expires_at<=?1",
         [now],
     )
     .map_err(|_| "MCP pruning failed")?;
-    conn.execute("DELETE FROM agent_mcp_clients WHERE created_at<=?1 AND id NOT IN (SELECT value FROM json_each(?2)) AND NOT EXISTS(SELECT 1 FROM agent_mcp_grants g WHERE g.client_id=agent_mcp_clients.id)", params![now.saturating_sub(UNAPPROVED_CLIENT_TTL_MS), protected])
+    conn.execute("DELETE FROM agent_mcp_clients WHERE ((approved_at IS NULL AND created_at<=?1) OR approved_at<=?3) AND id NOT IN (SELECT value FROM json_each(?2)) AND NOT EXISTS(SELECT 1 FROM agent_mcp_grants g WHERE g.client_id=agent_mcp_clients.id)", params![now.saturating_sub(UNAPPROVED_CLIENT_TTL_MS), protected, now.saturating_sub(APPROVED_CLIENT_RETENTION_MS)])
         .map_err(|_| "MCP pruning failed")?;
     Ok(())
 }
@@ -140,8 +186,8 @@ impl DatabaseStore {
             .map_err(|_| "Client registration failed")?;
         if count >= MAX_CLIENTS {
             // Recover from an unauthenticated registration flood without
-            // displacing a client with a live grant. Admission stays bounded.
-            let removed = tx.execute("DELETE FROM agent_mcp_clients WHERE id=(SELECT c.id FROM agent_mcp_clients c WHERE NOT EXISTS(SELECT 1 FROM agent_mcp_grants g WHERE g.client_id=c.id) AND c.id NOT IN (SELECT value FROM json_each(?1)) ORDER BY c.created_at,c.id LIMIT 1)", [&protected])
+            // displacing a retained approved client. Admission stays bounded.
+            let removed = tx.execute("DELETE FROM agent_mcp_clients WHERE id=(SELECT c.id FROM agent_mcp_clients c WHERE c.approved_at IS NULL AND NOT EXISTS(SELECT 1 FROM agent_mcp_grants g WHERE g.client_id=c.id) AND c.id NOT IN (SELECT value FROM json_each(?1)) ORDER BY c.created_at,c.id LIMIT 1)", [&protected])
                 .map_err(|_| "Client registration failed")?;
             if removed == 0 {
                 return Err("Client registration limit reached".into());
@@ -198,6 +244,8 @@ impl DatabaseStore {
         )
         .map_err(|_| "Grant persistence failed")?;
         tx.execute("INSERT INTO agent_mcp_grants(id,client_id,token_hash,redirect_uri,resource,access,created_at,expires_at,revoked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",params![grant.id,grant.client_id,grant.token_hash,grant.redirect_uri,grant.resource,grant.access,grant.created_at,grant.expires_at]).map_err(|_|"Grant persistence failed".to_string())?;
+        tx.execute("UPDATE agent_mcp_clients SET approved_at=?2 WHERE id=?1", params![grant.client_id, grant.created_at])
+            .map_err(|_| "Grant persistence failed")?;
         // No tombstone is required for an opaque grant: absence fails closed.
         tx.execute(
             "DELETE FROM agent_mcp_grants WHERE revoked=1 OR expires_at<=?1",
@@ -291,6 +339,48 @@ mod tests {
             created_at: 1,
             expires_at: 100,
         }
+    }
+    #[test]
+    fn mario_r5_approved_retention_is_independent_bounded_and_not_bearer_authority() {
+        let db = db();
+        db.mcp_register_client(client("client"), 0).unwrap();
+        let mut approved = grant("hour", "synthetic-hour-token");
+        approved.expires_at = 3_600_001;
+        db.mcp_mint_grant(approved).unwrap();
+        let expired = 3_600_002;
+        db.mcp_prune_clients(expired, &[]).unwrap();
+        assert!(
+            db.mcp_client("client").unwrap().is_some(),
+            "Token expiry must not delete a recently approved cached registration"
+        );
+        assert!(db
+            .mcp_grant("hour", "https://mcp.example/mcp", expired)
+            .unwrap()
+            .is_none());
+        assert!(db.mcp_list_grants(expired).unwrap().is_empty());
+        for i in 1..MAX_CLIENTS {
+            let mut spam = client(&format!("spam-{i:03}"));
+            spam.created_at = expired;
+            db.mcp_register_client(spam, expired).unwrap();
+        }
+        let mut extra = client("overflow");
+        extra.created_at = expired;
+        db.mcp_register_client(extra, expired).unwrap();
+        assert!(
+            db.mcp_client("client").unwrap().is_some(),
+            "Anonymous registration pressure must not evict an approved client inside retention"
+        );
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_mcp_clients", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, MAX_CLIENTS);
+        // Seven days since the last successful owner-approved mint, not infinity.
+        db.mcp_prune_clients(1 + 7 * 86_400_000, &[]).unwrap();
+        assert!(db.mcp_client("client").unwrap().is_none());
+        assert!(db.mcp_client("overflow").unwrap().is_none());
     }
     #[test]
     fn client_collision_never_overwrites_registered_metadata() {

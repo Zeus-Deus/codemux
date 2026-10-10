@@ -21,8 +21,10 @@ impl ControlCaller {
         Self { principal: "local".into(), access: ControlAccess::FullAccess, grant_id: None }
     }
 
-    pub fn outside(grant_id: String, access: ControlAccess) -> Self {
-        Self { principal: format!("mcp:{grant_id}"), access, grant_id: Some(grant_id) }
+    /// Receipt ownership is the authenticated registration, while every action
+    /// remains bound to the particular (replaceable/revocable) grant.
+    pub fn outside(client_id: String, grant_id: String, access: ControlAccess) -> Self {
+        Self { principal: format!("mcp-client:{client_id}"), access, grant_id: Some(grant_id) }
     }
 }
 

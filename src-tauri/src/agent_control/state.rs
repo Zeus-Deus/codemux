@@ -71,6 +71,18 @@ impl Default for ThreadRuntimeView {
         }
     }
 }
+/// Safe logical outcome shared by live observations and serialized history.
+/// Do not expose provider diagnostic messages in status or wait results.
+pub(crate) fn turn_outcome(kind: Option<&str>, subtype: Option<&str>) -> (&'static str, &'static str) {
+    match (kind, subtype) {
+        (Some("success"), _) => ("completed", "success"),
+        (Some("interrupted"), _) | (Some("error"), Some("interrupted")) => ("interrupted", "interrupted"),
+        (Some("max_turns"), _) => ("error", "max_turns"),
+        (Some("max_budget"), _) => ("error", "max_budget"),
+        _ => ("error", "error"),
+    }
+}
+
 const MAX_RUNTIME_THREADS: usize = 1024;
 const RECENT_IDS: usize = 256;
 struct RuntimeEntry {
@@ -319,12 +331,19 @@ impl NativeControlState {
                 request_id,
                 request_kind,
                 payload,
+                subagent_id,
                 ..
             } => {
                 if entry.completed_turns.contains(&turn_id.0) {
                     return;
                 }
-                remember(&mut entry.seen_turns, &turn_id.0);
+                // Callback turn IDs can belong to delegated work (or be
+                // empty). Only an early, unlabelled single-owner callback
+                // may establish the parent identity before its send ACK.
+                if entry.view.turn_id.is_none() && subagent_id.is_none() && !turn_id.0.is_empty() {
+                    remember(&mut entry.seen_turns, &turn_id.0);
+                    entry.view.turn_id = Some(turn_id.0.clone());
+                }
                 if !entry
                     .view
                     .pending_approvals
@@ -346,7 +365,6 @@ impl NativeControlState {
                         request_kind: request_kind.clone(),
                     });
                 }
-                entry.view.turn_id = Some(turn_id.0.clone());
                 entry.view.phase = "waiting_approval".into();
             }
             ProviderRuntimeEvent::RequestResolved { request_id, .. }
@@ -357,12 +375,15 @@ impl NativeControlState {
                     .retain(|p| p.request_id != request_id.0);
                 if entry.view.pending_approvals.is_empty() && entry.view.phase == "waiting_approval"
                 {
-                    entry.view.phase = if entry.view.turn_id.is_some() {
+                    entry.view.phase = if let Some(last) = entry.view.last_turn.as_ref().filter(|last| {
+                        entry.view.turn_id.as_deref().is_some_and(|parent| last["turn_id"] == parent)
+                    }) {
+                        turn_outcome(last["status"]["kind"].as_str(), last["status"]["subtype"].as_str()).0
+                    } else if entry.view.turn_id.is_some() {
                         "running"
                     } else {
                         "ready"
-                    }
-                    .into();
+                    }.into();
                 }
             }
             ProviderRuntimeEvent::TurnCompleted {
@@ -373,15 +394,13 @@ impl NativeControlState {
                 }
                 remember(&mut entry.completed_turns, &turn_id.0);
                 remember(&mut entry.seen_turns, &turn_id.0);
-                let (phase, kind) = match status {
-                    TurnStatus::Success => ("completed", "success"),
-                    TurnStatus::Error { subtype, .. } if subtype == "interrupted" => {
-                        ("interrupted", "interrupted")
-                    }
-                    TurnStatus::Error { .. } => ("error", "error"),
-                    TurnStatus::MaxTurns => ("error", "max_turns"),
-                    TurnStatus::MaxBudget => ("error", "max_budget"),
+                let (kind, subtype) = match status {
+                    TurnStatus::Success => ("success", None),
+                    TurnStatus::Error { subtype, .. } => ("error", Some(subtype.as_str())),
+                    TurnStatus::MaxTurns => ("max_turns", None),
+                    TurnStatus::MaxBudget => ("max_budget", None),
                 };
+                let (phase, kind) = turn_outcome(Some(kind), subtype);
                 entry.view.last_turn = Some(
                     json!({"type":"turn_completed","turn_id":turn_id.0,"status":{"kind":kind}}),
                 );
@@ -504,7 +523,7 @@ impl NativeControlState {
         {
             remember(&mut entry.seen_turns, &result.turn_id.0);
             entry.view.turn_id = Some(result.turn_id.0.clone());
-            entry.view.phase = "running".into();
+            entry.view.phase = if entry.view.pending_approvals.is_empty() { "running" } else { "waiting_approval" }.into();
         }
     }
 }

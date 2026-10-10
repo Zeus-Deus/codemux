@@ -2953,6 +2953,11 @@ async fn send_turn_internal<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
+    if let Some(queued_id) = &result.queued_id {
+        // Do not acknowledge queued acceptance without durable evidence.
+        // The event bridge may lag, or dispatch/cancellation may beat this ACK.
+        db.control_record_queue_admission(&input.thread_id.0, queued_id)?;
+    }
     if let Some(state) = app.try_state::<NativeControlState>() {
         state.record_accepted_turn(&input.thread_id.0, &result);
     }
@@ -6161,6 +6166,15 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             if let Err(error) = db.clear_agent_chat_sdk_session_id(&thread_id.0) {
                 eprintln!("[codemux::agent_chat] failed to clear stale sdk_session_id: {error}");
             }
+        }
+    }
+    // Queue events contain prompt text for LIVE rendering only. Persist a
+    // control-only ID/disposition journal instead of replayable actor events.
+    if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. }) {
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.control_record_queue_event(&event) {
+            eprintln!("[codemux::agent_chat] failed to persist queue disposition: {error}");
         }
     }
     if let ProviderRuntimeEvent::TurnQueued {

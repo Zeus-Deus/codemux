@@ -781,7 +781,11 @@ pub mod protocol {
                     keys(
                         &self.params,
                         &["protocolVersion", "capabilities", "clientInfo", "_meta"],
-                    ) && self.params["protocolVersion"] == PROTOCOL
+                    ) && self.params["protocolVersion"].as_str().is_some_and(|version| {
+                        version.len() == 10
+                            && chrono::NaiveDate::parse_from_str(version, "%Y-%m-%d")
+                                .is_ok_and(|date| date.format("%Y-%m-%d").to_string() == version)
+                    })
                         && self.params["capabilities"].is_object()
                         && keys(&self.params["clientInfo"], &["name", "version", "title"])
                         && label(&self.params["clientInfo"]["name"])

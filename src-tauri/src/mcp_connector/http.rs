@@ -73,6 +73,11 @@ fn consent_page(status: StatusCode, html: String, callback: &str) -> Response {
     response
         .headers_mut()
         .insert("content-security-policy", policy);
+    // Preserve the issuer Origin on the browser's same-origin navigation POST.
+    // Callback redirects still use secure()'s no-referrer policy.
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("same-origin"));
     response
 }
 fn method_not_allowed(allow: &'static str) -> Response {
@@ -138,6 +143,7 @@ fn preflight<R: Runtime>(
             .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "connector_unavailable"))?
             .ok_or_else(|| unauthorized(&issuer))?;
         Some(ControlCaller::outside(
+            grant.client_id,
             grant.id,
             parse_access(&grant.access).map_err(|_| unauthorized(&issuer))?,
         ))
@@ -420,7 +426,7 @@ fn register<R: Runtime>(app: &AppHandle<R>, ingress: &Ingress, bytes: &[u8]) -> 
 }
 
 fn waiting_html(name: &str, callback: &str, id: &str, nonce: &str) -> String {
-    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>Connect an agent to CodeMux</title></head><body><main><h1>Connect an outside agent</h1><p>The client calls itself <strong>{}</strong>. This name is untrusted and is not proof of identity.</p><p>Access will be delivered to <strong>{}</strong>. Check this callback host before approving.</p><p>Open CodeMux Settings → MCP → Outside agents and approve or deny this request. Access covers <strong>all workspaces</strong> on this instance, not just the focused workspace.</p><p>Read-only is the default. Supervised clients can start and control workers but cannot approve their own worker permission requests. <strong>Full access can authorize worker commands and filesystem changes.</strong></p><p>After the owner decides in CodeMux, press Continue. This browser cannot grant or increase access.</p><form action=\"/oauth/mcp/complete\" method=\"post\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><input type=\"hidden\" name=\"nonce\" value=\"{}\"><button type=\"submit\">Continue</button></form></main></body></html>",protocol::escaped(name),protocol::escaped(callback),protocol::escaped(id),protocol::escaped(nonce))
+    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"same-origin\"><title>Connect an agent to CodeMux</title></head><body><main><h1>Connect an outside agent</h1><p>The client calls itself <strong>{}</strong>. This name is untrusted and is not proof of identity.</p><p>Access will be delivered to <strong>{}</strong>. Check this callback host before approving.</p><p>Open CodeMux Settings → MCP → Outside agents and approve or deny this request. Access covers <strong>all workspaces</strong> on this instance, not just the focused workspace.</p><p>Read-only is the default. Supervised clients can start and control workers but cannot approve their own worker permission requests. <strong>Full access can authorize worker commands and filesystem changes.</strong></p><p>After the owner decides in CodeMux, press Continue. This browser cannot grant or increase access.</p><form action=\"/oauth/mcp/complete\" method=\"post\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><input type=\"hidden\" name=\"nonce\" value=\"{}\"><button type=\"submit\">Continue</button></form></main></body></html>",protocol::escaped(name),protocol::escaped(callback),protocol::escaped(id),protocol::escaped(nonce))
 }
 fn wait_cookie(id: &str, nonce: &str, issuer: &str, clear: bool) -> Result<HeaderValue, String> {
     HeaderValue::from_str(&format!(
@@ -589,6 +595,11 @@ fn token<R: Runtime>(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../tests/helpers/mock_agent_provider.rs"]
+mod receipt_mock;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tauri::Manager;
@@ -719,6 +730,571 @@ mod tests {
         r
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires isolated headless Chromium/CDP driver and evidence directory"]
+    async fn mario_r1_real_browser_continue_preserves_origin_and_pkce_binding() {
+        let f = fixture().await;
+        let origin = format!("http://127.0.0.1:{}", f.port);
+        let resource = format!("{origin}/mcp");
+        let evidence = std::path::PathBuf::from(std::env::var("CODEMUX_BROWSER_EVIDENCE").unwrap());
+        std::fs::create_dir_all(&evidence).unwrap();
+        let callback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let callback = format!(
+            "http://127.0.0.1:{}/callback",
+            callback_listener.local_addr().unwrap().port()
+        );
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let capture = captured.clone();
+        let routes = Router::new().route("/callback", any(move |r: axum::http::Request<Body>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push(json!({"uri":r.uri().to_string(),"referer":r.headers().get(header::REFERER).and_then(|h|h.to_str().ok())}));
+                "Synthetic callback received"
+            }
+        }));
+        struct AbortServer(tokio::task::JoinHandle<()>);
+        impl Drop for AbortServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _callback_server = AbortServer(tokio::spawn(async move {
+            axum::serve(callback_listener, routes).await.unwrap();
+        }));
+        let registration = json!({"client_name":"Synthetic browser","redirect_uris":[callback]});
+        let registered = value(
+            invoke(
+                &f,
+                request(
+                    &f,
+                    "/oauth/mcp/register",
+                    "POST",
+                    &registration.to_string(),
+                    None,
+                ),
+            )
+            .await,
+        )
+        .await;
+        let client_id = registered["client_id"].as_str().unwrap();
+        let mut authorization = url::Url::parse(&format!("{origin}/oauth/mcp/authorize")).unwrap();
+        authorization.query_pairs_mut().extend_pairs([
+            ("client_id", client_id),
+            ("redirect_uri", callback.as_str()),
+            ("response_type", "code"),
+            ("resource", resource.as_str()),
+            ("code_challenge_method", "S256"),
+            (
+                "code_challenge",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            ),
+            ("state", "synthetic-browser-state"),
+        ]);
+        let mut child = tokio::process::Command::new("node")
+            .arg(std::env::var("CODEMUX_BROWSER_DRIVER").unwrap())
+            .env("CODEMUX_BROWSER_AUTHORIZE", authorization.as_str())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let binding = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(evidence.join("browser-ready.json")) {
+                    break serde_json::from_slice::<Value>(&bytes).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let id = binding["request_id"].as_str().unwrap();
+        let nonce = binding["nonce"].as_str().unwrap();
+        super::super::agent_connector_approve(
+            f.app.handle().clone(),
+            id.into(),
+            ControlAccess::ReadOnly,
+        )
+        .unwrap();
+        std::fs::write(evidence.join("approved"), "native owner decided read_only").unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(30), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+        let result: Value =
+            serde_json::from_slice(&std::fs::read(evidence.join("browser-result.json")).unwrap())
+                .unwrap();
+        let observed: Vec<_> = result["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["method"] == "Network.requestWillBeSentExtraInfo")
+            .filter_map(|e| {
+                e["params"]["headers"]
+                    .get("Origin")
+                    .or_else(|| e["params"]["headers"].get("origin"))
+            })
+            .cloned()
+            .collect();
+        assert!(
+            result["url"].as_str().unwrap().starts_with(&callback),
+            "Real browser Continue was rejected: URL={}, observed Origins={observed:?}",
+            result["url"]
+        );
+        assert!(
+            observed.contains(&json!(origin)),
+            "Browser navigation POST must send the exact issuer Origin: {observed:?}"
+        );
+        let captured = captured.lock().unwrap().clone();
+        std::fs::write(
+            evidence.join("callback.json"),
+            serde_json::to_vec_pretty(&captured).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0]["referer"].is_null(),
+            "Callback must not receive consent URL/code binding as Referer"
+        );
+        let location = url::Url::parse(result["url"].as_str().unwrap()).unwrap();
+        let parameters: std::collections::HashMap<_, _> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(parameters["state"], "synthetic-browser-state");
+        assert_eq!(parameters["iss"], origin);
+        assert!(super::super::agent_connector_status(f.app.handle().clone())
+            .unwrap()
+            .pending
+            .is_empty());
+        let make = |verifier: &str| {
+            form_request(
+                &f,
+                "/oauth/mcp/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", client_id),
+                    ("code", parameters["code"].as_str()),
+                    ("redirect_uri", callback.as_str()),
+                    ("resource", resource.as_str()),
+                    ("code_verifier", verifier),
+                ],
+                None,
+            )
+        };
+        assert_eq!(
+            invoke(&f, make(&"x".repeat(43))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(invoke(&f, make(verifier)).await.status(), StatusCode::OK);
+        assert_eq!(
+            invoke(&f, make(verifier)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // Strict Origin rejection is unchanged, including opaque/missing origins.
+        for bad in [None, Some("null"), Some("https://evil.example")] {
+            let mut r = form_request(
+                &f,
+                "/oauth/mcp/complete",
+                &[("request_id", id), ("nonce", nonce)],
+                None,
+            );
+            r.headers_mut().remove(header::ORIGIN);
+            if let Some(bad) = bad {
+                r.headers_mut().insert(header::ORIGIN, bad.parse().unwrap());
+            }
+            assert_eq!(invoke(&f, r).await.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    async fn consent_and_exchange(f: &Fixture, client_id: &str, access: ControlAccess) -> String {
+        let origin = format!("http://127.0.0.1:{}", f.port);
+        let resource = format!("{origin}/mcp");
+        let callback = "https://client.example/cb";
+        let mut authorization = url::Url::parse(&format!("{origin}/oauth/mcp/authorize")).unwrap();
+        authorization.query_pairs_mut().extend_pairs([
+            ("client_id", client_id),
+            ("redirect_uri", callback),
+            ("response_type", "code"),
+            ("resource", resource.as_str()),
+            ("code_challenge_method", "S256"),
+            (
+                "code_challenge",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            ),
+        ]);
+        let path = format!("/oauth/mcp/authorize?{}", authorization.query().unwrap());
+        let waiting = invoke(f, request(f, &path, "GET", "", None)).await;
+        assert_eq!(waiting.status(),StatusCode::OK,"The cached approved registration must be usable for fresh native consent after token expiry");
+        let cookie = waiting.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let id = cookie
+            .split_once('=')
+            .unwrap()
+            .0
+            .strip_prefix("cmcp_wait_")
+            .unwrap();
+        let html = String::from_utf8(
+            axum::body::to_bytes(waiting.into_body(), MAX_OAUTH_BODY)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let nonce = html
+            .split_once("name=\"nonce\" value=\"")
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap();
+        // Retaining registration never grants authority or autoapproves consent.
+        assert_eq!(
+            invoke(
+                f,
+                form_request(
+                    f,
+                    "/oauth/mcp/complete",
+                    &[("request_id", id), ("nonce", nonce)],
+                    Some(&cookie)
+                )
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        super::super::agent_connector_approve(f.app.handle().clone(), id.into(), access).unwrap();
+        let redirect = invoke(
+            f,
+            form_request(
+                f,
+                "/oauth/mcp/complete",
+                &[("request_id", id), ("nonce", nonce)],
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(redirect.status(), StatusCode::SEE_OTHER);
+        assert_eq!(redirect.headers()["referrer-policy"], "no-referrer");
+        let location =
+            url::Url::parse(redirect.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let parameters: std::collections::HashMap<_, _> =
+            location.query_pairs().into_owned().collect();
+        let exchanged = invoke(
+            f,
+            form_request(
+                f,
+                "/oauth/mcp/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", client_id),
+                    ("code", parameters["code"].as_str()),
+                    ("redirect_uri", callback),
+                    ("resource", resource.as_str()),
+                    (
+                        "code_verifier",
+                        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                    ),
+                ],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(exchanged.status(), StatusCode::OK);
+        value(exchanged).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn mario_r5_cached_approved_client_reauthorizes_after_one_hour_token_expiry() {
+        let f = fixture().await;
+        let now = now_ms();
+        let old = now - TOKEN_TTL_MS - 1;
+        let resource = format!("http://127.0.0.1:{}/mcp", f.port);
+        let old_token = format!("cmcp_{}", oauth::opaque());
+        let db = f.app.state::<DatabaseStore>();
+        for id in ["cached-client", "stale-anonymous"] {
+            db.mcp_register_client(
+                NewMcpClient {
+                    id: id.into(),
+                    name: "Synthetic cached label".into(),
+                    redirects: vec!["https://client.example/cb".into()],
+                    created_at: old,
+                },
+                old,
+            )
+            .unwrap();
+        }
+        db.mcp_mint_grant(NewMcpGrant {
+            id: "expired-hour-grant".into(),
+            client_id: "cached-client".into(),
+            token_hash: oauth::credential_hash(&old_token),
+            redirect_uri: "https://client.example/cb".into(),
+            resource: resource.clone(),
+            access: "full_access".into(),
+            created_at: old,
+            expires_at: old + TOKEN_TTL_MS,
+        })
+        .unwrap();
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        assert_eq!(
+            invoke(&f, request(&f, "/mcp", "POST", ping, Some(&old_token)))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let new_token = consent_and_exchange(&f, "cached-client", ControlAccess::ReadOnly).await;
+        assert!(db.mcp_client("stale-anonymous").unwrap().is_none());
+        assert!(db.mcp_client("cached-client").unwrap().is_some());
+        assert_eq!(
+            invoke(&f, request(&f, "/mcp", "POST", ping, Some(&new_token)))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(db.mcp_list_grants(now_ms()).unwrap()[0].access, "read_only");
+        super::super::agent_connector_revoke(f.app.handle().clone(), "cached-client".into())
+            .unwrap();
+        assert_eq!(
+            invoke(&f, request(&f, "/mcp", "POST", ping, Some(&new_token)))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            db.mcp_client("cached-client").unwrap().is_some(),
+            "Revocation removes bearer authority, not the ability to request new owner consent"
+        );
+    }
+
+    async fn call_tool(f: &Fixture, token: &str, name: &str, arguments: Value) -> Value {
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+        let response = invoke(
+            f,
+            request(f, "/mcp", "POST", &body.to_string(), Some(token)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        value(response).await["result"].clone()
+    }
+    async fn settled_receipt(f: &Fixture, token: &str, id: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value =
+                    call_tool(f, token, "operation_status", json!({"operation_id":id})).await;
+                assert_ne!(
+                    value["isError"], true,
+                    "Operation receipt must belong to this authenticated client: {value}"
+                );
+                let receipt = value["structuredContent"].clone();
+                if !matches!(receipt["state"].as_str(), Some("accepted" | "running")) {
+                    break receipt;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    fn authenticated_caller(f: &Fixture, token: &str) -> ControlCaller {
+        let r = request(f, "/mcp", "POST", "", Some(token));
+        match preflight(f.app.handle(), r.headers(), "/mcp") {
+            Ok(ingress) => ingress.caller.unwrap(),
+            Err(response) => panic!("Fixture token was not authenticated: {}", response.status()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mario_r2_reauthorization_preserves_exact_receipts_and_current_grant_authority() {
+        let provider = std::sync::Arc::new(receipt_mock::MockAgentProvider::new(
+            crate::agent_provider::ProviderKind::Claude,
+        ));
+        let (app, _root, workspace, _pane) =
+            crate::agent_control::guard_tests::fixture(provider.clone(), "receipt-worker").await;
+        app.manage(crate::web_remote::WebRemoteState::default());
+        app.manage(McpConnectorState::default());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        crate::web_remote::web_remote_set_config(
+            app.handle().clone(),
+            Some(port),
+            None,
+            Some("loopback".into()),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        crate::web_remote::web_remote_enable(app.handle().clone())
+            .await
+            .unwrap();
+        super::super::agent_connector_set_config(app.handle().clone(), true, None).unwrap();
+        let f = Fixture { app, port };
+        let _seed = grant(&f);
+        let first_token =
+            consent_and_exchange(&f, "fixture-client", ControlAccess::FullAccess).await;
+        let first_caller = authenticated_caller(&f, &first_token);
+        let args = json!({"workspace_id":workspace,"thread_id":"receipt-worker","client_request_id":"frozen-receipt-key"});
+        let first = call_tool(&f, &first_token, "thread_interrupt", args.clone()).await;
+        assert_ne!(
+            first["isError"], true,
+            "First actual native facade operation must succeed: {first}"
+        );
+        let first_id = first["structuredContent"]["operation_id"].as_str().unwrap();
+        let frozen = settled_receipt(&f, &first_token, first_id).await;
+        assert_eq!(frozen["state"], "succeeded");
+        let interruptions = || {
+            provider
+                .calls
+                .snapshot()
+                .iter()
+                .filter(|c| matches!(c, receipt_mock::MockCall::InterruptTurn(..)))
+                .count()
+        };
+        assert_eq!(interruptions(), 1);
+        let replacement =
+            consent_and_exchange(&f, "fixture-client", ControlAccess::FullAccess).await;
+        let replacement_caller = authenticated_caller(&f, &replacement);
+        assert!(
+            validate_caller(f.app.handle(), &first_caller).is_err(),
+            "An old caller must not borrow the new grant's authority"
+        );
+        assert_ne!(first_caller.grant_id, replacement_caller.grant_id);
+        let retry = call_tool(&f, &replacement, "thread_interrupt", args.clone()).await;
+        assert_ne!(
+            retry["isError"], true,
+            "Same registered client must recover its durable receipt: {retry}"
+        );
+        let retry_id = retry["structuredContent"]["operation_id"].as_str().unwrap();
+        let recovered = settled_receipt(&f, &replacement, retry_id).await;
+        if let Ok(directory) = std::env::var("CODEMUX_RECEIPT_EVIDENCE") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("frozen-receipt.json"),
+                serde_json::to_vec_pretty(&frozen).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join("recovered-receipt.json"),
+                serde_json::to_vec_pretty(&recovered).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join("provider-invocations.txt"),
+                interruptions().to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            recovered, frozen,
+            "Grant replacement must return the exact frozen receipt, never admit another operation"
+        );
+        assert_eq!(
+            interruptions(),
+            1,
+            "Reauthorization must not invoke the provider twice for the same request key"
+        );
+        let visible = call_tool(
+            &f,
+            &replacement,
+            "operation_status",
+            json!({"operation_id":first_id}),
+        )
+        .await;
+        assert_eq!(visible["structuredContent"], frozen);
+        let mut conflicting = args.clone();
+        conflicting["turn_id"] = json!("different-turn");
+        let conflict = call_tool(&f, &replacement, "thread_interrupt", conflicting).await;
+        assert_eq!(
+            conflict["structuredContent"]["error"]["code"],
+            "request_key_conflict"
+        );
+        let now = now_ms();
+        f.app
+            .state::<DatabaseStore>()
+            .mcp_register_client(
+                NewMcpClient {
+                    id: "different-client".into(),
+                    name: "synthetic".into(),
+                    redirects: vec!["https://client.example/cb".into()],
+                    created_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        let different =
+            consent_and_exchange(&f, "different-client", ControlAccess::FullAccess).await;
+        let not_owned = call_tool(
+            &f,
+            &different,
+            "operation_status",
+            json!({"operation_id":first_id}),
+        )
+        .await;
+        assert_eq!(
+            not_owned["structuredContent"]["error"]["code"],
+            "operation_not_found"
+        );
+        let different_caller = authenticated_caller(&f, &different);
+        let mut forged = replacement_caller.clone();
+        forged.principal = different_caller.principal;
+        assert!(validate_caller(f.app.handle(),&forged).is_err(),"Stable principal must match the current grant's registered owner, not a self-asserted identity");
+        let mut elevated = replacement_caller.clone();
+        elevated.access = ControlAccess::ReadOnly;
+        assert!(validate_caller(f.app.handle(), &elevated).is_err());
+        let queued = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        *f.app
+            .state::<agent_control::NativeControlState>()
+            .fixture_operation_barrier
+            .lock()
+            .unwrap() = Some(queued.clone());
+        let mut held_args = args.clone();
+        held_args["client_request_id"] = json!("held-old-grant");
+        let held = call_tool(&f, &replacement, "thread_interrupt", held_args).await;
+        let held_id = held["structuredContent"]["operation_id"].as_str().unwrap();
+        let readonly = consent_and_exchange(&f, "fixture-client", ControlAccess::ReadOnly).await;
+        queued.add_permits(1);
+        let stale = settled_receipt(&f, &readonly, held_id).await;
+        assert_eq!(stale["state"], "failed");
+        assert_eq!(stale["error"]["code"], "grant_revoked");
+        assert_eq!(
+            interruptions(),
+            1,
+            "Queued work cannot adopt replacement authentication"
+        );
+        let read = call_tool(
+            &f,
+            &readonly,
+            "operation_status",
+            json!({"operation_id":first_id}),
+        )
+        .await;
+        assert_eq!(read["structuredContent"], frozen);
+        let denied = call_tool(&f, &readonly, "thread_interrupt", args).await;
+        assert_eq!(
+            denied["structuredContent"]["error"]["code"],
+            "access_denied"
+        );
+        assert!(validate_caller(f.app.handle(), &replacement_caller).is_err());
+        super::super::agent_connector_revoke(f.app.handle().clone(), "fixture-client".into())
+            .unwrap();
+        assert!(validate_caller(f.app.handle(), &authenticated_caller(&f, &different)).is_ok());
+        let r = request(
+            &f,
+            "/mcp",
+            "POST",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            Some(&readonly),
+        );
+        assert_eq!(invoke(&f, r).await.status(), StatusCode::UNAUTHORIZED);
+    }
     #[tokio::test]
     async fn registration_pressure_preserves_pending_and_code_client_bindings() {
         let f = fixture().await;
@@ -1161,6 +1737,7 @@ mod tests {
         let waiting = invoke(&f, request(&f, &path, "GET", "", None)).await;
         assert_eq!(waiting.status(), StatusCode::OK);
         assert_eq!(waiting.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(waiting.headers()["referrer-policy"], "same-origin");
         assert!(waiting.headers()["content-security-policy"]
             .to_str()
             .unwrap()
@@ -1189,6 +1766,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(id != nonce && nonce != cookie_secret);
+        assert!(html.contains("<meta name=\"referrer\" content=\"same-origin\">"));
         assert!(html.contains("&lt;script&gt;untrusted&lt;/script&gt;"));
         assert!(!html.contains("<script>"));
         assert!(html.contains("https://client.example"));
@@ -1348,9 +1926,9 @@ mod tests {
     async fn revoked_changed_and_disabled_callers_and_concurrency_fail_closed() {
         let f = fixture().await;
         let token = grant(&f);
-        let caller = ControlCaller::outside("fixture-grant".into(), ControlAccess::ReadOnly);
+        let caller = ControlCaller::outside("fixture-client".into(), "fixture-grant".into(), ControlAccess::ReadOnly);
         assert!(validate_caller(f.app.handle(), &caller).is_ok());
-        let elevated = ControlCaller::outside("fixture-grant".into(), ControlAccess::FullAccess);
+        let elevated = ControlCaller::outside("fixture-client".into(), "fixture-grant".into(), ControlAccess::FullAccess);
         assert!(validate_caller(f.app.handle(), &elevated).is_err());
         let permit = f
             .app
@@ -1406,6 +1984,67 @@ mod tests {
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+    #[tokio::test]
+    async fn mario_r6_initialize_negotiates_valid_versions_but_headers_stay_strict() {
+        let f = fixture().await;
+        let token = grant(&f);
+        for version in ["2024-11-05", "2025-03-26", "2030-01-01", PROTOCOL] {
+            let body = json!({"jsonrpc":"2.0","id":"version-negotiation","method":"initialize","params":{
+                "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}
+            }});
+            let mut r = request(&f, "/mcp", "POST", &body.to_string(), Some(&token));
+            r.headers_mut().remove("mcp-protocol-version");
+            let response = invoke(&f, r).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = value(response).await;
+            assert_eq!(response["result"]["protocolVersion"],PROTOCOL,"A valid unsupported offer must negotiate the server's supported version: {response}");
+            assert!(response.get("error").is_none());
+        }
+        for invalid in [
+            Value::Null,
+            json!(1),
+            json!(""),
+            json!("wrong"),
+            json!("2025-02-30"),
+            json!("2025-6-18"),
+            json!("x".repeat(4096)),
+        ] {
+            let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":invalid,"capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}
+            }});
+            let response = value(
+                invoke(
+                    &f,
+                    request(&f, "/mcp", "POST", &body.to_string(), Some(&token)),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        let missing = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}}}"#;
+        assert_eq!(
+            value(invoke(&f, request(&f, "/mcp", "POST", missing, Some(&token))).await).await
+                ["error"]["code"],
+            -32602
+        );
+        let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        for version in [None, Some("2024-11-05"), Some("null")] {
+            let mut r = request(&f, "/mcp", "POST", ping, Some(&token));
+            r.headers_mut().remove("mcp-protocol-version");
+            if let Some(version) = version {
+                r.headers_mut()
+                    .insert("mcp-protocol-version", version.parse().unwrap());
+            }
+            assert_eq!(invoke(&f, r).await.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            invoke(&f, request(&f, "/mcp", "POST", ping, Some(&token)))
+                .await
+                .status(),
+            StatusCode::OK
         );
     }
     #[tokio::test]

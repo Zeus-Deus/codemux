@@ -44,6 +44,67 @@ pub struct Admission {
 }
 
 impl DatabaseStore {
+    /// Snapshot real bridge-written SQLite state at a deterministic crash
+    /// boundary. Restart reads open the file, never re-seed event fixtures.
+    #[cfg(test)]
+    pub(crate) fn control_fixture_snapshot(&self, path: &std::path::Path) -> Self {
+        self.conn.lock().unwrap().execute("VACUUM INTO ?1", params![path.to_str().unwrap()]).unwrap();
+        Self { conn: std::sync::Mutex::new(super::open_connection(path).unwrap()) }
+    }
+
+    /// Durable control-only queue evidence. It intentionally is NOT a
+    /// ProviderRuntimeEvent: replay cannot restore a queued bubble or callback.
+    /// Only IDs/dispositions are stored, never prompt text or tool payloads.
+    fn control_record_queue_transition(&self, thread: &str, queued: &str, disposition: &str,
+        turn: Option<&str>, steered: bool) -> Result<(), String> {
+        let payload = serde_json::json!({"type":"native_queue_control","thread_id":thread,
+            "queued_id":queued,"disposition":disposition,"turn_id":turn,"steered":steered});
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO agent_chat_messages (thread_id,payload,created_at)
+             SELECT ?1,?2,strftime('%Y-%m-%d %H:%M:%f','now')
+             WHERE NOT EXISTS (SELECT 1 FROM agent_chat_messages
+                 WHERE thread_id=?1 AND json_extract(payload,'$.type')='native_queue_control'
+                   AND json_extract(payload,'$.queued_id')=?3 AND json_extract(payload,'$.disposition')=?4)",
+            params![thread,payload.to_string(),queued,disposition],
+        ).map_err(|e|format!("queue_journal_failed: {e}"))?;
+        Ok(())
+    }
+
+    /// The RPC acknowledgement and event bridge race. Admission deduplicates,
+    /// while any actual disposition wins even if its event preceded the ACK.
+    pub(crate) fn control_record_queue_admission(&self, thread: &str, queued: &str) -> Result<(), String> {
+        self.control_record_queue_transition(thread,queued,"accepted",None,false)
+    }
+
+    pub(crate) fn control_record_queue_event(&self, event: &crate::agent_provider::ProviderRuntimeEvent) -> Result<(), String> {
+        use crate::agent_provider::ProviderRuntimeEvent;
+        match event {
+            ProviderRuntimeEvent::TurnQueued {thread_id,queued_id,..} => self.control_record_queue_admission(&thread_id.0,queued_id),
+            ProviderRuntimeEvent::QueuedTurnDispatched {thread_id,queued_id,turn_id,steered,..} =>
+                self.control_record_queue_transition(&thread_id.0,queued_id,"dispatched",Some(&turn_id.0),*steered),
+            ProviderRuntimeEvent::QueuedTurnCancelled {thread_id,queued_id} =>
+                self.control_record_queue_transition(&thread_id.0,queued_id,"cancelled",None,false),
+            _ => Ok(()),
+        }
+    }
+
+    /// Historical uncertainty is read-only evidence, never native queued_ids.
+    pub(crate) fn control_unresolved_queued_ids(&self, thread: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT json_extract(a.payload,'$.queued_id') FROM agent_chat_messages a
+             WHERE a.thread_id=?1 AND json_extract(a.payload,'$.type')='native_queue_control'
+               AND json_extract(a.payload,'$.disposition')='accepted'
+               AND NOT EXISTS (SELECT 1 FROM agent_chat_messages d
+                   WHERE d.thread_id=a.thread_id AND json_extract(d.payload,'$.type')='native_queue_control'
+                     AND json_extract(d.payload,'$.queued_id')=json_extract(a.payload,'$.queued_id')
+                     AND json_extract(d.payload,'$.disposition') IN ('dispatched','cancelled'))
+             ORDER BY a.id ASC",
+        ).map_err(|e|e.to_string())?;
+        let rows = statement.query_map(params![thread], |row|row.get(0)).map_err(|e|e.to_string())?;
+        rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    }
+
     pub fn control_operation_by_key(
         &self, principal: &str, key: &str, tool: &str, hash: &str, epoch: &str,
     ) -> Result<Option<OperationReceipt>, String> {
@@ -75,7 +136,9 @@ impl DatabaseStore {
     pub fn control_last_thread_run_event(&self, thread: &str) -> Result<Option<Value>, String> {
         let event: Option<String> = self.conn.lock().unwrap().query_row(
             "SELECT payload FROM agent_chat_messages WHERE thread_id=?1
-             AND json_extract(payload,'$.type') IN ('turn_completed','user_message','turn_queued','queued_turn_dispatched')
+             AND (json_extract(payload,'$.type') IN ('turn_completed','user_message','turn_queued','queued_turn_dispatched')
+                  OR (json_extract(payload,'$.type')='native_queue_control'
+                      AND json_extract(payload,'$.disposition')='dispatched' AND json_extract(payload,'$.steered')=0))
              ORDER BY id DESC LIMIT 1",
             params![thread], |row|row.get(0),
         ).optional().map_err(|e|e.to_string())?;
@@ -173,6 +236,36 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mario_r3_real_queue_dispositions_win_even_before_late_acceptance_ack() {
+        use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId};
+        for dispatched in [false,true] {
+            let db = DatabaseStore::new_in_memory();
+            db.upsert_agent_chat_session("queue-thread","workspace",None,"cursor").unwrap();
+            let event = if dispatched {
+                ProviderRuntimeEvent::QueuedTurnDispatched {
+                    thread_id:ThreadId("queue-thread".into()),queued_id:"opaque-queue".into(),turn_id:TurnId("b".into()),
+                    text:"synthetic private prompt".into(),steered:false,
+                }
+            } else {
+                ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:ThreadId("queue-thread".into()),queued_id:"opaque-queue".into()}
+            };
+            db.control_record_queue_event(&event).unwrap();
+            db.control_record_queue_admission("queue-thread","opaque-queue").unwrap();
+            db.control_record_queue_admission("queue-thread","opaque-queue").unwrap();
+            assert!(db.control_unresolved_queued_ids("queue-thread").unwrap().is_empty());
+            let rows = db.list_agent_chat_messages("queue-thread");
+            assert_eq!(rows.len(),2, "late ACK and event bridge must not duplicate admission");
+            assert!(!rows.iter().any(|row|row.contains("private prompt")));
+            if dispatched {
+                assert_eq!(db.control_last_thread_run_event("queue-thread").unwrap().unwrap()["disposition"],"dispatched",
+                    "dispatch without a later completion is not an old parent's terminal outcome");
+            } else {
+                assert!(db.control_last_thread_run_event("queue-thread").unwrap().is_none(), "cancelled queue is not a new parent run");
+            }
+        }
+    }
+
     #[test]
     fn retry_of_admitted_operation_returns_same_receipt() {
         let db = DatabaseStore::new_in_memory();

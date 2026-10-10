@@ -37,6 +37,387 @@ async fn fixture() -> (tauri::App<tauri::test::MockRuntime>, Arc<mock_agent_prov
     (app, provider, root, workspace)
 }
 
+// Capture the actual native Channel serializer, never a hand-built DTO.
+fn mario_channel(app: &tauri::AppHandle<tauri::test::MockRuntime>, thread: &str) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+    let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let output = events.clone();
+    let channel = tauri::ipc::Channel::<crate::commands::agent_chat::AgentChatEventPayload>::new(move |body| {
+        output.lock().unwrap().push(body.deserialize::<serde_json::Value>().unwrap());
+        Ok(())
+    });
+    crate::commands::agent_chat::attach_agent_chat_output(app.state(), thread.into(), channel).unwrap();
+    events
+}
+
+#[tokio::test]
+async fn mario_r7_interrupted_native_event_is_consistent_live_restart_and_selected_wait() {
+    use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId, TurnStatus};
+    let (app, provider, _root, workspace) = fixture().await;
+    let thread = "mario-interrupted";
+    app.state::<crate::database::DatabaseStore>().upsert_agent_chat_session(thread, &workspace, None, "claude").unwrap();
+    let events = mario_channel(app.handle(), thread);
+    let event = ProviderRuntimeEvent::TurnCompleted {
+        thread_id: ThreadId(thread.into()), turn_id: TurnId("interrupted-parent".into()),
+        status: TurnStatus::Error { subtype: "interrupted".into(), message: "synthetic private diagnostic".into() }, usage: None,
+    };
+    crate::commands::agent_chat::forward_event(app.handle(), event.clone());
+    let raw = serde_json::to_value(&event).unwrap();
+    assert_eq!(raw["status"]["kind"], "error");
+    assert_eq!(raw["status"]["subtype"], "interrupted");
+    assert_eq!(events.lock().unwrap()[0]["event"], raw);
+    assert_eq!(app.state::<crate::database::DatabaseStore>().control_turn_outcome(thread, "interrupted-parent").unwrap().unwrap(), raw);
+    let target = json!({"workspace_id": workspace, "thread_id":thread});
+    let live = execute(app.handle(), &ControlCaller::trusted(), "thread_status", target.clone()).await.unwrap();
+    assert_eq!(live["phase"], "interrupted");
+    assert_eq!(live["last_turn"]["status"]["kind"], "interrupted");
+    assert!(!live.to_string().contains("private diagnostic"));
+    let live_wait = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", json!({
+        "workspace_id":workspace,"thread_id":thread,"turn_id":"interrupted-parent","timeout_ms":1,
+    })).await.unwrap();
+    assert_eq!(live_wait["selected_turn"]["outcome"], "interrupted");
+    app.unmanage::<NativeControlState>().unwrap();
+    app.manage(NativeControlState::default());
+    let restarted = execute(app.handle(), &ControlCaller::trusted(), "thread_status", target.clone()).await.unwrap();
+    assert_eq!(restarted["phase"], "interrupted", "persisted native error subtype must not become a true error: {restarted}");
+    assert_eq!(restarted["last_turn"], live["last_turn"]);
+    let waited = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", json!({
+        "workspace_id":workspace,"thread_id":thread,"turn_id":"interrupted-parent","timeout_ms":1,
+    })).await.unwrap();
+    assert_eq!(waited["selected_turn"]["outcome"], "interrupted");
+    assert_eq!(waited["settled"], true);
+    mario_save_receipt("r7-interrupted", &json!({"raw":raw,"fanout":*events.lock().unwrap(),"live":live,"live_wait":live_wait,"restarted":restarted,"waited":waited}));
+    assert!(provider.calls.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn mario_r7_true_errors_and_limits_remain_distinct_across_native_history() {
+    use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId, TurnStatus};
+    for (native, outcome, phase) in [
+        (TurnStatus::Success, "success", "completed"),
+        (TurnStatus::Error {subtype:"provider_failure".into(),message:"synthetic private diagnostic".into()}, "error", "error"),
+        (TurnStatus::MaxTurns, "max_turns", "error"),
+        (TurnStatus::MaxBudget, "max_budget", "error"),
+    ] {
+        let (app, provider, root, workspace) = fixture().await;
+        let thread = "mario-native-outcome";
+        app.state::<crate::database::DatabaseStore>().upsert_agent_chat_session(thread,&workspace,None,"claude").unwrap();
+        let channel = mario_channel(app.handle(),thread);
+        crate::commands::agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnCompleted {
+            thread_id:ThreadId(thread.into()),turn_id:TurnId("parent".into()),status:native,usage:None,
+        });
+        let target = json!({"workspace_id":workspace,"thread_id":thread,"turn_id":"parent","timeout_ms":1});
+        let live = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", target.clone()).await.unwrap();
+        assert_eq!(live["selected_turn"]["outcome"], outcome);
+        let db = app.state::<crate::database::DatabaseStore>().control_fixture_snapshot(&root.path().join("durable.sqlite"));
+        app.unmanage::<crate::database::DatabaseStore>().unwrap();app.manage(db);
+        app.unmanage::<NativeControlState>().unwrap();app.manage(NativeControlState::default());
+        let recovered = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", target).await.unwrap();
+        assert_eq!(recovered["selected_turn"]["outcome"], outcome);
+        assert_eq!(recovered["status"]["phase"], phase);
+        assert_eq!(recovered["status"]["last_turn"], live["status"]["last_turn"]);
+        assert_eq!(recovered["settled"], true);
+        assert!(!recovered.to_string().contains("private diagnostic"));
+        mario_save_receipt(&format!("r7-{outcome}"), &json!({"fanout":*channel.lock().unwrap(),"live":live,"recovered":recovered}));
+        assert!(provider.calls.snapshot().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mario_r4_child_unknown_and_empty_approvals_keep_selected_parent_wait_busy() {
+    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, ThreadId, TurnId, TurnStatus, SessionStatus, SubagentSnapshot, SubagentStatus};
+    use crate::commands::agent_chat::{forward_event, SubagentTracker};
+    for callback_turn in ["child-b", "", "unknown-turn"] {
+        let (app, provider, _root, workspace) = fixture().await;
+        let launch = execute(app.handle(), &ControlCaller::trusted(), "thread_launch", json!({
+            "workspace_id":workspace,"client_request_id":"mario-parent-launch","provider":"claude","permission_mode":"default",
+        })).await.unwrap();
+        let launched = settle_operation(&app, &launch).await;
+        let thread = launched["thread_id"].as_str().unwrap();
+        let channel = mario_channel(app.handle(), thread);
+        forward_event(app.handle(), ProviderRuntimeEvent::SessionStateChanged {
+            thread_id:ThreadId(thread.into()), status:SessionStatus::Running { active_turn:TurnId("parent-a".into()) },
+        });
+        forward_event(app.handle(), ProviderRuntimeEvent::SubagentUpdated {
+            thread_id:ThreadId(thread.into()), subagent:SubagentSnapshot {
+                subagent_id:"delegate-b".into(),status:SubagentStatus::Running,..Default::default()
+            },
+        });
+        forward_event(app.handle(), ProviderRuntimeEvent::TurnCompleted {
+            thread_id:ThreadId(thread.into()),turn_id:TurnId("parent-a".into()),status:TurnStatus::Success,usage:None,
+        });
+        let request = ProviderRuntimeEvent::RequestOpened {
+            thread_id:ThreadId(thread.into()),turn_id:TurnId(callback_turn.into()),request_id:RequestId("child-request".into()),
+            request_kind:"tool_approval".into(),payload:json!({"private_tool_args":"synthetic confidential"}),tool_use_id:None,subagent_id:None,
+        };
+        forward_event(app.handle(), request.clone());
+        assert!(channel.lock().unwrap().iter().any(|p|p["event"]==serde_json::to_value(&request).unwrap()));
+        assert!(app.state::<SubagentTracker>().delegated_work_holding_turn(thread));
+        let target = json!({"workspace_id":workspace,"thread_id":thread,"turn_id":"parent-a","timeout_ms":1});
+        let blocked = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", target.clone()).await.unwrap();
+        mario_save_receipt(&format!("r4-{}",if callback_turn.is_empty(){"empty"}else{callback_turn}), &json!({"request":request,"fanout":*channel.lock().unwrap(),"blocked":blocked}));
+        assert_eq!(blocked["settled"], false, "child/unknown callbacks cannot stand in for a newer parent: {blocked}");
+        assert_eq!(blocked["timed_out"], true);
+        assert_eq!(blocked["status"]["turn_id"], "parent-a");
+        assert_eq!(blocked["status"]["pending_approvals"][0]["turn_id"], callback_turn);
+        assert!(!blocked["status"].to_string().contains("private_tool_args"));
+        let handle = blocked["status"]["pending_approvals"][0]["request_id"].clone();
+        let replied = execute(app.handle(), &ControlCaller::trusted(), "thread_respond", json!({
+            "workspace_id":workspace,"thread_id":thread,"client_request_id":"mario-child-reply","request_id":handle,"decision":"deny",
+        })).await.unwrap();
+        assert_eq!(settle_operation(&app, &replied).await["state"], "succeeded");
+        assert!(provider.calls.snapshot().iter().any(|call|matches!(call,mock_agent_provider::MockCall::RespondToRequest(t,r) if t.0==thread && r.0=="child-request")));
+        let resolved = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", target.clone()).await.unwrap();
+        assert_eq!(resolved["status"]["turn_id"], "parent-a");
+        assert_eq!(resolved["status"]["phase"], "completed", "resolving child must restore parent's outcome");
+        assert_eq!(resolved["settled"], false, "delegate is still holding the native parent run");
+        forward_event(app.handle(), ProviderRuntimeEvent::SubagentUpdated {
+            thread_id:ThreadId(thread.into()),subagent:SubagentSnapshot {subagent_id:"delegate-b".into(),status:SubagentStatus::Completed,..Default::default()},
+        });
+        assert_eq!(execute(app.handle(), &ControlCaller::trusted(), "thread_wait", target.clone()).await.unwrap()["settled"], true);
+        forward_event(app.handle(), ProviderRuntimeEvent::SessionStateChanged {
+            thread_id:ThreadId(thread.into()),status:SessionStatus::Running {active_turn:TurnId("new-parent-c".into())},
+        });
+        forward_event(app.handle(), ProviderRuntimeEvent::RequestOpened {
+            thread_id:ThreadId(thread.into()),turn_id:TurnId("new-parent-c".into()),request_id:RequestId("parent-c-request".into()),
+            request_kind:"tool_approval".into(),payload:json!({}),tool_use_id:None,subagent_id:None,
+        });
+        assert_eq!(execute(app.handle(), &ControlCaller::trusted(), "thread_wait", target).await.unwrap()["settled"], true,
+            "an explicitly newer parent C must not block the completed selected A");
+    }
+}
+
+#[test]
+fn mario_r4_early_single_owner_approval_correlates_without_child_identity_adoption() {
+    use crate::agent_provider::{ProviderRuntimeEvent, RequestId, ThreadId, TurnId, TurnStartResult};
+    let state = NativeControlState::default();
+    state.observe_event(&ProviderRuntimeEvent::RequestOpened {
+        thread_id:ThreadId("early".into()),turn_id:TurnId("early-parent".into()),request_id:RequestId("early-request".into()),
+        request_kind:"tool_approval".into(),payload:json!({}),tool_use_id:None,subagent_id:None,
+    });
+    state.record_accepted_turn("early", &TurnStartResult {turn_id:TurnId("early-parent".into()),queued_id:None,steered:false});
+    let view = state.thread_runtime("early").unwrap();
+    assert_eq!(view.turn_id.as_deref(), Some("early-parent"));
+    assert_eq!(view.phase, "waiting_approval");
+    assert!(state.request_is_current("early", "early-request"));
+    state.observe_event(&ProviderRuntimeEvent::RequestOpened {
+        thread_id:ThreadId("orphan-child".into()),turn_id:TurnId("child".into()),request_id:RequestId("child-request".into()),
+        request_kind:"tool_approval".into(),payload:json!({}),tool_use_id:None,subagent_id:Some("child".into()),
+    });
+    assert!(state.thread_runtime("orphan-child").unwrap().turn_id.is_none());
+    // The fresh native send ACK, not that child callback, establishes the
+    // parent while retaining the already-actionable callback and its phase.
+    state.record_accepted_turn("orphan-child", &TurnStartResult {turn_id:TurnId("fresh-parent".into()),queued_id:None,steered:false});
+    let view = state.thread_runtime("orphan-child").unwrap();
+    assert_eq!(view.turn_id.as_deref(), Some("fresh-parent"));
+    assert_eq!(view.phase, "waiting_approval");
+    assert!(state.request_is_current("orphan-child", "child-request"));
+}
+
+fn mario_save_receipt(label: &str, value: &serde_json::Value) {
+    if let Some(path) = std::env::var_os("CODEMUX_MARIO_RECEIPT") {
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(path.with_file_name(format!("{label}.json")), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+}
+
+// Scheduling-only test adapter. Native Cursor/ACP still owns all queue,
+// callback, guard, prompt and child lifecycle behavior.
+#[cfg(unix)]
+#[derive(Debug)]
+struct MarioQueueGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+#[cfg(unix)]
+#[derive(Debug)]
+struct MarioQueueCheckpoint {
+    inner: Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>,
+    gate: Arc<MarioQueueGate>,
+}
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl crate::agent_provider::types::TurnDispatchCheckpoint for MarioQueueCheckpoint {
+    fn authorize_dispatch(&self) -> Result<(), crate::agent_provider::ProviderError> { self.inner.authorize_dispatch() }
+    async fn prepare(&self) {
+        self.inner.prepare().await;
+        self.gate.entered.notify_one();
+        self.gate.release.acquire().await.unwrap().forget();
+    }
+    async fn commit(&self) { self.inner.commit().await; }
+    async fn abort(&self) { self.inner.abort().await; }
+}
+#[cfg(unix)]
+struct MarioQueuedCursor {
+    inner: Arc<crate::agent_provider::cursor::CursorAgentProvider>,
+    gate: Arc<MarioQueueGate>,
+    starts: std::sync::atomic::AtomicUsize,
+}
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl crate::agent_provider::AgentProvider for MarioQueuedCursor {
+    fn kind(&self) -> crate::agent_provider::ProviderKind { self.inner.kind() }
+    fn capabilities(&self) -> crate::agent_provider::ProviderCapabilities { self.inner.capabilities() }
+    async fn start_session(&self, input: crate::agent_provider::StartSessionInput) -> Result<crate::agent_provider::ProviderSession, crate::agent_provider::ProviderError> {
+        self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.start_session(input).await
+    }
+    async fn send_turn(&self, mut input: crate::agent_provider::SendTurnInput) -> Result<crate::agent_provider::TurnStartResult, crate::agent_provider::ProviderError> {
+        if input.text == "mario-held-b" {
+            input.turn_checkpoint = Some(Arc::new(MarioQueueCheckpoint {
+                inner: input.turn_checkpoint.take().expect("actual native dispatch guard"),gate:self.gate.clone(),
+            }));
+        }
+        self.inner.send_turn(input).await
+    }
+    async fn interrupt_turn(&self, t: crate::agent_provider::ThreadId, id: Option<crate::agent_provider::TurnId>) -> Result<(), crate::agent_provider::ProviderError> { self.inner.interrupt_turn(t,id).await }
+    async fn cancel_queued_turn(&self, t: crate::agent_provider::ThreadId, id: String) -> Result<bool, crate::agent_provider::ProviderError> { self.inner.cancel_queued_turn(t,id).await }
+    async fn send_queued_turn_now(&self, t: crate::agent_provider::ThreadId, id: String) -> Result<(), crate::agent_provider::ProviderError> { self.inner.send_queued_turn_now(t,id).await }
+    async fn respond_to_request(&self, t: crate::agent_provider::ThreadId, r: crate::agent_provider::RequestId, d: crate::agent_provider::ApprovalDecision) -> Result<(), crate::agent_provider::ProviderError> { self.inner.respond_to_request(t,r,d).await }
+    async fn set_model(&self, t: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.inner.set_model(t,m).await }
+    async fn set_permission_mode(&self, t: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.inner.set_permission_mode(t,m).await }
+    async fn stop_session(&self, t: crate::agent_provider::ThreadId) -> Result<(), crate::agent_provider::ProviderError> { self.inner.stop_session(t).await }
+    async fn list_sessions(&self) -> Result<Vec<crate::agent_provider::ProviderSession>, crate::agent_provider::ProviderError> { self.inner.list_sessions().await }
+    async fn has_session(&self, t: &crate::agent_provider::ThreadId) -> bool { self.inner.has_session(t).await }
+    async fn turn_active(&self, t: &crate::agent_provider::ThreadId) -> bool { self.inner.turn_active(t).await }
+    fn event_stream(&self) -> crate::agent_provider::ProviderEventStream { self.inner.event_stream() }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mario_r3_real_acp_queue_crash_after_parent_completion_is_restart_uncertain() {
+    mario_r3_queue_boundary("crash").await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mario_r3_actual_queue_cancellation_is_not_restart_uncertainty() {
+    mario_r3_queue_boundary("cancelled").await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mario_r3_actual_queue_dispatch_and_completion_are_not_restart_uncertainty() {
+    mario_r3_queue_boundary("dispatched").await;
+}
+
+#[cfg(unix)]
+async fn mario_r3_queue_boundary(mode: &str) {
+    use crate::agent_provider::{AgentProvider, ProviderKind, StartSessionInput, ThreadId};
+    use crate::commands::agent_chat::{self, ProviderRegistry};
+    use futures_util::StreamExt;
+    use std::os::unix::fs::PermissionsExt;
+    let peer_root = tempfile::tempdir().unwrap();
+    let binary = peer_root.path().join("peer.py");
+    std::fs::write(&binary, include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let rig = peer_root.path().join("rig");std::fs::create_dir(&rig).unwrap();
+    let inner = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(crate::agent_provider::cursor::CursorProviderConfig {binary,event_channel_capacity:256}));
+    let gate = Arc::new(MarioQueueGate {entered:Default::default(),release:tokio::sync::Semaphore::new(0)});
+    let provider = Arc::new(MarioQueuedCursor {inner,gate:gate.clone(),starts:Default::default()});
+    let thread_name = format!("mario-queue-{mode}");
+    let thread = thread_name.as_str();
+    let (app, root, workspace, pane) = super::guard_tests::fixture(provider.clone(), thread).await;
+    app.state::<ProviderRegistry>().set_cursor(provider.clone()).await;
+    let channel = mario_channel(app.handle(), thread);
+    let mut stream = provider.event_stream();
+    let bridge_app = app.handle().clone();
+    let bridge = tokio::spawn(async move {
+        while let Some(event) = stream.next().await { agent_chat::forward_event(&bridge_app,event); }
+    });
+    agent_chat::agent_chat_start_session(app.handle().clone(), pane, ProviderKind::Cursor, StartSessionInput {
+        thread_id:ThreadId(thread.into()),cwd:root.path().canonicalize().unwrap(),model:None,resume_cursor:None,fresh_session:true,
+        permission_mode:Some("ask".into()),effort:None,context_window:None,fast_mode:false,additional_directories:vec![],
+        env:Some(std::collections::HashMap::from([("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(),rig.to_string_lossy().into_owned())])),
+        workspace_id:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
+    }, Some(thread.into())).await.unwrap();
+    let first = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, serde_json::from_value(json!({
+        "thread_id":thread,"text":"review-hold","delivery":"queue","client_nonce":"mario-parent-nonce",
+    })).unwrap()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if app.state::<NativeControlState>().thread_runtime(thread).is_some_and(|v|!v.pending_approvals.is_empty()) {break;}
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let sent = execute(app.handle(), &ControlCaller::trusted(), "thread_send", json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"mario-queue-b","message":"mario-held-b","delivery":"queue",
+    })).await.unwrap();
+    let accepted = settle_operation(&app, &sent).await;
+    assert_eq!(accepted["state"], "succeeded");
+    let queued = accepted["result"]["turn"]["queued_id"].as_str().unwrap().to_string();
+    let target = json!({"workspace_id":workspace,"thread_id":thread});
+    let healthy = execute(app.handle(), &ControlCaller::trusted(), "thread_status", target.clone()).await.unwrap();
+    assert!(healthy["queued_ids"].as_array().unwrap().iter().any(|id|id==&queued));
+    assert_eq!(healthy["uncertain_queued_ids"], json!([]), "current native queues are not historical uncertainty");
+    if mode == "cancelled" {
+        assert!(agent_chat::agent_chat_cancel_queued_turn(app.handle().clone(), ProviderKind::Cursor, ThreadId(thread.into()), queued.clone()).await.unwrap());
+    } else if mode == "dispatched" { gate.release.add_permits(1); }
+    let reply = execute(app.handle(), &ControlCaller::trusted(), "thread_respond", json!({
+        "workspace_id":workspace,"thread_id":thread,"client_request_id":"mario-parent-reply","request_id":healthy["pending_approvals"][0]["request_id"],"decision":"allow_once",
+    })).await.unwrap();
+    assert_eq!(settle_operation(&app, &reply).await["state"], "succeeded");
+    if mode != "cancelled" {
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let db = app.state::<crate::database::DatabaseStore>();
+            let parent_done = db.control_turn_outcome(thread,&first.turn_id.0).unwrap().is_some();
+            let latest = db.control_last_thread_run_event(thread).unwrap();
+            let b_done = latest.is_some_and(|e|e["type"]=="turn_completed" && e["turn_id"]!=first.turn_id.0);
+            let disposed = channel.lock().unwrap().iter().any(|p| matches!(p["event"]["type"].as_str(),Some("queued_turn_dispatched"|"queued_turn_cancelled")) && p["event"]["queued_id"]==queued);
+            if parent_done && (mode=="crash" || disposed && (mode=="cancelled" || b_done)) {break;}
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let dispositions = channel.lock().unwrap().iter().filter(|p| matches!(p["event"]["type"].as_str(),Some("queued_turn_dispatched"|"queued_turn_cancelled")) && p["event"]["queued_id"]==queued).count();
+    assert_eq!(dispositions, usize::from(mode!="crash"));
+    let wire = std::fs::read_to_string(rig.join("peer-wire.jsonl")).unwrap();
+    assert_eq!(wire.contains("mario-held-b"), mode=="dispatched", "only actual dispatch reaches the child");
+    let snapshot = std::env::var_os("CODEMUX_MARIO_RECEIPT").map(std::path::PathBuf::from)
+        .map(|p|p.with_file_name(format!("r3-{mode}-boundary.sqlite"))).unwrap_or_else(||peer_root.path().join("snapshot.sqlite"));
+    let recovered_db = app.state::<crate::database::DatabaseStore>().control_fixture_snapshot(&snapshot);
+    let rows: Vec<serde_json::Value> = recovered_db.list_agent_chat_messages(thread).iter().map(|p|serde_json::from_str(p).unwrap()).collect();
+    let fanout = channel.lock().unwrap().clone();
+    // Cleanup cannot rewrite the frozen crash boundary. The actor remains
+    // unchanged; its real Stop reaps the synthetic peer after snapshotting.
+    bridge.abort();let _ = bridge.await;
+    let peer_pid: u32 = std::fs::read_to_string(rig.join("peer-pid")).unwrap().parse().unwrap();
+    provider.stop_session(ThreadId(thread.into())).await.unwrap();
+    assert!(!provider.has_session(&ThreadId(thread.into())).await);
+    #[cfg(target_os = "linux")]
+    assert!(!std::path::Path::new(&format!("/proc/{peer_pid}")).exists(), "Stop must reap the exact synthetic peer PID");
+    gate.release.add_permits(1);
+    let old_epoch = app.state::<NativeControlState>().epoch.clone();
+    app.unmanage::<NativeControlState>().unwrap();app.manage(NativeControlState::default());
+    app.unmanage::<ProviderRegistry>().unwrap();app.manage(ProviderRegistry::new());
+    let recovered_provider = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::Cursor));
+    app.state::<ProviderRegistry>().set_cursor(recovered_provider.clone()).await;
+    app.unmanage::<crate::database::DatabaseStore>().unwrap();app.manage(recovered_db);
+    let restarted = execute(app.handle(), &ControlCaller::trusted(), "thread_status", target).await.unwrap();
+    let waited = execute(app.handle(), &ControlCaller::trusted(), "thread_wait", json!({
+        "workspace_id":workspace,"thread_id":thread,"timeout_ms":1,
+    })).await.unwrap();
+    mario_save_receipt(&format!("r3-{mode}"), &json!({"queued_id":queued,"parent_turn":first.turn_id,"accepted":accepted,"healthy":healthy,
+        "fanout":fanout,"rows":rows,"wire":wire,"snapshot":snapshot,"peer_pid":peer_pid,"peer_stopped":true,"restarted":restarted,"waited":waited}));
+    assert_ne!(app.state::<NativeControlState>().epoch, old_epoch);
+    assert!(app.state::<NativeControlState>().thread_runtime(thread).is_none(), "history must not resurrect an actor queue or callbacks");
+    assert!(recovered_provider.calls.snapshot().is_empty(), "status and wait must not create a worker or reserve a turn");
+    assert_eq!(provider.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(restarted["settled"], mode!="crash", "only undisposed accepted B is restart uncertainty: {restarted}");
+    assert_eq!(restarted["phase"], if mode=="crash" {"needs_attention"} else {"completed"});
+    assert_eq!(restarted["queued_ids"], json!([]));
+    assert_eq!(restarted["pending_approvals"], json!([]));
+    assert_eq!(restarted["uncertain_queued_ids"], if mode=="crash" {json!([queued])} else {json!([])});
+    assert_eq!(waited["settled"], mode!="crash");assert_eq!(waited["timed_out"], mode=="crash");
+    assert_eq!(rows.iter().filter(|r|r["type"]=="native_queue_control" && r["queued_id"]==queued && r["disposition"]=="accepted").count(),1,
+        "native enqueue event and send acknowledgement deduplicate in the real journal");
+    assert_eq!(rows.iter().filter(|r|r["type"]=="native_queue_control" && r["queued_id"]==queued && r["disposition"]!="accepted").count(),usize::from(mode!="crash"));
+    assert!(!rows.iter().any(|r|r["type"]=="turn_queued"), "durable queue evidence must not rehydrate actionable queued bubbles");
+    assert!(!rows.iter().any(|r|r["type"]=="native_queue_control" && r.to_string().contains("mario-held-b")));
+    assert!(!fanout.iter().any(|r|r["event"]["type"]=="native_queue_control"), "control journal is not an actor event");
+}
+
 #[tokio::test]
 async fn workspace_discovery_uses_app_owned_state() {
     let app = tauri::test::mock_app();
