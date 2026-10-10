@@ -8,7 +8,7 @@ import {
   ArrowLeft,
   Bell,
   Check,
-  ChevronRight,
+  CalendarClock,
   ChevronDown,
   MessageSquare,
   Globe,
@@ -17,8 +17,12 @@ import {
   Users,
   Code2,
   Folder,
+  FolderPlus,
   GitBranch,
+  GitFork,
+  GitPullRequest,
   Keyboard,
+  MonitorSmartphone,
   MoreHorizontal,
   Plus,
   Search,
@@ -30,7 +34,14 @@ import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { activateWorkspace } from "@/tauri/commands";
-import { getWorkspaceStatus, STATUS_LABEL } from "@/lib/pane-status";
+import {
+  getWorkspaceStatus,
+  STATUS_DOT_CLASS,
+  STATUS_LABEL,
+  STATUS_TEXT_CLASS,
+} from "@/lib/pane-status";
+import { cn } from "@/lib/utils";
+import type { WorkspaceSnapshot } from "@/tauri/types";
 import { WorkspaceMain } from "@/components/layout/workspace-main";
 import {
   Dialog,
@@ -145,6 +156,42 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
         (filter === "settled" && isSettled))
     );
   });
+  const appAction = (
+    label: string,
+    Icon: typeof Search,
+    run: () => void,
+  ) => (
+    <button
+      key={label}
+      onClick={() => {
+        setMore(false);
+        run();
+      }}
+    >
+      <Icon size={18} aria-hidden />
+      {label}
+    </button>
+  );
+  const appActions = (
+    <div className="mobile-actions">
+      {appAction("All commands", Search, () => ui().setShowCommandPalette(true))}
+      {appAction("New workspace", Plus, () => startChat())}
+      {appAction("New project", FolderPlus, () => ui().setShowNewProjectScreen(true))}
+      {appAction("Clone repository", GitFork, () => ui().setShowCloneDialog(true))}
+      {workspace && !draft && !home && (
+        <MobileWorkspaceActions
+          key={workspace.workspace_id}
+          workspace={workspace}
+          onDone={() => setMore(false)}
+        />
+      )}
+      {appAction("Settings", Settings, () => ui().setShowSettings(true))}
+      {appAction("Automations", CalendarClock, () => ui().setShowAutomations(true))}
+      {appAction("Devices", MonitorSmartphone, () => ui().setShowDevices(true))}
+      {appAction("All pull requests", GitPullRequest, () => ui().setShowPullRequests(true))}
+      {appAction("Install and notifications", Bell, () => setInstall(true))}
+    </div>
+  );
   return (
     <div className="mobile-shell">
       <header className="mobile-header">
@@ -178,9 +225,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                   ? "Reconnecting…"
                   : connection === "offline"
                     ? "Disconnected"
-                    : (workspace.tabs.find(
-                        (t) => t.tab_id === workspace.active_tab_id,
-                      )?.title ?? "Sessions")}
+                    : sessionSubtitle(workspace)}
               </span>
             </span>
             <ChevronDown size={14} className="shrink-0 text-muted-foreground" />
@@ -215,14 +260,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
           aria-expanded={more}
           onClick={() => setMore(true)}
         >
-          {home ? (
-            <MoreHorizontal size={20} />
-          ) : (
-            <>
-              <Folder size={17} />
-              <span>Tools</span>
-            </>
-          )}
+          <MoreHorizontal size={20} />
         </button>
       </header>
       {home ? (
@@ -268,34 +306,48 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                 snapshot?.pane_statuses ?? {},
               );
               const isSettled = settled.some((s) => s.id === w.workspace_id);
+              const project = (w.project_root ?? w.cwd).split(/[\\/]/).pop();
               return (
                 <article key={w.workspace_id} className="mobile-workspace">
                   <button
                     className="mobile-workspace-open"
                     onClick={() => void openWorkspace(w.workspace_id)}
                   >
-                    <span className="mobile-project-icon">
-                      <Code2 size={21} />
+                    <span className="mobile-project-icon" aria-hidden>
+                      {project?.charAt(0).toUpperCase() || (
+                        <Code2 className="size-4" />
+                      )}
+                      {status && (
+                        <span
+                          className={cn(
+                            "mobile-project-status",
+                            STATUS_DOT_CLASS[status],
+                          )}
+                        />
+                      )}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-medium">
                         {w.title}
                       </span>
-                      <span className="block truncate text-label text-muted-foreground mt-1">
-                        {(w.project_root ?? w.cwd).split(/[\\/]/).pop()} ·{" "}
-                        {status
-                          ? STATUS_LABEL[status]
-                          : isSettled
-                            ? "Settled"
-                            : "Ready"}
-                      </span>
-                      {w.git_changed_files > 0 && (
-                        <span className="block text-label text-muted-foreground mt-1">
-                          {w.git_changed_files} changed files
+                      <span className="mt-0.5 block truncate text-label text-muted-foreground">
+                        {project} ·{" "}
+                        <span className={status ? STATUS_TEXT_CLASS[status] : undefined}>
+                          {status
+                            ? STATUS_LABEL[status]
+                            : isSettled
+                              ? "Settled"
+                              : "Ready"}
                         </span>
-                      )}
+                        {w.git_changed_files > 0 && (
+                          <>
+                            {" · "}
+                            {w.git_changed_files}{" "}
+                            {w.git_changed_files === 1 ? "file" : "files"}
+                          </>
+                        )}
+                      </span>
                     </span>
-                    <ChevronRight size={16} />
                   </button>
                   <button
                     className="mobile-settle"
@@ -435,93 +487,14 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
               </div>
             </>
           )}
-          <details className="mobile-more-actions" open={home || !!draft}>
-            <summary>Workspace and app actions</summary>
-            <div className="mobile-actions">
-              <button
-                onClick={() => {
-                  ui().setShowCommandPalette(true);
-                  setMore(false);
-                }}
-              >
-                <Search size={18} />
-                All commands
-              </button>
-              <button
-                onClick={() => {
-                  startChat();
-                }}
-              >
-                <Plus size={18} />
-                New workspace
-              </button>
-              <button
-                onClick={() => {
-                  ui().setShowNewProjectScreen(true);
-                  setMore(false);
-                }}
-              >
-                New project
-              </button>
-              <button
-                onClick={() => {
-                  ui().setShowCloneDialog(true);
-                  setMore(false);
-                }}
-              >
-                Clone repository
-              </button>
-              {workspace && !draft && !home && (
-                <MobileWorkspaceActions
-                  key={workspace.workspace_id}
-                  workspace={workspace}
-                  onDone={() => setMore(false)}
-                />
-              )}
-              <button
-                onClick={() => {
-                  ui().setShowSettings(true);
-                  setMore(false);
-                }}
-              >
-                <Settings size={18} />
-                Settings
-              </button>
-              <button
-                onClick={() => {
-                  ui().setShowAutomations(true);
-                  setMore(false);
-                }}
-              >
-                Automations
-              </button>
-              <button
-                onClick={() => {
-                  ui().setShowDevices(true);
-                  setMore(false);
-                }}
-              >
-                Devices
-              </button>
-              <button
-                onClick={() => {
-                  ui().setShowPullRequests(true);
-                  setMore(false);
-                }}
-              >
-                All pull requests
-              </button>
-              <button
-                onClick={() => {
-                  setMore(false);
-                  setInstall(true);
-                }}
-              >
-                <Bell size={18} />
-                Install and notifications
-              </button>
-            </div>
-          </details>
+          {workspace && !draft && !home ? (
+            <details className="mobile-more-actions">
+              <summary>Workspace and app actions</summary>
+              {appActions}
+            </details>
+          ) : (
+            appActions
+          )}
         </SheetContent>
       </Sheet>
       <Dialog open={install} onOpenChange={setInstall}>
@@ -557,4 +530,12 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
       {overlays}
     </div>
   );
+}
+
+/** The active session's name, unless it only repeats the workspace title (a
+ *  terminal tab is named after its workspace) — then the branch says more. */
+function sessionSubtitle(workspace: WorkspaceSnapshot) {
+  const tab = workspace.tabs.find((t) => t.tab_id === workspace.active_tab_id);
+  if (tab && tab.title !== workspace.title) return tab.title;
+  return workspace.git_branch ?? tab?.title ?? "Sessions";
 }

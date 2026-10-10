@@ -109,4 +109,19 @@ describe("MobileShell conversation navigation", () => {
     expect(screen.getByRole("textbox", { name: "Conversation draft" })).toBe(composer);
     expect(composer).toHaveValue("Resume this later");
   });
+
+  it("lists a workspace with its status and a correctly pluralized file count", () => {
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: workspace.workspace_id,
+        workspaces: [{ ...workspace, git_changed_files: 1 }],
+        pane_statuses: {},
+      } as AppStateSnapshot,
+    });
+    useMobileNavigationStore.setState({ home: true });
+    render(<MobileShell overlays={null} />);
+    const row = screen.getByRole("button", { name: /Mobile polish.*demo/ });
+    expect(row).toHaveTextContent("demo · Ready · 1 file");
+    expect(row).not.toHaveTextContent("files");
+  });
 });

@@ -175,6 +175,7 @@ import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
+import { MobileComposerChips } from "@/components/mobile/mobile-composer-chips";
 import { RevertTurnDialog } from "./revert-turn-dialog";
 import { randomUUID } from "@/lib/uuid";
 
@@ -4127,6 +4128,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               // Docked in a `pointer-events-none` region, so the banner's
               // own buttons have to opt back in.
               <div className="pointer-events-auto">{debugBannerEl}</div>
+            )}
+            {mobile && conversationWritable && !enteredSubagent && paneWorkspaceId && (
+              <MobileComposerChips workspaceId={paneWorkspaceId} />
             )}
             {composerEl}
           </div>

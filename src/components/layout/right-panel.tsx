@@ -52,6 +52,7 @@ import {
   Loader2,
   PanelRight as PanelRightIcon,
   RefreshCw,
+  Search,
   Terminal,
   WrapText,
   X,
@@ -929,14 +930,12 @@ export const RightPanel = memo(function RightPanel({
     // No left border: the resize handle in `workspace-main.tsx` is the seam.
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
       {mobile ? <div className="mobile-panel-header">
-        <div className="flex min-w-0 items-center gap-1">
-          <select aria-label="Open tool or file" className="mobile-pane-picker min-w-0 flex-1" value={activePane ?? "empty"} onChange={e => setRightPanelTab(workspaceId, e.target.value as RightPanelTab)}>
-            <option value="empty">All tools</option>{tabs.map(tab => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
-          </select>
-          <button aria-label="Find a file" onClick={handleOpenFile}>Find file</button>
-          <button aria-label="Back to conversation" onClick={handleCollapsePanel}>Back</button>
-        </div>
-        <div className="mobile-panel-actions">{actions}{activePane && <button onClick={() => handleClose(activePane)}>Close this view</button>}</div>
+        <select aria-label="Open tool or file" className="mobile-pane-picker" value={activePane ?? "empty"} onChange={e => setRightPanelTab(workspaceId, e.target.value as RightPanelTab)}>
+          <option value="empty">All tools</option>{tabs.map(tab => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
+        </select>
+        <div className="mobile-panel-actions">{actions}</div>
+        <button aria-label="Find a file" title="Find a file" onClick={handleOpenFile}><Search className="size-4" aria-hidden /></button>
+        {activePane && <button aria-label="Close this view" title="Close this view" onClick={() => handleClose(activePane)}><X className="size-4" aria-hidden /></button>}
       </div> : <PaneTabStrip
         inTitlebar={titlebarOverlay}
         tabs={tabs}

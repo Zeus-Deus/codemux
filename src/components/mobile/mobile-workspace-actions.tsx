@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "@/lib/toast";
+import { Archive, Bell, BellOff, Pencil, Pin, PinOff, X } from "lucide-react";
 
 export function MobileWorkspaceActions({
   workspace,
@@ -52,6 +53,7 @@ export function MobileWorkspaceActions({
             setRenaming(true);
           }}
         >
+          <Pencil size={18} aria-hidden />
           Rename workspace
         </button>
         <button
@@ -62,6 +64,11 @@ export function MobileWorkspaceActions({
             )
           }
         >
+          {workspace.pinned_at ? (
+            <PinOff size={18} aria-hidden />
+          ) : (
+            <Pin size={18} aria-hidden />
+          )}
           {workspace.pinned_at ? "Unpin workspace" : "Pin workspace"}
         </button>
         <button
@@ -75,6 +82,11 @@ export function MobileWorkspaceActions({
             )
           }
         >
+          {workspace.notifications_muted ? (
+            <Bell size={18} aria-hidden />
+          ) : (
+            <BellOff size={18} aria-hidden />
+          )}
           {workspace.notifications_muted
             ? "Unmute workspace"
             : "Mute workspace"}
@@ -98,6 +110,7 @@ export function MobileWorkspaceActions({
             })
           }
         >
+          {attached ? <X size={18} aria-hidden /> : <Archive size={18} aria-hidden />}
           {attached ? "Close workspace" : "Archive workspace"}
         </button>
       </div>

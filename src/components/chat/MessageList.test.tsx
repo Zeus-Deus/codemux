@@ -226,6 +226,33 @@ describe("MessageList retained scroll state", () => {
     expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
+  it("re-pins the end when the list itself leaves it while follow intent holds", async () => {
+    // A tail-first cold open backfills history while LegendList is still
+    // settling its initial scroll; on a phone that settle can land at the
+    // tail's old end, hundreds of turns up. No gesture released follow.
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    // Let the mount-time advance (two frames) drain before the list moves.
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("treats keyboard scrolling as the reader leaving the end", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    fireEvent.keyDown(viewport, { key: "PageUp" });
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
   it("reveals background growth when a resumed tail follower misses the built-in end pin", async () => {
     listState.isAtEnd = true;
     listState.isNearEnd = true;
