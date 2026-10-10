@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// Maximum number of stderr bytes the helper retains as diagnostic context
 /// for [`RpcChildError::ChildExited`].
@@ -66,6 +66,19 @@ const INCOMING_REQUEST_CHANNEL_CAPACITY: usize = 256;
 /// Depth of the notifications broadcast channel. Lagging subscribers
 /// observe a `Lagged` error rather than blocking the reader task.
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 512;
+const MAX_STRICT_FRAME_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Retained transport health, separate from untrusted protocol notifications.
+/// Contains no peer bytes, stderr, credentials or environment values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    MalformedJson,
+    InvalidEnvelope,
+    CallbackOverflow,
+    CallbackReceiverClosed,
+    ReadFailed,
+    FrameTooLarge,
+}
 
 /// Parameters for spawning a JSON-RPC child process.
 #[derive(Debug, Clone)]
@@ -90,6 +103,13 @@ pub struct SpawnConfig {
 pub struct Notification {
     pub method: String,
     pub params: Value,
+}
+
+/// Reader-assigned wire position; protocol values remain unchanged.
+#[derive(Debug, Clone)]
+pub struct SequencedNotification {
+    pub sequence: u64,
+    pub notification: Notification,
 }
 
 /// A server-initiated JSON-RPC request (has both `method` and `id`). The
@@ -190,7 +210,7 @@ impl std::error::Error for RpcChildError {
     }
 }
 
-type PendingResult = Result<Value, RpcError>;
+type PendingResult = Result<(Value, u64), RpcError>;
 
 /// Internal pending-request bookkeeping.
 #[derive(Default)]
@@ -267,17 +287,21 @@ struct ExitInfo {
 /// wrap the handle in an `Arc` and hand it to background tasks freely.
 pub struct JsonRpcChild {
     writer: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
+    #[cfg(test)]
+    pub(crate) reader_gate: Arc<tokio::sync::Mutex<()>>,
     pending: Arc<Mutex<PendingMap>>,
     next_id: Arc<AtomicU64>,
     default_timeout: Duration,
     notifications_tx: broadcast::Sender<Notification>,
+    sequenced_notifications_tx: broadcast::Sender<SequencedNotification>,
+    failure_rx: watch::Receiver<Option<TransportFailure>>,
     incoming_rx: Arc<Mutex<Option<mpsc::Receiver<IncomingRequest>>>>,
     alive: Arc<AtomicBool>,
+    reaped: Arc<AtomicBool>,
     exit_info: Arc<Mutex<Option<ExitInfo>>>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    /// Set to `true` the first time [`shutdown`](Self::shutdown) runs. A
-    /// second call observes `true` via `swap` and returns early; the
-    /// original cleanup has already fired.
+    /// The first shutdown poll synchronously signals the retained watchdog.
+    /// All callers then join its actual process-reap and pipe-drain boundary.
     shutdown_started: Arc<AtomicBool>,
 }
 
@@ -287,6 +311,16 @@ impl JsonRpcChild {
     /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot be
     /// started or its stdio pipes cannot be captured.
     pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {
+        Self::spawn_mode(config, false).await
+    }
+
+    /// Standards-driven peers fail closed on malformed framing or callback
+    /// loss. Existing native adapters retain their tolerant transport mode.
+    pub async fn spawn_strict(config: SpawnConfig) -> Result<Self, RpcChildError> {
+        Self::spawn_mode(config, true).await
+    }
+
+    async fn spawn_mode(config: SpawnConfig, strict: bool) -> Result<Self, RpcChildError> {
         let mut cmd = Command::new(&config.program);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
@@ -319,17 +353,22 @@ impl JsonRpcChild {
         })?;
 
         let writer = Arc::new(tokio::sync::Mutex::new(Some(stdin)));
+        #[cfg(test)]
+        let reader_gate = Arc::new(tokio::sync::Mutex::new(()));
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(PendingMap::default()));
         let next_id = Arc::new(AtomicU64::new(1));
         let (notifications_tx, _) = broadcast::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let (sequenced_notifications_tx, _) = broadcast::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let (failure_tx, failure_rx) = watch::channel(None);
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_REQUEST_CHANNEL_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
+        let reaped = Arc::new(AtomicBool::new(false));
         let exit_info: Arc<Mutex<Option<ExitInfo>>> = Arc::new(Mutex::new(None));
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         // Stderr drain task: accumulates the tail buffer and finishes on EOF.
-        {
+        let stderr_handle = {
             let stderr_tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
@@ -345,8 +384,8 @@ impl JsonRpcChild {
                         Err(_) => break,
                     }
                 }
-            });
-        }
+            })
+        };
 
         // Reader task: parses stdout lines and routes them. The JoinHandle
         // is handed to the watchdog so it can await EOF before failing
@@ -354,29 +393,59 @@ impl JsonRpcChild {
         let reader_handle = {
             let pending_reader = Arc::clone(&pending);
             let notifications_tx_reader = notifications_tx.clone();
+            let sequenced_notifications_tx_reader = sequenced_notifications_tx.clone();
+            let failure_tx_reader = failure_tx.clone();
             let incoming_tx_reader = incoming_tx.clone();
             let alive_reader = Arc::clone(&alive);
+            #[cfg(test)]
+            let reader_gate_reader = reader_gate.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
+                let mut sequence = 0u64;
                 loop {
                     line.clear();
-                    match reader.read_line(&mut line).await {
+                    let read = if strict {
+                        (&mut reader).take(MAX_STRICT_FRAME_BYTES + 1).read_line(&mut line).await
+                    } else {
+                        reader.read_line(&mut line).await
+                    };
+                    match read {
                         Ok(0) => break, // EOF
                         Ok(_) => {
+                            #[cfg(test)]
+                            let _schedule = reader_gate_reader.lock().await;
+                            if strict && line.len() as u64 > MAX_STRICT_FRAME_BYTES {
+                                failure_tx_reader.send_replace(Some(TransportFailure::FrameTooLarge));
+                                break;
+                            }
                             let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            route_incoming_line(
+                            sequence += 1;
+                            if let Err(failure) = route_incoming_line(
                                 trimmed,
                                 &pending_reader,
                                 &notifications_tx_reader,
                                 &incoming_tx_reader,
+                                strict,
+                                sequence,
+                                &sequenced_notifications_tx_reader,
                             )
-                            .await;
+                            .await {
+                                if strict {
+                                    failure_tx_reader.send_replace(Some(failure));
+                                    break;
+                                }
+                            }
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            if strict {
+                                failure_tx_reader.send_replace(Some(TransportFailure::ReadFailed));
+                            }
+                            break;
+                        }
                     }
                 }
                 alive_reader.store(false, Ordering::SeqCst);
@@ -392,8 +461,10 @@ impl JsonRpcChild {
         {
             let pending_watchdog = Arc::clone(&pending);
             let alive_watchdog = Arc::clone(&alive);
+            let reaped_watchdog = Arc::clone(&reaped);
             let exit_info_watchdog = Arc::clone(&exit_info);
             let stderr_tail_watchdog = Arc::clone(&stderr_tail);
+            let writer_watchdog = Arc::clone(&writer);
             // We intentionally keep the incoming sender inside the watchdog
             // so that the incoming-request channel does not close until the
             // child has truly gone away.
@@ -402,7 +473,13 @@ impl JsonRpcChild {
                 let exit_status = tokio::select! {
                     status = child.wait() => status,
                     _ = shutdown_rx => {
-                        match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.wait()).await {
+                        // The total grace budget includes acquiring stdin: a
+                        // blocked write must not delay the owned kill timer.
+                        // This cleanup outlives cancellation of any caller.
+                        match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, async {
+                            *writer_watchdog.lock().await = None;
+                            child.wait().await
+                        }).await {
                             Ok(s) => s,
                             Err(_) => {
                                 let _ = child.kill().await;
@@ -414,6 +491,7 @@ impl JsonRpcChild {
 
                 alive_watchdog.store(false, Ordering::SeqCst);
 
+                let waited = exit_status.is_ok();
                 let code = exit_status.ok().and_then(|s| s.code());
                 // Publish exit info immediately so requests arriving from
                 // here on fail with the informative `ChildExited` rather
@@ -440,7 +518,18 @@ impl JsonRpcChild {
                 // Wait for the reader to reach EOF so every buffered message
                 // is routed first; bounded because a grandchild inheriting
                 // the stdout fd can hold the pipe open indefinitely.
-                let _ = tokio::time::timeout(PIPE_DRAIN_TIMEOUT, reader_handle).await;
+                let reader_abort = reader_handle.abort_handle();
+                let stderr_abort = stderr_handle.abort_handle();
+                let drain = async { tokio::join!(reader_handle, stderr_handle) };
+                tokio::pin!(drain);
+                if tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut drain).await.is_err() {
+                    // Retain join!'s per-owner completion state across timeout:
+                    // one pipe may have reached EOF while the other is inherited.
+                    // A fresh join would re-poll the already consumed handle.
+                    reader_abort.abort();
+                    stderr_abort.abort();
+                    let _ = drain.await;
+                }
 
                 // Refresh the stderr tail: the drain window may have let the
                 // stderr task capture the child's final diagnostics too.
@@ -472,19 +561,29 @@ impl JsonRpcChild {
                         data: None,
                     }));
                 }
-                // Dropping `_incoming_keepalive` now closes the
-                // incoming-request channel.
+                // Reference the sender in this closure so it is actually
+                // retained until the owned child and pending requests settle.
+                drop(_incoming_keepalive);
+                drop(failure_tx);
+                if waited {
+                    reaped_watchdog.store(true, Ordering::SeqCst);
+                }
             });
         }
 
         Ok(Self {
             writer,
+            #[cfg(test)]
+            reader_gate,
             pending,
             next_id,
             default_timeout: config.default_timeout,
             notifications_tx,
+            sequenced_notifications_tx,
+            failure_rx,
             incoming_rx: Arc::new(Mutex::new(Some(incoming_rx))),
             alive,
+            reaped,
             exit_info,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
@@ -505,6 +604,17 @@ impl JsonRpcChild {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, RpcChildError> {
+        self.request_with_sequence(method, params, timeout).await.map(|(value, _)| value)
+    }
+
+    /// Await a response together with its actual stdout wire position.
+    /// Ordered consumers can reject an older snapshot applied after a drain.
+    pub async fn request_with_sequence(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<(Value, u64), RpcChildError> {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(self.exit_or_shutdown());
         }
@@ -607,45 +717,41 @@ impl JsonRpcChild {
         self.notifications_tx.subscribe()
     }
 
+    pub fn sequenced_notifications(&self) -> broadcast::Receiver<SequencedNotification> {
+        self.sequenced_notifications_tx.subscribe()
+    }
+
+    /// A late subscriber still sees the first strict transport failure.
+    pub fn transport_failures(&self) -> watch::Receiver<Option<TransportFailure>> {
+        self.failure_rx.clone()
+    }
+
     /// Close stdin, wait up to 2s for the child to exit on its own, and
     /// then kill it if it has not.
     ///
-    /// Idempotent: a second call after the first one started observes the
-    /// internal `shutdown_started` flag and returns `Ok(())` immediately
-    /// without re-running the shutdown sequence. This lets `Arc<Self>`
-    /// holders coordinate cleanup without needing to decide who "owns"
-    /// the single shutdown call.
+    /// Idempotent: exactly one caller starts shutdown; concurrent callers
+    /// wait for the same actual process-reap and pipe-drain boundary.
     pub async fn shutdown(&self) -> Result<(), RpcChildError> {
-        if self.shutdown_started.swap(true, Ordering::SeqCst) {
-            // Someone else already kicked off shutdown. Nothing to do.
-            return Ok(());
+        if !self.shutdown_started.swap(true, Ordering::SeqCst) {
+            // No await between winning initiation and transferring cleanup.
+            // The watchdog, not this cancellable caller, closes/kills/reaps.
+            let tx = self.shutdown_tx.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
         }
-
-        // Close stdin so the child observes EOF.
-        {
-            let mut guard = self.writer.lock().await;
-            *guard = None;
-        }
-
-        // Trigger the watchdog timer if it has not fired already.
-        let tx = self
-            .shutdown_tx
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        if let Some(tx) = tx {
-            let _ = tx.send(());
-        }
-
-        // Poll alive for a short while to give the watchdog a chance to
-        // actually reap the process; this keeps the caller's ordering
-        // predictable.
-        let deadline = std::time::Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT + Duration::from_secs(1);
-        while self.alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        // stdout EOF only describes transport liveness. All concurrent
+        // shutdown callers wait for the watchdog's actual wait/drain boundary.
+        let timeout = GRACEFUL_SHUTDOWN_TIMEOUT + PIPE_DRAIN_TIMEOUT + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.reaped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-
-        Ok(())
+        if self.reaped.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(RpcChildError::Timeout { method: "shutdown/reap".into(), elapsed: timeout })
+        }
     }
 
     /// Whether the child process is still running (best-effort).
@@ -687,18 +793,17 @@ async fn route_incoming_line(
     pending: &Arc<Mutex<PendingMap>>,
     notifications_tx: &broadcast::Sender<Notification>,
     incoming_tx: &mpsc::Sender<IncomingRequest>,
-) {
+    strict: bool,
+    sequence: u64,
+    sequenced_notifications_tx: &broadcast::Sender<SequencedNotification>,
+) -> Result<(), TransportFailure> {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(err) => {
-            // Emit a best-effort log line; do not crash the reader. The
-            // protocol_error variant is used both for malformed incoming
-            // lines and for local encoding failures.
-            eprintln!(
-                "[json_rpc_child] dropping malformed line: {err}; line={:?}",
-                line
-            );
-            return;
+            if !strict {
+                eprintln!("[json_rpc_child] dropping malformed line: {err}");
+            }
+            return Err(TransportFailure::MalformedJson);
         }
     };
 
@@ -706,16 +811,25 @@ async fn route_incoming_line(
     let obj = match value.as_object() {
         Some(o) => o.clone(),
         None => {
-            eprintln!(
-                "[json_rpc_child] dropping non-object JSON: {}",
-                value
-            );
-            return;
+            if !strict { eprintln!("[json_rpc_child] dropping non-object JSON"); }
+            return Err(TransportFailure::InvalidEnvelope);
         }
     };
 
     let id = obj.get("id").cloned();
     let method = obj.get("method").and_then(|v| v.as_str()).map(String::from);
+
+    if strict && (
+        obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || obj.contains_key("method") && method.is_none()
+        || method.is_some() && (obj.contains_key("result") || obj.contains_key("error"))
+        || method.is_none() && (id.is_none() || obj.contains_key("result") == obj.contains_key("error"))
+        || id.as_ref().is_some_and(|id| !id.is_null() && !id.is_string() && id.as_i64().is_none() && id.as_u64().is_none())
+        || obj.get("error").is_some_and(|error| serde_json::from_value::<RpcError>(error.clone()).is_err())
+        || obj.get("params").is_some_and(|params| !params.is_null() && !params.is_object() && !params.is_array())
+    ) {
+        return Err(TransportFailure::InvalidEnvelope);
+    }
 
     match (id, method) {
         // Response: has id + (result | error), no method.
@@ -723,11 +837,9 @@ async fn route_incoming_line(
             let id_u64 = match id_val.as_u64() {
                 Some(n) => n,
                 None => {
-                    eprintln!(
-                        "[json_rpc_child] ignoring response with non-u64 id: {}",
-                        id_val
-                    );
-                    return;
+                    if strict { return Err(TransportFailure::InvalidEnvelope); }
+                    eprintln!("[json_rpc_child] ignoring response with non-u64 id");
+                    return Ok(());
                 }
             };
             let sender = pending.lock().ok().and_then(|mut m| m.remove(id_u64));
@@ -735,7 +847,7 @@ async fn route_incoming_line(
                 eprintln!(
                     "[json_rpc_child] response for unknown id {id_u64} (possibly timed out)"
                 );
-                return;
+                return Ok(());
             };
             let outcome: PendingResult = if let Some(err_val) = obj.get("error") {
                 match serde_json::from_value::<RpcError>(err_val.clone()) {
@@ -747,7 +859,7 @@ async fn route_incoming_line(
                     }),
                 }
             } else {
-                Ok(obj.get("result").cloned().unwrap_or(Value::Null))
+                Ok((obj.get("result").cloned().unwrap_or(Value::Null), sequence))
             };
             let _ = tx.send(outcome);
         }
@@ -765,9 +877,11 @@ async fn route_incoming_line(
                 match err {
                     mpsc::error::TrySendError::Full(_) => {
                         eprintln!("[json_rpc_child] incoming request queue full; dropping");
+                        return Err(TransportFailure::CallbackOverflow);
                     }
                     mpsc::error::TrySendError::Closed(_) => {
                         // No consumer attached — silently drop.
+                        return Err(TransportFailure::CallbackReceiverClosed);
                     }
                 }
             }
@@ -775,16 +889,20 @@ async fn route_incoming_line(
         // Notification: has method but no id.
         (None, Some(method_name)) => {
             let params = obj.get("params").cloned().unwrap_or(Value::Null);
-            let _ = notifications_tx.send(Notification {
+            let notification = Notification {
                 method: method_name,
                 params,
-            });
+            };
+            let _ = notifications_tx.send(notification.clone());
+            let _ = sequenced_notifications_tx.send(SequencedNotification { sequence, notification });
         }
         // No method and no id — unusable.
         (None, None) => {
             eprintln!("[json_rpc_child] dropping message with neither id nor method");
+            return Err(TransportFailure::InvalidEnvelope);
         }
     }
+    Ok(())
 }
 
 impl std::fmt::Debug for JsonRpcChild {

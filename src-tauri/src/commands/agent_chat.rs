@@ -113,6 +113,7 @@ pub struct ProviderRegistry {
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     grok: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     hermes: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    acp: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
 }
 
@@ -146,6 +147,10 @@ impl ProviderRegistry {
         *self.hermes.write().await = Some(provider);
     }
 
+    pub async fn set_acp(&self, provider: Arc<dyn AgentProvider>) {
+        *self.acp.write().await = Some(provider);
+    }
+
     /// Inject the Grok Build ACP provider.
     pub async fn set_grok(&self, provider: Arc<dyn AgentProvider>) {
         *self.grok.write().await = Some(provider);
@@ -168,6 +173,7 @@ impl ProviderRegistry {
             ProviderKind::Cursor => self.cursor.read().await.clone(),
             ProviderKind::Grok => self.grok.read().await.clone(),
             ProviderKind::Hermes => self.hermes.read().await.clone(),
+            ProviderKind::Acp => self.acp.read().await.clone(),
             ProviderKind::OpenCode => self.opencode.read().await.clone(),
         }
     }
@@ -187,6 +193,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.hermes.read().await.clone() {
             out.push((ProviderKind::Hermes, p));
+        }
+        if let Some(p) = self.acp.read().await.clone() {
+            out.push((ProviderKind::Acp, p));
         }
         if let Some(p) = self.grok.read().await.clone() {
             out.push((ProviderKind::Grok, p));
@@ -746,6 +755,29 @@ pub async fn agent_chat_start_session<R: Runtime>(
             crate::local_session_import::require_live_session(&app, &thread)?;
         }
     }
+    if provider == ProviderKind::Acp {
+        let state: State<'_, AppStateStore> = app.state();
+        let workspace = state.workspace_id_for_pane(&pane_id);
+        if state.snapshot().workspaces.iter().any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some()) {
+            return Err("Custom ACP agents run on this desktop's local workspaces. Connect to the target desktop to run an agent there.".into());
+        }
+        let db: State<'_, DatabaseStore> = app.state();
+        let binding = db.acp_binding(&input.thread_id.0)?;
+        let selected = input.extra.get("acp_agent_id").and_then(serde_json::Value::as_str);
+        if binding.as_ref().is_some_and(|binding| selected.is_some_and(|id| id != binding.agent_id)) {
+            return Err("This chat is bound to another ACP instance. Start a new chat to change the harness.".into());
+        }
+        let id = binding.as_ref().map(|binding| binding.agent_id.as_str()).or(selected)
+            .ok_or_else(|| "Select a custom ACP agent before starting this chat.".to_string())?;
+        let config = db.acp_launch_config(id)?;
+        if binding.as_ref().is_some_and(|binding| binding.revision != config.agent.revision) {
+            return Err("This ACP launch configuration changed. Restore it or start a new chat; the existing conversation will not be replaced.".into());
+        }
+        // Persistent instance configuration owns the launch environment;
+        // only the host-owned workspace overlay may vary per conversation.
+        input.env = None;
+        input.permission_mode = None;
+    }
     if provider == ProviderKind::Hermes {
         let state: State<'_, AppStateStore> = app.state();
         let workspace = state.workspace_id_for_pane(&pane_id);
@@ -812,8 +844,10 @@ pub async fn agent_chat_start_session<R: Runtime>(
         // value left by the previous provider. `keep_or_set` was unsafe for
         // an in-place Claude -> Codex/OpenCode handoff because it preserved
         // Claude-only effort/context/permission columns on the new session.
-        model: Some(input.model.clone()),
-        effort: Some(input.effort.clone()),
+        // ACP projects its acknowledged binding after this row is created.
+        // Other providers retain complete nullable launch-selection persistence.
+        model: (provider != ProviderKind::Acp).then(|| input.model.clone()),
+        effort: (provider != ProviderKind::Acp).then(|| input.effort.clone()),
         context_window: Some(input.context_window.clone()),
         permission_mode: Some(input.permission_mode.clone()),
         fast_mode: Some(input.fast_mode),
@@ -832,6 +866,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
             ProviderKind::Hermes => "hermes",
+            ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
         };
         let persisted_sdk_session_id = {
@@ -1038,6 +1073,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
             ProviderKind::Hermes => "hermes",
+            ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
         };
         // A CodeMux thread can keep its transcript while changing provider,
@@ -1082,6 +1118,11 @@ pub async fn agent_chat_start_session<R: Runtime>(
             db.update_agent_chat_session_config(&session.thread_id.0, &config_for_persist)
         {
             eprintln!("[codemux::agent_chat] failed to persist session config: {error}");
+        }
+        if provider == ProviderKind::Acp {
+            // The row now exists. Project the latest acknowledged binding,
+            // including updates accepted while startup was completing.
+            db.project_acp_binding(&session.thread_id.0)?;
         }
         // Checkpoints are captured at each provider's real dispatch boundary,
         // not at session start. That keeps queued prompts aligned with both
@@ -1618,6 +1659,7 @@ fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
         "cursor" => Ok(ProviderKind::Cursor),
         "grok" => Ok(ProviderKind::Grok),
         "hermes" => Ok(ProviderKind::Hermes),
+        "acp" => Ok(ProviderKind::Acp),
         "opencode" => Ok(ProviderKind::OpenCode),
         other => Err(format!("unsupported provider stored for chat: {other}")),
     }
@@ -1858,7 +1900,7 @@ fn resume_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>
 /// Fetch (or create) the resume lock for a single thread. The returned
 /// `Arc` is cloned out from under the map's std mutex so the short
 /// synchronous section never overlaps the `.await` on the async lock.
-fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut map = resume_locks().lock().unwrap();
     map.entry(thread_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -1882,7 +1924,7 @@ impl HermesSendGate {
     async fn before_dispatch(&self, generation: u64) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
         let guard = self.dispatch.lock().await;
         if self.cancelled.load(Ordering::SeqCst) != generation {
-            return Err("cancelled: Hermes send stopped before dispatch".into());
+            return Err("cancelled: send stopped before dispatch".into());
         }
         Ok(guard)
     }
@@ -1915,7 +1957,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
         ProviderKind::Codex => Some("danger-full-access"),
         ProviderKind::Cursor => Some("agent"),
         ProviderKind::Grok => Some("agent"),
-        ProviderKind::Hermes => None,
+        ProviderKind::Hermes | ProviderKind::Acp => None,
         ProviderKind::OpenCode => None,
     }
 }
@@ -2069,10 +2111,10 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         return Ok(());
     };
 
-    if provider_kind == ProviderKind::Hermes {
+    if matches!(provider_kind, ProviderKind::Hermes | ProviderKind::Acp) {
         let state: State<'_, AppStateStore> = app.state();
         if state.snapshot().workspaces.iter().any(|w| w.workspace_id.0 == record.workspace_id && w.host_id.is_some()) {
-            return Err("unsupported: Hermes v1 runs on local workspaces only".into());
+            return Err("This ACP integration runs on local workspaces only; connect to the target desktop to resume it there.".into());
         }
     }
 
@@ -2159,11 +2201,13 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
-        model: record.model.clone(),
+        // ACP restores accepted binding intent. A legacy generic row is not
+        // an explicit new user override; shared setters apply that separately.
+        model: if provider_kind == ProviderKind::Acp { None } else { record.model.clone() },
         resume_cursor,
         fresh_session: false,
         permission_mode: permission_mode.clone(),
-        effort: record.effort.clone(),
+        effort: if provider_kind == ProviderKind::Acp { None } else { record.effort.clone() },
         context_window: record.context_window.clone(),
         fast_mode: record.fast_mode,
         additional_directories: vec![],
@@ -2189,7 +2233,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         Err(err)
             if resume_cursor.is_some()
                 && !require_original
-                && provider_kind != ProviderKind::Hermes =>
+                && !matches!(provider_kind, ProviderKind::Hermes | ProviderKind::Acp) =>
         {
             // Resume-start failed — retry once as a fresh session. The
             // transcript already hydrates from the DB, so the user keeps
@@ -2269,7 +2313,7 @@ fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
         ProviderKind::Cursor => crate::skills::SkillProvider::Codex,
         // Grok also consumes the portable `.agents/skills` projection.
         ProviderKind::Grok => crate::skills::SkillProvider::Codex,
-        ProviderKind::Hermes => crate::skills::SkillProvider::Codex,
+        ProviderKind::Hermes | ProviderKind::Acp => crate::skills::SkillProvider::Codex,
         ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
     }
 }
@@ -2404,7 +2448,7 @@ pub async fn send_turn_with_origin<R: Runtime>(
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    let hermes_gate = (provider == ProviderKind::Hermes).then(|| hermes_send_gate(&input.thread_id.0));
+    let hermes_gate = matches!(provider, ProviderKind::Hermes | ProviderKind::Acp).then(|| hermes_send_gate(&input.thread_id.0));
     let send_generation = hermes_gate.as_ref().map(|gate| gate.cancelled.load(Ordering::SeqCst));
     if origin == TurnOrigin::User {
         let db: State<'_, DatabaseStore> = app.state();
@@ -3525,7 +3569,7 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    let hermes_gate = (provider == ProviderKind::Hermes && turn_id.is_none())
+    let hermes_gate = (matches!(provider, ProviderKind::Hermes | ProviderKind::Acp) && turn_id.is_none())
         .then(|| hermes_send_gate(&thread_id.0));
     let _dispatch_guard = if let Some(gate) = hermes_gate.as_ref() {
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
@@ -3779,7 +3823,8 @@ fn emit_stale_request_failure<R: Runtime>(
 /// picked up by the next `ensure_live_session` auto-resume) and only
 /// THEN applied to the live session. A `SessionNotFound` from the live
 /// apply is swallowed into `Ok` — the value already took effect for the
-/// next resume.
+/// next resume. Custom ACP instead persists only acknowledged catalog state;
+/// its model change must reach a live, validated instance.
 #[tauri::command]
 pub async fn agent_chat_set_model<R: Runtime>(
     app: AppHandle<R>,
@@ -3801,6 +3846,18 @@ pub async fn agent_chat_set_model<R: Runtime>(
             impl_.set_model(thread_id.clone(), model.clone()).await.map_err(provider_err)?;
         }
         return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, Some(&model), None);
+    }
+
+    if provider == ProviderKind::Acp {
+        // Resume takes this same lock. Finish it before locking the mutation;
+        // a missing session is never acknowledgement of a model request.
+        ensure_live_session(&app, provider, &thread_id).await?;
+        let lock = resume_lock_for(&thread_id.0);
+        let _guard = lock.lock().await;
+        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
+        let acp = app.state::<Arc<crate::agent_provider::custom_acp::GenericAcpProvider>>();
+        let catalog = acp.catalog(&thread_id).await.map_err(provider_err)?;
+        return super::custom_acp::persist_catalog(&app.state::<DatabaseStore>(), &thread_id.0, &catalog);
     }
 
     // Persist first so a restart / next auto-resume uses the new model
@@ -3869,7 +3926,8 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
 /// before the live apply, and a `SessionNotFound` from the apply is
 /// swallowed into `Ok` so a restart / next auto-resume adopts the mode.
 /// Non-`SessionNotFound` errors (e.g. a provider that rejects
-/// mid-session permission changes) still surface.
+/// mid-session permission changes) still surface. Custom ACP validates the
+/// supervised host policy before persisting it, including for a cold thread.
 #[tauri::command]
 pub async fn agent_chat_set_permission_mode<R: Runtime>(
     app: AppHandle<R>,
@@ -3890,6 +3948,14 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
             impl_.set_permission_mode(thread_id.clone(), mode.clone()).await.map_err(provider_err)?;
         }
         return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, None, Some(&mode));
+    }
+    if provider == ProviderKind::Acp {
+        let lock = resume_lock_for(&thread_id.0);
+        let _guard = lock.lock().await;
+        impl_.set_permission_mode(thread_id.clone(), mode.clone()).await.map_err(provider_err)?;
+        return app.state::<DatabaseStore>().update_agent_chat_session_config(&thread_id.0, &AgentChatSessionConfig {
+            permission_mode: AgentChatSessionConfig::set(mode), ..Default::default()
+        });
     }
     // Persist first so the value survives a restart / next auto-resume.
     {
@@ -4027,6 +4093,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 .map_err(|error| error.to_command_string())
         }
         ProviderKind::Hermes => Err("Select a Hermes profile to discover its models".into()),
+        ProviderKind::Acp => Err("Select a custom ACP instance to discover its models".into()),
         ProviderKind::OpenCode => {
             crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
                 opencode_manager.inner().as_ref(),
@@ -4164,7 +4231,7 @@ pub async fn list_chat_slash_commands(
             Ok(commands)
         }
         ProviderKind::Codex => Ok(crate::agent_provider::codex::slash_commands::commands()),
-        ProviderKind::Hermes => match thread_id {
+        ProviderKind::Hermes | ProviderKind::Acp => match thread_id {
             Some(thread_id) => lookup_provider(&registry, provider).await?
                 .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err),
             None => Ok(Vec::new()),
@@ -4809,6 +4876,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         "cursor" => ProviderKind::Cursor,
         "grok" => ProviderKind::Grok,
         "hermes" => ProviderKind::Hermes,
+        "acp" => ProviderKind::Acp,
         "opencode" => ProviderKind::OpenCode,
         other => return Err(format!("unsupported_provider: {other}")),
     };

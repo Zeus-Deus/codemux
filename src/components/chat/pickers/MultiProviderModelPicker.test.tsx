@@ -103,6 +103,7 @@ function resetHealthStore() {
       cursor: emptyHealthSlot(),
       grok: emptyHealthSlot(),
       hermes: emptyHealthSlot(),
+      acp: emptyHealthSlot(),
       opencode: emptyHealthSlot(),
     },
   });

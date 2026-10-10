@@ -62,6 +62,7 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   getGithubIssueByPath,
@@ -140,10 +141,12 @@ function DraftChatSurfaceInner({
   focusOnMount: boolean;
   onBackgroundStarted: (draftId: string) => void;
 }) {
-  const capabilities = useProviderCapabilities((s) =>
+  const nativeCapabilities = useProviderCapabilities((s) =>
     selectCapabilities(s, draft.provider),
   );
-  const activeModel = selectModel(capabilities, draft.model);
+  const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, draft.threadId));
+  const capabilities = draft.provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
+  const activeModel = draft.provider === "acp" ? capabilities?.models.find(m => m.id === draft.model) ?? null : selectModel(capabilities, draft.model);
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
 
@@ -1021,7 +1024,7 @@ function DraftChatSurfaceInner({
   // permission-mode default differs between providers, so we seed a
   // sensible default whenever the provider flips.
   const handleProviderModelChange = useCallback(
-    (nextProvider: ChatDraft["provider"], nextModel: string) => {
+    (nextProvider: ChatDraft["provider"], nextModel: string | null) => {
       if (nextProvider === draft.provider) {
         updateDraftConfig(draft.draftId, { model: nextModel });
         return;
@@ -1210,7 +1213,7 @@ function DraftChatSurfaceInner({
       onAttachPr={handleAttachPr}
       onAttachSession={handleAttachSession}
       onAttachImage={handleAttachImage}
-      modelSupportsImages={activeModel?.supports_images ?? false}
+      modelSupportsImages={draft.provider === "acp" ? acpCatalog?.supports_images ?? false : activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={existingWorkspaceProviderKind}
       providerCliInstalled={providerCliInstalled}

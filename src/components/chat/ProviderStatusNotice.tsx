@@ -14,6 +14,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   cursor: "Cursor",
   grok: "Grok",
   hermes: "Hermes",
+  acp: "Custom agent",
   opencode: "OpenCode",
 };
 

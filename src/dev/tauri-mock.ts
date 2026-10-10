@@ -35,6 +35,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
@@ -2787,6 +2788,8 @@ function streamMockRunStalled(
 /** Provider-health QA: per-provider override served by the
  *  `agent_chat_provider_health` mock handler. Absent → healthy. */
 type MockProviderKind =
+  | "acp"
+  | "hermes"
   | "claude"
   | "codex"
   | "cursor"
@@ -3441,7 +3444,9 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+const customAcpMock = createCustomAcpMock(emitEvent);
 const handlers: Record<string, Handler> = {
+  ...customAcpMock.handlers,
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
     if (update) {
@@ -4369,6 +4374,7 @@ const handlers: Record<string, Handler> = {
   // resume, New Chat).
   agent_chat_start_session: (a) => {
     const threadId = (a.input as { thread_id: string }).thread_id;
+    if (a.provider === "acp") customAcpMock.start(a.input as { thread_id: string; cwd: string; model: string | null; extra?: unknown });
     const expectedThread =
       typeof a.expectedThread === "string" ? a.expectedThread : null;
     const pane = findChatPaneNode(a.paneId);
@@ -4617,10 +4623,10 @@ const handlers: Record<string, Handler> = {
     });
     return undefined;
   },
-  agent_chat_set_model: () => undefined,
+  agent_chat_set_model: (a) => { if (a.provider === "acp") customAcpMock.setModel(String(a.threadId), String(a.model)); },
   agent_chat_set_fast_mode: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
-  agent_chat_stop_session: () => undefined,
+  agent_chat_stop_session: (a) => customAcpMock.handlers.agent_chat_stop_session(a),
   agent_chat_rename_session: () => undefined,
   agent_chat_delete_session: () => undefined,
   agent_chat_list_turn_checkpoints: (a) => {

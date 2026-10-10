@@ -46,6 +46,7 @@ fn binary_name(provider: ProviderKind) -> &'static str {
         ProviderKind::Cursor => "cursor-agent",
         ProviderKind::Grok => "grok",
         ProviderKind::Hermes => "hermes",
+        ProviderKind::Acp => "acp",
         ProviderKind::OpenCode => "opencode",
     }
 }
@@ -197,6 +198,9 @@ async fn detect(
     provider: ProviderKind,
     installation: Option<&str>,
 ) -> Result<Installation, String> {
+    if provider == ProviderKind::Acp {
+        return Err("Custom ACP executables are managed externally; Codemux does not update them.".into());
+    }
     let binary = if provider == ProviderKind::Hermes {
         crate::agent_provider::hermes::profile::resolve_installation(Path::new(
             installation.unwrap_or("hermes"),

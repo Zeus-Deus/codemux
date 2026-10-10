@@ -46,6 +46,8 @@ import {
   sessionProviderLabel,
 } from "@/lib/agent-chat/session-mentions";
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
+import { useAppStore } from "@/stores/app-store";
+import { useCustomAcpThread } from "@/hooks/use-custom-acp-thread";
 import { isChatModeSupported } from "@/lib/agent-chat/mode-compatibility";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
@@ -356,7 +358,7 @@ interface Props {
   onStop: () => void;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
-    model: string,
+    model: string | null,
   ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
@@ -488,7 +490,18 @@ export function Composer({
   const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
   const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
   const addonActions = useAddonComposerActions(addonComposer);
-  const configurationEnabled = sessionReady && configurationReady;
+  const customAgentsAllowed = useAppStore(s => {
+    const workspace = s.appState?.workspaces.find(w => w.workspace_id === workspaceId);
+    return !workspace?.attach_only && workspace?.host_id == null;
+  });
+  const acp = useCustomAcpThread(threadId, provider === "acp" && customAgentsAllowed);
+  if (provider === "acp") {
+    modelSupportsImages = acp.catalog?.supports_images ?? false;
+    if (!acp.ready || !modelSupportsImages) onAttachImage = undefined;
+    permissionModes = [];
+  }
+  const unsupportedAcpImages = provider === "acp" && !acp.catalog?.supports_images && stagedAttachments.some(a => a.kind === "image");
+  const configurationEnabled = (sessionReady || (provider === "acp" && sessionAwaitingIntent)) && configurationReady && !acp.busy && !acp.loading;
   // Named apart from the `provider` prop above, which is the AI agent
   // backend (claude/codex/…) — a different axis entirely.
   const scProvider = resolveProvider(providerKind);
@@ -690,7 +703,7 @@ export function Composer({
       }).map((item) => ({
         ...item,
         disabled:
-          item.disabled ||
+          item.disabled || provider === "acp" ||
           !configurationEnabled ||
           (item.id === "mode:plan" &&
             !isChatModeSupported(provider, "plan")) ||
@@ -882,7 +895,7 @@ export function Composer({
         { name: "settings", label: "Agent settings", section: "agent", description: "Open Codemux agent settings" },
         { name: "usage", label: "Usage", section: "usage", description: "View provider usage and limits" }].map((action): SlashCommandItem => ({
           id: `composer:${action.name}`, label: action.label, command: `/${action.name}`, icon: Settings,
-          description: action.description, group: "CHAT", onSelect: () => useUIStore.getState().setShowSettings(true, action.section),
+          description: action.description, disabled: provider === "acp" && action.name !== "settings", group: "CHAT", onSelect: () => useUIStore.getState().setShowSettings(true, action.section),
         })),
       ...(provider === "codex" ? [{
         id: "composer:hooks", label: "Hooks", command: "/hooks", icon: Settings,
@@ -903,7 +916,7 @@ export function Composer({
       },
       {
         id: "composer:mcp", label: "MCP servers", command: "/mcp", icon: Server,
-        description: "View and manage connected tools", group: "CHAT",
+        description: provider === "acp" ? "Host MCP injection is unavailable for custom harnesses" : "View and manage connected tools", disabled: provider === "acp", group: "CHAT",
         onSelect: () => { setAttachOpen(true); setAttachSubmode("mcp"); setAttachQuery(""); },
       },
     ],
@@ -1931,7 +1944,8 @@ export function Composer({
         {
           id: "attach:mcp",
           label: "MCP Servers…",
-          description: "Toggle integrations the agent can call",
+          description: provider === "acp" ? "Host MCP injection unavailable for custom harnesses" : "Toggle integrations the agent can call",
+          disabled: provider === "acp",
           command: "",
           icon: Server,
           tone: "green",
@@ -2672,7 +2686,7 @@ export function Composer({
     [],
   );
   const submit = useCallback((background = false) => {
-    if (remoteDisconnected) return;
+    if (remoteDisconnected || (provider === "acp" && (!acp.ready || acp.busy || !customAgentsAllowed || unsupportedAcpImages))) return;
     const action = allSlashItems.find((item) => item.id.startsWith("composer:") && item.command.toLowerCase() === draft.trim().toLowerCase());
     if (action) {
       if (action.disabled) return;
@@ -2697,7 +2711,7 @@ export function Composer({
     }, SEND_HOLD_MS);
     if (background && onBackgroundSubmit) onBackgroundSubmit();
     else onSubmit();
-  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems]);
+  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems, provider, acp.ready, acp.busy, customAgentsAllowed, unsupportedAcpImages]);
 
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's
@@ -2708,7 +2722,7 @@ export function Composer({
   const delivery = parseMessageDelivery(draft);
   const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
   const discoveringCommands = draftLeadsWithSlash && providerCommandsEntry.loading && !providerCommandsEntry.loaded;
-  const canSubmit = !remoteDisconnected && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
+  const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
@@ -2764,7 +2778,7 @@ export function Composer({
     // textarea via native tab navigation.
     if (e.shiftKey && e.key === "Tab") {
       e.preventDefault();
-      if (!configurationEnabled) return;
+      if (!configurationEnabled || provider === "acp") return;
       // Grok exposes ask/agent as restart-scoped permissions, not the
       // client-controlled Plan/Ask chat modes. Keep keyboard cycling useful
       // by skipping those two unsupported states.
@@ -3093,7 +3107,7 @@ export function Composer({
               footerNote={attachPopupFooter}
               submode={attachSubmode}
               headerSlot={
-                ladder.configInMenu && attachSubmode === "main" ? (
+                ladder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
                   <>
                     <ReasoningPicker
                       model={activeModel}
@@ -3161,6 +3175,9 @@ export function Composer({
                   </span>
                 </div>
               )}
+              {unsupportedAcpImages && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}
+              {provider === "acp" && !customAgentsAllowed && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">Custom agents are local-workspace only. Create a local chat to use this harness.</p>}
+              {provider === "acp" && (acp.error || acp.loading || acp.warning) && <p role={acp.error ? "alert" : "status"} className="px-3 pt-2 text-body-sm text-muted-foreground">{acp.error ?? acp.warning ?? "Restoring custom agent identity…"}</p>}
               {/* Step 8 Stage 3 refactor — strip above textarea hosts
                   the active mode pill + image attachment chips. File /
                   folder chips render INSIDE the textarea via the mirror
@@ -3567,6 +3584,7 @@ export function Composer({
           <ComposerFooter
             hermesThreadId={threadId}
             hermesProjectPath={cwd}
+            customAgentsAllowed={customAgentsAllowed}
             provider={provider}
             model={model}
             permissionMode={permissionMode}

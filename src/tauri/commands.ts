@@ -1687,12 +1687,34 @@ export const agentChatStartSession = async (
   input: AgentChatStartSessionInput,
   expectedThread: string | null = null,
 ) => {
+  let acpStartEpoch: number | undefined;
   if (provider === "hermes") {
     const { useHermes } = await import("@/stores/hermes-store");
     const profile = useHermes.getState().selections[input.thread_id];
     if (profile) input = { ...input, permission_mode: useHermes.getState().modes[input.thread_id] ?? input.permission_mode, extra: { hermes_profile: profile } };
   }
-  return invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+  if (provider === "acp") {
+    const { useCustomAcp, acpLifecycleEpoch } = await import("@/stores/custom-acp-store");
+    const state = useCustomAcp.getState();
+    const binding = await state.restore(input.thread_id);
+    const extra: Record<string, unknown> = input.extra && typeof input.extra === "object" && !Array.isArray(input.extra) ? input.extra as Record<string, unknown> : {};
+    const explicitId = typeof extra.acp_agent_id === "string" ? extra.acp_agent_id : null;
+    if (binding && explicitId !== null && explicitId !== binding.agent_id) throw new Error("This thread is bound to a different custom agent.");
+    const agentId = binding?.agent_id ?? explicitId ?? useCustomAcp.getState().selections[input.thread_id];
+    if (!agentId) throw new Error("Choose a custom agent before starting this chat.");
+    input = { ...input, permission_mode: null, extra: { ...(input.extra && typeof input.extra === "object" && !Array.isArray(input.extra) ? input.extra : {}), acp_agent_id: agentId } };
+    acpStartEpoch = acpLifecycleEpoch(input.thread_id);
+  }
+  const threadId = await invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+  if (provider === "acp") {
+    const { useCustomAcp } = await import("@/stores/custom-acp-store");
+    const binding = await useCustomAcp.getState().restore(threadId);
+    if (!binding) throw new Error("Custom agent session started, but its durable binding could not be verified. Reopen this chat before sending.");
+    // The start invoke, not durable metadata, is the process evidence.
+    // Keep any lifecycle/read evidence admitted during the metadata gap.
+    useCustomAcp.getState().markLive(threadId, true, acpStartEpoch);
+  }
+  return threadId;
 };
 
 export const agentChatSendTurn = (
@@ -1930,10 +1952,16 @@ export const agentChatSetPermissionMode = (
     mode,
   });
 
-export const agentChatStopSession = (
+export const agentChatStopSession = async (
   provider: AgentChatProviderKind,
   threadId: string,
-) => invoke<void>("agent_chat_stop_session", { provider, threadId });
+) => {
+  await invoke<void>("agent_chat_stop_session", { provider, threadId });
+  if (provider === "acp") {
+    const { useCustomAcp } = await import("@/stores/custom-acp-store");
+    useCustomAcp.getState().markLive(threadId, false);
+  }
+};
 
 // ── Session history (pane-header dropdown) ──
 

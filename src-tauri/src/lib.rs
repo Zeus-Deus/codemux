@@ -571,6 +571,25 @@ fn build_core_app<R: tauri::Runtime>(
         })
         .setup(move |app| {
             diagnostics::record_startup_milestone("startup.setup-enter");
+            // Configuration and explicit connection probes remain available
+            // when chat is disabled. Constructing the aggregate starts no CLI.
+            let acp = std::sync::Arc::new(agent_provider::custom_acp::GenericAcpProvider::new(
+                std::sync::Arc::new(commands::custom_acp::AppAcpStore(app.handle().clone())),
+            ));
+            let mut catalogs = acp.catalog_updates();
+            let catalog_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match catalogs.recv().await {
+                        Ok(update) => { let _ = catalog_handle.emit("custom_acp_catalog_changed", update); }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = catalog_handle.emit("custom_acp_changed", ());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            app.manage(acp);
             // Reap chat-image staging files leaked by a crash or an
             // abandoned draft (best-effort, off the startup path).
             tauri::async_runtime::spawn(
@@ -1123,6 +1142,7 @@ fn build_core_app<R: tauri::Runtime>(
                     app.handle().state();
                 if observability.agent_chat_enabled() {
                     let registry_handle = app.handle().clone();
+                    let acp = app.state::<std::sync::Arc<agent_provider::custom_acp::GenericAcpProvider>>().inner().clone();
                     tauri::async_runtime::spawn(async move {
                         let registry: tauri::State<
                             '_,
@@ -1201,6 +1221,8 @@ fn build_core_app<R: tauri::Runtime>(
                         ));
                         registry_handle.manage(hermes.clone());
                         registry.set_hermes(hermes).await;
+
+                        registry.set_acp(acp).await;
 
                         // OpenCode provider — Step 12 Stage 8. Shares
                         // the singleton OpenCodeServerManager held in
@@ -2504,6 +2526,14 @@ fn build_core_app<R: tauri::Runtime>(
             commands::hermes::hermes_binding,
             commands::hermes::hermes_catalog,
             commands::hermes::hermes_disconnect,
+            commands::custom_acp::acp_agents,
+            commands::custom_acp::acp_save_agent,
+            commands::custom_acp::acp_delete_agent,
+            commands::custom_acp::acp_probe,
+            commands::custom_acp::acp_binding,
+            commands::custom_acp::acp_catalog,
+            commands::custom_acp::acp_thread_catalog,
+            commands::custom_acp::acp_set_config,
             commands::agent_chat_provider_health,
             commands::provider_updates::agent_chat_provider_update_check,
             commands::provider_updates::agent_chat_provider_update,
