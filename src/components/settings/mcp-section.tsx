@@ -14,6 +14,7 @@ import {
 import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
 import { cn } from "@/lib/utils";
 import { useMcpStore } from "@/stores/mcp-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   listMcpServers,
   MCP_CODEMUX_SELF_ID,
@@ -26,6 +27,7 @@ import {
   type McpServerRuntime,
 } from "@/tauri/commands";
 
+import { OutsideAssistantsSection } from "./outside-assistants-section";
 import { McpToolModal } from "./mcp-tool-modal";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
 
@@ -63,6 +65,14 @@ interface Props {
  * updates so the UI never polls.
  */
 export function McpSection({ projectRoot }: Props) {
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  return <div>
+    {enableAgentChat && <OutboundMcpSection projectRoot={projectRoot} />}
+    <OutsideAssistantsSection />
+  </div>;
+}
+
+function OutboundMcpSection({ projectRoot }: Props) {
   const [servers, setServers] = useState<McpServerConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

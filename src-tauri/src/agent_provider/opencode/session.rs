@@ -403,6 +403,7 @@ impl OpenCodeSession {
                 input.model_override,
                 input.effort_override,
                 steered,
+                input.turn_checkpoint.clone(),
             )
             .await;
         match result {
@@ -571,7 +572,7 @@ impl OpenCodeSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
-        self.post_turn(text, images, model_override, effort_override, false)
+        self.post_turn(text, images, model_override, effort_override, false, None)
             .await
     }
 
@@ -582,6 +583,7 @@ impl OpenCodeSession {
         model_override: Option<String>,
         effort_override: Option<String>,
         steer: bool,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
         let model = match model_override {
             Some(m) => Some(m),
@@ -643,6 +645,7 @@ impl OpenCodeSession {
         };
         let turn_id = {
             let mut ctx = self.event_ctx.lock().await;
+            if let Some(checkpoint) = &checkpoint { checkpoint.authorize_dispatch()?; }
             if !steer {
                 ctx.turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
             }
@@ -771,6 +774,20 @@ impl OpenCodeSession {
         // SSE may already have completed the turn before this HTTP response.
         // Never re-arm it here. A steer retains the active turn's identity.
         Ok(turn_id)
+    }
+
+    pub async fn interrupt_selected(&self, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
+        // All native prompt assignment and queue drains own outbound. Keep it
+        // across the session-scoped abort so a newer turn cannot enter between
+        // checking the selected identity and writing the HTTP request.
+        let _outbound = self.outbound.lock().await;
+        if let Some(turn_id) = turn_id {
+            let ctx = self.event_ctx.lock().await;
+            if !ctx.turn_active || ctx.turn_id != turn_id {
+                return Err(ProviderError::ValidationError {message:"stale_turn: selected OpenCode turn is no longer active".into()});
+            }
+        }
+        self.interrupt().await
     }
 
     /// Abort the active turn. OpenCode's `/abort` endpoint is
@@ -1102,7 +1119,7 @@ pub(crate) fn lookup_model_cost(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agent_provider::types::{ImageInput, ThreadId};
     use mockito::Server;
@@ -1378,7 +1395,7 @@ mod tests {
     /// pre-built handle pointing at the supplied mock URL. Bypasses
     /// the real `opencode serve` process so unit tests don't depend
     /// on the binary.
-    async fn mock_session(
+    pub(crate) async fn mock_session(
         base_url: String,
         password: String,
         session_id: &str,

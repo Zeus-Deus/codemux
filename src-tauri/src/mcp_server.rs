@@ -12,6 +12,10 @@ use std::sync::{LazyLock, Mutex};
 // removes the entry after the repair. It can never remove-then-resurrect it.
 static MCP_CONFIG_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Set by app-owned provider MCP descriptors, never per-call metadata.
+pub(crate) const PROVIDER_ORIGIN_ENV: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+fn provider_stdio_origin() -> bool { std::env::var_os(PROVIDER_ORIGIN_ENV).is_some() }
+
 /// Check if auto-MCP config is enabled in settings (default: true).
 pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     use tauri::Manager;
@@ -86,7 +90,7 @@ struct McpTool {
 }
 
 fn register_tools() -> Vec<McpTool> {
-    vec![
+    let mut tools = vec![
         // -- Browser tools --
         McpTool {
             name: "browser_navigate",
@@ -865,7 +869,15 @@ fn register_tools() -> Vec<McpTool> {
                 "required": ["number"]
             }),
         },
-    ]
+    ];
+    if !provider_stdio_origin() {
+        tools.extend(crate::agent_control::native_tools().into_iter().map(|tool| McpTool {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        }));
+    }
+    tools
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +899,9 @@ async fn dispatch(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
+                "instructions": if provider_stdio_origin() {
+                    "Use the advertised workspace and browser tools. Native thread control is unavailable on provider-injected MCP; it requires a separate authorized controller connection."
+                } else { crate::agent_control::INSTRUCTIONS },
                 "serverInfo": {
                     "name": "codemux",
                     "version": env!("CARGO_PKG_VERSION")
@@ -965,6 +980,10 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         Some(name) => name.to_string(),
         None => return JsonRpcResponse::error(id, INVALID_REQUEST, "Missing tool name"),
     };
+    if provider_stdio_origin() && crate::agent_control::is_native_tool(&tool_name) {
+        return JsonRpcResponse::error(id, INVALID_REQUEST,
+            "provider_control_denied: provider MCP cannot use trusted native-controller tools");
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     // Workspace ID for workspace-scoped routing (browser session binding,
@@ -986,6 +1005,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         |action: Value| json!({ "workspace_id": &workspace_id, "cwd": &cwd, "action": action });
 
     let result = match tool_name.as_str() {
+        name if crate::agent_control::is_native_tool(name) => call_socket(name,arguments.clone()).await,
         // -- Browser tools --
         "browser_navigate" => {
             let url = arguments.get("url").and_then(Value::as_str).unwrap_or_default();
@@ -1721,7 +1741,8 @@ fn codemux_mcp_entry() -> Value {
     let command = codemux_mcp_command();
     json!({
         "command": command,
-        "args": ["mcp"]
+        "args": ["mcp"],
+        "env": { (PROVIDER_ORIGIN_ENV): "1" }
     })
 }
 
@@ -2138,6 +2159,30 @@ fn remove_mcp_config_locked(workspace_dir: &Path) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn review_s1_provider_stdio_has_no_trusted_native_controller_route() {
+        const MARKER: &str = "CODEMUX_MCP_PROVIDER_ORIGIN";
+        if std::env::var_os("CODEMUX_REVIEW_STDIO_CHILD").is_none() {
+            // Process-owned origin, never mutable global test environment or
+            // caller-controlled request metadata. This invokes only this test.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["mcp_server::tests::review_s1_provider_stdio_has_no_trusted_native_controller_route", "--exact", "--nocapture"])
+                .env(MARKER, "1").env("CODEMUX_REVIEW_STDIO_CHILD", "1").output().unwrap();
+            assert!(result.status.success(), "provider-origin stdio assertion failed: {}", String::from_utf8_lossy(&result.stderr));
+            assert_eq!(codemux_mcp_entry()["env"][MARKER], "1", "app-installed provider configs must bind the restricted invocation");
+            return;
+        }
+        assert!(!register_tools().iter().any(|tool| crate::agent_control::is_native_tool(tool.name)),
+            "provider-origin stdio must omit trusted native tools");
+        let result = handle_tool_call(json!(1), json!({"name":"thread_launch","arguments":{},
+            "_meta":{"control_access":"full_access"}})).await;
+        assert!(serde_json::to_string(&result).unwrap().contains("provider_control_denied"),
+            "provider stdio must reject guessed native calls before opening a trusted socket");
+        let initialized = dispatch(JsonRpcRequest {jsonrpc:"2.0".into(),method:"initialize".into(),params:json!({}),id:Some(json!(2))}).await.unwrap();
+        assert!(initialized.result.unwrap()["instructions"].as_str().unwrap().contains("Native thread control is unavailable"),
+            "provider instructions must not promise the native tools removed from its catalog");
+    }
+
     #[test]
     fn scroll_amount_reaches_receiver_as_i64() {
         // The receiver (stream_input handle_vision_action) reads `amount` with
@@ -2193,8 +2238,8 @@ mod tests {
         // with provider-neutral attached-conversation history
         // (workspace_archive / workspace_unarchive /
         // workspace_archive_list). Keep this number in sync with
-        // register_tools() when adding new entries.
-        assert_eq!(tools.len(), 57);
+        // register_tools() when adding new entries. Native control adds eleven.
+        assert_eq!(tools.len(), 68);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -2362,9 +2407,10 @@ mod tests {
     fn path_level_entry_leaves_each_session_workspace_id_inherited() {
         let entry = codemux_mcp_entry();
         assert!(
-            entry.get("env").is_none(),
+            entry["env"].get("CODEMUX_WORKSPACE_ID").is_none(),
             "a shared path must not pin one workspace id in .mcp.json"
         );
+        assert_eq!(entry["env"][PROVIDER_ORIGIN_ENV], "1");
 
         let params = json!({ "name": "browser_navigate", "arguments": {} });
         assert_eq!(
@@ -2410,8 +2456,8 @@ mod tests {
         // then 44 → 52 with the eight automation tools, then 52 → 55
         // with the workspace-archive tools, then 55 → 57 with attached
         // conversation history. See
-        // tool_registry_has_all_tools for the canonical count.
-        assert_eq!(tools.len(), 57);
+        // tool_registry_has_all_tools for the canonical count (native control adds eleven).
+        assert_eq!(tools.len(), 68);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
@@ -2484,7 +2530,7 @@ mod tests {
         let config = read_mcp(&dir);
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
         assert_eq!(config["mcpServers"]["codemux"]["args"][0], "mcp");
-        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
 
         cleanup(&dir);
     }
@@ -2522,7 +2568,7 @@ mod tests {
         let config = read_mcp(&dir);
         // codemux updated
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
-        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
         // other server untouched
         assert_eq!(config["mcpServers"]["other"]["command"], "x");
 
@@ -2612,7 +2658,7 @@ mod tests {
         upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
-        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(config["mcpServers"]["codemux"]["env"], json!({(PROVIDER_ORIGIN_ENV): "1"}));
         assert_eq!(std::fs::read(dir.join(".mcp.json")).unwrap(), before);
 
         cleanup(&dir);
@@ -3159,6 +3205,28 @@ mod tests {
         );
 
         cleanup(&dir);
+    }
+
+    #[test]
+    fn native_thread_control_tools_are_discoverable() {
+        let tools = register_tools();
+        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool.name).collect();
+        for name in [
+            "agent_capabilities",
+            "thread_list",
+            "thread_launch",
+            "thread_send",
+            "thread_read",
+            "thread_status",
+            "thread_wait",
+            "thread_interrupt",
+            "thread_stop",
+            "thread_respond",
+            "operation_status",
+        ] {
+            assert!(names.contains(name), "native control tool {name} is missing from MCP discovery");
+        }
+        assert_eq!(names.len(), tools.len(), "MCP tool names must remain unique");
     }
 
     /// Upsert path uses atomic_write under the hood — verify a fresh

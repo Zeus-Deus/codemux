@@ -85,6 +85,31 @@ import type {
   NativePerformanceDiagnostics,
 } from "./types";
 
+// ── Outside-assistant MCP connector ──
+
+async function invokeAgentConnector<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (isRemoteClient()) throw new Error("Manage connections from the desktop.");
+  return args ? invoke<T>(command, args) : invoke<T>(command);
+}
+
+export const agentConnectorStatus = () =>
+  invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_status");
+
+export const agentConnectorSetConfig = (config: { enabled: boolean; publicOrigin: string | null }) =>
+  invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_set_config", {
+    enabled: config.enabled,
+    publicOrigin: config.publicOrigin,
+  });
+
+export const agentConnectorApprove = (requestId: string, access: import("./types").AgentConnectorAccess) =>
+  invokeAgentConnector<void>("agent_connector_approve", { requestId, access });
+
+export const agentConnectorDeny = (requestId: string) =>
+  invokeAgentConnector<void>("agent_connector_deny", { requestId });
+
+export const agentConnectorRevoke = (clientId: string) =>
+  invokeAgentConnector<void>("agent_connector_revoke", { clientId });
+
 /** Bounded, identifier-free native latency summaries for support reports. */
 export const getPerformanceDiagnostics = () =>
   invoke<NativePerformanceDiagnostics>("get_performance_diagnostics");

@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, within, cleanup } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from "vitest";
+import { render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
+afterEach(cleanup);
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -141,10 +142,19 @@ vi.mock("@/tauri/commands", () => ({
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
   usageExportCsv: vi.fn().mockResolvedValue(""),
+  agentConnectorStatus: vi.fn().mockResolvedValue({ enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null, localCommand: "codemux mcp", pending: [], clients: [] }),
+  agentConnectorRevoke: vi.fn().mockResolvedValue(undefined),
+  listMcpServers: vi.fn().mockResolvedValue([]),
+  getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
+  setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
+  primeMcpRuntime: vi.fn().mockResolvedValue([]),
 }));
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
 vi.mock("@/tauri/events", () => ({
   onPresetsChanged: vi.fn().mockReturnValue(Promise.resolve(() => {})),
+  onAgentConnectorChanged: vi.fn().mockResolvedValue(() => {}),
 }));
 
 // ── Model picker mock ──
@@ -542,6 +552,30 @@ describe("Settings footer navigation", () => {
     expect(view.getByRole("status")).toHaveTextContent("Settings section unavailable");
     expect(view.queryByRole("button", { name: "Pin to footer" })).toBeNull();
     view.unmount();
+  });
+
+  it("keeps inbound administration on the shared MCP route in classic CLI mode without mounting outbound runtime", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    vi.clearAllMocks();
+    const status = { enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null,
+      localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", clientName: "Synthetic read-only assistant", callbackOrigin: "https://client.example",
+        access: "read_only" as const, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString() }] };
+    vi.mocked(commands.agentConnectorStatus).mockResolvedValue(status);
+    requestedSection = "mcp";
+    const view = render(<SettingsView />);
+    try {
+      expect(view.getByRole("button", { name: "MCP Servers" })).toHaveAttribute("aria-current", "page");
+      fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
+      vi.mocked(commands.agentConnectorStatus).mockResolvedValue({ ...status, clients: [] });
+      fireEvent.click(view.getByRole("button", { name: "Revoke access" }));
+      await waitFor(() => expect(commands.agentConnectorRevoke).toHaveBeenCalledWith("synthetic-granted"));
+      await waitFor(() => expect(view.queryByText("Synthetic read-only assistant")).not.toBeInTheDocument());
+      expect(commands.agentConnectorStatus).toHaveBeenCalledTimes(2);
+      for (const fn of [commands.listMcpServers, commands.getMcpRuntimeStatus, commands.setMcpDisabledIds, commands.primeMcpRuntime]) expect(fn).not.toHaveBeenCalled();
+      expect(view.queryByLabelText("Refresh MCP servers")).not.toBeInTheDocument();
+      expect(useFeatureFlags.getState().enableAgentChat).toBe(false);
+    } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); requestedSection = null; }
   });
 
   it("does not render a chat-only Settings section when the feature is disabled", async () => {

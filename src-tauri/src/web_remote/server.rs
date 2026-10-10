@@ -237,6 +237,7 @@ pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
         .route("/proxy/browser/:port/ws", get(super::proxy::ws_proxy::<R>))
         .route("/proxy/browser/:port/api/*rest", any(super::proxy::http_forward::<R>))
         .route("/ws", get(ws_upgrade::<R>))
+        .merge(crate::mcp_connector::router::<R>())
         .merge(compressible)
         .with_state(app)
 }

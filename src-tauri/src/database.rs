@@ -1,4 +1,6 @@
 pub mod async_questions;
+pub mod agent_control;
+pub mod mcp_connector;
 pub mod hermes;
 pub(crate) mod local_sessions;
 
@@ -8,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -355,6 +357,8 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
+    conn.execute_batch(mcp_connector::SCHEMA).map_err(|e| e.to_string())?;
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(

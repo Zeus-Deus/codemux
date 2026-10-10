@@ -83,9 +83,19 @@ pub struct ProviderCapabilities {
 /// prompts capture the state at dispatch, not when they were typed.
 #[async_trait]
 pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
+    /// Fallible runtime-only authority at actual dispatch, including drains.
+    /// Plain Git snapshots have no caller; the native owner wraps controlled
+    /// inputs with a live authority check regardless of checkpoint settings.
+    fn authorize_dispatch(&self) -> Result<(), super::ProviderError> { Ok(()) }
     async fn prepare(&self);
     async fn commit(&self);
     async fn abort(&self);
+}
+
+#[async_trait]
+pub trait SessionStartCancellation: Send + Sync {
+    fn check(&self) -> Result<(), String>;
+    async fn cancelled(&self);
 }
 
 /// Opaque identifier a provider hands back for its own internal session.

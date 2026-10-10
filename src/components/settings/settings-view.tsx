@@ -2113,11 +2113,7 @@ export function SettingsView() {
         );
 
       case "mcp":
-        return enableAgentChat ? (
-          <McpSection projectRoot={projectRoot} />
-        ) : (
-          <InterfaceSection />
-        );
+        return <McpSection projectRoot={projectRoot} />;
 
       case "archive":
         return (

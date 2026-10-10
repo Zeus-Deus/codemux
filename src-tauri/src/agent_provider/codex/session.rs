@@ -646,6 +646,7 @@ impl CodexSession {
                 input.skill_invocations,
                 input.model_override,
                 input.effort_override,
+                checkpoint.clone(),
             )
             .await;
         match sent {
@@ -715,6 +716,7 @@ impl CodexSession {
                         input.skill_invocations.clone(),
                     ),
                 };
+                if let Some(checkpoint) = &input.turn_checkpoint { checkpoint.authorize_dispatch()?; }
                 match self
                     .child
                     .request("turn/steer", serde_json::to_value(params).unwrap())
@@ -759,6 +761,7 @@ impl CodexSession {
                     input.skill_invocations.clone(),
                     input.model_override.clone(),
                     input.effort_override.clone(),
+                    input.turn_checkpoint.clone(),
                 )
                 .await
             } else {
@@ -769,6 +772,7 @@ impl CodexSession {
                     input.model_override.clone(),
                     input.effort_override.clone(),
                     input.client_nonce.clone(),
+                    input.turn_checkpoint.clone(),
                 )
                 .await
                 .map_err(plain_send_error)
@@ -873,6 +877,7 @@ impl CodexSession {
                     queued.input.skill_invocations,
                     queued.input.model_override,
                     queued.input.effort_override,
+                    checkpoint.clone(),
                 )
                 .await
             {
@@ -1015,6 +1020,7 @@ impl CodexSession {
         skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
         model_override: Option<String>,
         effort_override: Option<String>,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
         let thread_id = self.state.lock().await.codex_thread_id.clone();
         let native = super::slash_commands::request(&text, &thread_id)
@@ -1029,6 +1035,12 @@ impl CodexSession {
             // its response, and own the final lifecycle/real turn identifier.
             let pending = TurnId(format!("native-{}", uuid::Uuid::new_v4()));
             self.state.lock().await.active_turn = Some(pending.clone());
+            if let Some(checkpoint) = &checkpoint {
+                if let Err(error) = checkpoint.authorize_dispatch() {
+                    self.state.lock().await.active_turn = None;
+                    return Err(error);
+                }
+            }
             let response = match self.child.request(method, params).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -1077,6 +1089,7 @@ impl CodexSession {
             model_override,
             effort_override,
             None,
+            checkpoint,
         )
         .await
         .map_err(plain_send_error)
@@ -1090,6 +1103,7 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
         client_id: Option<String>,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, TurnStartError> {
         let (codex_thread_id, model_default, effort_default, fast_mode) = {
             let state = self.state.lock().await;
@@ -1134,6 +1148,11 @@ impl CodexSession {
         let mut params_value = serde_json::to_value(&params).unwrap();
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
+        }
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.authorize_dispatch().map_err(|error| TurnStartError::Rpc(
+                crate::json_rpc_child::RpcChildError::RpcError(crate::json_rpc_child::RpcError {code:-32001,message:error.to_string(),data:None})
+            ))?;
         }
         let resp = self
             .child
@@ -1260,6 +1279,7 @@ impl CodexSession {
                         None,
                         None,
                         Some(input.submission_id.clone()),
+                        input.checkpoint.clone(),
                     )
                     .await;
                 match result {

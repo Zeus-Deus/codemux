@@ -348,6 +348,9 @@ impl JsonRpcChild {
             });
         }
 
+        #[cfg(test)]
+        let test_exit_cwd = config.cwd.clone();
+
         // Reader task: parses stdout lines and routes them. The JoinHandle
         // is handed to the watchdog so it can await EOF before failing
         // pending requests (the module-level "Exit-drain guarantee").
@@ -453,6 +456,12 @@ impl JsonRpcChild {
                         code,
                         stderr_tail: tail_snapshot.clone(),
                     });
+                }
+
+                #[cfg(test)]
+                if let Some(barrier) = exit_drain_test_barrier(test_exit_cwd.as_deref()) {
+                    barrier.entered.notify_one();
+                    barrier.release.acquire().await.unwrap().forget();
                 }
 
                 // Fail every request that is GENUINELY still outstanding —
@@ -679,6 +688,30 @@ impl JsonRpcChild {
         }
         RpcChildError::AlreadyShutdown
     }
+}
+
+// Scheduling-only, keyed by the disposable child CWD. Hold the actual
+// watchdog between alive=false and pending-RPC cleanup; never fabricate EOF
+// or a cancellation result. Production compilation contains no hook.
+#[cfg(test)]
+pub(crate) struct ExitDrainTestBarrier {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
+}
+#[cfg(test)]
+fn exit_drain_test_barriers() -> &'static Mutex<std::collections::HashMap<std::path::PathBuf, Arc<ExitDrainTestBarrier>>> {
+    static BARRIERS: std::sync::OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, Arc<ExitDrainTestBarrier>>>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn install_exit_drain_test_barrier(cwd: &std::path::Path) -> Arc<ExitDrainTestBarrier> {
+    let barrier = Arc::new(ExitDrainTestBarrier { entered: Default::default(), release: tokio::sync::Semaphore::new(0) });
+    assert!(exit_drain_test_barriers().lock().unwrap().insert(cwd.to_path_buf(), barrier.clone()).is_none());
+    barrier
+}
+#[cfg(test)]
+fn exit_drain_test_barrier(cwd: Option<&std::path::Path>) -> Option<Arc<ExitDrainTestBarrier>> {
+    cwd.and_then(|cwd| exit_drain_test_barriers().lock().unwrap().remove(cwd))
 }
 
 /// Parse and dispatch a single line of stdout.
