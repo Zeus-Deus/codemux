@@ -36,6 +36,7 @@ function projectionProviderForChat(
       return provider;
     // Cursor and Grok have no native SKILL.md inventory. The backend feeds
     // both the portable `.agents/skills` / Codex projection.
+    case "acp":
     case "hermes":
       return null;
     case "cursor":

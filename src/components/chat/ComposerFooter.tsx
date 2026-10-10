@@ -33,6 +33,7 @@ const ROUND_CONTROL =
 interface Props {
   hermesThreadId?: string | null;
   hermesProjectPath?: string | null;
+  customAgentsAllowed?: boolean;
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
@@ -58,7 +59,7 @@ interface Props {
   mode: ChatMode;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
-    model: string,
+    model: string | null,
   ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
@@ -113,7 +114,7 @@ interface Props {
  * send pinned right, a flexible gap in between.
  */
 export function ComposerFooter({
-  hermesThreadId, hermesProjectPath,
+  hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
   provider,
   model,
   permissionMode,
@@ -267,10 +268,11 @@ export function ComposerFooter({
           </>
         )}
 
-        {showProviderPicker || provider === "hermes" ? (
+        {showProviderPicker || provider === "hermes" || provider === "acp" ? (
           <MultiProviderModelPicker
             hermesThreadId={hermesThreadId}
             hermesProjectPath={hermesProjectPath}
+            customAgentsAllowed={customAgentsAllowed}
             provider={provider}
             model={model}
             onProviderModelChange={onProviderModelChange}
@@ -288,7 +290,7 @@ export function ComposerFooter({
             leafLabel={modelLeafLabel}
           />
         )}
-        {!configInMenu && (
+        {!configInMenu && provider !== "acp" && (
           <>
             <ReasoningPicker
               model={activeModel}

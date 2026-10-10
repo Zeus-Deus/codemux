@@ -9,6 +9,7 @@ export function isChatModeSupported(
   // Grok owns its ask/agent permissions inside ACP. They are not the same
   // thing as Codemux's Plan/Ask pills, which impose Claude-style plan mode
   // and prompt wrappers. Debug remains provider-agnostic.
+  if (provider === "acp") return mode === "default";
   return provider !== "grok" || (mode !== "plan" && mode !== "ask");
 }
 

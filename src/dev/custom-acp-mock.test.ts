@@ -1,0 +1,55 @@
+import { expect, it, vi } from "vitest";
+import { createCustomAcpMock } from "./custom-acp-mock";
+import { acpCatalog, acpThreadCatalog, type AcpAgent } from "@/tauri/custom-acp";
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+it("passes the combined readonly contract through the real IPC wrapper and development mock", async () => {
+  const mock = createCustomAcpMock(vi.fn());
+  const agent = mock.handlers.acp_save_agent({ input: { name: "A", executable: "cli", args: [], environment: {}, enabled: true, auth_method: null } }) as AcpAgent;
+  mock.start({ thread_id: "t", cwd: "/repo", model: null, extra: { acp_agent_id: agent.id } });
+  invoke.mockReset();
+  invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => mock.handlers[command](args));
+  const result = await acpThreadCatalog("t");
+  expect(result).toMatchObject({ live: true, catalog: { agent_id: agent.id } });
+  expect(invoke).toHaveBeenCalledExactlyOnceWith("acp_thread_catalog", { threadId: "t" });
+  expect(await acpCatalog("t")).toEqual(result.catalog);
+  expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(["acp_thread_catalog", "acp_catalog"]);
+});
+it("mocks real redaction, retained-null edits, explicit probes and durable instance routing", () => {
+  const emit = vi.fn(); const mock = createCustomAcpMock(emit);
+  expect(typeof mock.handlers.acp_save_agent).toBe("function");
+  const agent = mock.handlers.acp_save_agent({ input: { name: "A", executable: "cli", args: ["two words"], environment: { TOKEN: "secret" }, enabled: true, auth_method: null } }) as AcpAgent;
+  expect(agent.environment).toEqual({ TOKEN: null });
+  expect(emit).toHaveBeenCalledWith("custom_acp_changed", null);
+  mock.handlers.acp_save_agent({ input: { ...agent, environment: { TOKEN: null }, name: "Renamed" } });
+  expect((mock.handlers.acp_agents({}) as AcpAgent[])[0].revision).toBe(agent.revision);
+  mock.handlers.acp_probe({ agentId: agent.id, cwd: null });
+  expect(mock.handlers.acp_binding({ threadId: "t" })).toBeNull();
+  mock.start({ thread_id: "t", cwd: "/repo", model: null, extra: { acp_agent_id: agent.id } });
+  expect(mock.handlers.acp_binding({ threadId: "t" })).toMatchObject({ agent_id: agent.id, revision: agent.revision, catalog: { current_model: null } });
+  mock.handlers.acp_delete_agent({ agentId: agent.id });
+  expect(() => mock.start({ thread_id: "t", cwd: "/repo", model: null, extra: {} })).toThrow(/unavailable/);
+});
+it("reads catalog and native liveness together without launching and denies a revised cold binding", () => {
+  const mock = createCustomAcpMock(vi.fn());
+  expect(typeof mock.handlers.acp_thread_catalog).toBe("function");
+  expect(typeof mock.handlers.agent_chat_stop_session).toBe("function");
+  const agent = mock.handlers.acp_save_agent({ input: { name: "A", executable: "cli", args: [], environment: {}, enabled: true, auth_method: null } }) as AcpAgent;
+  mock.start({ thread_id: "t", cwd: "/repo", model: null, extra: { acp_agent_id: agent.id } });
+  mock.handlers.acp_save_agent({ input: { ...agent, args: ["changed"] } });
+  expect(mock.handlers.acp_thread_catalog({ threadId: "t" })).toMatchObject({ live: true, catalog: { agent_id: agent.id, current_model: null } });
+  mock.handlers.agent_chat_stop_session({ provider: "acp", threadId: "t" });
+  expect(mock.handlers.acp_binding({ threadId: "t" })).toMatchObject({ revision: agent.revision });
+  expect(() => mock.handlers.acp_thread_catalog({ threadId: "t" })).toThrow(/unavailable/);
+});
+it("returns explicit false for an eligible cold catalog and retains the catalog-only API", () => {
+  const mock = createCustomAcpMock(vi.fn());
+  expect(typeof mock.handlers.acp_thread_catalog).toBe("function");
+  expect(typeof mock.handlers.agent_chat_stop_session).toBe("function");
+  const agent = mock.handlers.acp_save_agent({ input: { name: "A", executable: "cli", args: [], environment: {}, enabled: true, auth_method: null } }) as AcpAgent;
+  mock.start({ thread_id: "t", cwd: "/repo", model: null, extra: { acp_agent_id: agent.id } });
+  mock.handlers.agent_chat_stop_session({ provider: "acp", threadId: "t" });
+  const read = mock.handlers.acp_thread_catalog({ threadId: "t" }) as { catalog: unknown; live: boolean };
+  expect(read.live).toBe(false);
+  expect(mock.handlers.acp_catalog({ threadId: "t" })).toEqual(read.catalog);
+});

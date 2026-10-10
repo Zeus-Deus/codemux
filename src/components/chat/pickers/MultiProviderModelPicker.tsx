@@ -1,4 +1,6 @@
 import { useHermes, hermesProfileKey } from "@/stores/hermes-store";
+import { CustomAcpModels } from "./CustomAcpModels";
+import { selectedAcpCatalog, useCustomAcp } from "@/stores/custom-acp-store";
 import { HermesProfileModels } from "./HermesProfileModels";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Star } from "lucide-react";
@@ -85,6 +87,7 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "cursor", label: "Cursor" },
   { kind: "grok", label: "Grok" },
   { kind: "hermes", label: "Hermes" },
+  { kind: "acp", label: "Custom agents" },
   { kind: "opencode", label: "OpenCode" },
 ];
 
@@ -175,11 +178,12 @@ function providerErrorTooltipLabel(parsed: ParsedProviderError): string {
 interface Props {
   hermesThreadId?: string | null;
   hermesProjectPath?: string | null;
+  customAgentsAllowed?: boolean;
   provider: AgentChatProviderKind;
   model: string | null;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
-    model: string,
+    model: string | null,
   ) => void;
   disabled?: boolean;
   /**
@@ -222,7 +226,7 @@ const IS_MAC =
 const JUMP_MOD_LABEL = IS_MAC ? "⌘" : "Ctrl+";
 
 export function MultiProviderModelPicker({
-  hermesThreadId, hermesProjectPath,
+  hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
   provider,
   model,
   onProviderModelChange,
@@ -231,6 +235,7 @@ export function MultiProviderModelPicker({
   openSignal,
   leafLabel = false,
 }: Props) {
+  const acpFixed = useCustomAcp(s => hermesThreadId ? !!s.bindings[hermesThreadId] : false);
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
   const [query, setQuery] = useState("");
@@ -251,8 +256,8 @@ export function MultiProviderModelPicker({
   // identity of `allowedProviders` so consumers passing a stable
   // array reference (the common case) don't churn the rail.
   const visibleProviders = useMemo(
-    () => filterProviders(allowedProviders),
-    [allowedProviders],
+    () => filterProviders(provider === "acp" && acpFixed ? ["acp"] : allowedProviders).filter(p => p.kind !== "acp" || customAgentsAllowed),
+    [allowedProviders, provider, acpFixed, customAgentsAllowed],
   );
 
   useEffect(() => {
@@ -275,6 +280,7 @@ export function MultiProviderModelPicker({
   }, [open, provider]);
 
   const allCaps = useProviderCapabilities();
+  const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, hermesThreadId));
   const hermesModelLabel = useHermes(s => {
     const profile = hermesThreadId ? s.selections[hermesThreadId] : undefined;
     return profile ? s.catalogs[hermesProfileKey(profile)]?.value?.session.models?.availableModels.find(m => m.modelId === model)?.name : undefined;
@@ -333,6 +339,7 @@ export function MultiProviderModelPicker({
       cursor: rowsFromCaps("cursor", cursorCaps),
       grok: rowsFromCaps("grok", grokCaps),
       hermes: [],
+      acp: [],
       opencode: rowsFromCaps("opencode", opencodeCaps),
     };
   }, [claudeCaps, codexCaps, cursorCaps, grokCaps, opencodeCaps]);
@@ -436,13 +443,14 @@ export function MultiProviderModelPicker({
   const resolvedModelId = resolvedModel?.id ?? model;
 
   const triggerLabel = useMemo(() => {
+    if (provider === "acp") return acpCatalog?.capabilities.models.find(m => m.id === model)?.label ?? model ?? "Agent default";
     if (provider === "hermes" && model === "profile_default") return "Profile default";
     if (provider === "hermes" && hermesModelLabel) return hermesModelLabel;
     if (!capsForCurrentProvider && !model) return "Loading…";
     if (resolvedModel) return resolvedModel.label;
     if (model) return model;
     return "Select model";
-  }, [capsForCurrentProvider, model, resolvedModel, provider, hermesModelLabel]);
+  }, [capsForCurrentProvider, model, resolvedModel, provider, hermesModelLabel, acpCatalog]);
 
   const triggerSubtitle = resolvedModel?.sub_provider ?? null;
 
@@ -533,7 +541,7 @@ export function MultiProviderModelPicker({
             }}
           />
           <div className="flex min-h-0 min-w-0 flex-col">
-            {railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false}>
+            {railKey === "acp" && customAgentsAllowed ? <CustomAcpModels disabled={disabled} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "acp" ? model : null} onSelect={value => { onProviderModelChange("acp", value); }} /> : railKey === "hermes" ? <HermesProfileModels onProfileChange={() => onProviderModelChange("hermes", "profile_default")} threadId={hermesThreadId} projectPath={hermesProjectPath} model={provider === "hermes" ? model : null} onSelect={(model) => { onProviderModelChange("hermes", model); setOpen(false); }} /> : <Command shouldFilter={false}>
               <CommandInput
                 placeholder="Search models..."
                 value={query}
@@ -790,6 +798,7 @@ function capsForRail(
       return grokCaps;
     case "opencode":
       return opencodeCaps;
+    case "acp":
     case "hermes":
     case "favorites":
       return null;
@@ -1168,6 +1177,8 @@ function providerDisplayLabel(provider: AgentChatProviderKind): string {
       return "Codex";
     case "cursor":
       return "Cursor";
+    case "acp":
+      return "Custom agents";
     case "hermes":
       return "Hermes";
     case "grok":

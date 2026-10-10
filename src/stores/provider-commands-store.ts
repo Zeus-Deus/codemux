@@ -64,7 +64,7 @@ const EMPTY_ENTRY: ProviderCommandsEntry = {
 export function catalogueFollowsSession(
   provider: AgentChatProviderKind,
 ): boolean {
-  return provider === "grok" || provider === "cursor" || provider === "hermes";
+  return provider === "grok" || provider === "cursor" || provider === "hermes" || provider === "acp";
 }
 
 export const commandsKey = (

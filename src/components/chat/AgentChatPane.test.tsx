@@ -251,6 +251,7 @@ vi.mock("./Composer", async (importOriginal) => {
     onFastModeChange,
     onPermissionModeChange,
     provider,
+    threadId,
     providerCliInstalled,
     providerAuthenticated,
     focusOnMount,
@@ -277,7 +278,8 @@ vi.mock("./Composer", async (importOriginal) => {
     onContextWindowChange: (contextWindow: string) => void;
     onFastModeChange?: (fastMode: boolean) => void;
     onPermissionModeChange: (mode: string) => void;
-    provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes";
+    provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes" | "acp";
+    threadId?: string | null;
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;
@@ -290,6 +292,7 @@ vi.mock("./Composer", async (importOriginal) => {
     <div
       data-testid="composer"
       data-provider={provider}
+      data-thread-id={threadId}
       data-provider-cli-installed={String(providerCliInstalled)}
       data-provider-authenticated={String(providerAuthenticated)}
       data-focus-on-mount={focusOnMount ? "true" : "false"}
@@ -770,6 +773,7 @@ import {
 } from "@/tauri/commands";
 import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import { toast } from "sonner";
 import type { ChatModelInfo } from "@/tauri/types";
@@ -1053,6 +1057,28 @@ describe("AgentChatPane imported provenance", () => {
 });
 
 describe("AgentChatPane provider runtime intent", () => {
+  it("keeps a new custom-ACP pane idle until an instance is explicitly selected", async () => {
+    useProviderRuntimeIntent.getState().reset();
+    useProviderRuntimeIntent.getState().observe("acp");
+    vi.mocked(agentChatStartSession).mockClear();
+    const { container } = render(<AgentChatPane pane={{ ...pane, thread_id: null, provider: "acp" }} />);
+    await act(async () => {});
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="composer"]')).toHaveAttribute("data-session-awaiting-intent", "true");
+  });
+  it("starts the same pending thread after its custom instance is selected", async () => {
+    useCustomAcp.setState({ selections: {}, bindings: {} });
+    useProviderRuntimeIntent.getState().reset();
+    useProviderRuntimeIntent.getState().observe("acp");
+    vi.mocked(agentChatStartSession).mockClear();
+    const { container } = render(<AgentChatPane pane={{ ...pane, thread_id: null, provider: "acp" }} />);
+    await act(async () => {});
+    const pendingThread = container.querySelector('[data-testid="composer"]')!.getAttribute("data-thread-id")!;
+    expect(pendingThread).toMatch(/-acp-/);
+    act(() => useCustomAcp.getState().select(pendingThread, "Exact/INSTANCE"));
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledWith("pane-1", "acp", expect.objectContaining({ thread_id: pendingThread, model: null, permission_mode: null })));
+    expect(useCustomAcp.getState().selections[pendingThread]).toBe("Exact/INSTANCE");
+  });
   const paneWithoutThread = { ...pane, thread_id: null };
 
   it("does not launch a provider until its restored pane is interacted with", async () => {

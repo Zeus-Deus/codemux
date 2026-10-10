@@ -37,6 +37,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { useAgentChatEvents } from "./use-agent-chat-events";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 
 function payloadFor(threadId: string, text: string): AgentChatEventPayload {
   return {
@@ -63,6 +64,20 @@ describe("useAgentChatEvents", () => {
     detachAgentChatOutput.mockReset().mockResolvedValue(undefined);
   });
 
+  it("tracks custom session liveness only from this thread's native channel envelope", () => {
+    useCustomAcp.setState({ bindings: { "thread-1": { agent_id: "synthetic" } as never }, live: {} });
+    const { unmount } = renderHook(() => useAgentChatEvents("thread-1", vi.fn()));
+    act(() => lastChannel().onmessage({ thread_id: "foreign", event: { type: "session_state_changed", thread_id: "foreign", status: { status: "ready" } } }));
+    expect(useCustomAcp.getState().live["thread-1"]).toBeUndefined();
+    act(() => lastChannel().onmessage({ thread_id: "thread-1", event: { type: "session_state_changed", thread_id: "foreign", status: { status: "ready" } } }));
+    expect(useCustomAcp.getState().live["thread-1"]).toBeUndefined();
+    act(() => lastChannel().onmessage({ thread_id: "thread-1", event: { type: "session_state_changed", thread_id: "thread-1", status: { status: "ready" } } }));
+    expect(useCustomAcp.getState().live["thread-1"]).toBe(true);
+    act(() => lastChannel().onmessage({ thread_id: "thread-1", event: { type: "session_state_changed", thread_id: "thread-1", status: { status: "closed" } } }));
+    expect(useCustomAcp.getState().live["thread-1"]).toBe(false);
+    unmount();
+    useCustomAcp.setState({ bindings: {}, live: {} });
+  });
   it("does not attach when threadId is null", () => {
     renderHook(() => useAgentChatEvents(null, vi.fn()));
     expect(attachAgentChatOutput).not.toHaveBeenCalled();
