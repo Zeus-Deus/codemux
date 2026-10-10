@@ -186,21 +186,19 @@ async fn check_codex_health() -> ProviderHealthReport {
             )
         }
     };
-    let version = match codex::auth::probe_installed(&binary).await {
-        // On PATH but `--version` exited non-zero. `probe_installed`
-        // documents this as benign — some Codex builds simply do that —
-        // so it is an advisory, not a dead provider.
-        Ok(None) => return codex_version_unavailable_report(),
-        Ok(Some(version)) => Some(version),
-        Err(err) => {
-            return ProviderHealthReport::error(
-                ProviderKind::Codex,
-                true,
-                format!("Codex CLI is installed but failed to run. ({err})"),
-            )
-        }
+    check_codex_health_owned(&binary,&codex::chatgpt::owner()).await
+}
+
+pub(crate) async fn check_codex_health_owned(binary:&std::path::Path,owner:&std::sync::Arc<codex::chatgpt::Owner>)->ProviderHealthReport{
+    let _lease=match owner.acquire_runtime(){Ok(lease)=>lease,Err(message)=>return ProviderHealthReport::warning(ProviderKind::Codex,None,message)};
+    let grant=match owner.usable().await{Ok(grant)=>grant,Err(message)=>return ProviderHealthReport::error(ProviderKind::Codex,true,message)};
+    let version=match codex::auth::probe_installed(binary).await{
+        Ok(Some(version))=>Some(version),
+        Ok(None)=>return codex_version_unavailable_report(),
+        Err(err)=>return ProviderHealthReport::error(ProviderKind::Codex,true,format!("Codex CLI is installed but failed to run. ({err})")),
     };
-    codex_report_from_auth(codex::auth::probe_authenticated(&binary).await, version)
+    if grant.is_some(){return ProviderHealthReport::ready(ProviderKind::Codex,version)}
+    codex_report_from_auth(codex::auth::probe_authenticated(binary).await,version)
 }
 
 /// `codex --version` exited non-zero on a binary that IS on PATH.
@@ -427,6 +425,14 @@ fn opencode_report_from_availability(
 mod tests {
     use super::*;
     use crate::agent_provider::opencode::OpenCodeAvailability;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chatgpt_health_uses_managed_grant_and_never_falls_back_after_revocation(){
+        let dir=tempfile::tempdir().unwrap();let binary=crate::agent_provider::codex::session::managed_tests::fixture_binary(dir.path());let owner=codex::chatgpt::Owner::testing(dir.path().join("chatgpt"));
+        let report=check_codex_health_owned(&binary,&owner).await;assert_eq!(report.status,ProviderHealthStatus::Ready,"a usable managed ChatGPT grant must not require native Codex login");assert!(report.installed);assert!(!dir.path().join("auth-called").exists());
+        owner.testing_revoke().await;let report=check_codex_health_owned(&binary,&owner).await;assert_eq!(report.status,ProviderHealthStatus::Error);assert!(!dir.path().join("auth-called").exists(),"a revoked plan grant cannot fall back to another CLI billing identity");
+    }
+
 
     #[test]
     fn claude_sidecar_missing_maps_to_not_installed_error() {

@@ -68,7 +68,7 @@ const INCOMING_REQUEST_CHANNEL_CAPACITY: usize = 256;
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 512;
 
 /// Parameters for spawning a JSON-RPC child process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SpawnConfig {
     /// Executable path to spawn.
     pub program: PathBuf,
@@ -82,6 +82,11 @@ pub struct SpawnConfig {
     /// [`JsonRpcChild::request`]. Individual callers can override via
     /// [`JsonRpcChild::request_with_timeout`].
     pub default_timeout: Duration,
+}
+impl std::fmt::Debug for SpawnConfig {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("SpawnConfig").field("program",&self.program).field("args",&self.args).field("env_keys",&self.env.keys().collect::<Vec<_>>()).field("cwd",&self.cwd).field("default_timeout",&self.default_timeout).finish()
+    }
 }
 
 /// JSON-RPC notification (a message with a `method` but no `id`) received
@@ -273,6 +278,7 @@ pub struct JsonRpcChild {
     notifications_tx: broadcast::Sender<Notification>,
     incoming_rx: Arc<Mutex<Option<mpsc::Receiver<IncomingRequest>>>>,
     alive: Arc<AtomicBool>,
+    reaped: Arc<AtomicBool>,
     exit_info: Arc<Mutex<Option<ExitInfo>>>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     /// Set to `true` the first time [`shutdown`](Self::shutdown) runs. A
@@ -286,7 +292,12 @@ impl JsonRpcChild {
     ///
     /// Fails with [`RpcChildError::SpawnFailed`] if the executable cannot be
     /// started or its stdio pipes cannot be captured.
-    pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {
+    pub async fn spawn(config: SpawnConfig) -> Result<Self, RpcChildError> {Self::spawn_impl(config,false,None).await}
+    /// App-owned bearer credentials require a minimal inherited environment.
+    /// Existing adapters retain their ordinary overlay semantics.
+    pub async fn spawn_isolated(config: SpawnConfig) -> Result<Self,RpcChildError>{Self::spawn_impl(config,true,None).await}
+    pub(crate) async fn spawn_owned(config:SpawnConfig,isolated:bool,lease:Arc<std::fs::File>)->Result<Self,RpcChildError>{Self::spawn_impl(config,isolated,Some(lease)).await}
+    async fn spawn_impl(config: SpawnConfig,isolated:bool,owner_lease:Option<Arc<std::fs::File>>) -> Result<Self, RpcChildError> {
         let mut cmd = Command::new(&config.program);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
@@ -300,6 +311,12 @@ impl JsonRpcChild {
         // env pair from `config` still wins. No-op outside an AppImage.
         crate::execution::sanitize_appimage_env_tokio(&mut cmd);
 
+        if isolated {
+            cmd.env_clear();
+            for key in ["HOME","USER","LOGNAME","PATH","SHELL","LANG","LC_ALL","LC_CTYPE","TERM","COLORTERM","TMPDIR","TMP","TEMP","XDG_RUNTIME_DIR","WAYLAND_DISPLAY","DISPLAY","DBUS_SESSION_BUS_ADDRESS"] {
+                if let Some(value)=std::env::var_os(key){cmd.env(key,value);}
+            }
+        }
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
@@ -324,6 +341,7 @@ impl JsonRpcChild {
         let (notifications_tx, _) = broadcast::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_REQUEST_CHANNEL_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
+        let reaped=Arc::new(AtomicBool::new(false));
         let exit_info: Arc<Mutex<Option<ExitInfo>>> = Arc::new(Mutex::new(None));
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -392,6 +410,7 @@ impl JsonRpcChild {
         {
             let pending_watchdog = Arc::clone(&pending);
             let alive_watchdog = Arc::clone(&alive);
+            let reaped_watchdog=reaped.clone();
             let exit_info_watchdog = Arc::clone(&exit_info);
             let stderr_tail_watchdog = Arc::clone(&stderr_tail);
             // We intentionally keep the incoming sender inside the watchdog
@@ -412,6 +431,8 @@ impl JsonRpcChild {
                     }
                 };
 
+                if exit_status.is_ok(){reaped_watchdog.store(true,Ordering::Release);drop(owner_lease);}
+                else if let Some(lease)=owner_lease{std::mem::forget(lease);} // fail closed if OS reap cannot be confirmed
                 alive_watchdog.store(false, Ordering::SeqCst);
 
                 let code = exit_status.ok().and_then(|s| s.code());
@@ -485,6 +506,7 @@ impl JsonRpcChild {
             notifications_tx,
             incoming_rx: Arc::new(Mutex::new(Some(incoming_rx))),
             alive,
+            reaped,
             exit_info,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
@@ -648,6 +670,16 @@ impl JsonRpcChild {
         Ok(())
     }
 
+    /// Owned credential processes must settle actual wait/reap, not stdout EOF.
+    /// Transfer shutdown before awaited writer I/O, so cancellation cannot strand it.
+    pub(crate) async fn shutdown_owned(&self)->Result<(),RpcChildError>{
+        self.shutdown_started.store(true,Ordering::Release);
+        let tx=self.shutdown_tx.lock().ok().and_then(|mut slot|slot.take());if let Some(tx)=tx{let _=tx.send(());}
+        if let Ok(mut writer)=tokio::time::timeout(Duration::from_millis(250),self.writer.lock()).await{*writer=None;}
+        let budget=GRACEFUL_SHUTDOWN_TIMEOUT+Duration::from_secs(1);let deadline=std::time::Instant::now()+budget;
+        while !self.reaped.load(Ordering::Acquire){if std::time::Instant::now()>=deadline{return Err(RpcChildError::Timeout{method:"owned child reap".into(),elapsed:budget})}tokio::time::sleep(Duration::from_millis(10)).await;}
+        Ok(())
+    }
     /// Whether the child process is still running (best-effort).
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)

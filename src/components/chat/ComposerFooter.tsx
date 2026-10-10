@@ -1,4 +1,5 @@
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
+import { ChatGptPlanUsage } from "./chatgpt-plan-usage";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
@@ -164,6 +165,7 @@ export function ComposerFooter({
   const modeIsActive = mode !== "default";
 
   return (
+    <>
     <div
       data-testid="composer-controls-row"
       className="flex h-[42px] shrink-0 items-center gap-1 px-1"
@@ -361,5 +363,7 @@ export function ComposerFooter({
         )}
       </div>
     </div>
+    <ChatGptPlanUsage provider={provider} />
+    </>
   );
 }

@@ -23,6 +23,7 @@
 //!   `Closed` and exit cleanly.
 
 pub mod auth;
+pub mod chatgpt;
 pub mod capabilities;
 pub mod protocol;
 pub mod slash_commands;
@@ -90,6 +91,7 @@ pub struct CodexAgentProvider {
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<CodexSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     hooks_operation: Mutex<()>,
+    chatgpt_owner: Option<Arc<chatgpt::Owner>>,
 }
 
 impl CodexAgentProvider {
@@ -102,12 +104,19 @@ impl CodexAgentProvider {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             hooks_operation: Mutex::new(()),
+            chatgpt_owner: None,
         }
     }
 
+    /// Only the default production registry opts into app-owned ChatGPT routing.
+    /// Custom configurations and synthetic adapters constructed with `new` are unchanged.
+    pub fn new_managed(config:CodexProviderConfig)->Self{
+        let mut value=Self::new(config);value.chatgpt_owner=Some(chatgpt::owner());value
+    }
     fn spawn_config(&self) -> CodexSpawnConfig {
         CodexSpawnConfig {
             codex_binary: self.config.codex_binary.clone(),
+            chatgpt_owner: self.chatgpt_owner.clone(),
             codex_home: self.config.codex_home.clone(),
             client_info: self.config.client_info.clone(),
             mcp_registry: self.config.mcp_registry.clone(),
@@ -182,25 +191,29 @@ impl AgentProvider for CodexAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
-        // Evict a corpse before rebuilding: if the child-exit watchdog marked
-        // the existing session dead, remove it under the write lock (so the
-        // check→remove is atomic against a concurrent rebuild) and shut it down
-        // cleanly below. A still-live session for this thread is a genuine
-        // double-start and stays a ValidationError.
-        let dead_evicted = {
+        // Wait for renewal/dispatch without holding the session map: dispatch
+        // can own outbound while waiting for the checkpoint timeline, whose
+        // revert owner calls turn_active (and therefore reads the session map).
+        let dead_evicted = loop {
+            let existing = self.sessions.read().await.get(&thread_id).cloned();
+            let Some(existing) = existing else { break None };
+            let _lifecycle = existing.lifecycle_guard().await;
             let mut sessions = self.sessions.write().await;
-            match sessions.get(&thread_id) {
-                Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
-                Some(_) => {
-                    return Err(ProviderError::ValidationError {
-                        message: format!(
-                            "codex session already exists for thread {:?}",
-                            thread_id.0
-                        ),
-                    });
-                }
-                None => None,
+            // Stop or another rebuild may have changed the binding while we
+            // waited. Never apply the old Arc's death classification to it.
+            if !sessions.get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &existing)) {
+                continue;
             }
+            if !existing.is_dead() {
+                return Err(ProviderError::ValidationError {
+                    message: format!(
+                        "codex session already exists for thread {:?}",
+                        thread_id.0
+                    ),
+                });
+            }
+            break sessions.remove(&thread_id);
         };
         if let Some(dead) = dead_evicted {
             // Best-effort: reap the dead child's tasks before spawning the
@@ -455,11 +468,16 @@ impl AgentProvider for CodexAgentProvider {
         // watchdog set `dead`) is treated as absent, so `ensure_live_session`
         // rebuilds a fresh one (with the resume cursor) on the next send
         // instead of routing to a dead child. Mirrors the OpenCode provider.
-        self.sessions
-            .read()
-            .await
-            .get(thread_id)
-            .is_some_and(|session| !session.is_dead())
+        let session = self.sessions.read().await.get(thread_id).cloned();
+        let Some(session) = session else { return false };
+        if !session.is_dead() {
+            return true;
+        }
+        // Do not classify a retired child as an absent session until its
+        // managed renewal/dispatch owner releases outbound. Drop the map read
+        // lock before waiting so unrelated provider operations remain live.
+        let _lifecycle = session.lifecycle_guard().await;
+        !session.is_dead()
     }
 
     async fn turn_active(&self, thread_id: &ThreadId) -> bool {
@@ -516,19 +534,17 @@ impl AgentProvider for CodexAgentProvider {
                 if session.cwd.canonicalize().map_err(|error| error.to_string())? != cwd {
                     return Err("Hook discovery must use this conversation's directory.".into());
                 }
-                return hooks::manage(&session.child, &cwd, update).await;
+                return hooks::manage(session.child().await.as_ref(), &cwd, update).await;
             }
         }
         // Home/new drafts have no session. Probe without creating a thread
         // or starting inference, using the same executable and Codex home.
-        let mut env = HashMap::new();
-        if let Some(home) = self.config.codex_home.as_ref() {
-            env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
-        }
-        let child = crate::json_rpc_child::JsonRpcChild::spawn(crate::json_rpc_child::SpawnConfig {
-            program: self.config.codex_binary.clone(), args: vec!["app-server".into()],
-            env, cwd: Some(cwd.clone()), default_timeout: std::time::Duration::from_secs(15),
-        }).await.map_err(|error| format!("Cannot start Codex hook discovery: {error}"))?;
+        let lease=self.chatgpt_owner.as_ref().map(|o|o.acquire_runtime().map(Arc::new)).transpose()?;
+        let grant=match self.chatgpt_owner.as_ref(){Some(owner)=>owner.usable().await?,None=>None};
+        let mut env=HashMap::new();if let Some(home)=self.config.codex_home.as_ref(){env.insert("CODEX_HOME".into(),home.to_string_lossy().into_owned());}
+        let(args,env)=match grant.as_ref(){Some(grant)=>grant.launch(env),None=>(vec!["app-server".into()],env)};
+        let config=crate::json_rpc_child::SpawnConfig{program:self.config.codex_binary.clone(),args,env,cwd:Some(cwd.clone()),default_timeout:std::time::Duration::from_secs(15)};
+        let child=match lease.clone(){Some(lease)=>crate::json_rpc_child::JsonRpcChild::spawn_owned(config,grant.is_some(),lease).await,None=>crate::json_rpc_child::JsonRpcChild::spawn(config).await}.map_err(|e|e.to_string())?;
         let result = async {
             child.request("initialize", serde_json::json!({
                 "clientInfo": self.config.client_info,
@@ -537,7 +553,7 @@ impl AgentProvider for CodexAgentProvider {
             child.notify("initialized", serde_json::json!({})).await.map_err(|error| error.to_string())?;
             hooks::manage(&child, &cwd, update).await
         }.await;
-        let _ = child.shutdown().await;
+        if lease.is_some(){let _=child.shutdown_owned().await;}else{let _=child.shutdown().await;}
         result
     }
 

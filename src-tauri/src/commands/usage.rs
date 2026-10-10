@@ -78,6 +78,11 @@ impl PlanQuotaStore {
         entry.received_at_ms = received_at_ms;
     }
 
+    /// Replace, not merge: no CLI quota is available for this managed route.
+    pub(crate) fn replace_chatgpt_route(&self,connected:bool,received_at_ms:i64){
+        let Ok(mut map)=self.inner.lock()else{return};
+        if connected{map.insert("codex".into(),ProviderQuota{windows:Vec::new(),plan_label:Some("Using ChatGPT plan".into()),auth_mode:Some(PlanAuthMode::Subscription),received_at_ms});}else{map.remove("codex");}
+    }
     /// Snapshot of everything known, for the dashboard query.
     pub fn snapshot(&self) -> HashMap<String, ProviderQuota> {
         self.inner
@@ -131,6 +136,18 @@ pub fn earliest_exhausted_reset(
                 .map(|at| (at, w.label.clone()))
         })
         .min_by_key(|(at, _)| *at)
+}
+
+#[cfg(test)]
+mod chatgpt_quota_tests {
+    use super::*;
+    #[test]
+    fn chatgpt_route_never_inherits_another_accounts_quota_or_reset(){
+        let store=PlanQuotaStore::default();let old=PlanUsageWindow{kind:crate::agent_provider::PlanWindowKind::FiveHour,used_pct:100.0,resets_at_ms:Some(123456),label:Some("old account quota".into())};
+        store.record("codex",vec![old.clone()],Some("ChatGPT Pro".into()),Some(PlanAuthMode::Subscription),1);store.record("claude",vec![old],None,None,1);
+        store.replace_chatgpt_route(true,2);let q=store.snapshot();assert!(q["codex"].windows.is_empty(),"managed plan sharing has no reported native CLI quota; never inherit old meters");assert_eq!(q["codex"].plan_label.as_deref(),Some("Using ChatGPT plan"));assert_eq!(q["codex"].auth_mode,Some(PlanAuthMode::Subscription));assert!(store.exhausted_reset_for("codex",0).is_none());assert_eq!(q["claude"].windows.len(),1);
+        store.replace_chatgpt_route(false,3);assert!(!store.snapshot().contains_key("codex"));assert!(store.snapshot().contains_key("claude"));
+    }
 }
 
 /// One bar in the overview chart.

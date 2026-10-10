@@ -1,4 +1,6 @@
 import { create } from "zustand";
+import { useChatGptStore } from "@/stores/chatgpt-store";
+import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import {
   capabilityDefaults,
@@ -266,7 +268,8 @@ function makeDraft(
   target: DraftTarget,
   opts: { lockedToHome?: boolean } = {},
 ): ChatDraft {
-  const provider: AgentChatProviderKind = "claude";
+  const chatGptConnected = useChatGptStore.getState().status?.phase === "connected";
+  const provider: AgentChatProviderKind = chatGptConnected ? "codex" : "claude";
   // Fully-configure the draft from the capabilities store: default
   // model + its `default_effort` + its default context-window option
   // + the provider's default permission mode. Drafts entering the
@@ -274,14 +277,17 @@ function makeDraft(
   // ContextWindow pickers render from minute zero — and the slice
   // materialize seeds inherits the same values, so pickers stay
   // visible post-first-send too (Stage C Effort-lock fix).
-  const modelId = defaultModelId(provider);
-  const defaults = capabilityDefaults(provider, modelId);
+  // A plan connection must not inherit a hardcoded or CLI-account model.
+  const modelId = chatGptConnected
+    ? useProviderCapabilities.getState().codex?.models[0]?.id ?? null
+    : defaultModelId(provider);
+  const defaults = capabilityDefaults(provider, modelId ?? "");
   return {
     draftId: newDraftId(),
     createdAt: new Date().toISOString(),
     target,
     provider,
-    model: defaults.model,
+    model: modelId,
     effort: defaults.effort,
     contextWindow: defaults.contextWindow,
     fastMode: false,

@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
+#[path="managed_runtime.rs"]
+mod managed_runtime;
+pub(crate) use managed_runtime::read_model_catalog;
 use tokio::task::JoinHandle;
 
 use crate::agent_provider::{
@@ -95,10 +98,11 @@ fn mint_request_id() -> RequestId {
 }
 
 /// Configuration for spawning the `codex app-server` subprocess.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CodexSpawnConfig {
     /// Path to the `codex` binary.
     pub codex_binary: PathBuf,
+    pub chatgpt_owner: Option<Arc<super::chatgpt::Owner>>,
     /// Value to set for `CODEX_HOME`, if any.
     pub codex_home: Option<PathBuf>,
     /// Client identification block to hand Codex at `initialize` time.
@@ -205,7 +209,10 @@ pub(crate) struct CodexSession {
     #[allow(dead_code)]
     pub cwd: PathBuf,
     /// Wrapped JSON-RPC child. Shared via `Arc` with background tasks.
-    pub child: Arc<JsonRpcChild>,
+    child: RwLock<Arc<JsonRpcChild>>,
+    managed: Option<managed_runtime::ManagedSession>,
+    runtime_lease: Mutex<Option<Arc<std::fs::File>>>,
+    notification_demux: Mutex<CodexSubagentDemux>,
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
     outbound: Mutex<()>,
@@ -232,7 +239,6 @@ pub(crate) struct CodexSession {
     /// Ledger totals already recorded for this thread at build time.
     /// Handed to the notification task's demux so a resumed thread does
     /// not re-record its history. Zero for a fresh thread.
-    recorded_usage_baseline: UsageBaseline,
     /// Owning workspace of the chat pane this session runs in, from
     /// `StartSessionInput.workspace_id`. Attached per-call to dynamic
     /// tool dispatches so workspace-scoped built-in tools bind to THIS
@@ -268,31 +274,13 @@ impl CodexSession {
         // re-recorded from zero — see `CodexSubagentDemux`.
         recorded_usage_baseline: Option<UsageBaseline>,
     ) -> Result<Arc<Self>, ProviderError> {
-        // Start from the caller-supplied workspace env (CODEMUX_WORKSPACE_ID,
-        // CODEMUX_PANE_ID, BROWSER, …) so the agent's Bash subprocesses route
-        // `codemux browser open` at their OWN workspace. Provider-critical
-        // vars are overlaid AFTER so they win on conflict — CODEX_HOME must
-        // point at Codemux's managed config dir regardless of what the
-        // workspace env carries.
-        let mut env = caller_env.unwrap_or_default();
-        if let Some(home) = spawn.codex_home.as_ref() {
-            env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
-        }
-
-        let child = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.codex_binary.clone(),
-            args: vec!["app-server".into()],
-            env,
-            cwd: Some(cwd.clone()),
-            default_timeout: DEFAULT_RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|e| ProviderError::ProcessError {
-            message: "failed to spawn `codex app-server`".into(),
-            source: Some(e.to_string()),
-        })?;
-        let child = Arc::new(child);
-
+        let caller_env=caller_env.unwrap_or_default();
+        let runtime_lease=spawn.chatgpt_owner.as_ref().map(|o|o.acquire_runtime().map(Arc::new)).transpose().map_err(|message|ProviderError::ValidationError{message})?;
+        let grant=match spawn.chatgpt_owner.as_ref(){Some(owner)=>owner.usable().await.map_err(|hint|ProviderError::NotAuthenticated{provider:crate::agent_provider::ProviderKind::Codex,hint})?,None=>None};
+        let child=managed_runtime::spawn_child(&spawn,&cwd,caller_env.clone(),grant.as_ref(),runtime_lease.clone()).await?;
+        // Keep the outer lease alive through exact-child teardown on any failed init.
+        let initialized=async {
+        let mut model=model;
         // Pull the single incoming-request receiver before any background
         // tasks start; otherwise the adapter could race the watchdog.
         let incoming_rx = child
@@ -355,18 +343,15 @@ impl CodexSession {
             None => None,
         };
 
-        // Best-effort probes. Failures are non-fatal — we log via
-        // RuntimeWarning and continue.
-        match child.request("model/list", json!({})).await {
-            Ok(_) => {}
-            Err(e) => {
-                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                    thread_id: Some(thread_id.clone()),
-                    message: format!("model/list probe failed: {e}"),
-                    original_payload: None,
-                });
-            }
-        }
+        let managed_models=if grant.is_some(){
+            let entries=read_model_catalog(&child).await.map_err(|message|ProviderError::RpcError{message})?;
+            model=Some(managed_runtime::selected_model(&entries,model.as_deref())?);
+            entries.into_iter().filter(|m|!m.hidden).map(|m|m.id).collect()
+        }else{
+            if let Err(e)=child.request("model/list",json!({})).await{let _=event_tx.send(ProviderRuntimeEvent::RuntimeWarning{thread_id:Some(thread_id.clone()),message:format!("model/list probe failed: {e}"),original_payload:None});}
+            Vec::new()
+        };
+        if grant.is_none(){
         // account/read is the canonical "can this provider run?" check.
         // `requires_openai_auth` describes the active provider and stays true
         // for a logged-in ChatGPT/API-key account, so only gate when the
@@ -456,6 +441,9 @@ impl CodexSession {
             }
         }
 
+        }else{
+            let _=event_tx.send(ProviderRuntimeEvent::PlanUsageUpdated{thread_id:thread_id.clone(),provider:crate::agent_provider::ProviderKind::Codex,windows:Vec::new(),plan_label:Some("Using ChatGPT plan".into()),auth_mode:Some(PlanAuthMode::Subscription)});
+        }
         // --- thread/start or thread/resume ----------------------------------
         let require_original = resume_cursor
             .as_ref()
@@ -523,6 +511,7 @@ impl CodexSession {
         };
 
         // --- assemble session handle ----------------------------------------
+        let mut demux=CodexSubagentDemux::new(codex_thread_id.clone());demux.set_recorded_usage_baseline(recorded_usage_baseline.unwrap_or_default());
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(4);
         let state = Mutex::new(CodexSessionState {
             codex_thread_id: codex_thread_id.clone(),
@@ -538,14 +527,16 @@ impl CodexSession {
             thread_id: thread_id.clone(),
             provider_session_id: ProviderSessionId(codex_thread_id.clone()),
             cwd,
-            child: Arc::clone(&child),
+            child: RwLock::new(Arc::clone(&child)),
+            managed: grant.as_ref().map(|g|managed_runtime::ManagedSession{owner:spawn.chatgpt_owner.as_ref().unwrap().clone(),spawn:spawn.clone(),env:caller_env.iter().filter(|(k,_)|matches!(k.as_str(),"CODEMUX_WORKSPACE_ID"|"CODEMUX_PANE_ID"|"CODEMUX_HOOK_PORT"|"CODEMUX_CONTROL_SOCKET")).map(|(k,v)|(k.clone(),v.clone())).collect(),revision:Mutex::new(g.revision.clone()),permission:permission_mode.clone(),models:Mutex::new(managed_models)}),
+            runtime_lease: Mutex::new(runtime_lease.clone()),
+            notification_demux: Mutex::new(demux),
             state,
             outbound: Mutex::new(()),
             event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
-            recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
             workspace_id,
         });
 
@@ -591,7 +582,11 @@ impl CodexSession {
         }
 
         Ok(session)
+        }.await;
+        if initialized.is_err(){if runtime_lease.is_some(){let _=child.shutdown_owned().await;}else{let _=child.shutdown().await;}}
+        initialized
     }
+    pub(crate) async fn child(&self)->Arc<JsonRpcChild>{self.child.read().await.clone()}
 
     /// Clone of the canonical event broadcaster, for methods that emit
     /// follow-up-queue events off the background-task path.
@@ -679,7 +674,7 @@ impl CodexSession {
     }
 
     async fn deliver_steer(
-        &self,
+        self: &Arc<Self>,
         input: SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let root = self.state.lock().await.codex_thread_id.clone();
@@ -715,8 +710,7 @@ impl CodexSession {
                         input.skill_invocations.clone(),
                     ),
                 };
-                match self
-                    .child
+                match self.child().await
                     .request("turn/steer", serde_json::to_value(params).unwrap())
                     .await
                 {
@@ -1009,13 +1003,14 @@ impl CodexSession {
     /// override is threaded straight into the RPC. Does NOT perform the
     /// busy check (callers gate that); assumes the session is idle.
     async fn do_send(
-        &self,
+        self: &Arc<Self>,
         text: String,
         images: Vec<crate::agent_provider::ImageInput>,
         skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
+        self.ensure_managed_child().await?;
         let thread_id = self.state.lock().await.codex_thread_id.clone();
         let native = super::slash_commands::request(&text, &thread_id)
             .map_err(|message| ProviderError::ValidationError { message })?;
@@ -1029,7 +1024,7 @@ impl CodexSession {
             // its response, and own the final lifecycle/real turn identifier.
             let pending = TurnId(format!("native-{}", uuid::Uuid::new_v4()));
             self.state.lock().await.active_turn = Some(pending.clone());
-            let response = match self.child.request(method, params).await {
+            let response = match self.child().await.request(method, params).await {
                 Ok(response) => response,
                 Err(error) => {
                     let mut state = self.state.lock().await;
@@ -1083,7 +1078,7 @@ impl CodexSession {
     }
 
     async fn do_send_with_id(
-        &self,
+        self: &Arc<Self>,
         text: String,
         images: Vec<crate::agent_provider::ImageInput>,
         skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
@@ -1091,6 +1086,7 @@ impl CodexSession {
         effort_override: Option<String>,
         client_id: Option<String>,
     ) -> Result<TurnId, TurnStartError> {
+        self.ensure_managed_child().await.map_err(TurnStartError::Admission)?;
         let (codex_thread_id, model_default, effort_default, fast_mode) = {
             let state = self.state.lock().await;
             (
@@ -1135,8 +1131,7 @@ impl CodexSession {
         if let Some(id) = client_id {
             params_value["clientUserMessageId"] = json!(id);
         }
-        let resp = self
-            .child
+        let resp = self.child().await
             .request("turn/start", params_value)
             .await
             .map_err(TurnStartError::Rpc)?;
@@ -1160,6 +1155,13 @@ impl CodexSession {
         self.dead.load(Ordering::Relaxed)
     }
 
+    /// A managed replacement temporarily marks its retired child dead while
+    /// holding outbound. Provider eviction must wait for that owner to settle
+    /// and recheck death, rather than removing an in-progress renewal.
+    pub(super) async fn lifecycle_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.outbound.lock().await
+    }
+
     pub async fn answer_question(
         self: &Arc<Self>,
         input: crate::agent_provider::AnswerQuestionInput,
@@ -1174,7 +1176,7 @@ impl CodexSession {
     }
 
     async fn deliver_question_answer(
-        &self,
+        self: &Arc<Self>,
         input: crate::agent_provider::AnswerQuestionInput,
     ) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError>
     {
@@ -1217,8 +1219,7 @@ impl CodexSession {
                         text_elements: vec![],
                     }],
                 };
-                match self
-                    .child
+                match self.child().await
                     .request("turn/steer", serde_json::to_value(params).unwrap())
                     .await
                 {
@@ -1284,8 +1285,7 @@ impl CodexSession {
     }
 
     async fn read_question_thread(&self, target: &str) -> Result<Value, String> {
-        let value = self
-            .child
+        let value = self.child().await
             .request(
                 "thread/read",
                 json!({"threadId": target, "includeTurns": true}),
@@ -1340,7 +1340,7 @@ impl CodexSession {
             turn_id: active_turn.0.clone(),
         };
         let params_value = serde_json::to_value(&params).unwrap();
-        self.child
+        self.child().await
             .request("turn/interrupt", params_value)
             .await
             .map_err(|e| ProviderError::RpcError {
@@ -1377,7 +1377,7 @@ impl CodexSession {
             message: format!("failed to serialize thread/rollback: {error}"),
             source: None,
         })?;
-        self.child
+        self.child().await
             .request("thread/rollback", params)
             .await
             .map_err(|error| ProviderError::RpcError {
@@ -1402,7 +1402,7 @@ impl CodexSession {
                 })?
         };
         let payload = serde_json::to_value(&response).unwrap();
-        self.child
+        self.child().await
             .respond(jsonrpc_id, Ok(payload))
             .await
             .map_err(|e| ProviderError::RpcError {
@@ -1432,6 +1432,7 @@ impl CodexSession {
     /// short-circuits on repeat calls, and the tasks list is drained, so
     /// later invocations are cheap no-ops.
     pub async fn shutdown(&self) {
+        let _outbound=self.outbound.lock().await;
         // Cancel any queued follow-ups so the UI clears its greyed items.
         self.cancel_all_queued().await;
 
@@ -1440,7 +1441,10 @@ impl CodexSession {
         let _ = self.shutdown_tx.send(());
 
         // Close the JSON-RPC child cleanly (EOF → 2s grace → kill).
-        let _ = self.child.shutdown().await;
+        let child=self.child().await;
+        if self.runtime_lease.lock().await.is_some(){
+            if child.shutdown_owned().await.is_err(){let _=self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning{thread_id:Some(self.thread_id.clone()),message:"Codex is still stopping. Wait before changing the ChatGPT connection.".into(),original_payload:None});}
+        }else{let _=child.shutdown().await;}
 
         // Abort any tasks that haven't exited on their own.
         let tasks: Vec<_> = {
@@ -1450,6 +1454,7 @@ impl CodexSession {
         for t in tasks {
             t.abort();
         }
+        self.runtime_lease.lock().await.take();
         // Flip internal status so concurrent callers see Closed without
         // waiting for the child to actually exit.
         {
@@ -1586,18 +1591,6 @@ fn spawn_notifications_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut notifications = child.notifications();
-        // One demux per session, rooted at the parent Codex thread id, so
-        // child-thread (sub-agent) registrations persist across messages.
-        let parent_codex_thread_id = {
-            let state = session.state.lock().await;
-            state.codex_thread_id.clone()
-        };
-        let mut demux = CodexSubagentDemux::new(parent_codex_thread_id);
-        // Codex's `total` is a lifetime counter that survives
-        // `thread/resume`, but this demux is rebuilt with the session.
-        // Seed what the ledger already holds so the first report after a
-        // rebuild records only genuinely new work.
-        demux.set_recorded_usage_baseline(session.recorded_usage_baseline);
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
@@ -1608,6 +1601,7 @@ fn spawn_notifications_task(
                             // Update local state for a few special
                             // notifications before broadcasting.
                             update_state_from_notification(&session, &msg).await;
+                            let mut demux=session.notification_demux.lock().await;
                             // Codex never states a model on the usage
                             // notification, so the ledger has to learn it
                             // from session state. Refreshed only on the
@@ -1620,7 +1614,9 @@ fn spawn_notifications_task(
                             }
                             let events =
                                 translate_notification_with(&mut demux, &session.thread_id, msg);
+                            drop(demux);
                             for ev in events {
+                                if session.managed.is_some() && matches!(ev,ProviderRuntimeEvent::PlanUsageUpdated{..}){continue}
                                 if event_tx.send(ev).is_err() {
                                     // No subscribers — silently drop.
                                 }
@@ -1640,7 +1636,7 @@ fn spawn_notifications_task(
                                 SessionStatus::Closed | SessionStatus::Error { .. } => {
                                     session.cancel_all_queued().await;
                                 }
-                                _ => session.drain_queue().await,
+                                _ => {let session=session.clone();tokio::spawn(async move{session.drain_queue().await;});},
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1908,6 +1904,10 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
     }
 }
 
+#[cfg(all(test,unix))]
+#[path="managed_tests.rs"]
+pub(crate) mod managed_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1982,7 +1982,7 @@ mod tests {
 
     /// Build a bare `QueuedTurn` with a given id for reorder tests. Only
     /// `queued_id` is inspected by `promote_queued_to_front`.
-    fn queued(id: &str) -> QueuedTurn {
+    pub(super) fn queued(id: &str) -> QueuedTurn {
         QueuedTurn {
             queued_id: id.to_string(),
             input: SendTurnInput {
@@ -2181,6 +2181,7 @@ mod tests {
 /// apart from one whose outcome is unknown.
 #[derive(Debug)]
 enum TurnStartError {
+    Admission(ProviderError),
     Rpc(crate::json_rpc_child::RpcChildError),
     Malformed(serde_json::Error),
 }
@@ -2189,6 +2190,7 @@ enum TurnStartError {
 fn plain_send_error(error: TurnStartError) -> ProviderError {
     ProviderError::RpcError {
         message: match error {
+            TurnStartError::Admission(e) => e.to_string(),
             TurnStartError::Rpc(e) => format!("turn/start failed: {e}"),
             TurnStartError::Malformed(e) => format!("malformed turn/start response: {e}"),
         },
@@ -2200,6 +2202,7 @@ fn question_turn_start_error(
     error: TurnStartError,
 ) -> crate::agent_provider::QuestionDeliveryError {
     match error {
+        TurnStartError::Admission(e) => crate::agent_provider::QuestionDeliveryError::Rejected(e.to_string()),
         TurnStartError::Rpc(e) => question_rpc_error(e),
         TurnStartError::Malformed(e) => crate::agent_provider::QuestionDeliveryError::Unknown(
             format!("Malformed turn/start response: {e}"),

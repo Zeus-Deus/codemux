@@ -267,6 +267,10 @@ pub(super) fn allowed(cmd: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn chatgpt_private_metadata_and_mutations_are_denied_to_web_remote(){
+        for cmd in ["get_chatgpt_status","start_chatgpt_login","cancel_chatgpt_login","disconnect_chatgpt","acknowledge_chatgpt_welcome","get_local_workbench","set_local_workbench"]{assert!(!allowed(cmd),"{cmd} exposes local-only ChatGPT account/preferences authority");}
+    }
+    #[test]
     fn hermes_remote_profile_workflow_is_explicitly_allowed() {
         // Paired clients already run and configure agent chats. Hermes exposes
         // profile identity/catalog/binding metadata and runtime disconnect only;
