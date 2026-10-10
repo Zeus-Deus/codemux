@@ -289,6 +289,7 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
         agent_chat::agent_chat_turn_active(app.clone(), provider, ThreadId(target.thread_id.clone())).await?
     } else { false };
     let latest = app.state::<DatabaseStore>().control_last_thread_run_event(&target.thread_id)?;
+    // The database resolves matching completion within the latest logical run.
     let terminal = latest.as_ref().filter(|event| event["type"] == "turn_completed");
     let observed = app.state::<NativeControlState>().thread_runtime(&target.thread_id);
     let pending: Vec<_> = observed.as_ref().map(|view|view.pending_approvals.iter().map(|request|
@@ -308,7 +309,8 @@ pub(crate) async fn thread_status<R: Runtime>(app: &AppHandle<R>, args: Value) -
     let last_turn = observed.as_ref().and_then(|view|view.last_turn.clone()).or_else(||terminal.map(|event|
         json!({"type":"turn_completed","turn_id":event["turn_id"],"status":{"kind":super::state::turn_outcome(event["status"]["kind"].as_str(), event["status"]["subtype"].as_str()).1}})));
     let settled = !busy && matches!(phase,"completed"|"interrupted"|"error") && last_turn.is_some();
-    let turn_id = observed.as_ref().and_then(|view|view.turn_id.clone()).or_else(||terminal.and_then(|event|event["turn_id"].as_str().map(str::to_owned)));
+    // Historical identity is correlation only, never a restored live owner.
+    let turn_id = observed.as_ref().and_then(|view|view.turn_id.clone()).or_else(||latest.as_ref().and_then(|event|event["turn_id"].as_str().filter(|turn| !turn.is_empty()).map(str::to_owned)));
     Ok(json!({
         "workspace_id":target.workspace_id,"thread_id":target.thread_id,"provider":provider,
         "pane_id":app.state::<AppStateStore>().agent_chat_pane_id_for_thread(&record.thread_id),

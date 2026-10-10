@@ -2991,7 +2991,8 @@ async fn send_turn_internal<R: Runtime>(
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
-                result.steered.then_some(&result.turn_id),
+                &result.turn_id,
+                result.steered,
             );
             bind_turn_checkpoint_transcript(
                 &app,
@@ -3816,14 +3817,15 @@ fn persist_user_message(
     text: &str,
     images: &[PersistedChatImage],
     client_nonce: Option<&str>,
-    steered_turn_id: Option<&TurnId>,
+    turn_id: &TurnId,
+    steered: bool,
 ) -> Option<i64> {
     let mut user_msg = serde_json::json!({
         "type": "user_message",
         "thread_id": thread_id,
         "text": text,
     });
-    if let Some(turn_id) = steered_turn_id {
+    if steered {
         user_msg["steered_turn_id"] = serde_json::json!(turn_id);
     }
     if let Some(nonce) = client_nonce.filter(|n| !n.is_empty()) {
@@ -3842,7 +3844,7 @@ fn persist_user_message(
         user_msg["images"] = serde_json::Value::Array(images_json);
     }
     let payload = serde_json::to_string(&user_msg).ok()?;
-    db.append_agent_chat_message(thread_id, &payload)
+    db.control_append_user_message(thread_id, &payload, &turn_id.0, steered)
         .ok()
         .flatten()
 }
@@ -6230,7 +6232,8 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 text,
                 &pending.images,
                 pending.client_nonce.as_deref(),
-                (*steered).then_some(turn_id),
+                turn_id,
+                *steered,
             );
             bind_turn_checkpoint_transcript(
                 app,

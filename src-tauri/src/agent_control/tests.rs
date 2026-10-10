@@ -418,6 +418,204 @@ async fn mario_r3_queue_boundary(mode: &str) {
     assert!(!fanout.iter().any(|r|r["event"]["type"]=="native_queue_control"), "control journal is not an actor event");
 }
 
+// The only substituted seam is provider discovery/session construction. All
+// sends, FIFO drain, HTTP/SSE translation, native guards, bridge and DB are real.
+struct RecoveryOpenCode {
+    session: Arc<crate::agent_provider::opencode::OpenCodeSession>,
+    tx: tokio::sync::broadcast::Sender<crate::agent_provider::ProviderRuntimeEvent>,
+    metadata: mock_agent_provider::MockAgentProvider,
+}
+#[async_trait::async_trait]
+impl crate::agent_provider::AgentProvider for RecoveryOpenCode {
+    fn kind(&self) -> crate::agent_provider::ProviderKind { crate::agent_provider::ProviderKind::OpenCode }
+    fn capabilities(&self) -> crate::agent_provider::ProviderCapabilities { self.metadata.capabilities() }
+    async fn start_session(&self, input: crate::agent_provider::StartSessionInput) -> Result<crate::agent_provider::ProviderSession, crate::agent_provider::ProviderError> { self.metadata.start_session(input).await }
+    async fn send_turn(&self, input: crate::agent_provider::SendTurnInput) -> Result<crate::agent_provider::TurnStartResult, crate::agent_provider::ProviderError> {
+        self.session.enqueue_or_send(input).await
+    }
+    async fn steer_turn(&self, input: crate::agent_provider::SendTurnInput) -> Result<crate::agent_provider::TurnStartResult, crate::agent_provider::ProviderError> { self.session.steer_turn(input).await }
+    async fn interrupt_turn(&self, _: crate::agent_provider::ThreadId, id: Option<crate::agent_provider::TurnId>) -> Result<(), crate::agent_provider::ProviderError> { self.session.interrupt_selected(id).await }
+    async fn cancel_queued_turn(&self, _: crate::agent_provider::ThreadId, id: String) -> Result<bool, crate::agent_provider::ProviderError> { Ok(self.session.cancel_queued(&id).await) }
+    async fn send_queued_turn_now(&self, _: crate::agent_provider::ThreadId, id: String) -> Result<(), crate::agent_provider::ProviderError> { self.session.send_queued_now(&id, false).await }
+    async fn respond_to_request(&self, _: crate::agent_provider::ThreadId, r: crate::agent_provider::RequestId, d: crate::agent_provider::ApprovalDecision) -> Result<(), crate::agent_provider::ProviderError> { self.session.respond_to_request(r,d).await }
+    async fn set_model(&self, _: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.session.set_model(m).await; Ok(()) }
+    async fn set_permission_mode(&self, t: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.metadata.set_permission_mode(t,m).await }
+    async fn stop_session(&self, _: crate::agent_provider::ThreadId) -> Result<(), crate::agent_provider::ProviderError> { self.session.shutdown().await; Ok(()) }
+    async fn list_sessions(&self) -> Result<Vec<crate::agent_provider::ProviderSession>, crate::agent_provider::ProviderError> { Ok(vec![]) }
+    async fn has_session(&self, _: &crate::agent_provider::ThreadId) -> bool { !self.session.is_dead() }
+    async fn turn_active(&self, _: &crate::agent_provider::ThreadId) -> bool { self.session.turn_active().await }
+    fn event_stream(&self) -> crate::agent_provider::ProviderEventStream {
+        Box::pin(futures_util::stream::unfold(self.tx.subscribe(), |mut rx| async move { Some((rx.recv().await.unwrap(),rx)) }))
+    }
+}
+
+struct RecoveryHttp {
+    events: tokio::sync::broadcast::Sender<String>,
+    connected: tokio::sync::Notify,
+    b_received: tokio::sync::Notify,
+    b_ack: tokio::sync::Semaphore,
+    calls: std::sync::atomic::AtomicUsize,
+    wire: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+async fn recovery_sse(axum::extract::State(peer): axum::extract::State<Arc<RecoveryHttp>>) -> axum::response::Sse<impl futures_util::Stream<Item=Result<axum::response::sse::Event,std::convert::Infallible>>> {
+    let rx = peer.events.subscribe();
+    peer.connected.notify_one();
+    axum::response::Sse::new(futures_util::stream::unfold(rx, |mut rx| async move {
+        Some((Ok(axum::response::sse::Event::default().data(rx.recv().await.unwrap())),rx))
+    }))
+}
+async fn recovery_prompt(axum::extract::State(peer): axum::extract::State<Arc<RecoveryHttp>>, axum::Json(body): axum::Json<serde_json::Value>) -> axum::http::StatusCode {
+    peer.wire.lock().unwrap().push(body);
+    if peer.calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst) == 1 {
+        peer.b_received.notify_one();
+        peer.b_ack.acquire().await.unwrap().forget();
+    }
+    axum::http::StatusCode::NO_CONTENT
+}
+async fn recovery_until(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !predicate() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review5479417968_completion_before_queue_ack_recovers_matching_terminal() {
+    recovery_opencode_boundary(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review5479417968_dispatched_incomplete_settles_only_selected_historical_a() {
+    recovery_opencode_boundary(false).await;
+}
+
+async fn recovery_opencode_boundary(complete_b: bool) {
+    use crate::agent_provider::{AgentProvider, ProviderKind, ThreadId};
+    use crate::commands::agent_chat::{self, ProviderRegistry};
+    use futures_util::StreamExt;
+    let peer = Arc::new(RecoveryHttp {events:tokio::sync::broadcast::channel(16).0,connected:Default::default(),b_received:Default::default(),b_ack:tokio::sync::Semaphore::new(0),calls:Default::default(),wire:Default::default()});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = axum::Router::new().route("/event",axum::routing::get(recovery_sse))
+        .route("/session/recovery/prompt_async",axum::routing::post(recovery_prompt))
+        .route("/session/recovery",axum::routing::delete(|| async {axum::http::StatusCode::NO_CONTENT}))
+        .with_state(peer.clone());
+    let server = tokio::spawn(async move {axum::serve(listener,router).await.unwrap();});
+    let (session,tx) = crate::agent_provider::opencode::session::tests::recovery_session(format!("http://{address}")).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5),peer.connected.notified()).await.unwrap();
+    let provider = Arc::new(RecoveryOpenCode {session,tx,metadata:mock_agent_provider::MockAgentProvider::new(ProviderKind::OpenCode)});
+    let (app, _, root, workspace) = fixture().await;
+    let thread = "t1";
+    app.state::<crate::state::AppStateStore>().create_agent_chat_pane(&workspace,Some(ProviderKind::OpenCode),Some(root.path().to_string_lossy().into_owned()),None,Some(thread.into())).unwrap();
+    app.state::<crate::database::DatabaseStore>().upsert_agent_chat_session(thread,&workspace,Some(root.path().to_str().unwrap()),"opencode").unwrap();
+    app.state::<ProviderRegistry>().set_opencode(provider.clone()).await;
+    let channel = mario_channel(app.handle(),thread);
+    let mut stream = provider.event_stream();let bridge_app = app.handle().clone();
+    let bridge = tokio::spawn(async move {while let Some(event) = stream.next().await {agent_chat::forward_event(&bridge_app,event);}});
+    let a = agent_chat::agent_chat_send_turn(app.handle().clone(),ProviderKind::OpenCode,serde_json::from_value(json!({"thread_id":thread,"text":"recovery-a","client_nonce":"recovery-a-nonce"})).unwrap()).await.unwrap();
+    assert!(provider.turn_active(&ThreadId(thread.into())).await);
+    let receipt = execute(app.handle(),&ControlCaller::trusted(),"thread_send",json!({"workspace_id":workspace,"thread_id":thread,"client_request_id":"recovery-b-nonce","message":"recovery-b","delivery":"queue"})).await.unwrap();
+    let accepted = settle_operation(&app,&receipt).await;
+    assert_eq!(accepted["state"],"succeeded","{accepted}");
+    let queued = accepted["result"]["turn"]["queued_id"].as_str().unwrap().to_string();
+    let idle = json!({"type":"session.idle","properties":{"sessionID":"recovery"}}).to_string();
+    peer.events.send(idle.clone()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5),peer.b_received.notified()).await.unwrap();
+    recovery_until(||app.state::<crate::database::DatabaseStore>().control_turn_outcome(thread,&a.turn_id.0).unwrap().is_some()).await;
+    recovery_until(||app.state::<NativeControlState>().thread_runtime(thread).is_some_and(|v|v.turn_id.as_deref().is_some_and(|id|id!=a.turn_id.0))).await;
+    let b = app.state::<NativeControlState>().thread_runtime(thread).unwrap().turn_id.unwrap();
+    assert_ne!(b,a.turn_id.0);
+    if complete_b {
+        peer.events.send(idle).unwrap();
+        recovery_until(||app.state::<crate::database::DatabaseStore>().control_turn_outcome(thread,&b).unwrap().is_some()).await;
+        assert!(!channel.lock().unwrap().iter().any(|p|p["event"]["type"]=="queued_turn_dispatched"),"B completed while its actual HTTP ACK is held");
+    }
+    peer.b_ack.add_permits(1);
+    recovery_until(||app.state::<crate::database::DatabaseStore>().list_agent_chat_messages(thread).iter().any(|p| {
+        let v:serde_json::Value=serde_json::from_str(p).unwrap();v["type"]=="user_message" && v["client_nonce"]=="recovery-b-nonce"
+    })).await;
+    recovery_until(||channel.lock().unwrap().iter().any(|p|p["event"]["type"]=="queued_turn_dispatched" && p["event"]["queued_id"]==queued)).await;
+    let live = execute(app.handle(),&ControlCaller::trusted(),"thread_status",json!({"workspace_id":workspace,"thread_id":thread})).await.unwrap();
+    let mode = if complete_b {"completed-before-ack"} else {"dispatched-incomplete"};
+    let snapshot = std::env::var_os("CODEMUX_MARIO_RECEIPT").map(std::path::PathBuf::from).map(|p|p.with_file_name(format!("review-{mode}.sqlite"))).unwrap_or_else(||root.path().join("snapshot.sqlite"));
+    let recovered_db = app.state::<crate::database::DatabaseStore>().control_fixture_snapshot(&snapshot);
+    let rows:Vec<serde_json::Value> = recovered_db.list_agent_chat_messages(thread).iter().map(|p|serde_json::from_str(p).unwrap()).collect();
+    let fanout = channel.lock().unwrap().clone();
+    // Freeze before cleanup; shutdown cannot manufacture a terminal in it.
+    bridge.abort();let _ = bridge.await;
+    provider.stop_session(ThreadId(thread.into())).await.unwrap();
+    server.abort();let _ = server.await;
+    assert!(tokio::net::TcpListener::bind(address).await.is_ok(),"owned HTTP listener must be released");
+    app.unmanage::<NativeControlState>().unwrap();app.manage(NativeControlState::default());
+    app.unmanage::<ProviderRegistry>().unwrap();app.manage(ProviderRegistry::new());
+    let cold_provider = Arc::new(mock_agent_provider::MockAgentProvider::new(ProviderKind::OpenCode));
+    app.state::<ProviderRegistry>().set_opencode(cold_provider.clone()).await;
+    app.unmanage::<crate::database::DatabaseStore>().unwrap();app.manage(recovered_db);
+    let target = json!({"workspace_id":workspace,"thread_id":thread});
+    let cold = execute(app.handle(),&ControlCaller::trusted(),"thread_status",target.clone()).await.unwrap();
+    let mut wait_target = target;wait_target["timeout_ms"]=json!(1);
+    let ordinary = execute(app.handle(),&ControlCaller::trusted(),"thread_wait",wait_target.clone()).await.unwrap();
+    wait_target["turn_id"]=json!(a.turn_id.0);
+    let selected_a = execute(app.handle(),&ControlCaller::trusted(),"thread_wait",wait_target.clone()).await.unwrap();
+    wait_target["turn_id"]=json!(b);
+    let selected_b = execute(app.handle(),&ControlCaller::trusted(),"thread_wait",wait_target).await.unwrap();
+    mario_save_receipt(&format!("review-{mode}"),&json!({"fanout":fanout,"rows":rows,"wire":*peer.wire.lock().unwrap(),"snapshot":snapshot,"a":a.turn_id,"b":b,"queued_id":queued,"accepted":accepted,"live":live,"cold":cold,"ordinary":ordinary,"selected_a":selected_a,"selected_b":selected_b,"listener_released":true}));
+    assert!(app.state::<NativeControlState>().thread_runtime(thread).is_none());
+    assert!(cold_provider.calls.snapshot().is_empty(),"history reads must not dispatch, reserve or restore callbacks");
+    assert_eq!(cold["queued_ids"],json!([]));assert_eq!(cold["uncertain_queued_ids"],json!([]));assert_eq!(cold["pending_approvals"],json!([]));
+    assert_eq!(rows.iter().filter(|r|r["type"]=="user_message" && r["client_nonce"]=="recovery-b-nonce").count(),1);
+    assert!(!rows.iter().any(|r|r["type"]=="native_queue_control" && r.to_string().contains("recovery-b")));
+    assert_eq!(cold["phase"],if complete_b {"completed"} else {"unknown"},"late ACK/envelope cannot hide B's matching completion: {cold}");
+    assert_eq!(cold["settled"],complete_b);
+    assert_eq!(ordinary["settled"],complete_b);assert_eq!(ordinary["timed_out"],!complete_b);
+    assert_eq!(selected_a["settled"],true,"completed historical A is independent of known newer B: {selected_a}");
+    assert_eq!(selected_a["timed_out"],false);
+    assert_eq!(selected_b["settled"],complete_b);assert_eq!(selected_b["timed_out"],!complete_b);
+    assert_eq!(cold["turn_id"],b,"historical current identity is not runtime authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review5479417968_immediate_envelope_and_late_steering_remain_one_completed_run() {
+    use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, ThreadId, TurnId, TurnStatus};
+    use crate::commands::agent_chat::{self, ProviderRegistry};
+    let (app, provider, root, workspace) = fixture().await;
+    let launch = execute(app.handle(),&ControlCaller::trusted(),"thread_launch",json!({"workspace_id":workspace,"client_request_id":"recovery-immediate-launch","provider":"claude","permission_mode":"default"})).await.unwrap();
+    let launched = settle_operation(&app,&launch).await;
+    let thread = launched["thread_id"].as_str().unwrap();
+    let channel = mario_channel(app.handle(),thread);
+    let (entered,release) = provider.hold_next_send();
+    let send_app = app.handle().clone();let send_thread=thread.to_string();
+    let send = tokio::spawn(async move {agent_chat::agent_chat_send_turn(send_app,ProviderKind::Claude,serde_json::from_value(json!({"thread_id":send_thread,"text":"immediate visible","client_nonce":"immediate-nonce"})).unwrap()).await.unwrap()});
+    tokio::time::timeout(std::time::Duration::from_secs(5),entered.notified()).await.unwrap();
+    // Scheduling-only synthetic completion before the mock send's ACK. The
+    // real command must still correlate its late visible envelope by ID.
+    agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnCompleted {thread_id:ThreadId(thread.into()),turn_id:TurnId("mock-turn".into()),status:TurnStatus::Success,usage:None});
+    release.notify_one();let result=send.await.unwrap();assert_eq!(result.turn_id.0,"mock-turn");
+    agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::TurnQueued {thread_id:ThreadId(thread.into()),queued_id:"cancel-me".into(),text:"must not replay".into(),client_nonce:None});
+    agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnCancelled {thread_id:ThreadId(thread.into()),queued_id:"cancel-me".into()});
+    agent_chat::forward_event(app.handle(),ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:ThreadId(thread.into()),queued_id:"late-steer".into(),turn_id:TurnId("mock-turn".into()),text:"late guidance".into(),steered:true});
+    let snapshot=std::env::var_os("CODEMUX_MARIO_RECEIPT").map(std::path::PathBuf::from).map(|p|p.with_file_name("review-immediate-steered.sqlite")).unwrap_or_else(||root.path().join("snapshot.sqlite"));
+    let db=app.state::<crate::database::DatabaseStore>().control_fixture_snapshot(&snapshot);
+    let rows:Vec<serde_json::Value>=db.list_agent_chat_messages(thread).iter().map(|p|serde_json::from_str(p).unwrap()).collect();
+    let user=rows.iter().find(|r|r["type"]=="user_message" && r["client_nonce"]=="immediate-nonce").unwrap();
+    assert_eq!(user,&json!({"type":"user_message","thread_id":thread,"text":"immediate visible","client_nonce":"immediate-nonce"}),"ordinary user envelope fields are unchanged");
+    let steer=rows.iter().find(|r|r["type"]=="user_message" && r["text"]=="late guidance").unwrap();
+    assert_eq!(steer["steered_turn_id"],"mock-turn");
+    for journal in rows.iter().filter(|r|r["type"]=="native_user_control") {
+        let keys:std::collections::BTreeSet<_>=journal.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys,std::collections::BTreeSet::from(["type","thread_id","user_message_id","turn_id","steered"]));
+    }
+    app.unmanage::<crate::database::DatabaseStore>().unwrap();app.manage(db);
+    app.unmanage::<NativeControlState>().unwrap();app.manage(NativeControlState::default());
+    app.unmanage::<ProviderRegistry>().unwrap();app.manage(ProviderRegistry::new());
+    let status=execute(app.handle(),&ControlCaller::trusted(),"thread_status",json!({"workspace_id":workspace,"thread_id":thread})).await.unwrap();
+    let read=execute(app.handle(),&ControlCaller::trusted(),"thread_read",json!({"workspace_id":workspace,"thread_id":thread,"limit":100})).await.unwrap();
+    assert_eq!(status["phase"],"completed");assert_eq!(status["settled"],true);assert_eq!(status["turn_id"],"mock-turn");
+    assert_eq!(status["uncertain_queued_ids"],json!([]));assert_eq!(status["pending_approvals"],json!([]));assert_eq!(status["queued_ids"],json!([]));
+    assert_eq!(read["total_visible_messages"],2);assert!(!read.to_string().contains("native_user_control"));
+    assert!(app.state::<NativeControlState>().thread_runtime(thread).is_none());
+    mario_save_receipt("review-immediate-steered",&json!({"fanout":*channel.lock().unwrap(),"rows":rows,"status":status,"read":read,"snapshot":snapshot}));
+}
+
 #[tokio::test]
 async fn workspace_discovery_uses_app_owned_state() {
     let app = tauri::test::mock_app();

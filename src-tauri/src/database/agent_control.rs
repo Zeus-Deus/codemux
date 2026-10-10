@@ -133,13 +133,63 @@ impl DatabaseStore {
         event.map(|event|serde_json::from_str(&event).map_err(|e|e.to_string())).transpose()
     }
 
+    /// Append the unchanged visible envelope and its ID-only run correlation
+    /// atomically. A crash must not leave a late envelope without its identity.
+    /// Neither this journal nor historical IDs restore runtime authority.
+    pub(crate) fn control_append_user_message(&self, thread: &str, payload: &str, turn: &str, steered: bool) -> Result<Option<i64>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e|e.to_string())?;
+        match tx.execute(
+            "INSERT INTO agent_chat_messages (thread_id,payload,created_at)
+             VALUES (?1,?2,strftime('%Y-%m-%d %H:%M:%f','now'))",
+            params![thread,payload],
+        ) {
+            Ok(_) => {},
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        }
+        let row = tx.last_insert_rowid();
+        if !turn.is_empty() {
+            let identity = serde_json::json!({"type":"native_user_control","thread_id":thread,
+                "user_message_id":row,"turn_id":turn,"steered":steered});
+            tx.execute(
+                "INSERT INTO agent_chat_messages (thread_id,payload,created_at)
+                 VALUES (?1,?2,strftime('%Y-%m-%d %H:%M:%f','now'))",
+                params![thread,identity.to_string()],
+            ).map_err(|e|format!("user_turn_journal_failed: {e}"))?;
+        }
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(Some(row))
+    }
+
+    /// Order logical runs by their first durable evidence, not a late ACK.
+    /// Legacy uncorrelated user rows remain unknown; never guess their IDs.
     pub fn control_last_thread_run_event(&self, thread: &str) -> Result<Option<Value>, String> {
         let event: Option<String> = self.conn.lock().unwrap().query_row(
-            "SELECT payload FROM agent_chat_messages WHERE thread_id=?1
-             AND (json_extract(payload,'$.type') IN ('turn_completed','user_message','turn_queued','queued_turn_dispatched')
-                  OR (json_extract(payload,'$.type')='native_queue_control'
-                      AND json_extract(payload,'$.disposition')='dispatched' AND json_extract(payload,'$.steered')=0))
-             ORDER BY id DESC LIMIT 1",
+            "WITH evidence AS (
+                 SELECT id,payload,
+                    CASE WHEN json_extract(payload,'$.type') IN ('user_message','turn_queued')
+                         OR COALESCE(json_extract(payload,'$.turn_id'),'')=''
+                         THEN 'row:'||id ELSE 'turn:'||json_extract(payload,'$.turn_id') END AS run,
+                    CASE WHEN json_extract(payload,'$.type')='native_user_control'
+                         THEN json_extract(payload,'$.user_message_id') ELSE id END AS position
+                 FROM agent_chat_messages a WHERE thread_id=?1 AND (
+                    json_extract(payload,'$.type') IN ('turn_completed','turn_queued')
+                    OR (json_extract(payload,'$.type')='queued_turn_dispatched'
+                        AND COALESCE(json_extract(payload,'$.steered'),0)=0)
+                    OR (json_extract(payload,'$.type')='native_queue_control'
+                        AND json_extract(payload,'$.disposition')='dispatched' AND json_extract(payload,'$.steered')=0)
+                    OR (json_extract(payload,'$.type')='native_user_control' AND json_extract(payload,'$.steered')=0)
+                    OR (json_extract(payload,'$.type')='user_message'
+                        AND COALESCE(json_extract(payload,'$.steered_turn_id'),'')=''
+                        AND NOT EXISTS (SELECT 1 FROM agent_chat_messages b WHERE b.thread_id=a.thread_id
+                            AND json_extract(b.payload,'$.type')='native_user_control'
+                            AND json_extract(b.payload,'$.user_message_id')=a.id))
+                 )
+             ), runs AS (SELECT run,MIN(position) AS first_position FROM evidence GROUP BY run)
+             SELECT payload FROM evidence JOIN runs USING(run)
+               ORDER BY first_position DESC, json_extract(payload,'$.type')='turn_completed' DESC, id DESC LIMIT 1",
             params![thread], |row|row.get(0),
         ).optional().map_err(|e|e.to_string())?;
         event.map(|event| serde_json::from_str(&event).map_err(|e|e.to_string())).transpose()
@@ -264,6 +314,35 @@ mod tests {
                 assert!(db.control_last_thread_run_event("queue-thread").unwrap().is_none(), "cancelled queue is not a new parent run");
             }
         }
+    }
+
+    #[test]
+    fn review5479417968_late_envelopes_do_not_reorder_logical_runs_or_guess_legacy_ids() {
+        use crate::agent_provider::{ProviderRuntimeEvent, ThreadId, TurnId};
+        let db = DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("t","w",None,"opencode").unwrap();
+        let complete = |id: &str| serde_json::json!({"type":"turn_completed","thread_id":"t","turn_id":id,"status":{"kind":"success"}}).to_string();
+        db.append_agent_chat_message("t",&complete("a")).unwrap();
+        db.append_agent_chat_message("t",&complete("b")).unwrap();
+        db.control_append_user_message("t",r#"{"type":"user_message","thread_id":"t","text":"visible c"}"#,"c",false).unwrap().unwrap();
+        // B's delayed ACK and actual deferred envelope arrive after C starts.
+        db.control_record_queue_event(&ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:ThreadId("t".into()),queued_id:"qb".into(),turn_id:TurnId("b".into()),text:"private b".into(),steered:false}).unwrap();
+        db.control_append_user_message("t",r#"{"type":"user_message","thread_id":"t","text":"visible b"}"#,"b",false).unwrap().unwrap();
+        assert_eq!(db.control_last_thread_run_event("t").unwrap().unwrap()["turn_id"],"c");
+        assert!(db.control_turn_outcome("t","c").unwrap().is_none());
+        assert!(db.control_turn_outcome("t","b").unwrap().is_some());
+        db.append_agent_chat_message("t",&complete("c")).unwrap();
+        assert_eq!(db.control_last_thread_run_event("t").unwrap().unwrap()["type"],"turn_completed");
+        db.append_agent_chat_message("t",r#"{"type":"user_message","thread_id":"t","text":"unknown legacy"}"#).unwrap();
+        let legacy = db.control_last_thread_run_event("t").unwrap().unwrap();
+        assert_eq!(legacy["type"],"user_message");assert!(legacy["turn_id"].is_null());
+        db.append_agent_chat_message("t",r#"{"type":"user_message","thread_id":"t","text":"late steer","steered_turn_id":"b"}"#).unwrap();
+        assert_eq!(db.control_last_thread_run_event("t").unwrap().unwrap(),legacy,"guidance is not a new run");
+        assert!(db.control_append_user_message("missing",r#"{"type":"user_message","text":"deleted thread"}"#,"invented",false).unwrap().is_none());
+        assert!(db.control_last_thread_run_event("missing").unwrap().is_none(),"deleted thread must not acquire a journal identity");
+        let page = db.read_agent_chat_history_page("w","t",None,100).unwrap();
+        assert_eq!(page.total_visible_messages,4);
+        assert!(!serde_json::to_string(&page).unwrap().contains("native_user_control"));
     }
 
     #[test]

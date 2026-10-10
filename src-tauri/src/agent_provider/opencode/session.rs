@@ -1444,6 +1444,21 @@ pub(crate) mod tests {
         (session, tx, rx)
     }
 
+    /// Recovery tests use the real HTTP prompt, SSE listener and queue worker,
+    /// but never discover/spawn an installed provider or access an account.
+    pub(crate) async fn recovery_session(base_url: String) -> (
+        Arc<OpenCodeSession>, broadcast::Sender<ProviderRuntimeEvent>,
+    ) {
+        let (session, tx, _) = mock_session(base_url.clone(), "synthetic".into(), "recovery").await;
+        let peer = SsePeer {
+            directory: None, session_id: "recovery".into(),
+            event_ctx: session.event_ctx.clone(), router: session.router.clone(),
+            dead: session.dead.clone(), usage: session.usage.clone(),
+        };
+        *session.sse_handle.lock().await = Some(spawn_sse_listener(base_url, "synthetic".into(), peer, tx.clone()));
+        (session, tx)
+    }
+
     #[tokio::test]
     async fn send_turn_posts_prompt_async_and_emits_running_state() {
         let mut server = Server::new_async().await;
