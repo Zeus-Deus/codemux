@@ -81,7 +81,11 @@ export function MessageCopyButton({
       ) : (
         <Copy className="size-3" aria-hidden />
       )}
-      {copied ? "Copied" : "Copy"}
+      {/* Touch shows the strip under every message, so the word would repeat
+          down the whole transcript; the glyph alone carries it there. */}
+      <span className="pointer-coarse:sr-only">
+        {copied ? "Copied" : "Copy"}
+      </span>
     </button>
   );
 }

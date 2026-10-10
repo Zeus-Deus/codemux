@@ -44,7 +44,8 @@ html[data-mobile] [data-slot="dialog-content"] {
 }
 html[data-mobile]
   :is([data-slot="popover-content"], [data-slot="dropdown-menu-content"]) {
-  max-width: calc(100vw - 16px);
+  /* Popovers start at the trigger's 16px inset; match it on the far side. */
+  max-width: calc(100vw - 32px);
   max-height: min(var(--radix-popper-available-height, 70dvh), 70dvh);
   overflow: auto;
 }
@@ -137,7 +138,7 @@ html[data-mobile] [data-terminal-pane-actions] {
 .mobile-workspaces {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 .mobile-workspace {
   display: flex;
@@ -153,17 +154,30 @@ html[data-mobile] [data-terminal-pane-actions] {
   align-items: center;
   flex: 1;
   min-width: 0;
-  padding: 16px 8px 16px 12px;
+  padding: 10px 4px 10px 12px;
 }
 .mobile-project-icon {
+  position: relative;
   display: grid;
   place-items: center;
-  height: 40px;
-  width: 40px;
+  height: 36px;
+  width: 36px;
   flex-shrink: 0;
   border-radius: var(--radius);
   background: var(--secondary);
   color: var(--muted-foreground);
+  font-size: 14px;
+  font-weight: 600;
+}
+/* Status rides on the avatar so the eye finds "needs you" without reading. */
+.mobile-project-status {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 11px;
+  height: 11px;
+  border-radius: 9999px;
+  box-shadow: 0 0 0 2px var(--card);
 }
 .mobile-settle {
   display: grid;
@@ -183,9 +197,6 @@ html[data-mobile] [data-terminal-pane-actions] {
 .mobile-actions > button:hover {
   background: var(--accent);
 }
-.mobile-actions > button svg:last-child {
-  margin-left: auto;
-}
 .mobile-keyboard-dismiss {
   display: none;
 }
@@ -193,13 +204,13 @@ html[data-keyboard="true"] .mobile-nav {
   display: none;
 }
 .mobile-pane-picker {
-  width: 100%;
   min-width: 0;
+  max-width: 50%;
   min-height: 44px;
   background: var(--background);
   color: var(--foreground);
-  border-bottom: 1px solid var(--border);
-  padding: 0 12px;
+  font-weight: 600;
+  padding: 0 4px 0 12px;
 }
 .mobile-install {
   margin-top: 20px;
@@ -288,21 +299,36 @@ html[data-mobile] .mobile-shell button:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: -2px;
 }
+/* One row: tool picker, the tool's own actions, then find/close. The shell
+   header's back arrow already returns to the conversation. */
 .mobile-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 48px;
+  padding: 0 4px 0 0;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 .mobile-panel-header button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   padding: 0 10px;
   flex-shrink: 0;
   font-size: 13px;
+  color: var(--muted-foreground);
+  border-radius: var(--radius);
 }
 .mobile-panel-actions {
   display: flex;
-  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
   align-items: center;
+  justify-content: flex-end;
   overflow-x: auto;
-  padding: 2px 8px;
+  scrollbar-width: none;
 }
 .mobile-panel-actions > * {
   flex-shrink: 0;
@@ -422,8 +448,12 @@ html[data-mobile] #root > .h-screen {
   padding-block: 12px;
 }
 .mobile-workspace-actions button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   text-align: left;
   padding: 0 10px;
+  border-radius: var(--radius);
 }
 
 html[data-mobile] [data-testid="composer-body"] textarea {
@@ -627,4 +657,67 @@ html[data-mobile] [data-slot="sheet-content"].mobile-bottom-sheet {
 .mobile-history-list > .mobile-history-more {
   align-items: center;
   background: transparent;
+}
+
+/* Streamdown lists use list-inside, which wraps a long bullet under its own
+   marker. Phones wrap nearly every bullet, so hang the marker instead. */
+html[data-mobile] .chat-markdown :is(ul, ol) {
+  list-style-position: outside;
+  padding-left: 1.25rem;
+}
+html[data-mobile] .chat-markdown li {
+  padding-left: 0.25rem;
+}
+/* The phone shows one pane and never rewrites the desktop's split tree, so a
+   split made here would only hide the pane the reader was looking at. */
+html[data-mobile] [data-terminal-pane-actions] :is([aria-label="Split right"], [aria-label="Split down"]) {
+  display: none;
+}
+
+/* Glanceable shortcuts above the composer (changed files, PR). Centered,
+   pill-shaped, and opted back into pointer events inside the docked region. */
+.mobile-composer-chips {
+  pointer-events: auto;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px 8px;
+}
+.mobile-composer-chips button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px !important;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  background: color-mix(in oklab, var(--card) 88%, transparent);
+  backdrop-filter: blur(12px);
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Devices: the desktop rows are one fixed 32px line. At phone width the
+   44px tap targets overflow it and the chips run into the branch, so each
+   row gets a second line for its actions, and a serving host's badge and
+   Connect wrap under its name instead of squeezing it to one letter. */
+html[data-mobile] [data-device-card-header="serving"] {
+  flex-wrap: wrap;
+}
+html[data-mobile] [data-device-card-header="serving"] > button:first-child {
+  flex-basis: 100%;
+}
+html[data-mobile] [data-device-sync-row] {
+  height: auto;
+  grid-template-columns: 14px minmax(0, 1fr) minmax(0, 40%);
+  row-gap: 2px;
+  padding-block: 6px;
+}
+html[data-mobile] [data-device-sync-row] > :nth-child(3) {
+  text-align: right;
+}
+html[data-mobile] [data-device-sync-row] > :nth-child(4) {
+  grid-column: 2 / -1;
+  justify-self: start;
 }
