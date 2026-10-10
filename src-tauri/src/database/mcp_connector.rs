@@ -77,7 +77,11 @@ fn grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpGrant> {
 const GRANT_SELECT: &str = "SELECT g.id,g.client_id,c.name,g.redirect_uri,g.resource,g.access,g.created_at,g.expires_at FROM agent_mcp_grants g JOIN agent_mcp_clients c ON c.id=g.client_id";
 
 pub(super) fn migrate(conn: &rusqlite::Connection) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    // Reserve the writer before schema reads retain a WAL snapshot. A Deferred
+    // read-to-write upgrade can otherwise fail with BUSY_SNAPSHOT after another
+    // connection commits, even with the normal busy timeout.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     tx.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
     let has_marker: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_mcp_clients') WHERE name='approved_at')",
@@ -340,6 +344,364 @@ mod tests {
             expires_at: 100,
         }
     }
+    // A scheduling-only hook on the real completed migration read. The writer
+    // either commits (old Deferred mode) or signals actual lock contention and
+    // waits for the schema owner to finish; no writer commit is required inside
+    // an Immediate transaction, and no same-thread callback waits for that commit.
+    #[test]
+    fn migration_serializes_writer_after_snapshot_read() {
+        use std::ffi::{c_void, CStr};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct WriterGate {
+            observed: mpsc::Sender<String>,
+            release: mpsc::Receiver<()>,
+            timed_out: bool,
+        }
+        unsafe extern "C" fn busy(context: *mut c_void, _: i32) -> i32 {
+            let gate = unsafe { &mut *(context as *mut WriterGate) };
+            let _ = gate.observed.send("writer-blocked".into());
+            if gate.release.recv_timeout(Duration::from_secs(5)).is_err() {
+                gate.timed_out = true;
+                return 0;
+            }
+            1
+        }
+        struct ReadGate {
+            start: mpsc::Sender<()>,
+            observed: mpsc::Receiver<String>,
+            observation: Option<String>,
+            fired: bool,
+            write_error: i32,
+        }
+        unsafe extern "C" fn profile(
+            kind: u32,
+            context: *mut c_void,
+            stmt: *mut c_void,
+            _: *mut c_void,
+        ) -> i32 {
+            if kind != rusqlite::ffi::SQLITE_TRACE_PROFILE as u32 {
+                return 0;
+            }
+            let stmt = stmt as *mut rusqlite::ffi::sqlite3_stmt;
+            let ptr = unsafe { rusqlite::ffi::sqlite3_sql(stmt) };
+            if ptr.is_null() {
+                return 0;
+            }
+            let sql = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+            let gate = unsafe { &mut *(context as *mut ReadGate) };
+            if sql.starts_with("UPDATE agent_control_operations SET principal=") {
+                gate.write_error = unsafe {
+                    rusqlite::ffi::sqlite3_extended_errcode(rusqlite::ffi::sqlite3_db_handle(stmt))
+                };
+            }
+            if !gate.fired && sql.contains("pragma_table_info('agent_mcp_clients')") {
+                gate.fired = true;
+                let _ = gate.start.send(());
+                gate.observation = gate.observed.recv_timeout(Duration::from_secs(5)).ok();
+            }
+            0
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration.db");
+        let seed = super::super::open_connection(&path).unwrap();
+        super::super::create_schema(&seed).unwrap();
+        let seed = DatabaseStore {
+            conn: Mutex::new(seed),
+        };
+        seed.mcp_register_client(client("client"), 0).unwrap();
+        seed.mcp_mint_grant(grant("grant", "synthetic-migration"))
+            .unwrap();
+        let receipt = seed
+            .admit_control_operation(
+                "mcp:grant",
+                "migration-key",
+                "thread_read",
+                "hash",
+                "boot",
+                None,
+                None,
+            )
+            .unwrap()
+            .receipt;
+        drop(seed);
+        let reader = super::super::open_connection(&path).unwrap();
+        let writer = super::super::open_connection(&path).unwrap();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut gate = Box::new(WriterGate {
+                observed: observed_tx,
+                release: release_rx,
+                timed_out: false,
+            });
+            unsafe {
+                assert_eq!(
+                    rusqlite::ffi::sqlite3_busy_handler(
+                        writer.handle(),
+                        Some(busy),
+                        &mut *gate as *mut WriterGate as *mut c_void
+                    ),
+                    0
+                );
+            }
+            let writer = DatabaseStore {
+                conn: Mutex::new(writer),
+            };
+            let started = start_rx.recv_timeout(Duration::from_secs(5));
+            let result = if started.is_ok() {
+                writer.set_setting("web_remote.device_id", "synthetic-owned-device")
+            } else {
+                Err("read hook did not start writer".into())
+            };
+            let _ = gate.observed.send(format!("writer-committed:{result:?}"));
+            unsafe {
+                rusqlite::ffi::sqlite3_busy_handler(
+                    writer.conn.lock().unwrap().handle(),
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+            (result, gate.timed_out)
+        });
+        let mut gate = Box::new(ReadGate {
+            start: start_tx,
+            observed: observed_rx,
+            observation: None,
+            fired: false,
+            write_error: 0,
+        });
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_trace_v2(
+                    reader.handle(),
+                    rusqlite::ffi::SQLITE_TRACE_PROFILE as u32,
+                    Some(profile),
+                    &mut *gate as *mut ReadGate as *mut c_void
+                ),
+                0
+            );
+        }
+        let result = super::super::create_schema(&reader);
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(reader.handle(), 0, None, std::ptr::null_mut());
+        }
+        let _ = release_tx.send(());
+        let (written, timed_out) = worker.join().unwrap();
+        println!("MIGRATION_SCHEDULE schema={result:?} writer={written:?} observation={:?} write_extended_code={} timed_out={timed_out}", gate.observation, gate.write_error);
+        assert!(
+            gate.fired && gate.observation.is_some(),
+            "completed production schema read was observed"
+        );
+        assert!(
+            !timed_out && written.is_ok(),
+            "competing real setter must survive after schema commit"
+        );
+        assert!(
+            result.is_ok(),
+            "schema must acquire write authority before its WAL snapshot: {result:?}"
+        );
+        assert_eq!(gate.observation.as_deref(), Some("writer-blocked"));
+        let readback = DatabaseStore {
+            conn: Mutex::new(reader),
+        };
+        assert_eq!(
+            readback.get_setting("web_remote.device_id").as_deref(),
+            Some("synthetic-owned-device")
+        );
+        let principal: String = readback
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT principal FROM agent_control_operations WHERE id=?1",
+                [&receipt.operation_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(principal, "mcp-client:client");
+    }
+
+    #[test]
+    fn migration_fresh_upgrade_and_repeated_full_reopen_preserve_owners_and_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        let conn = super::super::open_connection(&path).unwrap();
+        super::super::create_schema(&conn).unwrap();
+        conn.execute_batch("DROP TABLE agent_mcp_grants; DROP TABLE agent_mcp_clients; DROP TABLE agent_mcp_config;").unwrap();
+        let legacy = SCHEMA.replace(
+            "created_at INTEGER NOT NULL,\n    approved_at INTEGER",
+            "created_at INTEGER NOT NULL",
+        );
+        conn.execute_batch(&legacy).unwrap();
+        conn.execute_batch("INSERT INTO agent_mcp_clients VALUES('client','client','[]',0),('anonymous','anon','[]',0);
+            INSERT INTO agent_mcp_grants VALUES('grant','client','hash','https://client.example/cb','https://mcp.example/mcp','read_only',7,100,0),
+                ('peer','client','hash-peer','https://client.example/cb','https://mcp.example/mcp','read_only',11,100,1);
+            INSERT INTO agent_control_operations(id,principal,request_key,tool,payload_hash,epoch,state) VALUES
+                ('unique','mcp:grant','unique','thread_read','h','b','succeeded'),
+                ('missing','mcp:deleted','missing','thread_read','h','b','succeeded'),
+                ('collision','mcp:grant','collision','thread_read','h','b','succeeded'),
+                ('stable','mcp-client:client','collision','thread_read','h','b','succeeded'),
+                ('ambiguous-a','mcp:grant','ambiguous','thread_read','h','b','succeeded'),
+                ('ambiguous-b','mcp:peer','ambiguous','thread_read','h','b','succeeded');
+            UPDATE schema_version SET version=19;").unwrap();
+        drop(conn);
+        for _ in 0..3 {
+            let conn = super::super::open_connection(&path).unwrap();
+            super::super::create_schema(&conn).unwrap();
+            let owners: Vec<(String, String)> = conn
+                .prepare("SELECT id,principal FROM agent_control_operations ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                owners,
+                vec![
+                    ("ambiguous-a".into(), "mcp:grant".into()),
+                    ("ambiguous-b".into(), "mcp:peer".into()),
+                    ("collision".into(), "mcp:grant".into()),
+                    ("missing".into(), "mcp:deleted".into()),
+                    ("stable".into(), "mcp-client:client".into()),
+                    ("unique".into(), "mcp-client:client".into())
+                ]
+            );
+            let approvals: Vec<(String, Option<i64>)> = conn
+                .prepare("SELECT id,approved_at FROM agent_mcp_clients ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                approvals,
+                vec![("anonymous".into(), None), ("client".into(), Some(11))]
+            );
+            assert_eq!(
+                conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                20
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, u32>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn migration_failure_rolls_back_and_busy_admission_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.db");
+        let conn = super::super::open_connection(&path).unwrap();
+        super::super::create_schema(&conn).unwrap();
+        conn.execute_batch("DROP TABLE agent_mcp_grants; DROP TABLE agent_mcp_clients; DROP TABLE agent_mcp_config;").unwrap();
+        conn.execute_batch(&SCHEMA.replace(
+            "created_at INTEGER NOT NULL,\n    approved_at INTEGER",
+            "created_at INTEGER NOT NULL",
+        ))
+        .unwrap();
+        conn.execute_batch("INSERT INTO agent_mcp_clients VALUES('client','client','[]',0);
+            INSERT INTO agent_mcp_grants VALUES('grant','client','hash','r','s','read_only',7,100,0);
+            INSERT INTO agent_control_operations(id,principal,request_key,tool,payload_hash,epoch,state) VALUES ('op','mcp:grant','key','thread_read','h','b','succeeded');
+            CREATE TRIGGER reject_owner BEFORE UPDATE OF principal ON agent_control_operations BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;").unwrap();
+        assert!(migrate(&conn)
+            .unwrap_err()
+            .contains("synthetic migration failure"));
+        assert!(conn.is_autocommit());
+        let marker: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_mcp_clients') WHERE name='approved_at')", [], |r|r.get(0)).unwrap();
+        assert!(
+            !marker,
+            "failed owner migration must roll back approval-column/backfill too"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT principal FROM agent_control_operations WHERE id='op'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "mcp:grant"
+        );
+        conn.execute_batch("DROP TRIGGER reject_owner;").unwrap();
+        let mut blocker = super::super::open_connection(&path).unwrap();
+        let held = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000, "production admission budget is unchanged");
+        let start = std::time::Instant::now();
+        let failure = migrate(&conn).unwrap_err();
+        println!(
+            "MIGRATION_BUSY budget_ms={timeout} elapsed_ms={} error={failure}",
+            start.elapsed().as_millis()
+        );
+        assert!(failure.contains("database is locked"));
+        assert!(conn.is_autocommit());
+        held.rollback().unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT principal FROM agent_control_operations WHERE id='op'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "mcp-client:client"
+        );
+        let outer = conn.unchecked_transaction().unwrap();
+        assert!(migrate(&conn).unwrap_err().contains("transaction"));
+        assert!(
+            !conn.is_autocommit(),
+            "failed nested migration must leave caller transaction owned"
+        );
+        outer.rollback().unwrap();
+    }
+
+    #[test]
+    fn migration_concurrent_full_reopens_preserve_both_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let seed = super::super::open_connection(&path).unwrap();
+        super::super::create_schema(&seed).unwrap();
+        drop(seed);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for n in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let conn = super::super::open_connection(&path).unwrap();
+                barrier.wait();
+                super::super::create_schema(&conn)?;
+                DatabaseStore {
+                    conn: Mutex::new(conn),
+                }
+                .set_setting(&format!("synthetic.reopen.{n}"), "written")
+            }));
+        }
+        for worker in workers {
+            assert!(worker.join().unwrap().is_ok());
+        }
+        let conn = super::super::open_connection(&path).unwrap();
+        super::super::create_schema(&conn).unwrap();
+        let db = DatabaseStore {
+            conn: Mutex::new(conn),
+        };
+        for n in 0..2 {
+            assert_eq!(
+                db.get_setting(&format!("synthetic.reopen.{n}")).as_deref(),
+                Some("written")
+            );
+        }
+    }
+
     #[test]
     fn mario_r5_approved_retention_is_independent_bounded_and_not_bearer_authority() {
         let db = db();

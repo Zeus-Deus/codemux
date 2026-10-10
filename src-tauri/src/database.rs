@@ -460,6 +460,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
 
+        -- Numeric affinity matches the row-id comparison, including legacy
+        -- numeric JSON strings. Accept JSON5 TEXT like json_extract while
+        -- excluding malformed input from this derived index.
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_user_control
+            ON agent_chat_messages(thread_id, CAST(json_extract(payload, '$.user_message_id') AS NUMERIC))
+            WHERE json_valid(payload, 2) AND json_extract(payload, '$.type') = 'native_user_control';
+
         -- Lazy, model-written conversation handoffs (schema v16). One cache
         -- row per source conversation is sufficient: changing utility model,
         -- prompt version, or source revision replaces it atomically. The
