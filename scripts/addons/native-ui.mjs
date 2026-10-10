@@ -947,13 +947,31 @@ function terminalProbeRows(value, command) {
 // get_app_state getter binds data-pane-drop-id to its exact native session.
 // No output subscription, raw PTY capture, command response substitution,
 // await/queue replacement, or content injection is installed.
-async function installTerminalProbeObserver(screen, command, scrub) {
+async function installTerminalProbeObserver(screen, command, scrub, cleanupId = command) {
   const key = "__codemuxCoreTerminalDiagnostic";
   if (window[key]) return { installed: false };
+  // CI-only cleanup retention, not active observation/restore authority. The
+  // single harness owner supplies a unique monotonic command/probe identity.
+  const cleanupKey = "__codemuxCoreTerminalDiagnosticCleanups";
+  const cleanups = window[cleanupKey] ?? new Map();
+  if (!(cleanups instanceof Map) || cleanups.size >= 32 || cleanups.has(cleanupId))
+    return { installed: false };
   const intended = screen.closest(".xterm");
+  const textarea = intended?.querySelector("textarea.xterm-helper-textarea");
   const paneId = screen.closest("[data-pane-drop-id]")?.getAttribute("data-pane-drop-id");
   const api = window.__TAURI_INTERNALS__;
   const original = api?.invoke;
+  // Native Tauri owns an immutable invoke property. Inspect, never redefine it.
+  const descriptor = () => {
+    try { return Object.getOwnPropertyDescriptor(api, "invoke"); } catch { return null; }
+  };
+  let invokeDescriptor = descriptor();
+  const descriptorFlags = () => ({
+    ownDataProperty: !!invokeDescriptor && Object.hasOwn(invokeDescriptor, "value"),
+    writable: invokeDescriptor?.writable === true,
+    configurable: invokeDescriptor?.configurable === true,
+  });
+  let invokeTraceReason = "setup-unavailable";
   const findPane = (value) => {
     if (!value || typeof value !== "object") return null;
     if (value.pane_id === paneId && value.kind === "terminal") return value;
@@ -975,11 +993,32 @@ async function installTerminalProbeObserver(screen, command, scrub) {
     return labels.get(element);
   };
   const number = (n) => Number.isFinite(n) ? n : null;
+  // DOM pixel proxy only: xterm can skip/lag syncing it or move it for IME/menu.
+  // Never read textarea content or infer a current buffer cursor/cell index.
+  const textareaDom = () => {
+    if (!textarea) return null;
+    try {
+      const rect = textarea.getBoundingClientRect();
+      const px = (value) => /^[+-]?(?:\d+\.?\d*|\.\d+)px$/.test(value)
+        ? number(Number(value.slice(0, -2))) : null;
+      return {
+        connected: textarea.isConnected && textarea.closest(".xterm") === intended,
+        focused: document.activeElement === textarea,
+        geometry: { x: number(rect.x), y: number(rect.y), width: number(rect.width), height: number(rect.height) },
+        inlinePx: { left: px(textarea.style.left), top: px(textarea.style.top),
+          width: px(textarea.style.width), height: px(textarea.style.height), lineHeight: px(textarea.style.lineHeight) },
+        zIndex: /^[+-]?\d+$/.test(textarea.style.zIndex) ? number(Number(textarea.style.zIndex)) : null,
+      };
+    } catch { return null; }
+  };
   const ipc = [];
   const started = performance.now();
   const elapsed = () => Math.round(performance.now() - started);
   let phase = "before-focus", sequence = 0, dropped = 0, active = true;
   let offset = 0, pending = 0;
+  const keyEdges = [];
+  let keyAttempt = null, seenDown = false, seenUp = false, keyListeners = false;
+  const listenerOptions = { capture: true, passive: true };
   const append = (event) => {
     if (!active) return;
     if (ipc.length < 256) ipc.push({ atMs: elapsed(), ...event }); else dropped++;
@@ -1021,15 +1060,41 @@ async function installTerminalProbeObserver(screen, command, scrub) {
     return result;
   };
   let installed = false;
+  const ownsObservation = () => active && window[key] === state &&
+    window.__TAURI_INTERNALS__ === api && api?.invoke === (installed ? wrapper : original);
+  // First matching synthetic initial-key DOM edges only, not native delivery.
+  // Existing xterm capture handlers may run before this target listener.
+  const observeKey = (event) => {
+    try {
+      if (!ownsObservation() || phase !== "before-type" || !keyAttempt || keyEdges.length >= 6 ||
+          event.target !== textarea || document.activeElement !== textarea ||
+          !textarea.isConnected || textarea.closest(".xterm") !== intended ||
+          event.key !== command[0] || event.repeat || event.isComposing ||
+          event.ctrlKey || event.altKey || event.metaKey) return;
+      const down = event.type === "keydown";
+      if (down ? seenDown : !seenDown || seenUp) return;
+      const atMs = elapsed(), inputDom = textareaDom();
+      if (!ownsObservation()) return;
+      if (down) seenDown = true; else seenUp = true;
+      keyEdges.push({ phase, attempt: keyAttempt, edge: down ? "keydown" : "keyup", atMs, textareaDom: inputDom });
+    } catch { /* Read-only diagnostics must not change keyboard propagation. */ }
+  };
   const state = {
     command,
     async sample(nextPhase, attempt) {
       phase = nextPhase;
-      if (phase === "before-type") offset = 0;
+      if (phase === "before-type") {
+        offset = 0;
+        if (attempt !== keyAttempt) {
+          keyAttempt = [1, 2, 3].includes(attempt) ? attempt : null;
+          seenDown = seenUp = false;
+        }
+      }
       const focused = document.activeElement?.matches("textarea.xterm-helper-textarea")
         ? document.activeElement.closest(".xterm") : null;
       const atMs = elapsed();
       const rect = screen.getBoundingClientRect();
+      const inputDom = textareaDom();
       const rows = scrub(intended?.innerText, command);
       const snapshot = sessionId ? await readState() : null;
       const owner = snapshot?.terminal_sessions?.find((s) => s.session_id === sessionId);
@@ -1040,27 +1105,46 @@ async function installTerminalProbeObserver(screen, command, scrub) {
         intendedConnected: screen.isConnected && intended?.isConnected === true,
         visible: rect.width > 0 && rect.height > 0 && screen.checkVisibility?.() !== false,
         geometry: { x: number(rect.x), y: number(rect.y), width: number(rect.width), height: number(rect.height) },
-        rows,
+        rows, textareaDom: inputDom,
         backend: owner ? { cols: number(owner.cols), rows: number(owner.rows),
           state: ["starting", "ready", "exited", "failed"].includes(owner.state) ? owner.state : "unobserved" } : null,
         ipcObservation: installed ? "scoped-invoke-only" : "unavailable",
+        invokeDescriptor: descriptorFlags(), invokeTraceReason,
         cursor: "unobserved", rendererDimensions: "unobserved", shellBuffer: "unobserved",
       };
     },
     finish() {
+      const wasActive = active;
       active = false;
+      let cleanupFailed = false;
+      if (keyListeners) {
+        // Attempt both exact removals even if one throws; release retention and
+        // deactivate before reporting an unavailable cleanup result.
+        for (const type of ["keydown", "keyup"]) {
+          try { textarea.removeEventListener(type, observeKey, listenerOptions); }
+          catch { cleanupFailed = true; }
+        }
+        keyListeners = false;
+      }
+      if (cleanups.get(cleanupId) === state) cleanups.delete(cleanupId);
+      if (window[cleanupKey] === cleanups && cleanups.size === 0) delete window[cleanupKey];
       let restore = "not-installed";
       if (installed) {
-        if (window[key] === state && window.__TAURI_INTERNALS__ === api && api.invoke === wrapper) {
-          api.invoke = original;
+        if (wasActive && window[key] === state && window.__TAURI_INTERNALS__ === api && api.invoke === wrapper) {
+          const current = descriptor();
+          if (current?.value === wrapper && current.writable === true) api.invoke = original;
           restore = api.invoke === original ? "restored" : "failed";
         } else restore = "superseded";
       }
       if (window[key] === state) delete window[key];
-      return { ipc, dropped, pending, restore };
+      if (cleanupFailed) throw Error("Terminal diagnostic cleanup unavailable");
+      return { ipc, dropped, pending, restore, keyEdges };
     },
   };
-  // Reserve cleanup ownership synchronously, before the native snapshot awaits.
+  // Reserve exact-own cleanup independently of the replaceable active global,
+  // synchronously before the native snapshot awaits. Never retain input/IDs.
+  cleanups.set(cleanupId, state);
+  window[cleanupKey] = cleanups;
   window[key] = state;
   const initial = typeof original === "function" ? await readState() : null;
   if (!active || window[key] !== state || window.__TAURI_INTERNALS__ !== api || api?.invoke !== original) {
@@ -1068,30 +1152,58 @@ async function installTerminalProbeObserver(screen, command, scrub) {
     return { installed: false };
   }
   sessionId = paneId ? findPane(initial?.workspaces)?.session_id : null;
-  if (sessionId && typeof original === "function") {
+  invokeDescriptor = descriptor();
+  if (typeof original !== "function") invokeTraceReason = "native-invoke-unavailable";
+  else if (!sessionId) invokeTraceReason = "native-session-unmapped";
+  else if (!invokeDescriptor || !Object.hasOwn(invokeDescriptor, "value") || invokeDescriptor.value !== original)
+    invokeTraceReason = "unsupported-invoke-descriptor";
+  else if (invokeDescriptor.writable !== true) invokeTraceReason = "immutable-invoke";
+  else {
     try { api.invoke = wrapper; installed = api.invoke === wrapper; } catch {}
+    invokeTraceReason = installed ? "scoped-invoke-installed" : "installation-failed";
   }
-  return { installed: true };
+  if (textarea) {
+    try {
+      keyListeners = true;
+      textarea.addEventListener("keydown", observeKey, listenerOptions);
+      textarea.addEventListener("keyup", observeKey, listenerOptions);
+    } catch {
+      textarea.removeEventListener("keydown", observeKey, listenerOptions);
+      textarea.removeEventListener("keyup", observeKey, listenerOptions);
+      keyListeners = false;
+    }
+  }
+  return { observationReady: true, installed, invokeDescriptor: descriptorFlags(), invokeTraceReason };
 }
 
 async function beginTerminalProbeDiagnostics(screen, command) {
   const probes = evidence.terminalDiagnostics ??= [];
   if (probes.length >= 32) return { sample: async () => {}, finish: async () => {} };
-  const probe = { command, observations: [], ipc: [], dropped: 0, restore: "unobserved" };
+  const probe = { command, observations: [], ipc: [], keyEdges: [], dropped: 0, restore: "unobserved",
+    observationReady: false, invokeTraceInstalled: false, invokeTraceReason: "setup-unavailable",
+    invokeDescriptor: { ownDataProperty: false, writable: false, configurable: false } };
   probes.push(probe);
-  let installed = false;
+  const cleanupId = `${probes.length}:${command}`;
+  let observationReady = false;
   try {
     const result = await wd("POST", "/execute/async", {
-      script: `const done = arguments[arguments.length - 1]; (${installTerminalProbeObserver})(arguments[0], arguments[1], (${terminalProbeRows})).then(done, () => done({installed: false}));`,
-      args: [screen, command],
+      script: `const done = arguments[arguments.length - 1]; (${installTerminalProbeObserver})(arguments[0], arguments[1], (${terminalProbeRows}), arguments[2]).then(done, () => done({installed: false}));`,
+      args: [screen, command, cleanupId],
     });
-    installed = result?.installed === true;
+    observationReady = result?.observationReady === true;
+    probe.observationReady = observationReady;
+    probe.invokeTraceInstalled = result?.installed === true;
+    if (["native-invoke-unavailable", "native-session-unmapped", "unsupported-invoke-descriptor",
+         "immutable-invoke", "scoped-invoke-installed", "installation-failed"].includes(result?.invokeTraceReason))
+      probe.invokeTraceReason = result.invokeTraceReason;
+    for (const flag of ["ownDataProperty", "writable", "configurable"])
+      probe.invokeDescriptor[flag] = result?.invokeDescriptor?.[flag] === true;
   } catch {}
   return {
     async sample(phase, attempt = null) {
       if (probe.observations.length >= 24) return;
       try {
-        if (!installed) throw Error("unavailable");
+        if (!observationReady) throw Error("unavailable");
         const observation = await wd("POST", "/execute/async", {
           script: `const done = arguments[arguments.length - 1]; const state = window.__codemuxCoreTerminalDiagnostic; if (state?.command !== arguments[0]) return done(null); state.sample(arguments[1], arguments[2]).then(done, () => done(null));`,
           args: [command, phase, attempt],
@@ -1100,9 +1212,11 @@ async function beginTerminalProbeDiagnostics(screen, command) {
       } catch { probe.observations.push({ phase, unavailable: true }); }
     },
     async finish() {
-      // Also cancel pending setup or recover an observer if its response was lost.
+      // Recover only this reserved cleanup identity, including pending/lost
+      // setup and post-install active-global replacement. Never finish a
+      // foreign active owner merely because its command matches.
       try {
-        const result = await script(`const state = window.__codemuxCoreTerminalDiagnostic; return state?.command === arguments[0] ? state.finish() : null`, command);
+        const result = await script(`const state = window.__codemuxCoreTerminalDiagnosticCleanups?.get(arguments[0]); return state?.command === arguments[1] ? state.finish() : null`, cleanupId, command);
         if (result) Object.assign(probe, result);
       } catch { probe.restore = "unobserved"; }
     },
