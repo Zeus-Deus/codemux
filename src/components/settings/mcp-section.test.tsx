@@ -15,6 +15,10 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     listMcpServers: vi.fn(),
+    agentConnectorStatus: vi.fn().mockResolvedValue({
+      enabled: false, publicOrigin: null, listenerRunning: false, mcpUrl: null,
+      localCommand: "/usr/bin/codemux mcp", pending: [], clients: [],
+    }),
     getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
     setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
     primeMcpRuntime: vi.fn().mockResolvedValue([]),
@@ -57,6 +61,31 @@ afterEach(() => {
 });
 
 describe("McpSection", () => {
+  it("separates inbound Outside assistants from outbound MCP servers", async () => {
+    listMcpServersMock.mockResolvedValueOnce([makeServer({ name: "outbound" })]);
+    render(<McpSection projectRoot={null} />);
+    expect(await screen.findByText("outbound")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Outside assistants" })).toBeInTheDocument();
+    expect(await screen.findByText("/usr/bin/codemux mcp")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Enable HTTP MCP connections" })).not.toBeChecked();
+  });
+  it("hides inbound administration from remote clients in classic CLI mode without outbound IPC", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    const { agentConnectorStatus, getMcpRuntimeStatus, primeMcpRuntime } = await import("@/tauri/commands");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    (window as unknown as { __CODEMUX_REMOTE__: boolean }).__CODEMUX_REMOTE__ = true;
+    vi.clearAllMocks();
+    const view = render(<McpSection projectRoot={null} />);
+    try {
+      expect(screen.getByText("Manage connections from the desktop")).toBeInTheDocument();
+      expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+      expect(agentConnectorStatus).not.toHaveBeenCalled();
+      expect(listMcpServers).not.toHaveBeenCalled();
+      expect(getMcpRuntimeStatus).not.toHaveBeenCalled();
+      expect(primeMcpRuntime).not.toHaveBeenCalled();
+    } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); (window as unknown as { __CODEMUX_REMOTE__: boolean }).__CODEMUX_REMOTE__ = false; }
+  });
+
   it("renders discovered servers grouped by primary source", async () => {
     listMcpServersMock.mockResolvedValueOnce([
       makeServer({

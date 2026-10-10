@@ -310,15 +310,10 @@ impl AgentProvider for OpenCodeAgentProvider {
     async fn interrupt_turn(
         &self,
         thread_id: ThreadId,
-        _turn_id: Option<TurnId>,
+        turn_id: Option<TurnId>,
     ) -> Result<(), ProviderError> {
-        // OpenCode's `/abort` is session-scoped — the optional
-        // turn_id check is enforced client-side by callers that want
-        // to avoid racing a turn that already finished. We don't try
-        // to validate it server-side because there is no direct
-        // turn->message mapping on the wire.
         let session = self.lookup(&thread_id).await?;
-        session.interrupt().await
+        session.interrupt_selected(turn_id).await
     }
 
     async fn respond_to_request(
@@ -445,6 +440,24 @@ impl AgentProvider for OpenCodeAgentProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn review_l4_opencode_selected_old_turn_does_not_abort_newer_turn() {
+        let mut server = mockito::Server::new_async().await;
+        let prompt = server.mock("POST", "/session/sess_1/prompt_async").with_status(204).create_async().await;
+        let abort = server.mock("POST", "/session/sess_1/abort").with_status(200).with_body("true").expect(2).create_async().await;
+        let (session, _, _) = super::super::session::tests::mock_session(server.url(), "pw".into(), "sess_1").await;
+        let input = serde_json::from_value(serde_json::json!({"thread_id":"thread-1","text":"newer turn B","model_override":null})).unwrap();
+        let newer = session.enqueue_or_send(input).await.unwrap();
+        let provider = OpenCodeAgentProvider::new(Arc::new(OpenCodeServerManager::new()), OpenCodeProviderConfig::default());
+        provider.sessions.write().await.insert(ThreadId("thread-1".into()), session);
+        let result = provider.interrupt_turn(ThreadId("thread-1".into()), Some(TurnId("retired-a".into()))).await;
+        assert!(result.is_err(), "selected old turn must be checked before session-scoped HTTP abort: {result:?}");
+        provider.interrupt_turn(ThreadId("thread-1".into()), Some(newer.turn_id)).await.unwrap();
+        provider.interrupt_turn(ThreadId("thread-1".into()), None).await.unwrap();
+        prompt.assert_async().await;
+        abort.assert_async().await;
+    }
 
     #[tokio::test]
     async fn capabilities_match_documented_surface() {

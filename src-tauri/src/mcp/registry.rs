@@ -34,7 +34,7 @@ use super::parser::{
 };
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{
-    aggregate_tools, start_mcp_server, McpServerHandle, McpServerStatus, McpTool,
+    start_mcp_server, McpServerHandle, McpServerStatus, McpTool,
 };
 use super::{McpConfigSource, McpServerConfig};
 
@@ -401,12 +401,10 @@ impl McpRegistry {
         out
     }
 
-    /// All currently-running tools across all servers. No cap is
-    /// applied — every tool from every enabled server is exposed; the
-    /// per-server toggle in Settings is the user's control surface.
+    /// Provider-facing tools across running servers, without a count cap.
+    /// Trusted native-controller tools are never injected into a provider.
     pub async fn list_all_tools(&self) -> Vec<McpTool> {
-        let inner = self.inner.lock().await;
-        aggregate_tools(&inner.handles)
+        self.list_all_tools_excluding_sources(&[]).await
     }
 
     /// Running tools except servers already native to `source`. This lets a
@@ -436,7 +434,10 @@ impl McpRegistry {
                 .iter()
                 .any(|source| sources.contains(source));
             if handle.status.is_running() && !provider_native {
-                tools.extend(handle.tools.iter().cloned());
+                let is_self = handle.config.sources.contains(&McpConfigSource::Codemux);
+                tools.extend(handle.tools.iter().filter(|tool|
+                    !is_self || !crate::agent_control::is_native_tool(&tool.name)
+                ).cloned());
             }
         }
         tools
@@ -568,6 +569,12 @@ impl McpRegistry {
             }
         };
 
+        // This relay has provider identity only, never a local controller or
+        // connector grant. In particular a persisted Codex dynamic tool can
+        // outlive its catalog. Omission alone is not an authority boundary.
+        if is_codemux_self && crate::agent_control::is_native_tool(&raw_name) {
+            return Err("provider_control_denied: native controller tools are not available through provider MCP relays".into());
+        }
         let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
         if let Some(child) = child {
             child
@@ -842,6 +849,35 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
         }
+    }
+
+    #[tokio::test]
+    async fn review_s1_provider_relay_rejects_native_controller_tools_before_transport() {
+        use mockito::Matcher;
+        let (mut server, registry, _) = test_support::codemux_remote_server("worker-ws").await;
+        {
+            let mut inner = registry.inner.lock().await;
+            let handle = inner.handles.get_mut("codemux-remote").unwrap();
+            handle.tools[0].name = "thread_launch".into();
+            handle.tools[0].prefixed_name = "mcp__codemux__thread_launch".into();
+        }
+        let call = server.mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({"method":"tools/call","params":{"name":"thread_launch"}})))
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"content":[]}}).to_string())
+            .expect(0).create_async().await;
+        let result = registry.dispatch_tool_call("mcp__codemux__thread_launch",
+            serde_json::json!({"workspace_id":"worker-ws","provider":"codex","permission_mode":"danger-full-access","client_request_id":"nested"}),
+            Some("worker-ws")).await;
+        assert!(result.is_err(), "provider relay must not confer trusted native-controller authority: {result:?}");
+        assert!(result.unwrap_err().starts_with("provider_control_denied:"));
+        call.assert_async().await;
+        assert!(!registry.list_all_tools().await.iter().any(|t| t.name == "thread_launch"),
+            "provider snapshot must not advertise an unusable trusted control route");
+        assert!(!registry.list_all_tools_excluding_source(McpConfigSource::CodexUser).await.iter().any(|t| t.name == "thread_launch"));
+        // Controller discovery itself and Settings retain the native catalog.
+        assert!(crate::agent_control::native_tools().iter().any(|t| t.name == "thread_launch"));
+        assert!(registry.list_tools_for_server("codemux-remote").await.iter().any(|t| t.name == "thread_launch"));
     }
 
     #[tokio::test]

@@ -917,6 +917,312 @@ async function removeAddon(title, keepData = false) {
     ),
   );
 }
+// CI fixture observations only: never read private xterm internals or mutate
+// terminal content. Keep row breaks/positions, but allowlist only this probe's
+// synthetic command and project basename; paths and all other text are masked.
+function terminalProbeRows(value, command) {
+  const mask = (text) => text.replace(/[^\n]/g, "·");
+  const bounded = String(value ?? "").split("\n").slice(-12)
+    .map((row) => row.slice(-160)).join("\n");
+  const text = bounded
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, mask)
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, mask)
+    .replace(/[\x00-\x09\x0b-\x1f\x7f]/g, "·");
+  const positions = [];
+  let flat = "";
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "\n") { positions.push(i); flat += text[i]; }
+  }
+  const result = [...mask(text)];
+  const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const marker = command.slice(5);
+  const known = new RegExp(`synthetic-project(?:[>$#] ?)?|synthetic-proje|${escaped}|${marker}`, "g");
+  for (const match of flat.matchAll(known))
+    for (let i = match.index; i < match.index + match[0].length; i++)
+      result[positions[i]] = flat[i];
+  return result.join("").split("\n");
+}
+
+// Runs only inside the acceptance WebDriver session. The existing public
+// get_app_state getter binds data-pane-drop-id to its exact native session.
+// No output subscription, raw PTY capture, command response substitution,
+// await/queue replacement, or content injection is installed.
+async function installTerminalProbeObserver(screen, command, scrub, cleanupId = command) {
+  const key = "__codemuxCoreTerminalDiagnostic";
+  if (window[key]) return { installed: false };
+  // CI-only cleanup retention, not active observation/restore authority. The
+  // single harness owner supplies a unique monotonic command/probe identity.
+  const cleanupKey = "__codemuxCoreTerminalDiagnosticCleanups";
+  const cleanups = window[cleanupKey] ?? new Map();
+  if (!(cleanups instanceof Map) || cleanups.size >= 32 || cleanups.has(cleanupId))
+    return { installed: false };
+  const intended = screen.closest(".xterm");
+  const textarea = intended?.querySelector("textarea.xterm-helper-textarea");
+  const paneId = screen.closest("[data-pane-drop-id]")?.getAttribute("data-pane-drop-id");
+  const api = window.__TAURI_INTERNALS__;
+  const original = api?.invoke;
+  // Native Tauri owns an immutable invoke property. Inspect, never redefine it.
+  const descriptor = () => {
+    try { return Object.getOwnPropertyDescriptor(api, "invoke"); } catch { return null; }
+  };
+  let invokeDescriptor = descriptor();
+  const descriptorFlags = () => ({
+    ownDataProperty: !!invokeDescriptor && Object.hasOwn(invokeDescriptor, "value"),
+    writable: invokeDescriptor?.writable === true,
+    configurable: invokeDescriptor?.configurable === true,
+  });
+  let invokeTraceReason = "setup-unavailable";
+  const findPane = (value) => {
+    if (!value || typeof value !== "object") return null;
+    if (value.pane_id === paneId && value.kind === "terminal") return value;
+    for (const child of Object.values(value)) {
+      const found = findPane(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  const readState = async () => {
+    try { return await original.call(api, "get_app_state", {}); }
+    catch { return null; }
+  };
+  let sessionId = null;
+  const labels = new Map([[intended, "terminal-1"]]);
+  const label = (element) => {
+    if (!element) return null;
+    if (!labels.has(element)) labels.set(element, `terminal-${labels.size + 1}`);
+    return labels.get(element);
+  };
+  const number = (n) => Number.isFinite(n) ? n : null;
+  // DOM pixel proxy only: xterm can skip/lag syncing it or move it for IME/menu.
+  // Never read textarea content or infer a current buffer cursor/cell index.
+  const textareaDom = () => {
+    if (!textarea) return null;
+    try {
+      const rect = textarea.getBoundingClientRect();
+      const px = (value) => /^[+-]?(?:\d+\.?\d*|\.\d+)px$/.test(value)
+        ? number(Number(value.slice(0, -2))) : null;
+      return {
+        connected: textarea.isConnected && textarea.closest(".xterm") === intended,
+        focused: document.activeElement === textarea,
+        geometry: { x: number(rect.x), y: number(rect.y), width: number(rect.width), height: number(rect.height) },
+        inlinePx: { left: px(textarea.style.left), top: px(textarea.style.top),
+          width: px(textarea.style.width), height: px(textarea.style.height), lineHeight: px(textarea.style.lineHeight) },
+        zIndex: /^[+-]?\d+$/.test(textarea.style.zIndex) ? number(Number(textarea.style.zIndex)) : null,
+      };
+    } catch { return null; }
+  };
+  const ipc = [];
+  const started = performance.now();
+  const elapsed = () => Math.round(performance.now() - started);
+  let phase = "before-focus", sequence = 0, dropped = 0, active = true;
+  let offset = 0, pending = 0;
+  const keyEdges = [];
+  let keyAttempt = null, seenDown = false, seenUp = false, keyListeners = false;
+  const listenerOptions = { capture: true, passive: true };
+  const append = (event) => {
+    if (!active) return;
+    if (ipc.length < 256) ipc.push({ atMs: elapsed(), ...event }); else dropped++;
+  };
+  const wrapper = function (...args) {
+    if (!active) return original.apply(this, args);
+    const [op, payload] = args;
+    if (!sessionId || payload?.sessionId !== sessionId ||
+        (op !== "write_to_pty" && op !== "resize_pty"))
+      return original.apply(this, args);
+    const id = ++sequence;
+    const event = { id, phase, op, event: "call", terminal: "terminal-1" };
+    if (op === "resize_pty") {
+      event.cols = number(payload.cols); event.rows = number(payload.rows);
+    } else if (phase === "before-enter" && payload.data === "\r") {
+      event.kind = "enter";
+    } else if (phase === "before-clear" && /^[\x08\x7f]+$/.test(payload.data)) {
+      event.kind = "erase"; event.length = payload.data.length;
+    } else if (phase === "before-type" && typeof payload.data === "string" &&
+               payload.data && command.slice(offset).startsWith(payload.data)) {
+      event.kind = "synthetic-command"; event.offset = offset;
+      event.length = payload.data.length; offset += payload.data.length;
+    } else {
+      // Never log unknown input (including terminal response/OSC payloads).
+      event.kind = "unobserved-input";
+    }
+    append(event);
+    let result;
+    try { result = original.apply(this, args); }
+    catch (error) { append({ id, event: "threw" }); throw error; }
+    pending++;
+    try {
+      result.then(
+        () => { pending--; append({ id, event: "resolved" }); },
+        () => { pending--; append({ id, event: "rejected" }); },
+      );
+    } catch { pending--; }
+    // The original promise/result, receiver, arguments and error pass through.
+    return result;
+  };
+  let installed = false;
+  const ownsObservation = () => active && window[key] === state &&
+    window.__TAURI_INTERNALS__ === api && api?.invoke === (installed ? wrapper : original);
+  // First matching synthetic initial-key DOM edges only, not native delivery.
+  // Existing xterm capture handlers may run before this target listener.
+  const observeKey = (event) => {
+    try {
+      if (!ownsObservation() || phase !== "before-type" || !keyAttempt || keyEdges.length >= 6 ||
+          event.target !== textarea || document.activeElement !== textarea ||
+          !textarea.isConnected || textarea.closest(".xterm") !== intended ||
+          event.key !== command[0] || event.repeat || event.isComposing ||
+          event.ctrlKey || event.altKey || event.metaKey) return;
+      const down = event.type === "keydown";
+      if (down ? seenDown : !seenDown || seenUp) return;
+      const atMs = elapsed(), inputDom = textareaDom();
+      if (!ownsObservation()) return;
+      if (down) seenDown = true; else seenUp = true;
+      keyEdges.push({ phase, attempt: keyAttempt, edge: down ? "keydown" : "keyup", atMs, textareaDom: inputDom });
+    } catch { /* Read-only diagnostics must not change keyboard propagation. */ }
+  };
+  const state = {
+    command,
+    async sample(nextPhase, attempt) {
+      phase = nextPhase;
+      if (phase === "before-type") {
+        offset = 0;
+        if (attempt !== keyAttempt) {
+          keyAttempt = [1, 2, 3].includes(attempt) ? attempt : null;
+          seenDown = seenUp = false;
+        }
+      }
+      const focused = document.activeElement?.matches("textarea.xterm-helper-textarea")
+        ? document.activeElement.closest(".xterm") : null;
+      const atMs = elapsed();
+      const rect = screen.getBoundingClientRect();
+      const inputDom = textareaDom();
+      const rows = scrub(intended?.innerText, command);
+      const snapshot = sessionId ? await readState() : null;
+      const owner = snapshot?.terminal_sessions?.find((s) => s.session_id === sessionId);
+      return {
+        phase, attempt, atMs, backendReadAtMs: elapsed(),
+        intended: "terminal-1", actual: label(focused),
+        focusMatchesIntended: focused === intended,
+        intendedConnected: screen.isConnected && intended?.isConnected === true,
+        visible: rect.width > 0 && rect.height > 0 && screen.checkVisibility?.() !== false,
+        geometry: { x: number(rect.x), y: number(rect.y), width: number(rect.width), height: number(rect.height) },
+        rows, textareaDom: inputDom,
+        backend: owner ? { cols: number(owner.cols), rows: number(owner.rows),
+          state: ["starting", "ready", "exited", "failed"].includes(owner.state) ? owner.state : "unobserved" } : null,
+        ipcObservation: installed ? "scoped-invoke-only" : "unavailable",
+        invokeDescriptor: descriptorFlags(), invokeTraceReason,
+        cursor: "unobserved", rendererDimensions: "unobserved", shellBuffer: "unobserved",
+      };
+    },
+    finish() {
+      const wasActive = active;
+      active = false;
+      let cleanupFailed = false;
+      if (keyListeners) {
+        // Attempt both exact removals even if one throws; release retention and
+        // deactivate before reporting an unavailable cleanup result.
+        for (const type of ["keydown", "keyup"]) {
+          try { textarea.removeEventListener(type, observeKey, listenerOptions); }
+          catch { cleanupFailed = true; }
+        }
+        keyListeners = false;
+      }
+      if (cleanups.get(cleanupId) === state) cleanups.delete(cleanupId);
+      if (window[cleanupKey] === cleanups && cleanups.size === 0) delete window[cleanupKey];
+      let restore = "not-installed";
+      if (installed) {
+        if (wasActive && window[key] === state && window.__TAURI_INTERNALS__ === api && api.invoke === wrapper) {
+          const current = descriptor();
+          if (current?.value === wrapper && current.writable === true) api.invoke = original;
+          restore = api.invoke === original ? "restored" : "failed";
+        } else restore = "superseded";
+      }
+      if (window[key] === state) delete window[key];
+      if (cleanupFailed) throw Error("Terminal diagnostic cleanup unavailable");
+      return { ipc, dropped, pending, restore, keyEdges };
+    },
+  };
+  // Reserve exact-own cleanup independently of the replaceable active global,
+  // synchronously before the native snapshot awaits. Never retain input/IDs.
+  cleanups.set(cleanupId, state);
+  window[cleanupKey] = cleanups;
+  window[key] = state;
+  const initial = typeof original === "function" ? await readState() : null;
+  if (!active || window[key] !== state || window.__TAURI_INTERNALS__ !== api || api?.invoke !== original) {
+    state.finish();
+    return { installed: false };
+  }
+  sessionId = paneId ? findPane(initial?.workspaces)?.session_id : null;
+  invokeDescriptor = descriptor();
+  if (typeof original !== "function") invokeTraceReason = "native-invoke-unavailable";
+  else if (!sessionId) invokeTraceReason = "native-session-unmapped";
+  else if (!invokeDescriptor || !Object.hasOwn(invokeDescriptor, "value") || invokeDescriptor.value !== original)
+    invokeTraceReason = "unsupported-invoke-descriptor";
+  else if (invokeDescriptor.writable !== true) invokeTraceReason = "immutable-invoke";
+  else {
+    try { api.invoke = wrapper; installed = api.invoke === wrapper; } catch {}
+    invokeTraceReason = installed ? "scoped-invoke-installed" : "installation-failed";
+  }
+  if (textarea) {
+    try {
+      keyListeners = true;
+      textarea.addEventListener("keydown", observeKey, listenerOptions);
+      textarea.addEventListener("keyup", observeKey, listenerOptions);
+    } catch {
+      textarea.removeEventListener("keydown", observeKey, listenerOptions);
+      textarea.removeEventListener("keyup", observeKey, listenerOptions);
+      keyListeners = false;
+    }
+  }
+  return { observationReady: true, installed, invokeDescriptor: descriptorFlags(), invokeTraceReason };
+}
+
+async function beginTerminalProbeDiagnostics(screen, command) {
+  const probes = evidence.terminalDiagnostics ??= [];
+  if (probes.length >= 32) return { sample: async () => {}, finish: async () => {} };
+  const probe = { command, observations: [], ipc: [], keyEdges: [], dropped: 0, restore: "unobserved",
+    observationReady: false, invokeTraceInstalled: false, invokeTraceReason: "setup-unavailable",
+    invokeDescriptor: { ownDataProperty: false, writable: false, configurable: false } };
+  probes.push(probe);
+  const cleanupId = `${probes.length}:${command}`;
+  let observationReady = false;
+  try {
+    const result = await wd("POST", "/execute/async", {
+      script: `const done = arguments[arguments.length - 1]; (${installTerminalProbeObserver})(arguments[0], arguments[1], (${terminalProbeRows}), arguments[2]).then(done, () => done({installed: false}));`,
+      args: [screen, command, cleanupId],
+    });
+    observationReady = result?.observationReady === true;
+    probe.observationReady = observationReady;
+    probe.invokeTraceInstalled = result?.installed === true;
+    if (["native-invoke-unavailable", "native-session-unmapped", "unsupported-invoke-descriptor",
+         "immutable-invoke", "scoped-invoke-installed", "installation-failed"].includes(result?.invokeTraceReason))
+      probe.invokeTraceReason = result.invokeTraceReason;
+    for (const flag of ["ownDataProperty", "writable", "configurable"])
+      probe.invokeDescriptor[flag] = result?.invokeDescriptor?.[flag] === true;
+  } catch {}
+  return {
+    async sample(phase, attempt = null) {
+      if (probe.observations.length >= 24) return;
+      try {
+        if (!observationReady) throw Error("unavailable");
+        const observation = await wd("POST", "/execute/async", {
+          script: `const done = arguments[arguments.length - 1]; const state = window.__codemuxCoreTerminalDiagnostic; if (state?.command !== arguments[0]) return done(null); state.sample(arguments[1], arguments[2]).then(done, () => done(null));`,
+          args: [command, phase, attempt],
+        });
+        probe.observations.push(observation ?? { phase, unavailable: true });
+      } catch { probe.observations.push({ phase, unavailable: true }); }
+    },
+    async finish() {
+      // Recover only this reserved cleanup identity, including pending/lost
+      // setup and post-install active-global replacement. Never finish a
+      // foreign active owner merely because its command matches.
+      try {
+        const result = await script(`const state = window.__codemuxCoreTerminalDiagnosticCleanups?.get(arguments[0]); return state?.command === arguments[1] ? state.finish() : null`, cleanupId, command);
+        if (result) Object.assign(probe, result);
+      } catch { probe.restore = "unobserved"; }
+    },
+  };
+}
+
 async function checkCoreTerminal() {
   const marker = `CODEMUX_CORE_${++terminalProbe}`;
   const command = `echo ${marker}`;
@@ -927,128 +1233,143 @@ async function checkCoreTerminal() {
       `return [...document.querySelectorAll('.xterm-screen')].find(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && e.checkVisibility?.() !== false }) ?? null`,
     ),
   );
-  const rect = await wd("GET", `/element/${elementId(screen)}/rect`);
-  // The shell-starting badge covers the centre of a narrow terminal. Focus
-  // its visible first row using a real pointer action, not a DOM focus bypass.
-  await wd("POST", "/actions", {
-    actions: [
-      {
-        type: "pointer",
-        id: "mouse",
-        parameters: { pointerType: "mouse" },
-        actions: [
-          {
-            type: "pointerMove",
-            origin: "viewport",
-            x: Math.round(rect.x + 12),
-            y: Math.round(rect.y + 12),
-          },
-          { type: "pointerDown", button: 0 },
-          { type: "pointerUp", button: 0 },
-        ],
-      },
-    ],
-  });
-  const focused = () =>
-    script(
-      `const input = document.activeElement; return input?.matches('textarea.xterm-helper-textarea') ? input.closest('.xterm') : null`,
+  const diagnostics = await beginTerminalProbeDiagnostics(screen, command);
+  try {
+    await diagnostics.sample("before-focus");
+    const rect = await wd("GET", `/element/${elementId(screen)}/rect`);
+    // The shell-starting badge covers the centre of a narrow terminal. Focus
+    // its visible first row using a real pointer action, not a DOM focus bypass.
+    await wd("POST", "/actions", {
+      actions: [
+        {
+          type: "pointer",
+          id: "mouse",
+          parameters: { pointerType: "mouse" },
+          actions: [
+            {
+              type: "pointerMove",
+              origin: "viewport",
+              x: Math.round(rect.x + 12),
+              y: Math.round(rect.y + 12),
+            },
+            { type: "pointerDown", button: 0 },
+            { type: "pointerUp", button: 0 },
+          ],
+        },
+      ],
+    });
+    const focused = () =>
+      script(
+        `const input = document.activeElement; return input?.matches('textarea.xterm-helper-textarea') ? input.closest('.xterm') : null`,
+      );
+    let terminal = await until(
+      "native terminal input focused",
+      focused,
+      3000,
+    ).catch(() => null);
+    if (!terminal) {
+      // A background runner window can drop the pointer's focus change. Focus
+      // this terminal's own input instead; typing and output below still go
+      // through the real terminal and shell.
+      await script(
+        "arguments[0].closest('.xterm').querySelector('textarea.xterm-helper-textarea').focus()",
+        screen,
+      );
+      terminal = await until("native terminal input focused", focused);
+      evidence.terminalFocusFallbacks =
+        (evidence.terminalFocusFallbacks ?? 0) + 1;
+    }
+    await diagnostics.sample("after-focus");
+    // The terminal's visible rows, one per line, spaces kept.
+    const screenText = () =>
+      script("return arguments[0].innerText.replace(/\\u00a0/g, ' ')", terminal);
+    // Every keystroke reaches the shell as its own write, and on Windows two
+    // have arrived swapped. Type at a steady pace and submit only a command
+    // line the shell echoed exactly; a different line is erased and retyped.
+    // The command must end the screen right after the prompt, spaces and all;
+    // only a long line's row breaks may fall inside it. A word character just
+    // before it would be what remains of an erased attempt.
+    assert.match(command, /^[\w ]+$/);
+    const typedLine = new RegExp(
+      `(?:^|[^\\w\\s])\\s*${[...command]
+        .map((c) => (c === " " ? "[ \\n]+" : c))
+        .join("\\n?")}\\s*$`,
     );
-  let terminal = await until(
-    "native terminal input focused",
-    focused,
-    3000,
-  ).catch(() => null);
-  if (!terminal) {
-    // A background runner window can drop the pointer's focus change. Focus
-    // this terminal's own input instead; typing and output below still go
-    // through the real terminal and shell.
-    await script(
-      "arguments[0].closest('.xterm').querySelector('textarea.xterm-helper-textarea').focus()",
-      screen,
-    );
-    terminal = await until("native terminal input focused", focused);
-    evidence.terminalFocusFallbacks =
-      (evidence.terminalFocusFallbacks ?? 0) + 1;
-  }
-  // The terminal's visible rows, one per line, spaces kept.
-  const screenText = () =>
-    script("return arguments[0].innerText.replace(/\\u00a0/g, ' ')", terminal);
-  // Every keystroke reaches the shell as its own write, and on Windows two
-  // have arrived swapped. Type at a steady pace and submit only a command
-  // line the shell echoed exactly; a different line is erased and retyped.
-  // The command must end the screen right after the prompt, spaces and all;
-  // only a long line's row breaks may fall inside it. A word character just
-  // before it would be what remains of an erased attempt.
-  assert.match(command, /^[\w ]+$/);
-  const typedLine = new RegExp(
-    `(?:^|[^\\w\\s])\\s*${[...command]
-      .map((c) => (c === " " ? "[ \\n]+" : c))
-      .join("\\n?")}\\s*$`,
-  );
-  for (let attempt = 1; ; attempt++) {
-    const baseline = await screenText();
-    await pressKeys([...command]);
-    let last;
-    let changed = Date.now();
-    const echoed = await until(
-      "native terminal echoed the command",
-      async () => {
+    for (let attempt = 1; ; attempt++) {
+      const baseline = await screenText();
+      await diagnostics.sample("before-type", attempt);
+      await pressKeys([...command]);
+      await diagnostics.sample("after-type", attempt);
+      let last;
+      let changed = Date.now();
+      const echoed = await until(
+        "native terminal echoed the command",
+        async () => {
+          const current = await screenText();
+          if (typedLine.test(current)) return "exact";
+          if (current !== last) {
+            last = current;
+            changed = Date.now();
+          } else if (current !== baseline && Date.now() - changed >= 1500) {
+            return "different";
+          }
+          return null;
+        },
+      );
+      await diagnostics.sample("echo-" + echoed, attempt);
+      if (echoed === "exact") break;
+      (evidence.terminalRetypes ??= []).push({
+        command,
+        attempt,
+        echoed: last.replace(/\s+/g, " ").trim().slice(-120),
+      });
+      assert.ok(
+        attempt < 3,
+        `The terminal did not receive "${command}" as typed`,
+      );
+      await diagnostics.sample("before-clear", attempt);
+      await pressKeys(Array(command.length + 4).fill("\uE003"));
+      let settled;
+      let since = Date.now();
+      await until("mistyped command erased", async () => {
         const current = await screenText();
-        if (typedLine.test(current)) return "exact";
-        if (current !== last) {
-          last = current;
-          changed = Date.now();
-        } else if (current !== baseline && Date.now() - changed >= 1500) {
-          return "different";
+        if (current !== settled) {
+          settled = current;
+          since = Date.now();
+          return false;
         }
-        return null;
-      },
-    );
-    if (echoed === "exact") break;
-    (evidence.terminalRetypes ??= []).push({
-      command,
-      attempt,
-      echoed: last.replace(/\s+/g, " ").trim().slice(-120),
+        return Date.now() - since >= 1000;
+      });
+      await diagnostics.sample("after-clear", attempt);
+    }
+    // Only the echo itself prints a row that is exactly the marker. A shell
+    // error that quotes a mistyped command never does.
+    const markerRows = async () =>
+      (await screenText()).split("\n").filter((row) => row.trim() === marker)
+        .length;
+    const rowsBefore = await markerRows();
+    await diagnostics.sample("before-enter");
+    await wd("POST", "/actions", {
+      actions: [
+        {
+          type: "key",
+          id: "keyboard",
+          actions: [
+            { type: "keyDown", value: "\uE007" },
+            { type: "keyUp", value: "\uE007" },
+          ],
+        },
+      ],
     });
-    assert.ok(
-      attempt < 3,
-      `The terminal did not receive "${command}" as typed`,
+    await diagnostics.sample("after-enter");
+    await until(
+      "native terminal command returned",
+      async () => (await markerRows()) > rowsBefore,
     );
-    await pressKeys(Array(command.length + 4).fill("\uE003"));
-    let settled;
-    let since = Date.now();
-    await until("mistyped command erased", async () => {
-      const current = await screenText();
-      if (current !== settled) {
-        settled = current;
-        since = Date.now();
-        return false;
-      }
-      return Date.now() - since >= 1000;
-    });
+    await diagnostics.sample("output-confirmed");
+  } finally {
+    await diagnostics.finish();
   }
-  // Only the echo itself prints a row that is exactly the marker. A shell
-  // error that quotes a mistyped command never does.
-  const markerRows = async () =>
-    (await screenText()).split("\n").filter((row) => row.trim() === marker)
-      .length;
-  const rowsBefore = await markerRows();
-  await wd("POST", "/actions", {
-    actions: [
-      {
-        type: "key",
-        id: "keyboard",
-        actions: [
-          { type: "keyDown", value: "\uE007" },
-          { type: "keyUp", value: "\uE007" },
-        ],
-      },
-    ],
-  });
-  await until(
-    "native terminal command returned",
-    async () => (await markerRows()) > rowsBefore,
-  );
 }
 async function shortcut(key) {
   await wd("POST", "/actions", {

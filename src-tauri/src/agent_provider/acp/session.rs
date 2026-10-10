@@ -116,6 +116,52 @@ struct XAiPromptCompletion {
 struct QueuedTurn {
     id: String,
     input: SendTurnInput,
+    dispatch: Option<Arc<QueuedDispatch>>,
+}
+
+/// Retain the selected input across preparation awaits and worker abort.
+/// Dispatch/cancellation share one disposition; checkpoint cleanup remains
+/// owned until preparation has either committed or been aborted.
+#[derive(Debug)]
+struct QueuedDispatch {
+    id: String,
+    thread_id: ThreadId,
+    event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    disposed: AtomicBool,
+    checkpoint: std::sync::Mutex<Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>>,
+    cleanup_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+}
+impl QueuedDispatch {
+    fn cancel(&self) {
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: self.thread_id.clone(), queued_id: self.id.clone(),
+            });
+        }
+    }
+
+    async fn abort_checkpoint(&self) {
+        let checkpoint = self.checkpoint.lock().unwrap().take();
+        if let Some(checkpoint) = checkpoint {
+            // The cleanup future must not belong to the abortable prompt
+            // worker. Stop joins these owned tasks before returning.
+            let (done_tx, done_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                checkpoint.abort().await;
+                let _ = done_tx.send(());
+            });
+            {
+                let mut tasks = self.cleanup_tasks.lock().unwrap();
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
+            }
+            let _ = done_rx.await;
+        }
+    }
+
+    fn committed(&self) {
+        self.checkpoint.lock().unwrap().take();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +239,7 @@ pub(crate) struct AcpSessionState {
     config_options: Vec<Value>,
     pending: HashMap<RequestId, PendingRequest>,
     queued: VecDeque<QueuedTurn>,
+    selected_queued: Option<Arc<QueuedDispatch>>,
     assistant_text: String,
     thinking_text: String,
     /// Monotonic id of the current claim on the session's single prompt
@@ -223,6 +270,17 @@ pub(crate) struct AcpSessionState {
     /// update. This can differ from the requested value after defaults or
     /// provider policy are applied.
     grok_effort: Option<String>,
+}
+
+// Authority rejection is local to an undispatched input, not a provider failure.
+enum PrepareTurnError {
+    Rejected(ProviderError),
+    Failed(ProviderError),
+}
+impl PrepareTurnError {
+    fn into_provider_error(self) -> ProviderError {
+        match self { Self::Rejected(error) | Self::Failed(error) => error }
+    }
 }
 
 impl AcpSessionState {
@@ -280,6 +338,7 @@ pub(crate) struct AcpSession {
     commands: Mutex<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    queue_cleanup_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Ordering barriers into the two tasks that consume child messages.
     /// See [`AcpSession::await_child_messages_drained`].
     notification_barrier_tx: mpsc::UnboundedSender<NotificationBarrier>,
@@ -507,6 +566,7 @@ impl AcpSession {
                 config_options: config_options(&setup),
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
+                selected_queued: None,
                 assistant_text: String::new(),
                 thinking_text: String::new(),
                 turn_generation: 0,
@@ -529,6 +589,7 @@ impl AcpSession {
                 .or_else(|| super::slash_commands::available_commands_from_value(&initialized)).unwrap_or_default()),
             event_tx,
             tasks: Mutex::new(Vec::new()),
+            queue_cleanup_tasks: Default::default(),
             notification_barrier_tx,
             request_barrier_tx,
             interrupt_notify: Notify::new(),
@@ -701,6 +762,7 @@ impl AcpSession {
             state.queued.push_back(QueuedTurn {
                 id: queued_id.clone(),
                 input: input.clone(),
+                dispatch: None,
             });
             drop(state);
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
@@ -729,15 +791,19 @@ impl AcpSession {
     async fn dispatch_turn(
         self: &Arc<Self>,
         input: SendTurnInput,
-        queued_id: Option<String>,
+        queued_dispatch: Option<Arc<QueuedDispatch>>,
         generation: u64,
     ) -> Result<TurnId, ProviderError> {
-        let (turn_id, prompt) = self.prepare_turn(input, queued_id).await?;
+        let checkpoint = input.turn_checkpoint.clone();
+        #[cfg(test)]
+        if queued_dispatch.is_some() { selected_prepare_test_schedule(&self.thread_id).await; }
+        let (turn_id, prompt) = self.prepare_turn(input, queued_dispatch).await
+            .map_err(PrepareTurnError::into_provider_error)?;
         let session = Arc::clone(self);
         let worker_turn_id = turn_id.clone();
         let task = tokio::spawn(async move {
             session
-                .run_prompt_worker(worker_turn_id, prompt, generation)
+                .run_prompt_worker(worker_turn_id, prompt, generation, checkpoint)
                 .await;
         });
         {
@@ -782,13 +848,57 @@ impl AcpSession {
         }
     }
 
+    fn claim_queued_turn(&self, state: &mut AcpSessionState, mut queued: QueuedTurn) -> (QueuedTurn, u64) {
+        debug_assert!(state.selected_queued.is_none());
+        let dispatch = Arc::new(QueuedDispatch {
+            id: queued.id.clone(), thread_id: self.thread_id.clone(),
+            event_tx: self.event_tx.clone(), disposed: AtomicBool::new(false),
+            checkpoint: std::sync::Mutex::new(queued.input.turn_checkpoint.clone()),
+            cleanup_tasks: self.queue_cleanup_tasks.clone(),
+        });
+        state.selected_queued = Some(dispatch.clone());
+        queued.dispatch = Some(dispatch);
+        state.active_turn = Some(self.dispatching_turn_id());
+        (queued, state.claim_turn())
+    }
+
+    async fn cancel_selected_queued(&self, id: &str) {
+        let selected = {
+            let state = self.state.lock().await;
+            state.selected_queued.as_ref().filter(|selected| selected.id == id).cloned()
+        };
+        if let Some(selected) = selected {
+            selected.cancel();
+            selected.abort_checkpoint().await;
+            let mut state = self.state.lock().await;
+            if state.selected_queued.as_ref().is_some_and(|selected| selected.id == id) {
+                state.selected_queued.take();
+            }
+        }
+    }
+
+    async fn abort_preparing_checkpoint(
+        checkpoint: &Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>,
+        queued: Option<&Arc<QueuedDispatch>>,
+    ) {
+        if let Some(queued) = queued { queued.abort_checkpoint().await; }
+        else { checkpoint.abort().await; }
+    }
+
     async fn prepare_turn(
         &self,
         mut input: SendTurnInput,
-        queued_id: Option<String>,
-    ) -> Result<(TurnId, Vec<Value>), ProviderError> {
+        queued_dispatch: Option<Arc<QueuedDispatch>>,
+    ) -> Result<(TurnId, Vec<Value>), PrepareTurnError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(PrepareTurnError::Failed(ProviderError::SessionClosed { thread_id: self.thread_id.clone() }));
+        }
         if let Some(checkpoint) = &input.turn_checkpoint {
             checkpoint.prepare().await;
+            if let Err(error) = checkpoint.authorize_dispatch() {
+                Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await;
+                return Err(PrepareTurnError::Rejected(error));
+            }
         }
         let configured = async {
             if self.dialect.is_grok() {
@@ -842,45 +952,55 @@ impl AcpSession {
         .await;
         if let Err(error) = configured {
             if let Some(checkpoint) = &input.turn_checkpoint {
-                checkpoint.abort().await;
+                Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await;
             }
-            return Err(error);
+            return Err(PrepareTurnError::Failed(error));
         }
 
+        if let Some(checkpoint) = &input.turn_checkpoint {
+            if let Err(error) = checkpoint.authorize_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
+        }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
             let mut state = self.state.lock().await;
+            // Stop owns an undispatched selection under this same lock.
+            // Never publish a late dispatch after it has cancelled the ID.
+            if self.is_dead() {
+                return Err(PrepareTurnError::Failed(ProviderError::SessionClosed { thread_id: self.thread_id.clone() }));
+            }
             state.active_turn = Some(turn_id.clone());
             state.status = SessionStatus::Running {
                 active_turn: turn_id.clone(),
             };
             state.assistant_text.clear();
             state.thinking_text.clear();
-        }
-        let _ = self
-            .event_tx
-            .send(ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: self.thread_id.clone(),
-                status: SessionStatus::Running {
-                    active_turn: turn_id.clone(),
-                },
-            });
-        if let Some(id) = queued_id {
             let _ = self
                 .event_tx
-                .send(ProviderRuntimeEvent::QueuedTurnDispatched {
-                    steered: false,
+                .send(ProviderRuntimeEvent::SessionStateChanged {
                     thread_id: self.thread_id.clone(),
-                    queued_id: id,
-                    turn_id: turn_id.clone(),
-                    text: input
-                        .display_text
-                        .clone()
-                        .unwrap_or_else(|| input.text.clone()),
+                    status: SessionStatus::Running {
+                        active_turn: turn_id.clone(),
+                    },
                 });
+            if let Some(queued) = &queued_dispatch {
+                if !queued.disposed.swap(true, Ordering::SeqCst) {
+                    let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                        steered: false, thread_id: self.thread_id.clone(),
+                        queued_id: queued.id.clone(), turn_id: turn_id.clone(),
+                        text: input.display_text.clone().unwrap_or_else(|| input.text.clone()),
+                    });
+                }
+            }
         }
         if let Some(checkpoint) = &input.turn_checkpoint {
             checkpoint.commit().await;
+        }
+        if let Some(queued) = &queued_dispatch {
+            queued.committed();
+            let mut state = self.state.lock().await;
+            if state.selected_queued.as_ref().is_some_and(|selected| selected.id == queued.id) {
+                state.selected_queued.take();
+            }
         }
 
         Ok((turn_id, build_prompt(&input)))
@@ -891,6 +1011,7 @@ impl AcpSession {
         mut turn_id: TurnId,
         mut prompt: Vec<Value>,
         mut generation: u64,
+        mut checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) {
         loop {
             // A Stop that landed while this turn was still being
@@ -901,22 +1022,53 @@ impl AcpSession {
             let response = if interrupted_before_send {
                 Ok(json!({ "stopReason": "cancelled" }))
             } else {
-                self.send_prompt(&prompt, generation).await
+                self.send_prompt(&prompt, generation, checkpoint.as_ref()).await
             };
-            let next = self.finish_turn(turn_id, response, generation).await;
-            let Some((queued, next_generation)) = next else {
-                return;
-            };
+            let mut next = self.finish_turn(turn_id, response, generation).await;
+            loop {
+                let Some((queued, next_generation)) = next else {
+                    return;
+                };
             generation = next_generation;
+            #[cfg(test)]
+            selected_prepare_test_schedule(&self.thread_id).await;
+            checkpoint = queued.input.turn_checkpoint.clone();
             match self
-                .prepare_turn(queued.input, Some(queued.id.clone()))
+                .prepare_turn(queued.input, queued.dispatch.clone())
                 .await
             {
                 Ok((next_turn_id, next_prompt)) => {
                     turn_id = next_turn_id;
                     prompt = next_prompt;
+                    break;
                 }
-                Err(error) => {
+                Err(PrepareTurnError::Rejected(_)) => {
+                    self.cancel_selected_queued(&queued.id).await;
+                    // Keep the single-prompt reservation while selecting the
+                    // next input. Stop still drains the queue and closes us.
+                    let mut state = self.state.lock().await;
+                    state.release_turn();
+                    state.status = SessionStatus::Ready;
+                    let cancelled = if self.is_dead() {
+                        // Unexpected child death has no shutdown owner to
+                        // retire the remaining inputs. This worker must do
+                        // so before abandoning its dispatch reservation.
+                        next = None;
+                        state.queued.drain(..).map(|queued| queued.id).collect::<Vec<_>>()
+                    } else {
+                        next = state.queued.pop_front().map(|queued| {
+                            self.claim_queued_turn(&mut state, queued)
+                        });
+                        Vec::new()
+                    };
+                    drop(state);
+                    for queued_id in cancelled {
+                        let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                            thread_id: self.thread_id.clone(), queued_id,
+                        });
+                    }
+                }
+                Err(PrepareTurnError::Failed(error)) => {
                     let cancelled = {
                         let mut state = self.state.lock().await;
                         // `release_turn` (not a bare `active_turn = None`)
@@ -924,11 +1076,14 @@ impl AcpSession {
                         // outlive it.
                         state.release_turn();
                         state.status = SessionStatus::Ready;
-                        state
+                        let cancelled = state
                             .queued
                             .drain(..)
                             .map(|queued| queued.id)
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        #[cfg(test)]
+                        failed_drain_locked_test_schedule(&self.thread_id, &cancelled).await;
+                        cancelled
                     };
                     self.warn(
                         format!(
@@ -937,12 +1092,8 @@ impl AcpSession {
                         ),
                         None,
                     );
-                    let _ = self
-                        .event_tx
-                        .send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                            thread_id: self.thread_id.clone(),
-                            queued_id: queued.id,
-                        });
+                    // These IDs are now worker-local: publish their terminal
+                    // dispositions before any await that Stop can abort.
                     for queued_id in cancelled {
                         let _ = self
                             .event_tx
@@ -951,8 +1102,10 @@ impl AcpSession {
                                 queued_id,
                             });
                     }
+                    self.cancel_selected_queued(&queued.id).await;
                     return;
                 }
+            }
             }
         }
     }
@@ -971,7 +1124,7 @@ impl AcpSession {
     /// and that mutex is FIFO so the cancel queues behind the prompt and
     /// still reaches the child second. `session/cancel` is a notification
     /// with no reply, so repeating it is harmless.
-    async fn send_prompt(&self, prompt: &[Value], generation: u64) -> Result<Value, RpcChildError> {
+    async fn send_prompt(&self, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
         let prompt_id = self.dialect.is_grok().then(|| self.opaque_id("prompt"));
         let fallback_rx = if let Some(prompt_id) = prompt_id.as_ref() {
             let (tx, rx) = oneshot::channel();
@@ -993,6 +1146,9 @@ impl AcpSession {
                 "promptId": prompt_id,
                 "requestId": prompt_id
             });
+        }
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.authorize_dispatch().map_err(|error| RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}))?;
         }
         let request = self
             .child
@@ -1249,8 +1405,7 @@ impl AcpSession {
                     // an idle session between popping the queued turn and
                     // preparing it, starting a second prompt worker for
                     // the same ACP session.
-                    state.active_turn = Some(self.dispatching_turn_id());
-                    Some((queued, state.claim_turn()))
+                    Some(self.claim_queued_turn(&mut state, queued))
                 }
                 None => {
                     state.release_turn();
@@ -1323,9 +1478,7 @@ impl AcpSession {
                     (None, true)
                 }
                 Some(queued) => {
-                    state.active_turn = Some(self.dispatching_turn_id());
-                    let generation = state.claim_turn();
-                    (Some((queued, generation)), false)
+                    (Some(self.claim_queued_turn(&mut state, queued)), false)
                 }
                 None => (None, false),
             }
@@ -1333,16 +1486,11 @@ impl AcpSession {
         if let Some((queued, generation)) = ready_to_dispatch {
             let queued_id = queued.id.clone();
             if let Err(error) = self
-                .dispatch_turn(queued.input, Some(queued.id), generation)
+                .dispatch_turn(queued.input, queued.dispatch.clone(), generation)
                 .await
             {
                 self.release_dispatch_reservation().await;
-                let _ = self
-                    .event_tx
-                    .send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                        thread_id: self.thread_id.clone(),
-                        queued_id,
-                    });
+                self.cancel_selected_queued(&queued_id).await;
                 return Err(error);
             }
         } else if should_interrupt {
@@ -1370,16 +1518,31 @@ impl AcpSession {
         request_id: RequestId,
         decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
-        let pending = self
-            .state
-            .lock()
-            .await
-            .pending
-            .remove(&request_id)
-            .ok_or_else(|| ProviderError::RequestNotPending {
-                request_id: request_id.clone(),
-            })?;
+        let pending = {
+            let mut state = self.state.lock().await;
+            if let ApprovalDecision::ProviderOption { option_id } = &decision {
+                let pending = state.pending.get(&request_id).ok_or_else(|| ProviderError::RequestNotPending {request_id:request_id.clone()})?;
+                if !matches!(pending, PendingRequest::Permission { options, .. } if options.iter().any(|option| option["optionId"].as_str() == Some(option_id))) {
+                    return Err(ProviderError::ValidationError {message:"unsupported_decision: exact option is not advertised for this callback".into()});
+                }
+            }
+            state.pending.remove(&request_id).ok_or_else(|| ProviderError::RequestNotPending {request_id:request_id.clone()})?
+        };
         let response = pending_response(&pending, &decision);
+        // The wire needs the exact opaque option ID. Native transcript/UI
+        // consumers need its logical scope, not Hermes' ProviderOption event.
+        let event_decision = match (&pending, &decision) {
+            (PendingRequest::Permission { options, .. }, ApprovalDecision::ProviderOption { option_id }) => {
+                match options.iter().find(|option| option["optionId"].as_str() == Some(option_id))
+                    .and_then(|option| option["kind"].as_str()) {
+                    Some("allow_once") => ApprovalDecision::Allow { updated_input: None, updated_permissions: None },
+                    Some("allow_always") => ApprovalDecision::AllowForSession,
+                    Some("reject_once" | "reject_always") => ApprovalDecision::Deny { message: String::new() },
+                    _ => decision.clone(),
+                }
+            }
+            _ => decision.clone(),
+        };
         self.child
             .respond(pending_rpc_id(pending), Ok(response))
             .await
@@ -1387,7 +1550,7 @@ impl AcpSession {
         let _ = self.event_tx.send(ProviderRuntimeEvent::RequestResolved {
             thread_id: self.thread_id.clone(),
             request_id,
-            decision,
+            decision: event_decision,
         });
         let status = {
             let mut state = self.state.lock().await;
@@ -2238,14 +2401,12 @@ impl AcpSession {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        let queued = {
+        let (queued, selected) = {
             let mut state = self.state.lock().await;
             state.status = SessionStatus::Closed;
-            state
-                .queued
-                .drain(..)
-                .map(|queued| queued.id)
-                .collect::<Vec<_>>()
+            let selected = state.selected_queued.take();
+            if let Some(selected) = &selected { selected.cancel(); }
+            (state.queued.drain(..).map(|queued| queued.id).collect::<Vec<_>>(), selected)
         };
         for queued_id in queued {
             let _ = self
@@ -2263,9 +2424,14 @@ impl AcpSession {
             )
             .await;
         let _ = self.child.shutdown().await;
-        for task in self.tasks.lock().await.drain(..) {
-            task.abort();
-        }
+        let tasks = self.tasks.lock().await.drain(..).collect::<Vec<_>>();
+        for task in &tasks { task.abort(); }
+        // Observe abort completion before cleaning a retained checkpoint so
+        // the old preparation cannot overwrite the cleanup after Stop.
+        for task in tasks { let _ = task.await; }
+        if let Some(selected) = selected { selected.abort_checkpoint().await; }
+        let cleanup = self.queue_cleanup_tasks.lock().unwrap().drain(..).collect::<Vec<_>>();
+        for task in cleanup { let _ = task.await; }
     }
 }
 
@@ -3215,6 +3381,11 @@ fn xai_plan_response(decision: &ApprovalDecision) -> Value {
 }
 
 fn permission_outcome(options: &[Value], decision: &ApprovalDecision) -> Value {
+    if let ApprovalDecision::ProviderOption { option_id } = decision {
+        return if options.iter().any(|option| option["optionId"].as_str() == Some(option_id)) {
+            json!({"outcome":"selected","optionId":option_id})
+        } else { json!({"outcome":"cancelled"}) };
+    }
     let kinds: &[&str] = match decision {
         ApprovalDecision::AllowForSession => &["allow_always", "allow_once"],
         ApprovalDecision::Allow { .. } => &["allow_once", "allow_always"],
@@ -3381,8 +3552,76 @@ fn value_contains_text(value: &Value, needle: &str) -> bool {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SelectedPrepareTestBarrier {
+    pub entered: Notify,
+    pub release: tokio::sync::Semaphore,
+}
+#[cfg(test)]
+fn selected_prepare_test_barriers() -> &'static std::sync::Mutex<HashMap<ThreadId, Arc<SelectedPrepareTestBarrier>>> {
+    static BARRIERS: std::sync::OnceLock<std::sync::Mutex<HashMap<ThreadId, Arc<SelectedPrepareTestBarrier>>>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn install_selected_prepare_test_barrier(thread: ThreadId) -> Arc<SelectedPrepareTestBarrier> {
+    let barrier = Arc::new(SelectedPrepareTestBarrier { entered: Notify::new(), release: tokio::sync::Semaphore::new(0) });
+    assert!(selected_prepare_test_barriers().lock().unwrap().insert(thread, barrier.clone()).is_none());
+    barrier
+}
+#[cfg(test)]
+async fn selected_prepare_test_schedule(thread: &ThreadId) {
+    let barrier = selected_prepare_test_barriers().lock().unwrap().remove(thread);
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FailedDrainLockedTestBarrier {
+    pub entered: Notify,
+    pub release: tokio::sync::Semaphore,
+    pub drained: std::sync::Mutex<Vec<String>>,
+}
+#[cfg(test)]
+fn failed_drain_locked_test_barriers() -> &'static std::sync::Mutex<HashMap<ThreadId, Arc<FailedDrainLockedTestBarrier>>> {
+    static BARRIERS: std::sync::OnceLock<std::sync::Mutex<HashMap<ThreadId, Arc<FailedDrainLockedTestBarrier>>>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn install_failed_drain_locked_test_barrier(thread: ThreadId) -> Arc<FailedDrainLockedTestBarrier> {
+    let barrier = Arc::new(FailedDrainLockedTestBarrier {
+        entered: Notify::new(), release: tokio::sync::Semaphore::new(0), drained: Default::default(),
+    });
+    assert!(failed_drain_locked_test_barriers().lock().unwrap().insert(thread, barrier.clone()).is_none());
+    barrier
+}
+#[cfg(test)]
+async fn failed_drain_locked_test_schedule(thread: &ThreadId, drained: &[String]) {
+    let barrier = failed_drain_locked_test_barriers().lock().unwrap().remove(thread);
+    if let Some(barrier) = barrier {
+        *barrier.drained.lock().unwrap() = drained.to_vec();
+        barrier.entered.notify_one();
+        // Hold the already-existing state lock, allowing real Stop to queue
+        // its FIFO acquisition. No post-drain cancellation point is added.
+        barrier.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_s3_acp_explicit_advertised_option_selects_exact_scope() {
+        let pending = PendingRequest::Permission {rpc_id:json!(1),options:vec![json!({"kind":"allow_always","optionId":"permit"})]};
+        assert_eq!(pending_response(&pending, &ApprovalDecision::ProviderOption {option_id:"permit".into()}),
+            json!({"outcome":{"outcome":"selected","optionId":"permit"}}), "exact option must be delivered, not cancelled or substituted");
+        // The legacy UI fallback remains its existing separate contract.
+        assert_eq!(pending_response(&pending, &ApprovalDecision::Allow {updated_input:None,updated_permissions:None}),
+            json!({"outcome":{"outcome":"selected","optionId":"permit"}}));
+    }
 
     #[test]
     fn grok_incompatible_model_marker_is_read_from_structured_error_data() {
@@ -4201,6 +4440,7 @@ mod tests {
             config_options: vec![],
             pending: HashMap::new(),
             queued: VecDeque::new(),
+            selected_queued: None,
             assistant_text: String::new(),
             thinking_text: String::new(),
             turn_generation: 0,

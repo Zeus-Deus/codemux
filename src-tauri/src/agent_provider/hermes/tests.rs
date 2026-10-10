@@ -8,6 +8,198 @@ impl BindingStore for crate::database::DatabaseStore {
         self.save_hermes_binding(binding)
     }
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_l3_native_stop_wakes_cold_hermes_profile_operation_wait() {
+    use tauri::Manager;
+    use crate::commands::agent_chat::{self, ProviderRegistry};
+    let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+    assert!(binary.is_file(), "synthetic ACP fixture required, never a real Hermes CLI");
+    let placeholder = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
+        crate::agent_provider::cursor::CursorProviderConfig {binary:binary.clone(), event_channel_capacity:128},
+    ));
+    let (app, root, workspace, pane) = crate::agent_control::guard_tests::fixture(placeholder, "cold-hermes-b").await;
+    let provider = Arc::new(HermesProvider::new(Arc::new(binding::AppBindingStore(app.handle().clone()))));
+    app.state::<ProviderRegistry>().set_hermes(provider.clone()).await;
+    app.state::<crate::state::AppStateStore>().claim_agent_chat_pane_checked(&pane,
+        ProviderKind::Hermes,"cold-hermes-b",Some("cold-hermes-b"), |_| Ok(())).unwrap();
+    let db = app.state::<crate::database::DatabaseStore>();
+    db.upsert_agent_chat_session("cold-hermes-b",&workspace,Some(root.path().to_str().unwrap()),"hermes").unwrap();
+    db.update_agent_chat_session_config("cold-hermes-b", &crate::database::AgentChatSessionConfig {
+        permission_mode:Some(None),..Default::default()
+    }).unwrap();
+    std::fs::write(root.path().join("config.yaml"),"model: {provider: custom}\n").unwrap();
+    let profile = profile::resolve(&binary, root.path(), "default").unwrap();
+    let mut b = test_binding(root.path()); b.profile=profile.clone(); b.thread_id="cold-hermes-b".into();
+    b.workspace_id=Some(workspace); b.current_native_id=b.acp_session_id.clone(); b.cleanup_pending=false;
+    db.save_hermes_binding(&b).unwrap();
+    let child = JsonRpcChild::spawn(SpawnConfig {program:binary,args:vec![],env:HashMap::new(),cwd:Some(root.path().into()),default_timeout:Duration::from_secs(2)}).await.unwrap();
+    let (barrier, _rx) = mpsc::unbounded_channel();
+    let runtime = Arc::new(Runtime {
+        fixture_start_wait:Notify::new(),child,ownership:std::sync::Mutex::new(None),installation_stamp:installation_stamp(&profile).unwrap(),profile:profile.clone(),
+        operation:Mutex::new(()),routes:Mutex::new(HashMap::new()),commands:Mutex::new(HashMap::new()),queue:Mutex::new(Queue::default()),barrier,
+    });
+    provider.inner.runtimes.lock().await.insert(runtime_key(&profile),runtime.clone());
+    // Same actual runtime.operation mutex that A's foreground approval owns.
+    let held_by_a = runtime.operation.lock().await;
+    let handle = app.handle().clone();
+    let send = tokio::spawn(async move {
+        agent_chat::agent_chat_send_turn(handle,ProviderKind::Hermes,
+            serde_json::from_value(json!({"thread_id":"cold-hermes-b","text":"Never dispatch","model_override":null})).unwrap()).await
+    });
+    tokio::time::timeout(Duration::from_secs(2),runtime.fixture_start_wait.notified()).await.unwrap();
+    let stop = agent_chat::agent_chat_stop_session(app.handle().clone(),ProviderKind::Hermes,ThreadId("cold-hermes-b".into()));
+    tokio::pin!(stop);
+    let stop_before_release = tokio::time::timeout(Duration::from_millis(150),stop.as_mut()).await;
+    let woke = stop_before_release.is_ok();
+    if let Ok(result) = stop_before_release { result.unwrap(); }
+    drop(held_by_a);
+    if !woke { stop.await.unwrap(); }
+    assert!(send.await.unwrap().is_err());
+    runtime.child.shutdown().await.unwrap();
+    assert!(woke, "Stop must release B's activity/native locks while A still owns the Hermes profile gate");
+    assert!(!db.hermes_binding("cold-hermes-b").unwrap().unwrap().cleanup_pending,
+        "cancelled pre-dispatch startup must not access new/load or commit a worktree execution hold");
+    assert!(!provider.has_session(&ThreadId("cold-hermes-b".into())).await);
+}
+
+#[derive(Debug, Default)]
+struct ReviewDispatchAuthority {
+    revoked: std::sync::atomic::AtomicBool,
+    prepared: std::sync::atomic::AtomicUsize,
+    committed: std::sync::atomic::AtomicUsize,
+    aborted: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuthority {
+    fn authorize_dispatch(&self) -> Result<(), ProviderError> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(invalid("grant_revoked: synthetic Q1 authority revoked"))
+        } else { Ok(()) }
+    }
+    async fn prepare(&self) { self.prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+    async fn commit(&self) { self.committed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+    async fn abort(&self) { self.aborted.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+}
+
+async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
+    let root = tempfile::tempdir().unwrap();
+    // Launch only the compiled synthetic ACP peer, never the official Hermes CLI.
+    let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+    assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
+    std::fs::write(root.path().join("config.yaml"), "model: {provider: custom}\n").unwrap();
+    let profile = profile::resolve(&binary, root.path(), "default").unwrap();
+    let provider = HermesProvider::new(Arc::new(crate::database::init_test_database()));
+    let env = HashMap::from([(
+        "CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(), root.path().to_string_lossy().into_owned(),
+    )]);
+    let child = JsonRpcChild::spawn(SpawnConfig {program:binary, args:vec![], env, cwd:Some(root.path().into()), default_timeout:Duration::from_secs(3)}).await.unwrap();
+    let mut notifications = child.notifications();
+    let mut requests = child.incoming_requests().unwrap();
+    let (barrier, mut barriers) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+    let runtime = Arc::new(Runtime {fixture_start_wait:Notify::new(), child, ownership:std::sync::Mutex::new(None),
+        installation_stamp:installation_stamp(&profile).unwrap(), profile:profile.clone(), operation:Mutex::new(()),
+        routes:Mutex::new(HashMap::new()), commands:Mutex::new(HashMap::new()), queue:Mutex::new(Queue::default()), barrier});
+    let mut binding = test_binding(root.path()); binding.profile=profile; binding.acp_session_id=Some("review-session".into());
+    binding.current_native_id=Some("existing-native".into());
+    let chat = Arc::new(Chat {binding:Mutex::new(binding), runtime:runtime.clone(), state:Mutex::new(ChatState::default()), finished:Notify::new()});
+    provider.inner.chats.lock().await.insert(ThreadId("thread".into()), chat.clone());
+    runtime.routes.lock().await.insert("review-session".into(), Arc::downgrade(&chat));
+    let inner = provider.inner.clone(); let r = runtime.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! { biased;
+                Some(request) = requests.recv() => inner.permission(&r, request).await,
+                Ok(n) = notifications.recv() => inner.notification(&r, n).await,
+                Some(done) = barriers.recv() => { let _ = done.send(()); },
+                else => break,
+            }
+        }
+    });
+    (root, provider, runtime, chat, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_r2_denied_hermes_job_preserves_healthy_chat_and_native_followup() {
+    let (_root, provider, runtime, chat, task) = review_pump_fixture().await;
+    let mut rx = provider.inner.events.subscribe();
+    // Deterministic busy-profile barrier: queue both inputs before pump ownership.
+    let held = runtime.operation.lock().await;
+    runtime.queue.lock().await.running = true;
+    let authority = Arc::new(ReviewDispatchAuthority::default());
+    let mut outside = turn("thread", "never-dispatch-q1"); outside.turn_checkpoint=Some(authority.clone());
+    let q1 = provider.send_turn(outside).await.unwrap().queued_id.unwrap();
+    let q2 = provider.send_turn(turn("thread", "native-q2")).await.unwrap().queued_id.unwrap();
+    authority.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let mut events = vec![]; while let Ok(e) = rx.try_recv() { events.push(e); }
+    let healthy = provider.has_session(&ThreadId("thread".into())).await;
+    let error = chat.state.lock().await.error.clone();
+    let active = chat.state.lock().await.active.clone();
+    runtime.child.shutdown().await.unwrap(); task.abort(); let _ = task.await;
+    assert!(healthy, "input authority denial must not make has_session false: {events:?}");
+    assert!(error.is_none(), "input denial poisoned healthy chat: {error:?}");
+    assert!(active.is_none(), "denied claim must be released");
+    assert!(!events.iter().any(|e| matches!(e, ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Error {..}, ..})), "input rejection is not session-fatal: {events:?}");
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q1)));
+    assert!(!events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q1)));
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q2)), "Q2 was lost: {events:?}");
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted {item:CompletedItem::AssistantText {text}, ..} if text == "native-q2")), "Q2 never reached transport: {events:?}");
+    assert_eq!(authority.prepared.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(authority.aborted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(authority.committed.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_r2_transport_failure_remains_chat_fatal_and_cancels_followup() {
+    let (_root, provider, runtime, chat, task) = review_pump_fixture().await;
+    let mut rx=provider.inner.events.subscribe();
+    runtime.queue.lock().await.running=true;
+    let q1=provider.send_turn(turn("thread", "review-runtime-fatal")).await.unwrap().queued_id.unwrap();
+    let q2=provider.send_turn(turn("thread", "native-q2")).await.unwrap().queued_id.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let mut events=vec![]; while let Ok(event)=rx.try_recv() { events.push(event); }
+    assert!(runtime.child.is_alive(), "RPC failure control must not be a child-exit fixture");
+    assert!(!provider.has_session(&ThreadId("thread".into())).await);
+    assert!(chat.state.lock().await.error.as_deref().unwrap().contains("synthetic runtime transport failure"));
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q1)));
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q2)));
+    assert!(!events.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q2)));
+    assert!(events.iter().any(|e| matches!(e, ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Error {..}, ..})));
+    runtime.child.shutdown().await.unwrap(); task.abort(); let _=task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_r2_interrupt_cancels_real_prompt_and_queue_but_allows_fresh_native_work() {
+    let (_root, provider, runtime, _chat, task) = review_pump_fixture().await;
+    let mut rx=provider.inner.events.subscribe();
+    runtime.queue.lock().await.running=true;
+    provider.send_turn(turn("thread", "review-hold")).await.unwrap();
+    let inner=provider.inner.clone(); let r=runtime.clone();
+    let pump=tokio::spawn(async move { inner.pump(r).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop { if matches!(rx.recv().await.unwrap(), ProviderRuntimeEvent::RequestOpened {..}) { break; } }
+    }).await.unwrap();
+    let q2=provider.send_turn(turn("thread", "never-dispatch-q2")).await.unwrap().queued_id.unwrap();
+    provider.interrupt_turn(ThreadId("thread".into()), None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), pump).await.unwrap().unwrap();
+    let mut cancelled=vec![]; while let Ok(e)=rx.try_recv() { cancelled.push(e); }
+    assert!(cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnCancelled {queued_id, ..} if queued_id == &q2)));
+    assert!(!cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::QueuedTurnDispatched {queued_id, ..} if queued_id == &q2)));
+    assert!(cancelled.iter().any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted {status:TurnStatus::Error {subtype, ..}, ..} if subtype == "cancelled")));
+    assert!(provider.has_session(&ThreadId("thread".into())).await);
+    runtime.queue.lock().await.running=true;
+    provider.send_turn(turn("thread", "fresh-native-after-interrupt")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.inner.clone().pump(runtime.clone())).await.unwrap();
+    let mut fresh=vec![]; while let Ok(e)=rx.try_recv() { fresh.push(e); }
+    assert!(fresh.iter().any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted {item:CompletedItem::AssistantText {text}, ..} if text == "fresh-native-after-interrupt")));
+    provider.stop_session(ThreadId("thread".into())).await.unwrap();
+    assert!(!provider.has_session(&ThreadId("thread".into())).await);
+    runtime.child.shutdown().await.unwrap(); task.abort(); let _=task.await;
+}
+
 fn start(thread: &str, cwd: &Path, profile: &Profile) -> StartSessionInput {
     serde_json::from_value(json!({"thread_id":thread,"cwd":cwd,"model":null,"resume_cursor":null,"permission_mode":null,"additional_directories":[],"env":null,"extra":{"hermes_profile":profile}})).unwrap()
 }
@@ -20,7 +212,8 @@ fn test_binding(root: &Path) -> Binding {
         profile: profile::resolve(&std::env::current_exe().unwrap(), root, "default").unwrap(),
         thread_id: "thread".into(),
         workspace_id: Some("workspace".into()),
-        cwd: root.into(),
+        // Match start_session's durable-path contract (Windows adds a verbatim prefix).
+        cwd: root.canonicalize().unwrap(),
         acp_session_id: Some("stable".into()),
         current_native_id: Some("native".into()),
         root_native_id: Some("native".into()),
@@ -36,6 +229,7 @@ fn hermes_durable_binding_provenance_and_cleanup_hold() {
     let root = tempfile::tempdir().unwrap();
     let db = crate::database::init_test_database();
     let mut b = test_binding(root.path());
+    b.validate_cwd().unwrap();
     db.save_hermes_binding(&b).unwrap();
     b.provenance(&json!({"_meta":{"hermes":{"sessionProvenance":{"acpSessionId":"stable","currentHermesSessionId":"head-2","rootHermesSessionId":"native","future":true}}}})).unwrap();
     db.save_hermes_binding(&b).unwrap();

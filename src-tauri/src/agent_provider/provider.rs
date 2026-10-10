@@ -44,6 +44,16 @@ pub trait AgentProvider: Send + Sync {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError>;
 
+    /// Only cancellation-safe pre-dispatch waits may observe this token.
+    /// Default adapters keep their existing startup/cleanup ownership; do not
+    /// drop an in-flight startup RPC as a generic cancellation fallback.
+    async fn start_session_with_cancellation(
+        &self, input: StartSessionInput,
+        _cancellation: Option<std::sync::Arc<dyn super::types::SessionStartCancellation>>,
+    ) -> Result<ProviderSession, ProviderError> {
+        self.start_session(input).await
+    }
+
     /// Queue a user turn on an existing session. Returns the newly minted
     /// turn identifier; actual turn output streams through
     /// [`event_stream`](Self::event_stream).

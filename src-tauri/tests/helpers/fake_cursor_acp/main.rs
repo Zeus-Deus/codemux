@@ -35,6 +35,8 @@ use std::io::{BufRead, BufReader, Write};
 
 use serde_json::{json, Value};
 
+mod fixture_peer;
+
 fn write_line(value: &Value) {
     let mut bytes = serde_json::to_vec(value).expect("serialize");
     bytes.push(b'\n');
@@ -121,6 +123,11 @@ fn requested_chunk_count(text: &str) -> Option<usize> {
 }
 
 fn main() {
+    // Explicit per-child opt-in; without it the legacy Cursor fixture is unchanged.
+    if let Some(root) = std::env::var_os("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT") {
+        fixture_peer::run(root.into());
+        return;
+    }
     let stdin = std::io::stdin();
     let mut stdin = BufReader::new(stdin.lock());
     let mut line = String::new();

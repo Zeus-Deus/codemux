@@ -1,4 +1,6 @@
 pub mod async_questions;
+pub mod agent_control;
+pub mod mcp_connector;
 pub mod hermes;
 pub(crate) mod local_sessions;
 
@@ -8,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 20;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -355,6 +357,8 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
+    mcp_connector::migrate(conn)?;
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(
@@ -455,6 +459,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Numeric affinity matches the row-id comparison, including legacy
+        -- numeric JSON strings. Accept JSON5 TEXT like json_extract while
+        -- excluding malformed input from this derived index.
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_user_control
+            ON agent_chat_messages(thread_id, CAST(json_extract(payload, '$.user_message_id') AS NUMERIC))
+            WHERE json_valid(payload, 2) AND json_extract(payload, '$.type') = 'native_user_control';
 
         -- Lazy, model-written conversation handoffs (schema v16). One cache
         -- row per source conversation is sufficient: changing utility model,
@@ -6435,6 +6446,183 @@ mod tests {
         assert_eq!(projects.len(), 1);
     }
 
+    #[test]
+    fn mario_r2_migration_preserves_known_legacy_receipts_without_inventing_owners() {
+        use mcp_connector::{NewMcpClient, NewMcpGrant};
+        let db = init_test_database();
+        db.mcp_register_client(
+            NewMcpClient {
+                id: "legacy-client".into(),
+                name: "Untrusted name".into(),
+                redirects: vec!["https://client.example/cb".into()],
+                created_at: 0,
+            },
+            0,
+        )
+        .unwrap();
+        let grant = |id: &str| NewMcpGrant {
+            id: id.into(),
+            client_id: "legacy-client".into(),
+            token_hash: id.into(),
+            redirect_uri: "https://client.example/cb".into(),
+            resource: "https://mcp.example/mcp".into(),
+            access: "full_access".into(),
+            created_at: 1,
+            expires_at: 3_600_001,
+        };
+        db.mcp_mint_grant(grant("legacy-active")).unwrap();
+        let admit = |principal: &str, key: &str| {
+            let a = db
+                .admit_control_operation(
+                    principal,
+                    key,
+                    "thread_interrupt",
+                    "unchanged-payload-hash",
+                    "original-epoch",
+                    Some("synthetic-workspace"),
+                    Some("synthetic-thread"),
+                )
+                .unwrap();
+            db.update_control_operation(
+                principal,
+                &a.receipt.operation_id,
+                "original-epoch",
+                "succeeded",
+                None,
+                None,
+                Some(&serde_json::json!({"reached_provider":true})),
+                None,
+            )
+            .unwrap();
+            db.control_operation(principal, &a.receipt.operation_id, "original-epoch")
+                .unwrap()
+                .unwrap()
+        };
+        let known = admit("mcp:legacy-active", "known-key");
+        let lost = admit("mcp:lost-deleted-grant", "lost-key");
+        create_schema(&db.conn.lock().unwrap()).unwrap();
+        let recovered=db.control_operation_by_key("mcp-client:legacy-client","known-key","thread_interrupt","unchanged-payload-hash","later-epoch").unwrap()
+            .expect("A retained grant's authenticated client mapping must preserve the exact existing receipt on upgrade");
+        assert_eq!(
+            serde_json::to_value(&recovered).unwrap(),
+            serde_json::to_value(&known).unwrap()
+        );
+        assert!(db
+            .control_operation(
+                "mcp-client:legacy-client",
+                &lost.operation_id,
+                "later-epoch"
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(
+                db.control_operation("mcp:lost-deleted-grant", &lost.operation_id, "later-epoch")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&lost).unwrap()
+        );
+        db.mcp_mint_grant(grant("replacement")).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                db.control_operation(
+                    "mcp-client:legacy-client",
+                    &known.operation_id,
+                    "later-epoch"
+                )
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&known).unwrap()
+        );
+        // Never select one of two historical receipts with the same stable key.
+        let stable = admit("mcp-client:legacy-client", "colliding-key");
+        let collision = admit("mcp:replacement", "colliding-key");
+        create_schema(&db.conn.lock().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                db.control_operation(
+                    "mcp-client:legacy-client",
+                    &stable.operation_id,
+                    "later-epoch"
+                )
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(stable).unwrap()
+        );
+        assert!(db
+            .control_operation(
+                "mcp-client:legacy-client",
+                &collision.operation_id,
+                "later-epoch"
+            )
+            .unwrap()
+            .is_none());
+        assert!(db
+            .control_operation("mcp:replacement", &collision.operation_id, "later-epoch")
+            .unwrap()
+            .is_some());
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_control_operations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 4,
+            "Migration must not drop or merge frozen historical receipts"
+        );
+    }
+
+    #[test]
+    fn mario_r5_v19_migration_preserves_approved_registration_metadata() {
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE agent_mcp_grants; DROP TABLE agent_mcp_clients;
+                CREATE TABLE agent_mcp_clients(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,redirects_json TEXT NOT NULL,created_at INTEGER NOT NULL);
+                CREATE TABLE agent_mcp_grants(id TEXT PRIMARY KEY NOT NULL,client_id TEXT NOT NULL REFERENCES agent_mcp_clients(id) ON DELETE CASCADE,token_hash TEXT UNIQUE NOT NULL,redirect_uri TEXT NOT NULL,resource TEXT NOT NULL,access TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
+                UPDATE schema_version SET version=19;
+                INSERT INTO agent_mcp_clients VALUES('cached-v19','Original untrusted name','[\"https://client.example/cb\"]',0);
+                INSERT INTO agent_mcp_clients VALUES('anonymous-v19','Unapproved','[\"https://client.example/cb\"]',0);
+                INSERT INTO agent_mcp_grants VALUES('expired-v19','cached-v19','synthetic-hash','https://client.example/cb','https://mcp.example/mcp','read_only',1,3600001,0);").unwrap();
+            create_schema(&conn).unwrap();
+            create_schema(&conn).unwrap();
+        }
+        db.mcp_prune_clients(3_600_002, &[]).unwrap();
+        let cached = db.mcp_client("cached-v19").unwrap().expect("Upgrading v19 must preserve approved cached registrations before pruning expired grants");
+        assert_eq!(cached.name, "Original untrusted name");
+        assert_eq!(cached.redirects, vec!["https://client.example/cb"]);
+        assert!(db.mcp_client("anonymous-v19").unwrap().is_none());
+        assert!(db.mcp_list_grants(3_600_002).unwrap().is_empty());
+        db.mcp_prune_clients(1 + 7 * 86_400_000, &[]).unwrap();
+        assert!(db.mcp_client("cached-v19").unwrap().is_none(),"Migration must use the historical approval timestamp, not extend retention on every restart");
+    }
+
+    #[test]
+    fn mario_r5_fresh_v18_initialization_and_restart_do_not_duplicate_columns() {
+        let db = init_test_database();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch("DROP TABLE agent_mcp_grants; DROP TABLE agent_mcp_clients; DROP TABLE agent_mcp_config; UPDATE schema_version SET version=18;").unwrap();
+        create_schema(&conn).unwrap();
+        create_schema(&conn).unwrap();
+        let columns:i64=conn.query_row("SELECT COUNT(*) FROM pragma_table_info('agent_mcp_clients') WHERE name='approved_at'",[],|r|r.get(0)).unwrap();
+        assert_eq!(
+            columns, 1,
+            "Fresh schema creation and upgrade must share one approved registration marker"
+        );
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
     #[test]
     fn schema_version_set() {
         let db = init_test_database();

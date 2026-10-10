@@ -167,6 +167,8 @@ struct Queue {
     running: bool,
 }
 struct Runtime {
+    #[cfg(test)]
+    fixture_start_wait: Notify,
     child: JsonRpcChild,
     ownership: std::sync::Mutex<Option<std::fs::File>>,
     installation_stamp: String,
@@ -351,6 +353,8 @@ impl Inner {
         }
         let (barrier, mut barriers) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
         let runtime = Arc::new(Runtime {
+            #[cfg(test)]
+            fixture_start_wait: Notify::new(),
             child,
             ownership: std::sync::Mutex::new(Some(ownership)),
             installation_stamp,
@@ -652,6 +656,7 @@ impl Inner {
             let thread = job.input.thread_id.clone();
             let turn = TurnId(Uuid::new_v4().to_string());
             let mut dispatched = false;
+            let mut rejected = false;
             {
                 let mut state = chat.state.lock().await;
                 if state.cancel_epoch != job.cancel_epoch {
@@ -678,7 +683,22 @@ impl Inner {
                     if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.abort().await; }
                     return Err(invalid("Hermes turn cancelled before dispatch"));
                 }
+                if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() {
+                    if let Err(error) = checkpoint.authorize_dispatch() {
+                        checkpoint.abort().await;
+                        rejected = true;
+                        return Err(error);
+                    }
+                }
                 if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() { checkpoint.commit().await; }
+                // Commit may await: authority must still hold at transport dispatch.
+                if let Some(checkpoint) = job.input.turn_checkpoint.as_ref() {
+                    if let Err(error) = checkpoint.authorize_dispatch() {
+                        checkpoint.abort().await;
+                        rejected = true;
+                        return Err(error);
+                    }
+                }
                 dispatched = true;
                 self.emit(ProviderRuntimeEvent::QueuedTurnDispatched {thread_id:thread.clone(),queued_id:job.id.clone(),turn_id:turn.clone(),text:job.input.display_text.clone().unwrap_or_else(||job.input.text.clone()),steered:false});
                 self.emit(ProviderRuntimeEvent::SessionStateChanged {thread_id:thread.clone(),status:SessionStatus::Running {active_turn:turn.clone()}});
@@ -701,6 +721,22 @@ impl Inner {
                 Ok::<(),ProviderError>(())
             }.await;
             let mut state = chat.state.lock().await;
+            if rejected {
+                // No prompt was written. Reject only this input, leaving real
+                // runtime errors intact and the profile pump free to continue.
+                state.active = None;
+                self.emit(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: thread.clone(), queued_id: job.id.clone(),
+                });
+                if !state.closed && state.error.is_none() {
+                    self.emit(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: thread, status: SessionStatus::Ready,
+                    });
+                }
+                drop(state);
+                chat.finished.notify_waiters();
+                continue;
+            }
             for (id, pending) in state.pending.drain() {
                 let _ = runtime
                     .child
@@ -799,6 +835,12 @@ impl AgentProvider for HermesProvider {
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
+        self.start_session_with_cancellation(input, None).await
+    }
+    async fn start_session_with_cancellation(
+        &self, input: StartSessionInput,
+        cancellation: Option<Arc<dyn crate::agent_provider::types::SessionStartCancellation>>,
+    ) -> Result<ProviderSession, ProviderError> {
         let start_lock = self
             .inner
             .starts
@@ -896,7 +938,23 @@ impl AgentProvider for HermesProvider {
         self.inner.store.save(&binding).map_err(invalid)?;
         drop(worktree_guard);
         let runtime = self.inner.runtime(binding.profile.clone()).await?;
-        let _operation = runtime.operation.lock().await;
+        #[cfg(test)]
+        runtime.fixture_start_wait.notify_one();
+        // No new/load RPC or worktree hold exists yet. Abandon only this
+        // cancellable profile-gate wait; never drop a dispatched startup RPC.
+        let _operation = match cancellation.as_ref() {
+            Some(cancellation) => {
+                cancellation.check().map_err(invalid)?;
+                let operation = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(invalid("cancelled: Hermes startup stopped before profile dispatch")),
+                    operation = runtime.operation.lock() => operation,
+                };
+                cancellation.check().map_err(invalid)?;
+                operation
+            }
+            None => runtime.operation.lock().await,
+        };
         if binding
             .current_native_id
             .as_ref()

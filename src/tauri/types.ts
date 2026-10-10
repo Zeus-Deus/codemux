@@ -1,3 +1,38 @@
+// ── Outside-assistant MCP connector (sanitized native views only) ──
+
+export type AgentConnectorAccess = "read_only" | "supervised" | "full_access";
+
+export type AgentConnectorPending = {
+  id: string;
+  clientName: string;
+  callbackOrigin: string;
+  requestedAt: string;
+  expiresAt: string;
+} & (
+  | { phase: "awaiting_approval"; access: null }
+  | { phase: "approved_awaiting_client"; access: AgentConnectorAccess }
+  | { phase: "denied"; access: null }
+);
+
+export interface AgentConnectorClient {
+  id: string;
+  clientName: string;
+  callbackOrigin: string;
+  access: AgentConnectorAccess;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface AgentConnectorStatus {
+  enabled: boolean;
+  publicOrigin: string | null;
+  listenerRunning: boolean;
+  mcpUrl: string | null;
+  localCommand: string;
+  pending: AgentConnectorPending[];
+  clients: AgentConnectorClient[];
+}
+
 // ── Feature flags ──
 
 export interface FeatureFlags {

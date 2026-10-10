@@ -16,6 +16,11 @@ import type { AutomationRunView } from "./commands";
 
 export type EventCallback<T> = (payload: T) => void;
 
+/** Invalidation only: do not forward any event fields, even if a backend
+ * version includes its sanitized status. Read the authoritative native view. */
+export const onAgentConnectorChanged = (cb: EventCallback<null>): Promise<UnlistenFn> =>
+  listen<unknown>("agent-connector-changed", () => cb(null));
+
 export const onAppStateChanged = (cb: EventCallback<AppStateSnapshot>): Promise<UnlistenFn> =>
   listen<AppStateSnapshot>("app-state-changed", (e) => cb(e.payload));
 

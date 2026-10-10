@@ -1,4 +1,6 @@
 use tauri::{Emitter, Listener, Manager};
+#[cfg(test)]
+extern crate self as codemux_lib;
 
 /// Subdirectory name used under XDG config/data dirs for all Codemux state
 /// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
@@ -13,6 +15,7 @@ pub mod addons;
 pub mod agent_capability;
 pub mod active_workspace_persistence;
 pub mod agent_context;
+pub mod agent_control;
 pub mod agent_provider;
 pub mod ai;
 pub mod auth;
@@ -22,6 +25,7 @@ pub mod branch_name;
 pub mod json_rpc_child;
 pub mod local_session_import;
 pub mod mcp_server;
+pub mod mcp_connector;
 pub mod agent_browser;
 pub mod browser_viewport;
 pub mod cli;
@@ -417,6 +421,7 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(auth::AuthState::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        .manage(agent_control::NativeControlState::default())
         // Per-thread live event channels for the chat pane: each
         // mounted pane attaches a tauri::ipc::Channel keyed by
         // thread_id; forward_event routes that thread's runtime
@@ -497,6 +502,7 @@ fn build_core_app<R: tauri::Runtime>(
             database::DatabaseStore::new_in_memory()
         }))
         .manage(web_remote_state)
+        .manage(mcp_connector::McpConnectorState::default())
         // Reroute channel frames opened by a web-remote invoke to the
         // browser that opened them. Returns true only for server-allocated
         // channel ids (the router owns them); genuine desktop-webview
@@ -2480,6 +2486,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_close_pane,
             commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
+            mcp_connector::agent_connector_status,
+            mcp_connector::agent_connector_set_config,
+            mcp_connector::agent_connector_approve,
+            mcp_connector::agent_connector_deny,
+            mcp_connector::agent_connector_revoke,
             commands::agent_chat_send_turn,
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,
