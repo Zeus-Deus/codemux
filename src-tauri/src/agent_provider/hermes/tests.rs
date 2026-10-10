@@ -84,19 +84,17 @@ impl crate::agent_provider::types::TurnDispatchCheckpoint for ReviewDispatchAuth
 
 async fn review_pump_fixture() -> (tempfile::TempDir, HermesProvider, Arc<Runtime>, Arc<Chat>, tokio::task::JoinHandle<()>) {
     let root = tempfile::tempdir().unwrap();
-    // Launch only the packaged synthetic ACP peer, never the official Hermes CLI.
-    // Python must be the executable: a script/shebang launch is not portable to Windows.
-    let binary = which::which(if cfg!(windows) { "python" } else { "python3" })
-        .expect("Python is required for the synthetic ACP fixture");
-    let script = root.path().join("agent_control_acp_peer.py");
-    std::fs::write(&script, include_str!("../../../tests/helpers/agent_control_acp_peer.py")).unwrap();
+    // Launch only the compiled synthetic ACP peer, never the official Hermes CLI.
+    let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+    assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     std::fs::write(root.path().join("config.yaml"), "model: {provider: custom}\n").unwrap();
     let profile = profile::resolve(&binary, root.path(), "default").unwrap();
     let provider = HermesProvider::new(Arc::new(crate::database::init_test_database()));
     let env = HashMap::from([(
         "CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(), root.path().to_string_lossy().into_owned(),
     )]);
-    let child = JsonRpcChild::spawn(SpawnConfig {program:binary, args:vec![script.to_string_lossy().into_owned()], env, cwd:Some(root.path().into()), default_timeout:Duration::from_secs(3)}).await.unwrap();
+    let child = JsonRpcChild::spawn(SpawnConfig {program:binary, args:vec![], env, cwd:Some(root.path().into()), default_timeout:Duration::from_secs(3)}).await.unwrap();
     let mut notifications = child.notifications();
     let mut requests = child.incoming_requests().unwrap();
     let (barrier, mut barriers) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
@@ -214,7 +212,8 @@ fn test_binding(root: &Path) -> Binding {
         profile: profile::resolve(&std::env::current_exe().unwrap(), root, "default").unwrap(),
         thread_id: "thread".into(),
         workspace_id: Some("workspace".into()),
-        cwd: root.into(),
+        // Match start_session's durable-path contract (Windows adds a verbatim prefix).
+        cwd: root.canonicalize().unwrap(),
         acp_session_id: Some("stable".into()),
         current_native_id: Some("native".into()),
         root_native_id: Some("native".into()),
@@ -230,6 +229,7 @@ fn hermes_durable_binding_provenance_and_cleanup_hold() {
     let root = tempfile::tempdir().unwrap();
     let db = crate::database::init_test_database();
     let mut b = test_binding(root.path());
+    b.validate_cwd().unwrap();
     db.save_hermes_binding(&b).unwrap();
     b.provenance(&json!({"_meta":{"hermes":{"sessionProvenance":{"acpSessionId":"stable","currentHermesSessionId":"head-2","rootHermesSessionId":"native","future":true}}}})).unwrap();
     db.save_hermes_binding(&b).unwrap();

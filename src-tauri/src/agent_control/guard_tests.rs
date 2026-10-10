@@ -1003,13 +1003,10 @@ async fn review_acp_fixture(thread: &str) -> (
     let root = tempfile::tempdir().unwrap();
     let rig = review_acp_rig(root.path());
     std::fs::create_dir_all(&rig).unwrap();
-    let binary = root.path().join("agent_control_acp_peer.py");
-    std::fs::write(&binary, include_str!("../../tests/helpers/agent_control_acp_peer.py")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    // A compiled, direct owned child on every platform; no interpreter or shell.
+    let binary = std::env::var_os("CODEMUX_NATIVE_CURSOR_FIXTURE").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("fake_cursor_acp{}", std::env::consts::EXE_SUFFIX)));
+    assert!(binary.is_file(), "build the fake_cursor_acp test fixture first");
     let provider = Arc::new(crate::agent_provider::cursor::CursorAgentProvider::new(
         crate::agent_provider::cursor::CursorProviderConfig { binary, event_channel_capacity: 256 },
     ));
