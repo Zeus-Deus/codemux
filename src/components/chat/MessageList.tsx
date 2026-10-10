@@ -627,10 +627,14 @@ export const MessageList = memo(function MessageList({
       };
       // Keyboard scrolling is navigation too. Editable targets keep their
       // keys: arrows inside an answer field move the caret, not the list.
+      // Space on a control (Copy, a fold, an approval) activates it rather
+      // than scrolling, so it must not retire follow any more than a click.
       const onKeyDown = (event: KeyboardEvent) => {
         if (!SCROLL_KEYS.has(event.key)) return;
         const target = event.target as HTMLElement | null;
         if (target?.closest("input, textarea, select, [contenteditable='true']"))
+          return;
+        if (event.key === " " && target?.closest(SPACE_ACTIVATED_CONTROLS))
           return;
         cancelFollowForUserNavigation();
       };
@@ -1437,6 +1441,10 @@ const SCROLL_KEYS = new Set([
   "End",
   " ",
 ]);
+
+/** Focused controls that consume Space as activation instead of scrolling. */
+const SPACE_ACTIVATED_CONTROLS =
+  "button, summary, [role='button'], [role='checkbox'], [role='switch'], [role='tab'], [role='menuitem'], [role='option'], [role='radio']";
 
 /** Frames the anchor positioner will wait for the list ref to exist before
  *  giving up. A frame budget, not a fixed timeout: it cannot assume layout

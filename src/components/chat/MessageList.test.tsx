@@ -240,6 +240,22 @@ describe("MessageList retained scroll state", () => {
     await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
   });
 
+  it("keeps following when Space activates a control in the transcript", async () => {
+    // Space on a focused Copy / fold / approval button activates it; it does
+    // not scroll, so it must not retire follow the way PageUp does.
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    const control = document.createElement("button");
+    viewport.appendChild(control);
+    fireEvent.keyDown(control, { key: " " });
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
   it("treats keyboard scrolling as the reader leaving the end", async () => {
     listState.isAtEnd = true;
     listState.isNearEnd = true;
