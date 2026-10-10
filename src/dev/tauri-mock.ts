@@ -1,5 +1,6 @@
 import type { AgentChatSessionRecord, LocalChatSession } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import { randomUUID } from "@/lib/uuid";
 /**
  * Dev-only Tauri runtime shim.
  *
@@ -3459,7 +3460,7 @@ const handlers: Record<string, Handler> = {
   set_local_workbench: (a) => { mockLocalWorkbench = a.enabled === true; },
   start_chatgpt_login: () => {
     if (mockChatGptStatus.phase === "pending") throw new Error("A sign-in is already in progress.");
-    mockChatGptStatus = { ...mockChatGptStatus, phase: "pending", attemptId: crypto.randomUUID(), error: null };
+    mockChatGptStatus = { ...mockChatGptStatus, phase: "pending", attemptId: randomUUID(), error: null };
     emitEvent("chatgpt-status-changed", null);
     return mockChatGptRead();
   },
