@@ -1,6 +1,10 @@
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type { UnlistenFn };
+
+/** Auth events carry no credentials; always read the native public snapshot. */
+export const onChatGptStatusChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen("chatgpt-status-changed", () => cb());
 import type {
   AgentChatProviderKind,
   AppStateSnapshot,

@@ -570,6 +570,7 @@ fn build_core_app<R: tauri::Runtime>(
             }
         })
         .setup(move |app| {
+            commands::chatgpt::install(app.handle());
             diagnostics::record_startup_milestone("startup.setup-enter");
             // Reap chat-image staging files leaked by a crash or an
             // abandoned draft (best-effort, off the startup path).
@@ -1162,7 +1163,7 @@ fn build_core_app<R: tauri::Runtime>(
                             agent_provider::codex::CodexProviderConfig::default();
                         codex_config.mcp_registry = Some(mcp_registry.clone());
                         let codex =
-                            agent_provider::codex::CodexAgentProvider::new(codex_config);
+                            agent_provider::codex::CodexAgentProvider::new_managed(codex_config);
                         registry
                             .set_codex(std::sync::Arc::new(codex) as _)
                             .await;
@@ -2325,6 +2326,13 @@ fn build_core_app<R: tauri::Runtime>(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_chatgpt_status,
+            commands::start_chatgpt_login,
+            commands::cancel_chatgpt_login,
+            commands::disconnect_chatgpt,
+            commands::acknowledge_chatgpt_welcome,
+            commands::get_local_workbench,
+            commands::set_local_workbench,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,

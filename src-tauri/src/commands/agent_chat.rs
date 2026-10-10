@@ -3998,7 +3998,7 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 .to_command_string()
             })?;
             codex_cache
-                .get_or_harvest(&binary_path, None)
+                .get_or_harvest_owned(&binary_path, &crate::agent_provider::codex::chatgpt::owner())
                 .await
                 .map_err(|err| err.to_command_string())
         }
@@ -5544,6 +5544,12 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             .ok()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| format!("{provider:?}").to_lowercase());
+        if *provider==ProviderKind::Codex {
+            let managed=crate::agent_provider::codex::chatgpt::owner().managed_selected_now();
+            let managed_signal=plan_label.as_deref()==Some("Using ChatGPT plan") && *auth_mode==Some(crate::agent_provider::PlanAuthMode::Subscription);
+            if managed {if managed_signal{quota.replace_chatgpt_route(true,now_ms);}return;}
+            if managed_signal{return;} // discard a late event from a disconnected managed child
+        }
         quota.record(
             &provider_id,
             windows.clone(),

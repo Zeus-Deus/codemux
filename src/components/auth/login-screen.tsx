@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { ChatGptConnection } from "./chatgpt-connection";
+import { useChatGptStore } from "@/stores/chatgpt-store";
 import { Github, Loader2, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,6 +12,9 @@ type View = "signin" | "signup" | "forgot-password" | "verify-email";
 
 export function LoginScreen() {
   const isLoading = useAuthStore((s) => s.isLoading);
+  const localMode = useChatGptStore((s) => s.localMode);
+  const enterLocal = useChatGptStore((s) => s.enterLocal);
+  const connecting = useChatGptStore((s) => s.busy || s.loading || s.status?.phase === "pending");
   const isSigningIn = useAuthStore((s) => s.isSigningIn);
   const error = useAuthStore((s) => s.error);
   const startOAuthFlow = useAuthStore((s) => s.startOAuthFlow);
@@ -75,7 +80,7 @@ export function LoginScreen() {
       <div className="relative flex flex-col h-screen w-screen bg-background">
         <WindowChrome />
         <div className="h-8 w-full shrink-0" />
-        <div className="flex flex-1 items-center justify-center">
+        <div className="flex flex-1 items-center justify-center overflow-y-auto py-6">
           <div className="flex flex-col items-center w-full max-w-sm px-6">
             <div className="mb-6">
               <span className="text-xl font-semibold text-foreground">
@@ -117,7 +122,7 @@ export function LoginScreen() {
       <div className="relative flex flex-col h-screen w-screen bg-background">
         <WindowChrome />
         <div className="h-8 w-full shrink-0" />
-        <div className="flex flex-1 items-center justify-center">
+        <div className="flex flex-1 items-center justify-center overflow-y-auto py-6">
           <div className="flex flex-col items-center w-full max-w-sm px-6">
             <div className="mb-6">
               <span className="text-xl font-semibold text-foreground">
@@ -189,7 +194,7 @@ export function LoginScreen() {
           centered content doesn't visually collide with the controls. */}
       <div className="h-8 w-full shrink-0" />
 
-      <div className="flex flex-1 items-center justify-center">
+      <div className="flex flex-1 items-center justify-center overflow-y-auto py-6">
         <div className="flex flex-col items-center w-full max-w-sm px-6">
           {/* Logo / App name */}
           <div className="mb-6">
@@ -202,10 +207,17 @@ export function LoginScreen() {
           <div className="text-center mb-6">
             <p className="text-body text-muted-foreground">
               {view === "signin"
-                ? "Sign in to get started"
+                ? "Your next build starts here"
                 : "Create your account"}
             </p>
           </div>
+
+          <div className="w-full mb-6">
+            <ChatGptConnection onboarding />
+          </div>
+          <p className="text-label text-muted-foreground text-center leading-relaxed mb-4">
+            GitHub or email connects your CodeMux account for sync.
+          </p>
 
           {/* GitHub OAuth */}
           <Button
@@ -308,6 +320,11 @@ export function LoginScreen() {
               {view === "signin" ? "Sign in" : "Create account"}
             </Button>
           </form>
+
+          <Button variant="ghost" className="mt-3 w-full text-muted-foreground" disabled={connecting || isSigningIn}
+            onClick={() => void enterLocal()}>
+            {localMode ? "Back to workbench" : "Continue locally with another provider"}
+          </Button>
 
           {/* Toggle sign-in / sign-up */}
           <button

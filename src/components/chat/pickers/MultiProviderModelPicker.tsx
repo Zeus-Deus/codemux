@@ -1,4 +1,5 @@
 import { useHermes, hermesProfileKey } from "@/stores/hermes-store";
+import { ChatGptConnection } from "@/components/auth/chatgpt-connection";
 import { HermesProfileModels } from "./HermesProfileModels";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Star } from "lucide-react";
@@ -1020,10 +1021,8 @@ function ModelListEmptyState({
       return (
         <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">Codex is not signed in</p>
-          <p className="mt-1">
-            Run <code className="rounded-sm bg-muted px-1">codex login</code> in a
-            terminal and try again.
-          </p>
+          <div className="mt-3"><ChatGptConnection onboarding /></div>
+          <p className="mt-3">Or use your existing CLI account with <code className="rounded-sm bg-muted px-1">codex login</code>.</p>
         </div>
       );
     }

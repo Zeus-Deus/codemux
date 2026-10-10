@@ -1,4 +1,6 @@
 import { MobileInstall } from "@/components/mobile/mobile-install";
+import { ChatGptConnection } from "@/components/auth/chatgpt-connection";
+import { useChatGptStore } from "@/stores/chatgpt-store";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
@@ -1479,7 +1481,11 @@ export function SettingsView() {
                 </>
               ) : (
                 <div className="py-4 text-body text-muted-foreground">
-                  Not signed in. Close settings and sign in to manage your account.
+                  <p className="mb-3">You’re using CodeMux locally. Connect a CodeMux account to sync across devices; your ChatGPT connection stays separate.</p>
+                  <Button variant="outline" onClick={() => {
+                    useChatGptStore.setState({ cloudLogin: true });
+                    setShowSettings(false);
+                  }}>Sign in for sync</Button>
                 </div>
               )}
             </div>
@@ -1999,6 +2005,8 @@ export function SettingsView() {
               title="Agent"
               description="Configure how Codemux integrates with AI coding agents."
             />
+            <div className="mb-7"><ChatGptConnection /></div>
+            <Separator />
             <div className="space-y-1">
               <SettingRow
                 label="Utility agent"

@@ -1,5 +1,6 @@
 import type { AgentChatSessionRecord, LocalChatSession } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import { randomUUID } from "@/lib/uuid";
 /**
  * Dev-only Tauri runtime shim.
  *
@@ -3441,7 +3442,43 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+// Explicit synthetic onboarding fixture; never reports a real OAuth completion.
+const chatGptFixture = new URLSearchParams(window.location.search).get("fixture");
+const chatGptOnboardingFixture = chatGptFixture === "chatgpt-onboarding" || chatGptFixture === "chatgpt-connected";
+let mockLocalWorkbench = false;
+let mockChatGptStatus: import("@/tauri/chatgpt").ChatGptStatus = {
+  phase: chatGptFixture === "chatgpt-connected" ? "connected" : "disconnected",
+  attemptId: null,
+  email: chatGptFixture === "chatgpt-connected" ? "builder@example.com" : null,
+  error: null, profiles: [], activeProfileId: chatGptFixture === "chatgpt-connected" ? "demo-connection" : null,
+  welcomePending: chatGptFixture === "chatgpt-connected", installed: true,
+};
+const mockChatGptRead = () => structuredClone(mockChatGptStatus);
 const handlers: Record<string, Handler> = {
+  get_chatgpt_status: mockChatGptRead,
+  get_local_workbench: () => mockLocalWorkbench,
+  set_local_workbench: (a) => { mockLocalWorkbench = a.enabled === true; },
+  start_chatgpt_login: () => {
+    if (mockChatGptStatus.phase === "pending") throw new Error("A sign-in is already in progress.");
+    mockChatGptStatus = { ...mockChatGptStatus, phase: "pending", attemptId: randomUUID(), error: null };
+    emitEvent("chatgpt-status-changed", null);
+    return mockChatGptRead();
+  },
+  cancel_chatgpt_login: (a) => {
+    if (a.attemptId !== mockChatGptStatus.attemptId) throw new Error("This sign-in is no longer active.");
+    mockChatGptStatus = { ...mockChatGptStatus, phase: "disconnected", attemptId: null };
+    emitEvent("chatgpt-status-changed", null);
+    return mockChatGptRead();
+  },
+  disconnect_chatgpt: () => {
+    mockChatGptStatus = { ...mockChatGptStatus, phase: "disconnected", email: null, activeProfileId: null, welcomePending: false };
+    emitEvent("chatgpt-status-changed", null);
+    return mockChatGptRead();
+  },
+  acknowledge_chatgpt_welcome: () => {
+    mockChatGptStatus.welcomePending = false;
+    return mockChatGptRead();
+  },
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
     if (update) {
@@ -3455,11 +3492,11 @@ const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
   bootstrap_session: () => ({
-    authenticated: true,
-    user: MOCK_USER,
+    authenticated: !chatGptOnboardingFixture,
+    user: chatGptOnboardingFixture ? null : MOCK_USER,
     settings: structuredClone(SYNCED_SETTINGS),
-    authMethod: "github",
-    status: "local",
+    authMethod: chatGptOnboardingFixture ? null : "github",
+    status: chatGptOnboardingFixture ? "signed-out" : "local",
   }),
   refresh_session: () => ({
     authenticated: true,

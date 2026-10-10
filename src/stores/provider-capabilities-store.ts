@@ -95,6 +95,7 @@ const providerIntentRefreshedAt = new Map<AgentChatProviderKind, number>();
 // just-cleared catalog in memory (and, via the persist middleware, back into
 // localStorage after `clearStorage()`).
 let providerResetEpoch = 0;
+let codexResetEpoch = 0;
 // Providers whose catalogue lives in an installed CLI and can change without
 // a Codemux release. A later intent past this window re-harvests; every other
 // provider stays a once-per-renderer intent because its catalogue ships with
@@ -136,10 +137,13 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
         }));
 
         const startedEpoch = providerResetEpoch;
+        const startedCodexEpoch = codexResetEpoch;
+        const isCurrent = () => providerResetEpoch === startedEpoch &&
+          (provider !== "codex" || codexResetEpoch === startedCodexEpoch);
         const request = (async () => {
           try {
             const caps = await listChatProviderCapabilities(provider);
-            if (providerResetEpoch !== startedEpoch) return;
+            if (!isCurrent()) return;
             set((state) => storeOk(state, provider, caps));
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -147,14 +151,14 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
               `[provider-capabilities] refresh(${provider}) failed:`,
               err,
             );
-            if (providerResetEpoch !== startedEpoch) return;
+            if (!isCurrent()) return;
             set((state) => storeErr(state, provider, message));
           }
         })().finally(() => {
           // A flight that straddled a reset must not touch state: writing
           // `loadedProviders` here would mark a wiped slot as settled (or
           // clobber the lifecycle of a fresher post-reset flight).
-          if (providerResetEpoch === startedEpoch) {
+          if (isCurrent()) {
             set((state) => ({
               loadedProviders: {
                 ...state.loadedProviders,
@@ -273,6 +277,18 @@ export function resetProviderCapabilities(): void {
     loadedProviders: {},
   });
   useProviderCapabilities.persist.clearStorage();
+}
+
+/** Account changes invalidate only Codex, including harvests already in flight. */
+export function invalidateCodexCapabilities(): void {
+  codexResetEpoch += 1;
+  providerRefreshInFlight.delete("codex");
+  providerIntentRefreshedAt.delete("codex");
+  useProviderCapabilities.setState((state) => ({
+    codex: null,
+    codexError: null,
+    loadedProviders: { ...state.loadedProviders, codex: false },
+  }));
 }
 
 /** Convenience selector: capabilities for the given provider, or null.

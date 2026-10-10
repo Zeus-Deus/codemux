@@ -41,7 +41,6 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
     AccountReadResponse, Capabilities, ClientInfo, InitializeParams, ModelEntry,
-    ModelListParams, ModelListResponse,
 };
 
 /// Hard cap on the harvest. Tuned to fit comfortably under the picker's
@@ -82,12 +81,16 @@ impl HarvestError {
 #[derive(Default)]
 pub struct CodexCapabilityCache {
     inner: Mutex<Option<ProviderChatCapabilities>>,
+    generation: std::sync::atomic::AtomicU64,
+    key: Mutex<Option<String>>,
 }
 
 impl CodexCapabilityCache {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            key: Mutex::new(None),
         }
     }
 
@@ -98,23 +101,38 @@ impl CodexCapabilityCache {
         binary_path: &std::path::Path,
         codex_home: Option<&std::path::Path>,
     ) -> Result<ProviderChatCapabilities, HarvestError> {
-        {
-            let guard = self.inner.lock().await;
-            if let Some(cached) = guard.clone() {
-                return Ok(cached);
-            }
-        }
-        let fresh = harvest_codex_capabilities(binary_path, codex_home).await?;
-        {
-            let mut guard = self.inner.lock().await;
-            *guard = Some(fresh.clone());
-        }
-        Ok(fresh)
+        let generation={
+            let guard=self.inner.lock().await;
+            if self.key.lock().await.is_none(){if let Some(cached)=guard.clone(){return Ok(cached)}}
+            self.generation.load(std::sync::atomic::Ordering::Acquire)
+        };
+        let fresh=harvest_codex_capabilities(binary_path,codex_home).await?;
+        let mut guard=self.inner.lock().await;
+        if self.generation.load(std::sync::atomic::Ordering::Acquire)!=generation{return Err(HarvestError::HarvestFailed{message:"Codex catalog changed while it was loading. Try again.".into()})}
+        *self.key.lock().await=None;*guard=Some(fresh.clone());Ok(fresh)
+    }
+
+    pub(crate) async fn get_or_harvest_owned(&self,binary:&std::path::Path,owner:&Arc<super::chatgpt::Owner>)->Result<ProviderChatCapabilities,HarvestError>{
+        let _lease=owner.acquire_runtime().map(Arc::new).map_err(|message|HarvestError::HarvestFailed{message})?;
+        let grant=owner.usable().await.map_err(|hint|HarvestError::NotAuthenticated{hint})?;
+        let key=match grant.as_ref(){Some(grant)=>grant.cache_key.clone(),None=>owner.cache_key().await.map_err(|hint|HarvestError::NotAuthenticated{hint})?};
+        let generation={
+            let mut guard=self.inner.lock().await;let mut stored_key=self.key.lock().await;
+            if stored_key.as_ref()==Some(&key){if let Some(cached)=guard.clone(){return Ok(cached)}}
+            *guard=None;*stored_key=Some(key.clone());self.generation.fetch_add(1,std::sync::atomic::Ordering::AcqRel)+1
+        };
+        let fresh=harvest_codex_capabilities_with_grant(binary,None,grant.as_ref(),Some(_lease.clone())).await?;
+        if owner.cache_key().await.map_err(|hint|HarvestError::NotAuthenticated{hint})?!=key{return Err(HarvestError::HarvestFailed{message:"ChatGPT credentials changed while the catalog was loading. Refresh the catalog.".into()})}
+        let mut guard=self.inner.lock().await;
+        if self.generation.load(std::sync::atomic::Ordering::Acquire)!=generation{return Err(HarvestError::HarvestFailed{message:"ChatGPT catalog changed while it was loading. Refresh the catalog.".into()})}
+        *guard=Some(fresh.clone());Ok(fresh)
     }
 
     /// Drop any cached value. The next call will re-harvest.
     pub async fn invalidate(&self) {
         let mut guard = self.inner.lock().await;
+        self.generation.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
+        *self.key.lock().await=None;
         *guard = None;
     }
 }
@@ -130,34 +148,19 @@ pub async fn harvest_codex_capabilities(
     binary_path: &std::path::Path,
     codex_home: Option<&std::path::Path>,
 ) -> Result<ProviderChatCapabilities, HarvestError> {
-    let mut env = HashMap::new();
-    if let Some(home) = codex_home {
-        env.insert("CODEX_HOME".into(), home.to_string_lossy().to_string());
-    }
-
-    let child = tokio::time::timeout(
-        HARVEST_TIMEOUT,
-        JsonRpcChild::spawn(SpawnConfig {
-            program: PathBuf::from(binary_path),
-            args: vec!["app-server".into()],
-            env,
-            cwd: None,
-            default_timeout: HARVEST_TIMEOUT,
-        }),
-    )
-    .await
-    .map_err(|_| HarvestError::HarvestFailed {
-        message: "spawn timed out".into(),
-    })?
-    .map_err(|err| HarvestError::HarvestFailed {
-        message: format!("spawn failed: {err}"),
-    })?;
-    let child = Arc::new(child);
-
+    harvest_codex_capabilities_with_grant(binary_path,codex_home,None,None).await
+}
+async fn harvest_codex_capabilities_with_grant(binary_path:&std::path::Path,codex_home:Option<&std::path::Path>,grant:Option<&super::chatgpt::ManagedGrant>,lease:Option<Arc<std::fs::File>>)->Result<ProviderChatCapabilities,HarvestError>{
+    let mut env=HashMap::new();if let Some(home)=codex_home{env.insert("CODEX_HOME".into(),home.to_string_lossy().into_owned());}
+    let (args,env)=match grant{Some(grant)=>grant.launch(env),None=>(vec!["app-server".into()],env)};
+    let config=SpawnConfig{program:PathBuf::from(binary_path),args,env,cwd:None,default_timeout:HARVEST_TIMEOUT};
+    let owned=lease.is_some();let child=match lease{Some(lease)=>JsonRpcChild::spawn_owned(config,grant.is_some(),lease).await,None=>if grant.is_some(){JsonRpcChild::spawn_isolated(config).await}else{JsonRpcChild::spawn(config).await}}.map_err(|e|HarvestError::HarvestFailed{message:format!("Codex catalog child failed: {e}")})?;
+    let child=Arc::new(child);
+    let harvested=async {
     // Initialize handshake.
     let init_params = serde_json::to_value(InitializeParams {
         client_info: ClientInfo {
-            name: "codemux-capability-harvest".into(),
+            name: "codemux".into(),
             title: "Codemux".into(),
             version: env!("CARGO_PKG_VERSION").into(),
         },
@@ -186,6 +189,7 @@ pub async fn harvest_codex_capabilities(
     // both `account: Some(...)` and `requires_openai_auth: true`. Only the
     // combination of a missing account and a provider that requires OpenAI
     // auth is an unauthenticated state.
+    if grant.is_none(){
     let account_resp = child
         .request("account/read", json!({}))
         .await
@@ -204,25 +208,12 @@ pub async fn harvest_codex_capabilities(
         });
     }
 
-    // Model list. Single page is fine for the picker — Codex returns
-    // ~5-10 models today and the cursor is rarely populated.
-    let model_resp = child
-        .request(
-            "model/list",
-            serde_json::to_value(ModelListParams::default()).unwrap(),
-        )
-        .await
-        .map_err(|err| HarvestError::HarvestFailed {
-            message: format!("model/list failed: {err}"),
-        })?;
-    let models: ModelListResponse =
-        serde_json::from_value(model_resp).map_err(|err| HarvestError::HarvestFailed {
-            message: format!("model/list decode failed: {err}"),
-        })?;
-
-    let _ = child.shutdown().await;
-
-    Ok(build_capabilities(models.data))
+    }
+    let models=super::session::read_model_catalog(&child).await.map_err(|message|HarvestError::HarvestFailed{message})?;
+    Ok(build_capabilities(models))
+    }.await;
+    if owned{let _=child.shutdown_owned().await;}else{let _=child.shutdown().await;}
+    harvested
 }
 
 /// Pure transformer — turn the SDK's `model/list` payload into the
@@ -366,6 +357,10 @@ pub fn codex_permission_modes() -> Vec<PermissionModeOption> {
         },
     ]
 }
+
+#[cfg(all(test,unix))]
+#[path="catalog_tests.rs"]
+mod catalog_tests;
 
 #[cfg(test)]
 mod tests {
