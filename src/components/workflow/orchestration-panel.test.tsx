@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import type {
   SubagentView,
@@ -20,10 +20,31 @@ globalThis.ResizeObserver = class {
 
 const mocks = vi.hoisted(() => ({
   interruptTurn: vi.fn().mockResolvedValue(undefined),
+  respondToRequest: vi.fn().mockResolvedValue(undefined),
+  markRequestResponding: vi.fn(),
+  markRequestPending: vi.fn(),
+  /** Thread messages the panel's store selector reads. */
+  threads: {} as Record<string, { messages: unknown[] }>,
 }));
 vi.mock("@/tauri/commands", () => ({
   agentChatInterruptTurn: (...a: unknown[]) => mocks.interruptTurn(...a),
+  agentChatRespondToRequest: (...a: unknown[]) => mocks.respondToRequest(...a),
 }));
+vi.mock("@/stores/agent-chat-store", () => {
+  const state = () => ({
+    threads: mocks.threads,
+    markRequestResponding: mocks.markRequestResponding,
+    markRequestPending: mocks.markRequestPending,
+  });
+  const useAgentChatStore = (selector: (s: ReturnType<typeof state>) => unknown) =>
+    selector(state());
+  useAgentChatStore.getState = state;
+  return { useAgentChatStore };
+});
+
+afterEach(() => {
+  mocks.threads = {};
+});
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { OrchestrationPanel } from "./orchestration-panel";
@@ -260,10 +281,65 @@ describe("OrchestrationPanel — agent detail drill-in", () => {
   });
 });
 
+describe("OrchestrationPanel — stopped run", () => {
+  it("never shows a check on a phase that did not finish its work", () => {
+    renderPanel({
+      workspace: makeWorkspace(),
+      run: run({
+        status: "stopped",
+        plannedPhases: [
+          { title: "Discover", detail: null },
+          { title: "Audit", detail: null },
+          { title: "Verify", detail: "~1 agent" },
+        ],
+        phases: [
+          phase({ title: "Discover", agents: [agent({ id: "d", status: "completed" })] }),
+          phase({ title: "Audit", agents: [agent({ id: "x", status: "interrupted" })] }),
+          phase({ title: "Verify", detail: "~1 agent", agents: [] }),
+        ],
+      }),
+      threadId: "thread-1",
+    });
+    const statuses = screen
+      .getAllByTestId("workflow-phase-status")
+      .map((el) => el.getAttribute("data-status"));
+    expect(statuses).toEqual(["done", "stopped", "skipped"]);
+    const verify = screen.getAllByTestId("workflow-phase-row")[2];
+    expect(within(verify).getByText("not run")).toBeInTheDocument();
+    expect(within(verify).queryByText("queued")).toBeNull();
+    expect(
+      verify.querySelector('[data-outcome="completed"]'),
+    ).toBeNull();
+  });
+
+  it("gives an interrupted agent's drill-in header a dash, not a check", () => {
+    renderPanel({
+      workspace: makeWorkspace(),
+      run: run({
+        status: "stopped",
+        phases: [
+          phase({
+            title: "Audit",
+            agents: [agent({ id: "x", status: "interrupted", name: "routes/x.ts" })],
+          }),
+        ],
+      }),
+      threadId: "thread-1",
+    });
+    const row = screen.getAllByTestId("workflow-phase-row")[0];
+    // A finished run opens no phase; expand this one first.
+    fireEvent.click(within(row).getAllByRole("button")[0]);
+    fireEvent.click(within(row).getByText("routes/x.ts"));
+    const detail = screen.getByTestId("workflow-agent-detail");
+    expect(detail.querySelector('[data-outcome="halted"]')).not.toBeNull();
+    expect(detail.querySelector('[data-outcome="completed"]')).toBeNull();
+  });
+});
+
 describe("OrchestrationPanel — controls", () => {
-  it("disables Pause and calls the interrupt command from Stop while running", () => {
+  it("offers no dead Pause control and calls the interrupt command from Stop while running", () => {
     renderPanel({ workspace: makeWorkspace(), run: makeRun(), threadId: "thread-1" });
-    expect(screen.getByTestId("workflow-pause")).toBeDisabled();
+    expect(screen.queryByTestId("workflow-pause")).toBeNull();
 
     const stop = screen.getByTestId("workflow-stop");
     expect(stop).not.toBeDisabled();
@@ -271,13 +347,71 @@ describe("OrchestrationPanel — controls", () => {
     expect(mocks.interruptTurn).toHaveBeenCalledWith("claude", "thread-1", null);
   });
 
-  it("disables Stop once the run is terminal", () => {
+  it("answers a pending approval from the panel", async () => {
+    const pending = run({ status: "pending_approval", approvalRequestId: "req-wf" });
+    renderPanel({ workspace: makeWorkspace(), run: pending, threadId: "thread-1" });
+    expect(screen.queryByTestId("workflow-stop")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("workflow-approve"));
+    expect(mocks.markRequestResponding).toHaveBeenCalledWith("thread-1", "req-wf", {
+      decision: "allow",
+    });
+    expect(mocks.respondToRequest).toHaveBeenCalledWith("claude", "thread-1", "req-wf", {
+      decision: "allow",
+    });
+    expect(screen.getByTestId("workflow-approve")).toHaveTextContent("Starting…");
+    expect(screen.getByTestId("workflow-deny")).toBeDisabled();
+  });
+
+  it("restores the approval controls when the decision fails to send", async () => {
+    mocks.respondToRequest.mockRejectedValueOnce(new Error("offline"));
+    const pending = run({ status: "pending_approval", approvalRequestId: "req-wf" });
+    renderPanel({ workspace: makeWorkspace(), run: pending, threadId: "thread-1" });
+    fireEvent.click(screen.getByTestId("workflow-deny"));
+    expect(mocks.respondToRequest).toHaveBeenLastCalledWith(
+      "claude",
+      "thread-1",
+      "req-wf",
+      { decision: "deny", message: expect.any(String) },
+    );
+    await waitFor(() => expect(screen.getByTestId("workflow-deny")).not.toBeDisabled());
+    expect(mocks.markRequestPending).toHaveBeenCalledWith("thread-1", "req-wf");
+  });
+
+  it("keeps Run once and Deny disabled while the thread's card is answering", () => {
+    mocks.threads = {
+      "thread-1": {
+        messages: [
+          {
+            kind: "permission_request",
+            id: "req-wf",
+            seq: 1,
+            request_id: "req-wf",
+            turn_id: "turn-1",
+            request_kind: "workflow",
+            payload: {},
+            tool_use_id: null,
+            resolution: { state: "responding", decision: { decision: "allow" } },
+          },
+        ],
+      },
+    };
+    const pending = run({ status: "pending_approval", approvalRequestId: "req-wf" });
+    renderPanel({ workspace: makeWorkspace(), run: pending, threadId: "thread-1" });
+    expect(screen.getByTestId("workflow-approve")).toBeDisabled();
+    expect(screen.getByTestId("workflow-deny")).toBeDisabled();
+    mocks.respondToRequest.mockClear();
+    fireEvent.click(screen.getByTestId("workflow-approve"));
+    expect(mocks.respondToRequest).not.toHaveBeenCalled();
+  });
+
+  it("shows no Stop control once the run is terminal", () => {
     renderPanel({
       workspace: makeWorkspace(),
       run: run({ status: "completed", phases: [] }),
       threadId: "thread-1",
     });
-    expect(screen.getByTestId("workflow-stop")).toBeDisabled();
+    expect(screen.queryByTestId("workflow-stop")).toBeNull();
   });
 
   it("disables Restart agent in the drill-in", () => {

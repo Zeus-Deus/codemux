@@ -455,13 +455,15 @@ describe("SidebarInbox — cards", () => {
     await renderInbox();
 
     const chip = screen.getByRole("button", {
-      name: "9 pull requests — 5 open, 4 merged. Opens #372",
+      name: "Stack of 9 pull requests — 5 open, 4 merged. Opens #372",
     });
     // The primary is still a specific PR the click opens, so the count reads
     // as "+8 more" rather than replacing the reference with a total.
     expect(chip).toHaveTextContent("#372");
     expect(chip).toHaveTextContent("+8");
     expect(chip).not.toHaveTextContent("#380");
+    // The set is one stack, so the chip says so with its glyph.
+    expect(chip.querySelector("[data-pr-stack-icon]")).not.toBeNull();
   });
 
   it("renders the PR chip icon alone when the number is unknown", async () => {
@@ -1294,6 +1296,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ) as HTMLElement;
     expect(row).not.toBeNull();
     expect(row).toHaveAttribute("data-active", "true");
+    expect(row).toHaveAttribute("aria-current", "page");
     expect(activateWorkspace).not.toHaveBeenCalled();
   });
 
@@ -1698,9 +1701,9 @@ describe("SidebarInbox — settle / un-settle", () => {
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
     // The grid tracks are the row's only column widths — 56px fits a 4-digit
-    // ref like `#1234`, 48px fits the age label and the text-only Un-settle
-    // button. The slots themselves must not restate either number, or the two
-    // copies drift.
+    // ref like `#1234`, 48px fits the age label and the Un-settle glyph. The
+    // slots themselves must not restate either number, or the two copies
+    // drift.
     expect(row.className).toContain(
       "grid-cols-[auto_minmax(0,1fr)_56px_48px]",
     );
@@ -2489,7 +2492,7 @@ describe("SidebarInbox — snooze shelf", () => {
     expect(container.querySelectorAll("[data-snoozed-row]").length).toBe(1);
     expect(
       container.querySelector('[data-snoozed-row="ws-2"]'),
-    ).not.toBeNull();
+    ).toHaveAttribute("aria-current", "page");
   });
 });
 
