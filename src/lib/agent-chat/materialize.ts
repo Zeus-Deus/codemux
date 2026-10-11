@@ -96,7 +96,7 @@ export interface MaterializeActions {
   /** Seed the slice's context-window selection. `null` clears. */
   setContextWindow: (threadId: string, contextWindow: string | null) => void;
   /** Seed the slice's premium speed-tier choice. */
-  setFastMode: (threadId: string, fastMode: boolean) => void;
+  setServiceTier: (threadId: string, serviceTier: string) => void;
   /** Seed the slice's composer mode pill. Stage 3 onward. */
   setMode: (threadId: string, mode: ChatMode) => void;
   /** Rebind path-derived skill ids when deferred worktree creation changes
@@ -400,7 +400,7 @@ export async function materializeAndSend(
       permission_mode: effectivePermissionMode(draft),
       effort: draft.effort,
       context_window: draft.contextWindow,
-      fast_mode: draft.fastMode ?? false,
+      service_tier: draft.serviceTier ?? "default",
       additional_directories: [],
       env: null,
     });
@@ -656,7 +656,7 @@ export async function materializeWithPreset(
         permission_mode: effectivePermissionMode(draft),
         effort: draft.effort,
         context_window: draft.contextWindow,
-        fast_mode: draft.fastMode ?? false,
+        service_tier: draft.serviceTier ?? "default",
         additional_directories: [],
         env: null,
       });
@@ -772,7 +772,7 @@ function seedSliceFromDraft(
   if (draft.contextWindow) {
     actions.setContextWindow(draft.threadId, draft.contextWindow);
   }
-  actions.setFastMode(draft.threadId, draft.fastMode ?? false);
+  actions.setServiceTier(draft.threadId, draft.serviceTier ?? "default");
   actions.setMode(
     draft.threadId,
     normalizeChatModeForProvider(draft.provider, draft.mode),

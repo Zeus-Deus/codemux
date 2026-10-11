@@ -176,7 +176,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -365,7 +365,7 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onModeActivate: (mode: ActivePillMode) => void;
   onModeRemove: () => void;
 }
@@ -468,7 +468,7 @@ export function Composer({
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -525,7 +525,7 @@ export function Composer({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onModeActivate,
   onModeRemove,
 }: Props) {
@@ -2793,7 +2793,7 @@ export function Composer({
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     permissionMode,
     busy,
     delivery.delivery,
@@ -3200,10 +3200,10 @@ export function Composer({
                       contextWindowValue={contextWindow}
                       labelMap={effortLabelMap}
                       ultrathinkInBodyText={ultrathinkInBodyText}
-                      fastMode={fastMode}
+                      serviceTier={serviceTier}
                       onEffortChange={onEffortChange}
                       onContextWindowChange={onContextWindowChange}
-                      onFastModeChange={onFastModeChange}
+                      onServiceTierChange={onServiceTierChange}
                       disabled={!configurationEnabled}
                     />
                     <PermissionModePicker
@@ -3675,7 +3675,7 @@ export function Composer({
             permissionMode={permissionMode}
             effort={effort}
             contextWindow={contextWindow}
-            fastMode={fastMode}
+            serviceTier={serviceTier}
             activeModel={activeModel}
             effortLabelMap={effortLabelMap}
             permissionModes={permissionModes}
@@ -3697,7 +3697,7 @@ export function Composer({
             onPermissionModeChange={onPermissionModeChange}
             onEffortChange={onEffortChange}
             onContextWindowChange={onContextWindowChange}
-            onFastModeChange={onFastModeChange}
+            onServiceTierChange={onServiceTierChange}
             onSubmit={() => submit()}
             onBackgroundSubmit={onBackgroundSubmit ? () => submit(true) : undefined}
             onStop={onStop}

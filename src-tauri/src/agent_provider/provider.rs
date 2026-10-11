@@ -175,6 +175,25 @@ pub trait AgentProvider: Send + Sync {
         })
     }
 
+    /// Service tiers are provider-native identifiers. Boolean adapters accept
+    /// only Standard/Fast; they must never silently treat Ultrafast as Fast.
+    async fn set_service_tier(
+        &self,
+        thread_id: ThreadId,
+        tier: String,
+    ) -> Result<(), ProviderError> {
+        let fast = match tier.as_str() {
+            "default" => false,
+            "fast" => true,
+            _ => {
+                return Err(ProviderError::ValidationError {
+                    message: "provider does not support this service tier".into(),
+                })
+            }
+        };
+        self.set_fast_mode(thread_id, fast).await
+    }
+
     /// Swap the session's permission mode at runtime.
     async fn set_permission_mode(
         &self,

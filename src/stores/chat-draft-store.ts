@@ -29,7 +29,7 @@ export interface ChatDraft {
   model: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   permissionMode: string | null;
   /** Composer mode pill carried through draft → slice on materialise.
    *  `default` renders no pill. Drafts can pre-select a mode before
@@ -146,7 +146,7 @@ export interface ChatDraftStore {
         | "model"
         | "effort"
         | "contextWindow"
-        | "fastMode"
+        | "serviceTier"
         | "permissionMode"
         | "mode"
         | "checkoutMode"
@@ -200,7 +200,8 @@ const STORAGE_KEY = "codemux:chat-drafts:v1";
 // the pre-flip `contextWindow: "200k"` seed. On v1→v2 we drop the
 // persisted draft set so the next `getOrCreate*Draft` call re-seeds
 // from the current `capabilityDefaults` (1M on multi-option models).
-const STORAGE_VERSION = 2;
+// v3 preserves draft contents while migrating the legacy Fast flag to a tier.
+const STORAGE_VERSION = 3;
 
 function newDraftId(): DraftId {
   return randomUUID() as DraftId;
@@ -278,7 +279,7 @@ type NewChatConfig = Pick<
   | "model"
   | "effort"
   | "contextWindow"
-  | "fastMode"
+  | "serviceTier"
   | "permissionMode"
   | "checkoutMode"
 >;
@@ -299,7 +300,7 @@ function newChatConfig(): NewChatConfig {
     model: defaults.model,
     effort: choice.effort ?? defaults.effort,
     contextWindow: defaults.contextWindow,
-    fastMode: false,
+    serviceTier: "default",
     permissionMode: defaults.permissionMode,
     checkoutMode: getNewChatCheckout(),
   };
@@ -746,7 +747,16 @@ export const useChatDraftStore = create<ChatDraftStore>()(
             activeDraftId: null,
           } as ChatDraftStore;
         }
-        return persistedState as ChatDraftStore;
+        const state = persistedState as ChatDraftStore & {
+          draftsById: Record<DraftId, ChatDraft & { fastMode?: boolean }>;
+        };
+        return {
+          ...state,
+          draftsById: Object.fromEntries(Object.entries(state.draftsById ?? {}).map(([id, draft]) => {
+            const { fastMode, ...rest } = draft;
+            return [id, { ...rest, serviceTier: draft.serviceTier ?? (fastMode ? "fast" : "default") }];
+          })),
+        } as ChatDraftStore;
       },
       partialize: partializeChatDraftStoreState,
     },
