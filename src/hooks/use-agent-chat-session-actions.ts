@@ -122,7 +122,7 @@ export function useAgentChatSessionActions(
         }
         // Hermes history is identified by the durable local binding. A new local
         // id would lose that binding and cannot safely resume the native history.
-        const newLocalThreadId = targetProvider === "hermes"
+        const newLocalThreadId = (targetProvider === "hermes" || targetProvider === "acp")
           ? record.thread_id
           : `chat-${paneId}-${Date.now()}`;
         // Hydrate the new slice with the picked session's persisted
@@ -243,6 +243,12 @@ export function useAgentChatSessionActions(
       }
       const newLocalThreadId = `chat-${paneId}-${Date.now()}`;
       if (hermesProfile) useHermes.getState().select(newLocalThreadId, cwd, hermesProfile, false);
+      if (provider === "acp" && threadId) {
+        const { useCustomAcp } = await import("@/stores/custom-acp-store");
+        await useCustomAcp.getState().restore(threadId);
+        const agentId = useCustomAcp.getState().selections[threadId];
+        if (agentId) useCustomAcp.getState().select(newLocalThreadId, agentId);
+      }
       // Launch in the provider default mode (Full access) — the same mode
       // the fresh store slice advertises in the footer pill. Passing `null`
       // here would boot the provider in `default` (prompt-for-every-tool)

@@ -30,6 +30,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::agent_provider::{ProviderKind, ProviderRuntimeEvent, ThreadId};
+use crate::agent_provider::events::UsageResumeBlockedReason;
 use crate::commands::usage::PlanQuotaStore;
 use crate::database::DatabaseStore;
 use crate::observability::ObservabilityStore;
@@ -99,14 +100,25 @@ pub fn plan_auto_resume(
     enabled: bool,
     attempts_so_far: i64,
 ) -> Option<i64> {
-    if !enabled || attempts_so_far >= MAX_AUTO_ATTEMPTS {
+    if auto_resume_blocked_reason(now_ms, resets_at_ms, enabled, attempts_so_far).is_some() {
         return None;
     }
-    let reset = resets_at_ms?;
-    if reset <= now_ms || reset - now_ms > MAX_RESUME_WAIT_MS {
-        return None;
-    }
-    Some(reset + RESUME_GRACE_MS)
+    resets_at_ms.map(|reset| reset.saturating_add(RESUME_GRACE_MS))
+}
+
+fn auto_resume_blocked_reason(
+    now_ms: i64,
+    resets_at_ms: Option<i64>,
+    enabled: bool,
+    attempts_so_far: i64,
+) -> Option<UsageResumeBlockedReason> {
+    use UsageResumeBlockedReason::*;
+    if !enabled { return Some(Disabled); }
+    if attempts_so_far >= MAX_AUTO_ATTEMPTS { return Some(AttemptsExhausted); }
+    let Some(reset) = resets_at_ms else { return Some(UnknownReset); };
+    if reset <= now_ms { return Some(ResetPassed); }
+    if reset.saturating_sub(now_ms) > MAX_RESUME_WAIT_MS { return Some(ResetTooFar); }
+    None
 }
 
 /// Whether `text` is a `/goal` command (`^/goal(\s|$)`, case-insensitive,
@@ -178,6 +190,10 @@ fn auto_resume_enabled(db: &DatabaseStore) -> bool {
 #[derive(Default)]
 struct TurnNotices {
     by_thread: HashMap<String, Option<i64>>,
+    /// Notices admitted per thread, across turns. A failure report compares
+    /// it against the value read before its dispatch, so it never overwrites
+    /// a limit reported while the dispatch was in flight.
+    generation: HashMap<String, u64>,
 }
 
 impl TurnNotices {
@@ -188,9 +204,14 @@ impl TurnNotices {
             Some(prev) if resets_at_ms <= *prev => false,
             _ => {
                 self.by_thread.insert(thread_id.to_string(), resets_at_ms);
+                *self.generation.entry(thread_id.to_string()).or_default() += 1;
                 true
             }
         }
+    }
+
+    fn generation(&self, thread_id: &str) -> u64 {
+        self.generation.get(thread_id).copied().unwrap_or(0)
     }
 
     fn contains(&self, thread_id: &str) -> bool {
@@ -207,12 +228,19 @@ fn turn_notices() -> &'static Mutex<TurnNotices> {
     NOTICES.get_or_init(|| Mutex::new(TurnNotices::default()))
 }
 
+fn notice_generation(thread_id: &str) -> u64 {
+    turn_notices()
+        .lock()
+        .map(|n| n.generation(thread_id))
+        .unwrap_or(0)
+}
+
 // ── forward_event hooks ──────────────────────────────────────────────
 
 /// Build the `UsageLimitReached` to emit ahead of a `TurnCompleted` whose
 /// status is the `rate_limit` error, for providers that signal the limit
 /// only through the turn status. The reset comes from the provider's last
-/// quota reading (earliest future reset of an exhausted window), or stays
+/// quota reading (latest future reset of exhausted windows), or stays
 /// unknown. `None` when the thread already got a notice this turn or its
 /// provider cannot be resolved.
 pub(super) fn synthesize_for_rate_limited_turn<R: Runtime>(
@@ -239,6 +267,7 @@ pub(super) fn synthesize_for_rate_limited_turn<R: Runtime>(
         provider,
         resets_at_ms: fallback.as_ref().map(|(at, _)| *at),
         auto_resume_at_ms: None,
+        auto_resume_blocked_reason: None,
         window: fallback.and_then(|(_, label)| label),
     })
 }
@@ -265,11 +294,23 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
         provider,
         resets_at_ms,
         auto_resume_at_ms,
+        auto_resume_blocked_reason: blocked_reason,
+        window,
         ..
     } = event
     else {
         return true;
     };
+    let now = now_ms();
+    // Assistant errors and ACP failures may report the stop without timing.
+    // Use only the quota readings that the same provider actually supplied.
+    if resets_at_ms.is_none() {
+        if let Some((at, label)) = app.try_state::<PlanQuotaStore>()
+            .and_then(|quota| quota.exhausted_reset_for(&provider_id(*provider), now)) {
+            *resets_at_ms = Some(at);
+            if window.is_none() { *window = label; }
+        }
+    }
     let admitted = turn_notices()
         .lock()
         .map(|mut n| n.admit(&thread_id.0, *resets_at_ms))
@@ -281,7 +322,9 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
     let db: State<'_, DatabaseStore> = app.state();
     let existing = db.get_agent_chat_usage_resume(&thread_id.0);
     let attempts = existing.as_ref().map(|row| row.attempts).unwrap_or(0);
-    let plan = plan_auto_resume(now_ms(), *resets_at_ms, auto_resume_enabled(&db), attempts);
+    let enabled = auto_resume_enabled(&db);
+    let plan = plan_auto_resume(now, *resets_at_ms, enabled, attempts);
+    *blocked_reason = auto_resume_blocked_reason(now, *resets_at_ms, enabled, attempts);
     // Only claim an armed resume once the schedule is durably stored; a row
     // is written for a disarmed plan only when one already exists, so its
     // attempt count is kept.
@@ -289,6 +332,7 @@ pub(super) fn arm_usage_limit_event<R: Runtime>(
         match db.upsert_agent_chat_usage_resume(&thread_id.0, &provider_id(*provider), plan) {
             Ok(()) => plan,
             Err(error) => {
+                *blocked_reason = Some(UsageResumeBlockedReason::StorageFailed);
                 eprintln!(
                     "[codemux::usage_resume] failed to store resume for thread={}: {error}",
                     thread_id.0
@@ -380,20 +424,32 @@ async fn thread_busy<R: Runtime>(
     tracker.delegated_work_holding_turn(&thread_id.0)
 }
 
-fn emit_cancelled<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
+fn emit_cancelled<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId, reason: UsageResumeBlockedReason) {
     forward_event(
         app,
         ProviderRuntimeEvent::UsageResumeCancelled {
             thread_id: thread_id.clone(),
+            reason: Some(reason),
         },
     );
+}
+
+/// Report a failed resume dispatch, unless a newer limit was admitted since
+/// `generation` was read: that notice already carries the thread's current
+/// resume state. The check and the emit share the notice lock, so a limit
+/// arriving meanwhile is fanned out after this report, never before it.
+fn emit_dispatch_failed<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId, generation: u64) {
+    let notices = turn_notices().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if notices.generation(&thread_id.0) == generation {
+        emit_cancelled(app, thread_id, UsageResumeBlockedReason::DispatchFailed);
+    }
 }
 
 /// Stopping or closing a thread has no new user message to clear its UI.
 pub(super) fn cancel_for_stopped_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     let db: State<'_, DatabaseStore> = app.state();
     match db.delete_agent_chat_usage_resume(thread_id) {
-        Ok(true) => emit_cancelled(app, &ThreadId(thread_id.to_owned())),
+        Ok(true) => emit_cancelled(app, &ThreadId(thread_id.to_owned()), UsageResumeBlockedReason::Cancelled),
         Ok(false) => {}
         Err(error) => eprintln!(
             "[codemux::usage_resume] failed to cancel stopped thread={thread_id}: {error}"
@@ -416,7 +472,7 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
         let Some(provider) = parse_provider(&row.provider) else {
             let db: State<'_, DatabaseStore> = app.state();
             let _ = db.delete_agent_chat_usage_resume(&row.thread_id);
-            emit_cancelled(app, &thread_id);
+            emit_cancelled(app, &thread_id, UsageResumeBlockedReason::Cancelled);
             continue;
         };
         let enabled = {
@@ -427,7 +483,7 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
             // Turned off after this resume was armed: disarm, keep attempts.
             let db: State<'_, DatabaseStore> = app.state();
             if db.disarm_agent_chat_usage_resume(&row).unwrap_or(false) {
-                emit_cancelled(app, &thread_id);
+                emit_cancelled(app, &thread_id, UsageResumeBlockedReason::Disabled);
             }
             continue;
         }
@@ -436,7 +492,7 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
             // erasing a later limit reported while the busy check awaited.
             let db: State<'_, DatabaseStore> = app.state();
             if db.disarm_agent_chat_usage_resume(&row).unwrap_or(false) {
-                emit_cancelled(app, &thread_id);
+                emit_cancelled(app, &thread_id, UsageResumeBlockedReason::Cancelled);
             }
             continue;
         }
@@ -450,7 +506,7 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
         if !open_workspace {
             let db: State<'_, DatabaseStore> = app.state();
             forget_on_user_activity(&db, &row.thread_id);
-            emit_cancelled(app, &thread_id);
+            emit_cancelled(app, &thread_id, UsageResumeBlockedReason::Cancelled);
             continue;
         }
         // Mark fired BEFORE dispatching, so a crash mid-dispatch can never
@@ -472,12 +528,13 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
             row.thread_id,
             row.attempts + 1
         );
+        let generation = notice_generation(&row.thread_id);
         if let Err(error) = dispatch_resume(app, provider, &thread_id).await {
             eprintln!(
                 "[codemux::usage_resume] automatic resume failed for thread={}: {error}",
                 row.thread_id
             );
-            emit_cancelled(app, &thread_id);
+            emit_dispatch_failed(app, &thread_id, generation);
         }
     }
 }
@@ -495,6 +552,12 @@ pub async fn spawn_usage_resume_scheduler<R: Runtime>(app: AppHandle<R>) {
             fire_due_resumes(&app).await;
         }
     });
+}
+
+/// Exercise a scheduler tick with mock providers, without a wall-clock wait.
+#[cfg(feature = "test-fixtures")]
+pub async fn fire_usage_resumes_for_test<R: Runtime>(app: &AppHandle<R>) {
+    fire_due_resumes(app).await;
 }
 
 // ── Commands ─────────────────────────────────────────────────────────
@@ -523,8 +586,14 @@ pub async fn agent_chat_resume_after_usage_limit<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         db.delete_agent_chat_usage_resume(&thread_id.0)?;
     }
-    emit_cancelled(&app, &thread_id);
-    dispatch_resume(&app, provider, &thread_id).await
+    let generation = notice_generation(&thread_id.0);
+    emit_cancelled(&app, &thread_id, UsageResumeBlockedReason::Cancelled);
+    let result = dispatch_resume(&app, provider, &thread_id).await;
+    if result.is_err() {
+        // The schedule is already gone; say why nothing will happen next.
+        emit_dispatch_failed(&app, &thread_id, generation);
+    }
+    result
 }
 
 /// Disarm a pending automatic resume, keeping its attempt count. Persists
@@ -546,7 +615,7 @@ pub async fn agent_chat_cancel_usage_resume<R: Runtime>(
             db.disarm_agent_chat_usage_resume(&row)?;
         }
     }
-    emit_cancelled(&app, &thread_id);
+    emit_cancelled(&app, &thread_id, UsageResumeBlockedReason::Cancelled);
     Ok(())
 }
 
@@ -644,6 +713,19 @@ mod tests {
         n.end_turn("t");
         assert!(!n.contains("t"));
         assert!(n.admit("t", Some(50)), "a new turn starts fresh");
+    }
+
+    #[test]
+    fn turn_notices_count_admitted_notices_across_turns() {
+        let mut n = TurnNotices::default();
+        assert_eq!(n.generation("t"), 0);
+        assert!(n.admit("t", Some(100)));
+        assert!(!n.admit("t", Some(100)));
+        assert_eq!(n.generation("t"), 1, "a dropped duplicate is not a newer limit");
+        n.end_turn("t");
+        assert!(n.admit("t", None));
+        assert_eq!(n.generation("t"), 2, "ending a turn keeps the count");
+        assert_eq!(n.generation("other"), 0);
     }
 
     #[tokio::test]

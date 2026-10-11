@@ -10,9 +10,12 @@ import {
 } from "@/lib/agent-chat/subagents";
 import type {
   ChatViewItem,
+  PermissionRequestItem,
   SubagentView,
+  ToolCallItem,
   UsageLimitState,
   UserMessageItem,
+  WorkflowRunItem,
 } from "@/lib/agent-chat/types";
 import {
   countdownIntervalMs,
@@ -20,12 +23,15 @@ import {
   formatResetTime,
   nextUsageLimitBoundary,
   usageLimitPhase,
+  usageResumeExplanation,
   usageWindowLabel,
 } from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
+import type { ApprovalDecision } from "@/tauri/events";
 
 import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
+import { isHermesPermission } from "./HermesPermissionOptions";
 
 /** How long the "just finished" row stays before it leaves the strip. */
 export const FINISHED_FLASH_MS = 2500;
@@ -266,7 +272,12 @@ export function useUsageLimitOccupant({
   onCancel: () => Promise<void>;
 }): StripOccupant | null {
   const [clock, setClock] = useState(() => Date.now());
-  const [pending, setPending] = useState<"resume" | "cancel" | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    kind: "resume" | "cancel";
+    limitKey: string;
+    token: number;
+  } | null>(null);
+  const tokenRef = useRef(0);
 
   useEffect(() => {
     if (!usageLimit) return;
@@ -286,16 +297,20 @@ export function useUsageLimitOccupant({
     return () => window.clearTimeout(id);
   }, [usageLimit, clock]);
 
-  // A new limit, a disarm, or a thread switch settles any in-flight click.
-  useEffect(() => {
-    setPending(null);
-  }, [usageLimit, threadId]);
+  // A click belongs to the limit it was made on. A disarm keeps the limit's
+  // `at`, so a manual resume stays pending while the backend clears the old
+  // schedule before dispatching; a newer limit or a thread switch has a new
+  // key and supersedes it.
+  const limitKey = usageLimit ? `${threadId ?? ""}\u0000${usageLimit.at}` : null;
+  const pending =
+    pendingAction && pendingAction.limitKey === limitKey ? pendingAction.kind : null;
 
-  if (!usageLimit || streaming) return null;
+  if (!usageLimit || streaming || limitKey === null) return null;
 
   const run = (kind: "resume" | "cancel") => {
     if (pending) return;
-    setPending(kind);
+    const token = ++tokenRef.current;
+    setPendingAction({ kind, limitKey, token });
     const action = kind === "resume" ? onResume : onCancel;
     void Promise.resolve()
       .then(action)
@@ -308,19 +323,23 @@ export function useUsageLimitOccupant({
           { description: error instanceof Error ? error.message : String(error) },
         );
       })
-      .finally(() => setPending(null));
+      // An older click settling must not release a newer one.
+      .finally(() =>
+        setPendingAction((cur) => (cur?.token === token ? null : cur)),
+      );
   };
 
   const busy = pending !== null;
+  const resuming = pending === "resume";
   const tryNow: StripAction = {
-    label: "Try now",
+    label: resuming ? "Resuming…" : "Try now",
     title: "Resume now instead of waiting for the reset",
     testId: "composer-strip-usage-try-now",
     disabled: busy,
     onClick: () => run("resume"),
   };
   const resume: StripAction = {
-    label: "Resume",
+    label: resuming ? "Resuming…" : "Resume",
     title: "Continue the run the usage limit stopped",
     tone: "solid",
     testId: "composer-strip-usage-resume",
@@ -382,6 +401,9 @@ export function useUsageLimitOccupant({
       };
       break;
   }
+  // The disarm that precedes a manual dispatch is not news; explain only
+  // what the user is left with once the resume settles.
+  row.note = resuming ? null : usageResumeExplanation(usageLimit, clock);
   return { kind: "usage", summary: row, rows: [row] };
 }
 
@@ -418,6 +440,104 @@ export function queuedOccupant(
     };
   });
   return { kind: "queued", summary: rows[0], rows };
+}
+
+/**
+ * Approval occupant: the run is parked on a decision only the user can
+ * make. It leads the strip so a waiting run never passes for an idle one,
+ * even while the transcript is scrolled away from the card. A plain tool
+ * approval can be answered from the row; a plan, a workflow or a
+ * provider-specific choice needs its card, so the row jumps there.
+ * AskUserQuestion prompts are excluded: they already sit above the
+ * composer.
+ */
+export function approvalOccupant(
+  messages: ChatViewItem[],
+  handlers: {
+    onRespond: (requestId: string, decision: ApprovalDecision) => void;
+    onJump: (itemId: string) => void;
+  },
+): StripOccupant | null {
+  const pending = messages.filter(
+    (m): m is PermissionRequestItem =>
+      m.kind === "permission_request" &&
+      m.request_kind !== "user-input" &&
+      m.resolution.state === "pending",
+  );
+  if (pending.length === 0) return null;
+
+  const rows = pending.map<StripRow>((request) => {
+    const tool = messages.find(
+      (m): m is ToolCallItem =>
+        m.kind === "tool_call" && m.approval_request_id === request.request_id,
+    );
+    const workflow = messages.find(
+      (m): m is WorkflowRunItem =>
+        m.kind === "workflow_run" && m.approvalRequestId === request.request_id,
+    );
+    const targetId = tool?.id ?? workflow?.id ?? request.id;
+    const review: StripAction = {
+      label: "Review",
+      title: "Jump to the request in the thread",
+      onClick: () => handlers.onJump(targetId),
+    };
+    const answerable =
+      tool !== undefined &&
+      request.request_kind !== "plan" &&
+      !isHermesPermission(request.payload);
+    const detail = workflow
+      ? `Workflow · ${workflow.name ?? "run as a workflow"}`
+      : request.request_kind === "plan"
+        ? "Plan ready to review"
+        : tool
+          ? [tool.tool_name, toolInputSummary(tool.input)]
+              .filter(Boolean)
+              .join(" · ")
+          : request.request_kind;
+    return {
+      id: `approval:${request.request_id}`,
+      mark: { kind: "orb", activity: { awaitingUser: true } },
+      label: "Needs approval",
+      detail,
+      secondaryAction: answerable
+        ? {
+            label: "Deny",
+            title: "Deny this request",
+            tone: "quiet",
+            testId: "composer-strip-approval-deny",
+            onClick: () =>
+              handlers.onRespond(request.request_id, {
+                decision: "deny",
+                message: "User denied",
+              }),
+          }
+        : null,
+      action: answerable
+        ? {
+            label: "Allow",
+            title: "Allow this once",
+            tone: "solid",
+            testId: "composer-strip-approval-allow",
+            onClick: () =>
+              handlers.onRespond(request.request_id, { decision: "allow" }),
+          }
+        : review,
+    };
+  });
+  return { kind: "approval", summary: rows[0], rows };
+}
+
+/** The one input field that says what a tool call is about to touch. */
+function toolInputSummary(input: unknown): string {
+  if (typeof input !== "object" || input === null) return "";
+  const record = input as Record<string, unknown>;
+  for (const key of ["command", "file_path", "notebook_path", "url", "pattern", "path"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.replace(/\s+/g, " ").trim();
+    }
+  }
+  return "";
 }
 
 const SESSION_ERROR_PREFIX = /^Session error:\s*/;

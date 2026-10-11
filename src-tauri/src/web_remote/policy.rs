@@ -21,6 +21,14 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "hermes_catalog"
             | "hermes_binding"
             | "hermes_disconnect"
+            | "acp_agents"
+            | "acp_save_agent"
+            | "acp_delete_agent"
+            | "acp_probe"
+            | "acp_binding"
+            | "acp_catalog"
+            | "acp_thread_catalog"
+            | "acp_set_config"
             | "unarchive_workspace"
             | "import_worktree_workspace"
             | "link_workspace_issue"
@@ -39,6 +47,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "archive_workspace"
             | "activate_pane"
             | "file_exists"
+            | "file_signature"
             | "grep_count_pattern"
             | "git_log_entries"
             | "git_commits_ahead"
@@ -199,6 +208,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "has_codemuxinclude"
             | "hosts_list"
             | "hosts_status_list"
+            | "get_local_device_name"
+            | "create_workspace_on_host"
             | "list_branches"
             | "list_branches_detailed"
             | "list_chat_provider_capabilities"
@@ -255,6 +266,12 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "undock_browser_from_right_panel"
             | "update_workspace_cwd"
             | "usage_summary"
+            // Usage → Limits and model prices. Reading limits runs the same
+            // Claude/Codex CLIs paired clients already drive through agents;
+            // a model price only changes how this host displays cost.
+            | "usage_refresh_quota"
+            | "usage_price_overrides"
+            | "usage_set_price_override"
             | "validate_resume"
             | "workspaces_adoption_preview"
             | "workspaces_sync_list"
@@ -266,6 +283,14 @@ pub(super) fn allowed(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_acp_thread_catalog_matches_existing_remote_read_policy() {
+        for cmd in ["acp_binding", "acp_catalog", "acp_thread_catalog"] {
+            assert!(allowed(cmd), "{cmd}");
+        }
+        assert!(!allowed("acp_get_credentials"));
+        assert!(!allowed("acp_future_command"));
+    }
     #[test]
     fn hermes_remote_profile_workflow_is_explicitly_allowed() {
         // Paired clients already run and configure agent chats. Hermes exposes
@@ -286,6 +311,18 @@ mod tests {
     }
 
     #[test]
+    fn usage_page_commands_are_explicitly_allowed() {
+        for cmd in [
+            "usage_summary",
+            "usage_refresh_quota",
+            "usage_price_overrides",
+            "usage_set_price_override",
+        ] {
+            assert!(allowed(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
     fn remote_invoke_allowlist_is_closed_by_default() {
         for cmd in [
             "touch_workspace",
@@ -296,6 +333,8 @@ mod tests {
             "agent_chat_resume_after_usage_limit",
             "agent_chat_cancel_usage_resume",
             "materialize_chat_workspace",
+            "create_workspace_on_host",
+            "get_local_device_name",
             "submit_pr_review_with_comments",
             "automations_create",
             "unarchive_workspace",
@@ -313,6 +352,8 @@ mod tests {
             "git_discard_file",
             "get_auth_token",
             "web_remote_disable",
+            "hosts_add",
+            "hosts_ssh_config_hosts",
             "plugin:shell|execute",
             "future_command",
         ] {

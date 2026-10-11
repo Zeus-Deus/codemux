@@ -189,6 +189,9 @@ export interface ReviewDetailProps {
    *  polls are healthy. Content is never blanked either way. */
   staleAgeMs: number | null;
   onRefresh: () => void;
+  /** Explicit refresh clears native successful reads first. Mutations
+   * use onRefresh because the host already invalidates after writes. */
+  onManualRefresh?: () => void;
   /** Absent on surfaces with no Changes pane to open. */
   onOpenChanges?: () => void;
 }
@@ -223,6 +226,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     gitDirtyFiles,
     staleAgeMs,
     onRefresh,
+    onManualRefresh = onRefresh,
     onOpenChanges,
   } = props;
 
@@ -276,14 +280,16 @@ export function ReviewDetail(props: ReviewDetailProps) {
   // Fetched for the Code tab, and also whenever notes are pending even
   // if you're reading Summary: a force-push has to be able to tell you
   // how many of your notes stopped matching without you going looking.
-  // Keyed on the head sha, so a rewrite refetches by itself.
+  // Keyed AND fetched against the head SHA. Native rejects a changed head
+  // before/after fetching: concurrent detail refreshes must never put a
+  // new patch into an old-head cache entry or re-anchor notes against it.
   const pollingActive = usePrPollingActive();
   const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
   const canFetch = pollingActive && !paused;
   const needsDiff = activeTab === "code" || lineDrafts.length > 0;
   const diffQuery = useQuery({
     queryKey: ["pr", "review-diff", cwd, pr.number, pr.head_ref_oid],
-    queryFn: () => getPrReviewDiff(cwd, pr.number),
+    queryFn: () => getPrReviewDiff(cwd, pr.number, pr.head_ref_oid),
     enabled: canFetch && needsDiff,
     refetchOnWindowFocus: false,
     retry: prQueryRetry,
@@ -610,14 +616,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
    * duplicate either errors or does the thing twice.
    */
   const track = useCallback(
-    async (work: PendingWork, run: () => Promise<void>) => {
+    async (work: PendingWork, failTitle: string, run: () => Promise<void>) => {
       if (inFlightRef.current) return;
       inFlightRef.current = true;
       setInFlight(work);
       try {
         await run();
       } catch (err) {
-        toast.error(String(err));
+        toast.failure(failTitle, err);
       } finally {
         inFlightRef.current = false;
         setInFlight(null);
@@ -628,7 +634,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const markReady = useCallback(
     () =>
-      track("ready", async () => {
+      track("ready", "Couldn't mark it ready for review", async () => {
         await setPrReady(cwd, pr.number, true);
         onRefresh();
         toast.success("Marked ready for review");
@@ -638,7 +644,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const closePr = useCallback(
     () =>
-      track("close", async () => {
+      track("close", "Couldn't close the pull request", async () => {
         await closePullRequest(cwd, pr.number);
         onRefresh();
         toast.success(`Closed #${pr.number}`);
@@ -648,7 +654,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const reopenPr = useCallback(
     () =>
-      track("reopen", async () => {
+      track("reopen", "Couldn't reopen the pull request", async () => {
         await reopenPullRequest(cwd, pr.number);
         onRefresh();
         toast.success(`Reopened #${pr.number}`);
@@ -662,13 +668,13 @@ export function ReviewDetail(props: ReviewDetailProps) {
       const branch = await checkoutDefaultBranchInWorkspace(workspaceId);
       toast.success(`Switched to ${branch}`);
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't switch to the default branch", err);
     }
   }, [workspaceId]);
 
   const pull = useCallback(
     () =>
-      track("pull", async () => {
+      track("pull", "Couldn't pull", async () => {
         await gitPullChanges(cwd);
         onRefresh();
         toast.success("Pulled");
@@ -678,7 +684,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const stashAndPull = useCallback(
     () =>
-      track("stash-pull", async () => {
+      track("stash-pull", "Couldn't stash and pull", async () => {
         await gitStashPush(cwd, false);
         await gitPullChanges(cwd);
         onRefresh();
@@ -704,7 +710,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const openPrPath = useCallback(
     (suffix: string) => {
-      openUrl(`${pr.url}${suffix}`).catch((err) => toast.error(String(err)));
+      openUrl(`${pr.url}${suffix}`).catch((err) => toast.failure("Couldn't open the link", err));
     },
     [pr.url],
   );
@@ -895,7 +901,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
                   label: "Refresh",
                   onClick: () => {
                     acknowledgeForcePush();
-                    onRefresh();
+                    onManualRefresh();
                   },
                   emphasis: "strong" as const,
                 },
@@ -1010,7 +1016,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         tone: "muted",
         // Stale and labelled beats blank: the content above stays put.
         message: <>Showing data from {shortAge(staleAgeMs)} ago</>,
-        actions: [{ label: "Retry now", onClick: onRefresh }],
+        actions: [{ label: "Retry now", onClick: onManualRefresh }],
       });
     }
 
@@ -1037,6 +1043,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     copyDraft,
     switchToDefaultBranch,
     onRefresh,
+    onManualRefresh,
     onOpenChanges,
     openPrPath,
     pull,
@@ -1062,7 +1069,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       prNumber: pr.number,
       existingWorkspaceId,
     })
-      .catch((err) => toast.error(String(err)))
+      .catch((err) => toast.failure("Couldn't check out the pull request", err))
       .finally(() => setCheckingOut(false));
   }, [checkingOut, projectRoot, pr.head_branch, pr.number, existingWorkspaceId]);
 
@@ -1120,7 +1127,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
               }
             : undefined
         }
-        onRefresh={onRefresh}
+        onRefresh={onManualRefresh}
       />
 
       <ReviewTabStrip
