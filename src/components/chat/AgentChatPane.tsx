@@ -162,10 +162,12 @@ import {
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
+  useDelegationOccupant,
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
 } from "./use-composer-strip-occupants";
+import { openDelegatedChat, stopDelegatedTask } from "./delegation-actions";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
 import { SubagentView } from "./SubagentView";
 import { DebugCleanupBanner } from "./DebugCleanupBanner";
@@ -3732,8 +3734,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   // ── Composer strip ──
   // One strip above the pill for everything pending: session error,
-  // monitoring, running / just-finished subagents, queued follow-ups. The
-  // strip picks the lead occupant; these only describe what exists.
+  // monitoring, delegated tasks, running / just-finished subagents, queued
+  // follow-ups. The strip picks the lead occupant; these only describe what
+  // exists.
+  const delegationOccupant = useDelegationOccupant({
+    messages,
+    threadId,
+    streaming: transcriptStreaming,
+    onOpen: openDelegatedChat,
+    onStop: stopDelegatedTask,
+  });
   const subagentOccupant = useSubagentOccupant({
     messages,
     threadId,
@@ -3909,6 +3919,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         errorOccupant,
         usageOccupant,
         monitoringOccupant,
+        delegationOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
       ]}

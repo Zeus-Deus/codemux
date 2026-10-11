@@ -30,6 +30,7 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
 import {
   isAutoResumeText,
   usageLimitRecordText,
@@ -41,6 +42,8 @@ import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
+import { DelegationCard } from "./DelegationCard";
+import { DelegationResultsDivider } from "./DelegationResultsDivider";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
@@ -1632,6 +1635,10 @@ function slotBodyContains(body: SlotBody, id: string): boolean {
       return body.item.id === id;
     case "activity":
       return body.items.some((entry) => entry.id === id);
+    case "delegation":
+      return body.entries.some(
+        (entry) => entry.call?.id === id || entry.view?.id === id,
+      );
     case "turn_fold":
       return false;
   }
@@ -1795,6 +1802,7 @@ function transcriptSlotsAreEqual(
 function transcriptSlotType(slot: TranscriptSlot): string {
   if (slot.body.kind === "activity") return "activity";
   if (slot.body.kind === "turn_fold") return "turn_fold";
+  if (slot.body.kind === "delegation") return "delegation";
   return slot.body.item.kind;
 }
 
@@ -1865,6 +1873,15 @@ function ItemRow({
   // the user typed: a quiet divider marks it, the text stays one click away.
   if (item.kind === "user_message" && !item.queued && isAutoResumeText(item.text)) {
     return <AutoResumedTurnDivider text={item.text} />;
+  }
+
+  // Likewise the round of delegated-task reports Codemux posts back.
+  if (
+    item.kind === "user_message" &&
+    !item.queued &&
+    isDelegationResultsText(item.text)
+  ) {
+    return <DelegationResultsDivider text={item.text} />;
   }
 
   if (item.kind === "user_message") {
@@ -2193,11 +2210,13 @@ function SlotRow({
       ? "mt-2"
       : slot.body.kind === "turn_fold"
         ? "mt-4"
-        : slot.body.item.kind === "user_message"
-          ? "mt-5"
-          : slot.turnStart
-            ? "mt-4"
-            : "mt-2.5";
+        : slot.body.kind === "delegation"
+          ? "mt-3"
+          : slot.body.item.kind === "user_message"
+            ? "mt-5"
+            : slot.turnStart
+              ? "mt-4"
+              : "mt-2.5";
   return (
     <div
       data-message-id={slot.messageId}
@@ -2223,6 +2242,9 @@ function SlotRow({
           cwd={cwd}
           onToggleTurnFold={onToggleTurnFold}
         />
+      ) : slot.body.kind === "delegation" ? (
+        // Memoized itself; `entries` keeps identity across untouched rebuilds.
+        <DelegationCard entries={slot.body.entries} />
       ) : (
         <ItemRowMemo
           item={slot.body.item}
