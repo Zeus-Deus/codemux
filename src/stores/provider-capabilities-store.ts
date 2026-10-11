@@ -124,7 +124,7 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
       opencodeError: null,
       loadedProviders: {},
       refresh: (provider) => {
-        if (provider === "hermes") return Promise.resolve();
+        if (provider === "hermes" || provider === "acp") return Promise.resolve();
         const existing = providerRefreshInFlight.get(provider);
         if (existing) return existing;
 
@@ -203,6 +203,7 @@ export function refreshProviderCapabilitiesForIntent(
   // Health probes can launch provider runtimes too, so they share the exact
   // same explicit-intent boundary. The health store's TTL handles later
   // picker openings without another process spawn.
+  if (provider === "acp") return Promise.resolve(); // Explicit per-instance probe only.
   const healthRefresh = useProviderHealth.getState().refresh(provider);
   const lastRefresh = providerIntentRefreshedAt.get(provider);
   // The Cursor and Grok catalogs are owned by their installed CLIs and used
@@ -290,6 +291,7 @@ export function selectCapabilities(
       return state.codex;
     case "cursor":
       return state.cursor;
+    case "acp":
     case "hermes":
       return null; // Hermes catalogs are profile-scoped, never a singleton.
     case "grok":
@@ -311,6 +313,7 @@ export function selectError(
       return state.codexError;
     case "cursor":
       return state.cursorError;
+    case "acp":
     case "hermes":
       return null;
     case "grok":

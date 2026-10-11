@@ -99,6 +99,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "copySelection", label: "Copy selection", category: "terminal", defaultKeys: "Ctrl+Shift+C", when: "terminal" },
   { id: "pasteTerminal", label: "Paste", category: "terminal", defaultKeys: "Ctrl+Shift+V", when: "terminal" },
   { id: "backwardKillWord", label: "Backward kill word", category: "terminal", defaultKeys: "Ctrl+Backspace", when: "terminal" },
+  { id: "terminalFind", label: "Find in terminal", category: "terminal", defaultKeys: "Ctrl+F", when: "terminal", description: "Search the scrollback. Full-screen apps such as vim and less keep the key" },
 ] as const;
 
 const registryById = new Map(KEYBIND_REGISTRY.map((e) => [e.id, e]));

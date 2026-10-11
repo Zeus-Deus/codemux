@@ -1,5 +1,6 @@
 pub mod async_questions;
 pub mod hermes;
+pub mod custom_acp;
 pub(crate) mod local_sessions;
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
@@ -357,6 +358,7 @@ fn database_path() -> Option<PathBuf> {
 fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
+    custom_acp::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -5513,6 +5515,20 @@ impl DatabaseStore {
         )
         .map_err(|e| format!("Failed to revoke web_remote session: {e}"))?;
         Ok(())
+    }
+
+    /// Hard-delete a session row only while it is still pending approval.
+    /// Returns whether a row was removed, so a browser withdrawing its own
+    /// request can tell "withdrawn" from "approved in the meantime".
+    pub fn web_remote_delete_pending_session(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn
+            .execute(
+                "DELETE FROM web_remote_sessions WHERE id = ?1 AND approved = 0",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to withdraw web_remote session: {e}"))?;
+        Ok(removed > 0)
     }
 
     /// Hard-delete a session row. Used by the reject flow — a rejected

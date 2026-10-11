@@ -62,7 +62,10 @@ import {
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { __resetHostsStoreForTests } from "@/stores/hosts-store";
-import { __resetHostStatusStoreForTests } from "@/stores/host-status-store";
+import {
+  __resetHostStatusStoreForTests,
+  useHostStatusStore,
+} from "@/stores/host-status-store";
 import { __resetLocalDeviceNameForTests } from "@/stores/local-device-store";
 import { useAddDeviceDialogStore } from "@/stores/add-device-dialog-store";
 
@@ -145,6 +148,58 @@ afterEach(() => {
   __resetHostStatusStoreForTests();
   __resetLocalDeviceNameForTests();
   useAddDeviceDialogStore.setState(initialDialogState, true);
+});
+
+describe("HostsSection — status dots", () => {
+  it("shows the poller's live status without pressing Test", async () => {
+    backendHosts = [
+      makeHost({ id: 1, name: "homelab" }),
+      makeHost({ id: 2, name: "pandora", ssh_target: "deus@pandora" }),
+    ];
+    mocked.hostsStatusList.mockResolvedValue([
+      makeStatus({ host_id: 1 }),
+      makeStatus({
+        host_id: 2,
+        reachable: false,
+        last_seen_at: null,
+        last_error: "unreachable: connection timed out",
+      }),
+    ]);
+
+    render(<HostsSection />);
+
+    await waitFor(() => expect(screen.getByText("Connected")).toBeInTheDocument());
+    expect(screen.getByText("Offline")).toBeInTheDocument();
+    expect(mocked.hostsTestConnection).not.toHaveBeenCalled();
+  });
+});
+
+describe("HostsSection — Test vs live status", () => {
+  it("shows a Test result until the poller reports again", async () => {
+    const row = (reachable: boolean) =>
+      makeStatus({ host_id: 1, reachable, last_seen_at: null });
+    backendHosts = [makeHost({ id: 1, name: "homelab" })];
+    mocked.hostsStatusList.mockResolvedValue([row(true)]);
+    mocked.hostsTestConnection.mockResolvedValue({
+      ok: false,
+      message: "connection timed out",
+      needs_install: false,
+      uname: null,
+    });
+    const user = userEvent.setup();
+
+    render(<HostsSection />);
+    await waitFor(() => expect(screen.getByText("Connected")).toBeInTheDocument());
+
+    await user.click(
+      await screen.findByRole("button", { name: "More actions for homelab" }),
+    );
+    await user.click(await screen.findByRole("menuitem", { name: "Test connection" }));
+    await waitFor(() => expect(screen.getByText("Offline")).toBeInTheDocument());
+
+    act(() => useHostStatusStore.getState().applyAll([row(true)]));
+    await waitFor(() => expect(screen.getByText("Connected")).toBeInTheDocument());
+  });
 });
 
 function stepState(label: string): string | null {

@@ -423,7 +423,7 @@ export async function materializeAndSend(
       text: applyAllPrefixes(
         exactSkillSelection?.text ?? text,
         normalizeChatModeForProvider(draft.provider, draft.mode),
-        draft.effort,
+        draft.provider === "acp" ? null : draft.effort,
         typeof skillBodies === "string" ? skillBodies : null,
         attachmentBlock,
         selectProviderCommands(draft.provider, cwd, draft.threadId)(useProviderCommandsStore.getState()).commands,
@@ -673,7 +673,7 @@ export async function materializeWithPreset(
           text: applyAllPrefixes(
             exactSkills?.text ?? prompt,
             normalizeChatModeForProvider(draft.provider, draft.mode),
-            draft.effort,
+            draft.provider === "acp" ? null : draft.effort,
             typeof skillBodies === "string" ? skillBodies : null,
             null,
             selectProviderCommands(draft.provider, sourceCwd, draft.threadId)(useProviderCommandsStore.getState()).commands,

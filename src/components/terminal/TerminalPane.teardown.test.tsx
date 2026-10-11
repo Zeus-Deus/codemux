@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import { resizePty } from "@/tauri/commands";
+import { attachPtyOutput, createBrowserPane, resizePty } from "@/tauri/commands";
 import {
   flushAllTeardowns,
   setTeardownScheduler,
@@ -24,6 +24,19 @@ const h = vi.hoisted(() => ({
   serializeCalls: 0,
   serializeAddons: 0,
   mobile: false,
+  status: {
+    state: "ready" as string,
+    message: null as string | null,
+    exit_code: null as number | null,
+  },
+  sessionState: "ready",
+  linkProviders: [] as {
+    provideLinks: (
+      line: number,
+      callback: (links: { text: string; activate: (event: MouseEvent) => void }[] | undefined) => void,
+    ) => void;
+  }[],
+  rows: [] as string[],
 }));
 
 vi.mock("@/hooks/use-mobile-layout", () => ({
@@ -37,8 +50,27 @@ vi.mock("@xterm/xterm", () => {
     cols = 80;
     rows = 24;
     options: Record<string, unknown>;
-    buffer = { active: { type: "normal" } };
+    buffer = {
+      active: {
+        type: "normal",
+        getLine: (y: number) => {
+          const row = h.rows[y];
+          if (row === undefined) return undefined;
+          return {
+            isWrapped: false,
+            length: row.length,
+            getCell: (x: number) => ({ getChars: () => row[x], getWidth: () => 1 }),
+          };
+        },
+      },
+    };
     parser = { registerOscHandler: () => ({ dispose: () => {} }) };
+    unicode = { activeVersion: "6" };
+    registerLinkProvider(provider: (typeof h.linkProviders)[number]) {
+      h.linkProviders.push(provider);
+      return { dispose: () => {} };
+    }
+    clearSelection() {}
     constructor(options: Record<string, unknown>) {
       this.options = options;
       this.index = h.terminals.length;
@@ -148,10 +180,14 @@ vi.mock("@/tauri/commands", () => ({
   resumePtyOutput: vi.fn(async () => {}),
   getTerminalStatus: vi.fn(async (session_id: string) => ({
     session_id,
-    state: "ready",
-    message: null,
-    exit_code: null,
+    ...h.status,
   })),
+  restartTerminalSession: vi.fn(async () => {
+    h.log.push("restart");
+  }),
+  closePane: vi.fn(async () => {}),
+  createBrowserPane: vi.fn(async () => "pane-browser"),
+  fileExists: vi.fn(async () => true),
   clearAgentStatus: vi.fn(async () => {}),
   getTerminalScrollback: vi.fn(async () => null),
   cacheTerminalScrollback: (...args: unknown[]) =>
@@ -227,6 +263,9 @@ vi.mock("@/stores/app-store", () => ({
         terminal_sessions: [
           {
             session_id: "sess-a",
+            state: h.sessionState,
+            last_message: null,
+            exit_code: null,
             cwd: "/tmp/a",
             original_command: null,
             cols: 80,
@@ -249,8 +288,17 @@ vi.mock("@/stores/app-store", () => ({
 }));
 
 vi.mock("@/stores/terminal-cwd-store", () => ({
-  useTerminalCwdStore: { getState: () => ({ setCwd: () => {} }) },
+  useTerminalCwdStore: { getState: () => ({ setCwd: () => {}, cwds: {} }) },
   parseOsc7: () => null,
+}));
+
+const openExternalUrl = vi.fn(async () => "browser");
+vi.mock("@/lib/open-url", () => ({
+  openExternalUrl: (...args: unknown[]) => openExternalUrl(...(args as [])),
+}));
+const openRightPanelDoc = vi.fn();
+vi.mock("@/lib/open-right-panel-doc", () => ({
+  openRightPanelDoc: (...args: unknown[]) => openRightPanelDoc(...(args as [])),
 }));
 
 // Imported after the mocks so the pane picks them up.
@@ -314,7 +362,10 @@ describe("TerminalPane deferred teardown", () => {
     h.serializeCalls = 0;
     h.serializeAddons = 0;
     h.mobile = false;
+    h.status = { state: "ready", message: null, exit_code: null };
+    h.sessionState = "ready";
     vi.mocked(resizePty).mockClear();
+    vi.mocked(attachPtyOutput).mockClear();
     cacheTerminalScrollback.mockClear();
     detachPtyOutput.mockClear();
     restoreEnabled = true;
@@ -469,5 +520,138 @@ describe("TerminalPane deferred teardown", () => {
     for (const term of h.terminals) expect(term.disposed).toBe(1);
     for (const webgl of h.webgls) expect(webgl.disposed).toBe(1);
     expect(h.serializeCalls).toBe(5);
+  });
+});
+
+describe("TerminalPane exited shell", () => {
+  beforeEach(() => {
+    h.log.length = 0;
+    h.terminals.length = 0;
+    h.webgls.length = 0;
+    h.serializeAddons = 0;
+    h.mobile = false;
+    vi.mocked(attachPtyOutput).mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    flushAllTeardowns();
+    setTeardownScheduler(null);
+    h.status = { state: "ready", message: null, exit_code: null };
+    h.sessionState = "ready";
+  });
+
+  it("says the process exited and restarts the shell in place", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
+    h.sessionState = "exited";
+    const view = renderPane("sess-a");
+    await act(async () => {});
+
+    expect(view.getByRole("heading", { name: "Process exited" })).toBeTruthy();
+    expect(view.getByText("Exit code 2")).toBeTruthy();
+    expect(view.queryByText("Terminal starting")).toBeNull();
+    expect(attachPtyOutput).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Restart shell" }));
+    });
+
+    expect(h.log).toContain("restart");
+    // The respawned runtime has no subscribers, so the pane attaches again.
+    expect(attachPtyOutput).toHaveBeenCalledTimes(2);
+    // Still the same xterm: the old output stays above the restart marker.
+    expect(h.terminals).toHaveLength(1);
+  });
+
+  it("hands focus to Restart from the terminal but not from the find bar", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: "Shell exited with code 2", exit_code: 2 };
+    h.sessionState = "exited";
+
+    // Focus sits in xterm's textarea when the shell exits.
+    const fromTerminal = renderPane("sess-a");
+    const overlay = fromTerminal.container.querySelector(".terminal-overlay")!;
+    const xtermInput = overlay.previousElementSibling!.appendChild(
+      document.createElement("textarea"),
+    );
+    xtermInput.focus();
+    await act(async () => {});
+    expect(document.activeElement).toBe(
+      fromTerminal.getByRole("button", { name: "Restart shell" }),
+    );
+    cleanup();
+
+    // Focus sits in a sibling of the terminal inside the pane, where the
+    // find bar renders: the user is typing a query and keeps focus.
+    const fromFind = renderPane("sess-a");
+    const shell = fromFind.container.querySelector(".terminal-overlay")!.parentElement!;
+    const findInput = shell.appendChild(document.createElement("input"));
+    findInput.focus();
+    await act(async () => {});
+    expect(fromFind.getByRole("heading", { name: "Process exited" })).toBeTruthy();
+    expect(document.activeElement).toBe(findInput);
+  });
+
+  it("treats a runtime-less read for a session that never exited as starting", async () => {
+    schedulerHarness();
+    h.status = { state: "exited", message: "Session is no longer running", exit_code: null };
+    h.sessionState = "starting";
+    const view = renderPane("sess-a");
+    await act(async () => {});
+
+    expect(view.getByRole("heading", { name: "Terminal starting" })).toBeTruthy();
+    expect(view.queryByRole("heading", { name: "Process exited" })).toBeNull();
+  });
+});
+
+describe("TerminalPane links", () => {
+  afterEach(() => {
+    cleanup();
+    flushAllTeardowns();
+    setTeardownScheduler(null);
+    h.linkProviders.length = 0;
+    h.rows = [];
+  });
+
+  async function linksOnRow(row: string) {
+    h.rows = [row];
+    schedulerHarness();
+    renderPane("sess-a");
+    await act(async () => {});
+    const provider = h.linkProviders[h.linkProviders.length - 1];
+    let links: { text: string; activate: (event: MouseEvent) => void }[] = [];
+    provider.provideLinks(1, (found) => {
+      links = found ?? [];
+    });
+    return links;
+  }
+
+  it("opens a dev-server URL beside the pane on Ctrl+click only", async () => {
+    vi.mocked(createBrowserPane).mockClear();
+    const [link] = await linksOnRow("Local: http://localhost:5173/");
+    expect(link.text).toBe("http://localhost:5173/");
+
+    link.activate(new MouseEvent("click"));
+    expect(createBrowserPane).not.toHaveBeenCalled();
+    link.activate(new MouseEvent("click", { ctrlKey: true }));
+    expect(createBrowserPane).toHaveBeenCalledWith("pane-1", "http://localhost:5173/");
+  });
+
+  it("sends other URLs through the app's link routing", async () => {
+    openExternalUrl.mockClear();
+    const [link] = await linksOnRow("PR: https://github.com/acme/app/pull/12");
+    link.activate(new MouseEvent("click", { metaKey: true }));
+    expect(openExternalUrl).toHaveBeenCalledWith("https://github.com/acme/app/pull/12");
+  });
+
+  it("opens a file reference at its line, resolved against the session cwd", async () => {
+    openRightPanelDoc.mockClear();
+    const [link] = await linksOnRow("error in src/App.tsx:12:5");
+    expect(link.text).toBe("src/App.tsx:12:5");
+    await act(async () => {
+      link.activate(new MouseEvent("click", { ctrlKey: true }));
+    });
+    expect(openRightPanelDoc).toHaveBeenCalledWith("ws-1", "/tmp/a/src/App.tsx", 12, 5);
   });
 });
