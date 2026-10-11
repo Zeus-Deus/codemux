@@ -82,7 +82,11 @@ import { isMarkdownFile } from "@/components/editor/EditorPane";
 import { subagentDeckSummary } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
-import { maxRightPanelWidth } from "@/lib/right-panel-width";
+import {
+  maxRightPanelWidth,
+  resolveRightPanelWidth,
+  RIGHT_PANEL_WIDTH_UI_KEY,
+} from "@/lib/right-panel-width";
 import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
@@ -140,10 +144,6 @@ interface Props {
   workspace: WorkspaceSnapshot;
   activeTab: RightPanelTab;
 }
-
-/** The width the expand toggle returns to. Its other endpoint is whatever
- *  the current layout allows — see `@/lib/right-panel-width`. */
-const PANEL_DEFAULT_WIDTH = 320;
 
 const EMPTY_MESSAGES: ChatViewItem[] = [];
 
@@ -241,7 +241,9 @@ export const RightPanel = memo(function RightPanel({
   const reorderRightPanelPanes = useUIStore((s) => s.reorderRightPanelPanes);
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
-  const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
+  const rightPanelWidth = useUIStore((s) =>
+    resolveRightPanelWidth(s.rightPanelWidth, s.rightPanelRowWidth),
+  );
   const rightPanelRowWidth = useUIStore((s) => s.rightPanelRowWidth);
   const storedPanes = useUIStore((s) => s.rightPanelPanes[workspaceId]);
   const storedDismissed = useUIStore(
@@ -545,7 +547,7 @@ export const RightPanel = memo(function RightPanel({
   // is made from the *rendered* active pane, which can differ from the
   // persisted one (workspace-main coerces a stale tab without writing to
   // the store).
-  const handleClose = useCallback(
+  const dropPane = useCallback(
     (id: RightPanelTab) => {
       closeRightPanelPane(workspaceId, id);
       if (id === "browser") {
@@ -555,6 +557,13 @@ export const RightPanel = memo(function RightPanel({
         // same as closing a browser pane in the main area.
         undockBrowserFromRightPanel(workspaceId, true).catch(console.error);
       }
+    },
+    [closeRightPanelPane, workspaceId],
+  );
+
+  const handleClose = useCallback(
+    (id: RightPanelTab) => {
+      dropPane(id);
       if (id !== activePane) return;
       const index = visiblePanes.indexOf(id);
       const remaining = visiblePanes.filter((pane) => pane !== id);
@@ -563,13 +572,20 @@ export const RightPanel = memo(function RightPanel({
         remaining[Math.min(index, remaining.length - 1)] ?? RIGHT_PANEL_EMPTY,
       );
     },
-    [
-      closeRightPanelPane,
-      setRightPanelTab,
-      workspaceId,
-      activePane,
-      visiblePanes,
-    ],
+    [dropPane, setRightPanelTab, workspaceId, activePane, visiblePanes],
+  );
+
+  // The tab context menu's bulk closes. One focus decision for the batch:
+  // looping `handleClose` would re-pick a neighbour per tab from a stale
+  // pane list.
+  const handleCloseMany = useCallback(
+    (ids: RightPanelTab[], focus: RightPanelTab | null) => {
+      ids.forEach(dropPane);
+      if (activePane !== null && ids.includes(activePane)) {
+        setRightPanelTab(workspaceId, focus ?? RIGHT_PANEL_EMPTY);
+      }
+    },
+    [dropPane, setRightPanelTab, workspaceId, activePane],
   );
 
   const handleOpenTerminal = useCallback(() => {
@@ -597,9 +613,14 @@ export const RightPanel = memo(function RightPanel({
       : rightPanelWidth;
   const expanded = rightPanelWidth >= panelMaxWidth;
   const handleToggleExpand = useCallback(() => {
-    const next = expanded ? PANEL_DEFAULT_WIDTH : Math.round(panelMaxWidth);
+    // Restores to the window-relative default (`null`, persisted as "");
+    // the other endpoint is whatever the current layout allows — see
+    // `@/lib/right-panel-width`.
+    const next = expanded ? null : Math.round(panelMaxWidth);
     setRightPanelWidth(next);
-    dbSetUiState("right_panel_width", String(next)).catch(console.error);
+    dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, next === null ? "" : String(next)).catch(
+      console.error,
+    );
   }, [expanded, panelMaxWidth, setRightPanelWidth]);
 
   // The store owns collapsing (it undocks a docked agent browser — a
@@ -943,6 +964,7 @@ export const RightPanel = memo(function RightPanel({
         activeTab={activePane}
         onSelect={(id) => setRightPanelTab(workspaceId, id)}
         onClose={handleClose}
+        onCloseMany={handleCloseMany}
         onReorder={(ids) => reorderRightPanelPanes(workspaceId, ids)}
         actions={actions}
         surfaces={surfaces}
