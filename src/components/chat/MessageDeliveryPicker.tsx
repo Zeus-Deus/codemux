@@ -33,7 +33,7 @@ export function MessageDeliveryPicker({
           disabled={disabled}
           aria-label={`Message delivery: ${selected.label}`}
           title={selected.description}
-          className="inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-full px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40"
+          className="inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40"
         >
           <Icon className="size-3.5" aria-hidden />
           <span>{value === "interrupt" ? "Interrupt" : selected.label}</span>
