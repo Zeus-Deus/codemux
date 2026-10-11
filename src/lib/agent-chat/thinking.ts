@@ -1,3 +1,4 @@
+import { isDelegatedRow } from "./delegation";
 import type { ChatViewItem } from "./types";
 
 /**
@@ -42,9 +43,12 @@ export function shouldShowThinkingIndicator(
       // The orchestration card renders its own live spinners while any
       // subagent is working, so the tail pulse steps back; once every
       // subagent finishes it's dead time again (waiting on the
-      // orchestrator to resume).
+      // orchestrator to resume). A cross-provider delegation is not the
+      // parent's work — its card shows the child, and the parent is still
+      // composing its reply.
       return last.subagents.every(
-        (s) => s.status !== "running" && s.status !== "pending",
+        (s) =>
+          isDelegatedRow(s) || (s.status !== "running" && s.status !== "pending"),
       );
     case "workflow_run":
       // The workflow card shows its own spinner/progress bar while the

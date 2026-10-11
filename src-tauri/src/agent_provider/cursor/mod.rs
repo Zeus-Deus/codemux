@@ -140,6 +140,7 @@ impl AgentProvider for CursorAgentProvider {
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
+        let fast_mode = input.boolean_fast_mode()?;
         let thread_id = input.thread_id.clone();
         if let Some(context) = super::managed::lookup_session(&thread_id) {
             if self.sessions.read().await.contains_key(&thread_id)
@@ -200,13 +201,14 @@ impl AgentProvider for CursorAgentProvider {
             input.permission_mode,
             input.effort,
             input.context_window,
-            input.fast_mode,
+            fast_mode,
             input.resume_cursor,
             input.env,
             AcpSpawnConfig {
                 binary: self.config.binary.clone(),
                 dialect: AcpDialect::Cursor,
                 slash_command_cache: Arc::clone(&self.slash_command_cache),
+                remote: input.remote,
             },
             self.event_tx.clone(),
         )

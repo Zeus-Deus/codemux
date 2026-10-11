@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
+import { delegationPhaseSummary, delegationRow } from "@/lib/agent-chat/delegation";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
+  delegationElapsedLabel,
   formatElapsed,
+  runningDelegations,
   runningSubagentEntries,
   subagentActivityLine,
   subagentElapsedMs,
@@ -10,9 +13,12 @@ import {
 } from "@/lib/agent-chat/subagents";
 import type {
   ChatViewItem,
+  PermissionRequestItem,
   SubagentView,
+  ToolCallItem,
   UsageLimitState,
   UserMessageItem,
+  WorkflowRunItem,
 } from "@/lib/agent-chat/types";
 import {
   countdownIntervalMs,
@@ -20,12 +26,16 @@ import {
   formatResetTime,
   nextUsageLimitBoundary,
   usageLimitPhase,
+  usageResumeExplanation,
   usageWindowLabel,
 } from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
+import type { AgentChatProviderKind } from "@/tauri/types";
+import type { ApprovalDecision } from "@/tauri/events";
 
 import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
+import { isHermesPermission } from "./HermesPermissionOptions";
 
 /** How long the "just finished" row stays before it leaves the strip. */
 export const FINISHED_FLASH_MS = 2500;
@@ -181,6 +191,127 @@ export function useSubagentOccupant({
 }
 
 /**
+ * Delegation occupant: tasks this chat handed to other agents that are still
+ * running in their own tabs.
+ *
+ * Calm on purpose — no sweep, no orb. The parent is not working; it is
+ * waiting to continue, and the copy says exactly that ("Continues when Codex
+ * finishes"). While the parent itself streams, the row only notes that
+ * reports will post here. Never withheld behind the transcript card: this is
+ * the one place that explains why the chat will pick up again on its own.
+ *
+ * Stop's pending state copies the monitoring occupant: "Stopping…" holds
+ * until the task leaves the running set (the backend's Stopped snapshot),
+ * not until the command returns. "Stop all" rides on the first row, so it
+ * survives opening the strip.
+ */
+export function useDelegationOccupant({
+  messages,
+  threadId,
+  streaming,
+  onOpen,
+  onStop,
+}: {
+  messages: ChatViewItem[];
+  threadId: string | null;
+  /** The parent's own live-run flag. */
+  streaming: boolean;
+  onOpen: (childThreadId: string) => void;
+  /** Swallows its own errors (`stopDelegatedTask`), so nothing unwinds. */
+  onStop: (provider: AgentChatProviderKind, childThreadId: string) => void;
+}): StripOccupant | null {
+  // Row ids are unique per child, so a settled task's id can never match a
+  // running row again; only a thread switch needs to drop them.
+  const [stopping, setStopping] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    setStopping((current) => (current.size === 0 ? current : new Set()));
+  }, [threadId]);
+
+  const running = runningDelegations(messages);
+  if (running.length === 0) return null;
+
+  const models = running.map((view) => ({ view, row: delegationRow(null, view) }));
+  const stop = (targets: typeof models) => {
+    const fresh = targets.filter(({ view }) => !stopping.has(view.id));
+    if (fresh.length === 0) return;
+    setStopping((current) => new Set([...current, ...fresh.map(({ view }) => view.id)]));
+    for (const { row } of fresh) {
+      if (row.provider && row.childThreadId) onStop(row.provider, row.childThreadId);
+    }
+  };
+  const count = models.length;
+  const label = streaming
+    ? `${count} delegated task${count === 1 ? "" : "s"} running`
+    : count === 1
+      ? `Continues when ${models[0].row.providerLabel} finishes`
+      : `Continues when ${count} agents finish`;
+
+  const taskRow = (model: (typeof models)[number], solo: boolean): StripRow => {
+    const { view, row } = model;
+    const pending = stopping.has(view.id);
+    const thread = row.childThreadId;
+    return {
+      id: `delegation:${view.id}`,
+      mark: { kind: "providers", providers: row.provider ? [row.provider] : [] },
+      label: solo ? label : row.providerLabel,
+      detail: `${row.title} · ${solo && streaming ? "reports post here" : row.line}`,
+      elapsed: (now) => delegationElapsedLabel([view], now),
+      secondaryAction: {
+        label: pending ? "Stopping…" : "Stop",
+        title: `Stop this task in ${row.providerLabel}`,
+        tone: "quiet",
+        testId: "composer-strip-delegation-stop",
+        disabled: pending,
+        onClick: () => stop([model]),
+      },
+      action: thread
+        ? {
+            label: "Open",
+            title: `Open the ${row.providerLabel} chat`,
+            testId: "composer-strip-delegation-open",
+            onClick: () => onOpen(thread),
+          }
+        : null,
+    };
+  };
+
+  if (count === 1) {
+    const row = taskRow(models[0], true);
+    return { kind: "delegation", summary: row, rows: [row] };
+  }
+
+  const rows = models.map(({ row }) => row);
+  const blocked = rows.some((row) => row.phase === "waiting" || row.phase === "paused");
+  const allStopping = running.every((view) => stopping.has(view.id));
+  const header: StripRow = {
+    id: "delegation:all",
+    mark: { kind: "providers", providers: [...new Set(rows.flatMap((row) => row.provider ?? []))] },
+    label,
+    detail: streaming
+      ? "reports post here"
+      : blocked
+        ? delegationPhaseSummary(rows)
+        : "working in their tabs",
+    elapsed: (now) => delegationElapsedLabel(running, now),
+    secondaryAction: {
+      label: allStopping ? "Stopping…" : "Stop all",
+      title: `Stop all ${count} delegated tasks`,
+      tone: "quiet",
+      testId: "composer-strip-delegation-stop-all",
+      disabled: allStopping,
+      onClick: () => stop(models),
+    },
+    action: null,
+    countsAsItem: false,
+  };
+  return {
+    kind: "delegation",
+    summary: header,
+    rows: [header, ...models.map((model) => taskRow(model, false))],
+  };
+}
+
+/**
  * Monitoring occupant: the pane reports `monitoring` (a settled thread
  * whose only live tasks are watch loops, or `codemux monitor start`).
  *
@@ -266,7 +397,12 @@ export function useUsageLimitOccupant({
   onCancel: () => Promise<void>;
 }): StripOccupant | null {
   const [clock, setClock] = useState(() => Date.now());
-  const [pending, setPending] = useState<"resume" | "cancel" | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    kind: "resume" | "cancel";
+    limitKey: string;
+    token: number;
+  } | null>(null);
+  const tokenRef = useRef(0);
 
   useEffect(() => {
     if (!usageLimit) return;
@@ -286,16 +422,20 @@ export function useUsageLimitOccupant({
     return () => window.clearTimeout(id);
   }, [usageLimit, clock]);
 
-  // A new limit, a disarm, or a thread switch settles any in-flight click.
-  useEffect(() => {
-    setPending(null);
-  }, [usageLimit, threadId]);
+  // A click belongs to the limit it was made on. A disarm keeps the limit's
+  // `at`, so a manual resume stays pending while the backend clears the old
+  // schedule before dispatching; a newer limit or a thread switch has a new
+  // key and supersedes it.
+  const limitKey = usageLimit ? `${threadId ?? ""}\u0000${usageLimit.at}` : null;
+  const pending =
+    pendingAction && pendingAction.limitKey === limitKey ? pendingAction.kind : null;
 
-  if (!usageLimit || streaming) return null;
+  if (!usageLimit || streaming || limitKey === null) return null;
 
   const run = (kind: "resume" | "cancel") => {
     if (pending) return;
-    setPending(kind);
+    const token = ++tokenRef.current;
+    setPendingAction({ kind, limitKey, token });
     const action = kind === "resume" ? onResume : onCancel;
     void Promise.resolve()
       .then(action)
@@ -308,19 +448,23 @@ export function useUsageLimitOccupant({
           { description: error instanceof Error ? error.message : String(error) },
         );
       })
-      .finally(() => setPending(null));
+      // An older click settling must not release a newer one.
+      .finally(() =>
+        setPendingAction((cur) => (cur?.token === token ? null : cur)),
+      );
   };
 
   const busy = pending !== null;
+  const resuming = pending === "resume";
   const tryNow: StripAction = {
-    label: "Try now",
+    label: resuming ? "Resuming…" : "Try now",
     title: "Resume now instead of waiting for the reset",
     testId: "composer-strip-usage-try-now",
     disabled: busy,
     onClick: () => run("resume"),
   };
   const resume: StripAction = {
-    label: "Resume",
+    label: resuming ? "Resuming…" : "Resume",
     title: "Continue the run the usage limit stopped",
     tone: "solid",
     testId: "composer-strip-usage-resume",
@@ -382,6 +526,9 @@ export function useUsageLimitOccupant({
       };
       break;
   }
+  // The disarm that precedes a manual dispatch is not news; explain only
+  // what the user is left with once the resume settles.
+  row.note = resuming ? null : usageResumeExplanation(usageLimit, clock);
   return { kind: "usage", summary: row, rows: [row] };
 }
 
@@ -418,6 +565,104 @@ export function queuedOccupant(
     };
   });
   return { kind: "queued", summary: rows[0], rows };
+}
+
+/**
+ * Approval occupant: the run is parked on a decision only the user can
+ * make. It leads the strip so a waiting run never passes for an idle one,
+ * even while the transcript is scrolled away from the card. A plain tool
+ * approval can be answered from the row; a plan, a workflow or a
+ * provider-specific choice needs its card, so the row jumps there.
+ * AskUserQuestion prompts are excluded: they already sit above the
+ * composer.
+ */
+export function approvalOccupant(
+  messages: ChatViewItem[],
+  handlers: {
+    onRespond: (requestId: string, decision: ApprovalDecision) => void;
+    onJump: (itemId: string) => void;
+  },
+): StripOccupant | null {
+  const pending = messages.filter(
+    (m): m is PermissionRequestItem =>
+      m.kind === "permission_request" &&
+      m.request_kind !== "user-input" &&
+      m.resolution.state === "pending",
+  );
+  if (pending.length === 0) return null;
+
+  const rows = pending.map<StripRow>((request) => {
+    const tool = messages.find(
+      (m): m is ToolCallItem =>
+        m.kind === "tool_call" && m.approval_request_id === request.request_id,
+    );
+    const workflow = messages.find(
+      (m): m is WorkflowRunItem =>
+        m.kind === "workflow_run" && m.approvalRequestId === request.request_id,
+    );
+    const targetId = tool?.id ?? workflow?.id ?? request.id;
+    const review: StripAction = {
+      label: "Review",
+      title: "Jump to the request in the thread",
+      onClick: () => handlers.onJump(targetId),
+    };
+    const answerable =
+      tool !== undefined &&
+      request.request_kind !== "plan" &&
+      !isHermesPermission(request.payload);
+    const detail = workflow
+      ? `Workflow · ${workflow.name ?? "run as a workflow"}`
+      : request.request_kind === "plan"
+        ? "Plan ready to review"
+        : tool
+          ? [tool.tool_name, toolInputSummary(tool.input)]
+              .filter(Boolean)
+              .join(" · ")
+          : request.request_kind;
+    return {
+      id: `approval:${request.request_id}`,
+      mark: { kind: "orb", activity: { awaitingUser: true } },
+      label: "Needs approval",
+      detail,
+      secondaryAction: answerable
+        ? {
+            label: "Deny",
+            title: "Deny this request",
+            tone: "quiet",
+            testId: "composer-strip-approval-deny",
+            onClick: () =>
+              handlers.onRespond(request.request_id, {
+                decision: "deny",
+                message: "User denied",
+              }),
+          }
+        : null,
+      action: answerable
+        ? {
+            label: "Allow",
+            title: "Allow this once",
+            tone: "solid",
+            testId: "composer-strip-approval-allow",
+            onClick: () =>
+              handlers.onRespond(request.request_id, { decision: "allow" }),
+          }
+        : review,
+    };
+  });
+  return { kind: "approval", summary: rows[0], rows };
+}
+
+/** The one input field that says what a tool call is about to touch. */
+function toolInputSummary(input: unknown): string {
+  if (typeof input !== "object" || input === null) return "";
+  const record = input as Record<string, unknown>;
+  for (const key of ["command", "file_path", "notebook_path", "url", "pattern", "path"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.replace(/\s+/g, " ").trim();
+    }
+  }
+  return "";
 }
 
 const SESSION_ERROR_PREFIX = /^Session error:\s*/;

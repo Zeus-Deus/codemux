@@ -38,8 +38,16 @@ import {
   useState,
 } from "react";
 
+import { openDelegatedChat } from "@/components/chat/delegation-actions";
+import { ProviderLogo } from "@/components/chat/provider-logo";
 import { TickingText } from "@/components/chat/TickingText";
 import { AgentOrb } from "@/components/ui/agent-orb";
+import {
+  childThreadIdOf,
+  isDelegatedRow,
+  modelEffortLabel,
+  providerKindOf,
+} from "@/lib/agent-chat/delegation";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   formatElapsed,
@@ -128,6 +136,13 @@ export function SubagentsPane({
 
   const openThread = useCallback(
     (subagentId: string) => {
+      // A delegated task is a real chat of its own: open its tab rather
+      // than the read-only drill-in, which has nothing to show for it.
+      const childThread = childThreadIdOf(subagentId);
+      if (childThread) {
+        void openDelegatedChat(childThread);
+        return;
+      }
       if (threadId) requestEnterSubagent(threadId, subagentId);
     },
     [threadId, requestEnterSubagent],
@@ -458,10 +473,11 @@ function SubagentRow({
       >
         <span className="flex w-full items-center gap-2">
           <RowGlyph view={view} />
+          <DelegatedProviderMark view={view} />
           <span className="min-w-0 flex-1 truncate text-body-sm font-semibold text-foreground">
             {title}
           </span>
-          <SubagentModelBadge model={view.model} />
+          <SubagentModelBadge model={modelEffortLabel(view) ?? undefined} />
           <TickingText
             active={running}
             className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground"
@@ -507,10 +523,11 @@ function AttentionCard({
     >
       <div className="flex w-full items-center gap-2">
         <RowGlyph view={view} />
+        <DelegatedProviderMark view={view} />
         <span className="min-w-0 flex-1 truncate text-body-sm font-semibold text-foreground">
           {title}
         </span>
-        <SubagentModelBadge model={view.model} />
+        <SubagentModelBadge model={modelEffortLabel(view) ?? undefined} />
         <TickingText
           active={false}
           className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground"
@@ -525,7 +542,7 @@ function AttentionCard({
       </p>
       <div className="mt-1 flex items-center gap-1 pl-7">
         <CardAction onClick={onOpen} disabled={!canOpen}>
-          Open thread
+          {isDelegatedRow(view) ? "Open chat" : "Open thread"}
         </CardAction>
         <CardAction onClick={onDismiss}>Dismiss</CardAction>
       </div>
@@ -753,6 +770,13 @@ function SubagentModelBadge({ model }: { model?: string }) {
       <span className="truncate">{value}</span>
     </span>
   );
+}
+
+/** A delegated row's provider mark: the task runs on another agent, and
+ *  the row opens that agent's chat. Nothing for native subagents. */
+function DelegatedProviderMark({ view }: { view: SubagentView }) {
+  const provider = isDelegatedRow(view) ? providerKindOf(view.agentType) : null;
+  return provider ? <ProviderLogo provider={provider} className="size-3.5" /> : null;
 }
 
 function elapsedLabel(view: SubagentView, now: number): string {

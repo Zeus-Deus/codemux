@@ -33,6 +33,37 @@ use super::protocol::{
 };
 use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
+fn resolve_catalog_service_tier(
+    models: &[super::protocol::ModelEntry],
+    model: Option<&str>,
+    tier: &str,
+) -> String {
+    let entry = model
+        .and_then(|id| {
+            models
+                .iter()
+                .find(|entry| entry.id == id || entry.model == id)
+        })
+        .or_else(|| {
+            if model.is_none() {
+                models.iter().find(|entry| entry.is_default)
+            } else {
+                None
+            }
+        });
+    let Some(entry) = entry else {
+        return "default".into();
+    };
+    let tiers = super::capabilities::service_tiers_for_model(entry);
+    if tiers.iter().any(|option| option.value == tier) {
+        return tier.into();
+    }
+    if tier == "fast" && tiers.iter().any(|option| option.value == "priority") {
+        return "priority".into();
+    }
+    "default".into()
+}
+
 /// Default per-request timeout, mirroring the upstream reference's
 /// `sendRequest(..., 20_000)` default.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -105,6 +136,8 @@ pub struct CodexSpawnConfig {
     pub client_info: ClientInfo,
     /// Shared MCP registry used to publish and execute dynamic tools.
     pub mcp_registry: Option<McpRegistry>,
+    /// Device to run `codex app-server` on over SSH; `None` runs it here.
+    pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
 }
 
 /// Runtime-mutable state inside a [`CodexSession`].
@@ -130,7 +163,8 @@ pub(crate) struct CodexSessionState {
     /// Service-speed tier applied to subsequent `turn/start` requests.
     /// Codex accepts this per turn, so changing Fast mode does not require
     /// rebuilding or resuming the provider thread.
-    pub fast_mode: bool,
+    pub service_tier: String,
+    pub tier_models: Vec<super::protocol::ModelEntry>,
     /// Follow-up turns queued while a turn was in flight, in FIFO
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
@@ -240,6 +274,10 @@ pub(crate) struct CodexSession {
     /// learn the caller from its env.
     workspace_id: Option<String>,
     managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
+    /// This session as a host-tool caller. Its permission mode is the one
+    /// the session started with: Codex cannot change mode mid-session, and
+    /// the host tools it lists are fixed at `thread/start`.
+    host_caller: crate::mcp::registry::HostCaller,
 }
 
 impl CodexSession {
@@ -256,7 +294,7 @@ impl CodexSession {
         model: Option<String>,
         permission_mode: Option<String>,
         effort: Option<String>,
-        fast_mode: bool,
+        service_tier: String,
         resume_cursor: Option<Value>,
         caller_env: Option<HashMap<String, String>>,
         // Owning workspace of the calling chat pane; stored on the
@@ -276,7 +314,9 @@ impl CodexSession {
         // point at Codemux's managed config dir regardless of what the
         // workspace env carries.
         let mut env = caller_env.unwrap_or_default();
-        if let Some(home) = spawn.codex_home.as_ref() {
+        // A device uses its own `~/.codex`; a local CODEX_HOME path means
+        // nothing there.
+        if let (Some(home), None) = (spawn.codex_home.as_ref(), spawn.remote.as_ref()) {
             env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
         }
 
@@ -312,10 +352,33 @@ impl CodexSession {
             )
             .await?
         } else {
-            Arc::new(
-                JsonRpcChild::spawn(SpawnConfig {
+            let args = vec!["app-server".to_string()];
+            let child = match spawn.remote.as_ref() {
+                #[cfg(unix)]
+                Some(remote) => {
+                    let codex =
+                        crate::ssh::sidecar::device_program(remote, &spawn.codex_binary).await?;
+                    JsonRpcChild::spawn(crate::ssh::sidecar::device_spawn_config(
+                        remote,
+                        &codex,
+                        &args,
+                        &env,
+                        &cwd,
+                        DEFAULT_RPC_TIMEOUT,
+                    )?)
+                    .await
+                    .map_err(crate::ssh::sidecar::ssh_spawn_error)?
+                }
+                #[cfg(not(unix))]
+                Some(_) => {
+                    return Err(ProviderError::ValidationError {
+                        message: "Threads on another device need macOS or Linux on this computer"
+                            .into(),
+                    })
+                }
+                None => JsonRpcChild::spawn(SpawnConfig {
                     program: spawn.codex_binary.clone(),
-                    args: vec!["app-server".into()],
+                    args,
                     env,
                     cwd: Some(cwd.clone()),
                     default_timeout: DEFAULT_RPC_TIMEOUT,
@@ -325,7 +388,8 @@ impl CodexSession {
                     message: "failed to spawn `codex app-server`".into(),
                     source: Some(e.to_string()),
                 })?,
-            )
+            };
+            Arc::new(child)
         };
 
         let mut startup_guard = child.managed_startup_guard();
@@ -354,8 +418,27 @@ impl CodexSession {
             child
                 .request("initialize", init_params)
                 .await
-                .map_err(|e| ProviderError::RpcError {
-                    message: format!("initialize failed: {e}"),
+                .map_err(|e| {
+                    // `initialize` is the first thing a device-side child
+                    // answers, so an install or connection problem there
+                    // surfaces here.
+                    #[cfg(unix)]
+                    if let Some(error) = spawn.remote.as_ref().and_then(|remote| {
+                        crate::ssh::sidecar::device_start_error(
+                            &e,
+                            crate::agent_provider::ProviderKind::Codex,
+                            remote,
+                            format!(
+                                "Install the Codex CLI on {} and run `codex login` there",
+                                remote.host_name
+                            ),
+                        )
+                    }) {
+                        return error;
+                    }
+                    ProviderError::RpcError {
+                        message: format!("initialize failed: {e}"),
+                    }
                 })?;
             child
                 .notify("initialized", json!({}))
@@ -365,6 +448,18 @@ impl CodexSession {
                 })?;
         }
 
+        let host_caller = crate::mcp::registry::HostCaller {
+            thread_id: thread_id.0.clone(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: workspace_id.clone(),
+            permission_mode: permission_mode.clone(),
+        };
+        // A session on a device publishes none of this computer's tools and
+        // keeps no registry to run the device's tool calls through.
+        let mcp_registry = crate::agent_provider::local_tool_registry(
+            spawn.mcp_registry.as_ref(),
+            spawn.remote.as_ref(),
+        );
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
@@ -383,43 +478,49 @@ impl CodexSession {
                     .collect(),
             )
         } else {
-            match spawn.mcp_registry.as_ref() {
-                Some(registry) => {
-                    let tools = if spawn.codex_home.is_none() {
-                        registry
-                            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
-                            .await
-                    } else {
-                        registry.list_all_tools().await
-                    };
-                    Some(
-                        tools
-                            .into_iter()
-                            .map(|tool| DynamicToolSpec::Function {
-                                name: codex_dynamic_tool_name(&tool.prefixed_name),
-                                description: tool.description.unwrap_or_default(),
-                                input_schema: tool.input_schema,
-                                defer_loading: None,
-                            })
-                            .collect(),
-                    )
-                }
-                None => None,
-            }
+            // Host tools are decided here too, from the mode the session starts
+            // in, so a Codex chat only ever lists what it could actually use.
+            dynamic_tool_specs(
+                mcp_registry.as_ref(),
+                spawn.codex_home.is_some(),
+                &host_caller,
+            )
+            .await
         };
 
         // Best-effort probes. Failures are non-fatal — we log via
         // RuntimeWarning and continue.
-        match child.request("model/list", json!({})).await {
-            Ok(_) => {}
+        let tier_models = match child.request("model/list", json!({})).await {
+            Ok(value) => match serde_json::from_value::<super::protocol::ModelListResponse>(value) {
+                Ok(response) => response.data,
+                Err(error) => {
+                    let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(thread_id.clone()),
+                        message: format!("model/list decode failed: {error}"),
+                        original_payload: None,
+                    });
+                    vec![]
+                }
+            },
             Err(e) => {
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
                     message: format!("model/list probe failed: {e}"),
                     original_payload: None,
                 });
+                vec![]
             }
+        };
+        let resolved_tier =
+            resolve_catalog_service_tier(&tier_models, model.as_deref(), &service_tier);
+        if resolved_tier == "default" && service_tier != "default" {
+            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: "service-tier-fallback: Saved service tier could not be verified for this model/account; using Standard.".into(),
+                original_payload: None,
+            });
         }
+        let service_tier = resolved_tier;
         // account/read is the canonical "can this provider run?" check.
         // `requires_openai_auth` describes the active provider and stays true
         // for a logged-in ChatGPT/API-key account, so only gate when the
@@ -442,7 +543,12 @@ impl CodexSession {
                     let _ = child.shutdown().await;
                     return Err(ProviderError::NotAuthenticated {
                         provider: crate::agent_provider::ProviderKind::Codex,
-                        hint: "Run `codex login` and try again.".into(),
+                        hint: match spawn.remote.as_ref() {
+                            Some(remote) => {
+                                format!("Run `codex login` on {} and try again.", remote.host_name)
+                            }
+                            None => "Run `codex login` and try again.".into(),
+                        },
                     });
                 }
                 Ok(info) => {
@@ -539,7 +645,9 @@ impl CodexSession {
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
                             model: model.clone(),
-                            service_tier: Some(fast_mode.then(|| "fast".to_string())),
+                            service_tier: Some(
+                                (service_tier != "default").then(|| service_tier.clone()),
+                            ),
                             cwd: Some(cwd.clone()),
                             collaboration_mode: None,
                             approval_policy,
@@ -575,7 +683,7 @@ impl CodexSession {
                                     cwd.clone(),
                                     model.clone(),
                                     permission_mode.clone(),
-                                    fast_mode,
+                                    service_tier.clone(),
                                     dynamic_tools.clone(),
                                 )
                                 .await?
@@ -593,7 +701,7 @@ impl CodexSession {
                             cwd.clone(),
                             model.clone(),
                             permission_mode.clone(),
-                            fast_mode,
+                            service_tier.clone(),
                             dynamic_tools.clone(),
                         )
                         .await?
@@ -606,7 +714,7 @@ impl CodexSession {
                     cwd.clone(),
                     model.clone(),
                     permission_mode.clone(),
-                    fast_mode,
+                    service_tier.clone(),
                     dynamic_tools.clone(),
                 )
                 .await?
@@ -623,7 +731,8 @@ impl CodexSession {
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
-            fast_mode,
+            service_tier,
+            tier_models,
             queued_turns: VecDeque::new(),
         });
         let session = Arc::new(Self {
@@ -640,6 +749,7 @@ impl CodexSession {
             recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
             workspace_id,
             managed,
+            host_caller,
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -664,7 +774,7 @@ impl CodexSession {
         let requests_task = spawn_incoming_requests_task(
             Arc::clone(&session),
             Arc::clone(&child),
-            spawn.mcp_registry.clone(),
+            mcp_registry,
             incoming_rx,
             event_tx.clone(),
             shutdown_tx.subscribe(),
@@ -1197,13 +1307,17 @@ impl CodexSession {
         effort_override: Option<String>,
         client_id: Option<String>,
     ) -> Result<TurnId, TurnStartError> {
-        let (codex_thread_id, model_default, effort_default, fast_mode) = {
+        let (codex_thread_id, model_default, effort_default, service_tier) = {
             let state = self.state.lock().await;
             (
                 state.codex_thread_id.clone(),
                 state.model.clone(),
                 state.default_effort.clone(),
-                state.fast_mode,
+                resolve_catalog_service_tier(
+                    &state.tier_models,
+                    model_override.as_deref().or(state.model.as_deref()),
+                    &state.service_tier,
+                ),
             )
         };
 
@@ -1233,7 +1347,7 @@ impl CodexSession {
             // thread keeps whatever tier the user configured. Send an explicit
             // `default` when Fast is off: omission would inherit the thread's
             // tier and silently keep a previous Fast turn's speed.
-            service_tier_for_turn: Some(if fast_mode { "fast" } else { "default" }.into()),
+            service_tier_for_turn: Some(service_tier),
             effort,
             collaboration_mode,
         };
@@ -1527,9 +1641,40 @@ impl CodexSession {
 
     /// Update the service tier used by subsequent turns without replacing
     /// the Codex app-server or its loaded thread.
-    pub async fn set_fast_mode(&self, fast_mode: bool) {
+    pub async fn set_service_tier(&self, tier: String) -> Result<(), ProviderError> {
+        // Refresh when choosing a premium tier: entitlement can change while
+        // the conversation stays alive. Standard always clears a stale choice.
+        let models = if tier != "default" {
+            let value = self
+                .child
+                .request("model/list", json!({}))
+                .await
+                .map_err(|error| ProviderError::RpcError {
+                    message: error.to_string(),
+                })?;
+            Some(
+                serde_json::from_value::<super::protocol::ModelListResponse>(value)
+                    .map_err(|error| ProviderError::RpcError {
+                        message: error.to_string(),
+                    })?
+                    .data,
+            )
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
-        state.fast_mode = fast_mode;
+        if let Some(models) = models {
+            state.tier_models = models;
+        }
+        let resolved =
+            resolve_catalog_service_tier(&state.tier_models, state.model.as_deref(), &tier);
+        if resolved == "default" && tier != "default" {
+            return Err(ProviderError::ValidationError {
+                message: "service tier is unavailable for this Codex model or account".into(),
+            });
+        }
+        state.service_tier = resolved;
+        Ok(())
     }
 
     /// Gracefully shut the session down: close the JSON-RPC child
@@ -1912,7 +2057,7 @@ async fn start_fresh_thread(
     cwd: PathBuf,
     model: Option<String>,
     permission_mode: Option<String>,
-    fast_mode: bool,
+    service_tier: String,
     dynamic_tools: Option<Vec<DynamicToolSpec>>,
 ) -> Result<String, ProviderError> {
     let managed = permission_mode.as_deref() == Some("managed-read-only");
@@ -1925,7 +2070,7 @@ async fn start_fresh_thread(
         model,
         // `Some(None)` deliberately serializes as JSON null: it clears a
         // user-level fast default so the composer's Standard choice is honest.
-        service_tier: Some(fast_mode.then(|| "fast".to_string())),
+        service_tier: Some((service_tier != "default").then(|| service_tier.clone())),
         cwd: Some(cwd),
         collaboration_mode: None,
         approval_policy,
@@ -1987,7 +2132,7 @@ fn is_recoverable_resume_error(err_msg: &str) -> bool {
 /// The wire values are lowercase tags (`"pro"`, `"plus"`); the dashboard
 /// wants something a human recognizes. Unknown tags are title-cased and
 /// passed through rather than dropped, so a new plan still shows a name.
-fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
+pub(crate) fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
     let plan = plan_type?.trim();
     if plan.is_empty() {
         return None;
@@ -2140,6 +2285,7 @@ fn spawn_incoming_requests_task(
                         let result = handle_dynamic_tool_call(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),
+                            Some((&session.host_caller, session.provider_session_id.0.as_str())),
                             params,
                         )
                         .await;
@@ -2165,42 +2311,97 @@ fn spawn_incoming_requests_task(
     })
 }
 
+/// The registry's tools, plus the host tools Codemux serves to
+/// `host_caller`, as Codex dynamic tools, or `None` without a registry
+/// (including every session on a device). With Codex's own config
+/// (`codex_home_managed == false`) Codex already loads the user's Codex MCP
+/// servers itself, so those are left out to avoid duplicates.
+async fn dynamic_tool_specs(
+    registry: Option<&McpRegistry>,
+    codex_home_managed: bool,
+    host_caller: &crate::mcp::registry::HostCaller,
+) -> Option<Vec<DynamicToolSpec>> {
+    let registry = registry?;
+    let mut tools = if codex_home_managed {
+        registry.list_all_tools().await
+    } else {
+        registry
+            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
+            .await
+    };
+    tools.extend(registry.host_tools(host_caller));
+    Some(
+        tools
+            .into_iter()
+            .map(|tool| DynamicToolSpec::Function {
+                name: codex_dynamic_tool_name(&tool.prefixed_name),
+                description: tool.description.unwrap_or_default(),
+                input_schema: tool.input_schema,
+                defer_loading: None,
+            })
+            .collect(),
+    )
+}
+
 /// Execute a Codex dynamic-tool request through the process-wide registry and
-/// translate the MCP content envelope into Codex's input-content shape.
+/// translate the MCP content envelope into Codex's input-content shape. With
+/// no registry (a session on a device, which must not reach this computer's
+/// tools whatever name it sends) the call fails without dispatching.
 async fn handle_dynamic_tool_call(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
+    // The root chat's caller and its Codex thread id.
+    host: Option<(&crate::mcp::registry::HostCaller, &str)>,
     raw: Value,
 ) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
-    let (success, result) = match (registry, parsed) {
-        (Some(registry), Ok(call)) => match registry
-            .dispatch_tool_call(
-                &registry_tool_name(&call.tool),
-                call.arguments,
-                workspace_id,
-            )
-            .await
-        {
-            Ok(result) => {
-                let success = !result
-                    .get("isError")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                (success, result)
+    let dispatched = match (registry, parsed) {
+        (Some(registry), Ok(call)) => {
+            let name = registry_tool_name(&call.tool);
+            // Host tools answer synchronously (no provider waits), which
+            // matters here: this request loop handles approvals too. They act
+            // as the root chat, so a call from another thread (a native
+            // subagent that inherited the dynamic tools) is refused rather
+            // than handed the root's identity and permission mode.
+            let host = host.and_then(|(caller, root_thread)| {
+                if call.thread_id == root_thread {
+                    registry.host_call(caller, &name, &call.arguments)
+                } else {
+                    registry
+                        .host_tools(caller)
+                        .iter()
+                        .any(|tool| tool.prefixed_name == name)
+                        .then(|| {
+                            json!({
+                                "content": [{ "type": "text", "text": "This tool is only available in the main conversation, not from a subagent." }],
+                                "isError": true,
+                            })
+                        })
+                }
+            });
+            match host {
+                Some(result) => Ok(result),
+                None => {
+                    registry
+                        .dispatch_tool_call(&name, call.arguments, workspace_id)
+                        .await
+                }
             }
-            Err(message) => (
-                false,
-                json!({ "content": [{ "type": "text", "text": message }] }),
-            ),
-        },
-        (None, _) => (
+        }
+        (None, _) => Err("Codemux's tools aren't available to this thread".to_string()),
+        (_, Err(error)) => Err(format!("invalid dynamic tool call: {error}")),
+    };
+    let (success, result) = match dispatched {
+        Ok(result) => {
+            let success = !result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (success, result)
+        }
+        Err(message) => (
             false,
-            json!({ "content": [{ "type": "text", "text": "Codemux MCP registry is unavailable" }] }),
-        ),
-        (_, Err(error)) => (
-            false,
-            json!({ "content": [{ "type": "text", "text": format!("invalid dynamic tool call: {error}") }] }),
+            json!({ "content": [{ "type": "text", "text": message }] }),
         ),
     };
 
@@ -2643,6 +2844,7 @@ mod tests {
         let response = handle_dynamic_tool_call(
             Some(&registry),
             Some("ws-42"),
+            None,
             json!({
                 "threadId": "thread",
                 "turnId": "turn",
@@ -2658,9 +2860,82 @@ mod tests {
         call.assert_async().await;
     }
 
+    struct HandOffHost;
+
+    impl crate::mcp::registry::HostTools for HandOffHost {
+        fn tools_for(&self, _caller: &crate::mcp::registry::HostCaller) -> Vec<crate::mcp::runtime::McpTool> {
+            vec![crate::mcp::runtime::McpTool {
+                name: "delegate_task".into(),
+                prefixed_name: "mcp__codemux__delegate_task".into(),
+                description: None,
+                input_schema: json!({}),
+                server_id: "codemux-host".into(),
+            }]
+        }
+
+        fn call(
+            &self,
+            caller: &crate::mcp::registry::HostCaller,
+            prefixed_name: &str,
+            _arguments: &Value,
+        ) -> Option<Value> {
+            (prefixed_name == "mcp__codemux__delegate_task").then(|| {
+                json!({ "content": [{ "type": "text", "text": format!("as {}", caller.thread_id) }] })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tools_answer_only_the_root_thread() {
+        let registry = McpRegistry::new();
+        registry.set_host_tools(Arc::new(HandOffHost));
+        let caller = crate::mcp::registry::HostCaller {
+            thread_id: "codemux-chat".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: None,
+            permission_mode: Some("danger-full-access".into()),
+        };
+        let request = |thread: &str| {
+            json!({
+                "threadId": thread,
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux__delegate_task",
+                "arguments": {}
+            })
+        };
+
+        let root = handle_dynamic_tool_call(
+            Some(&registry),
+            None,
+            Some((&caller, "codex-root")),
+            request("codex-root"),
+        )
+        .await;
+        assert_eq!(root["success"], true, "{root}");
+        assert_eq!(root["contentItems"][0]["text"], "as codemux-chat");
+
+        // A native subagent that inherited the dynamic tools has its own
+        // thread id and must not act as the root chat.
+        let native_child = handle_dynamic_tool_call(
+            Some(&registry),
+            None,
+            Some((&caller, "codex-root")),
+            request("codex-native-child"),
+        )
+        .await;
+        assert_eq!(native_child["success"], false, "{native_child}");
+        assert!(native_child["contentItems"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("only available in the main conversation"));
+    }
+
     #[tokio::test]
     async fn dynamic_tool_call_without_registry_returns_failed_response() {
         let response = handle_dynamic_tool_call(
+            None,
             None,
             None,
             json!({
@@ -2677,7 +2952,49 @@ mod tests {
         assert!(response["contentItems"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("registry is unavailable"));
+            .contains("aren't available to this thread"));
+    }
+
+    #[tokio::test]
+    async fn device_session_gets_and_runs_none_of_this_computers_tools() {
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let caller = crate::mcp::registry::HostCaller {
+            thread_id: "codemux-chat".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: Some("ws-42".into()),
+            permission_mode: None,
+        };
+        let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
+        let published = dynamic_tool_specs(local.as_ref(), false, &caller).await.unwrap();
+        assert_eq!(published.len(), 1);
+
+        let device = crate::agent_provider::types::RemoteSpawnTarget {
+            host_id: 3,
+            ssh_target: "deus@ai-node".into(),
+            host_name: "ai-node".into(),
+        };
+        let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
+        assert!(dynamic_tool_specs(on_device.as_ref(), true, &caller).await.is_none());
+
+        // A call the device sends anyway, by a name it guessed, fails and
+        // never reaches the registry.
+        let response = handle_dynamic_tool_call(
+            on_device.as_ref(),
+            Some("ws-42"),
+            None,
+            json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux-remote__echo",
+                "arguments": {"text": "hi"}
+            }),
+        )
+        .await;
+        assert_eq!(response["success"], false);
+        assert!(!call.matched_async().await);
     }
 
     fn rpc_failure(code: i64) -> TurnStartError {

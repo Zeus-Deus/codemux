@@ -112,6 +112,9 @@ export interface ProviderAuthStatus {
   username: string | null;
   /** What may be *done* here, per operation — see `ProviderOperations`. */
   operations: ProviderOperations;
+  /** `false` only when git answered that this checkout has no remote.
+   *  Absent is treated as having one. */
+  has_remote?: boolean;
 }
 
 /** Mirrors src-tauri/src/git_provider/provider.rs:OperationCapabilities.
@@ -173,6 +176,14 @@ export interface PrReviewThread {
   is_resolvable: boolean;
   path: string | null;
   line: number | null;
+  /** Which column `line` counts in. Absent from older payloads, where
+   *  RIGHT (the new file) is the safe reading. */
+  side?: "LEFT" | "RIGHT" | null;
+  /** First line of a multi-line thread. */
+  start_line?: number | null;
+  /** Which column `start_line` counts in; GitHub lets a range start on
+   *  the other side from where it ends. Absent ⇒ the same as `side`. */
+  start_side?: "LEFT" | "RIGHT" | null;
   comments: PrThreadComment[];
 }
 
@@ -591,6 +602,12 @@ export interface CommitSummary {
   body: string;
 }
 
+/** Mirrors src-tauri/src/ai.rs:PrDescriptionDraft. */
+export interface PrDescriptionDraft {
+  title: string;
+  body: string;
+}
+
 export interface EditorInfo {
   id: string;
   name: string;
@@ -613,12 +630,33 @@ export interface WorktreeInfo {
   is_bare: boolean;
 }
 
+/** Everything the user typed into the New Workspace dialog. Kept on the
+ *  pending row so a failed create can reopen the dialog with the prompt,
+ *  attachments and linked issue intact instead of losing them. */
+export interface NewWorkspaceDraft {
+  projectDir: string;
+  workspaceName: string;
+  branchName: string;
+  branchAutoFilled: boolean;
+  prompt: string;
+  attachments: string[];
+  linkedIssue: GitHubIssue | null;
+  selectedAgentId: string | null;
+  modelSelection: ModelSelection;
+  baseBranch: string;
+  branchMode: "create_new" | "open_existing";
+  openExistingBranch: string | null;
+}
+
 export interface PendingWorkspace {
   id: string;
   name: string;
   projectPath: string;
   status: "creating" | "failed";
   errorMessage?: string;
+  /** Present when the row came from the New Workspace dialog. A failed
+   *  row with a draft stays until the user retries or dismisses it. */
+  draft?: NewWorkspaceDraft;
 }
 
 export interface PullRequestInfo {
@@ -749,6 +787,8 @@ export interface GhRateLimit {
 export interface PrsOverview {
   viewer: string | null;
   items: PrOverviewItem[];
+  /** The checkout has no remote, so there was nothing to list. */
+  local_only?: boolean;
 }
 
 export interface CheckInfo {
@@ -775,6 +815,9 @@ export interface InlineReviewComment {
   body: string;
   path: string;
   line: number | null;
+  /** Which column `line` counts in: LEFT for a comment on a deleted
+   *  line. Absent ⇒ RIGHT, the new file. */
+  side?: "LEFT" | "RIGHT" | null;
   created_at: string;
   in_reply_to_id: number | null;
   pull_request_review_id: number | null;
@@ -885,6 +928,7 @@ export type AgentChatProviderKind =
   | "cursor"
   | "grok"
   | "hermes"
+  | "acp"
   | "opencode";
 
 /** Launch-time model / reasoning / context choice for a CLI agent
@@ -977,6 +1021,12 @@ export interface ContextWindowOption {
   context_window_tokens?: number | null;
 }
 
+export interface ServiceTierOption {
+  value: string;
+  label: string;
+  description: string;
+}
+
 export interface ChatModelInfo {
   id: string;
   label: string;
@@ -994,6 +1044,8 @@ export interface ChatModelInfo {
   supports_adaptive_thinking: boolean;
   supports_thinking_toggle: boolean;
   supports_fast_mode: boolean;
+  /** Provider-advertised tiers; missing on older capability payloads. */
+  service_tiers?: ServiceTierOption[];
   /** Step 8 Stage 6 — true when the model accepts image attachments.
    *  Drives the `+ → Image…` enable state and whether the composer's
    *  paste/drop handlers stage attachments at all. */
@@ -1157,6 +1209,10 @@ export interface WorkspaceSnapshot {
    *  "open on host" / attach-in-place workspaces (terminals spawn here
    *  on the remote). `null`/undefined for local + pushed workspaces. */
   remote_cwd?: string | null;
+  /** The project's checkout ON ITS HOST for an attach-in-place
+   *  workspace. A thread started on a device keeps this computer's path in
+   *  `project_root` for sidebar grouping. `null`/undefined elsewhere. */
+  remote_root?: string | null;
   /** True when this workspace is operated in place on its host with no
    *  local copy of the files (`cwd` is a host path). The UI shows a
    *  host badge and offers only "Close (detach)" — never delete/push.
