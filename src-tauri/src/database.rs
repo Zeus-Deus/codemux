@@ -5488,6 +5488,20 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Hard-delete a session row only while it is still pending approval.
+    /// Returns whether a row was removed, so a browser withdrawing its own
+    /// request can tell "withdrawn" from "approved in the meantime".
+    pub fn web_remote_delete_pending_session(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn
+            .execute(
+                "DELETE FROM web_remote_sessions WHERE id = ?1 AND approved = 0",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to withdraw web_remote session: {e}"))?;
+        Ok(removed > 0)
+    }
+
     /// Hard-delete a session row. Used by the reject flow — a rejected
     /// pending device leaves no trace.
     pub fn web_remote_delete_session(&self, id: &str) -> Result<(), String> {
