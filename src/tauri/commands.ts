@@ -152,6 +152,9 @@ export const signupEmail = (email: string, password: string, name: string) =>
 export const forgotPassword = (email: string) =>
   invoke<void>("forgot_password", { email });
 
+export const resendVerificationEmail = (email: string) =>
+  invoke<void>("resend_verification_email", { email });
+
 export const checkAuth = () =>
   invoke<AuthUser | null>("check_auth");
 
@@ -482,9 +485,6 @@ export const resizeActivePane = (delta: number) =>
 
 export const notifyAttention = (message: string, sessionId: string, paneId: string) =>
   invoke<string>("notify_attention", { message, sessionId, paneId });
-
-export const setNotificationSoundEnabled = (enabled: boolean) =>
-  invoke("set_notification_sound_enabled", { enabled });
 
 export const createBrowserPane = (paneId: string, url?: string) =>
   invoke<string>("create_browser_pane", { paneId, url: url ?? null });
@@ -882,9 +882,13 @@ export const submitPrReview = (path: string, prNumber: number, event: string, bo
 
 /** The whole unified diff, for the Code tab. Uncapped where
  *  `getGithubPrDiffByPath` is capped at 100 KB, and uncached on the
- *  backend so a force-push shows the new patch immediately. */
-export const getPrReviewDiff = (path: string, prNumber: number) =>
-  invoke<string>("get_pr_review_diff", { path, prNumber });
+ *  backend so a force-push shows the new patch immediately. Supplying the
+ *  cache key's SHA makes GitHub reject a patch read across a head change. */
+export const getPrReviewDiff = (path: string, prNumber: number, expectedHeadSha?: string | null) =>
+  invoke<string>("get_pr_review_diff", {
+    path, prNumber,
+    ...(expectedHeadSha == null ? {} : { expectedHeadSha }),
+  });
 
 /** The host's own history of a pull request, oldest first.
  *
@@ -1476,6 +1480,11 @@ export const readFile = (path: string) =>
 export const writeFile = (path: string, content: string) =>
   invoke<void>("write_file", { path, content });
 
+/** Opaque size + mtime token. Cheap enough to poll; when it moves, re-read
+ *  the file to learn whether its content actually changed. */
+export const fileSignature = (path: string) =>
+  invoke<string>("file_signature", { path });
+
 export const grepCountPattern = (cwd: string, pattern: string) =>
   invoke<number>("grep_count_pattern", { cwd, pattern });
 
@@ -1687,12 +1696,34 @@ export const agentChatStartSession = async (
   input: AgentChatStartSessionInput,
   expectedThread: string | null = null,
 ) => {
+  let acpStartEpoch: number | undefined;
   if (provider === "hermes") {
     const { useHermes } = await import("@/stores/hermes-store");
     const profile = useHermes.getState().selections[input.thread_id];
     if (profile) input = { ...input, permission_mode: useHermes.getState().modes[input.thread_id] ?? input.permission_mode, extra: { hermes_profile: profile } };
   }
-  return invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+  if (provider === "acp") {
+    const { useCustomAcp, acpLifecycleEpoch } = await import("@/stores/custom-acp-store");
+    const state = useCustomAcp.getState();
+    const binding = await state.restore(input.thread_id);
+    const extra: Record<string, unknown> = input.extra && typeof input.extra === "object" && !Array.isArray(input.extra) ? input.extra as Record<string, unknown> : {};
+    const explicitId = typeof extra.acp_agent_id === "string" ? extra.acp_agent_id : null;
+    if (binding && explicitId !== null && explicitId !== binding.agent_id) throw new Error("This thread is bound to a different custom agent.");
+    const agentId = binding?.agent_id ?? explicitId ?? useCustomAcp.getState().selections[input.thread_id];
+    if (!agentId) throw new Error("Choose a custom agent before starting this chat.");
+    input = { ...input, permission_mode: null, extra: { ...(input.extra && typeof input.extra === "object" && !Array.isArray(input.extra) ? input.extra : {}), acp_agent_id: agentId } };
+    acpStartEpoch = acpLifecycleEpoch(input.thread_id);
+  }
+  const threadId = await invoke<string>("agent_chat_start_session", { paneId, provider, input, expectedThread });
+  if (provider === "acp") {
+    const { useCustomAcp } = await import("@/stores/custom-acp-store");
+    const binding = await useCustomAcp.getState().restore(threadId);
+    if (!binding) throw new Error("Custom agent session started, but its durable binding could not be verified. Reopen this chat before sending.");
+    // The start invoke, not durable metadata, is the process evidence.
+    // Keep any lifecycle/read evidence admitted during the metadata gap.
+    useCustomAcp.getState().markLive(threadId, true, acpStartEpoch);
+  }
+  return threadId;
 };
 
 export const agentChatSendTurn = (
@@ -1930,10 +1961,16 @@ export const agentChatSetPermissionMode = (
     mode,
   });
 
-export const agentChatStopSession = (
+export const agentChatStopSession = async (
   provider: AgentChatProviderKind,
   threadId: string,
-) => invoke<void>("agent_chat_stop_session", { provider, threadId });
+) => {
+  await invoke<void>("agent_chat_stop_session", { provider, threadId });
+  if (provider === "acp") {
+    const { useCustomAcp } = await import("@/stores/custom-acp-store");
+    useCustomAcp.getState().markLive(threadId, false);
+  }
+};
 
 // ── Session history (pane-header dropdown) ──
 
@@ -2442,6 +2479,8 @@ export interface PlanUsageWindow {
   /** Unix ms when the window rolls over, when the provider said. */
   resets_at_ms: number | null;
   label?: string | null;
+  /** Window length in minutes, when known — places the even-pace mark. */
+  window_mins?: number | null;
 }
 
 /** One provider's live plan-quota reading. Absent for providers that
@@ -2472,9 +2511,29 @@ export interface UsageComposition {
 export interface CostConfidence {
   provider_reported_share: number;
   table_priced_share: number;
+  /** Share of cost priced from the user's own model prices. */
+  override_priced_share: number;
   /** Share of TOKENS from unpriced rows (a cost share would always be 0). */
   unpriced_token_share: number;
   cache_savings_usd: number;
+}
+
+/** Cost split by the kind of token that incurred it. `unsplit` holds
+ *  provider-reported cost for models with no known rates to split by. */
+export interface CategoryCost {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  unsplit: number;
+}
+
+/** Per-model rates, USD per million tokens. */
+export interface PriceOverride {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
 }
 
 /** One row of the flat, cross-provider model breakdown. */
@@ -2485,6 +2544,20 @@ export interface FlatModelUsage {
   cost_usd: number;
   priced: boolean;
   provider_reported: boolean;
+  /** Priced from the user's own model price. */
+  price_overridden: boolean;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  unpriced_tokens: number;
+  session_count: number;
+  category_cost: CategoryCost;
+  /** The rates the model is priced at (override, else the static table). */
+  rates: PriceOverride | null;
+  /** This model's slice of every bucket, aligned with `UsageSummary.buckets`. */
+  buckets: UsageBucketSlice[];
 }
 
 export interface UsageSummary {
@@ -2495,6 +2568,8 @@ export interface UsageSummary {
   providers: UsageProvider[];
   totals: UsageTotals;
   composition: UsageComposition;
+  /** The period's cost split by token kind. */
+  category_cost: CategoryCost;
   confidence: CostConfidence;
   /** Flat cross-provider model breakdown, most expensive first. */
   models: FlatModelUsage[];
@@ -2541,6 +2616,41 @@ export interface UsageImportReport {
  *  and safe to call repeatedly. */
 export const usageScanProviderHistory = () =>
   invoke<UsageImportReport>("usage_scan_provider_history");
+
+export type QuotaProbeOutcome =
+  | "ok"
+  | "unavailable"
+  | "failed"
+  | "not_installed";
+
+export interface QuotaProbeStatus {
+  provider: string;
+  outcome: QuotaProbeOutcome;
+  message?: string;
+}
+
+export interface QuotaRefreshReport {
+  quota: Record<string, ProviderQuota>;
+  /** Empty when the call joined a refresh already in flight. */
+  statuses: QuotaProbeStatus[];
+  refreshed_at_ms: number;
+}
+
+/** Ask Claude and Codex for their plan limits now, rather than waiting
+ *  for a session to report them. Spawns each CLI briefly. */
+export const usageRefreshQuota = () =>
+  invoke<QuotaRefreshReport>("usage_refresh_quota");
+
+/** The user's per-model prices, keyed by model id. */
+export const usagePriceOverrides = () =>
+  invoke<Record<string, PriceOverride>>("usage_price_overrides");
+
+/** Set a model's price, or remove it with `null`. Returns every override. */
+export const usageSetPriceOverride = (model: string, price: PriceOverride | null) =>
+  invoke<Record<string, PriceOverride>>("usage_set_price_override", {
+    model,
+    price,
+  });
 
 // ── Skills ──
 
@@ -2865,9 +2975,9 @@ export interface HostStatusView {
   reachable: boolean;
   /** ISO timestamp of the last successful probe; null if never reached. */
   last_seen_at: string | null;
-  /** Last probe problem: the unreachable reason, or — while reachable — a
-   *  degraded note such as the host agent being missing or the inventory
-   *  failing. Null when clean. */
+  /** Last probe problem: the unreachable reason, or — while reachable —
+   *  why the device needs setup (host agent missing, damaged or out of
+   *  date). Null when clean. */
   last_error: string | null;
   /** Sum of the host's workspace directories in bytes; null if unknown. */
   disk_bytes: number | null;
@@ -2921,6 +3031,13 @@ export const hostsBootstrapInstall = (id: number, uname: string) =>
  *  Test connection is required. */
 export const hostsReinstallRemote = (id: number) =>
   invoke<HostBootstrapResult>("hosts_reinstall_remote", { id });
+
+/** This machine's hostname, shown as the local device ("ai-node"). */
+export const getLocalDeviceName = () => invoke<string>("get_local_device_name");
+
+/** Host aliases from `~/.ssh/config`, offered as suggestions when adding a
+ *  device. Wildcard patterns are skipped. */
+export const hostsSshConfigHosts = () => invoke<string[]>("hosts_ssh_config_hosts");
 
 // ── Automations (scheduled agent runs) ──
 //
@@ -3223,6 +3340,38 @@ export interface OpenOnHostOutcome {
  *  re-activates the existing local view. */
 export const workspaceOpenOnHost = (syncRowId: number) =>
   invoke<OpenOnHostOutcome>("workspace_open_on_host", { syncRowId });
+
+export interface CreateWorkspaceOnHostRequest {
+  hostId: number;
+  /** Local project root that identifies the repo. The device gets its own
+   *  checkout from the project's git remote (cloned on first use). `null`
+   *  starts in the device's home directory. */
+  projectPath: string | null;
+  /** Worktree branch to create on the device when `newBranch`. */
+  branch: string | null;
+  /** Create a new worktree; false works in the device's checkout. */
+  newBranch: boolean;
+  /** Branch the new worktree starts from; null = the repo default. */
+  baseBranch: string | null;
+  initialChat?: InitialChatPane;
+  select?: boolean;
+}
+
+/** Create a workspace that lives on a device: the checkout, terminals and
+ *  agent all run there. Returns the workspace id and its path on the
+ *  device. */
+export const createWorkspaceOnHost = (
+  req: CreateWorkspaceOnHostRequest,
+): Promise<WorkspaceCreateResult> =>
+  invoke<unknown>("create_workspace_on_host", {
+    hostId: req.hostId,
+    projectPath: req.projectPath,
+    branch: req.branch,
+    newBranch: req.newBranch,
+    baseBranch: req.baseBranch,
+    ...(req.initialChat ? { initialChat: req.initialChat } : {}),
+    ...(req.select !== undefined ? { select: req.select } : {}),
+  }).then(normalizeWorkspaceCreate);
 
 // ── Web Remote Access ──
 //

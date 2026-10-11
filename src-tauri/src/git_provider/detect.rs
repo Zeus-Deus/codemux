@@ -519,6 +519,16 @@ pub fn detect_provider(repo_path: &Path) -> DetectedProvider {
     try_detect_provider(repo_path).unwrap_or_else(|_| DetectedProvider::unknown())
 }
 
+/// A git checkout with no remote at all: everything in it is local, so
+/// there is no host to sign in to and no pull request to list.
+///
+/// Distinct from an unrecognised host (which has a remote) and from a
+/// failed probe or a folder that is not a repository (git gave no
+/// answer); both of those stay `false`.
+pub fn has_no_remote(repo_path: &Path) -> bool {
+    matches!(try_detect_provider(repo_path), Ok(detected) if detected.remote_name.is_none())
+}
+
 /// Classify a checkout while retaining the difference between an authoritative
 /// `Unknown` and a failed/timed-out git probe.
 ///
@@ -1056,6 +1066,25 @@ upstream\thttps://gitlab.com/g/p.git (push)
         assert_eq!(detect_provider(&repo).kind, ProviderKind::GitHub);
 
         invalidate_detection_cache(Some(&repo));
+    }
+
+    #[test]
+    fn only_a_repository_without_remotes_has_no_remote() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        assert!(!has_no_remote(repo), "a folder git can't read is not local-only");
+        invalidate_detection_cache(Some(repo));
+
+        git(repo, &["init"]);
+        assert!(has_no_remote(repo));
+
+        git(
+            repo,
+            &["remote", "add", "origin", "git@git.acme.internal:acme/app.git"],
+        );
+        invalidate_detection_cache(Some(repo));
+        assert!(!has_no_remote(repo), "an unrecognised host still has a remote");
+        invalidate_detection_cache(Some(repo));
     }
 
     /// An authoritative `Unknown` is cached — but only for the short

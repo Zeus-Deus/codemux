@@ -1,5 +1,11 @@
 import { create } from "zustand";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { hostsList, type HostView } from "@/tauri/commands";
+
+/** Event name emitted (no payload) when an account sync changed the device
+ *  list — devices added, renamed or removed on another computer. Mirrors
+ *  `hosts_sync::HOSTS_CHANGED_EVENT`. */
+export const HOSTS_CHANGED_EVENT = "hosts-changed";
 
 /**
  * Single source of truth for the user's configured SSH hosts.
@@ -13,11 +19,12 @@ import { hostsList, type HostView } from "@/tauri/commands";
  * pure redundant work. Caching here collapses that to a single
  * round-trip with subscription-based reuse across consumers.
  *
- * Refresh model is explicit: callers that know they mutated hosts
- * (add/update/delete) call `refresh()` after the Tauri command
- * resolves. No subscription to a backend event yet — the surface
- * mutating the list is always the same surface that needs the
- * refresh, so explicit invalidation is simpler than wiring an event.
+ * Refresh model: callers that know they mutated hosts (add/update/
+ * delete) call `refresh()` after the Tauri command resolves. Changes
+ * nobody here made — an account sync pulling devices added, renamed or
+ * removed on another computer — arrive as the backend's `hosts-changed`
+ * event, which one listener (started by the first `init()`) turns into
+ * a `refresh()`.
  *
  * `init()` is idempotent: callers can call it on mount without
  * worrying about double-fetch. The first call kicks off the
@@ -45,6 +52,24 @@ interface HostsStore {
 }
 
 let inFlight: Promise<void> | null = null;
+let changesListener: Promise<UnlistenFn | void> | null = null;
+
+/** Reload on `hosts-changed`. One listener for the app's lifetime, like
+ *  the store itself. */
+function listenForChanges(): void {
+  if (changesListener) return;
+  changesListener = listen(HOSTS_CHANGED_EVENT, () => {
+    // A load already in flight may have read the list before this
+    // change landed, so reload once it settles.
+    const pending = inFlight;
+    if (pending) void pending.then(() => useHostsStore.getState().refresh());
+    else void useHostsStore.getState().refresh();
+  }).catch(() => {
+    // No event bus (e.g. outside Tauri): the explicit refreshes still
+    // work, and the next init retries.
+    changesListener = null;
+  });
+}
 
 export const useHostsStore = create<HostsStore>((set, get) => ({
   hosts: [],
@@ -53,6 +78,7 @@ export const useHostsStore = create<HostsStore>((set, get) => ({
   loaded: false,
 
   init: () => {
+    listenForChanges();
     if (get().loaded || inFlight) {
       return inFlight ?? Promise.resolve();
     }
@@ -60,6 +86,7 @@ export const useHostsStore = create<HostsStore>((set, get) => ({
   },
 
   refresh: () => {
+    listenForChanges();
     if (inFlight) {
       return inFlight;
     }
@@ -88,6 +115,8 @@ export const useHostsStore = create<HostsStore>((set, get) => ({
  *  this file's compilation unit need access. */
 export function __resetHostsStoreForTests() {
   inFlight = null;
+  void changesListener?.then((unlisten) => unlisten?.());
+  changesListener = null;
   useHostsStore.setState({
     hosts: [],
     loading: false,

@@ -7,13 +7,20 @@
  * React state alone can't promise that — the panel unmounts when the
  * pane deck switches tabs — so the text lives here, outside the tree.
  *
- * Equally deliberate: it is *only* here. Nothing is written to disk or
- * to the backend. A two-day-old draft resurfacing on a PR you've since
- * forgotten is worse than retyping a sentence, so these die with the
- * page.
+ * Equally deliberate: drafts are *only* here. Nothing typed is written to
+ * disk or to the backend. A two-day-old draft resurfacing on a PR you've
+ * since forgotten is worse than retyping a sentence, so these die with
+ * the page. The diff view preferences at the bottom are the exception:
+ * they are settings, not drafts.
  */
 
 import { useSyncExternalStore } from "react";
+import {
+  getDiffLayoutPreference,
+  getHideWhitespacePreference,
+  useSettingsStore,
+  type DiffLayoutPreference,
+} from "@/stores/settings-store";
 import {
   indexDiffRows,
   reanchor,
@@ -261,28 +268,28 @@ export function useViewedFiles(key: DraftKey): ReadonlySet<string> {
 
 // ── Diff view preferences ──
 //
-// Split-vs-unified and whitespace are habits, not per-PR decisions —
-// remembered once for the session, like the merge strategy above.
+// Split-vs-unified and whitespace are habits, not per-PR decisions. They
+// are the Settings → Git → Diffs defaults, so a toggle here also becomes
+// the starting state for the next review.
 
-export type DiffLayout = "unified" | "split";
-
-let diffLayout: DiffLayout = "unified";
-let ignoreWhitespacePref = false;
+export type DiffLayout = DiffLayoutPreference;
 
 export function getDiffLayout(): DiffLayout {
-  return diffLayout;
+  return getDiffLayoutPreference();
 }
 
 export function setDiffLayout(layout: DiffLayout): void {
-  diffLayout = layout;
+  useSettingsStore.getState().set("diff.layout", layout);
 }
 
 export function getIgnoreWhitespace(): boolean {
-  return ignoreWhitespacePref;
+  return getHideWhitespacePreference();
 }
 
 export function setIgnoreWhitespace(value: boolean): void {
-  ignoreWhitespacePref = value;
+  useSettingsStore
+    .getState()
+    .set("diff.hide_whitespace", value ? "true" : "false");
 }
 
 // ── Re-anchoring ──
@@ -416,8 +423,16 @@ export function _resetPrDrafts(): void {
   diffSnapshots.clear();
   viewedFiles.clear();
   mergeStrategy = "squash";
-  diffLayout = "unified";
-  ignoreWhitespacePref = false;
+  // The view preferences live in the settings store; drop them back to
+  // their defaults in memory only.
+  useSettingsStore.setState((s) => {
+    const {
+      "diff.layout": _layout,
+      "diff.hide_whitespace": _whitespace,
+      ...settings
+    } = s.settings;
+    return { settings };
+  });
   seq = 0;
   notify();
 }

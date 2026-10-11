@@ -59,6 +59,27 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // before it waits for the user); the composer strip always offers a
   // manual Resume either way.
   "agents.auto_resume_usage_limit": "true",
+  // What a brand-new chat draft starts with. An empty provider means
+  // "Automatic": Claude on its provider-default model, the behavior before
+  // these keys existed. Effort is only applied when the chosen model still
+  // offers it. See src/lib/agent-chat/new-chat-defaults.ts.
+  "chat.default_provider": "",
+  "chat.default_model": "",
+  "chat.default_effort": "",
+  // Where a new chat runs: "worktree" (an isolated checkout per chat) or
+  // "current" (the project's checked-out branch). The composer can still
+  // flip it per chat.
+  "chat.default_checkout": "worktree",
+  // Diff habits. The layout toggle in a diff toolbar writes back here, so
+  // the last choice becomes the default everywhere. Whitespace and the
+  // collapsed state apply to the pull request Code tab, the surface that
+  // renders every file of a diff at once.
+  "diff.layout": "unified",
+  "diff.hide_whitespace": "false",
+  "diff.file_state": "expanded",
+  // Clock style for timestamps: "system" follows the locale, "12h"/"24h"
+  // force it. See src/lib/time-format.ts.
+  "appearance.time_format": "system",
 };
 
 /** Color palette variant. */
@@ -70,6 +91,16 @@ export type AppearanceDensity = "comfortable" | "compact";
 /** Idle-sweep window for the inbox auto-settle. "off" disables the
  *  inactivity rule; the numeric values are day counts. */
 export type AutoSettleDays = "off" | "1" | "3" | "7" | "14";
+
+/** Where a new chat runs by default. */
+export type NewChatCheckout = "worktree" | "current";
+
+export type DiffLayoutPreference = "unified" | "split";
+
+/** Whether diff files open expanded or collapsed. */
+export type DiffFileState = "expanded" | "collapsed";
+
+export type TimeFormat = "system" | "12h" | "24h";
 
 interface SettingsState {
   loaded: boolean;
@@ -119,6 +150,27 @@ function raw(key: string): string {
 
 export function getTerminalColorTheme(): string {
   return raw("terminal.color_theme");
+}
+
+export function getNewChatCheckout(): NewChatCheckout {
+  return raw("chat.default_checkout") === "current" ? "current" : "worktree";
+}
+
+export function getDiffLayoutPreference(): DiffLayoutPreference {
+  return raw("diff.layout") === "split" ? "split" : "unified";
+}
+
+export function getHideWhitespacePreference(): boolean {
+  return raw("diff.hide_whitespace") === "true";
+}
+
+export function getDiffFileState(): DiffFileState {
+  return raw("diff.file_state") === "collapsed" ? "collapsed" : "expanded";
+}
+
+export function getTimeFormat(): TimeFormat {
+  const value = raw("appearance.time_format");
+  return value === "12h" || value === "24h" ? value : "system";
 }
 
 // ── Per-user imperative getters (redirect to synced store for backward compat) ──
@@ -180,6 +232,36 @@ export const selectChatCodeWrap = (s: SettingsStore): boolean =>
 export const selectAutoResumeUsageLimit = (s: SettingsStore): boolean =>
   (s.settings["agents.auto_resume_usage_limit"] ??
     SETTINGS_DEFAULTS["agents.auto_resume_usage_limit"]!) !== "false";
+
+export const selectNewChatCheckout = (s: SettingsStore): NewChatCheckout =>
+  (s.settings["chat.default_checkout"] ??
+    SETTINGS_DEFAULTS["chat.default_checkout"]!) === "current"
+    ? "current"
+    : "worktree";
+
+export const selectDiffLayoutPreference = (
+  s: SettingsStore,
+): DiffLayoutPreference =>
+  (s.settings["diff.layout"] ?? SETTINGS_DEFAULTS["diff.layout"]!) === "split"
+    ? "split"
+    : "unified";
+
+export const selectHideWhitespacePreference = (s: SettingsStore): boolean =>
+  (s.settings["diff.hide_whitespace"] ??
+    SETTINGS_DEFAULTS["diff.hide_whitespace"]!) === "true";
+
+export const selectDiffFileState = (s: SettingsStore): DiffFileState =>
+  (s.settings["diff.file_state"] ?? SETTINGS_DEFAULTS["diff.file_state"]!) ===
+  "collapsed"
+    ? "collapsed"
+    : "expanded";
+
+export const selectTimeFormat = (s: SettingsStore): TimeFormat => {
+  const value =
+    s.settings["appearance.time_format"] ??
+    SETTINGS_DEFAULTS["appearance.time_format"]!;
+  return value === "12h" || value === "24h" ? value : "system";
+};
 
 /** Whether agent orbs follow the current activity. Default on; off pins
  *  every orb to the neutral working state. */

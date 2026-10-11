@@ -169,7 +169,7 @@ function PrRowImpl({
       prNumber: row.number,
       existingWorkspaceId,
     })
-      .catch((err) => toast.error(String(err)))
+      .catch((err) => toast.failure("Couldn't check out the pull request", err))
       .finally(() => setBusy(false));
   };
 

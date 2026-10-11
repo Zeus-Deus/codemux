@@ -131,6 +131,17 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
 }
 
 fn main() {
+    // Also serves as a native executable fixture for Windows install probes.
+    // The sidecar's normal no-argument JSON-RPC behavior is unchanged.
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("9.9.9 (Claude Code)");
+        return;
+    }
+    if args == ["auth", "status"] {
+        println!("{{\"loggedIn\":false}}");
+        return;
+    }
     let script = load_script();
     let exit_after = std::env::var("FAKE_CLAUDE_SIDECAR_EXIT_AFTER").ok();
 
