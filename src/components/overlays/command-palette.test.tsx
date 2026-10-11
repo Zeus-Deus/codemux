@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     openThemeStudio: vi.fn(),
     takeCommandPaletteQuery: vi.fn<() => string | null>(() => null),
     setShowNewWorkspaceDialog: vi.fn(),
+    setShowLocalSessionImport: vi.fn(),
   },
   synced: {
     settings: {
@@ -105,6 +106,7 @@ import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import { BUILT_IN_THEMES, applyTheme } from "@/lib/themes";
 import { useOmarchyStore } from "@/stores/omarchy-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { omarchyToTheme } from "@/lib/omarchy-theme";
 import { fallbackTheme } from "@/hooks/use-theme-colors";
 
@@ -817,5 +819,26 @@ describe("command palette — across opens", () => {
 
     view.rerender(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
     expect(screen.getByRole("combobox")).toHaveValue("");
+  });
+});
+
+describe("command palette — import recent chats", () => {
+  afterEach(() => useFeatureFlags.setState({ enableAgentChat: false }));
+
+  it("opens the recent chat import from anywhere", async () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    await user.click(screen.getByText("Import recent chats…"));
+    expect(mocks.ui.setShowLocalSessionImport).toHaveBeenCalledWith(true);
+  });
+
+  it("is hidden when agent chat is off", async () => {
+    useFeatureFlags.setState({ enableAgentChat: false });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    expect(screen.queryByText("Import recent chats…")).toBeNull();
   });
 });

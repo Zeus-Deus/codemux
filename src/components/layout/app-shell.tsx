@@ -1,4 +1,5 @@
 import { useNotificationLink } from "@/hooks/use-notification-link";
+import { useRemotePairingRequests } from "@/hooks/use-remote-pairing-requests";
 import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
 import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
@@ -22,6 +23,7 @@ import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
+import { NeedsYouAnnouncer } from "./needs-you-announcer";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { useMountedOnceOpen } from "@/hooks/use-mounted-once-open";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
@@ -85,6 +87,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const mobile = useMobileLayout();
   useMobileViewport();
   useNotificationLink();
+  useRemotePairingRequests();
   const isLoading = useAppStore((s) => s.appState === null);
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const syncedLoading = useSyncedSettingsStore((s) => s.isLoading);
@@ -108,10 +111,17 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const fileSearchMounted = useMountedOnceOpen(fileSearchOpen);
   const contentSearchMounted = useMountedOnceOpen(contentSearchOpen);
   const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null);
+  // Once opened, the peek stays mounted so it can play its own exit animation;
+  // it renders nothing while closed.
+  const [browserPeekMounted, setBrowserPeekMounted] = useState(false);
+  useEffect(() => {
+    if (browserPeekOpen) setBrowserPeekMounted(true);
+  }, [browserPeekOpen]);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  // Width lives in the persisted UI store: the full-screen pages below
-  // unmount `SidebarProvider`, which would otherwise reset it to default.
+  // Open state and width live in the persisted UI store: the full-screen
+  // pages below unmount `SidebarProvider`, which would otherwise reset them.
+  const sidebarOpen = useUIStore((s) => s.sidebarOpen);
+  const setSidebarOpen = useUIStore((s) => s.setSidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
   const setSidebarWidth = useUIStore((s) => s.setSidebarWidth);
 
@@ -233,7 +243,10 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // `setSidebarOpen` alone cannot reach. This registration still matters for
   // the branches that return before `SidebarProvider` renders.
   useEffect(() => {
-    useUIStore.getState().setSidebarToggleFn(() => setSidebarOpen((o) => !o));
+    useUIStore.getState().setSidebarToggleFn(() => {
+      const ui = useUIStore.getState();
+      ui.setSidebarOpen(!ui.sidebarOpen);
+    });
     return () => useUIStore.getState().setSidebarToggleFn(null);
   }, []);
 
@@ -309,8 +322,9 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
     <div className="relative flex h-screen max-h-screen flex-col overflow-hidden">
       <TitleBar
         sidebarOpen={sidebarOpen}
-        onToggleSidebar={() => setSidebarOpen((o) => !o)}
+        onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
       />
+      <NeedsYouAnnouncer />
       <SidebarProvider
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}
@@ -326,7 +340,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
               inside this `relative` SidebarInset, so it floats over
               WorkspaceMain without resizing it. Renders nothing unless
               GUI chrome applies and the peek is explicitly opened. */}
-          {browserPeekOpen && (
+          {(browserPeekOpen || browserPeekMounted) && (
             <LazyBoundary
               label="browser peek"
               className="absolute right-3.5 top-3.5 z-30 h-[300px] w-[440px] rounded-lg border border-border"

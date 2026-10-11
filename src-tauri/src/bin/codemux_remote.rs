@@ -20,6 +20,9 @@
 //!   daemon over HTTP. Configure your CLI agent to launch this. New.
 //! - `version` — JSON version string. The laptop's bootstrap probe
 //!   parses it. Unchanged.
+//! - `project ensure` / `worktree create` — one-shot calls the desktop
+//!   makes over SSH to run a thread on this device: get a checkout of the
+//!   project (cloning on first use), then a worktree for the thread.
 //!
 //! Unix-only by design: the existing PTY daemon uses Unix-domain
 //! sockets and the new `serve` mode wraps headless features that
@@ -97,6 +100,82 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         subcommand: WorkspaceSubcommand,
+    },
+    /// Project checkouts for threads the desktop runs on this device.
+    Project {
+        #[command(subcommand)]
+        subcommand: ProjectSubcommand,
+    },
+    /// Git worktrees for threads the desktop runs on this device.
+    Worktree {
+        #[command(subcommand)]
+        subcommand: WorktreeSubcommand,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum ProjectSubcommand {
+    /// Find this host's checkout of a project by its git remote, cloning
+    /// it into ~/.codemux/projects/<name>-<uid8> on first use, and record
+    /// it in the workspace registry.
+    ///
+    /// Stable contract: the last stdout line is one JSON object
+    /// `{"path","cloned","default_branch","branch","project_uid","canonical_remote"}`.
+    /// On failure: non-zero exit and a one-line message on stderr.
+    Ensure {
+        /// The project's git remote (ssh, https or scp-style URL).
+        #[arg(long)]
+        remote_url: String,
+        /// Folder name for a fresh clone. Defaults to the repo name.
+        #[arg(long)]
+        name: Option<String>,
+        /// State directory of the daemon. Defaults to the same path
+        /// `serve` defaults to.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum WorktreeSubcommand {
+    /// Create (or reuse) a worktree for `--branch` under
+    /// ~/.codemux/worktrees and register it. An existing branch (local or
+    /// on origin) is checked out; otherwise a new one starts from
+    /// `--base`, default the repo's default branch. Runs through the
+    /// `serve` daemon when it is up, so it owns the setup commands.
+    ///
+    /// Stable contract: the last stdout line is one JSON object
+    /// `{"path","branch","repo_root","created"}`. On failure: non-zero
+    /// exit and a one-line message on stderr.
+    Create {
+        /// Absolute path of the repo to branch from.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Branch for the worktree.
+        #[arg(long)]
+        branch: String,
+        /// Base for a new branch. Defaults to the repo's default branch.
+        #[arg(long)]
+        base: Option<String>,
+        /// State directory of the daemon. Defaults to the same path
+        /// `serve` defaults to.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Run a new worktree's setup commands. `worktree create` starts this
+    /// detached when no daemon is up to own them.
+    #[command(hide = true)]
+    Setup {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        workspace_id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        branch: Option<String>,
     },
 }
 
@@ -226,6 +305,27 @@ fn main() -> ExitCode {
                 connect_timeout_secs,
             ),
             WorkspaceSubcommand::List { state_dir } => run_workspace_list(state_dir),
+        },
+        Some(Command::Project { subcommand }) => match subcommand {
+            ProjectSubcommand::Ensure {
+                remote_url,
+                name,
+                state_dir,
+            } => run_project_ensure(remote_url, name, state_dir),
+        },
+        Some(Command::Worktree { subcommand }) => match subcommand {
+            WorktreeSubcommand::Create {
+                repo,
+                branch,
+                base,
+                state_dir,
+            } => run_worktree_create(repo, branch, base, state_dir),
+            WorktreeSubcommand::Setup {
+                path,
+                workspace_id,
+                name,
+                branch,
+            } => run_worktree_setup(path, workspace_id, name, branch),
         },
     }
 }
@@ -652,11 +752,6 @@ fn run_workspace_register(
     let state_dir = resolve_state_dir(state_dir_arg);
     let manifest_path = codemux_lib::remote::config::manifest_path(&state_dir);
 
-    // Wait for the manifest to appear AND the daemon to answer
-    // /health. systemctl returns immediately when starting a unit;
-    // the daemon's actual bind happens a tick later.
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(connect_timeout_secs.max(1));
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -668,31 +763,17 @@ fn run_workspace_register(
         }
     };
 
-    let manifest = loop {
-        match codemux_lib::remote::manifest::read(&manifest_path) {
-            Ok(Some(m)) if codemux_lib::remote::manifest::pid_alive(m.pid) => {
-                // Probe /health to catch the case where the manifest
-                // is fresh but the listener hasn't accepted yet.
-                let healthy = client
-                    .get(format!("{}/health", m.endpoint))
-                    .send()
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                if healthy {
-                    break m;
-                }
-            }
-            Ok(_) | Err(_) => {}
-        }
-        if std::time::Instant::now() > deadline {
-            eprintln!(
-                "[codemux-remote] daemon at {} did not become healthy within {}s",
-                manifest_path.display(),
-                connect_timeout_secs
-            );
-            return ExitCode::from(1);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    let Some(manifest) = wait_for_healthy_daemon(
+        &manifest_path,
+        &client,
+        std::time::Duration::from_secs(connect_timeout_secs.max(1)),
+    ) else {
+        eprintln!(
+            "[codemux-remote] daemon at {} did not become healthy within {}s",
+            manifest_path.display(),
+            connect_timeout_secs
+        );
+        return ExitCode::from(1);
     };
 
     // POST workspace_create.
@@ -805,4 +886,214 @@ fn run_workspace_list(state_dir_arg: Option<PathBuf>) -> ExitCode {
     });
     println!("{}", payload);
     ExitCode::SUCCESS
+}
+
+/// Poll until the manifest at `manifest_path` names a live daemon that
+/// answers `/health`, or `timeout` passes. systemctl returns as soon as it
+/// starts a unit and the daemon binds a tick later, so a fresh manifest
+/// alone isn't proof the daemon is listening.
+#[cfg(unix)]
+fn wait_for_healthy_daemon(
+    manifest_path: &std::path::Path,
+    client: &reqwest::blocking::Client,
+    timeout: std::time::Duration,
+) -> Option<codemux_lib::remote::manifest::Manifest> {
+    use codemux_lib::remote::manifest;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(Some(m)) = manifest::read(manifest_path) {
+            if manifest::pid_alive(m.pid) {
+                let healthy = client
+                    .get(format!("{}/health", m.endpoint))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                if healthy {
+                    return Some(m);
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Fail a `project` / `worktree` call per their contract: one plain line
+/// on stderr (the desktop shows it as-is) and a non-zero exit.
+#[cfg(unix)]
+fn fail_one_line(message: impl std::fmt::Display) -> ExitCode {
+    let message = message.to_string();
+    let line: Vec<&str> = message.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    eprintln!("{}", line.join(" "));
+    ExitCode::from(1)
+}
+
+/// Implementation for `codemux-remote project ensure`.
+#[cfg(unix)]
+fn run_project_ensure(
+    remote_url: String,
+    name: Option<String>,
+    state_dir_arg: Option<PathBuf>,
+) -> ExitCode {
+    use codemux_lib::remote::{checkout, config, manifest, workspace::WorkspaceStore};
+
+    let Some(home) = dirs::home_dir() else {
+        return fail_one_line("couldn't find the home folder on this device");
+    };
+    let state_dir = resolve_state_dir(state_dir_arg);
+    // Without the registry the ensure still works: it scans for a
+    // checkout instead and skips recording the result.
+    let store = WorkspaceStore::open(
+        &config::database_path(&state_dir),
+        manifest::current_host_id(),
+        config::workspaces_root(&state_dir),
+    )
+    .ok();
+    match checkout::ensure_project(&home, store.as_ref(), &remote_url, name.as_deref()) {
+        Ok(project) => {
+            println!("{}", serde_json::json!(project));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail_one_line(e),
+    }
+}
+
+/// How long `worktree create` waits on a daemon whose process is up but
+/// isn't answering yet. A daemon that isn't running at all gets no wait.
+#[cfg(unix)]
+const DAEMON_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cap on one `worktree_create` call through the daemon: a base fetch
+/// (itself capped at 10s), the checkout, and the include-file copy.
+#[cfg(unix)]
+const DAEMON_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Implementation for `codemux-remote worktree create`. Prefers the
+/// `serve` daemon, which outlives this call and so can own the setup
+/// commands; without one, creates the worktree in-process and starts the
+/// setup commands detached.
+#[cfg(unix)]
+fn run_worktree_create(
+    repo: PathBuf,
+    branch: String,
+    base: Option<String>,
+    state_dir_arg: Option<PathBuf>,
+) -> ExitCode {
+    use codemux_lib::remote::checkout;
+
+    let args = match checkout::worktree_create_args(&repo, &branch, base.as_deref()) {
+        Ok(args) => args,
+        Err(e) => return fail_one_line(e),
+    };
+    let state_dir = resolve_state_dir(state_dir_arg);
+    let data = match call_daemon_tool(&state_dir, "worktree_create", &args) {
+        Ok(Some(data)) => Ok(data),
+        Ok(None) => create_worktree_in_process(&state_dir, &args),
+        Err(e) => Err(e),
+    };
+    match data.and_then(|data| checkout::worktree_create_output(&data)) {
+        Ok(output) => {
+            println!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail_one_line(e),
+    }
+}
+
+/// Call one tool on the local `serve` daemon. `Ok(None)` means nothing
+/// was done — no daemon is running, it went away before the call, or it
+/// predates the tool — so the caller can do the work itself.
+#[cfg(unix)]
+fn call_daemon_tool(
+    state_dir: &std::path::Path,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    use codemux_lib::remote::{config, manifest};
+    use serde_json::Value;
+
+    let manifest_path = config::manifest_path(state_dir);
+    let running = matches!(manifest::read(&manifest_path), Ok(Some(m)) if manifest::pid_alive(m.pid));
+    if !running {
+        return Ok(None);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(DAEMON_TOOL_TIMEOUT)
+        .build()
+        .map_err(|e| format!("couldn't reach the codemux-remote daemon: {e}"))?;
+    let Some(manifest) = wait_for_healthy_daemon(&manifest_path, &client, DAEMON_STARTUP_WAIT) else {
+        return Ok(None);
+    };
+
+    let response = match client
+        .post(format!("{}/tools/call", manifest.endpoint))
+        .bearer_auth(&manifest.secret)
+        .json(&serde_json::json!({ "name": tool, "arguments": arguments }))
+        .send()
+    {
+        Ok(response) => response,
+        Err(e) if e.is_connect() => return Ok(None),
+        Err(e) => return Err(format!("the codemux-remote daemon didn't finish {tool}: {e}")),
+    };
+    let payload: Value = response
+        .json()
+        .map_err(|e| format!("unexpected reply from the codemux-remote daemon: {e}"))?;
+    if payload.get("ok") == Some(&Value::Bool(true)) {
+        return Ok(Some(payload.get("data").cloned().unwrap_or(Value::Null)));
+    }
+    let error = payload.get("error");
+    let kind = error.and_then(|e| e.get("kind")).and_then(Value::as_str);
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("the codemux-remote daemon reported an error");
+    if kind == Some("not_found") && message.starts_with("unknown tool") {
+        return Ok(None);
+    }
+    Err(message.to_string())
+}
+
+/// The `worktree_create` tool run in this process, with setup commands
+/// handed to a detached `worktree setup` so they outlive this call.
+#[cfg(unix)]
+fn create_worktree_in_process(
+    state_dir: &std::path::Path,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use codemux_lib::remote::{config, manifest, tools, workspace::WorkspaceStore};
+
+    let store = WorkspaceStore::open(
+        &config::database_path(state_dir),
+        manifest::current_host_id(),
+        config::workspaces_root(state_dir),
+    )
+    .map_err(|e| format!("couldn't open the workspace registry: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("couldn't locate codemux-remote: {e}"))?;
+    let runner = tools::SetupRunner::Detached {
+        exe,
+        log_dir: config::logs_dir(state_dir),
+    };
+    tools::worktree_create_with(args, &store, &runner).map_err(|e| e.message)
+}
+
+/// Implementation for the hidden `codemux-remote worktree setup`. Output
+/// goes to the log file `worktree create` opened for it.
+#[cfg(unix)]
+fn run_worktree_setup(
+    path: PathBuf,
+    workspace_id: String,
+    name: String,
+    branch: Option<String>,
+) -> ExitCode {
+    match codemux_lib::remote::tools::run_worktree_setup(&path, &name, &workspace_id, branch.as_deref()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("[codemux-remote] setup failed for workspace {workspace_id}: {e}");
+            ExitCode::from(1)
+        }
+    }
 }

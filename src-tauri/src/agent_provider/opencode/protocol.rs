@@ -302,7 +302,13 @@ impl OpenCodeApiError {
                 "MessageOutputLengthError" => "model output length cap reached".into(),
                 _ => "unknown error".into(),
             });
-        (self.name.clone(), message)
+        let payload = serde_json::json!({"name": self.name, "data": self.data});
+        let subtype = if crate::agent_provider::usage_limit::is_usage_limit_error(&message, &payload) {
+            crate::agent_provider::events::RATE_LIMIT_SUBTYPE.into()
+        } else {
+            self.name.clone()
+        };
+        (subtype, message)
     }
 }
 

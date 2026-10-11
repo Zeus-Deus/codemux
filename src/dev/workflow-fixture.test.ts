@@ -67,8 +67,9 @@ describe("workflow demo fixtures", () => {
     // The persisted stream ends mid-run (no terminal workflow snapshot),
     // so the hydrate reconciliation (issue #153) stops the workflow and
     // interrupts its still-in-flight agents — a resumed transcript never
-    // resurrects a live spinner. (A genuinely live run is demoed via the
-    // real event stream, not this persisted-replay path.)
+    // resurrects a live spinner. The dev mock seeds this pane idle to match.
+    // (A genuinely live run is demoed via the real event stream, not this
+    // persisted-replay path.)
     expect(wf.status).toBe("stopped");
     // Stays linked after resolution so transcript-slots keeps suppressing
     // the standalone resolved permission block (no stray "Allowed" row).

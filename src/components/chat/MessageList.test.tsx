@@ -30,6 +30,7 @@ import {
   resetTranscriptFadeCacheForTests,
   setRendererMode,
 } from "./transcript-fade";
+import { USER_INPUT_SKIPPED_MESSAGE } from "./ComposerPendingInputPanel";
 import { MessageList } from "./MessageList";
 import { TranscriptTopInsetContext } from "./transcript-top-inset";
 
@@ -226,6 +227,49 @@ describe("MessageList retained scroll state", () => {
     expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
+  it("re-pins the end when the list itself leaves it while follow intent holds", async () => {
+    // A tail-first cold open backfills history while LegendList is still
+    // settling its initial scroll; on a phone that settle can land at the
+    // tail's old end, hundreds of turns up. No gesture released follow.
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    // Let the mount-time advance (two frames) drain before the list moves.
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("keeps following when Space activates a control in the transcript", async () => {
+    // Space on a focused Copy / fold / approval button activates it; it does
+    // not scroll, so it must not retire follow the way PageUp does.
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    const control = document.createElement("button");
+    viewport.appendChild(control);
+    fireEvent.keyDown(control, { key: " " });
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("treats keyboard scrolling as the reader leaving the end", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    fireEvent.keyDown(viewport, { key: "PageUp" });
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
   it("reveals background growth when a resumed tail follower misses the built-in end pin", async () => {
     listState.isAtEnd = true;
     listState.isNearEnd = true;
@@ -260,6 +304,29 @@ describe("MessageList retained scroll state", () => {
     await act(() => new Promise<void>((resolve) => window.setTimeout(resolve, 180)));
     view.rerender(tree("visible"));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Jump to latest" })).not.toBeNull());
+  });
+
+  it("says an approval is waiting when the reader is off the live edge", async () => {
+    const pendingTool: ToolCallItem = {
+      ...readCall(1, "/b"),
+      tool_name: "Bash",
+      input: { command: "npm test" },
+      status: "running",
+      approval_request_id: "req-pill",
+    };
+    const messages: ChatViewItem[] = [
+      readCall(0, "/a"),
+      pendingTool,
+      planReq({ request_id: "req-pill", request_kind: "command", tool_use_id: "tu-1" }),
+    ];
+    const view = render(<MessageList messages={messages} {...noopHandlers} />);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    fireEvent.wheel(viewport, { deltaY: -100 });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Approval needed" })).not.toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
   });
 });
 
@@ -504,13 +571,26 @@ describe("MessageList dispatch", () => {
     expect(screen.getByText("Styling")).toBeInTheDocument();
   });
 
-  it("falls back to the plain marker when a resolved user-input carries no answer", () => {
+  it("falls back to a plain marker when a user-input was cancelled without an answer", () => {
     renderList([
       askReq({
         resolution: { state: "resolved", decision: { decision: "cancel" } },
       }),
     ]);
-    expect(screen.getByText("Answered")).toBeInTheDocument();
+    expect(screen.getByText("Not answered")).toBeInTheDocument();
+  });
+
+  it("marks a skipped user-input prompt as skipped, not answered", () => {
+    renderList([
+      askReq({
+        resolution: {
+          state: "resolved",
+          decision: { decision: "deny", message: USER_INPUT_SKIPPED_MESSAGE },
+        },
+      }),
+    ]);
+    expect(screen.getByText("Skipped")).toBeInTheDocument();
+    expect(screen.queryByText("Answered")).toBeNull();
   });
 
   it("falls back to PermissionRequestBlock for unknown request_kind", () => {
@@ -606,6 +686,133 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("src/components/chat/MessageList.tsx")).toBeInTheDocument();
   });
 
+  it("keeps a work log the user opened mid-run on screen when the turn settles", () => {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-live", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-live" },
+      { ...readCall(2, "/b"), turn_id: "turn-live" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running,
+      {
+        kind: "assistant_message",
+        id: "final-live",
+        seq: 3,
+        turn_id: "turn-live",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-live",
+        seq: 4,
+        turn_id: "turn-live",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    // Collapsing the fold releases the pin, and it stays collapsed.
+    fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  // A live turn often reads: work, a short message, more work. Each log in
+  // that turn is the user's to keep open, not only the one with the live row.
+  function multiStretchTurn(): { running: ChatViewItem[]; settled: ChatViewItem[] } {
+    const running: ChatViewItem[] = [
+      { kind: "user_message", id: "user-multi", seq: 0, text: "Check it", created_at: 1_000 },
+      { ...readCall(1, "/a"), turn_id: "turn-multi" },
+      { ...readCall(2, "/b"), turn_id: "turn-multi" },
+      {
+        kind: "assistant_message",
+        id: "between-multi",
+        seq: 3,
+        turn_id: "turn-multi",
+        text: "Now more.",
+        streaming: false,
+      },
+      { ...readCall(4, "/c"), turn_id: "turn-multi" },
+      { ...readCall(5, "/d"), turn_id: "turn-multi", status: "running" },
+    ];
+    const settled: ChatViewItem[] = [
+      ...running.slice(0, -1),
+      { ...readCall(5, "/d"), turn_id: "turn-multi" },
+      {
+        kind: "assistant_message",
+        id: "final-multi",
+        seq: 6,
+        turn_id: "turn-multi",
+        text: "All good.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-multi",
+        seq: 7,
+        turn_id: "turn-multi",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ];
+    return { running, settled };
+  }
+
+  it("keeps an earlier work log of a live turn open when the turn settles", () => {
+    const { running, settled } = multiStretchTurn();
+    const view = render(<MessageList messages={running} streaming {...noopHandlers} />);
+    // The first log sits above the intermediate message, away from the live
+    // row; collapsed, it shows its last step.
+    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    expect(screen.getByRole("button", { name: "Worked for 5s" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("/a")).toBeInTheDocument();
+  });
+
+  it("collapses a fold pinned by two open logs in one click", () => {
+    const { running, settled } = multiStretchTurn();
+    // Open the first log while it still holds the live row, then the second
+    // one once the agent has written a message and started more work.
+    const view = render(
+      <MessageList messages={running.slice(0, 3)} streaming {...noopHandlers} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /\/b/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    view.rerender(<MessageList messages={running} streaming {...noopHandlers} />);
+    fireEvent.click(screen.getByRole("button", { name: /\/d/ }));
+    expect(screen.getByText("/c")).toBeInTheDocument();
+
+    view.rerender(<MessageList messages={settled} streaming={false} {...noopHandlers} />);
+    const fold = () => screen.getByRole("button", { name: "Worked for 5s" });
+    expect(fold()).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    expect(screen.getByText("/c")).toBeInTheDocument();
+
+    fireEvent.click(fold());
+    expect(fold()).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.queryByText("/c")).toBeNull();
+  });
+
   it("shows only the newest completed tool call until earlier work is requested", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
@@ -620,7 +827,7 @@ describe("MessageList activity blocks", () => {
     fireEvent.click(screen.getByText("/c"));
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Work log/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /\/b/ })).toBeInTheDocument();
   });
 
   it("keeps a lone successful observational call silent", () => {
@@ -705,6 +912,35 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("2 tools")).toBeInTheDocument();
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
+  });
+
+  it("keeps the approval footer on an html_render call waiting for approval", () => {
+    const pending: ToolCallItem = {
+      kind: "tool_call",
+      id: "tc-page",
+      seq: 0,
+      tool_use_id: "tu-page",
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+      status: "running",
+      result_content: null,
+      approval_request_id: "req-page",
+    };
+    const approval: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "req-page",
+      seq: 1,
+      request_id: "req-page",
+      turn_id: "turn-1",
+      request_kind: "tool",
+      payload: { tool_name: pending.tool_name, tool_input: pending.input },
+      tool_use_id: "tu-page",
+      resolution: { state: "pending" },
+    };
+    renderList([pending, approval]);
+    expect(screen.getByText("Allow")).toBeInTheDocument();
+    expect(screen.getByText("Deny")).toBeInTheDocument();
+    expect(screen.queryByText("Building visualization…")).toBeNull();
   });
 });
 
@@ -963,6 +1199,47 @@ describe("MessageList dead-run detection (issue #154)", () => {
       expect(screen.getByTestId("run-stalled-notice")).toHaveTextContent(
         "No activity for 1m",
       );
+    });
+
+    it("offers Stop, wired to the turn's stop handler", () => {
+      const onStop = vi.fn();
+      render(
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={{ silentForSecs: 700 }}
+          onStop={onStop}
+          {...noopHandlers}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      expect(onStop).toHaveBeenCalledTimes(1);
+    });
+
+    it("hides on Keep waiting until another full stall passes, and resets on activity", () => {
+      const tree = (stalled: { silentForSecs: number } | null) => (
+        <MessageList
+          messages={[userTurn]}
+          streaming
+          stalled={stalled}
+          {...noopHandlers}
+        />
+      );
+      const view = render(tree({ silentForSecs: 700 }));
+      // No stop handler (a read-only pane): only the snooze is offered.
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+
+      view.rerender(tree({ silentForSecs: 1_270 }));
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+      view.rerender(tree({ silentForSecs: 1_300 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Keep waiting" }));
+      view.rerender(tree(null));
+      view.rerender(tree({ silentForSecs: 600 }));
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
     });
 
     it("does not render when the thread is not streaming", () => {

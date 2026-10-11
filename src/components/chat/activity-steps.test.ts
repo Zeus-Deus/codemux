@@ -8,6 +8,8 @@ import {
   deriveActivitySummary,
   deriveWorkingCounter,
   formatActivityDuration,
+  stepDurationMs,
+  stepElapsedLabel,
   stepMeta,
   toStepView,
 } from "./activity-steps";
@@ -129,6 +131,21 @@ describe("stepMeta / toStepView", () => {
     expect(toStepView(tool("Bash", { input: { command: "ls" } })).verb).toBe("run");
     expect(toStepView(think({ text: "first line\nsecond" })).verb).toBe("think");
     expect(toStepView(think({ text: "first line\nsecond" })).summary).toBe("first line");
+  });
+  it("appends how long a settled step took, from one second up", () => {
+    const timed = (completed_at: number) =>
+      tool("Bash", { started_at: 1_000, completed_at });
+    expect(toStepView(timed(4_200)).meta).toBe("ok · 3s");
+    expect(toStepView(tool("Bash", { status: "error", started_at: 0, completed_at: 75_000 })).meta)
+      .toBe("failed · 1m 15s");
+    // Hydrated rows replay at one instant; a sub-second span is noise.
+    expect(toStepView(timed(1_400)).meta).toBe("ok");
+    expect(toStepView(think({ duration_ms: 2_000 })).meta).toBe("2s");
+    expect(stepDurationMs(tool("Bash", { status: "running", started_at: 0 }))).toBeNull();
+  });
+  it("leaves the live elapsed label empty for the first second", () => {
+    expect(stepElapsedLabel(10_000, 10_400)).toBe("");
+    expect(stepElapsedLabel(10_000, 72_000)).toBe("1m 2s");
   });
 });
 

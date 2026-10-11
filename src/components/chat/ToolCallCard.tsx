@@ -1,9 +1,8 @@
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
-import { memo, useEffect, useRef, useState, type ComponentType } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   Check,
   ChevronDown,
-  ChevronRight,
   Clock,
   X,
 } from "lucide-react";
@@ -13,11 +12,17 @@ import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
   buildPermissionUpdate,
+  formatPermissionRule,
+  suggestPermissionRule,
+  type PermissionRuleSpec,
   type PermissionScope,
 } from "@/lib/agent-chat/permission-rules";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
@@ -30,6 +35,10 @@ import type {
 } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
 
+import { formatActivityDuration, stepDurationMs } from "./activity-steps";
+import { useChatProvider } from "./chat-provider-context";
+import { Reveal } from "./Reveal";
+import { StepElapsed } from "./StepElapsed";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolCallBody } from "./ToolCallBodies";
 import { ToolCallStatus } from "./ToolCallStatus";
@@ -37,6 +46,10 @@ import { categoryTint, toolCategory, toolIcon } from "./tool-visuals";
 
 interface Props {
   item: ToolCallItem;
+  /** The call's turn is still running, so a `running` call really is. A
+   *  settled transcript can hold a call that never reported back (crash,
+   *  quit); its start time is no longer meaningful, so no timer counts. */
+  turnLive?: boolean;
   /** Resolved from the slice by matching `item.approval_request_id`
    *  against the thread's permission requests. `null` when the tool
    *  call is not gated (bypassPermissions mode) or the request event
@@ -63,6 +76,7 @@ interface Props {
  */
 export const ToolCallCard = memo(function ToolCallCard({
   item,
+  turnLive = false,
   approval,
   onDecide,
 }: Props) {
@@ -96,9 +110,6 @@ export const ToolCallCard = memo(function ToolCallCard({
   const hasImages = hasToolResultImages(item.result_content);
   const defaultExpanded = isPendingApproval || isError || isDiffTool || hasImages;
   const [expanded, setExpanded] = useState(defaultExpanded);
-  // Only a user's own toggle eases the body in. Default-expanded cards
-  // remount as the virtualized transcript scrolls, and must not replay it.
-  const [bodyEase, setBodyEase] = useState(false);
   const hasSeenImagesRef = useRef(hasImages);
 
   // Tool cards usually mount while the call is still running, before
@@ -127,57 +138,96 @@ export const ToolCallCard = memo(function ToolCallCard({
     ? safeStringify(item.input)
     : null;
   const canExpand = hasResultBody || inputText !== null;
-  const showBody =
-    expanded && !isPendingApproval && !isResponding && !isDenied;
+  // The approval states own the card's body slot, so only a settled or
+  // executing call toggles.
+  const toggleable =
+    canExpand && !isPendingApproval && !isResponding && !isDenied;
+  const showBody = expanded && toggleable;
+  const bodyId = useId();
+  // An approval-gated call runs from the moment it was answered, not from
+  // when the request was raised.
+  const timed =
+    item.approved_at != null ? { ...item, started_at: item.approved_at } : item;
+  const duration = stepDurationMs(timed);
+
+  // Tinted icon chip · mono command · elapsed · status glyph · chevron.
+  // `min-w-0 truncate` on the label lets long commands ellipsize rather than
+  // push the trailing glyphs off-screen.
+  const headerContent = (
+    <>
+      <span
+        className={cn(
+          "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md",
+          categoryTint(toolCategory(item.tool_name)),
+          isDenied && "opacity-50",
+        )}
+      >
+        <Icon className="size-3" aria-hidden />
+      </span>
+      <span
+        className={cn(
+          "block min-w-0 flex-1 truncate",
+          isDenied && "line-through text-muted-foreground/60",
+        )}
+      >
+        <ToolCallStatus item={item} />
+        {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
+      </span>
+      {isExecuting && turnLive ? (
+        <StepElapsed step={timed} className={ELAPSED_CLASS} />
+      ) : duration != null && (isSuccess || isError) ? (
+        <span className={ELAPSED_CLASS}>{formatActivityDuration(duration)}</span>
+      ) : null}
+      {glyph && (
+        <glyph.Icon
+          className={cn("size-3.5 shrink-0", glyph.className)}
+          aria-hidden
+        />
+      )}
+      {toggleable && (
+        <ChevronDown
+          className={cn(
+            "size-3 shrink-0 text-muted-foreground/60 transition-transform duration-150 motion-reduce:transition-none",
+            expanded && "rotate-180",
+          )}
+          aria-hidden
+        />
+      )}
+    </>
+  );
+  const headerClass = "flex w-full min-w-0 items-center gap-2.5 px-3 py-2.5";
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border/60 bg-muted/40">
-      {/* Header row: tinted icon chip · mono command · status glyph ·
-          chevron. `min-w-0 truncate` on the label lets long commands
-          ellipsize rather than push the trailing glyphs off-screen. */}
-      <div className="flex items-center gap-2.5 px-3 py-2.5 min-w-0">
-        <span
+    <div
+      data-approval-pending={isPendingApproval || undefined}
+      className={cn(
+        "overflow-hidden rounded-lg border bg-muted/40",
+        // A card waiting on the user must not look like a finished one.
+        isPendingApproval
+          ? "border-status-working/40 ring-1 ring-status-working/40"
+          : "border-border/60",
+      )}
+    >
+      {/* The whole header is the disclosure target, like a work-log row.
+          It stays a plain row while an approval decides what the card
+          shows. The inset ring keeps focus visible inside the clipped card. */}
+      {toggleable ? (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          // Reveal mounts the body on first open; point at it only then.
+          aria-controls={expanded ? bodyId : undefined}
+          onClick={() => setExpanded((v) => !v)}
           className={cn(
-            "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md",
-            categoryTint(toolCategory(item.tool_name)),
-            isDenied && "opacity-50",
+            headerClass,
+            "text-left transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60",
           )}
         >
-          <Icon className="size-3" aria-hidden />
-        </span>
-        <div
-          className={cn(
-            "min-w-0 flex-1 truncate",
-            isDenied && "line-through text-muted-foreground/60",
-          )}
-        >
-          <ToolCallStatus item={item} />
-          {item.status === "unconfirmed" && <span className="ml-2 text-label text-muted-foreground">Outcome unconfirmed · Hermes did not report completion</span>}
-        </div>
-        {glyph && (
-          <glyph.Icon
-            className={cn("size-3.5 shrink-0", glyph.className)}
-            aria-hidden
-          />
-        )}
-        {canExpand && !isPendingApproval && !isResponding && (
-          <button
-            type="button"
-            onClick={() => {
-              setBodyEase(true);
-              setExpanded((v) => !v);
-            }}
-            className="shrink-0 text-muted-foreground/60 hover:text-foreground"
-            aria-label={expanded ? "Collapse" : "Expand"}
-          >
-            {expanded ? (
-              <ChevronDown className="size-3" />
-            ) : (
-              <ChevronRight className="size-3" />
-            )}
-          </button>
-        )}
-      </div>
+          {headerContent}
+        </button>
+      ) : (
+        <div className={headerClass}>{headerContent}</div>
+      )}
 
       {/* Approval footer (pending). Keyed on the approval request id so
           a fresh approval (different request_id) remounts the footer
@@ -186,9 +236,11 @@ export const ToolCallCard = memo(function ToolCallCard({
       {isPendingApproval && approval && (isHermesPermission(approval.payload) ? <HermesPermissionOptions key={approval.request_id} payload={approval.payload} onDecide={onDecide} /> : (
         <ApprovalFooter
           key={approval.request_id}
+          requestId={approval.request_id}
           inputText={inputText}
           onDecide={onDecide}
           toolName={item.tool_name}
+          toolInput={item.input}
         />
       ))}
 
@@ -214,35 +266,56 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {/* Result body when expanded — known tools get a polished
           renderer, unknown tools fall back to the raw JSON dump. */}
-      {showBody && (
-        <div
-          data-testid="tool-call-body"
-          className={cn(
-            "border-t border-border/60 px-3 py-2.5",
-            bodyEase &&
-              "animate-in fade-in-0 slide-in-from-top-1 duration-150 ease-out",
-          )}
-        >
+      <Reveal open={showBody} id={bodyId}>
+        <div className="border-t border-border/60 px-3 py-2.5">
           <ToolCallBody item={item} />
         </div>
-      )}
+      </Reveal>
     </div>
   );
 });
+
+const ELAPSED_CLASS =
+  "shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/60";
 
 // ---------------------------------------------------------------------------
 // Approval footer
 // ---------------------------------------------------------------------------
 
 interface ApprovalFooterProps {
+  requestId: string;
   inputText: string | null;
   toolName: string;
+  toolInput: unknown;
   onDecide: (decision: ApprovalDecision) => void;
 }
 
-function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) {
+/** Request ids whose Allow button already took focus once. A virtualized
+ *  row remounts when it scrolls back into view and must not grab focus
+ *  again then. */
+const autoFocusedRequests = new Set<string>();
+
+const SCOPE_ITEMS: ReadonlyArray<{
+  scope: Exclude<PermissionScope, "once">;
+  label: string;
+  where: string;
+}> = [
+  { scope: "session", label: "For this session", where: "not saved" },
+  { scope: "project", label: "For this project", where: ".claude/settings.local.json" },
+  { scope: "user", label: "For all projects", where: "~/.claude/settings.json" },
+];
+
+function ApprovalFooter({
+  requestId,
+  inputText,
+  onDecide,
+  toolName,
+  toolInput,
+}: ApprovalFooterProps) {
   const [denying, setDenying] = useState(false);
   const [reason, setReason] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const allowRef = useRef<HTMLButtonElement | null>(null);
   // Synchronous in-flight guard. The parent flips
   // `approval.resolution` to `responding` after the IPC round-trips,
   // but rapid double-clicks can fire `handleAllow` (or `confirmDeny`)
@@ -251,11 +324,39 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
   // the footer is about to unmount when `responding` lands.
   const dispatchedRef = useRef(false);
 
-  const handleAllow = (scope: PermissionScope) => {
+  const scopedRule = useMemo(
+    () => suggestPermissionRule(toolName, toolInput),
+    [toolName, toolInput],
+  );
+  const anyInputRule: PermissionRuleSpec = { toolName };
+  // Settings rules (`Bash(git status:*)`) are Claude's model; other
+  // providers drop `updated_permissions`. They get the session-wide allow
+  // they do support instead of rules that would silently do nothing.
+  const provider = useChatProvider();
+  const claudeRules = provider === null || provider === "claude";
+
+  // Take keyboard focus only when nothing else holds it. A focused
+  // composer, even an empty one, is where the user is about to type, and
+  // an Enter landing on Allow there would approve by accident.
+  useEffect(() => {
+    if (autoFocusedRequests.has(requestId)) return;
+    autoFocusedRequests.add(requestId);
+    // Only recent requests can remount; keep the set bounded.
+    if (autoFocusedRequests.size > 64) {
+      const oldest = autoFocusedRequests.values().next().value;
+      if (oldest !== undefined) autoFocusedRequests.delete(oldest);
+    }
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    allowRef.current?.focus({ preventScroll: true });
+  }, [requestId]);
+
+  const handleAllow = (
+    scope: PermissionScope,
+    rule: PermissionRuleSpec = anyInputRule,
+  ) => {
     if (dispatchedRef.current) return;
-    // Stage 5 omits ruleContent — every "Allow always" matches any
-    // input for the tool. Stage 7 will add command-specific rules.
-    const updatedPermissions = buildPermissionUpdate(scope, { toolName });
+    const updatedPermissions = buildPermissionUpdate(scope, rule);
     if (scope !== "once" && !updatedPermissions) {
       // Defensive: helper returned undefined for a persistent scope
       // (currently only possible if `PermissionScope` gains a new
@@ -273,17 +374,28 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
     });
     // Toast wording is action-oriented (not past-tense) because the
     // SDK persists the rule asynchronously and the sidecar does not
-    // currently surface a write-failed signal. The settings-file
-    // path is shown so the user can verify.
-    if (scope === "project") {
-      toast.success(`Allowing ${toolName} for this project`, {
+    // currently surface a write-failed signal. The exact rule and the
+    // settings-file path are shown so the user can verify both.
+    const ruleText = formatPermissionRule(rule);
+    if (scope === "session") {
+      toast.success(`Allowing ${ruleText} for this session`, {
+        description: "Not saved to settings",
+      });
+    } else if (scope === "project") {
+      toast.success(`Allowing ${ruleText} for this project`, {
         description: "Rule saved to .claude/settings.local.json",
       });
     } else if (scope === "user") {
-      toast.success(`Allowing ${toolName} for all projects`, {
+      toast.success(`Allowing ${ruleText} for all projects`, {
         description: "Rule saved to ~/.claude/settings.json",
       });
     }
+  };
+
+  const allowForSession = () => {
+    if (dispatchedRef.current) return;
+    dispatchedRef.current = true;
+    onDecide({ decision: "allow_for_session" });
   };
 
   const confirmDeny = () => {
@@ -292,8 +404,34 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
     onDecide({ decision: "deny", message: reason || "User denied" });
   };
 
+  const cancelDeny = () => {
+    setDenying(false);
+    setReason("");
+  };
+
+  // Single-key shortcuts while focus is inside the footer: Enter already
+  // activates the focused Allow button, A opens the Allow-always menu and
+  // D starts a denial.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Keys typed in the open Allow-always menu bubble here through the
+    // React tree (the menu is portaled, not a DOM child). They belong to
+    // the menu's own navigation and typeahead.
+    if (menuOpen || denying || e.metaKey || e.ctrlKey || e.altKey) return;
+    const key = e.key.toLowerCase();
+    if (key === "a") {
+      e.preventDefault();
+      setMenuOpen(true);
+    } else if (key === "d") {
+      e.preventDefault();
+      setDenying(true);
+    }
+  };
+
   return (
-    <div className="border-t border-border/60 p-3 space-y-2">
+    <div
+      className="group/approval border-t border-border/60 p-3 space-y-2"
+      onKeyDown={handleKeyDown}
+    >
       {inputText !== null && (
         <ToolCallBlock content={null} text={inputText} />
       )}
@@ -312,6 +450,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
         // conversation neutral.
         <div className="flex flex-wrap items-center gap-2">
           <Button
+            ref={allowRef}
             type="button"
             size="sm"
             className="bg-foreground text-background hover:bg-foreground/90"
@@ -319,7 +458,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
           >
             Allow
           </Button>
-          <DropdownMenu>
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button
                 type="button"
@@ -330,25 +469,36 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
                 <ChevronDown className="ml-1 size-3" aria-hidden />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="text-label">
-              <DropdownMenuItem
-                onSelect={() => handleAllow("project")}
-                className="text-label gap-3"
-              >
-                <span>For this project</span>
-                <span className="ml-auto text-caption text-muted-foreground">
-                  .claude/settings.local.json
-                </span>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onSelect={() => handleAllow("user")}
-                className="text-label gap-3"
-              >
-                <span>For all projects</span>
-                <span className="ml-auto text-caption text-muted-foreground">
-                  ~/.claude/settings.json
-                </span>
-              </DropdownMenuItem>
+            <DropdownMenuContent
+              align="start"
+              className={cn("text-label", claudeRules ? "w-80" : "w-48")}
+            >
+              {!claudeRules && (
+                <DropdownMenuItem
+                  onSelect={allowForSession}
+                  className="text-label"
+                >
+                  For this session
+                </DropdownMenuItem>
+              )}
+              {/* The narrow rule leads; the any-input rule sits last and
+                  says plainly how much it covers. */}
+              {claudeRules && scopedRule && (
+                <>
+                  <RuleScopeGroup
+                    rule={scopedRule}
+                    onPick={(scope) => handleAllow(scope, scopedRule)}
+                  />
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              {claudeRules && (
+                <RuleScopeGroup
+                  rule={anyInputRule}
+                  anyInput
+                  onPick={(scope) => handleAllow(scope, anyInputRule)}
+                />
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
           <Button
@@ -360,12 +510,25 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
           >
             Deny
           </Button>
+          <span
+            data-testid="approval-key-hints"
+            className="ml-auto hidden text-caption text-muted-foreground/70 group-focus-within/approval:inline"
+          >
+            <Kbd>↵</Kbd> allow · <Kbd>A</Kbd> always · <Kbd>D</Kbd> deny
+          </span>
         </div>
       ) : (
         <div className="space-y-2">
           <textarea
+            autoFocus
             value={reason}
             onChange={(e) => setReason(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                cancelDeny();
+              }
+            }}
             placeholder="Reason (optional)"
             className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-label text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
             rows={2}
@@ -387,10 +550,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
               variant="ghost"
               size="sm"
               className="text-muted-foreground hover:text-foreground"
-              onClick={() => {
-                setDenying(false);
-                setReason("");
-              }}
+              onClick={cancelDeny}
             >
               Cancel
             </Button>
@@ -398,6 +558,61 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
         </div>
       )}
     </div>
+  );
+}
+
+/** One rule and the three places it can live. The rule is printed exactly
+ *  as it will be written, so "Allow always" never hides how much it
+ *  allows. */
+function RuleScopeGroup({
+  rule,
+  anyInput = false,
+  onPick,
+}: {
+  rule: PermissionRuleSpec;
+  anyInput?: boolean;
+  onPick: (scope: Exclude<PermissionScope, "once">) => void;
+}) {
+  const ruleText = formatPermissionRule(rule);
+  return (
+    <DropdownMenuGroup aria-label={ruleText}>
+      <DropdownMenuLabel className="flex min-w-0 items-baseline gap-2">
+        <span
+          className={cn(
+            "min-w-0 truncate font-mono text-caption",
+            anyInput ? "text-muted-foreground" : "text-foreground",
+          )}
+          title={ruleText}
+        >
+          {ruleText}
+        </span>
+        {anyInput && (
+          <span className="shrink-0 text-caption text-muted-foreground">
+            {rule.toolName === "Bash" ? "any command" : "any input"}
+          </span>
+        )}
+      </DropdownMenuLabel>
+      {SCOPE_ITEMS.map(({ scope, label, where }) => (
+        <DropdownMenuItem
+          key={scope}
+          onSelect={() => onPick(scope)}
+          className="text-label gap-3"
+        >
+          <span>{label}</span>
+          <span className="ml-auto text-caption text-muted-foreground">
+            {where}
+          </span>
+        </DropdownMenuItem>
+      ))}
+    </DropdownMenuGroup>
+  );
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="rounded-sm bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
+      {children}
+    </kbd>
   );
 }
 
@@ -421,7 +636,7 @@ function glyphForState(states: {
   isSuccess: boolean;
   isError: boolean;
 }): StatusGlyph | null {
-  if (states.isPendingApproval) return { Icon: Clock, className: "text-muted-foreground" };
+  if (states.isPendingApproval) return { Icon: Clock, className: "text-status-working" };
   if (states.isResponding)
     return { Icon: Spinner, className: "text-muted-foreground" };
   if (states.isExecuting)
