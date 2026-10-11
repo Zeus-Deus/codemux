@@ -155,6 +155,7 @@ vi.mock("@/stores/ui-store", () => ({
     {
       getState: () => ({
         setSidebarToggleFn: vi.fn(),
+        closeUtilityPages: vi.fn(),
       }),
     },
   ),
