@@ -169,9 +169,20 @@ if (process.platform === "linux") {
     "Linux xdg-open on the launched app's PATH is a logger; the native opener path runs, no browser starts",
   );
 }
+// The runner's ~/.bashrc prompt (user@host plus this run's temp path) is 78
+// columns. Ubuntu 22.04's bash 5.1 in a UTF-8 locale redraws a typed line
+// over itself when the prompt ends exactly at the right margin, which a 39-
+// or 26-column pane does. Pin a short prompt so the terminal checks don't
+// depend on the runner's hostname, paths and pane width.
+if (process.platform === "linux") {
+  evidence.seams.push(
+    "Linux shells get a fixed '$ ' prompt through PROMPT_COMMAND; the runner's own prompt length is incidental",
+  );
+}
 const env = {
   ...process.env,
   ...(openerPath && { PATH: openerPath }),
+  ...(process.platform === "linux" && { PROMPT_COMMAND: 'PS1="\\$ "' }),
   CODEMUX_API_URL: `http://127.0.0.1:${account.address().port}`,
   WEBKIT_DISABLE_COMPOSITING_MODE: "1",
 };

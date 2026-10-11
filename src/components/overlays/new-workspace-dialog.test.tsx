@@ -76,11 +76,8 @@ vi.mock("@/tauri/commands", () => ({
     url: "https://github.com/u/r/issues/92",
     body: "Implement the backend endpoints.",
   }),
-  // Added in step 2b: the new-workspace dialog now embeds the
-  // DevicePicker, which reads from hostsList. The submit flow
-  // calls setWorkspaceHost when a non-local host is chosen.
+  // The ProjectPicker groups projects through the shared hosts store.
   hostsList: vi.fn().mockResolvedValue([]),
-  setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
   // Added when the dialog started seeding `baseBranch` from
   // `useDefaultBranch(projectDir)`. The hook calls `getDefaultBranch`
   // unconditionally on every project change — without a mock here, the
@@ -320,6 +317,17 @@ describe("NewWorkspaceDialog", () => {
       const buttons = screen.getAllByRole("button", { name: /Create/i });
       expect(buttons.length).toBeGreaterThan(0);
     });
+  });
+
+  it("creates on this device only — no device picker", async () => {
+    // Picking a device here used to only label a local workspace as
+    // remote; threads on a device start from the new-thread composer.
+    setAppState("/path/to/project");
+    renderDialog(true);
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /Create/i }).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("button", { name: /^Device:/ })).toBeNull();
   });
 
   it("shows Ctrl+Enter hint", async () => {

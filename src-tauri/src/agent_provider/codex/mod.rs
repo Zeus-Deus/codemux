@@ -111,6 +111,7 @@ impl CodexAgentProvider {
             codex_home: self.config.codex_home.clone(),
             client_info: self.config.client_info.clone(),
             mcp_registry: self.config.mcp_registry.clone(),
+            remote: None,
         }
     }
 
@@ -208,17 +209,23 @@ impl AgentProvider for CodexAgentProvider {
             dead.shutdown().await;
         }
 
+        let spawn = CodexSpawnConfig {
+            remote: input.remote,
+            ..self.spawn_config()
+        };
         let session = CodexSession::spawn_and_initialize(
             thread_id.clone(),
             input.cwd,
             input.model,
             input.permission_mode,
             input.effort,
-            input.fast_mode,
+            input
+                .service_tier
+                .unwrap_or_else(|| if input.fast_mode { "fast" } else { "default" }.into()),
             input.resume_cursor.clone(),
             input.env,
             input.workspace_id,
-            self.spawn_config(),
+            spawn,
             self.event_tx.clone(),
             input.recorded_usage_baseline,
         )
@@ -420,8 +427,24 @@ impl AgentProvider for CodexAgentProvider {
             sessions.get(&thread_id).cloned()
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
-        session.set_fast_mode(fast_mode).await;
-        Ok(())
+        session
+            .set_service_tier(if fast_mode { "fast" } else { "default" }.into())
+            .await
+    }
+
+    async fn set_service_tier(
+        &self,
+        thread_id: ThreadId,
+        tier: String,
+    ) -> Result<(), ProviderError> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or(ProviderError::SessionNotFound { thread_id })?;
+        session.set_service_tier(tier).await
     }
 
     async fn set_permission_mode(

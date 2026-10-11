@@ -7,6 +7,7 @@ import {
 import { useAppStore } from "@/stores/app-store";
 import { undockBrowserFromRightPanel } from "@/tauri/commands";
 import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
+import { selectUtilityPage } from "@/lib/utility-pages";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
 export type RightPanelCorePane =
@@ -88,7 +89,14 @@ interface UIStore {
    *  rather than in `SidebarProvider` because full-screen pages (Settings,
    *  Automations, …) unmount the provider. Clamped by the provider. */
   sidebarWidth: number;
-  rightPanelWidth: number;
+  /** Left sidebar expanded (true) or collapsed to the icon rail. Persisted
+   *  next to its width so the two halves of one preference survive a
+   *  restart together. */
+  sidebarOpen: boolean;
+  /** The panel width the user dragged to, or `null` until they do — the
+   *  panel then opens at a window-relative default. See
+   *  `resolveRightPanelWidth` in `@/lib/right-panel-width`. */
+  rightPanelWidth: number | null;
   /** Measured width of the row the panel shares with the workspace content
    *  (`workspace-main.tsx` owns the measurement). Runtime-only, never
    *  persisted, `0` until first layout.
@@ -126,6 +134,7 @@ interface UIStore {
   showAutomations: boolean;
   showDevices: boolean;
   showPullRequests: boolean;
+  showUsage: boolean;
   /** A pull request the page should select as it opens — set by the
    *  palette or a link, consumed and cleared by the page. `url` is where
    *  a link came from, so the page can hand it to the browser if the
@@ -196,8 +205,9 @@ interface UIStore {
    *  open on what is running now, so this is never persisted. */
   subagentsHistoryOpen: boolean;
   /** Subagent ids whose failure card the user has waved off. Failures hold
-   *  the pane until acknowledged; the acknowledgement itself is per-session
-   *  (the run is over next launch), so this is transient too. */
+   *  the pane until acknowledged, and the cards are rebuilt from persisted
+   *  chat history, so the acknowledgement is persisted too (newest
+   *  `MAX_DISMISSED_SUBAGENTS` kept) or every restart would re-raise them. */
   dismissedSubagentAttention: string[];
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
@@ -231,7 +241,10 @@ interface UIStore {
     order: readonly RightPanelTab[],
   ) => void;
   setSidebarWidth: (width: number) => void;
-  setRightPanelWidth: (width: number) => void;
+  setSidebarOpen: (open: boolean) => void;
+  setRightPanelWidth: (width: number | null) => void;
+  /** Back to the window-relative default (`null`), as if never dragged. */
+  resetRightPanelWidth: () => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
@@ -246,6 +259,10 @@ interface UIStore {
   clearPendingPresetCreate: () => void;
   setShowAutomations: (show: boolean) => void;
   setShowDevices: (show: boolean) => void;
+  setShowUsage: (show: boolean) => void;
+  /** Leave whichever utility page is open (Automations, Devices, Pull
+   *  requests, Usage) and return to the workspace underneath it. */
+  closeUtilityPages: () => void;
   /** Open the Pull Requests page, optionally on a given pull request. */
   setShowPullRequests: (
     show: boolean,
@@ -289,6 +306,18 @@ interface UIStore {
   dismissSubagentAttention: (id: string) => void;
 }
 
+const NO_UTILITY_PAGE = {
+  showAutomations: false,
+  showDevices: false,
+  showPullRequests: false,
+  showUsage: false,
+  pendingPrSelection: null,
+} as const;
+
+/** Only the latest wave's failures can raise a card, so a short memory of
+ *  dismissals is enough and keeps the persisted list from growing forever. */
+const MAX_DISMISSED_SUBAGENTS = 200;
+
 export const useUIStore = create<UIStore>()(
   persist(
     (set, get) => ({
@@ -297,7 +326,8 @@ export const useUIStore = create<UIStore>()(
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
-      rightPanelWidth: 320,
+      sidebarOpen: true,
+      rightPanelWidth: null,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
       fileSearchTarget: "editor",
@@ -310,6 +340,7 @@ export const useUIStore = create<UIStore>()(
       showAutomations: false,
       showDevices: false,
       showPullRequests: false,
+      showUsage: false,
       pendingPrSelection: null,
       prBadgeSeen: [],
       renameWorkspaceId: null,
@@ -534,13 +565,20 @@ export const useUIStore = create<UIStore>()(
       // instead of being permanently clipped down to it.
       setRightPanelWidth: (width) =>
         set({
-          rightPanelWidth: Math.max(
-            RIGHT_PANEL_MIN_WIDTH,
-            Math.min(RIGHT_PANEL_MAX_STORED_WIDTH, width),
-          ),
+          rightPanelWidth:
+            width === null
+              ? null
+              : Math.max(
+                  RIGHT_PANEL_MIN_WIDTH,
+                  Math.min(RIGHT_PANEL_MAX_STORED_WIDTH, width),
+                ),
         }),
 
+      resetRightPanelWidth: () => set({ rightPanelWidth: null }),
+
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
+
+      setSidebarOpen: (open) => set({ sidebarOpen: open }),
 
       setRightPanelRowWidth: (width) =>
         set((state) =>
@@ -575,14 +613,24 @@ export const useUIStore = create<UIStore>()(
           pendingPresetCreate: true,
         }),
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
-      setShowAutomations: (show) => set({ showAutomations: show }),
+      // Utility pages share the main area beside the sidebar, so opening
+      // one replaces whichever other one was showing.
+      setShowAutomations: (show) =>
+        set(show ? { ...NO_UTILITY_PAGE, showAutomations: true } : { showAutomations: false }),
       setShowDevices: (show) =>
-        set({ showDevices: show }),
+        set(show ? { ...NO_UTILITY_PAGE, showDevices: true } : { showDevices: false }),
+      setShowUsage: (show) =>
+        set(show ? { ...NO_UTILITY_PAGE, showUsage: true } : { showUsage: false }),
       setShowPullRequests: (show, select = null) =>
         set({
+          ...(show ? NO_UTILITY_PAGE : {}),
           showPullRequests: show,
           pendingPrSelection: show ? select : null,
         }),
+      closeUtilityPages: () =>
+        set((state) =>
+          selectUtilityPage(state) === null ? state : NO_UTILITY_PAGE,
+        ),
       clearPendingPrSelection: () => set({ pendingPrSelection: null }),
       markPrBadgeSeen: (keys) =>
         set((state) => ({
@@ -690,32 +738,44 @@ export const useUIStore = create<UIStore>()(
         set((s) =>
           s.dismissedSubagentAttention.includes(id)
             ? s
-            : { dismissedSubagentAttention: [...s.dismissedSubagentAttention, id] },
+            : {
+                dismissedSubagentAttention: [
+                  ...s.dismissedSubagentAttention,
+                  id,
+                ].slice(-MAX_DISMISSED_SUBAGENTS),
+              },
         ),
     }),
     {
       name: "codemux-ui",
-      version: 1,
+      version: 2,
       partialize: (state) => ({
         rightPanelTabs: state.rightPanelTabs,
         rightPanelLastTabs: state.rightPanelLastTabs,
         rightPanelPanes: state.rightPanelPanes,
         rightPanelDismissedPanes: state.rightPanelDismissedPanes,
         sidebarWidth: state.sidebarWidth,
+        sidebarOpen: state.sidebarOpen,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
+        dismissedSubagentAttention: state.dismissedSubagentAttention,
       }),
       // v0 → v1: the right-panel tab id `"pr"` was renamed to `"review"`
       // when the panel itself was renamed (Phase 3). Rewrite any persisted
       // values so users keep their active tab on upgrade instead of having
       // it silently fall back to the default.
+      //
+      // v1 → v2: drop the saved panel width, for the same reason the
+      // SQLite copy moved to a new key (see `RIGHT_PANEL_WIDTH_UI_KEY`).
       migrate: (persistedState, version) => {
-        if (version >= 1) return persistedState;
         const state = persistedState as {
           rightPanelTabs?: Record<string, string | null>;
+          rightPanelWidth?: number;
         };
+        if (version < 2 && state) delete state.rightPanelWidth;
+        if (version >= 1) return persistedState;
         if (state?.rightPanelTabs) {
           const migrated: Record<string, string | null> = {};
           for (const [wsId, tab] of Object.entries(state.rightPanelTabs)) {

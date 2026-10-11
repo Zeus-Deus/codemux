@@ -23,8 +23,9 @@ use crate::json_rpc_child::{
 };
 
 use super::protocol::{
-    config_id_for, config_options, current_model_id, grok_auth_method, grok_model_effort_catalog,
-    initialize_params, looks_unauthenticated, option_by_id, resolve_boolean_value,
+    config_id_for, config_options, current_model_id, grok_auth_method,
+    grok_auth_reads_ambient_api_key, grok_model_effort_catalog, initialize_params,
+    local_xai_api_key_set, looks_unauthenticated, option_by_id, resolve_boolean_value,
     resolve_effort_value, resolve_select_value, session_id, set_config_params, set_model_params,
     ConfigKind, GrokModelEffortCatalog,
 };
@@ -103,6 +104,8 @@ pub struct AcpSpawnConfig {
     /// Shared with the command IPC so the composer reads the same catalogue
     /// the live session last observed.
     pub slash_command_cache: Arc<AcpSlashCommandCache>,
+    /// Device to run the agent on over SSH; `None` runs it here.
+    pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
 }
 
 #[derive(Debug)]
@@ -327,11 +330,25 @@ impl AcpSessionState {
 /// [`AcpSession::await_child_messages_drained`].
 type NotificationBarrier = oneshot::Sender<()>;
 
+/// Whether the composer's `cwd` names this session's folder for command
+/// discovery. A device session's folder is a path on the device, which the
+/// composer may know only by the workspace's local path; the thread already
+/// identifies the session there, so any folder will do.
+fn command_discovery_cwd_matches(
+    on_device: bool,
+    session_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+) -> bool {
+    on_device || cwd == session_cwd
+}
+
 pub(crate) struct AcpSession {
     pub thread_id: ThreadId,
     pub provider_session_id: ProviderSessionId,
     pub state: Mutex<AcpSessionState>,
     cwd: PathBuf,
+    /// Runs on a device over SSH; `cwd` is a path there, not on this computer.
+    on_device: bool,
     child: Arc<JsonRpcChild>,
     dialect: AcpDialect,
     slash_command_cache: Arc<AcpSlashCommandCache>,
@@ -359,7 +376,7 @@ impl AcpSession {
     }
 
     pub async fn slash_commands(&self, cwd: &std::path::Path) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, ProviderError> {
-        if cwd != self.cwd {
+        if !command_discovery_cwd_matches(self.on_device, &self.cwd, cwd) {
             return Err(ProviderError::ValidationError { message: "Command discovery must use this conversation's directory.".into() });
         }
         Ok(self.commands.lock().await.clone())
@@ -382,15 +399,40 @@ impl AcpSession {
         let dialect = spawn.dialect;
         let slash_command_cache = Arc::clone(&spawn.slash_command_cache);
         let child_env = env.unwrap_or_default();
-        let child = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.binary,
-            args: dialect.spawn_args(),
-            env: child_env.clone(),
-            cwd: Some(cwd.clone()),
-            default_timeout: RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|error| map_spawn_error(error, dialect))?;
+        let remote = spawn.remote.clone();
+        let device = remote.as_ref().map(|remote| remote.host_name.as_str());
+        let child = match remote.as_ref() {
+            #[cfg(unix)]
+            Some(remote) => {
+                let program = crate::ssh::sidecar::device_program(remote, &spawn.binary).await?;
+                JsonRpcChild::spawn(crate::ssh::sidecar::device_spawn_config(
+                    remote,
+                    &program,
+                    &dialect.spawn_args(),
+                    &child_env,
+                    &cwd,
+                    RPC_TIMEOUT,
+                )?)
+                .await
+                .map_err(crate::ssh::sidecar::ssh_spawn_error)?
+            }
+            #[cfg(not(unix))]
+            Some(_) => {
+                return Err(ProviderError::ValidationError {
+                    message: "Threads on another device need macOS or Linux on this computer"
+                        .into(),
+                })
+            }
+            None => JsonRpcChild::spawn(SpawnConfig {
+                program: spawn.binary,
+                args: dialect.spawn_args(),
+                env: child_env.clone(),
+                cwd: Some(cwd.clone()),
+                default_timeout: RPC_TIMEOUT,
+            })
+            .await
+            .map_err(|error| map_spawn_error(error, dialect))?,
+        };
         let child = Arc::new(child);
         let notification_rx = child.notifications();
         let request_rx = child
@@ -406,19 +448,60 @@ impl AcpSession {
             let initialized = child
                 .request("initialize", initialize_params("codemux"))
                 .await
-                .map_err(|error| map_rpc_error(error, dialect))?;
+                .map_err(|error| {
+                    // `initialize` is the first thing a device-side agent
+                    // answers, so an install or connection problem there
+                    // surfaces here.
+                    #[cfg(unix)]
+                    if let Some(mapped) = remote.as_ref().and_then(|remote| {
+                        crate::ssh::sidecar::device_start_error(
+                            &error,
+                            dialect.provider(),
+                            remote,
+                            device_install_hint(dialect, &remote.host_name),
+                        )
+                    }) {
+                        return mapped;
+                    }
+                    map_rpc_error(error, dialect)
+                })?;
             slash_command_cache
                 .replace_from_value(dialect, &cwd, &initialized)
                 .await;
             let auth_method = match dialect {
                 AcpDialect::Cursor => "cursor_login".to_string(),
-                AcpDialect::Grok => grok_auth_method(&initialized, &child_env).ok_or_else(|| {
-                    ProviderError::NotAuthenticated {
-                        provider: ProviderKind::Grok,
-                        hint: "Run `grok login --device-auth` (or set `XAI_API_KEY`) and try again."
-                            .into(),
-                    }
-                })?,
+                AcpDialect::Grok => {
+                    // Older CLIs pick API-key auth only when the agent's own
+                    // environment has the key. This computer's says nothing
+                    // about a device, so ask the device (its answer, never
+                    // the value), and only when it can change the method.
+                    let ambient_api_key =
+                        grok_auth_reads_ambient_api_key(&initialized, &child_env)
+                            && match remote.as_ref() {
+                                None => local_xai_api_key_set(),
+                                #[cfg(unix)]
+                                Some(remote) => crate::ssh::exec::remote_env_var_set(
+                                    &remote.ssh_target,
+                                    "XAI_API_KEY",
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                    eprintln!(
+                                        "[codemux::acp] couldn't check {} for XAI_API_KEY: {error}",
+                                        remote.host_name
+                                    );
+                                    false
+                                }),
+                                #[cfg(not(unix))]
+                                Some(_) => false,
+                            };
+                    grok_auth_method(&initialized, &child_env, ambient_api_key).ok_or_else(
+                        || ProviderError::NotAuthenticated {
+                            provider: ProviderKind::Grok,
+                            hint: auth_hint(dialect, device),
+                        },
+                    )?
+                }
             };
             let auth_params = if dialect.is_grok() {
                 json!({ "methodId": auth_method, "_meta": { "headless": true } })
@@ -428,7 +511,7 @@ impl AcpSession {
             child
                 .request("authenticate", auth_params)
                 .await
-                .map_err(|error| map_auth_error(error, dialect))?;
+                .map_err(|error| map_auth_error(error, dialect, device))?;
 
             // `initialize` is Grok's first authoritative model catalogue.
             // Reconcile persisted startup preferences before they reach
@@ -582,6 +665,7 @@ impl AcpSession {
                     .or_else(|| grok_reasoning_effort(&initialized)),
             }),
             cwd,
+            on_device: remote.is_some(),
             child,
             dialect,
             slash_command_cache,
@@ -1379,10 +1463,23 @@ impl AcpSession {
             duration_ms: usage.api_duration_ms,
             num_turns: usage.num_turns,
         });
-        let status = match response {
-            Ok(result) => turn_status_from_result(&result, self.dialect),
-            Err(error) => turn_status_from_rpc_error(&error, self.dialect),
+        let status = match &response {
+            Ok(result) => turn_status_from_result(result, self.dialect),
+            Err(error) => turn_status_from_rpc_error(error, self.dialect),
         };
+        if let TurnStatus::Error { subtype, message } = &status {
+            if subtype == crate::agent_provider::events::RATE_LIMIT_SUBTYPE {
+                let payload = match &response {
+                    Ok(result) => result,
+                    Err(RpcChildError::RpcError(error)) => error.data.as_ref().unwrap_or(&Value::Null),
+                    Err(_) => &Value::Null,
+                };
+                let notice = crate::agent_provider::usage_limit::usage_limit_notice(
+                    &self.thread_id, self.dialect.provider(), payload, message,
+                );
+                if let Some(notice) = notice { let _ = self.event_tx.send(notice); }
+            }
+        }
         let _ = self.event_tx.send(ProviderRuntimeEvent::TurnCompleted {
             thread_id: self.thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -2636,7 +2733,9 @@ fn context_window_from_value(value: &Value) -> Option<u64> {
 fn turn_status_from_result(result: &Value, dialect: AcpDialect) -> TurnStatus {
     match result.get("stopReason").and_then(Value::as_str) {
         Some("error") => TurnStatus::Error {
-            subtype: format!("{}_acp", dialect.id_prefix()),
+            subtype: if crate::agent_provider::usage_limit::is_usage_limit_error(
+                &agent_result_message(result).unwrap_or_default(), result,
+            ) { "rate_limit".into() } else { format!("{}_acp", dialect.id_prefix()) },
             message: agent_result_message(result)
                 .unwrap_or_else(|| format!("{} turn failed", dialect.label())),
         },
@@ -2656,13 +2755,11 @@ fn turn_status_from_rpc_error(error: &RpcChildError, dialect: AcpDialect) -> Tur
         _ => None,
     };
     let message = detail.unwrap_or_else(|| error.to_string());
-    let lower = message.to_ascii_lowercase();
-    let rate_limited = lower.contains("rate limit")
-        || lower.contains("usage limit")
-        || matches!(error, RpcChildError::RpcError(error) if error.data.as_ref().is_some_and(|data| {
-            data.get("http_status").and_then(Value::as_u64) == Some(429)
-                || data.get("httpStatus").and_then(Value::as_u64) == Some(429)
-        }));
+    let payload = match error {
+        RpcChildError::RpcError(error) => error.data.as_ref().unwrap_or(&Value::Null),
+        _ => &Value::Null,
+    };
+    let rate_limited = crate::agent_provider::usage_limit::is_usage_limit_error(&message, payload);
     TurnStatus::Error {
         subtype: if rate_limited {
             "rate_limit".into()
@@ -3480,17 +3577,43 @@ fn map_spawn_error(error: RpcChildError, dialect: AcpDialect) -> ProviderError {
     }
 }
 
-fn map_auth_error(error: RpcChildError, dialect: AcpDialect) -> ProviderError {
+/// How to sign in, on this computer or on the named device.
+fn auth_hint(dialect: AcpDialect, device: Option<&str>) -> String {
+    match (dialect, device) {
+        (AcpDialect::Cursor, None) => "Run `cursor-agent login` and try again.".into(),
+        (AcpDialect::Cursor, Some(device)) => {
+            format!("Run `cursor-agent login` on {device} and try again.")
+        }
+        (AcpDialect::Grok, None) => {
+            "Run `grok login --device-auth` (or set `XAI_API_KEY`) and try again.".into()
+        }
+        (AcpDialect::Grok, Some(device)) => format!(
+            "Run `grok login --device-auth` on {device} (or set `XAI_API_KEY` there) and try again."
+        ),
+    }
+}
+
+/// How to install the agent CLI on a device.
+#[cfg(unix)]
+fn device_install_hint(dialect: AcpDialect, device: &str) -> String {
+    match dialect {
+        AcpDialect::Cursor => {
+            format!("Install Cursor Agent on {device} and run `cursor-agent login` there")
+        }
+        AcpDialect::Grok => format!("Install the Grok CLI on {device} and sign in there"),
+    }
+}
+
+fn map_auth_error(
+    error: RpcChildError,
+    dialect: AcpDialect,
+    device: Option<&str>,
+) -> ProviderError {
     let message = error.to_string();
     if looks_unauthenticated(&message) {
         ProviderError::NotAuthenticated {
             provider: dialect.provider(),
-            hint: match dialect {
-                AcpDialect::Cursor => "Run `cursor-agent login` and try again.".into(),
-                AcpDialect::Grok => {
-                    "Run `grok login --device-auth` (or set `XAI_API_KEY`) and try again.".into()
-                }
-            },
+            hint: auth_hint(dialect, device),
         }
     } else {
         ProviderError::RpcError { message }
@@ -3621,6 +3744,18 @@ mod tests {
         // The legacy UI fallback remains its existing separate contract.
         assert_eq!(pending_response(&pending, &ApprovalDecision::Allow {updated_input:None,updated_permissions:None}),
             json!({"outcome":{"outcome":"selected","optionId":"permit"}}));
+    }
+
+    #[test]
+    fn device_sessions_list_commands_for_the_workspaces_local_folder() {
+        let device_cwd = std::path::Path::new("/home/u/.codemux/worktrees/uid-app/feat");
+        let local_cwd = std::path::Path::new("/home/me/projects/app");
+        assert!(command_discovery_cwd_matches(false, local_cwd, local_cwd));
+        assert!(!command_discovery_cwd_matches(false, device_cwd, local_cwd));
+        // A workspace moved to a device keeps its local folder in the
+        // composer while the session runs in the device's copy.
+        assert!(command_discovery_cwd_matches(true, device_cwd, local_cwd));
+        assert!(command_discovery_cwd_matches(true, device_cwd, device_cwd));
     }
 
     #[test]
@@ -3857,6 +3992,23 @@ mod tests {
             ),
             TurnStatus::Error { ref subtype, .. } if subtype == "rate_limit"
         ));
+    }
+
+    #[test]
+    fn usage_limit_acp_results_preserve_reset_metadata() {
+        for dialect in [AcpDialect::Cursor, AcpDialect::Grok] {
+            let result = json!({"stopReason":"error", "_meta":{"agentResult":"Usage limit reached",
+                "reset_at_ms":1_800_000_000_000_i64}});
+            let status = turn_status_from_result(&result, dialect);
+            let TurnStatus::Error { subtype, message } = status else { panic!("expected limit"); };
+            assert_eq!(subtype, "rate_limit");
+            let notice = crate::agent_provider::usage_limit::usage_limit_notice(
+                &ThreadId("acp-limit".into()), dialect.provider(), &result, &message,
+            ).unwrap();
+            assert!(matches!(notice, ProviderRuntimeEvent::UsageLimitReached {
+                resets_at_ms: Some(1_800_000_000_000), ..
+            }));
+        }
     }
 
     #[test]

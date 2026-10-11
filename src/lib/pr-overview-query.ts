@@ -197,6 +197,9 @@ export interface PrOverviewResult {
   /** Roots whose fetch failed. The rest of the list still renders —
    *  a repository you can't reach is a footer line, not a blank page. */
   failures: RootFailure[];
+  /** Roots with no remote. Nothing to list and nothing broken, so they
+   *  are counted apart from `failures`. */
+  localOnly: ProjectRoot[];
   roots: ProjectRoot[];
   /** Newest successful fetch across all roots, for "20s ago". */
   updatedAt: number | null;
@@ -331,10 +334,10 @@ export function usePrOverview(
   // has no reason to carry.
   const wantsHistory = stateFilter !== "open";
   const historyResults = useQueries({
-    queries: roots.map((root) => ({
+    queries: roots.map((root, i) => ({
       queryKey: prHistoryKey(root.path, stateFilter),
       queryFn: () => listPullRequests(root.path, stateFilter === "closed" ? "closed" : "all"),
-      enabled: canFetch(root) && wantsHistory,
+      enabled: canFetch(root) && wantsHistory && !results[i]?.data?.local_only,
       refetchOnWindowFocus: false,
       staleTime: listRefetchMs,
       retry: prQueryRetry,
@@ -360,6 +363,7 @@ export function usePrOverview(
   const rows: PrRow[] = [];
   const viewerByRoot = new Map<string, string | null>();
   const failures: RootFailure[] = [];
+  const localOnly: ProjectRoot[] = [];
   let updatedAt: number | null = null;
   let statsUpdatedAt = 0;
   let isLoading = false;
@@ -385,6 +389,13 @@ export function usePrOverview(
     const root = roots[i];
     if (!root) return;
     if (result.isLoading) isLoading = true;
+
+    // Answered, with nothing to ask a host about. Not a fresh root either:
+    // it must not hide a refresh that failed everywhere it could run.
+    if (result.data?.local_only) {
+      localOnly.push(root);
+      return;
+    }
 
     if (result.data) {
       anyRootFresh = true;
@@ -539,11 +550,13 @@ export function usePrOverview(
     rows: visible,
     viewerByRoot,
     failures,
+    localOnly,
     roots,
     updatedAt,
     carried,
     carriedAt: carried ? (snapshot?.savedAt ?? null) : null,
-    allRootsFailed: roots.length > 0 && failures.length === roots.length,
+    allRootsFailed:
+      roots.length > localOnly.length && failures.length === roots.length - localOnly.length,
     refreshFailed: failures.length > 0 && !anyRootFresh && !isLoading,
     rateLimitedUntil,
     isLoading,

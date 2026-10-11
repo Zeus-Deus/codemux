@@ -15,6 +15,7 @@ vi.mock("@/lib/toast", () => ({
   toast: {
     success: vi.fn(),
     error: vi.fn(),
+    failure: vi.fn(),
     info: vi.fn(),
     warning: vi.fn(),
   },
@@ -180,6 +181,7 @@ beforeEach(() => {
   for (const fn of Object.values(cmds)) (fn as ReturnType<typeof vi.fn>).mockReset();
   vi.mocked(toast.success).mockReset();
   vi.mocked(toast.error).mockReset();
+  vi.mocked(toast.failure).mockReset();
   vi.mocked(toast.info).mockReset();
   cmds.webRemoteStatus.mockResolvedValue(status({}));
   cmds.webRemoteListEndpoints.mockResolvedValue(endpoints());
@@ -360,7 +362,38 @@ describe("RemoteAccessSection — enabled", () => {
     );
   });
 
-  it("toasts and badges a new pending device arriving over the live event", async () => {
+  it("asks before revoking every browser", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteRevokeSession.mockResolvedValue(status({ enabled: true, running: true }));
+    render(<RemoteAccessSection />);
+    await waitFor(() => expect(screen.getByText("MacBook Air")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: /^revoke all$/i }));
+    expect(await screen.findByText(/Revoke 1 browser\?/)).toBeInTheDocument();
+    expect(cmds.webRemoteRevokeSession).not.toHaveBeenCalled();
+
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: /^revoke all$/i }));
+    await waitFor(() =>
+      expect(cmds.webRemoteRevokeSession).toHaveBeenCalledWith("macbook"),
+    );
+  });
+
+  it("leaves every browser alone when Revoke all is cancelled", async () => {
+    const user = userEvent.setup();
+    render(<RemoteAccessSection />);
+    await waitFor(() => expect(screen.getByText("MacBook Air")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: /^revoke all$/i }));
+    await user.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", { name: /cancel/i }),
+    );
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(cmds.webRemoteRevokeSession).not.toHaveBeenCalled();
+  });
+
+  // The "wants to connect" question is asked app-wide by
+  // useRemotePairingRequests; this section only lists the request.
+  it("lists a new pending device arriving over the live event without a second toast", async () => {
     render(<RemoteAccessSection />);
     await waitFor(() => expect(events.cb).not.toBeNull());
     // One pending device already ("Waiting for approval" with count 1).
@@ -380,14 +413,8 @@ describe("RemoteAccessSection — enabled", () => {
       );
     });
 
-    await waitFor(() =>
-      expect(toast.info).toHaveBeenCalledWith(
-        expect.stringMatching(/iPad wants to connect/i),
-        expect.objectContaining({ description: expect.any(String) }),
-      ),
-    );
-    // The new pending device now shows in the list.
-    expect(screen.getByText("iPad")).toBeInTheDocument();
+    expect(await screen.findByText("iPad")).toBeInTheDocument();
+    expect(toast.info).not.toHaveBeenCalled();
   });
 });
 
@@ -749,8 +776,9 @@ describe("RemoteAccessSection — ways to connect", () => {
       await screen.findByRole("button", { name: /retry starting the server/i }),
     );
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith(
-        "Still couldn't start the server: Address already in use",
+      expect(toast.failure).toHaveBeenCalledWith(
+        "Still couldn't start the server",
+        "Address already in use",
       ),
     );
   });
@@ -870,7 +898,7 @@ describe("RemoteAccessSection — ways to connect", () => {
     expect(screen.queryByText(/every network interface/i)).toBeNull();
   });
 
-  it("lists paired devices and account browsers together under Devices", async () => {
+  it("lists paired devices and account browsers together under Paired browsers", async () => {
     cmds.webRemoteStatus.mockResolvedValue(
       ways({
         sessions: [
@@ -883,7 +911,7 @@ describe("RemoteAccessSection — ways to connect", () => {
     render(<RemoteAccessSection />);
 
     await screen.findByText("Work laptop");
-    expect(screen.getByText(/^Devices$/)).toBeInTheDocument();
+    expect(screen.getByText(/^Paired browsers$/)).toBeInTheDocument();
     expect(screen.getByText("Phone")).toBeInTheDocument();
     expect(screen.getByText("Tablet")).toBeInTheDocument();
     expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument();
@@ -892,7 +920,7 @@ describe("RemoteAccessSection — ways to connect", () => {
   it("shows one empty state when nothing is connected yet", async () => {
     cmds.webRemoteStatus.mockResolvedValue(ways());
     render(<RemoteAccessSection />);
-    expect(await screen.findByText(/No devices yet/)).toBeInTheDocument();
+    expect(await screen.findByText(/No browsers yet/)).toBeInTheDocument();
   });
 });
 
@@ -989,6 +1017,7 @@ describe("RemoteAccessSection — web-client rebind disconnect", () => {
     expect(screen.getByText(/reconnecting to this device/i)).toBeInTheDocument();
     // …and crucially, NO error toast for the expected disconnect.
     expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.failure).not.toHaveBeenCalled();
   });
 
   it("still surfaces a genuine backend rejection as an error and reverts", async () => {
@@ -1002,7 +1031,7 @@ describe("RemoteAccessSection — web-client rebind disconnect", () => {
     });
 
     await user.click(tailscaleBtn);
-    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    await waitFor(() => expect(toast.failure).toHaveBeenCalled());
     // Reverted: the control snaps back to the server's actual scope.
     await waitFor(() =>
       expect(

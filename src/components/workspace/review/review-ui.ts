@@ -103,6 +103,18 @@ export const btnGreenMuted = `${BASE} bg-card text-muted-foreground`;
 export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text-foreground`;
 
 /**
+ * The in-slot progress ring for a button whose request is in flight.
+ * It sits beside the changed label inside the same box, so the button
+ * never resizes; under reduced motion it stays a still ring.
+ */
+export const spinnerRing =
+  "size-2.5 shrink-0 rounded-full border-[1.6px] border-current border-r-transparent motion-safe:animate-spin";
+
+/** Keycap chip for a shortcut hint ("Ctrl+↵"). */
+export const kbdChip =
+  "rounded-sm bg-muted/60 px-1 py-px font-mono text-caption text-muted-foreground";
+
+/**
  * Comment-sized ember tint, for actions that sit inside a quoted thread.
  *
  * A second, smaller geometry rather than a shrunk {@link btnEmber}: on a
