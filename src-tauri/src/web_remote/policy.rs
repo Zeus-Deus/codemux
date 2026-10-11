@@ -208,6 +208,8 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "has_codemuxinclude"
             | "hosts_list"
             | "hosts_status_list"
+            | "get_local_device_name"
+            | "create_workspace_on_host"
             | "list_branches"
             | "list_branches_detailed"
             | "list_chat_provider_capabilities"
@@ -331,6 +333,8 @@ mod tests {
             "agent_chat_resume_after_usage_limit",
             "agent_chat_cancel_usage_resume",
             "materialize_chat_workspace",
+            "create_workspace_on_host",
+            "get_local_device_name",
             "submit_pr_review_with_comments",
             "automations_create",
             "unarchive_workspace",
@@ -348,6 +352,8 @@ mod tests {
             "git_discard_file",
             "get_auth_token",
             "web_remote_disable",
+            "hosts_add",
+            "hosts_ssh_config_hosts",
             "plugin:shell|execute",
             "future_command",
         ] {

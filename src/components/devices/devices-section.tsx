@@ -191,6 +191,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
 
 const TONE_DOT: Record<DeviceTone, string> = {
   online: "bg-status-open ring-[3px] ring-status-open/15",
+  updating: "bg-status-remote motion-safe:animate-pulse",
   attention: "bg-status-working ring-[3px] ring-status-working/15",
   offline: "bg-muted-foreground/60",
   checking: "bg-muted-foreground/40",
@@ -198,6 +199,7 @@ const TONE_DOT: Record<DeviceTone, string> = {
 
 const TONE_TEXT: Record<DeviceTone, string> = {
   online: "text-status-open",
+  updating: "text-status-remote",
   attention: "text-status-working",
   offline: "text-muted-foreground/70",
   checking: "text-muted-foreground/60",

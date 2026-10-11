@@ -108,6 +108,11 @@ export interface ChatDraft {
    *  it once branches load, mirroring the branch popover's
    *  main/master/first-branch heuristic). */
   baseBranch?: string;
+  /** Device (`HostView.id`) the first send creates the thread on; null =
+   *  this device. Ignored for `existing_workspace` targets, whose own
+   *  `host_id` decides. Optional so older persisted drafts deserialize
+   *  unchanged. */
+  hostId?: number | null;
 }
 
 export interface ChatDraftStore {
@@ -147,6 +152,8 @@ export interface ChatDraftStore {
         | "checkoutMode"
         | "worktreeName"
         | "baseBranch"
+        | "hostId"
+        | "lockedToHome"
       >
     >,
   ) => void;
@@ -317,6 +324,7 @@ function makeDraft(
     lockedToHome: opts.lockedToHome ?? false,
     worktreeName: "",
     baseBranch: "",
+    hostId: null,
   };
 }
 

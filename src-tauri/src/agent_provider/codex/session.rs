@@ -105,6 +105,8 @@ pub struct CodexSpawnConfig {
     pub client_info: ClientInfo,
     /// Shared MCP registry used to publish and execute dynamic tools.
     pub mcp_registry: Option<McpRegistry>,
+    /// Device to run `codex app-server` on over SSH; `None` runs it here.
+    pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
 }
 
 /// Runtime-mutable state inside a [`CodexSession`].
@@ -275,22 +277,49 @@ impl CodexSession {
         // point at Codemux's managed config dir regardless of what the
         // workspace env carries.
         let mut env = caller_env.unwrap_or_default();
-        if let Some(home) = spawn.codex_home.as_ref() {
+        // A device uses its own `~/.codex`; a local CODEX_HOME path means
+        // nothing there.
+        if let (Some(home), None) = (spawn.codex_home.as_ref(), spawn.remote.as_ref()) {
             env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
         }
 
-        let child = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.codex_binary.clone(),
-            args: vec!["app-server".into()],
-            env,
-            cwd: Some(cwd.clone()),
-            default_timeout: DEFAULT_RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|e| ProviderError::ProcessError {
-            message: "failed to spawn `codex app-server`".into(),
-            source: Some(e.to_string()),
-        })?;
+        let args = vec!["app-server".to_string()];
+        let child = match spawn.remote.as_ref() {
+            #[cfg(unix)]
+            Some(remote) => {
+                let codex =
+                    crate::ssh::sidecar::device_program(remote, &spawn.codex_binary).await?;
+                JsonRpcChild::spawn(crate::ssh::sidecar::device_spawn_config(
+                    remote,
+                    &codex,
+                    &args,
+                    &env,
+                    &cwd,
+                    DEFAULT_RPC_TIMEOUT,
+                )?)
+                .await
+                .map_err(crate::ssh::sidecar::ssh_spawn_error)?
+            }
+            #[cfg(not(unix))]
+            Some(_) => {
+                return Err(ProviderError::ValidationError {
+                    message: "Threads on another device need macOS or Linux on this computer"
+                        .into(),
+                })
+            }
+            None => JsonRpcChild::spawn(SpawnConfig {
+                program: spawn.codex_binary.clone(),
+                args,
+                env,
+                cwd: Some(cwd.clone()),
+                default_timeout: DEFAULT_RPC_TIMEOUT,
+            })
+            .await
+            .map_err(|e| ProviderError::ProcessError {
+                message: "failed to spawn `codex app-server`".into(),
+                source: Some(e.to_string()),
+            })?,
+        };
         let child = Arc::new(child);
 
         // Pull the single incoming-request receiver before any background
@@ -316,8 +345,27 @@ impl CodexSession {
         child
             .request("initialize", init_params)
             .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("initialize failed: {e}"),
+            .map_err(|e| {
+                // `initialize` is the first thing a device-side child
+                // answers, so an install or connection problem there
+                // surfaces here.
+                #[cfg(unix)]
+                if let Some(error) = spawn.remote.as_ref().and_then(|remote| {
+                    crate::ssh::sidecar::device_start_error(
+                        &e,
+                        crate::agent_provider::ProviderKind::Codex,
+                        remote,
+                        format!(
+                            "Install the Codex CLI on {} and run `codex login` there",
+                            remote.host_name
+                        ),
+                    )
+                }) {
+                    return error;
+                }
+                ProviderError::RpcError {
+                    message: format!("initialize failed: {e}"),
+                }
             })?;
         child
             .notify("initialized", json!({}))
@@ -326,34 +374,17 @@ impl CodexSession {
                 message: format!("initialized notification failed: {e}"),
             })?;
 
+        // A session on a device publishes none of this computer's tools and
+        // keeps no registry to run the device's tool calls through.
+        let mcp_registry = crate::agent_provider::local_tool_registry(
+            spawn.mcp_registry.as_ref(),
+            spawn.remote.as_ref(),
+        );
         // Capture the live registry tool surface once for thread/start.
         // Codex persists dynamic tool definitions in the rollout, while the
         // request handler below always dispatches through the live registry.
-        let dynamic_tools = match spawn.mcp_registry.as_ref() {
-            Some(registry) => {
-                let tools = if spawn.codex_home.is_none() {
-                    registry
-                        .list_all_tools_excluding_source(
-                            crate::mcp::McpConfigSource::CodexUser,
-                        )
-                        .await
-                } else {
-                    registry.list_all_tools().await
-                };
-                Some(
-                    tools
-                        .into_iter()
-                        .map(|tool| DynamicToolSpec::Function {
-                            name: codex_dynamic_tool_name(&tool.prefixed_name),
-                            description: tool.description.unwrap_or_default(),
-                            input_schema: tool.input_schema,
-                            defer_loading: None,
-                        })
-                        .collect(),
-                )
-            }
-            None => None,
-        };
+        let dynamic_tools =
+            dynamic_tool_specs(mcp_registry.as_ref(), spawn.codex_home.is_some()).await;
 
         // Best-effort probes. Failures are non-fatal — we log via
         // RuntimeWarning and continue.
@@ -379,7 +410,12 @@ impl CodexSession {
                     let _ = child.shutdown().await;
                     return Err(ProviderError::NotAuthenticated {
                         provider: crate::agent_provider::ProviderKind::Codex,
-                        hint: "Run `codex login` and try again.".into(),
+                        hint: match spawn.remote.as_ref() {
+                            Some(remote) => {
+                                format!("Run `codex login` on {} and try again.", remote.host_name)
+                            }
+                            None => "Run `codex login` and try again.".into(),
+                        },
                     });
                 }
                 Ok(info) => {
@@ -571,7 +607,7 @@ impl CodexSession {
         let requests_task = spawn_incoming_requests_task(
             Arc::clone(&session),
             Arc::clone(&child),
-            spawn.mcp_registry.clone(),
+            mcp_registry,
             incoming_rx,
             event_tx.clone(),
             shutdown_tx.subscribe(),
@@ -1702,8 +1738,39 @@ fn spawn_incoming_requests_task(
     })
 }
 
+/// The registry's tools as Codex dynamic tools, or `None` without a registry
+/// (including every session on a device). With Codex's own config
+/// (`codex_home_managed == false`) Codex already loads the user's Codex MCP
+/// servers itself, so those are left out to avoid duplicates.
+async fn dynamic_tool_specs(
+    registry: Option<&McpRegistry>,
+    codex_home_managed: bool,
+) -> Option<Vec<DynamicToolSpec>> {
+    let registry = registry?;
+    let tools = if codex_home_managed {
+        registry.list_all_tools().await
+    } else {
+        registry
+            .list_all_tools_excluding_source(crate::mcp::McpConfigSource::CodexUser)
+            .await
+    };
+    Some(
+        tools
+            .into_iter()
+            .map(|tool| DynamicToolSpec::Function {
+                name: codex_dynamic_tool_name(&tool.prefixed_name),
+                description: tool.description.unwrap_or_default(),
+                input_schema: tool.input_schema,
+                defer_loading: None,
+            })
+            .collect(),
+    )
+}
+
 /// Execute a Codex dynamic-tool request through the process-wide registry and
-/// translate the MCP content envelope into Codex's input-content shape.
+/// translate the MCP content envelope into Codex's input-content shape. With
+/// no registry (a session on a device, which must not reach this computer's
+/// tools whatever name it sends) the call fails without dispatching.
 async fn handle_dynamic_tool_call(
     registry: Option<&McpRegistry>,
     workspace_id: Option<&str>,
@@ -1729,7 +1796,7 @@ async fn handle_dynamic_tool_call(
         },
         (None, _) => (
             false,
-            json!({ "content": [{ "type": "text", "text": "Codemux MCP registry is unavailable" }] }),
+            json!({ "content": [{ "type": "text", "text": "Codemux's tools aren't available to this thread" }] }),
         ),
         (_, Err(error)) => (
             false,
@@ -2120,7 +2187,42 @@ mod tests {
         assert!(response["contentItems"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("registry is unavailable"));
+            .contains("aren't available to this thread"));
+    }
+
+    #[tokio::test]
+    async fn device_session_gets_and_runs_none_of_this_computers_tools() {
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
+        let published = dynamic_tool_specs(local.as_ref(), false).await.unwrap();
+        assert_eq!(published.len(), 1);
+
+        let device = crate::agent_provider::types::RemoteSpawnTarget {
+            host_id: 3,
+            ssh_target: "deus@ai-node".into(),
+            host_name: "ai-node".into(),
+        };
+        let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
+        assert!(dynamic_tool_specs(on_device.as_ref(), true).await.is_none());
+
+        // A call the device sends anyway, by a name it guessed, fails and
+        // never reaches the registry.
+        let response = handle_dynamic_tool_call(
+            on_device.as_ref(),
+            Some("ws-42"),
+            json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux-remote__echo",
+                "arguments": {"text": "hi"}
+            }),
+        )
+        .await;
+        assert_eq!(response["success"], false);
+        assert!(!call.matched_async().await);
     }
 
     fn rpc_failure(code: i64) -> TurnStartError {
