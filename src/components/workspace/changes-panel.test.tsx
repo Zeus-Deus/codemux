@@ -1,6 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGetGitStatus = vi.fn();
@@ -22,7 +24,7 @@ vi.mock("@/lib/toast", () => ({
   toast: { info: vi.fn(), success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { ChangesPanel } from "./changes-panel";
+import { ChangesPanel, SmartCommitButton } from "./changes-panel";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { GitFileStatus, WorkspaceSnapshot } from "@/tauri/types";
 
@@ -185,5 +187,67 @@ describe("section actions", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Unstage all" }));
     await waitFor(() => expect(mockUnstage).toHaveBeenCalledWith("/repo", ["src/staged.ts"]));
+  });
+});
+
+function renderButton(over: Partial<ComponentProps<typeof SmartCommitButton>> = {}) {
+  const props: ComponentProps<typeof SmartCommitButton> = {
+    loading: false,
+    hasChanges: false,
+    staged: 0,
+    isGenerating: false,
+    isMerging: false,
+    busy: null,
+    justDone: null,
+    onCommit: vi.fn(),
+    onCommitAndPush: vi.fn(),
+    onAmend: vi.fn(),
+    onUndoLastCommit: vi.fn(),
+    onStashPush: vi.fn(),
+    onStashPop: vi.fn(),
+    onPush: vi.fn(),
+    onPull: vi.fn(),
+    onSync: vi.fn(),
+    onFetch: vi.fn(),
+    ahead: 2,
+    behind: 0,
+    ...over,
+  };
+  return render(<SmartCommitButton {...props} />);
+}
+
+describe("SmartCommitButton", () => {
+  it("says Push when ahead and idle", () => {
+    renderButton();
+    expect(screen.getByRole("button", { name: "Push 2" })).toBeEnabled();
+  });
+
+  it("says what is running while a push is in flight", () => {
+    renderButton({ busy: "push" });
+    const button = screen.getByRole("button", { name: "Pushing…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("names an action started from the menu, not the primary's own", () => {
+    renderButton({ busy: "pull" });
+    expect(screen.getByRole("button", { name: "Pulling…" })).toBeInTheDocument();
+  });
+
+  it("says Popping, not Stashing, while a stash pops", () => {
+    renderButton({ busy: "stash-pop" });
+    expect(screen.getByRole("button", { name: "Popping…" })).toBeInTheDocument();
+  });
+
+  it("confirms a finished push on the button", () => {
+    renderButton({ justDone: "push", ahead: 0 });
+    expect(screen.getByRole("button", { name: "Pushed" })).toBeInTheDocument();
+  });
+
+  it("says Amend with all changes when nothing is staged", async () => {
+    const user = userEvent.setup();
+    renderButton({ hasChanges: true, staged: 0 });
+    await user.click(screen.getByRole("button", { name: "More actions" }));
+    expect(await screen.findByText("Amend with all changes")).toBeInTheDocument();
   });
 });
