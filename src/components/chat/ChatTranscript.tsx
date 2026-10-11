@@ -14,6 +14,7 @@ import { TranscriptCacheMount } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
 import { MessageList } from "./MessageList";
 import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
+import { RemoteTaskContext, type RemoteTaskScope } from "./remote-task-context";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
@@ -65,6 +66,8 @@ interface Props {
   runtimeIntentAllowed?: boolean;
   /** Text-only snapshots must not automatically load linked resources. */
   passive?: boolean;
+  /** Live pane authority published inside both cached and uncached transcripts. */
+  remoteTaskScope?: RemoteTaskScope | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -119,6 +122,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   provider,
   runtimeIntentAllowed = false,
   passive = false,
+  remoteTaskScope = null,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -152,6 +156,7 @@ export const ChatTranscript = memo(function ChatTranscript({
 
   const list = (
     <ChatMarkdownPassiveContext.Provider value={passive}>
+      <RemoteTaskContext.Provider value={remoteTaskScope}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -182,6 +187,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+      </RemoteTaskContext.Provider>
     </ChatMarkdownPassiveContext.Provider>
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The

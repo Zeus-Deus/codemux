@@ -2,6 +2,13 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
+// Native IPC seam only: keep the real pane subscription and task components.
+vi.mock("@/lib/delegation", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/delegation")>(),
+  delegationList: vi.fn().mockResolvedValue([]),
+  onDelegationChanged: vi.fn().mockResolvedValue(() => {}),
+}));
+
 let currentMessages: unknown[] = [];
 let useRealTranscript = false;
 let useRealComposer = false;
@@ -535,6 +542,7 @@ vi.mock("@/tauri/commands", () => ({
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   // MCP warmup fired on the empty-state mount; no-op in tests.
   primeChatMcp: vi.fn().mockResolvedValue(undefined),
+  hostsList: vi.fn().mockResolvedValue([]),
   listMcpServers: vi.fn().mockResolvedValue([]),
   startSkillsWatcher: vi.fn().mockResolvedValue(undefined),
   listChatSlashCommands: vi.fn().mockResolvedValue([]),
@@ -748,6 +756,7 @@ import { AgentChatPane } from "./AgentChatPane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { TranscriptCacheProvider } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
+import { onDelegationChanged } from "@/lib/delegation";
 import {
   agentChatGetSession,
   agentChatInterruptTurn,
@@ -820,6 +829,40 @@ function interactWithCachedTranscript(container: HTMLElement) {
   fireEvent.keyDown(target, { key: "ArrowDown" });
   fireEvent.focus(target);
 }
+
+describe("AgentChatPane remote task launcher", () => {
+  it("keeps failed native task updates visible after successful list readback and offers recovery", async () => {
+    vi.mocked(onDelegationChanged).mockRejectedValueOnce(new Error("Task listener offline"));
+    currentMessages = [{ kind: "assistant_message", id: "parent-answer", seq: 1, text: "Ready", streaming: false, turn_id: "t" }];
+    currentThreadsMap = {};
+    currentSliceOverrides = { "thread-x": { model: "already-seeded" } };
+    const view = render(<AgentChatPane pane={pane} />);
+    expect(await view.findByText("Remote task updates paused")).toBeInTheDocument();
+    expect(view.getByText("Task listener offline")).toBeInTheDocument();
+    fireEvent.click(view.getByRole("button", { name: "Retry remote task updates" }));
+    await waitFor(() => expect(view.queryByText("Remote task updates paused")).not.toBeInTheDocument());
+  });
+
+  it("opens host consent without sending, rebinding or discarding the parent composer", async () => {
+    useRealComposer = true;
+    currentMessages = [{ kind: "assistant_message", id: "parent-answer", seq: 1, text: "Ready", streaming: false, turn_id: "t" }];
+    currentThreadsMap = {};
+    currentSliceOverrides = { "thread-x": { model: "already-seeded", inputDraft: "Keep this unsent draft" } };
+    const view = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+    await waitFor(() => expect(view.container.querySelector("textarea")).toHaveValue("Keep this unsent draft"));
+    const textarea = view.container.querySelector("textarea")!;
+    textarea.setSelectionRange(2, 10);
+    vi.mocked(agentChatSendTurn).mockClear();
+    setInputDraftMock.mockClear();
+    fireEvent.click(view.getByRole("button", { name: "Attach" }));
+    fireEvent.click(await view.findByText("Run on host…"));
+    expect(await view.findByRole("dialog", { name: "Run on host" })).toBeInTheDocument();
+    expect(view.container.querySelector("textarea")).toBe(textarea);
+    expect(textarea).toHaveValue("Keep this unsent draft");
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setInputDraftMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("AgentChatPane real cached provenance", () => {
   beforeEach(() => {
@@ -2016,6 +2059,7 @@ describe("AgentChatPane Stage C race fix", () => {
   });
 
   it("requests focus for the composer mounted from a promoted draft", async () => {
+    useRealComposer = true;
     currentDraftsById = {
       "draft-1": {
         draftId: "draft-1",
@@ -2027,13 +2071,12 @@ describe("AgentChatPane Stage C race fix", () => {
       "draft-thread-42": [{ kind: "user_message", id: "m1", text: "hello" }],
     };
 
-    const { container } = render(<AgentChatPane pane={paneNoThread} />);
+    const { container } = render(<TooltipProvider><AgentChatPane pane={paneNoThread} /></TooltipProvider>);
+    // The focus signal is deliberately consumed after mount. Later native
+    // invalidations may paint false; test the actual focus, not that old prop.
+    await waitFor(() => expect(container.querySelector("textarea")).toHaveFocus());
     await act(async () => {});
-
-    expect(container.querySelector('[data-testid="composer"]')).toHaveAttribute(
-      "data-focus-on-mount",
-      "true",
-    );
+    expect(container.querySelector("textarea")).toHaveFocus();
   });
 
   it("starts a fresh session when pane.thread_id is null AND no promoted draft claims this workspace", async () => {

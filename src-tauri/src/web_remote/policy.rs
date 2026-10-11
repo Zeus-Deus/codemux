@@ -6,7 +6,8 @@
 pub(super) fn allowed(cmd: &str) -> bool {
     matches!(
         cmd,
-        "reply_to_pr_thread"
+        "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver"
+            | "reply_to_pr_thread"
             | "set_pr_thread_resolved"
             | "submit_pr_review"
             | "add_pr_inline_comment"

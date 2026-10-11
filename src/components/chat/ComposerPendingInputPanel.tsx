@@ -37,7 +37,7 @@ export function ComposerPendingInputPanel({
   );
 }
 
-function extractQuestions(payload: unknown): Question[] {
+export function extractQuestions(payload: unknown): Question[] {
   if (!isRecord(payload)) return [];
   const raw = payload["questions"];
   if (!Array.isArray(raw)) return [];

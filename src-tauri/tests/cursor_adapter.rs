@@ -11,8 +11,8 @@ use codemux_lib::agent_provider::acp::session::AcpDialect;
 use codemux_lib::agent_provider::acp::slash_commands::AcpSlashCommandCache;
 use codemux_lib::agent_provider::cursor::{CursorAgentProvider, CursorProviderConfig};
 use codemux_lib::agent_provider::{
-    AgentProvider, ApprovalDecision, CompletedItem, ProviderError, ProviderRuntimeEvent,
-    RequestId, SendTurnInput, StartSessionInput, ThreadId, TurnStatus,
+    AgentProvider, ApprovalDecision, CompletedItem, ProviderError, ProviderRuntimeEvent, RequestId,
+    SendTurnInput, StartSessionInput, ThreadId, TurnStatus,
 };
 use futures_util::StreamExt;
 use tokio::time::{timeout, Duration};
@@ -90,6 +90,7 @@ fn fixture_turn(thread_id: &str, text: &str) -> SendTurnInput {
         display_text: None,
         skill_invocations: vec![],
         turn_checkpoint: None,
+        dispatch_guard: None,
     }
 }
 
@@ -173,11 +174,27 @@ async fn live_session_update_populates_the_shared_command_cache() {
     .await
     .expect("session never published its command catalogue");
 
-    assert_eq!(provider.session_slash_commands(ThreadId(thread_id.into()), &cwd).await.unwrap(), published);
-    assert!(provider.session_slash_commands(ThreadId(thread_id.into()), std::path::Path::new("/wrong-directory")).await.is_err());
+    assert_eq!(
+        provider
+            .session_slash_commands(ThreadId(thread_id.into()), &cwd)
+            .await
+            .unwrap(),
+        published
+    );
+    assert!(provider
+        .session_slash_commands(
+            ThreadId(thread_id.into()),
+            std::path::Path::new("/wrong-directory")
+        )
+        .await
+        .is_err());
     // A catalogue owned by another conversation must not be returned just
     // because it has the same cwd.
-    assert!(provider.session_slash_commands(ThreadId("missing-conversation".into()), &cwd).await.unwrap().is_empty());
+    assert!(provider
+        .session_slash_commands(ThreadId("missing-conversation".into()), &cwd)
+        .await
+        .unwrap()
+        .is_empty());
 
     assert_eq!(
         published
@@ -348,6 +365,7 @@ async fn cursor_real_session_resumes_across_fast_tier_changes() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .expect("send first Cursor turn");

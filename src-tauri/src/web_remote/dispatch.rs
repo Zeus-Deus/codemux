@@ -266,6 +266,13 @@ pub async fn dispatch_invoke<R: Runtime>(
         let _ = out.send(err_text(id, "web-remote: command is not allowed"));
         return;
     }
+    if crate::delegation::commands::is_command(&cmd) {
+        // Socket invokes are detached; conn_id alone does not revoke a job
+        // already queued across disconnect. Do not mint durable authority
+        // until connection-owned admission and cancellation are qualified.
+        let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: delegation requires the desktop app"));
+        return;
+    }
     let Some(args_map) = args.as_object_mut() else {
         let _ = out.send(err_text(id, "web-remote: args must be an object"));
         return;
@@ -564,6 +571,35 @@ mod tests {
         assert_eq!(router.routed_ids(), [a, b].into_iter().collect());
         router.remove_conn(100);
         assert_eq!(router.routed_ids(), [b].into_iter().collect());
+    }
+}
+
+
+#[cfg(test)]
+mod delegation_boundary_tests {
+    use super::*;
+    use tauri::Manager;
+    #[tokio::test]
+    async fn paired_delegation_is_fail_closed_before_native_or_channel_side_effects() {
+        let app = tauri::test::mock_app();
+        let state = crate::state::AppStateStore::default();
+        let ws = state.snapshot().active_workspace_id.0;
+        let pane = state.create_agent_chat_pane(&ws, Some(crate::agent_provider::ProviderKind::Codex), None, None, Some("paired-fixture-parent".into())).unwrap();
+        let db = crate::database::DatabaseStore::new_in_memory();
+        db.upsert_agent_chat_session("paired-fixture-parent", &ws, Some("/synthetic/parent"), "codex").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        app.manage(state); app.manage(db);
+        app.manage(Arc::new(crate::delegation::journal::Journal::open(dir.path()).unwrap()));
+        let router = Arc::new(ChannelRouter::default());
+        let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        for command in ["delegation_grants", "delegation_authorize", "delegate_task", "delegation_host_info", "delegation_revoke", "delegation_list", "delegation_read", "delegation_cancel", "delegation_respond", "delegation_deliver"] {
+            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"paneId":pane.0,"channel":"__CHANNEL__:12"})).await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
+            assert!(frame.contains("REMOTE_UNSUPPORTED"), "paired invocation reached native delegation without revocable authority: {command}: {frame}");
+            assert!(router.routes.lock().unwrap().is_empty());
+        }
+        // Desktop's scoped dispatcher remains enabled.
+        assert_eq!(crate::delegation::app::invoke(app.handle(), "delegation_grants", json!({"paneId":pane.0})).await.unwrap(), json!([]));
     }
 }
 

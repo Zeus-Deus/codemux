@@ -235,7 +235,7 @@ impl SubagentDemux {
 /// Read the wire-level `parent_tool_use_id` (top-level on the SDK
 /// message, NOT inside `message`). Empty / null / absent all map to
 /// `None`, i.e. "this is a parent-thread message".
-fn parent_tool_use_id(msg: &serde_json::Value) -> Option<String> {
+pub(super) fn parent_tool_use_id(msg: &serde_json::Value) -> Option<String> {
     msg.get("parent_tool_use_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
@@ -1620,6 +1620,12 @@ fn translate_result(
     msg: &serde_json::Value,
     demux: &mut SubagentDemux,
 ) -> Vec<ProviderRuntimeEvent> {
+    // Opaque SDK payloads share the outer parent thread. An inner result
+    // is not parent completion or parent context usage. Retain it as data;
+    // existing assistant/user/task messages still own subagent demux.
+    if parent_tool_use_id(msg).is_some() {
+        return warning(thread_id, "sdk inner subagent result", msg);
+    }
     let turn_id = extract_turn_id(msg);
     let subtype = msg
         .get("subtype")

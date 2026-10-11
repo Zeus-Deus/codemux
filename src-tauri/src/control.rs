@@ -525,8 +525,9 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
     serde_json::from_str(&response).map_err(|error| format!("Invalid response JSON: {error}"))
 }
 
-async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
+pub(crate) async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
+        "delegation_host_info" | "delegation_grants" | "delegation_authorize" | "delegation_revoke" | "delegate_task" | "delegation_list" | "delegation_read" | "delegation_cancel" | "delegation_respond" | "delegation_deliver" => crate::delegation::app::invoke(app, &request.command, request.params).await,
         "status" => {
             let state: State<'_, AppStateStore> = app.state();
             let snap = state.snapshot();

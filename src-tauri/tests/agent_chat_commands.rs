@@ -138,10 +138,7 @@ fn close_pane_is_idempotent() {
 
     // First close succeeds.
     let first = store.close_pane(&pane_id.0);
-    assert!(
-        first.is_ok(),
-        "first close should succeed, got: {first:?}"
-    );
+    assert!(first.is_ok(), "first close should succeed, got: {first:?}");
 
     // Second close fails — the wrapper swallows the error to stay
     // idempotent from the UI's perspective.
@@ -234,6 +231,7 @@ async fn send_turn_forwards_to_selected_provider() {
             display_text: None,
             skill_invocations: vec![],
             turn_checkpoint: None,
+            dispatch_guard: None,
         })
         .await
         .unwrap();
@@ -373,14 +371,9 @@ fn thread_id_for_event_extracts_bound_threads() {
         subagent_id: None,
         thread_id: ThreadId("th-1".into()),
         turn_id: TurnId("tn-1".into()),
-        delta: codemux_lib::agent_provider::ContentDelta::Text {
-            text: "hi".into(),
-        },
+        delta: codemux_lib::agent_provider::ContentDelta::Text { text: "hi".into() },
     };
-    assert_eq!(
-        thread_id_for_event(&delta),
-        Some(ThreadId("th-1".into()))
-    );
+    assert_eq!(thread_id_for_event(&delta), Some(ThreadId("th-1".into())));
 
     let warn = ProviderRuntimeEvent::RuntimeWarning {
         thread_id: None,
@@ -832,7 +825,10 @@ async fn forward_event_publishes_status_into_pane_statuses() {
 
     // Streaming deltas → Working.
     forward_event(&handle, text_delta("thread-status", "hello"));
-    assert_eq!(status_of(&pane), Some(codemux_lib::state::PaneStatus::Working));
+    assert_eq!(
+        status_of(&pane),
+        Some(codemux_lib::state::PaneStatus::Working)
+    );
 
     // A pending approval → Permission.
     forward_event(
@@ -862,7 +858,10 @@ async fn forward_event_publishes_status_into_pane_statuses() {
             usage: None,
         },
     );
-    assert_eq!(status_of(&pane), Some(codemux_lib::state::PaneStatus::Review));
+    assert_eq!(
+        status_of(&pane),
+        Some(codemux_lib::state::PaneStatus::Review)
+    );
 
     // Session closes → entry cleared.
     forward_event(
@@ -872,7 +871,11 @@ async fn forward_event_publishes_status_into_pane_statuses() {
             status: codemux_lib::agent_provider::SessionStatus::Closed,
         },
     );
-    assert_eq!(status_of(&pane), None, "closed session clears the indicator");
+    assert_eq!(
+        status_of(&pane),
+        None,
+        "closed session clears the indicator"
+    );
 }
 
 #[tokio::test]
@@ -966,9 +969,7 @@ async fn full_bridge_pipeline_streams_provider_events_per_thread() {
     // until everything has flowed through (bounded by a timeout).
     timeout(Duration::from_secs(5), async {
         loop {
-            if captured_a.lock().unwrap().len() == 21
-                && captured_b.lock().unwrap().len() == 20
-            {
+            if captured_a.lock().unwrap().len() == 21 && captured_b.lock().unwrap().len() == 20 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1244,7 +1245,9 @@ mod auto_resume {
         let provider = claude_provider_with_capture(wrapper).await;
         {
             let registry: tauri::State<'_, ProviderRegistry> = handle.state();
-            registry.set_claude(provider.clone() as Arc<dyn AgentProvider>).await;
+            registry
+                .set_claude(provider.clone() as Arc<dyn AgentProvider>)
+                .await;
         }
 
         // Seed the persisted row exactly as it would survive a restart:
@@ -1252,13 +1255,8 @@ mod auto_resume {
         let thread = ThreadId("chat-pane-448-1783369893274".into());
         {
             let db: tauri::State<'_, DatabaseStore> = handle.state();
-            db.upsert_agent_chat_session(
-                &thread.0,
-                "ws-1",
-                Some(&cwd.to_string_lossy()),
-                "claude",
-            )
-            .unwrap();
+            db.upsert_agent_chat_session(&thread.0, "ws-1", Some(&cwd.to_string_lossy()), "claude")
+                .unwrap();
             db.set_agent_chat_sdk_session_id(&thread.0, "sdk-uuid-123")
                 .unwrap();
             db.update_agent_chat_session_config(
@@ -1294,7 +1292,10 @@ mod auto_resume {
         let captured = read_capture(&capture);
         assert_eq!(captured.len(), 1, "exactly one start-session was sent");
         let params = &captured[0]["params"];
-        assert_eq!(params["fastMode"], false, "disabled Claude Fast must not be restored");
+        assert_eq!(
+            params["fastMode"], false,
+            "disabled Claude Fast must not be restored"
+        );
         assert_eq!(
             params["threadId"].as_str(),
             Some(thread.0.as_str()),
@@ -1324,6 +1325,7 @@ mod auto_resume {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             })
             .await
             .expect("send_turn succeeds on the resumed session");
@@ -1417,7 +1419,9 @@ mod auto_resume {
         let provider = claude_provider_with_capture(wrapper).await;
         {
             let registry: tauri::State<'_, ProviderRegistry> = handle.state();
-            registry.set_claude(provider.clone() as Arc<dyn AgentProvider>).await;
+            registry
+                .set_claude(provider.clone() as Arc<dyn AgentProvider>)
+                .await;
         }
 
         let thread = ThreadId("thread-live".into());
@@ -1509,13 +1513,8 @@ mod run_checkpoints {
         // The checkpoint row FKs onto the session row, mirroring the
         // production ordering (session persisted before the
         // checkpoint task runs).
-        db.upsert_agent_chat_session(
-            thread_id,
-            "ws-1",
-            Some(&repo.to_string_lossy()),
-            "claude",
-        )
-        .expect("session row");
+        db.upsert_agent_chat_session(thread_id, "ws-1", Some(&repo.to_string_lossy()), "claude")
+            .expect("session row");
         db
     }
 
@@ -1649,13 +1648,8 @@ async fn background_checkpoint_spawn_persists_and_emits_event() {
 
     let app = tauri::test::mock_app();
     let db = DatabaseStore::new_in_memory();
-    db.upsert_agent_chat_session(
-        "thread-bg",
-        "ws-1",
-        Some(&repo.to_string_lossy()),
-        "claude",
-    )
-    .expect("session row");
+    db.upsert_agent_chat_session("thread-bg", "ws-1", Some(&repo.to_string_lossy()), "claude")
+        .expect("session row");
     app.manage(db);
     let handle = app.handle().clone();
 
@@ -1767,10 +1761,7 @@ async fn turn_revert_restores_workspace_provider_and_transcript_together() {
     .unwrap();
 
     let capture = |db: &DatabaseStore, index: i64, nonce: &str| {
-        let ref_name = codemux_lib::git::turn_checkpoint_ref_name(
-            "thread-turn-revert",
-            index,
-        );
+        let ref_name = codemux_lib::git::turn_checkpoint_ref_name("thread-turn-revert", index);
         let snapshot = codemux_lib::git::git_checkpoint_create(
             &repo,
             &ref_name,
@@ -1838,15 +1829,15 @@ async fn turn_revert_restores_workspace_provider_and_transcript_together() {
     app.manage(registry);
     let handle = app.handle().clone();
 
-    let remaining = agent_chat_revert_turn_checkpoint(
-        handle.clone(),
-        "thread-turn-revert".into(),
-        2,
-    )
-    .await
-    .expect("true revert succeeds");
+    let remaining =
+        agent_chat_revert_turn_checkpoint(handle.clone(), "thread-turn-revert".into(), 2)
+            .await
+            .expect("true revert succeeds");
 
-    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "v2");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+        "v2"
+    );
     assert!(!repo.join("agent-artifact.txt").exists());
     let db = handle.state::<DatabaseStore>();
     assert_eq!(db.list_agent_chat_messages("thread-turn-revert").len(), 2);
@@ -1881,13 +1872,10 @@ async fn turn_revert_restores_workspace_provider_and_transcript_together() {
     std::fs::write(repo.join("code.txt"), "v2-after-first-revert").unwrap();
     std::fs::write(repo.join("second-artifact.txt"), "remove me too").unwrap();
     let first_ref = remaining[0].ref_name.clone();
-    let remaining = agent_chat_revert_turn_checkpoint(
-        handle.clone(),
-        "thread-turn-revert".into(),
-        1,
-    )
-    .await
-    .expect("a consecutive true revert succeeds");
+    let remaining =
+        agent_chat_revert_turn_checkpoint(handle.clone(), "thread-turn-revert".into(), 1)
+            .await
+            .expect("a consecutive true revert succeeds");
 
     assert_eq!(
         std::fs::read_to_string(repo.join("code.txt")).unwrap(),
@@ -1990,17 +1978,19 @@ async fn failed_provider_rollback_compensates_workspace_and_keeps_local_history(
     app.manage(registry);
     let handle = app.handle().clone();
 
-    let error = agent_chat_revert_turn_checkpoint(
-        handle.clone(),
-        "thread-compensate".into(),
-        1,
-    )
-    .await
-    .expect_err("provider rollback fails");
+    let error = agent_chat_revert_turn_checkpoint(handle.clone(), "thread-compensate".into(), 1)
+        .await
+        .expect_err("provider rollback fails");
 
     assert!(error.contains("workspace was restored"), "got: {error}");
-    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "after");
-    assert_eq!(std::fs::read_to_string(repo.join("artifact.txt")).unwrap(), "keep");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+        "after"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("artifact.txt")).unwrap(),
+        "keep"
+    );
     // The compensating restore takes its own safety snapshot; its ref must
     // live in a namespace that cannot D/F-conflict with the pre-restore ref
     // already written for this thread.
@@ -2017,15 +2007,17 @@ async fn failed_provider_rollback_compensates_workspace_and_keeps_local_history(
     );
     let db = handle.state::<DatabaseStore>();
     assert_eq!(db.list_agent_chat_messages("thread-compensate").len(), 2);
-    assert_eq!(db.list_agent_chat_turn_checkpoints("thread-compensate").len(), 1);
+    assert_eq!(
+        db.list_agent_chat_turn_checkpoints("thread-compensate")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
 async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
     use codemux_lib::commands::agent_chat::agent_chat_delete_session;
-    use codemux_lib::database::{
-        AgentChatCheckpointRecord, AgentChatTurnCheckpointRecord,
-    };
+    use codemux_lib::database::{AgentChatCheckpointRecord, AgentChatTurnCheckpointRecord};
 
     let dir = tempfile::TempDir::new().unwrap();
     let repo = dir.path().to_path_buf();
@@ -2046,13 +2038,8 @@ async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
 
     let thread_id = "thread-delete-checkpoints";
     let db = DatabaseStore::new_in_memory();
-    db.upsert_agent_chat_session(
-        thread_id,
-        "ws-1",
-        Some(&repo.to_string_lossy()),
-        "codex",
-    )
-    .unwrap();
+    db.upsert_agent_chat_session(thread_id, "ws-1", Some(&repo.to_string_lossy()), "codex")
+        .unwrap();
     let legacy_ref = codemux_lib::git::checkpoint_ref_name(thread_id);
     let legacy = codemux_lib::git::git_checkpoint_create(&repo, &legacy_ref, "legacy")
         .unwrap()
@@ -2166,7 +2153,10 @@ mod workspace_identity {
         assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("1"));
 
         // An orphaned pane injects nothing and names no workspace.
-        assert_eq!(pane_workspace_context(&state, "pane-orphan", None), (None, None));
+        assert_eq!(
+            pane_workspace_context(&state, "pane-orphan", None),
+            (None, None)
+        );
     }
 
     #[test]
@@ -2207,8 +2197,13 @@ mod workspace_identity {
         super::bind_chat_pane(&state, &ws.0, &thread.0);
         {
             let db: tauri::State<'_, DatabaseStore> = handle.state();
-            db.upsert_agent_chat_session(&thread.0, &ws.0, Some("/tmp/codemux-ws-rebuild"), "codex")
-                .unwrap();
+            db.upsert_agent_chat_session(
+                &thread.0,
+                &ws.0,
+                Some("/tmp/codemux-ws-rebuild"),
+                "codex",
+            )
+            .unwrap();
         }
 
         ensure_live_session(&handle, ProviderKind::Codex, &thread)
@@ -2238,9 +2233,7 @@ async fn async_question_command_claims_once_and_keeps_other_providers_disabled()
     use codemux_lib::agent_provider::{
         AgentProvider, QuestionResolution, UserQuestion, UserQuestionSet,
     };
-    use codemux_lib::commands::async_questions::{
-        agent_chat_answer_question, QuestionAction,
-    };
+    use codemux_lib::commands::async_questions::{agent_chat_answer_question, QuestionAction};
     for kind in [ProviderKind::Codex, ProviderKind::Claude] {
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();

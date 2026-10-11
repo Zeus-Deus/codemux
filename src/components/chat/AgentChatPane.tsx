@@ -142,6 +142,12 @@ import type {
 } from "@/tauri/types";
 
 import { ChatTranscript } from "./ChatTranscript";
+import { DelegateTaskDialog } from "./DelegateTaskDialog";
+import { RemoteTaskDetail } from "./RemoteTaskDetail";
+import { projectRemoteTasks } from "./remote-task-projection";
+import type { RemoteTaskScope } from "./remote-task-context";
+import { useDelegationTasks } from "@/stores/delegation-store";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
@@ -707,6 +713,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleTasksClick = useCallback(() => {
     if (paneWorkspaceId) toggleRightPanel?.(paneWorkspaceId, "tasks");
   }, [paneWorkspaceId, toggleRightPanel]);
+
+  const remoteTasks = useDelegationTasks(conversationWritable ? pane.pane_id : null, conversationWritable ? threadId : null);
+  const [delegateDialogThread, setDelegateDialogThread] = useState<string | null>(null);
+  const [remoteTaskView, setRemoteTaskView] = useState<{ threadId: string; taskId: string } | null>(null);
+  const openRemoteTask = useCallback((taskId: string) => {
+    if (threadId && remoteTasks.tasks.some(task => task.id === taskId && task.parent_thread_id === threadId)) {
+      setRemoteTaskView({ threadId, taskId });
+    }
+  }, [threadId, remoteTasks.tasks]);
+  const remoteTaskScope = useMemo<RemoteTaskScope>(() => ({
+    paneId: pane.pane_id, writable: conversationWritable, onOpen: openRemoteTask,
+  }), [pane.pane_id, conversationWritable, openRemoteTask]);
+  const transcriptMessages = useMemo(() => projectRemoteTasks(messages, remoteTasks.tasks), [messages, remoteTasks.tasks]);
+  const viewedRemoteTask = remoteTaskView?.threadId === threadId
+    ? remoteTasks.tasks.find(task => task.id === remoteTaskView.taskId) ?? null : null;
+  useEffect(() => {
+    if (!conversationWritable || delegateDialogThread !== threadId) setDelegateDialogThread(null);
+    if (remoteTaskView && remoteTaskView.threadId !== threadId) setRemoteTaskView(null);
+  }, [threadId, conversationWritable, delegateDialogThread, remoteTaskView]);
 
   // Warm the MCP servers once when a fresh (empty) chat pane mounts, so
   // the prime cost overlaps the user composing rather than blocking the
@@ -3928,7 +3953,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
       belowComposerSlot={mobile ? null : belowComposerSlot}
-      stripSlot={conversationWritable ? stripEl : <>{stripEl}{conversationCheckNotice}</>}
+      stripSlot={conversationWritable ? <>
+        {stripEl}
+        {(remoteTasks.error || remoteTasks.subscriptionError) && <div role="status" className="pointer-events-auto mb-2 flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2 text-body-sm">
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">{remoteTasks.subscriptionError ? "Remote task updates paused" : "Remote tasks unavailable"}</p>
+            <p className="break-words text-muted-foreground">{remoteTasks.subscriptionError ?? remoteTasks.error}</p>
+          </div>
+          <Button type="button" variant="ghost" size="sm" disabled={remoteTasks.loading || remoteTasks.subscriptionHealth === "connecting"} onClick={() => void remoteTasks.retrySubscription()}>Retry remote task updates</Button>
+        </div>}
+      </> : <>{stripEl}{conversationCheckNotice}</>}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
@@ -3982,6 +4016,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachIssue={conversationWritable ? handleAttachIssue : undefined}
       onAttachPr={conversationWritable ? handleAttachPr : undefined}
       onAttachSession={conversationWritable ? handleAttachSession : undefined}
+      onDelegateTask={conversationWritable && threadId ? () => setDelegateDialogThread(threadId) : undefined}
       onAttachImage={conversationWritable ? handleAttachImage : undefined}
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
@@ -4034,7 +4069,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           Renders as a floating top overlay; needs `relative` above. */}
       {conversationWritable && <ProviderStatusNotice provider={provider} />}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
-      {messages.length === 0 ? (
+      {transcriptMessages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
         <>
@@ -4058,7 +4093,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             </>
           ) : (
             <ChatTranscript
-              messages={messages}
+              messages={transcriptMessages}
               streaming={transcriptStreaming}
               compacting={compacting}
               stalled={stalled}
@@ -4074,6 +4109,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               provider={provider}
               runtimeIntentAllowed={conversationWritable}
               passive={!conversationWritable}
+              remoteTaskScope={remoteTaskScope}
               onRespondToRequest={conversationWritable ? handleRespond : () => Promise.resolve()}
               onAcceptPlan={conversationWritable ? handleAcceptPlan : () => {}}
               onRejectPlan={conversationWritable ? handleRejectPlan : () => {}}
@@ -4136,6 +4172,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         open={debugExitDialog !== null}
         onChoose={(choice) => debugExitDialog?.resolve(choice)}
       />
+      {threadId && <DelegateTaskDialog
+        key={JSON.stringify([pane.pane_id, threadId])}
+        open={delegateDialogThread === threadId && conversationWritable}
+        paneId={pane.pane_id}
+        threadId={threadId}
+        writable={conversationWritable && sessionReady}
+        onOpenChange={open => setDelegateDialogThread(open && conversationWritable ? threadId : null)}
+        onLaunched={() => { void remoteTasks.refresh(); }}
+      />}
+      {viewedRemoteTask && <Dialog open onOpenChange={open => { if (!open) setRemoteTaskView(null); }}>
+        <DialogContent showCloseButton={false} className="flex max-h-[calc(100dvh-4rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
+          <DialogTitle className="sr-only">Remote task</DialogTitle>
+          <DialogDescription className="sr-only">Actual output from the selected host. The parent conversation remains here.</DialogDescription>
+          <RemoteTaskDetail task={viewedRemoteTask} paneId={pane.pane_id} writable={conversationWritable} onBack={() => setRemoteTaskView(null)} />
+        </DialogContent>
+      </Dialog>}
       <RevertTurnDialog
         checkpoint={revertTarget}
         reverting={revertingTurnIndex !== null}

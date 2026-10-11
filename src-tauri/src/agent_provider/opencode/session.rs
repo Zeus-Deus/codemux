@@ -37,12 +37,12 @@ use crate::agent_provider::types::{
 };
 use crate::mcp::registry::McpRegistry;
 
-use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
-use super::protocol::{
-    PermissionRespondRequest, SessionCreateRequest, SessionResponse,
+use super::client::{
+    OpenCodeClient, OpenCodeClientConfig, OpenCodeModelCost, OpenCodeProviderEntry,
 };
+use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
+use super::protocol::{PermissionRespondRequest, SessionCreateRequest, SessionResponse};
 use super::sse::{spawn_sse_listener, SsePeer, SseRouter};
-use super::client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeModelCost, OpenCodeProviderEntry};
 use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
     OpenCodeUsageState,
@@ -112,7 +112,9 @@ impl OpenCodeSession {
             if err == "opencode_not_installed" {
                 ProviderError::NotInstalled {
                     provider: ProviderKind::OpenCode,
-                    hint: "Install OpenCode (https://opencode.ai/) and ensure `opencode` is on PATH.".into(),
+                    hint:
+                        "Install OpenCode (https://opencode.ai/) and ensure `opencode` is on PATH."
+                            .into(),
                 }
             } else {
                 ProviderError::ProcessError {
@@ -170,7 +172,10 @@ impl OpenCodeSession {
         // from the DB, so the user keeps their history either way).
         let base = server_handle.base_url.trim_end_matches('/').to_string();
         let resumed_id = match &resume_session_id {
-            Some(id) if session_is_addressable(&http, &base, &server_handle.server_password, id).await => {
+            Some(id)
+                if session_is_addressable(&http, &base, &server_handle.server_password, id)
+                    .await =>
+            {
                 Some(id.clone())
             }
             _ => None,
@@ -200,11 +205,13 @@ impl OpenCodeSession {
                         message: format!("session_create_http_status_{}", status.as_u16()),
                     });
                 }
-                let session_resp: SessionResponse = response.json().await.map_err(|err| {
-                    ProviderError::RpcError {
-                        message: format!("session_create_decode_failed: {err}"),
-                    }
-                })?;
+                let session_resp: SessionResponse =
+                    response
+                        .json()
+                        .await
+                        .map_err(|err| ProviderError::RpcError {
+                            message: format!("session_create_decode_failed: {err}"),
+                        })?;
                 session_resp.id
             }
         };
@@ -635,8 +642,12 @@ impl OpenCodeSession {
                     "command": name, "arguments": arguments, "parts": files,
                 });
                 // Optional Zod fields accept omission, not JSON null.
-                if let Some(model) = model.as_ref() { body["model"] = serde_json::json!(model); }
-                if let Some(variant) = prompt.variant.as_ref() { body["variant"] = serde_json::json!(variant); }
+                if let Some(model) = model.as_ref() {
+                    body["model"] = serde_json::json!(model);
+                }
+                if let Some(variant) = prompt.variant.as_ref() {
+                    body["variant"] = serde_json::json!(variant);
+                }
                 ("command", body)
             }
             None => ("prompt_async", serde_json::to_value(&prompt).unwrap()),
@@ -942,13 +953,14 @@ async fn attach_mcp_gateway(
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
 ) -> Result<(), ProviderError> {
-    let connection = registry
-        .gateway_connection()
-        .await
-        .map_err(|message| ProviderError::ProcessError {
-            message: "failed to start Codemux MCP gateway".into(),
-            source: Some(message),
-        })?;
+    let connection =
+        registry
+            .gateway_connection()
+            .await
+            .map_err(|message| ProviderError::ProcessError {
+                message: "failed to start Codemux MCP gateway".into(),
+                source: Some(message),
+            })?;
     let url = format!("{}/mcp", server.base_url.trim_end_matches('/'));
     let response = http
         .post(url)
@@ -1119,6 +1131,7 @@ mod tests {
             permission_mode_override: None,
             client_nonce: Some(text.into()),
             turn_checkpoint: None,
+            dispatch_guard: None,
         }
     }
 
@@ -1254,13 +1267,9 @@ mod tests {
             base_url: server.url(),
             server_password: "pw".into(),
         };
-        attach_mcp_gateway(
-            &reqwest::Client::new(),
-            &handle,
-            &McpRegistry::new(),
-        )
-        .await
-        .unwrap();
+        attach_mcp_gateway(&reqwest::Client::new(), &handle, &McpRegistry::new())
+            .await
+            .unwrap();
         attach.assert_async().await;
     }
 
@@ -1436,8 +1445,7 @@ mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let (session, _tx, mut rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
 
         let turn_id = session
             .send_turn("hello".into(), Vec::<ImageInput>::new(), None, None)
@@ -1474,8 +1482,7 @@ mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
 
         session
             .send_turn("hi".into(), vec![], None, Some("high".into()))
@@ -1495,8 +1502,7 @@ mod tests {
             .with_body(r#"{"error":"bad model"}"#)
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
 
         let err = session
             .send_turn("hi".into(), vec![], None, None)
@@ -1514,8 +1520,7 @@ mod tests {
     #[tokio::test]
     async fn send_turn_validation_error_for_invalid_model_id() {
         let server = Server::new_async().await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         // Override with an id missing the `provider/` prefix.
         let err = session
             .send_turn("hi".into(), vec![], Some("invalid".into()), None)
@@ -1538,8 +1543,7 @@ mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session.interrupt().await.expect("abort succeeds");
         mock.assert_async().await;
     }
@@ -1554,8 +1558,7 @@ mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session
             .respond_to_request(
                 RequestId("perm_1".into()),
@@ -1581,8 +1584,7 @@ mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         // Simulate the SSE listener having recorded the child permission.
         session
             .router
@@ -1612,8 +1614,7 @@ mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, mut rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session.shutdown().await;
         mock.assert_async().await;
         let event = rx.try_recv().expect("closed event published");
@@ -1768,8 +1769,7 @@ mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session
             .set_model("anthropic/claude-sonnet-4-6".into())
             .await;
@@ -1790,8 +1790,7 @@ mod tests {
         let mut server = Server::new_async().await;
         // The background re-probe must not resolve a window during the
         // test; an unmocked /config/providers 501s, leaving it unknown.
-        let (session, _tx, mut rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         let windowed = EventContext {
             context_window_tokens: Some(1_000_000),
             ..session.event_ctx.lock().await.clone()
@@ -1827,10 +1826,17 @@ mod tests {
         }
         while rx.try_recv().is_ok() {}
 
-        session.set_model("anthropic/claude-sonnet-4-6".into()).await;
+        session
+            .set_model("anthropic/claude-sonnet-4-6".into())
+            .await;
 
         assert!(
-            session.event_ctx.lock().await.context_window_tokens.is_none(),
+            session
+                .event_ctx
+                .lock()
+                .await
+                .context_window_tokens
+                .is_none(),
             "the routing-context copy is cleared for the SSE listener"
         );
         match rx.try_recv().expect("a corrected snapshot is published") {
@@ -1906,10 +1912,18 @@ mod tests {
     }
     async fn await_native_http(session: &OpenCodeSession) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while session.native_requests.lock().await.iter().any(|request| !request.is_finished()) {
+            while session
+                .native_requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| !request.is_finished())
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-        }).await.expect("native HTTP must return");
+        })
+        .await
+        .expect("native HTTP must return");
     }
 
     async fn await_native_completion(
@@ -1951,8 +1965,13 @@ mod tests {
             .await
             .unwrap();
         await_native_http(&session).await;
-        assert!(session.turn_active().await, "HTTP success must wait for final SSE output and idle");
-        while let Ok(event) = rx.try_recv() { assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })); }
+        assert!(
+            session.turn_active().await,
+            "HTTP success must wait for final SSE output and idle"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }));
+        }
         command.assert_async().await;
     }
 
@@ -1980,7 +1999,9 @@ mod tests {
             .unwrap();
         await_native_http(&session).await;
         assert!(session.turn_active().await);
-        while let Ok(event) = rx.try_recv() { assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })); }
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }));
+        }
         compact.assert_async().await;
     }
 
@@ -2015,14 +2036,21 @@ mod tests {
     #[tokio::test]
     async fn native_command_omits_unselected_model_and_effort() {
         let mut server = Server::new_async().await;
-        let command = server.mock("POST", "/session/sess_1/command")
+        let command = server
+            .mock("POST", "/session/sess_1/command")
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "command": "init", "arguments": "", "parts": [],
             })))
-            .with_status(200).with_body("{}").create_async().await;
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
         let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
         *session.current_model.lock().await = None;
-        session.send_turn("/init".into(), vec![], None, None).await.unwrap();
+        session
+            .send_turn("/init".into(), vec![], None, None)
+            .await
+            .unwrap();
         await_native_http(&session).await;
         command.assert_async().await;
     }

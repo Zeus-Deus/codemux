@@ -98,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         subcommand: WorkspaceSubcommand,
     },
+    /// Durable native coding tasks. JSON requests use stdin, not shell arguments.
+    Task {
+        #[command(subcommand)]
+        subcommand: codemux_lib::remote::tasks::cli::TaskCommand,
+    },
 }
 
 #[cfg(unix)]
@@ -209,6 +214,7 @@ fn main() -> ExitCode {
             run_serve(args.port, args.state_dir)
         }
         Some(Command::Mcp { state_dir }) => run_mcp(state_dir),
+        Some(Command::Task { subcommand }) => run_task(subcommand),
         Some(Command::Workspace { subcommand }) => match subcommand {
             WorkspaceSubcommand::Register {
                 path,
@@ -265,6 +271,33 @@ fn run_scheduler() -> ExitCode {
         }
     };
     runtime.block_on(scheduler_loop())
+}
+
+#[cfg(unix)]
+fn run_task(command: codemux_lib::remote::tasks::cli::TaskCommand) -> ExitCode {
+    codemux_lib::remote::tasks::initialize_runtime();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[codemux-remote] task runtime: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match runtime.block_on(codemux_lib::remote::tasks::cli::dispatch(command)) {
+        Ok(Some(value)) => {
+            println!("{value}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("[codemux-remote] task: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -805,4 +838,30 @@ fn run_workspace_list(state_dir_arg: Option<PathBuf>) -> ExitCode {
     });
     println!("{}", payload);
     ExitCode::SUCCESS
+}
+
+#[cfg(all(test, unix))]
+mod task_cli_tests {
+    use super::*;
+    #[test]
+    fn task_read_is_a_real_subcommand_with_bounded_wire_options() {
+        let parsed = Cli::try_parse_from([
+            "codemux-remote",
+            "task",
+            "read",
+            "--id",
+            "00000000-0000-0000-0000-000000000001",
+            "--after",
+            "3",
+            "--wait-ms",
+            "15000",
+            "--state-dir",
+            "/fixture",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "task CLI must expose the agreed wire subcommands: {:?}",
+            parsed.err()
+        );
+    }
 }
