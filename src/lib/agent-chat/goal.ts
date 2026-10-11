@@ -1,4 +1,5 @@
 import type { ChatThreadState, ChatViewItem, UserMessageItem } from "./types";
+import { withTimeFormat } from "@/lib/time-format";
 
 /**
  * A goal the user set in this thread with `/goal <text>`.
@@ -153,11 +154,10 @@ export function formatGoalAge(ms: number): string {
 
 /** Wall-clock time for the opened row's meta line, e.g. `12:21`. */
 export function formatClockTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  });
+  return new Date(ms).toLocaleTimeString(
+    [],
+    withTimeFormat({ hour: "2-digit", minute: "2-digit", hourCycle: "h23" }),
+  );
 }
 
 /** Where an interrupted run stopped, as far as the transcript can say. */

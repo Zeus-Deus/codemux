@@ -13,9 +13,59 @@ import {
   usageLimitPhase,
   usageLimitRecordText,
   usageWindowLabel,
+  usageResumeExplanation,
 } from "./usage-limit";
 
 const MIN = 60_000;
+
+describe("usageResumeExplanation", () => {
+  it("explains an unknown reset in old and new transcripts", () => {
+    const expected = "No reset time was reported. The agent won’t continue on its own.";
+    expect(usageResumeExplanation(limit(), 0)).toBe(expected);
+    expect(usageResumeExplanation(limit({ autoResumeBlockedReason: "unknown_reset" }), 0))
+      .toBe(expected);
+  });
+
+  it.each([
+    ["disabled", "Settings → Agent"],
+    ["attempts_exhausted", "Two automatic resumes"],
+    ["reset_too_far", "more than 26 hours"],
+    ["cancelled", "cancelled"],
+    ["dispatch_failed", "couldn’t start"],
+    ["storage_failed", "couldn’t be saved"],
+    ["reset_passed", "had already passed"],
+  ] as const)("explains %s as manual-only without naming a button", (reason, text) => {
+    const note = usageResumeExplanation(limit({ autoResumeBlockedReason: reason }), 0);
+    expect(note).toContain(text);
+    expect(note).toContain("The agent won’t continue on its own.");
+    // The same note sits beside Try now before the reset and Resume after.
+    expect(note).not.toMatch(/\bResume\b|Try now/);
+  });
+
+  it.each(["reset_too_far", "reset_passed"] as const)(
+    "keeps the %s note identical on both sides of the reset",
+    (reason) => {
+      const resetsAtMs = reason === "reset_too_far" ? 27 * 60 * MIN : -MIN;
+      const l = limit({ resetsAtMs, autoResumeBlockedReason: reason });
+      const before = usageResumeExplanation(l, 0);
+      // Hydrated long after the reset, the phase has moved on; the note still holds.
+      const after = usageResumeExplanation(l, resetsAtMs + 60 * MIN);
+      expect(usageLimitPhase(l, resetsAtMs + 60 * MIN).kind).toBe("reset");
+      expect(after).toBe(before);
+      // Past tense: never "is … away" or "after it resets" once it has.
+      expect(after).toMatch(/\b(was|had already)\b/);
+      expect(after).not.toMatch(/\bis more than|after it resets/);
+    },
+  );
+
+  it("keeps armed countdowns quiet and explains a missed continuation", () => {
+    const armed = limit({ autoResumeAtMs: MIN });
+    expect(usageResumeExplanation(armed, 0)).toBeNull();
+    expect(usageResumeExplanation(armed, MIN + RESUME_GRACE_MS)).toBe(
+      "Automatic resume hasn’t started.",
+    );
+  });
+});
 
 function limit(overrides: Partial<UsageLimitState> = {}): UsageLimitState {
   return {

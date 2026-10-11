@@ -225,6 +225,8 @@ pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
         // instead of pasting a pairing code (Stage A).
         .route("/api/pair-account", post(pair_account::<R>))
         .route("/api/ws-ticket", post(ws_ticket::<R>))
+        // A waiting browser that cancels or gives up withdraws its own request.
+        .route("/api/withdraw", post(withdraw::<R>))
         // Authenticated one-shot state bootstrap (versioned API surface).
         .route("/api/snapshot", get(super::snapshot::serve::<R>))
         // Authenticated file streamer backing the shim's `convertFileSrc`.
@@ -484,6 +486,34 @@ async fn ws_ticket<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderM
 
     let ticket = app.state::<WebRemoteState>().shared().tickets.issue(&session.id);
     Json(json!({ "ticket": ticket })).into_response()
+}
+
+/// A browser still waiting for approval withdraws its own request (it
+/// cancelled or gave up), so the desktop stops asking about a device that is
+/// no longer there. Answers `{approved: true}` and changes nothing when the
+/// desktop approved it in the meantime, so the browser can connect instead.
+async fn withdraw<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderMap) -> Response {
+    if !auth::origin_ok(&headers) {
+        return error(StatusCode::FORBIDDEN, "origin_mismatch");
+    }
+    let token = match extract_session_token(&headers) {
+        Some(t) => t,
+        None => return error(StatusCode::UNAUTHORIZED, "missing_credentials"),
+    };
+    let db = app.state::<crate::database::DatabaseStore>();
+    let session = match auth::authenticate(&db, &token) {
+        Some(s) => s,
+        None => return error(StatusCode::UNAUTHORIZED, "invalid_session"),
+    };
+    let withdrawn = match db.web_remote_delete_pending_session(&session.id) {
+        Ok(w) => w,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    if withdrawn {
+        app.state::<WebRemoteState>().shared().connections.close_session(&session.id);
+        super::emit_state_changed(&app);
+    }
+    Json(json!({ "approved": !withdrawn })).into_response()
 }
 
 async fn ws_upgrade<R: Runtime>(

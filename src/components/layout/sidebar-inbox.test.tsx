@@ -455,13 +455,15 @@ describe("SidebarInbox — cards", () => {
     await renderInbox();
 
     const chip = screen.getByRole("button", {
-      name: "9 pull requests — 5 open, 4 merged. Opens #372",
+      name: "Stack of 9 pull requests — 5 open, 4 merged. Opens #372",
     });
     // The primary is still a specific PR the click opens, so the count reads
     // as "+8 more" rather than replacing the reference with a total.
     expect(chip).toHaveTextContent("#372");
     expect(chip).toHaveTextContent("+8");
     expect(chip).not.toHaveTextContent("#380");
+    // The set is one stack, so the chip says so with its glyph.
+    expect(chip.querySelector("[data-pr-stack-icon]")).not.toBeNull();
   });
 
   it("renders the PR chip icon alone when the number is unknown", async () => {
@@ -1294,6 +1296,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ) as HTMLElement;
     expect(row).not.toBeNull();
     expect(row).toHaveAttribute("data-active", "true");
+    expect(row).toHaveAttribute("aria-current", "page");
     expect(activateWorkspace).not.toHaveBeenCalled();
   });
 
@@ -1698,9 +1701,9 @@ describe("SidebarInbox — settle / un-settle", () => {
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
     // The grid tracks are the row's only column widths — 56px fits a 4-digit
-    // ref like `#1234`, 48px fits the age label and the text-only Un-settle
-    // button. The slots themselves must not restate either number, or the two
-    // copies drift.
+    // ref like `#1234`, 48px fits the age label and the Un-settle glyph. The
+    // slots themselves must not restate either number, or the two copies
+    // drift.
     expect(row.className).toContain(
       "grid-cols-[auto_minmax(0,1fr)_56px_48px]",
     );
@@ -1824,6 +1827,55 @@ describe("SidebarInbox — jump-to-card shortcuts", () => {
     });
     expect(screen.queryByText("1")).not.toBeInTheDocument();
     expect(screen.queryByText("2")).not.toBeInTheDocument();
+  });
+});
+
+describe("SidebarInbox — parked shelves anchor to the bottom", () => {
+  it("wraps the settled shelf in a bottom-anchored group below the active cards", async () => {
+    const active = makeWorkspace();
+    const parked = makeWorkspace();
+    workspaces = [active, parked];
+    persistedSettled = JSON.stringify({
+      settled: [{ id: parked.workspace_id, at: Date.now() }],
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderInbox();
+
+    const shelves = container.querySelector("[data-parked-shelves]");
+    expect(shelves).not.toBeNull();
+    // `mt-auto` pushes the group to the floor of the sidebar's flex column.
+    expect(shelves).toHaveClass("mt-auto");
+    expect(shelves!.querySelector("[data-settled-row]")).not.toBeNull();
+    // The active card stays outside the parked group.
+    const card = container.querySelector(`[data-inbox-card="${active.workspace_id}"]`);
+    expect(card).not.toBeNull();
+    expect(shelves!.contains(card)).toBe(false);
+  });
+
+  it("puts the snoozed shelf in the same bottom-anchored group", async () => {
+    const active = makeWorkspace();
+    const snoozed = makeWorkspace();
+    workspaces = [active, snoozed];
+    persistedSettled = JSON.stringify({
+      settled: [],
+      snoozed: [{ id: snoozed.workspace_id, at: Date.now(), until: Date.now() + 60_000 }],
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderInbox();
+
+    const shelves = container.querySelector("[data-parked-shelves]");
+    expect(shelves).not.toBeNull();
+    // The shelf starts collapsed, so its header is what renders.
+    const header = screen.getByRole("button", { name: "Snoozed (1)" });
+    expect(shelves!.contains(header)).toBe(true);
+  });
+
+  it("renders no parked group when nothing is settled or snoozed", async () => {
+    workspaces = [makeWorkspace()];
+    const { container } = await renderInbox();
+    expect(container.querySelector("[data-parked-shelves]")).toBeNull();
   });
 });
 
@@ -2019,6 +2071,26 @@ describe("SidebarInbox — wrapping-up tier", () => {
     ).toBeInTheDocument();
     // Newest-first still decides the top tier; the demoted card just left it.
     expect(cardOrder(container)).toEqual(["ws-2", "ws-1"]);
+  });
+
+  it("anchors the tier to the bottom of the sidebar with the parked shelves", async () => {
+    const base = Date.now();
+    workspaces = [
+      makeWorkspace({ title: "Handed off", worktree_path: "/wt/a", pr_number: 12, pr_state: "OPEN", ...readStamps(base) }),
+      makeWorkspace({ title: "Live work" }),
+    ];
+    const { container } = await flushRender();
+
+    const shelves = container.querySelector("[data-parked-shelves]");
+    expect(shelves).toHaveClass("mt-auto");
+    expect(shelves!.contains(divider(container))).toBe(true);
+    expect(
+      shelves!.contains(container.querySelector('[data-inbox-card="ws-1"]')),
+    ).toBe(true);
+    // Live work keeps the top of the list.
+    expect(
+      shelves!.contains(container.querySelector('[data-inbox-card="ws-2"]')),
+    ).toBe(false);
   });
 
   it("collapses and expands the tier from its header", async () => {
@@ -2420,7 +2492,7 @@ describe("SidebarInbox — snooze shelf", () => {
     expect(container.querySelectorAll("[data-snoozed-row]").length).toBe(1);
     expect(
       container.querySelector('[data-snoozed-row="ws-2"]'),
-    ).not.toBeNull();
+    ).toHaveAttribute("aria-current", "page");
   });
 });
 

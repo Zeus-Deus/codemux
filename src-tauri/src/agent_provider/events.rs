@@ -472,6 +472,29 @@ pub struct PlanUsageWindow {
     /// Provider-supplied name, kept for `Other` windows and tooltips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Length of the window in minutes, when known. Lets the UI place the
+    /// "even spending" mark: how far into the window the clock is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_mins: Option<i64>,
+}
+
+/// Minutes in the rolling five-hour window.
+pub const FIVE_HOUR_WINDOW_MINS: i64 = 5 * 60;
+/// Minutes in a weekly window.
+pub const SEVEN_DAY_WINDOW_MINS: i64 = 7 * 24 * 60;
+
+impl PlanWindowKind {
+    /// The window length a kind implies, for providers that report the kind
+    /// but not the duration.
+    pub fn implied_window_mins(self) -> Option<i64> {
+        match self {
+            Self::FiveHour => Some(FIVE_HOUR_WINDOW_MINS),
+            Self::SevenDay | Self::SevenDayOpus | Self::SevenDaySonnet => {
+                Some(SEVEN_DAY_WINDOW_MINS)
+            }
+            Self::Overage | Self::Other => None,
+        }
+    }
 }
 
 /// The canonical event stream produced by every provider.
@@ -829,6 +852,9 @@ pub enum ProviderRuntimeEvent {
         /// out, or automatic attempts exhausted).
         #[serde(default)]
         auto_resume_at_ms: Option<i64>,
+        /// Why the backend could not arm an automatic continuation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_resume_blocked_reason: Option<UsageResumeBlockedReason>,
         /// Which quota window was exhausted, as the provider names it
         /// (e.g. `"five_hour"`, `"seven_day"`). `None` when unknown.
         #[serde(default)]
@@ -839,7 +865,24 @@ pub enum ProviderRuntimeEvent {
     /// because the automatic dispatch failed. The UI falls back to the
     /// manual resume affordance. Persisted so hydrate does not resurrect a
     /// stale countdown.
-    UsageResumeCancelled { thread_id: ThreadId },
+    UsageResumeCancelled {
+        thread_id: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<UsageResumeBlockedReason>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageResumeBlockedReason {
+    Disabled,
+    UnknownReset,
+    ResetPassed,
+    ResetTooFar,
+    AttemptsExhausted,
+    Cancelled,
+    DispatchFailed,
+    StorageFailed,
 }
 
 /// Turn-error subtype providers stamp on a [`TurnStatus::Error`] when the
@@ -1137,6 +1180,7 @@ mod tests {
             provider: ProviderKind::Claude,
             resets_at_ms: Some(1_800_000_000_000),
             auto_resume_at_ms: Some(1_800_000_045_000),
+            auto_resume_blocked_reason: None,
             window: Some("five_hour".into()),
         };
         let v = serde_json::to_value(&event).unwrap();
@@ -1176,6 +1220,7 @@ mod tests {
             provider: ProviderKind::Codex,
             resets_at_ms: None,
             auto_resume_at_ms: None,
+            auto_resume_blocked_reason: None,
             window: None,
         };
         let v = serde_json::to_value(&event).unwrap();
@@ -1193,6 +1238,7 @@ mod tests {
             ProviderRuntimeEvent::UsageLimitReached {
                 resets_at_ms: None,
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 window: None,
                 ..
             }
@@ -1203,13 +1249,14 @@ mod tests {
     fn usage_resume_cancelled_wire_shape_round_trips() {
         let event = ProviderRuntimeEvent::UsageResumeCancelled {
             thread_id: ThreadId("t1".into()),
+            reason: None,
         };
         let v = serde_json::to_value(&event).unwrap();
         assert_eq!(v, json!({"type": "usage_resume_cancelled", "thread_id": "t1"}));
         let back: ProviderRuntimeEvent = serde_json::from_value(v).unwrap();
         assert!(matches!(
             back,
-            ProviderRuntimeEvent::UsageResumeCancelled { thread_id } if thread_id.0 == "t1"
+            ProviderRuntimeEvent::UsageResumeCancelled { thread_id, .. } if thread_id.0 == "t1"
         ));
     }
 

@@ -74,7 +74,7 @@ export function ReviewHeader({
   const age = relativeAge(pr.updated_at);
 
   const openInBrowser = () => {
-    openUrl(pr.url).catch((err) => toast.error(String(err)));
+    openUrl(pr.url).catch((err) => toast.failure("Couldn't open the link", err));
   };
 
   const copyUrl = () => {
