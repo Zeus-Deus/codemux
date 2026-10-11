@@ -118,7 +118,7 @@ function SendToAgentButton({ onSend }: { onSend: () => Promise<unknown> }) {
         if (sending) return;
         setSending(true);
         onSend()
-          .catch((err) => toast.error(String(err)))
+          .catch((err) => toast.failure("Couldn't send the thread to an agent", err))
           .finally(() => setSending(false));
       }}
     >
@@ -526,7 +526,7 @@ export function ReviewThreads({
         delete next[thread.id];
         return next;
       });
-      toast.error(String(err));
+      toast.failure(resolved ? "Couldn't resolve the thread" : "Couldn't reopen the thread", err);
     });
   };
 

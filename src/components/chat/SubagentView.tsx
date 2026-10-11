@@ -2,6 +2,7 @@ import { Lock } from "lucide-react";
 import { useMemo } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   isRunning,
@@ -21,6 +22,7 @@ import { DelegationCard } from "./DelegationCard";
 import { AssistantMessage } from "./AssistantMessage";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
+import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 import { buildTranscriptSlots } from "./transcript-slots";
@@ -94,6 +96,9 @@ export function SubagentView({
               <ActivityBlock
                 items={slot.body.items}
                 working={slot.body.working}
+                // The drill-in builds settled slots, so liveness comes from
+                // the subagent itself: its running steps really are running.
+                turnLive={running}
                 workspaceId={workspaceId}
               />
             ) : slot.body.kind === "turn_fold" ? (
@@ -103,7 +108,12 @@ export function SubagentView({
             ) : slot.body.kind === "delegation" ? (
               <DelegationCard entries={slot.body.entries} />
             ) : (
-              <SubItem item={slot.body.item} workspaceId={workspaceId} cwd={cwd} />
+              <SubItem
+                item={slot.body.item}
+                live={running}
+                workspaceId={workspaceId}
+                cwd={cwd}
+              />
             )}
           </div>
         ))}
@@ -135,10 +145,13 @@ export function SubagentView({
  *  Tool cards are inert (read-only): approvals happen in the parent. */
 function SubItem({
   item,
+  live,
   workspaceId,
   cwd,
 }: {
   item: ChatViewItem;
+  /** The subagent is still running; gates a tool card's live timer. */
+  live: boolean;
   workspaceId?: string | null;
   cwd?: string | null;
 }) {
@@ -154,8 +167,15 @@ function SubItem({
     case "tool_call":
       return isTaskSummaryTool(item as ToolCallItem) ? (
         <TaskSummaryCard item={item as ToolCallItem} />
+      ) : isInlineHtmlRender(item as ToolCallItem) ? (
+        <HtmlRenderFrame item={item as ToolCallItem} />
       ) : (
-        <ToolCallCard item={item as ToolCallItem} approval={null} onDecide={NOOP} />
+        <ToolCallCard
+          item={item as ToolCallItem}
+          turnLive={live}
+          approval={null}
+          onDecide={NOOP}
+        />
       );
     case "permission_request":
       return (

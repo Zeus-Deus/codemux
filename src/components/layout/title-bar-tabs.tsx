@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   FileCode,
@@ -41,6 +41,7 @@ import type {
 } from "@/tauri/types";
 
 import { TabDropIndicator } from "./tab-drop-indicator";
+import { reportFailure } from "@/lib/toast";
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -84,6 +85,69 @@ const CLOSE_BTN =
 
 interface TitleBarTabsProps {
   workspace: WorkspaceSnapshot;
+}
+
+/** Width of the edge fade that marks tabs scrolled out of view. */
+const EDGE_FADE_PX = 16;
+
+/** Which ends of a horizontal scroller have content hidden past them. */
+function useOverflowEdges(scroller: HTMLElement | null, contentKey: string) {
+  const [edges, setEdges] = useState({ start: false, end: false });
+  useEffect(() => {
+    if (!scroller) return;
+    const update = () => {
+      const start = scroller.scrollLeft > 0;
+      const end =
+        scroller.scrollLeft + scroller.clientWidth < scroller.scrollWidth - 1;
+      setEdges((prev) =>
+        prev.start === start && prev.end === end ? prev : { start, end },
+      );
+    };
+    update();
+    scroller.addEventListener("scroll", update, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(scroller);
+    // Once the island hits its width cap the scroller's own box stops
+    // changing, so a pill growing or shrinking (a rename, the active chat
+    // tab gaining its chevron) is only seen through the pills themselves.
+    for (const pill of Array.from(scroller.children)) observer?.observe(pill);
+    return () => {
+      scroller.removeEventListener("scroll", update);
+      observer?.disconnect();
+    };
+  }, [scroller, contentKey]);
+  return edges;
+}
+
+/** Re-reveals the active pill whenever the strip changes width. Activation
+ *  alone is not enough: a panel or sidebar growing, or the window shrinking,
+ *  narrows the strip after the fact and can push the selected tab out. */
+function useKeepActiveTabInView(
+  scroller: HTMLElement | null,
+  activeTabId: string | null,
+) {
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  useEffect(() => {
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      const id = activeTabIdRef.current;
+      if (!id) return;
+      Array.from(scroller.querySelectorAll<HTMLElement>("[data-tab-id]"))
+        .find((el) => el.dataset.tabId === id)
+        ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [scroller]);
+}
+
+function edgeFadeMask(start: boolean, end: boolean): string | undefined {
+  if (!start && !end) return undefined;
+  const from = start ? `transparent, black ${EDGE_FADE_PX}px` : "black";
+  const to = end ? `black calc(100% - ${EDGE_FADE_PX}px), transparent` : "black";
+  return `linear-gradient(to right, ${from}, ${to})`;
 }
 
 /**
@@ -138,19 +202,31 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   const attachWheelScroll = useHorizontalWheelScroll<HTMLDivElement>();
   // The scroller is also the reorder hook's measurement container, so both
   // consumers are fed from one ref callback.
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const setScrollerNode = useCallback(
     (node: HTMLDivElement | null) => {
       containerRef.current = node;
       attachWheelScroll(node);
+      setScroller(node);
     },
     [attachWheelScroll, containerRef],
   );
+  // The strip hides its scrollbar, so a fade on whichever edge has tabs
+  // past it is the only hint that more tabs exist.
+  const edges = useOverflowEdges(scroller, tabIds.join("\n"));
+  const mask = edgeFadeMask(edges.start, edges.end);
+  useKeepActiveTabInView(scroller, workspace.active_tab_id);
 
   return (
     <div
       ref={setScrollerNode}
-      className="no-scrollbar relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
+      // `scroll-px-4` matches EDGE_FADE_PX so a pill scrolled into view
+      // stops clear of the fade instead of losing its close button to it.
+      className="no-scrollbar relative flex min-w-0 scroll-px-4 items-center gap-[2px] overflow-x-auto"
       data-testid="titlebar-tabs-scroll"
+      data-overflow-start={edges.start ? "" : undefined}
+      data-overflow-end={edges.end ? "" : undefined}
+      style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
     >
       {dragTabId && dropIndicatorLeft !== null && (
         <TabDropIndicator left={dropIndicatorLeft} />
@@ -199,6 +275,17 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   );
 }
 
+/** Keeps the selected pill visible when it is activated from outside the
+ *  strip (Ctrl+1..9, the palette) while it sits past the clipped edge. */
+function useScrollIntoViewWhenActive(isActive: boolean) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isActive) return;
+    ref.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [isActive]);
+  return ref;
+}
+
 interface TitleBarTabProps {
   workspace: WorkspaceSnapshot;
   tab: TabSnapshot;
@@ -218,19 +305,21 @@ function TitleBarTab({
   reorderProps,
   isDragging,
 }: TitleBarTabProps) {
+  const ref = useScrollIntoViewWhenActive(isActive);
   const handleActivate = () => {
     if (!isActive) {
-      activateTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+      activateTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't switch tabs"));
     }
   };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+    closeTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
 
   return (
     <div
       {...reorderProps}
+      ref={ref}
       className={cn(
         PILL_BASE,
         isActive ? PILL_ACTIVE : PILL_INACTIVE,
@@ -241,6 +330,7 @@ function TitleBarTab({
         type="button"
         className="flex min-w-0 items-center gap-1.5"
         onClick={handleActivate}
+        aria-current={isActive ? "page" : undefined}
         title={tab.title}
       >
         <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
@@ -284,6 +374,7 @@ function ActiveChatTab({
   isDragging,
 }: ActiveChatTabProps) {
   const [open, setOpen] = useState(false);
+  const ref = useScrollIntoViewWhenActive(true);
   const workspaceId = workspace.workspace_id;
 
   const { cwd, handleSelect, handleNewChat } = useAgentChatSessionActions(pane);
@@ -294,13 +385,14 @@ function ActiveChatTab({
   });
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeTab(workspaceId, tab.tab_id).catch(console.error);
+    closeTab(workspaceId, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
 
   return (
     <>
       <div
         {...reorderProps}
+        ref={ref}
         className={cn(PILL_BASE, PILL_ACTIVE, isDragging && "opacity-40")}
       >
         <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -308,6 +400,7 @@ function ActiveChatTab({
             <button
               type="button"
               className="flex min-w-0 items-center gap-1.5"
+              aria-current="page"
               title={tab.title}
               data-testid="titlebar-chat-tab-trigger"
             >

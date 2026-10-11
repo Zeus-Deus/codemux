@@ -12,6 +12,7 @@ import {
   type PrDiffFile,
 } from "@/lib/pr-diff";
 import { groupDigits, tzBody, tzMeta, tzMetaNum } from "./review-ui";
+import { getDiffFileState } from "@/stores/settings-store";
 import type { DiffLayout } from "./pr-drafts";
 
 interface Props {
@@ -45,12 +46,26 @@ export function ReviewCodeFile({
   pendingNotes,
   forceOpen = false,
 }: Props) {
-  const [manuallyCollapsed, setManuallyCollapsed] = useState(false);
+  // Settings → Git → Diffs decides whether files start open; the header
+  // toggle still flips each one.
+  const [manuallyCollapsed, setManuallyCollapsed] = useState(
+    () => getDiffFileState() === "collapsed",
+  );
   // Numbers, not vibes: a 2,000-line file is opened on request, not by
   // default — otherwise the file you came to read is ten screens down.
   const [loadedAnyway, setLoadedAnyway] = useState(false);
 
-  const collapsed = !forceOpen && (viewed || manuallyCollapsed);
+  // Viewed folds a file away, but its chevron can still open it: checking
+  // one line again must not cost the Viewed mark. Marking or unmarking
+  // starts the file folded or open by its own state again.
+  const [openWhileViewed, setOpenWhileViewed] = useState(false);
+  const [viewedSeen, setViewedSeen] = useState(viewed);
+  if (viewedSeen !== viewed) {
+    setViewedSeen(viewed);
+    setOpenWhileViewed(false);
+  }
+
+  const collapsed = !forceOpen && (viewed ? !openWhileViewed : manuallyCollapsed);
   const renderable = isRenderable(file);
   const large = isLargeFile(file);
   const changed = changedLines(file);
@@ -76,7 +91,9 @@ export function ReviewCodeFile({
           type="button"
           aria-label={collapsed ? `Expand ${file.path}` : `Collapse ${file.path}`}
           aria-expanded={!collapsed}
-          onClick={() => setManuallyCollapsed((c) => !c)}
+          onClick={() =>
+            viewed ? setOpenWhileViewed((o) => !o) : setManuallyCollapsed((c) => !c)
+          }
           className="shrink-0 text-muted-foreground hover:text-foreground"
         >
           {collapsed ? (

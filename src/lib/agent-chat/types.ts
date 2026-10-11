@@ -9,6 +9,7 @@ import type {
   SubagentTaskKind,
   TasksSnapshot,
   TurnStatus,
+  UsageResumeBlockedReason,
 } from "@/tauri/events";
 
 export type { SubagentStatus, SubagentTaskKind };
@@ -165,6 +166,11 @@ export interface ToolCallItem {
    *  (`done` / `error`). Optional for the same backward-compat reason.
    *  With `started_at`, bounds this call's contribution to run duration. */
   completed_at?: number;
+  /** Wall-clock ms when the call's permission request was answered while
+   *  the call was still `running`. The call only runs from here, so the
+   *  card's timer starts here instead of at `started_at`, which would count
+   *  the user's think time as the tool's. */
+  approved_at?: number;
 }
 
 export interface PermissionRequestItem {
@@ -411,6 +417,7 @@ export interface UsageLimitState {
   resetsAtMs: number | null;
   /** When Codemux resumes on its own; `null` when nothing is armed. */
   autoResumeAtMs: number | null;
+  autoResumeBlockedReason?: UsageResumeBlockedReason | null;
   window: string | null;
   /** Clock time the limit was observed. */
   at: number;
