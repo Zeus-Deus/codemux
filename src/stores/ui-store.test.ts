@@ -23,6 +23,7 @@ beforeEach(() => {
     rightPanelTabs: {},
     rightPanelLastTabs: {},
     sidebarWidth: 288,
+    sidebarOpen: true,
     rightPanelWidth: 320,
     rightPanelMaximized: false,
     showNewWorkspaceDialog: false,
@@ -162,6 +163,16 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.hasSeenOnboarding).toBe(true);
     });
 
+    // The rail-or-expanded choice is half of one preference with the width;
+    // forgetting it made rail users collapse the sidebar on every launch.
+    it("persists the sidebar's collapsed state alongside its width", () => {
+      useUIStore.getState().setSidebarOpen(false);
+
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.sidebarOpen).toBe(false);
+      expect(persisted.state.sidebarWidth).toBe(288);
+    });
+
     it("does NOT persist onboardingProjectDir (session-only)", () => {
       useUIStore.getState().setOnboardingProjectDir("/home/user/myproj");
 
@@ -221,6 +232,28 @@ describe("ui-store — onboarding state", () => {
       expect(useUIStore.getState().pendingPrSelection).toBeNull();
     });
 
+    it("keeps at most one utility page open, and Back closes it", () => {
+      useUIStore.getState().setShowPullRequests(true, { projectRoot: "/repo", number: 1 });
+      useUIStore.getState().setShowDevices(true);
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+      expect(useUIStore.getState().pendingPrSelection).toBeNull();
+      expect(useUIStore.getState().showDevices).toBe(true);
+
+      useUIStore.getState().setShowAutomations(true);
+      expect(useUIStore.getState().showDevices).toBe(false);
+      expect(useUIStore.getState().showAutomations).toBe(true);
+
+      useUIStore.getState().setShowUsage(true);
+      expect(useUIStore.getState().showAutomations).toBe(false);
+      expect(useUIStore.getState().showUsage).toBe(true);
+
+      useUIStore.getState().closeUtilityPages();
+      expect(useUIStore.getState().showAutomations).toBe(false);
+      expect(useUIStore.getState().showDevices).toBe(false);
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+      expect(useUIStore.getState().showUsage).toBe(false);
+    });
+
     it("accumulates the badge keys the page has shown", () => {
       useUIStore.setState({ prBadgeSeen: [] });
       useUIStore.getState().markPrBadgeSeen(["/repo 1", "/repo 2"]);
@@ -253,6 +286,12 @@ describe("ui-store — onboarding state", () => {
     it("still refuses a width below the panel minimum", () => {
       useUIStore.getState().setRightPanelWidth(10);
       expect(useUIStore.getState().rightPanelWidth).toBe(RIGHT_PANEL_MIN_WIDTH);
+    });
+
+    it("resets to the window-relative default, as if never dragged", () => {
+      useUIStore.getState().setRightPanelWidth(900);
+      useUIStore.getState().resetRightPanelWidth();
+      expect(useUIStore.getState().rightPanelWidth).toBeNull();
     });
 
     it("persists the left sidebar width", () => {
@@ -595,5 +634,29 @@ describe("ui-store — forgetting add-on panes", () => {
     useUIStore.getState().forgetRightPanelPanes(isBrief);
     expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBeNull();
     expect(useUIStore.getState().rightPanelPanes["ws-1"]).toEqual(["files"]);
+  });
+});
+
+describe("ui-store — subagent attention dismissals", () => {
+  beforeEach(() => {
+    useUIStore.setState({ dismissedSubagentAttention: [] });
+    window.localStorage.clear();
+  });
+
+  it("persists dismissals so failure cards stay dismissed after a restart", () => {
+    useUIStore.getState().dismissSubagentAttention("sub-1");
+
+    const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+    expect(persisted.state.dismissedSubagentAttention).toEqual(["sub-1"]);
+  });
+
+  it("keeps only the newest dismissals", () => {
+    for (let i = 0; i < 205; i++) {
+      useUIStore.getState().dismissSubagentAttention(`sub-${i}`);
+    }
+    const dismissed = useUIStore.getState().dismissedSubagentAttention;
+    expect(dismissed).toHaveLength(200);
+    expect(dismissed[0]).toBe("sub-5");
+    expect(dismissed[dismissed.length - 1]).toBe("sub-204");
   });
 });

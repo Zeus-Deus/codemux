@@ -19,7 +19,7 @@ type SliceOverrides = {
   model?: string | null;
   effort?: string | null;
   contextWindow?: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   resumeCursor?: Record<string, string> | null;
   hasDebugActivity?: boolean;
   debugActivityResolved?: boolean;
@@ -69,7 +69,7 @@ const setDebugActivityResolvedMock = vi.fn();
 // picker fields the pane restored from the persisted session row.
 const setEffortMock = vi.fn();
 const setContextWindowMock = vi.fn();
-const setFastModeMock = vi.fn();
+const setServiceTierMock = vi.fn();
 const setResumeCursorMock = vi.fn();
 // Hoisted mock for the bug/chat-agent-empty regression test (an
 // unmount/remount that lands on an existing thread should pull the
@@ -127,6 +127,7 @@ vi.mock("./ChatTranscript", async (importOriginal) => {
     onEnterSubagent,
     onCancelQueued,
     onSendQueuedNow,
+    onRevertTurn,
   }: {
     messages: unknown[];
     streaming?: boolean;
@@ -138,6 +139,7 @@ vi.mock("./ChatTranscript", async (importOriginal) => {
     onEnterSubagent?: (subagentId: string) => void;
     onCancelQueued?: (queuedId: string, text: string) => void;
     onSendQueuedNow?: (queuedId: string) => void;
+    onRevertTurn?: (turnIndex: number) => void;
   }) => (
     <div
       data-testid="transcript"
@@ -178,6 +180,10 @@ vi.mock("./ChatTranscript", async (importOriginal) => {
       <button
         data-testid="send-queued-now"
         onClick={() => onSendQueuedNow?.("q-1")}
+      />
+      <button
+        data-testid="revert-turn"
+        onClick={() => onRevertTurn?.(1)}
       />
     </div>
   );
@@ -235,6 +241,7 @@ vi.mock("./DebugExitDialog", () => ({
 
 vi.mock("./Composer", async (importOriginal) => {
   const { Composer: RealComposer } = await importOriginal<typeof import("./Composer")>();
+  const { useRef } = await import("react");
   const StubComposer = ({
     zone1Override,
     belowComposerSlot,
@@ -248,9 +255,10 @@ vi.mock("./Composer", async (importOriginal) => {
     onModelChange,
     onProviderModelChange,
     onContextWindowChange,
-    onFastModeChange,
+    onServiceTierChange,
     onPermissionModeChange,
     provider,
+    threadId,
     providerCliInstalled,
     providerAuthenticated,
     focusOnMount,
@@ -275,9 +283,10 @@ vi.mock("./Composer", async (importOriginal) => {
       model: string,
     ) => void;
     onContextWindowChange: (contextWindow: string) => void;
-    onFastModeChange?: (fastMode: boolean) => void;
+    onServiceTierChange?: (serviceTier: string) => void;
     onPermissionModeChange: (mode: string) => void;
-    provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes";
+    provider: "claude" | "codex" | "cursor" | "grok" | "opencode" | "hermes" | "acp";
+    threadId?: string | null;
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;
@@ -286,13 +295,19 @@ vi.mock("./Composer", async (importOriginal) => {
     sessionAwaitingIntent?: boolean;
     draft: string;
     onDraftChange: (draft: string) => void;
-  }) => (
+  }) => {
+    // The real Composer focuses on the rising edge of `focusOnMount` and
+    // never hands focus back, so a request holds for the stub's lifetime.
+    const focusRequested = useRef(false);
+    if (focusOnMount) focusRequested.current = true;
+    return (
     <div
       data-testid="composer"
       data-provider={provider}
+      data-thread-id={threadId}
       data-provider-cli-installed={String(providerCliInstalled)}
       data-provider-authenticated={String(providerAuthenticated)}
-      data-focus-on-mount={focusOnMount ? "true" : "false"}
+      data-focus-on-mount={focusRequested.current ? "true" : "false"}
       data-configuration-ready={configurationReady ? "true" : "false"}
       data-session-ready={sessionReady ? "true" : "false"}
       data-session-awaiting-intent={sessionAwaitingIntent ? "true" : "false"}
@@ -357,11 +372,11 @@ vi.mock("./Composer", async (importOriginal) => {
       />
       <button
         data-testid="fast-mode-change"
-        onClick={() => onFastModeChange?.(true)}
+        onClick={() => onServiceTierChange?.("fast")}
       />
       <button
         data-testid="standard-mode-change"
-        onClick={() => onFastModeChange?.(false)}
+        onClick={() => onServiceTierChange?.("default")}
       />
       {/* Permission-mode picker selection. Per-turn providers have to
           push the choice onto the LIVE session; per-session ones
@@ -371,7 +386,8 @@ vi.mock("./Composer", async (importOriginal) => {
         onClick={() => onPermissionModeChange("ask")}
       />
     </div>
-  );
+    );
+  };
   return { Composer: (props: React.ComponentProps<typeof RealComposer>) => useRealComposer ? <RealComposer {...props} /> : <StubComposer {...props} /> };
 });
 
@@ -451,7 +467,7 @@ vi.mock("@/hooks/use-chat-code-plugin", () => ({ useChatCodePlugin: () => undefi
 vi.mock("@/hooks/use-mcp-runtime", () => ({ useMcpRuntime: () => ({ runtimes: {} }) }));
 
 vi.mock("@/hooks/use-agent-chat-events", () => ({
-  useAgentChatEvents: () => {},
+  useAgentChatEvents: vi.fn(),
 }));
 
 vi.mock("@/tauri/events", () => ({
@@ -502,6 +518,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatListSessions: vi.fn().mockResolvedValue([]),
   agentChatListTurnCheckpoints: vi.fn().mockResolvedValue([]),
   agentChatRevertTurnCheckpoint: vi.fn().mockResolvedValue([]),
+  agentChatUndoTurnRevert: vi.fn().mockResolvedValue(undefined),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatCancelQueuedTurn: vi.fn().mockResolvedValue(true),
   agentChatResumeAfterUsageLimit: vi.fn().mockResolvedValue(undefined),
@@ -509,7 +526,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSendQueuedTurnNow: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
-  agentChatSetFastMode: vi.fn().mockResolvedValue(undefined),
+  agentChatSetServiceTier: vi.fn().mockResolvedValue(undefined),
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
@@ -652,7 +669,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       modePriorPermissionMode: overrides.modePriorPermissionMode ?? null,
       effort: overrides.effort ?? null,
       contextWindow: overrides.contextWindow ?? null,
-      fastMode: overrides.fastMode ?? false,
+      serviceTier: overrides.serviceTier ?? "default",
       hasDebugActivity: overrides.hasDebugActivity ?? false,
       debugActivityResolved: overrides.debugActivityResolved ?? false,
       pendingRequestIds: [],
@@ -689,7 +706,7 @@ vi.mock("@/stores/agent-chat-store", () => {
         setSessionLaunchMode: vi.fn(),
         setEffort: setEffortMock,
         setContextWindow: setContextWindowMock,
-        setFastMode: setFastModeMock,
+        setServiceTier: setServiceTierMock,
         setResumeCursor: setResumeCursorMock,
         setMode: setModeMock,
         setModePriorPermissionMode: setModePriorMock,
@@ -712,6 +729,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       getState: () => ({
         threads: buildThreads(),
         applyEvent: applyEventMock,
+        applyLiveEvents: vi.fn(),
         // Session bring-up seeds the agent-chat slice through these
         // after start_session resolves.
         ensureThread: vi.fn(),
@@ -720,7 +738,7 @@ vi.mock("@/stores/agent-chat-store", () => {
         setModel: setModelMock,
         setEffort: setEffortMock,
         setContextWindow: setContextWindowMock,
-        setFastMode: setFastModeMock,
+        setServiceTier: setServiceTierMock,
         setMode: setModeMock,
         // Thread Scope deferred-worktree submit seeds the NEW thread's
         // optimistic user bubble through getState().
@@ -745,6 +763,7 @@ vi.mock("@/stores/agent-chat-store", () => {
 });
 
 import { AgentChatPane } from "./AgentChatPane";
+import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { TranscriptCacheProvider } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
@@ -758,7 +777,7 @@ import {
   agentChatListSessions,
   agentChatRespondToRequest,
   agentChatSendTurn,
-  agentChatSetFastMode,
+  agentChatSetServiceTier,
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -770,6 +789,7 @@ import {
 } from "@/tauri/commands";
 import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import { toast } from "sonner";
 import type { ChatModelInfo } from "@/tauri/types";
@@ -1053,6 +1073,28 @@ describe("AgentChatPane imported provenance", () => {
 });
 
 describe("AgentChatPane provider runtime intent", () => {
+  it("keeps a new custom-ACP pane idle until an instance is explicitly selected", async () => {
+    useProviderRuntimeIntent.getState().reset();
+    useProviderRuntimeIntent.getState().observe("acp");
+    vi.mocked(agentChatStartSession).mockClear();
+    const { container } = render(<AgentChatPane pane={{ ...pane, thread_id: null, provider: "acp" }} />);
+    await act(async () => {});
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="composer"]')).toHaveAttribute("data-session-awaiting-intent", "true");
+  });
+  it("starts the same pending thread after its custom instance is selected", async () => {
+    useCustomAcp.setState({ selections: {}, bindings: {} });
+    useProviderRuntimeIntent.getState().reset();
+    useProviderRuntimeIntent.getState().observe("acp");
+    vi.mocked(agentChatStartSession).mockClear();
+    const { container } = render(<AgentChatPane pane={{ ...pane, thread_id: null, provider: "acp" }} />);
+    await act(async () => {});
+    const pendingThread = container.querySelector('[data-testid="composer"]')!.getAttribute("data-thread-id")!;
+    expect(pendingThread).toMatch(/-acp-/);
+    act(() => useCustomAcp.getState().select(pendingThread, "Exact/INSTANCE"));
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledWith("pane-1", "acp", expect.objectContaining({ thread_id: pendingThread, model: null, permission_mode: null })));
+    expect(useCustomAcp.getState().selections[pendingThread]).toBe("Exact/INSTANCE");
+  });
   const paneWithoutThread = { ...pane, thread_id: null };
 
   it("does not launch a provider until its restored pane is interacted with", async () => {
@@ -1159,6 +1201,27 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="transcript"]'),
     ).toBeNull();
+  });
+
+  it("shows a transcript skeleton, not the new-chat landing, while history loads", async () => {
+    currentMessages = [];
+    let finishRead: (rows: never[]) => void = () => {};
+    vi.mocked(agentChatListMessagesAfter).mockImplementationOnce(
+      () => new Promise((resolve) => { finishRead = resolve; }),
+    );
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="transcript-skeleton"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="home-landing"]')).toBeNull();
+
+    // The read comes back empty: this really is a new chat.
+    await act(async () => {
+      finishRead([]);
+    });
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="home-landing"]')).not.toBeNull(),
+    );
+    expect(container.querySelector('[data-testid="transcript-skeleton"]')).toBeNull();
   });
 
   it("renders ChatTranscript + Composer when messages.length >= 1", async () => {
@@ -1348,6 +1411,119 @@ describe("AgentChatPane usage-limit row", () => {
         "thread-x",
       ),
     );
+  });
+});
+
+describe("AgentChatPane turn revert", () => {
+  const checkpoint = {
+    thread_id: "thread-x",
+    workspace_id: "ws-home",
+    repo_path: "/home/user",
+    turn_index: 1,
+    client_nonce: "nonce-1",
+    transcript_cutoff_id: 0,
+    ref_name: "refs/codemux/turn-checkpoints/thread-x/1",
+    snapshot_commit: "snap",
+    head_commit: "head",
+    branch: "main",
+    created_at: "",
+  };
+
+  beforeEach(async () => {
+    currentMessages = [
+      {
+        kind: "user_message",
+        id: "m1",
+        seq: 0,
+        text: "Rename the helper",
+        clientNonce: "nonce-1",
+      },
+    ];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    setInputDraftMock.mockClear();
+    const {
+      agentChatListMessagesTail,
+      agentChatListTurnCheckpoints,
+      agentChatRevertTurnCheckpoint,
+      agentChatUndoTurnRevert,
+    } = await import("@/tauri/commands");
+    vi.mocked(agentChatListTurnCheckpoints).mockResolvedValue([checkpoint]);
+    vi.mocked(agentChatListMessagesTail).mockResolvedValueOnce({
+      rows: [],
+      total_rows: 0,
+      complete: true,
+    } as never);
+    vi.mocked(agentChatRevertTurnCheckpoint).mockClear().mockResolvedValue([]);
+    vi.mocked(agentChatUndoTurnRevert).mockClear().mockResolvedValue(undefined);
+  });
+
+  afterEach(async () => {
+    const { agentChatListTurnCheckpoints } = await import("@/tauri/commands");
+    vi.mocked(agentChatListTurnCheckpoints).mockResolvedValue([]);
+    vi.mocked(toast.success).mockRestore?.();
+  });
+
+  it("hands the reverted prompt back to the composer and offers to restore the files", async () => {
+    const success = vi.spyOn(toast, "success");
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const { agentChatRevertTurnCheckpoint, agentChatUndoTurnRevert } =
+      await import("@/tauri/commands");
+    // The checkpoint list loads after mount; until then there is nothing to
+    // revert to.
+    await waitFor(() => {
+      fireEvent.click(container.querySelector('[data-testid="revert-turn"]')!);
+      expect(document.querySelector('[data-testid="revert-turn-confirm"]')).not.toBeNull();
+    });
+    expect(document.body.textContent).toContain("Revert this turn?");
+    expect(document.body.textContent).toContain("Your prompt goes back into the composer");
+
+    fireEvent.click(document.querySelector('[data-testid="revert-turn-confirm"]')!);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatRevertTurnCheckpoint)).toHaveBeenCalledWith("thread-x", 1);
+    });
+    await waitFor(() => {
+      expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "Rename the helper");
+    });
+
+    const reverted = success.mock.calls.find(([message]) => message === "Turn reverted");
+    expect(reverted?.[1]?.description).toBe("Prompt restored to the composer.");
+    const action = reverted?.[1]?.action as
+      | { label: string; onClick: (event: { preventDefault: () => void }) => void }
+      | undefined;
+    expect(action?.label).toBe("Restore files");
+    action?.onClick({ preventDefault: vi.fn() });
+    await waitFor(() => {
+      expect(vi.mocked(agentChatUndoTurnRevert)).toHaveBeenCalledWith("thread-x");
+    });
+  });
+
+  it("keeps the prompt and the undo when the transcript refresh fails", async () => {
+    const success = vi.spyOn(toast, "success");
+    const error = vi.spyOn(toast, "error");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const { agentChatListMessagesAfter } = await import("@/tauri/commands");
+    await waitFor(() => {
+      fireEvent.click(container.querySelector('[data-testid="revert-turn"]')!);
+      expect(document.querySelector('[data-testid="revert-turn-confirm"]')).not.toBeNull();
+    });
+    vi.mocked(agentChatListMessagesAfter).mockRejectedValueOnce(new Error("ipc down"));
+
+    fireEvent.click(document.querySelector('[data-testid="revert-turn-confirm"]')!);
+    await waitFor(() => {
+      expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "Rename the helper");
+    });
+    const reverted = success.mock.calls.find(([message]) => message === "Turn reverted");
+    expect((reverted?.[1]?.action as { label: string } | undefined)?.label).toBe(
+      "Restore files",
+    );
+    expect(error.mock.calls.some(([message]) => message === "Could not revert turn")).toBe(
+      false,
+    );
+    error.mockRestore();
+    warn.mockRestore();
   });
 });
 
@@ -2549,7 +2725,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     setModelMock.mockClear();
     setEffortMock.mockClear();
     setContextWindowMock.mockClear();
-    setFastModeMock.mockClear();
+    setServiceTierMock.mockClear();
     setResumeCursorMock.mockClear();
     setPermissionModeMock.mockClear();
     vi.mocked(agentChatStartSession).mockClear();
@@ -2772,7 +2948,7 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
     );
   });
 
-  function renderFastModePane(provider: "codex" | "cursor", fastMode = false) {
+  function renderServiceTierPane(provider: "codex" | "cursor", serviceTier = "default") {
     useProviderCapabilities.setState({
       [provider]: {
         models: [{ ...grokModel("fast-model"), supports_fast_mode: true }],
@@ -2784,7 +2960,7 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
       },
     });
     currentSliceOverrides = {
-      "thread-x": { model: "fast-model", fastMode },
+      "thread-x": { model: "fast-model", serviceTier },
     };
     return render(<AgentChatPane pane={{ ...pane, provider }} />);
   }
@@ -2793,50 +2969,50 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
     "applies %s Fast mode only after acceptance without restarting the session",
     async (provider) => {
       let accept!: () => void;
-      vi.mocked(agentChatSetFastMode).mockReset().mockImplementationOnce(
+      vi.mocked(agentChatSetServiceTier).mockReset().mockImplementationOnce(
         () => new Promise<void>((resolve) => { accept = resolve; }),
       );
-      const { container } = renderFastModePane(provider);
+      const { container } = renderServiceTierPane(provider);
       await act(async () => {});
-      setFastModeMock.mockClear();
+      setServiceTierMock.mockClear();
       vi.mocked(agentChatStopSession).mockClear();
       vi.mocked(agentChatStartSession).mockClear();
       const button = container.querySelector('[data-testid="fast-mode-change"]')!;
       fireEvent.click(button);
       fireEvent.click(button);
 
-      expect(agentChatSetFastMode).toHaveBeenCalledExactlyOnceWith(provider, "thread-x", true);
-      expect(setFastModeMock).not.toHaveBeenCalled();
+      expect(agentChatSetServiceTier).toHaveBeenCalledExactlyOnceWith(provider, "thread-x", "fast");
+      expect(setServiceTierMock).not.toHaveBeenCalled();
       await act(async () => accept());
-      expect(setFastModeMock).toHaveBeenCalledExactlyOnceWith("thread-x", true);
+      expect(setServiceTierMock).toHaveBeenCalledExactlyOnceWith("thread-x", "fast");
       expect(agentChatStopSession).not.toHaveBeenCalled();
       expect(agentChatStartSession).not.toHaveBeenCalled();
     },
   );
 
-  it.each([false, true])(
+  it.each(["default", "fast"])(
     "keeps the accepted Fast mode (%s) after rejection and permits retry",
-    async (initialFastMode) => {
-      vi.mocked(agentChatSetFastMode).mockReset()
+    async (initialServiceTier) => {
+      vi.mocked(agentChatSetServiceTier).mockReset()
         .mockRejectedValueOnce("tier unavailable")
         .mockResolvedValue(undefined);
       const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "fast-error");
       try {
-        const { container } = renderFastModePane("codex", initialFastMode);
+        const { container } = renderServiceTierPane("codex", initialServiceTier);
         await act(async () => {});
-        setFastModeMock.mockClear();
+        setServiceTierMock.mockClear();
         const button = container.querySelector(
-          initialFastMode ? '[data-testid="standard-mode-change"]' : '[data-testid="fast-mode-change"]',
+          initialServiceTier !== "default" ? '[data-testid="standard-mode-change"]' : '[data-testid="fast-mode-change"]',
         )!;
         fireEvent.click(button);
         await waitFor(() => expect(errorToast).toHaveBeenCalledWith(
           "Failed to set service tier: tier unavailable", expect.objectContaining({ duration: 8000 }),
         ));
-        expect(setFastModeMock).not.toHaveBeenCalled();
+        expect(setServiceTierMock).not.toHaveBeenCalled();
 
         fireEvent.click(button);
-        await waitFor(() => expect(setFastModeMock).toHaveBeenCalledExactlyOnceWith(
-          "thread-x", !initialFastMode,
+        await waitFor(() => expect(setServiceTierMock).toHaveBeenCalledExactlyOnceWith(
+          "thread-x", initialServiceTier === "default" ? "fast" : "default",
         ));
       } finally {
         errorToast.mockRestore();
@@ -2918,7 +3094,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     setModelMock.mockReset();
     setEffortMock.mockReset();
     setContextWindowMock.mockReset();
-    setFastModeMock.mockReset();
+    setServiceTierMock.mockReset();
     setModeMock.mockClear();
     setModePriorMock.mockClear();
     setPermissionModeMock.mockClear();
@@ -2942,7 +3118,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     setModelMock.mockReset();
     setEffortMock.mockReset();
     setContextWindowMock.mockReset();
-    setFastModeMock.mockReset();
+    setServiceTierMock.mockReset();
   });
 
   it("reselects the live model when a retired effort falls back to the advertised default", async () => {
@@ -3255,7 +3431,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
         model: "grok-4.6",
         effort: "xhigh",
         context_window: "1m",
-        fast_mode: false,
+        service_tier: "default",
       },
     );
   });
@@ -3312,7 +3488,7 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
       model: "grok-4.6",
       effort: "low",
       context_window: null,
-      fast_mode: false,
+      service_tier: "default",
     });
     expect(agentChatStartSession).not.toHaveBeenCalledWith(
       "pane-1",
@@ -4341,4 +4517,26 @@ describe("GUI delivery commands", () => {
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "/steer Use SQLite"));
   });
+});
+
+
+it("refreshes the Codex catalog when startup falls back from a saved tier", async () => {
+  vi.mocked(agentChatListMessagesAfter).mockReset().mockResolvedValue([]);
+  const refresh = vi.spyOn(useProviderCapabilities.getState(), "refresh").mockResolvedValue();
+  try {
+    render(<AgentChatPane pane={pane} />);
+    const handler = vi.mocked(useAgentChatEvents).mock.lastCall?.[1];
+    expect(handler).toBeDefined();
+    await act(async () => handler?.({
+      thread_id: "thread-x",
+      event: {
+        type: "runtime_warning", thread_id: "thread-x",
+        message: "service-tier-fallback: Saved tier is unavailable; using Standard.",
+        original_payload: null,
+      },
+    }));
+    expect(refresh).toHaveBeenCalledWith("codex");
+  } finally {
+    refresh.mockRestore();
+  }
 });

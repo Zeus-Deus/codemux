@@ -103,6 +103,43 @@ pub struct McpRegistry {
     /// Lazily-started authenticated loopback gateway shared by provider
     /// adapters that need a remote MCP URL (OpenCode and future providers).
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
+    /// Tools Codemux serves itself, in-process, to its own Claude and Codex
+    /// chats (see [`HostTools`]). Set once at startup.
+    host: Arc<std::sync::OnceLock<Arc<dyn HostTools>>>,
+}
+
+/// The chat calling a host tool, as identified by the adapter session that
+/// received the call. Nothing in it comes from the model's arguments, so a
+/// tool can trust it for permission and ownership checks.
+#[derive(Debug, Clone)]
+pub struct HostCaller {
+    pub thread_id: String,
+    pub provider: crate::agent_provider::ProviderKind,
+    /// Owning workspace of the session's chat pane, when it has one.
+    pub workspace_id: Option<String>,
+    /// Claude: the session's live mode. Codex: the mode its session started
+    /// with, since Codex cannot change mode mid-session.
+    pub permission_mode: Option<String>,
+}
+
+/// Tools Codemux answers itself instead of forwarding to an MCP child.
+///
+/// Deliberately invisible to [`McpRegistry::list_all_tools`] and
+/// [`McpRegistry::dispatch_tool_call`]: those also back the OpenCode
+/// gateway and `codemux mcp`, which cannot identify the calling chat. Only
+/// adapters that know their session (Claude, Codex) list and call these.
+pub trait HostTools: Send + Sync {
+    /// Tools to offer `caller`, already prefixed like registry tools.
+    fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool>;
+    /// Answer a call as an MCP `tools/call` result (`content` + `isError`),
+    /// or `None` when `prefixed_name` is not a host tool. Codex answers its
+    /// tool requests inline, so this must never wait on a provider.
+    fn call(
+        &self,
+        caller: &HostCaller,
+        prefixed_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value>;
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -157,6 +194,7 @@ impl Default for McpRegistry {
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
             gateway: Arc::new(OnceCell::new()),
+            host: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -179,6 +217,49 @@ impl McpRegistry {
             })
             .await?;
         Ok(runtime.connection())
+    }
+
+    /// Install the process-wide host tools. Only the first call wins; every
+    /// clone of this registry (one per provider adapter) sees it.
+    pub fn set_host_tools(&self, tools: Arc<dyn HostTools>) {
+        let _ = self.host.set(tools);
+    }
+
+    /// Host tools to offer `caller`. Empty until [`set_host_tools`] runs.
+    ///
+    /// [`set_host_tools`]: Self::set_host_tools
+    pub fn host_tools(&self, caller: &HostCaller) -> Vec<McpTool> {
+        self.host
+            .get()
+            .map(|host| host.tools_for(caller))
+            .unwrap_or_default()
+    }
+
+    /// Answer `prefixed_name` if it is a host tool; `None` means "not mine,
+    /// dispatch it to the MCP children as usual".
+    pub fn host_call(
+        &self,
+        caller: &HostCaller,
+        prefixed_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        self.host.get()?.call(caller, prefixed_name, arguments)
+    }
+
+    /// Tell live sessions to re-collect their tool lists because the host
+    /// tool surface changed (e.g. a setting that gates it flipped). Rides the
+    /// in-process status bus only — the Settings UI has no row for it.
+    pub fn notify_host_tools_changed(&self) {
+        let row = McpServerRuntime {
+            id: "codemux-host".to_string(),
+            name: "codemux".to_string(),
+            status: McpServerStatus::Running { tool_count: 0 },
+            tools_count: 0,
+            error_message: None,
+            stderr_tail: None,
+            started_at_ms: None,
+        };
+        let _ = self.status_tx.send(row);
     }
 
     /// Mirror the frontend's disabled-set into the registry. The next
@@ -842,6 +923,58 @@ mod tests {
             transport: McpTransport::Stdio,
             raw: serde_json::Value::Null,
         }
+    }
+
+    struct EchoHost;
+
+    impl HostTools for EchoHost {
+        fn tools_for(&self, caller: &HostCaller) -> Vec<McpTool> {
+            vec![McpTool {
+                name: "echo".into(),
+                prefixed_name: "mcp__codemux__echo".into(),
+                description: Some(caller.thread_id.clone()),
+                input_schema: serde_json::json!({}),
+                server_id: "codemux-host".into(),
+            }]
+        }
+
+        fn call(
+            &self,
+            caller: &HostCaller,
+            prefixed_name: &str,
+            _arguments: &serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            (prefixed_name == "mcp__codemux__echo")
+                .then(|| serde_json::json!({ "content": [{"type": "text", "text": caller.thread_id}] }))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tools_are_served_per_caller_and_never_reach_shared_surfaces() {
+        let reg = McpRegistry::new();
+        let caller = HostCaller {
+            thread_id: "thread-1".into(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: None,
+            permission_mode: None,
+        };
+        assert!(reg.host_tools(&caller).is_empty(), "nothing before install");
+        assert!(reg.host_call(&caller, "mcp__codemux__echo", &serde_json::json!({})).is_none());
+
+        // Installing through a clone reaches every other clone.
+        reg.clone_handle().set_host_tools(Arc::new(EchoHost));
+        let tools = reg.host_tools(&caller);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].description.as_deref(), Some("thread-1"));
+        assert!(reg.host_call(&caller, "mcp__codemux__echo", &serde_json::json!({})).is_some());
+        assert!(reg.host_call(&caller, "mcp__codemux__other", &serde_json::json!({})).is_none());
+
+        // The gateway / `codemux mcp` surfaces stay unaware of host tools.
+        assert!(reg.list_all_tools().await.is_empty());
+        assert!(reg
+            .dispatch_tool_call("mcp__codemux__echo", serde_json::json!({}), None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

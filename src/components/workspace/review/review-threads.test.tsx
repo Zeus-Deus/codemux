@@ -9,7 +9,8 @@ vi.mock("@/lib/toast", () => ({
     info: vi.fn(),
     success: vi.fn(),
     warning: vi.fn(),
-    error: (...a: unknown[]) => mockToastError(...a),
+    error: vi.fn(),
+    failure: (...a: unknown[]) => mockToastError(...a),
   },
 }));
 
@@ -248,7 +249,7 @@ describe("resolve", () => {
       expect(screen.getByTestId("review-thread")).toHaveAttribute("data-resolved", "false"),
     );
     expect(screen.getByTestId("thread-resolve-T1")).toHaveTextContent("Resolve");
-    expect(mockToastError).toHaveBeenCalledWith("403 Forbidden");
+    expect(mockToastError).toHaveBeenCalledWith("Couldn't resolve the thread", "403 Forbidden");
   });
 
   it("offers Unresolve on a resolved thread", async () => {

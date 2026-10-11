@@ -467,7 +467,7 @@ export function ReviewCodeTab({
           onPosted();
           toast.success("Comment posted");
         })
-        .catch((err) => toast.error(String(err)))
+        .catch((err) => toast.failure("Couldn't post the comment", err))
         .finally(() => setPosting(false));
     },
     [selection, headOid, cwd, prNumber, onPosted],
@@ -627,6 +627,8 @@ export function ReviewCodeTab({
 
   // ── Render ──
 
+  const viewedCount = files.filter((f) => viewed.has(f.path)).length;
+
   if (loading && !diffText) {
     return (
       <p className={cn("px-3.5 py-6 text-center text-muted-foreground", tzBody)}>
@@ -649,9 +651,32 @@ export function ReviewCodeTab({
     // scrollbar inside it turns "keep reading" into "find the right
     // scrollbar first".
     <div ref={rootRef} className="@container flex flex-1 flex-col">
-      <div className="flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
+      <div className="relative flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
+        {/* Review progress, drawn over the header's bottom edge so it
+            appears without moving the files below. */}
+        {viewedCount > 0 && (
+          <div
+            role="progressbar"
+            aria-label="Files viewed"
+            aria-valuemin={0}
+            aria-valuemax={files.length}
+            aria-valuenow={viewedCount}
+            data-testid="viewed-rail"
+            className="pointer-events-none absolute inset-x-0 -bottom-px h-0.5"
+          >
+            <div
+              className="h-full bg-status-open/70 transition-[width] duration-150 motion-reduce:transition-none"
+              style={{ width: `${(viewedCount / files.length) * 100}%` }}
+            />
+          </div>
+        )}
         <span className={cn("flex-1 text-muted-foreground", tzMetaNum)}>
           {files.length === 1 ? "1 file" : `${files.length} files`} changed
+          {viewedCount > 0 && (
+            <span data-testid="viewed-count">
+              {" "}· {viewedCount} of {files.length} viewed
+            </span>
+          )}
         </span>
         <div className="flex gap-px rounded-md bg-muted/60 p-0.5" role="radiogroup" aria-label="Diff layout">
           {(["split", "unified"] as const).map((id) => (

@@ -107,6 +107,7 @@ impl AgentProvider for CursorAgentProvider {
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
+        let fast_mode = input.boolean_fast_mode()?;
         let thread_id = input.thread_id.clone();
         // Evict a corpse under the write lock so check→remove is atomic
         // against a concurrent rebuild. A read-lock check followed by a
@@ -138,13 +139,14 @@ impl AgentProvider for CursorAgentProvider {
             input.permission_mode,
             input.effort,
             input.context_window,
-            input.fast_mode,
+            fast_mode,
             input.resume_cursor,
             input.env,
             AcpSpawnConfig {
                 binary: self.config.binary.clone(),
                 dialect: AcpDialect::Cursor,
                 slash_command_cache: Arc::clone(&self.slash_command_cache),
+                remote: input.remote,
             },
             self.event_tx.clone(),
         )

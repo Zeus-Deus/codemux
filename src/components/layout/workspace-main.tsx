@@ -6,7 +6,14 @@ import {
   useLayoutEffect,
   useState,
 } from "react";
-import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import {
+  clampRightPanelWidth,
+  maxRightPanelWidth,
+  resolveRightPanelWidth,
+  RIGHT_PANEL_MIN_WIDTH,
+  RIGHT_PANEL_WIDTH_UI_KEY,
+} from "@/lib/right-panel-width";
+import { resizeKeyAction } from "@/lib/resize-keys";
 import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -56,8 +63,17 @@ const ProjectOnboarding = lazy(() =>
  * drag layer stops short of it (`RIGHT_PANEL_RESIZER_REACH`), so the seam
  * also resizes from the top 40px.
  */
-function RightPanelResizer() {
+function RightPanelResizer({
+  width,
+  rowWidth,
+}: {
+  /** The panel's rendered width. */
+  width: number;
+  /** The shared content row's measured width, 0 until measured. */
+  rowWidth: number;
+}) {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
+  const resetRightPanelWidth = useUIStore((s) => s.resetRightPanelWidth);
   const handleRef = useRef<HTMLDivElement>(null);
   const rafId = useRef(0);
 
@@ -110,7 +126,7 @@ function RightPanelResizer() {
         // Commit to React state + persist to SQLite (single re-render)
         if (lastWidth > 0) {
           setRightPanelWidth(lastWidth);
-          dbSetUiState("right_panel_width", String(lastWidth)).catch(console.error);
+          dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, String(lastWidth)).catch(console.error);
         }
       };
 
@@ -121,15 +137,46 @@ function RightPanelResizer() {
     [setRightPanelWidth],
   );
 
+  const commitWidth = (next: number) => {
+    const clamped = clampRightPanelWidth(next, rowWidth);
+    setRightPanelWidth(clamped);
+    dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, String(clamped)).catch(console.error);
+  };
+
+  // The panel sits right of the seam, so moving the seam left grows it.
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    const action = resizeKeyAction(e, "vertical");
+    if (!action) return;
+    e.preventDefault();
+    commitWidth(
+      action.kind === "min"
+        ? RIGHT_PANEL_MIN_WIDTH
+        : action.kind === "max"
+          ? maxRightPanelWidth(rowWidth)
+          : width - action.px,
+    );
+  };
+
   return (
     <div
       ref={handleRef}
       data-testid="right-panel-resizer"
-      className="group relative z-10 w-px shrink-0 bg-border"
+      className="group relative z-10 w-px shrink-0 bg-border outline-none"
       onPointerDown={startResize}
+      onKeyDown={handleKeyDown}
+      onDoubleClick={() => {
+        // Back to the window-relative default, as if never dragged. Clearing
+        // the saved width keeps a restart from bringing the old one back.
+        resetRightPanelWidth();
+        dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, "").catch(console.error);
+      }}
       role="separator"
+      tabIndex={0}
       aria-orientation="vertical"
       aria-label="Resize right panel"
+      aria-valuenow={Math.round(width)}
+      aria-valuemin={RIGHT_PANEL_MIN_WIDTH}
+      aria-valuemax={Math.round(maxRightPanelWidth(rowWidth))}
     >
       <div
         aria-hidden
@@ -138,7 +185,7 @@ function RightPanelResizer() {
       />
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-y-0 left-1/2 w-[3px] -translate-x-1/2 bg-transparent transition-colors duration-100 group-hover:bg-foreground/25 group-data-[dragging=true]:bg-foreground/40"
+        className="pointer-events-none absolute inset-y-0 left-1/2 w-[3px] -translate-x-1/2 bg-transparent transition-colors duration-100 group-hover:bg-foreground/25 group-focus-visible:bg-ring/60 group-data-[dragging=true]:bg-foreground/40"
       />
     </div>
   );
@@ -151,11 +198,18 @@ function RightPanelResizer() {
  * rather than assumed: the left sidebar is its own resizable region outside
  * this row, and reading `window.innerWidth` instead would let a wide
  * sidebar and a wide panel between them squeeze the content to nothing.
+ *
+ * A callback ref, not an effect on a ref object: `WorkspaceMain` returns
+ * early (onboarding, no workspace, a chat draft) before the row exists, and
+ * a mount-time effect never saw the row that rendered later — the width
+ * stayed 0 and the panel was never clamped to the window.
  */
-function useContentRowWidth(ref: React.RefObject<HTMLDivElement | null>): number {
+function useContentRowWidth(): [number, (el: HTMLDivElement | null) => void] {
   const [width, setWidth] = useState(0);
-  useEffect(() => {
-    const el = ref.current;
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: HTMLDivElement | null) => {
+    observerRef.current?.disconnect();
+    observerRef.current = null;
     if (!el || typeof ResizeObserver === "undefined") return;
     setWidth(el.getBoundingClientRect().width);
     const observer = new ResizeObserver((entries) => {
@@ -163,14 +217,13 @@ function useContentRowWidth(ref: React.RefObject<HTMLDivElement | null>): number
       if (typeof next === "number") setWidth(next);
     });
     observer.observe(el);
-    return () => observer.disconnect();
-  }, [ref]);
-  return width;
+    observerRef.current = observer;
+  }, []);
+  return [width, ref];
 }
 
 export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
-  const contentRowRef = useRef<HTMLDivElement>(null);
-  const contentRowWidth = useContentRowWidth(contentRowRef);
+  const [contentRowWidth, contentRowRef] = useContentRowWidth();
   const storedRightPanelWidth = useUIStore((s) => s.rightPanelWidth);
   const rightPanelMaximized = useUIStore((s) => s.rightPanelMaximized);
   // Publish the measurement, not a conclusion drawn from it: the title bar
@@ -182,7 +235,7 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
 
   // Load persisted right panel width from SQLite on mount
   useEffect(() => {
-    dbGetUiState("right_panel_width").then((val) => {
+    dbGetUiState(RIGHT_PANEL_WIDTH_UI_KEY).then((val) => {
       if (val) useUIStore.getState().setRightPanelWidth(Number(val));
     }).catch(() => {});
   }, []);
@@ -318,14 +371,11 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
   // zero-width workspace column with nothing beside it.
   const maximized = showRightPanel && (mobile || rightPanelMaximized);
   // The stored width is what the user asked for; this is what fits right
-  // now. Before the row has been measured (first paint, or a test with no
-  // ResizeObserver) fall back to the stored value — the observer corrects
-  // it on the very next frame, and clamping against a width of 0 would
-  // snap every panel to its minimum.
-  const effectiveRightPanelWidth =
-    contentRowWidth > 0
-      ? clampRightPanelWidth(storedRightPanelWidth, contentRowWidth)
-      : storedRightPanelWidth;
+  // now.
+  const effectiveRightPanelWidth = resolveRightPanelWidth(
+    storedRightPanelWidth,
+    contentRowWidth,
+  );
   const activeTab = activeWorkspace.tabs.find(
     (t) => t.tab_id === activeWorkspace.active_tab_id,
   );
@@ -401,7 +451,12 @@ export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
         <>
           {/* No handle while maximized — there is no second column left to
               drag the boundary against. */}
-          {!maximized && <RightPanelResizer />}
+          {!maximized && (
+            <RightPanelResizer
+              width={effectiveRightPanelWidth}
+              rowWidth={contentRowWidth}
+            />
+          )}
           <div
             data-testid="right-panel-column"
             className={cn(
