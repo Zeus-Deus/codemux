@@ -152,6 +152,9 @@ export const signupEmail = (email: string, password: string, name: string) =>
 export const forgotPassword = (email: string) =>
   invoke<void>("forgot_password", { email });
 
+export const resendVerificationEmail = (email: string) =>
+  invoke<void>("resend_verification_email", { email });
+
 export const checkAuth = () =>
   invoke<AuthUser | null>("check_auth");
 
