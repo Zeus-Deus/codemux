@@ -4903,7 +4903,13 @@ pub async fn agent_chat_set_model<R: Runtime>(
     model: Option<String>,
 ) -> Result<(), String> {
     let native_gate = native_thread_gate(&app, &thread_id.0);
-    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
+    // Custom ACP orders a model change against its own turns: sends stay
+    // admissible while the change awaits the agent's acknowledgement.
+    let _native_guard = if provider == ProviderKind::Acp {
+        None
+    } else {
+        Some(native_gate.dispatch.clone().lock_owned().await)
+    };
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
