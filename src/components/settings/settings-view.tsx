@@ -62,6 +62,7 @@ import {
   type AutoSettleDays,
 } from "@/stores/settings-store";
 import { ThemeSettings } from "./theme-settings";
+import { CustomAcpSettings } from "./custom-acp-settings";
 import { UtilityAgentSetting } from "./utility-agent-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { NON_INTERACTIVE_CLI_PROVIDERS } from "@/lib/agent-chat/capability-defaults";
@@ -1192,8 +1193,8 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         onProviderModelChange={(nextProvider, nextModel) => {
           setAiCommitMessageCli(nextProvider).catch(console.error);
           storeSet("ai_commit_message_cli", nextProvider);
-          setAiCommitMessageModel(nextModel).catch(console.error);
-          storeSet("ai_commit_message_model", nextModel);
+          setAiCommitMessageModel(nextModel ?? "").catch(console.error);
+          storeSet("ai_commit_message_model", nextModel ?? "");
         }}
         disabled={disabled}
       />
@@ -1959,8 +1960,8 @@ export function SettingsView() {
                     onProviderModelChange={(provider, model) => {
                       setAiResolverCli(provider).catch(console.error);
                       storeSet("ai_resolver_cli", provider);
-                      setAiResolverModel(model).catch(console.error);
-                      storeSet("ai_resolver_model", model);
+                      setAiResolverModel(model ?? "").catch(console.error);
+                      storeSet("ai_resolver_model", model ?? "");
                     }}
                   />
                 </SettingRow>
@@ -2019,6 +2020,8 @@ export function SettingsView() {
               <div className="pb-4">
                 <HermesSetting />
               </div>
+              <Separator />
+              <CustomAcpSettings />
               <Separator />
               <SettingRow
                 label="Auto-configure MCP for workspaces"

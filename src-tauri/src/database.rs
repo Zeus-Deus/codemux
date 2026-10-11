@@ -1,5 +1,6 @@
 pub mod async_questions;
 pub mod hermes;
+pub mod custom_acp;
 pub(crate) mod local_sessions;
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
@@ -357,6 +358,7 @@ fn database_path() -> Option<PathBuf> {
 fn create_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
+    custom_acp::migrate(conn).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_version (
