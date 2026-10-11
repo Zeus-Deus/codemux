@@ -25,6 +25,7 @@ import {
 } from "react";
 
 import { Button } from "@/components/ui/button";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import type {
   ChatViewItem,
   PermissionRequestItem,
@@ -46,7 +47,9 @@ import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
+import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
+import { AsyncQuestionRecord } from "./AsyncQuestionPanel";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
@@ -331,6 +334,16 @@ export const MessageList = memo(function MessageList({
   const modeRef = useRef<SendScrollMode>("following-end");
   const isAtEndRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const approvalPending = useMemo(
+    () =>
+      messages.some(
+        (m) =>
+          m.kind === "permission_request" &&
+          m.request_kind !== "user-input" &&
+          m.resolution.state === "pending",
+      ),
+    [messages],
+  );
   const pillTimerRef = useRef<number | null>(null);
   // Bumped whenever a pending "show the pill" decision is invalidated. The
   // timer callback compares against it instead of being cleared, so the
@@ -625,15 +638,30 @@ export const MessageList = memo(function MessageList({
         if (event.target !== viewport) return;
         cancelFollowForUserNavigation();
       };
+      // Keyboard scrolling is navigation too. Editable targets keep their
+      // keys: arrows inside an answer field move the caret, not the list.
+      // Space on a control (Copy, a fold, an approval) activates it rather
+      // than scrolling, so it must not retire follow any more than a click.
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (!SCROLL_KEYS.has(event.key)) return;
+        const target = event.target as HTMLElement | null;
+        if (target?.closest("input, textarea, select, [contenteditable='true']"))
+          return;
+        if (event.key === " " && target?.closest(SPACE_ACTIVATED_CONTROLS))
+          return;
+        cancelFollowForUserNavigation();
+      };
       viewport.addEventListener("wheel", onGesture, { passive: true });
       viewport.addEventListener("touchmove", onGesture, { passive: true });
       viewport.addEventListener("pointerdown", onPointerDown, {
         passive: true,
       });
+      viewport.addEventListener("keydown", onKeyDown);
       removeListeners = () => {
         viewport.removeEventListener("wheel", onGesture);
         viewport.removeEventListener("touchmove", onGesture);
         viewport.removeEventListener("pointerdown", onPointerDown);
+        viewport.removeEventListener("keydown", onKeyDown);
       };
     });
     return () => {
@@ -967,6 +995,21 @@ export const MessageList = memo(function MessageList({
     if (!ownsScroll()) return;
     scheduleAdvance();
   }, [anchoredEndSpace, ownsScroll, scheduleAdvance, slots, threadKey]);
+
+  // LegendList can also move the viewport with no data change of ours. A
+  // tail-first cold open backfills the older history while the list is still
+  // settling its initial scroll, and on a narrow viewport that settle can
+  // finish against the tail's old end — parking the reader hundreds of turns
+  // up. Follow intent still holds (no gesture has released it), so leaving
+  // the edge here is the list's doing: re-pin through the same advance.
+  useEffect(() => {
+    const state = listRef.current?.getState();
+    if (!state) return;
+    return state.listen("isNearEnd", (atEnd) => {
+      if (atEnd || !ownsScroll() || modeRef.current !== "following-end") return;
+      scheduleAdvance();
+    });
+  }, [ownsScroll, scheduleAdvance, threadKey]);
 
   /** The pill is the deliberate way back to the live edge, so it re-claims
    *  follow rather than cancelling it. Animated for the same reason the send
@@ -1384,9 +1427,16 @@ export const MessageList = memo(function MessageList({
           style={{
             bottom: "calc(1rem + var(--composer-overlay-height, 0px))",
           }}
-          className="absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className={cn(
+            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg hover:bg-card hover:text-foreground",
+            approvalPending
+              ? "border-status-working/50 text-foreground"
+              : "border-border text-muted-foreground",
+          )}
         >
-          Jump to latest
+          {/* Approvals render at the live edge, so off the edge means the
+              waiting card is below the viewport. */}
+          {approvalPending ? "Approval needed" : "Jump to latest"}
           <ArrowDown className="size-3.5" aria-hidden />
         </Button>
       )}
@@ -1400,6 +1450,21 @@ export const MessageList = memo(function MessageList({
  *  who scrolls up gets the affordance without noticing the wait. Hiding is
  *  always immediate — an unwanted pill is worse than a late one. */
 const JUMP_PILL_SHOW_DELAY_MS = 150;
+
+/** Keys a browser scrolls a focused scroller with. */
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
+
+/** Focused controls that consume Space as activation instead of scrolling. */
+const SPACE_ACTIVATED_CONTROLS =
+  "button, summary, [role='button'], [role='checkbox'], [role='switch'], [role='tab'], [role='menuitem'], [role='option'], [role='radio']";
 
 /** Frames the anchor positioner will wait for the list ref to exist before
  *  giving up. A frame budget, not a fixed timeout: it cannot assume layout
@@ -1793,25 +1858,7 @@ function renderAssistantBody(
 ) {
   switch (item.kind) {
     case "async_question":
-      return (
-        <div className="space-y-1 py-1 text-body">
-          {item.question.text && (
-            <p className="text-muted-foreground">{item.question.text}</p>
-          )}
-          {item.question.questions
-            .filter((question) => !item.question.text.includes(question.title))
-            .map((question, index) => (
-              <p key={index}>{question.title}</p>
-            ))}
-          <p className="text-label text-muted-foreground">
-            {item.resolution.status === "answered"
-              ? "Answered"
-              : item.resolution.status === "dismissed"
-                ? "Dismissed"
-                : "Answer above the composer · work can continue"}
-          </p>
-        </div>
-      );
+      return <AsyncQuestionRecord item={item} />;
     case "assistant_message":
       return (
         <AssistantMessage
@@ -1827,6 +1874,8 @@ function renderAssistantBody(
     case "tool_call":
       return isTaskSummaryTool(item) ? (
         <TaskSummaryCard item={item} workspaceId={handlers.workspaceId} />
+      ) : isInlineHtmlRender(item) ? (
+        <HtmlRenderFrame item={item} />
       ) : (
         <ToolCallCard
           item={item}

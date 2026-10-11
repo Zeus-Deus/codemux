@@ -118,7 +118,6 @@ export function ModelPicker({
           disabled={disabled}
           className={cn(
             FOOTER_TRIGGER,
-            "gap-1.5",
             iconOnly ? FOOTER_TRIGGER_ICON_ONLY : "min-w-[60px] shrink",
           )}
           aria-label={
@@ -126,7 +125,7 @@ export function ModelPicker({
           }
           title={modelLabel(provider, current)}
         >
-          <ProviderLogo provider={provider} className="size-4 shrink-0" />
+          <ProviderLogo provider={provider} className="size-3.5 shrink-0" />
           {!iconOnly && (
             <>
               <span className="max-w-[140px] truncate">
@@ -134,7 +133,7 @@ export function ModelPicker({
                   ? leafModelName(modelLabel(provider, current))
                   : modelLabel(provider, current)}
               </span>
-              <ChevronDown className="-mx-0.5 size-3.5 shrink-0 opacity-70" />
+              <ChevronDown className="size-3 shrink-0 opacity-50" />
             </>
           )}
         </button>

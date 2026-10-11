@@ -1,3 +1,4 @@
+import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useEffect, useRef } from "react";
 
 import {
@@ -51,6 +52,10 @@ export function useAgentChatEvents(
       // detach landing on the backend.
       if (cancelled) return;
       if (payload.thread_id !== threadId) return;
+      if (payload.event.type === "session_state_changed" && payload.event.thread_id === threadId && useCustomAcp.getState().bindings[threadId]) {
+        const live = payload.event.status.status !== "closed" && payload.event.status.status !== "error";
+        useCustomAcp.getState().markLive(threadId, live);
+      }
       handlerRef.current(payload);
     });
     const attached = attachAgentChatOutput(threadId, channel);

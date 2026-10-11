@@ -12,6 +12,7 @@ import {
   Columns2,
   FolderOpen,
   Globe,
+  Import,
   GitPullRequest,
   MonitorSmartphone,
   Keyboard,
@@ -75,6 +76,7 @@ import {
   type AgentChatSearchResult,
 } from "@/tauri/commands";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useCanImportLocalSessions } from "@/components/chat/LocalSessionImportEntry";
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
@@ -146,6 +148,8 @@ interface PaletteCommand {
   run?: (ctx: CommandContext) => void;
   /** Hidden when there is no active workspace to act on. */
   requiresWorkspace?: boolean;
+  /** Hidden where recent chats can't be imported (see `useCanImportLocalSessions`). */
+  requiresChatImport?: boolean;
   addon?: boolean;
 }
 
@@ -246,6 +250,14 @@ const COMMANDS: PaletteCommand[] = [
     run: () => useUIStore.getState().setShowDevices(true),
   },
   { id: "settings", label: "Settings", icon: Settings, actionId: "openSettings", keywords: "preferences config" },
+  {
+    id: "import-recent-chats",
+    label: "Import recent chats…",
+    icon: Import,
+    keywords: "claude code codex sessions history conversations copy",
+    requiresChatImport: true,
+    run: () => useUIStore.getState().setShowLocalSessionImport(true),
+  },
   {
     id: "reload-interface",
     label: "Reload interface",
@@ -469,6 +481,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
 
   // ── Command rows ───────────────────────────────────────────────────────
+  const canImportChats = useCanImportLocalSessions();
   const addonInstalled = useAddonsStore(s => s.installed);
   const addonsPaused = useAddonsStore(s => s.paused);
   // Add-on commands are attributed ("title · add-on") and never get a
@@ -504,13 +517,16 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
   const commandRows = useMemo<CommandRow[]>(
     () =>
-      [...COMMANDS, ...addonCommands].filter((c) => !c.requiresWorkspace || activeWorkspace !== null).map((command) => ({
+      [...COMMANDS, ...addonCommands]
+        .filter((c) => !c.requiresWorkspace || activeWorkspace !== null)
+        .filter((c) => !c.requiresChatImport || canImportChats)
+        .map((command) => ({
         kind: "command" as const,
         key: `cmd:${command.id}`,
         command,
         keys: command.actionId ? getKeysForAction(command.actionId) : "",
       })),
-    [activeWorkspace, getKeysForAction, addonCommands],
+    [activeWorkspace, getKeysForAction, addonCommands, canImportChats],
   );
 
   // ── Theme rows ─────────────────────────────────────────────────────────

@@ -39,8 +39,8 @@ export function MessageDeliveryPicker({
           aria-label={`Message delivery: ${selected.label}`}
           title={selected.description}
           className={cn(
-            "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-full px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40",
-            iconOnly && "w-[34px] justify-center px-0",
+            "inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40",
+            iconOnly && "w-[30px] justify-center px-0",
           )}
         >
           <Icon className="size-3.5" aria-hidden />
