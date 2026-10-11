@@ -27,6 +27,9 @@ interface Props {
   pendingNotes: number;
   /** Force the body open (the re-anchor flow scrolls here). */
   forceOpen?: boolean;
+  /** The header's chevron folded the file; lets the owner stop forcing
+   *  it open. */
+  onCollapse?: () => void;
 }
 
 /**
@@ -45,6 +48,7 @@ export function ReviewCodeFile({
   selection,
   pendingNotes,
   forceOpen = false,
+  onCollapse,
 }: Props) {
   // Settings → Git → Diffs decides whether files start open; the header
   // toggle still flips each one.
@@ -91,9 +95,21 @@ export function ReviewCodeFile({
           type="button"
           aria-label={collapsed ? `Expand ${file.path}` : `Collapse ${file.path}`}
           aria-expanded={!collapsed}
-          onClick={() =>
-            viewed ? setOpenWhileViewed((o) => !o) : setManuallyCollapsed((c) => !c)
-          }
+          // Set from what is shown, not toggled: a file held open by
+          // `forceOpen` can already be marked collapsed underneath, and a
+          // toggle would then unfold it while the label says Collapse. A
+          // viewed file folds through its own open state, so it keeps its
+          // Viewed mark.
+          onClick={() => {
+            if (collapsed) {
+              if (viewed) setOpenWhileViewed(true);
+              else setManuallyCollapsed(false);
+              return;
+            }
+            if (viewed) setOpenWhileViewed(false);
+            else setManuallyCollapsed(true);
+            onCollapse?.();
+          }}
           className="shrink-0 text-muted-foreground hover:text-foreground"
         >
           {collapsed ? (

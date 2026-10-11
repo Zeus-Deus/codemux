@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  aiTextCliSelection,
   resolveAutoUtilitySelection,
   utilityEffortFor,
   utilitySelectionFromStores,
@@ -184,5 +185,30 @@ describe("Utility agent selection", () => {
     });
     expect(utilityEffortFor("codex", lunaNoLow.id, lunaNoLow)).toBe("medium");
     expect(utilityEffortFor("claude", "claude-haiku-4-5", null)).toBeNull();
+  });
+});
+
+describe("aiTextCliSelection", () => {
+  const utility = { provider: "codex" as const, model: "gpt-mini", effort: null };
+  const noOverride = { ai_commit_message_cli: null, ai_commit_message_model: null };
+
+  it("follows the Utility agent when nothing is overridden", () => {
+    expect(aiTextCliSelection(noOverride, utility)).toEqual({ cli: "codex", model: "gpt-mini" });
+  });
+
+  it("lets the commit-message CLI win, without another provider's model", () => {
+    expect(
+      aiTextCliSelection({ ...noOverride, ai_commit_message_cli: "opencode" }, utility),
+    ).toEqual({ cli: "opencode", model: null });
+    expect(
+      aiTextCliSelection(
+        { ai_commit_message_cli: "opencode", ai_commit_message_model: "big-pickle" },
+        utility,
+      ),
+    ).toEqual({ cli: "opencode", model: "big-pickle" });
+  });
+
+  it("falls back to claude with no Utility agent and no override", () => {
+    expect(aiTextCliSelection(null, null)).toEqual({ cli: "claude", model: null });
   });
 });
