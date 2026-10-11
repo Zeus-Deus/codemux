@@ -48,11 +48,11 @@ export function NewChatModelSetting() {
 
   const write = (
     provider: string,
-    nextModel: string,
+    nextModel: string | null,
     effort: string | null,
   ) => {
     setSetting(NEW_CHAT_SETTING_KEYS.provider, provider);
-    setSetting(NEW_CHAT_SETTING_KEYS.model, nextModel);
+    setSetting(NEW_CHAT_SETTING_KEYS.model, nextModel ?? "");
     setSetting(NEW_CHAT_SETTING_KEYS.effort, effort ?? "");
     useChatDraftStore.getState().applyNewChatDefaults();
   };

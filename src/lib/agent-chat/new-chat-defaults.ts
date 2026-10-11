@@ -31,7 +31,7 @@ export const NEW_CHAT_SETTING_KEYS = {
 
 export interface NewChatModelDefaults {
   provider: AgentChatProviderKind;
-  model: string;
+  model: string | null;
   /** null leaves the model's own default effort in place. */
   effort: string | null;
 }
