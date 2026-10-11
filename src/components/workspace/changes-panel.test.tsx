@@ -192,6 +192,7 @@ describe("section actions", () => {
 
 function renderButton(over: Partial<ComponentProps<typeof SmartCommitButton>> = {}) {
   const props: ComponentProps<typeof SmartCommitButton> = {
+    loading: false,
     hasChanges: false,
     staged: 0,
     isGenerating: false,
