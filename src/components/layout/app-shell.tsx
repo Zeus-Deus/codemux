@@ -24,6 +24,8 @@ import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
+import { BootSplash } from "./boot-splash";
+import { cn } from "@/lib/utils";
 import { NeedsYouAnnouncer } from "./needs-you-announcer";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
@@ -106,6 +108,11 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
   const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
   const hasActiveDraft = activeDraftId !== null;
+  const agentChatEnabled = useFeatureFlags((s) => s.enableAgentChat);
+  const flagsLoaded = useFeatureFlags((s) => s.loaded);
+  // The shell fades in over the boot splash once, on the overlay tier; later
+  // remounts (closing Settings and the like) appear without it.
+  const [bootFadeDone, setBootFadeDone] = useState(false);
   const showSettings = useUIStore((s) => s.showSettings);
   const utilityPage = useUIStore(selectUtilityPage);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
@@ -278,13 +285,7 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
     return () => useUIStore.getState().setSidebarToggleFn(null);
   }, []);
 
-  if (isLoading || !settingsLoaded || syncedLoading) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background text-muted-foreground">
-        Loading…
-      </div>
-    );
-  }
+  if (isLoading || !settingsLoaded || syncedLoading) return <BootSplash />;
 
   // Full-screen settings — replaces entire app including sidebar
   if (showSettings) {
@@ -329,11 +330,23 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // a lazy-creation draft is active, so the draft surface can render
   // inside the normal app shell (sidebar, title bar, WorkspaceMain).
   if (!hasWorkspaces && !(lazyEnabled && hasActiveDraft)) {
+    // Under lazy creation the Home draft appears one effect after the first
+    // snapshot (see useEnsureDraftWhenEmpty). Keep the splash up until then
+    // rather than flashing the full-screen Open Project page for a frame.
+    if (!flagsLoaded || (lazyEnabled && agentChatEnabled)) return <BootSplash />;
     return <EmptyState />;
   }
 
   return (
-    <div className="relative flex h-screen max-h-screen flex-col overflow-hidden">
+    <div
+      className={cn(
+        "relative flex h-screen max-h-screen flex-col overflow-hidden",
+        !bootFadeDone && "motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-250",
+      )}
+      onAnimationEnd={(e) => {
+        if (e.target === e.currentTarget) setBootFadeDone(true);
+      }}
+    >
       <TitleBar
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
