@@ -7,6 +7,7 @@ import type {
   UserMessageItem,
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
@@ -22,13 +23,31 @@ export interface TurnFoldBody {
   turnId: string;
   label: string;
   expanded: boolean;
+  /** The work-entry ids holding this fold open: the user opened those work
+   *  logs while the turn ran (see `buildTranscriptSlots`). Collapsing the
+   *  fold has to release every one of them. */
+  pinnedBy: readonly string[];
   hiddenCount: number;
   failedCount: number;
 }
 
 export type SlotBody =
-  | { kind: "item"; item: ChatViewItem }
-  | { kind: "activity"; items: WorkEntry[]; working: boolean }
+  | {
+      kind: "item";
+      item: ChatViewItem;
+      /** Belongs to the turn still running, so a `running` call on it really
+       *  is executing. Absent for a settled turn. */
+      turnLive?: boolean;
+    }
+  | {
+      kind: "activity";
+      items: WorkEntry[];
+      /** Holds the active turn's newest work entry: the live row. */
+      working: boolean;
+      /** Belongs to the turn still running, so the user opening it should
+       *  pin the fold that will settle over it. */
+      turnLive: boolean;
+    }
   | TurnFoldBody;
 
 export interface TranscriptSlot {
@@ -49,7 +68,7 @@ type PresentationEntry =
   /** `revealed` marks an item the user pulled back out of an expanded turn
    *  fold — it was explicitly asked for, so the quiet-observation filter
    *  below leaves it alone. */
-  | { kind: "item"; item: ChatViewItem; revealed?: boolean }
+  | { kind: "item"; item: ChatViewItem; revealed?: boolean; turnLive?: boolean }
   | { kind: "turn_fold"; body: TurnFoldBody };
 
 interface TurnSegment {
@@ -78,6 +97,7 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *    approval footer must render on a standalone `ToolCallCard`.
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
+ *  - `html_render` pages — the page is part of the reply, not process.
  * (`subagent_run` items are not tool calls; the slot builder joins them into
  * the same work-log line separately.)
  */
@@ -85,7 +105,8 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
     item.kind === "tool_call" &&
     item.approval_request_id == null &&
-    !isTaskSummaryTool(item)
+    !isTaskSummaryTool(item) &&
+    !isInlineHtmlRender(item)
   );
 }
 
@@ -165,8 +186,10 @@ function isFoldableSettledItem(
     case "reasoning":
       return true;
     case "tool_call":
+      // An `html_render` page stays beside the answer it belongs to.
       return !(
-        item.approval_request_id && pendingRequestIds.has(item.approval_request_id)
+        (item.approval_request_id && pendingRequestIds.has(item.approval_request_id)) ||
+        isInlineHtmlRender(item)
       );
     case "subagent_run":
       return subagentRunSettled(item);
@@ -246,6 +269,11 @@ function activeTurnIndex(segments: TurnSegment[], streaming: boolean): number {
  * Turn-level presentation derivation. Settled turns retain their terminal
  * assistant answer and replace all routine process output with one quiet fold.
  * Expanding that fold restores the original chronological items.
+ *
+ * `expandedTurnIds` holds turn ids the user expanded, plus the ids of work
+ * entries whose log the user opened mid-run. A fold that settles over such
+ * an entry starts expanded, so the log being read does not vanish when the
+ * turn ends.
  */
 function buildPresentationEntries(
   messages: ChatViewItem[],
@@ -272,9 +300,10 @@ function buildPresentationEntries(
     }
 
     if (!ended || !segment.user) {
+      const turnLive = segmentIndex === activeIndex;
       for (const item of segment.items) {
         if (item.kind === "turn_ended" && silentTurnEnd(item)) continue;
-        entries.push({ kind: "item", item });
+        entries.push({ kind: "item", item, turnLive });
       }
       continue;
     }
@@ -285,12 +314,19 @@ function buildPresentationEntries(
     );
     const hiddenIds = new Set(hidden.map((item) => item.id));
     const turnId = turnIdFor(segment, ended);
-    const expanded = expandedTurnIds.has(turnId);
+    // Read pins off every entry, not just the foldable ones: a log whose
+    // first entry is still running (a background subagent) stays out of
+    // `hidden`, yet the rest of that log would fold away under the reader.
+    const pinnedBy = segment.items
+      .filter((item) => isWorkEntry(item) && expandedTurnIds.has(item.id))
+      .map((item) => item.id);
+    const expanded = expandedTurnIds.has(turnId) || pinnedBy.length > 0;
     const body: TurnFoldBody = {
       kind: "turn_fold",
       turnId,
       label: foldLabel(segment.user, ended),
       expanded,
+      pinnedBy,
       hiddenCount: hidden.length,
       failedCount: hidden.filter(itemFailed).length,
     };
@@ -337,6 +373,7 @@ export function buildTranscriptSlots(
   // any other visible row end it.
   let run: WorkEntry[] = [];
   let runRevealed = false;
+  let runTurnLive = false;
   const flush = () => {
     if (run.length === 0) return;
     const working =
@@ -354,18 +391,25 @@ export function buildTranscriptSlots(
     ) {
       run = [];
       runRevealed = false;
+      runTurnLive = false;
       return;
     }
     const hasWork = run.some(
       (entry) => entry.kind === "tool_call" || entry.kind === "subagent_run",
     );
     if (hasWork) {
-      bodies.push({ kind: "activity", items: run, working });
+      bodies.push({
+        kind: "activity",
+        items: run,
+        working,
+        turnLive: runTurnLive,
+      });
     } else {
       for (const entry of run) bodies.push({ kind: "item", item: entry });
     }
     run = [];
     runRevealed = false;
+    runTurnLive = false;
   };
 
   for (const entry of entries) {
@@ -386,10 +430,15 @@ export function buildTranscriptSlots(
     if (isWorkEntry(item)) {
       run.push(item);
       if (entry.revealed) runRevealed = true;
+      if (entry.turnLive) runTurnLive = true;
       continue;
     }
     flush();
-    bodies.push({ kind: "item", item });
+    bodies.push(
+      entry.turnLive
+        ? { kind: "item", item, turnLive: true }
+        : { kind: "item", item },
+    );
   }
   flush();
 
@@ -445,12 +494,16 @@ function slotsEquivalent(a: TranscriptSlot, b: TranscriptSlot): boolean {
 }
 
 function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
-  if (a.kind === "item" && b.kind === "item") return a.item === b.item;
+  if (a.kind === "item" && b.kind === "item") {
+    return a.item === b.item && a.turnLive === b.turnLive;
+  }
   if (a.kind === "turn_fold" && b.kind === "turn_fold") {
     return (
       a.turnId === b.turnId &&
       a.label === b.label &&
       a.expanded === b.expanded &&
+      a.pinnedBy.length === b.pinnedBy.length &&
+      a.pinnedBy.every((id, index) => id === b.pinnedBy[index]) &&
       a.hiddenCount === b.hiddenCount &&
       a.failedCount === b.failedCount
     );
@@ -458,6 +511,7 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
   if (a.kind === "activity" && b.kind === "activity") {
     return (
       a.working === b.working &&
+      a.turnLive === b.turnLive &&
       a.items.length === b.items.length &&
       a.items.every((item, index) => item === b.items[index])
     );

@@ -12,7 +12,9 @@ import {
 
 import type {
   ChatViewItem,
+  PermissionRequestItem,
   SubagentRunItem,
+  WorkflowRunItem,
   SubagentView,
   UsageLimitState,
 } from "@/lib/agent-chat/types";
@@ -24,6 +26,7 @@ import {
   type StripGoal,
 } from "./ComposerStrip";
 import {
+  approvalOccupant,
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
@@ -138,7 +141,7 @@ describe("ComposerStrip — shell", () => {
     expect(shell.className).toContain("bg-muted/20");
     expect(shell.className).not.toContain("rounded-t-[19px]");
     const row = rows()[0];
-    expect(row.className).toContain(STRIP_ROW_HEIGHT);
+    expect(row.firstElementChild?.className).toContain(STRIP_ROW_HEIGHT);
   });
 
   it("colours only the mark: an amber, still monitoring dot", () => {
@@ -734,6 +737,106 @@ describe("ComposerStrip — usage limit", () => {
     expect(screen.queryByTestId("composer-strip")).toBeNull();
   });
 
+  it("explains a manual-only wait below the countdown without hiding its action", () => {
+    render(<UsageHarness usageLimit={limit({
+      resetsAtMs: Date.now() + 30 * MIN,
+      autoResumeBlockedReason: "attempts_exhausted",
+    })} />);
+    expect(screen.getByTestId("composer-strip-usage-explanation")).toHaveTextContent(
+      "Two automatic resumes were already used. The agent won’t continue on its own.",
+    );
+    expect(screen.getByTestId("composer-strip-usage-countdown")).toHaveTextContent("resets in");
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toBeEnabled();
+  });
+
+  it("explains unknown resets and still offers Resume", () => {
+    render(<UsageHarness usageLimit={limit({ window: null })} />);
+    expect(screen.getByTestId("composer-strip-usage-explanation")).toHaveTextContent(
+      "No reset time was reported. The agent won’t continue on its own.",
+    );
+    expect(screen.getByTestId("composer-strip-usage-resume")).toBeEnabled();
+  });
+
+  it("a manual resume stays Resuming… through the disarm that precedes its dispatch", async () => {
+    const settle: Array<() => void> = [];
+    const onResume = vi.fn(
+      () => new Promise<void>((resolve) => settle.push(resolve)),
+    );
+    const armed = limit({
+      resetsAtMs: Date.now() + 20 * MIN,
+      autoResumeAtMs: Date.now() + 21 * MIN,
+    });
+    const { rerender } = render(<UsageHarness usageLimit={armed} onResume={onResume} />);
+    fireEvent.click(screen.getByTestId("composer-strip-usage-try-now"));
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+
+    // The backend clears the schedule before dispatching: same limit, disarmed.
+    rerender(
+      <UsageHarness
+        usageLimit={{ ...armed, autoResumeAtMs: null, autoResumeBlockedReason: "cancelled" }}
+        onResume={onResume}
+      />,
+    );
+    const tryNow = screen.getByTestId("composer-strip-usage-try-now");
+    expect(tryNow).toHaveTextContent("Resuming…");
+    expect(tryNow).toBeDisabled();
+    expect(screen.queryByTestId("composer-strip-usage-explanation")).toBeNull();
+    expect(usageRow()).not.toHaveTextContent(/cancelled/i);
+    fireEvent.click(tryNow);
+    expect(onResume).toHaveBeenCalledTimes(1);
+
+    // A newer limit supersedes the click…
+    const newer = limit({ at: armed.at + 1 });
+    rerender(<UsageHarness usageLimit={newer} onResume={onResume} />);
+    const resume = screen.getByTestId("composer-strip-usage-resume");
+    expect(resume).toHaveTextContent(/^Resume$/);
+    expect(resume).toBeEnabled();
+    fireEvent.click(resume);
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(2));
+
+    // …and the older click settling does not release the newer one.
+    await act(async () => settle[0]!());
+    expect(screen.getByTestId("composer-strip-usage-resume")).toHaveTextContent("Resuming…");
+    expect(screen.getByTestId("composer-strip-usage-resume")).toBeDisabled();
+    await act(async () => settle[1]!());
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-strip-usage-resume")).toBeEnabled(),
+    );
+  });
+
+  it("a manual dispatch failure after the disarm says why nothing will happen", async () => {
+    let fail: (error: Error) => void = () => {};
+    const onResume = vi.fn(
+      () => new Promise<void>((_, reject) => (fail = reject)),
+    );
+    const armed = limit({
+      resetsAtMs: Date.now() + 20 * MIN,
+      autoResumeAtMs: Date.now() + 21 * MIN,
+    });
+    vi.mocked(toast.error).mockClear();
+    const { rerender } = render(<UsageHarness usageLimit={armed} onResume={onResume} />);
+    fireEvent.click(screen.getByTestId("composer-strip-usage-try-now"));
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+    expect(toast.error).not.toHaveBeenCalled();
+    for (const reason of ["cancelled", "dispatch_failed"] as const) {
+      rerender(
+        <UsageHarness
+          usageLimit={{ ...armed, autoResumeAtMs: null, autoResumeBlockedReason: reason }}
+          onResume={onResume}
+        />,
+      );
+    }
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toHaveTextContent("Resuming…");
+    await act(async () => fail(new Error("provider unavailable")));
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    const tryNow = screen.getByTestId("composer-strip-usage-try-now");
+    expect(tryNow).toHaveTextContent("Try now");
+    expect(tryNow).toBeEnabled();
+    expect(screen.getByTestId("composer-strip-usage-explanation")).toHaveTextContent(
+      "The resume couldn’t start. The agent won’t continue on its own.",
+    );
+  });
+
   it("buttons call their command and disable while it is in flight", async () => {
     let finish: () => void = () => {};
     const onCancel = vi.fn(
@@ -794,5 +897,141 @@ describe("ComposerStrip — usage limit", () => {
     );
     expect(screen.queryByTestId("composer-strip-goal-more")).toBeNull();
     expect(screen.queryByTestId("composer-strip-goal-resume")).toBeNull();
+  });
+});
+
+describe("ComposerStrip — pending approval", () => {
+  function bashCall(requestId: string | null, command = "npm test"): ChatViewItem {
+    return {
+      kind: "tool_call",
+      id: `tool-${requestId}`,
+      seq: 1,
+      tool_use_id: `tu-${requestId}`,
+      tool_name: "Bash",
+      input: { command },
+      status: "running",
+      result_content: null,
+      approval_request_id: requestId,
+    };
+  }
+  function request(
+    requestId: string,
+    overrides: Partial<PermissionRequestItem> = {},
+  ): PermissionRequestItem {
+    return {
+      kind: "permission_request",
+      id: `req-item-${requestId}`,
+      seq: 2,
+      request_id: requestId,
+      turn_id: "t1",
+      request_kind: "command",
+      payload: {},
+      tool_use_id: `tu-${requestId}`,
+      resolution: { state: "pending" },
+      ...overrides,
+    };
+  }
+  const handlers = () => ({ onRespond: vi.fn(), onJump: vi.fn() });
+
+  it("leads the strip ahead of everything else and answers from the row", () => {
+    const h = handlers();
+    const messages = [bashCall("r1"), request("r1"), errorNotice("Session error: x")];
+    render(
+      <ComposerStrip
+        occupants={[
+          sessionErrorOccupant(messages, false),
+          approvalOccupant(messages, h),
+        ]}
+      />,
+    );
+    const lead = rows()[0];
+    expect(lead).toHaveAttribute("data-kind", "approval");
+    expect(within(lead).getByText("Needs approval")).toBeInTheDocument();
+    expect(within(lead).getByText("Bash · npm test")).toBeInTheDocument();
+    expect(orbStates()).toEqual(["listening"]);
+
+    fireEvent.click(screen.getByTestId("composer-strip-approval-allow"));
+    expect(h.onRespond).toHaveBeenCalledWith("r1", { decision: "allow" });
+    fireEvent.click(screen.getByTestId("composer-strip-approval-deny"));
+    expect(h.onRespond).toHaveBeenLastCalledWith("r1", {
+      decision: "deny",
+      message: "User denied",
+    });
+  });
+
+  it("sends a plan or a workflow to its card instead of answering blind", () => {
+    const h = handlers();
+    const occupant = approvalOccupant([request("p1", { request_kind: "plan" })], h);
+    render(<ComposerStrip occupants={[occupant]} />);
+    expect(screen.queryByTestId("composer-strip-approval-allow")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(h.onJump).toHaveBeenCalledWith("req-item-p1");
+  });
+
+  it("sends a workflow gate to its card", () => {
+    const h = handlers();
+    const workflow: WorkflowRunItem = {
+      kind: "workflow_run",
+      id: "wf-item-1",
+      seq: 3,
+      workflowId: "wf-1",
+      status: "running",
+      name: "deploy",
+      description: null,
+      script: null,
+      plannedPhases: [],
+      phases: [],
+      resultText: null,
+      totalTokens: null,
+      agentCount: null,
+      startedAt: 0,
+      durationMs: null,
+      approvalRequestId: "w1",
+    };
+    const occupant = approvalOccupant([request("w1"), workflow], h);
+    render(<ComposerStrip occupants={[occupant]} />);
+    expect(screen.getByText("Workflow · deploy")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-strip-approval-allow")).toBeNull();
+    expect(screen.queryByTestId("composer-strip-approval-deny")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(h.onJump).toHaveBeenCalledWith("wf-item-1");
+  });
+
+  it("ignores AskUserQuestion prompts and settled requests", () => {
+    expect(
+      approvalOccupant(
+        [
+          request("q1", { request_kind: "user-input" }),
+          request("r2", {
+            resolution: { state: "responding", decision: { decision: "allow" } },
+          }),
+        ],
+        handlers(),
+      ),
+    ).toBeNull();
+  });
+
+  it("takes its own row above a goal", () => {
+    const messages = [bashCall("r1"), request("r1")];
+    const goal: StripGoal = {
+      goal: {
+        text: "Port the importer",
+        setAt: Date.now(),
+        sourceMessageId: "user-1",
+        status: "standing",
+      },
+      resumePhrase: "/goal resume",
+      onResume: vi.fn(),
+      onEditResume: vi.fn(),
+      onClear: vi.fn(),
+      onCopy: vi.fn(),
+      onJump: null,
+      stopped: null,
+    };
+    render(
+      <ComposerStrip goal={goal} occupants={[approvalOccupant(messages, handlers())]} />,
+    );
+    expect(rows()[0]).toHaveAttribute("data-kind", "approval");
+    expect(screen.queryByTestId("composer-strip-goal-more")).toBeNull();
   });
 });

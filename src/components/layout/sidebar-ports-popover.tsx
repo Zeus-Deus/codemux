@@ -1,5 +1,5 @@
 import type { LucideIcon } from "lucide-react";
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useRef } from "react";
 import {
   Popover,
   PopoverContent,
@@ -48,6 +48,39 @@ const GROUP_RANK: Record<PortGroupKind, number> = {
 
 const DOCKER_KEY = "__docker__";
 const OTHER_KEY = "__other__";
+
+/**
+ * The port's process or container name. Its full text shows in a tooltip
+ * only when the row actually truncates it. A native `title` is avoided on
+ * purpose: WebKitGTK draws it as a detached GTK tooltip that can land away
+ * from the row and outlive the popover.
+ */
+function PortName({ name }: { name: string }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLSpanElement>(null);
+  return (
+    <Tooltip
+      open={open}
+      onOpenChange={(next) => {
+        const el = ref.current;
+        setOpen(next && el !== null && el.scrollWidth > el.clientWidth);
+      }}
+    >
+      <TooltipTrigger asChild>
+        <span
+          ref={ref}
+          data-testid="port-name"
+          className="truncate text-label text-muted-foreground flex-1 min-w-0"
+        >
+          {name}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-xs break-all text-label">
+        {name}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 export function groupPorts(
   ports: PortInfoSnapshot[],
@@ -171,9 +204,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
           </PopoverTrigger>
         </TooltipTrigger>
         <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
-          {portCount > 0
-            ? `${portCount} active port${portCount === 1 ? "" : "s"}`
-            : "No active ports"}
+          {portCount > 0 ? `Ports · ${portCount} active` : "Ports · none active"}
         </TooltipContent>
       </Tooltip>
       <PopoverContent
@@ -212,12 +243,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                       <span className="font-mono text-label font-semibold text-foreground tabular-nums shrink-0">
                         {port.port}
                       </span>
-                      <span
-                        className="truncate text-label text-muted-foreground flex-1 min-w-0"
-                        title={port.label ?? port.process_name}
-                      >
-                        {port.label ?? port.process_name}
-                      </span>
+                      <PortName name={port.label ?? port.process_name} />
                       <span className="text-caption text-muted-foreground/50 tabular-nums shrink-0 transition-opacity duration-150 group-hover/port:opacity-0">
                         {port.source === "docker"
                           ? port.process_name

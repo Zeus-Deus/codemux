@@ -9,6 +9,7 @@
 //! <state_dir>/codemux.db      # SQLite workspace registry
 //! <state_dir>/workspaces/     # worktree storage
 //! <state_dir>/serve.log       # daemonized-mode log
+//! <state_dir>/logs/           # detached worktree-setup logs
 //! ```
 
 use std::path::PathBuf;
@@ -51,4 +52,10 @@ pub fn workspaces_root(state_dir: &std::path::Path) -> PathBuf {
 /// Serve mode log file (only used when daemonized).
 pub fn serve_log_path(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("serve.log")
+}
+
+/// Logs of worktree setup commands that `worktree create` ran detached
+/// because no daemon was up to own them.
+pub fn logs_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("logs")
 }

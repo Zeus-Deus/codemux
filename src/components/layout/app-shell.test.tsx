@@ -145,6 +145,8 @@ vi.mock("@/stores/ui-store", () => ({
         showCommandPalette: commandPaletteOpenFlag,
         setShowCommandPalette: vi.fn(),
         setSidebarToggleFn: vi.fn(),
+        sidebarOpen: true,
+        setSidebarOpen: vi.fn(),
       }),
     ),
     {

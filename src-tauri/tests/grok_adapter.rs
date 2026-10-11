@@ -45,6 +45,7 @@ fn fresh_start_input(thread_id: &str) -> StartSessionInput {
         additional_directories: vec![],
         env: None,
         workspace_id: None,
+        remote: None,
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     }

@@ -261,6 +261,7 @@ pub struct PtyHydrationWorkspace {
     pub project_uid: Option<String>,
     pub host_id: Option<i64>,
     pub remote_cwd: Option<String>,
+    pub remote_root: Option<String>,
     pub attach_only: bool,
 }
 
@@ -633,6 +634,14 @@ pub struct WorkspaceSnapshot {
     /// snapshots deserialize as `None`.
     #[serde(default)]
     pub remote_cwd: Option<String>,
+    /// The project's checkout **on its host** for an attach-in-place
+    /// workspace. Terminal and agent env name it as the project root there
+    /// (falling back to `remote_cwd`) instead of `project_root`, which for
+    /// a thread started on a device stays this computer's path so the
+    /// sidebar groups it with the local project. `None` elsewhere.
+    /// Additive; old snapshots deserialize as `None`.
+    #[serde(default)]
+    pub remote_root: Option<String>,
     /// True when this workspace is operated **in place on its host with no
     /// local copy of the files**. Created by `workspace_open_on_host`. The
     /// `cwd`/`worktree_path` are host paths that do not exist on this
@@ -780,6 +789,8 @@ pub struct CodemuxConfigSnapshot {
     pub default_shell: Option<String>,
     pub theme_source: String,
     pub linux_first: bool,
+    /// Unused. The synced `notifications.sound_enabled` setting decides;
+    /// kept because older peers still require it in synced snapshots.
     pub notification_sound_enabled: bool,
     #[serde(default = "default_true")]
     pub ai_commit_message_enabled: bool,
@@ -979,8 +990,87 @@ pub struct InitialChatPane {
     pub thread_id: String,
 }
 
+/// Where an attach-in-place workspace lives and how it is labelled. See
+/// [`AppStateStore::create_remote_attach_workspace`].
+#[derive(Debug, Clone)]
+pub struct RemoteAttachWorkspace {
+    pub title: String,
+    pub host_id: i64,
+    /// The workspace's directory on the host.
+    pub remote_cwd: String,
+    /// False for a host's home directory, which is not a checkout.
+    pub is_git: bool,
+    pub git_branch: Option<String>,
+    pub project_root: Option<String>,
+    /// The project's checkout on the host, which env names as the root
+    /// there. A device thread's `project_root` is this computer's path, so
+    /// this is what keeps env on the device. `None` means `remote_cwd`.
+    pub remote_root: Option<String>,
+    pub project_uid: Option<String>,
+    pub workspace_kind: Option<String>,
+}
+
 pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
+    // Runtime-only lookup authority, bounded by live workspace ids. Always
+    // acquire `inner` first; validation and PR publication share that lock.
+    pr_lookup_authorities: Mutex<HashMap<String, Arc<()>>>,
+}
+
+/// Authority captured before a workspace PR lookup starts. Arc identity is a
+/// generation without counter wraparound or any serialized snapshot fields.
+#[derive(Clone)]
+pub(crate) struct WorkspacePrLookup {
+    pub(crate) workspace_id: String,
+    pub(crate) cwd: String,
+    authority: Arc<()>,
+    explicit: bool,
+}
+
+/// Operation-local stored path identities, retained across mutation I/O even
+/// if the initiating workspace closes. Never serialized or globally registered.
+pub(crate) struct WorkspacePrMutationScope {
+    paths: Vec<String>,
+}
+
+impl WorkspacePrMutationScope {
+    fn matches(&self, workspace: &WorkspaceSnapshot) -> bool {
+        !workspace.attach_only
+            && self.paths.iter().any(|path| {
+                let path = Path::new(path);
+                Path::new(&workspace.cwd) == path
+                    || workspace
+                        .worktree_path
+                        .as_deref()
+                        .is_some_and(|p| Path::new(p) == path)
+                    || workspace
+                        .project_root
+                        .as_deref()
+                        .is_some_and(|p| Path::new(p) == path)
+            })
+    }
+}
+
+fn write_workspace_prs(workspace: &mut WorkspaceSnapshot, prs: Vec<WorkspacePr>) -> bool {
+    let primary = prs.first();
+    let pr_number = primary.map(|pr| pr.number);
+    let pr_state = primary.map(|pr| pr.state.clone());
+    let pr_url = primary.map(|pr| pr.url.clone());
+    let pr_head_branch = primary.and_then(|pr| pr.head_branch.clone());
+    if workspace.prs == prs
+        && workspace.pr_number == pr_number
+        && workspace.pr_state == pr_state
+        && workspace.pr_url == pr_url
+        && workspace.pr_head_branch == pr_head_branch
+    {
+        return false;
+    }
+    workspace.prs = prs;
+    workspace.pr_number = pr_number;
+    workspace.pr_state = pr_state;
+    workspace.pr_url = pr_url;
+    workspace.pr_head_branch = pr_head_branch;
+    true
 }
 
 /// Outcome of [`AppStateStore::adopt_or_create_worktree_workspace`]:
@@ -1055,6 +1145,23 @@ fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
     collect_terminal_sessions(&workspace.surfaces).len()
 }
 
+/// Title for a new terminal tab: the lowest "Terminal N" no tab in the
+/// workspace already uses. Counting terminal-kind tabs instead misnumbers,
+/// because Agent Chat tabs share `TabKind::Terminal` and closing a middle tab
+/// would hand out a number that is still taken. A workspace's default tab is
+/// a bare "Terminal", which reads as number 1.
+fn next_terminal_tab_title(tabs: &[TabSnapshot]) -> String {
+    let used: std::collections::HashSet<usize> = tabs
+        .iter()
+        .filter_map(|tab| match tab.title.as_str() {
+            "Terminal" => Some(1),
+            title => title.strip_prefix("Terminal ")?.parse().ok(),
+        })
+        .collect();
+    let n = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+    format!("Terminal {n}")
+}
+
 /// Drop every manual-monitor flag whose pane no longer exists.
 ///
 /// A flag is a claim by a live process about a specific pane, so the pane
@@ -1084,6 +1191,7 @@ impl Default for AppStateStore {
     fn default() -> Self {
         Self {
             inner: Mutex::new(default_app_state()),
+            pr_lookup_authorities: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1146,6 +1254,7 @@ fn build_pty_hydration_plan(
         project_uid: workspace.project_uid.clone(),
         host_id: workspace.host_id,
         remote_cwd: workspace.remote_cwd.clone(),
+        remote_root: workspace.remote_root.clone(),
         attach_only: workspace.attach_only,
     };
     let sessions = collect_terminal_sessions(&workspace.surfaces)
@@ -1238,7 +1347,9 @@ impl AppStateStore {
                 workspace.imported_snapshot_only = Some(workspace.is_local_import_snapshot_only());
             }
         }
-        *self.inner.lock().unwrap() = snapshot;
+        let mut current = self.inner.lock().unwrap();
+        self.pr_lookup_authorities.lock().unwrap().clear();
+        *current = snapshot;
     }
 
     /// Remove all workspaces and sessions, keeping config intact.
@@ -1247,12 +1358,9 @@ impl AppStateStore {
     pub fn clear_workspaces(&self) {
         let mut snapshot = self.inner.lock().unwrap();
         snapshot.workspaces.clear();
+        self.pr_lookup_authorities.lock().unwrap().clear();
         snapshot.terminal_sessions.clear();
         snapshot.active_workspace_id = WorkspaceId(String::new());
-    }
-
-    pub fn set_notification_sound_enabled(&self, enabled: bool) {
-        self.inner.lock().unwrap().config.notification_sound_enabled = enabled;
     }
 
     pub fn set_ai_commit_message_enabled(&self, enabled: bool) {
@@ -1879,6 +1987,7 @@ impl AppStateStore {
             surfaces: vec![],
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -1969,6 +2078,7 @@ impl AppStateStore {
             // cleared to None on successful pull.
             host_id: Some(host_id),
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             // Adoption is not activity. This workspace has a history — it
@@ -2044,6 +2154,7 @@ impl AppStateStore {
             surfaces: vec![],
             host_id: Some(host_id),
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             // Same as [`create_synced_workspace_shell`]: an adopted root
@@ -2083,40 +2194,123 @@ impl AppStateStore {
         workspace_kind: Option<String>,
     ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
+        Self::create_remote_attach_workspace_locked(
+            &mut snapshot,
+            RemoteAttachWorkspace {
+                title,
+                host_id,
+                remote_cwd,
+                is_git: true,
+                git_branch,
+                // A host workspace's project root, as the host reported it,
+                // so it is also the root on the host.
+                remote_root: project_root.clone(),
+                project_root,
+                project_uid,
+                workspace_kind,
+            },
+            None,
+        )
+    }
+
+    /// Create the attach-in-place workspace a thread started on a device
+    /// runs in. With `initial_chat` its first pane is that thread's agent
+    /// chat, published atomically like [`Self::materialize_chat_workspace`];
+    /// without one it gets the single terminal of
+    /// [`Self::create_remote_attach_workspace`]. `select = false` keeps the
+    /// current selection.
+    pub fn create_remote_workspace_with_selection(
+        &self,
+        spec: RemoteAttachWorkspace,
+        initial_chat: Option<InitialChatPane>,
+        select: bool,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            Self::create_remote_attach_workspace_locked(snapshot, spec, initial_chat)
+        })
+    }
+
+    fn create_remote_attach_workspace_locked(
+        snapshot: &mut AppStateSnapshot,
+        spec: RemoteAttachWorkspace,
+        initial_chat: Option<InitialChatPane>,
+    ) -> WorkspaceId {
+        let RemoteAttachWorkspace {
+            title,
+            host_id,
+            remote_cwd,
+            is_git,
+            git_branch,
+            project_root,
+            remote_root,
+            project_uid,
+            workspace_kind,
+        } = spec;
         let workspace_id = WorkspaceId(next_id("workspace"));
-        let surface_id = SurfaceId(next_id("surface"));
-        let session_id = SessionId(next_id("session"));
-        let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
-        // A single shell session whose cwd is the host directory. The
-        // daemon-backed spawn path re-derives the effective cwd from
-        // `remote_cwd`, so this value is informational, but we keep it
-        // consistent so the UI shows the right path.
-        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
-            session_id: session_id.clone(),
-            title: format!("Terminal {base_terminal_index}"),
-            shell: None,
-            cwd: remote_cwd.clone(),
-            cols: 80,
-            rows: 24,
-            state: TerminalSessionState::Starting,
-            last_message: Some("Preparing shell session".into()),
-            exit_code: None,
-            original_command: None,
-            adapter_captures: Default::default(),
-        });
+        // A chat workspace starts empty; the chat pane below becomes its
+        // first tab.
+        let (tabs, active_tab_id, active_surface_id, surfaces) = if initial_chat.is_some() {
+            (
+                Vec::new(),
+                String::new(),
+                SurfaceId(String::new()),
+                Vec::new(),
+            )
+        } else {
+            let surface_id = SurfaceId(next_id("surface"));
+            let session_id = SessionId(next_id("session"));
+            let base_terminal_index = snapshot.terminal_sessions.len() + 1;
 
-        let pane_id = PaneId(next_id("pane"));
-        let root = PaneNodeSnapshot::Terminal {
-            pane_id: pane_id.clone(),
-            session_id: session_id.clone(),
-            title: "Terminal".into(),
+            // A single shell session whose cwd is the host directory. The
+            // daemon-backed spawn path re-derives the effective cwd from
+            // `remote_cwd`, so this value is informational, but we keep it
+            // consistent so the UI shows the right path.
+            snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+                session_id: session_id.clone(),
+                title: format!("Terminal {base_terminal_index}"),
+                shell: None,
+                cwd: remote_cwd.clone(),
+                cols: 80,
+                rows: 24,
+                state: TerminalSessionState::Starting,
+                last_message: Some("Preparing shell session".into()),
+                exit_code: None,
+                original_command: None,
+                adapter_captures: Default::default(),
+            });
+
+            let pane_id = PaneId(next_id("pane"));
+            let root = PaneNodeSnapshot::Terminal {
+                pane_id: pane_id.clone(),
+                session_id,
+                title: "Terminal".into(),
+            };
+            let default_tab_id = next_id("tab");
+            (
+                vec![TabSnapshot {
+                    tab_id: default_tab_id.clone(),
+                    kind: TabKind::Terminal,
+                    title: "Terminal".into(),
+                    surface_id: Some(surface_id.clone()),
+                    browser_id: None,
+                    icon: None,
+                }],
+                default_tab_id,
+                surface_id.clone(),
+                vec![SurfaceSnapshot {
+                    surface_id,
+                    title: "Main Surface".into(),
+                    active_pane_id: pane_id,
+                    root,
+                }],
+            )
         };
-        let default_tab_id = next_id("tab");
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
-            is_git: true,
+            is_git,
             title,
             workspace_type: WorkspaceType::Standard,
             // `cwd` is a host path that does not exist on this device. It
@@ -2147,24 +2341,13 @@ impl AppStateStore {
             pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
-            tabs: vec![TabSnapshot {
-                tab_id: default_tab_id.clone(),
-                kind: TabKind::Terminal,
-                title: "Terminal".into(),
-                surface_id: Some(surface_id.clone()),
-                browser_id: None,
-                icon: None,
-            }],
-            active_tab_id: default_tab_id,
-            active_surface_id: surface_id.clone(),
-            surfaces: vec![SurfaceSnapshot {
-                surface_id,
-                title: "Main Surface".into(),
-                active_pane_id: pane_id,
-                root,
-            }],
+            tabs,
+            active_tab_id,
+            active_surface_id,
+            surfaces,
             host_id: Some(host_id),
-            remote_cwd: Some(remote_cwd),
+            remote_cwd: Some(remote_cwd.clone()),
+            remote_root,
             attach_only: true,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -2175,6 +2358,20 @@ impl AppStateStore {
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != workspace_id);
+
+        if let Some(chat) = initial_chat {
+            // The pane's cwd is the host path too: the provider is spawned
+            // there over SSH.
+            Self::create_chat_pane_locked(
+                snapshot,
+                &workspace_id.0,
+                Some(chat.provider),
+                Some(remote_cwd),
+                None,
+                Some(chat.thread_id),
+            )
+            .expect("new workspace accepts its initial chat pane");
+        }
         workspace_id
     }
 
@@ -2327,6 +2524,7 @@ impl AppStateStore {
             }],
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -3014,19 +3212,6 @@ impl AppStateStore {
         Ok(true)
     }
 
-    /// Whether the workspace containing `session_id` has notifications muted.
-    /// Used by the hook handler to suppress the completion popup.
-    pub fn is_session_workspace_muted(&self, session_id: &str) -> bool {
-        let snapshot = self.inner.lock().unwrap();
-        snapshot.workspaces.iter().any(|ws| {
-            ws.notifications_muted
-                && ws
-                    .surfaces
-                    .iter()
-                    .any(|s| find_terminal_pane_id(&s.root, session_id).is_some())
-        })
-    }
-
     /// Returns true when at least one field actually moved. The periodic
     /// sweeps use that to emit a snapshot only when a workspace's git
     /// metadata changed — re-running the same 5 s refresh over an idle
@@ -3079,6 +3264,136 @@ impl AppStateStore {
         })
     }
 
+    /// Capture all background lookup authorities before any detection/auth or
+    /// batch I/O. Capturing later (after A returns while B is pending) would
+    /// accidentally authorize an old answer with a newer refresh generation.
+    pub(crate) fn workspace_pr_poll_lookups(&self) -> Vec<WorkspacePrLookup> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        authorities.retain(|id, _| snapshot.workspaces.iter().any(|w| w.workspace_id.0 == *id));
+        snapshot
+            .workspaces
+            .iter()
+            .filter(|w| !w.attach_only)
+            .map(|w| {
+                let authority = authorities
+                    .entry(w.workspace_id.0.clone())
+                    .or_insert_with(|| Arc::new(()))
+                    .clone();
+                WorkspacePrLookup {
+                    workspace_id: w.workspace_id.0.clone(),
+                    cwd: w.worktree_path.clone().unwrap_or_else(|| w.cwd.clone()),
+                    authority,
+                    explicit: false,
+                }
+            })
+            .collect()
+    }
+
+    /// Capture the command path and matched stored project roots while revoking
+    /// pre-mutation reads under the same state lock. Retain this scope across
+    /// I/O; completion must not depend on the initiating workspace staying live.
+    pub(crate) fn invalidate_workspace_pr_lookups_for_path(
+        &self,
+        path: &str,
+    ) -> WorkspacePrMutationScope {
+        let snapshot = self.inner.lock().unwrap();
+        let mut scope = WorkspacePrMutationScope {
+            paths: vec![path.to_owned()],
+        };
+        let roots: Vec<String> = snapshot
+            .workspaces
+            .iter()
+            .filter(|w| scope.matches(w))
+            .filter_map(|w| w.project_root.clone())
+            .collect();
+        scope.paths.extend(roots);
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        for workspace in snapshot.workspaces.iter().filter(|w| scope.matches(w)) {
+            authorities.remove(&workspace.workspace_id.0);
+        }
+        scope
+    }
+
+    /// Revoke during-mutation reads for matching CURRENT workspaces, including
+    /// siblings created after the initial revocation, using only retained paths.
+    pub(crate) fn invalidate_workspace_pr_lookups_for_scope(
+        &self,
+        scope: &WorkspacePrMutationScope,
+    ) {
+        let snapshot = self.inner.lock().unwrap();
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        for workspace in snapshot.workspaces.iter().filter(|w| scope.matches(w)) {
+            authorities.remove(&workspace.workspace_id.0);
+        }
+    }
+
+    /// An explicit refresh supersedes older reads immediately, even if its
+    /// lookup later preserves the pill or writes identical data.
+    pub(crate) fn begin_workspace_pr_refresh(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkspacePrLookup, String> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id && !w.attach_only)
+            .ok_or_else(|| format!("No local workspace found: {workspace_id}"))?;
+        let authority = Arc::new(());
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .insert(workspace_id.to_owned(), authority.clone());
+        Ok(WorkspacePrLookup {
+            workspace_id: workspace_id.to_owned(),
+            cwd: workspace
+                .worktree_path
+                .clone()
+                .unwrap_or_else(|| workspace.cwd.clone()),
+            authority,
+            explicit: true,
+        })
+    }
+
+    /// Validate id, current local checkout and generation, then publish both
+    /// the PR list and its scalars under the same state lock. Rejected and
+    /// unchanged publications keep the poller's emit gate closed.
+    pub(crate) fn publish_workspace_pr_lookup(
+        &self,
+        lookup: &WorkspacePrLookup,
+        outcome: crate::github::WorkspacePrsOutcome,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace) = snapshot.workspaces.iter_mut().find(|w| {
+            w.workspace_id.0 == lookup.workspace_id
+                && !w.attach_only
+                && w.worktree_path.as_deref().unwrap_or(&w.cwd) == lookup.cwd
+        }) else {
+            return false;
+        };
+        let mut authorities = self.pr_lookup_authorities.lock().unwrap();
+        if !authorities
+            .get(&lookup.workspace_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &lookup.authority))
+        {
+            return false;
+        }
+        // Fence background reads captured DURING an explicit refresh as well.
+        // Only its still-current completion may advance authority; a stale
+        // no-op/Preserve completion must never reauthorize an older batch.
+        if lookup.explicit {
+            authorities.insert(lookup.workspace_id.clone(), Arc::new(()));
+        }
+        match outcome {
+            crate::github::WorkspacePrsOutcome::Write(prs) => {
+                write_workspace_prs(workspace, crate::workspace_pr_rows(prs))
+            }
+            crate::github::WorkspacePrsOutcome::Clear => write_workspace_prs(workspace, Vec::new()),
+            crate::github::WorkspacePrsOutcome::Preserve => false,
+        }
+    }
+
     /// Returns true when the stored PR pill actually changed (same
     /// emit-gating contract as `update_workspace_git_info`).
     pub fn update_workspace_pr_info(
@@ -3097,6 +3412,11 @@ impl AppStateStore {
         else {
             return false;
         };
+        // Immediate writes revoke older lookups even when the value is equal.
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .remove(workspace_id);
         // The head branch joins the equality gate rather than riding along
         // silently: a badge that stays numerically identical while moving
         // from the current branch to a side branch (or back) changes whether
@@ -3119,7 +3439,8 @@ impl AppStateStore {
     /// Replace the whole set of PRs a workspace owns, deriving the flat
     /// `pr_*` scalars from its head.
     ///
-    /// This is the writer the pollers use. It exists alongside
+    /// Immediate writes revoke pending lookups, including no-op writes. The
+    /// async pollers use `publish_workspace_pr_lookup` instead. This exists alongside
     /// `update_workspace_pr_info` rather than replacing it because the
     /// worktree-creation seed knows a PR *number* and nothing else, which is
     /// not enough to build a `WorkspacePr`; that path stays scalar-only and is
@@ -3137,25 +3458,11 @@ impl AppStateStore {
         else {
             return false;
         };
-        let primary = prs.first();
-        let pr_number = primary.map(|pr| pr.number);
-        let pr_state = primary.map(|pr| pr.state.clone());
-        let pr_url = primary.map(|pr| pr.url.clone());
-        let pr_head_branch = primary.and_then(|pr| pr.head_branch.clone());
-        if workspace.prs == prs
-            && workspace.pr_number == pr_number
-            && workspace.pr_state == pr_state
-            && workspace.pr_url == pr_url
-            && workspace.pr_head_branch == pr_head_branch
-        {
-            return false;
-        }
-        workspace.prs = prs;
-        workspace.pr_number = pr_number;
-        workspace.pr_state = pr_state;
-        workspace.pr_url = pr_url;
-        workspace.pr_head_branch = pr_head_branch;
-        true
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .remove(workspace_id);
+        write_workspace_prs(workspace, prs)
     }
 
     /// Record the branch a worktree workspace was created from. Set once at
@@ -3210,6 +3517,12 @@ impl AppStateStore {
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
         {
+            if workspace.worktree_path.as_ref() != Some(&worktree_path) {
+                self.pr_lookup_authorities
+                    .lock()
+                    .unwrap()
+                    .remove(workspace_id);
+            }
             workspace.worktree_path = Some(worktree_path);
             workspace.title = title;
         }
@@ -3653,6 +3966,12 @@ impl AppStateStore {
             .iter_mut()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
+            if workspace.cwd != cwd {
+                self.pr_lookup_authorities
+                    .lock()
+                    .unwrap()
+                    .remove(workspace_id);
+            }
             workspace.cwd = cwd;
             return true;
         }
@@ -3670,6 +3989,10 @@ impl AppStateStore {
                 .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
             let removed = snapshot.workspaces.remove(workspace_index);
+            self.pr_lookup_authorities
+                .lock()
+                .unwrap()
+                .remove(workspace_id);
             let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
             let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
             snapshot
@@ -3711,6 +4034,10 @@ impl AppStateStore {
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
         let removed = snapshot.workspaces.remove(workspace_index);
+        self.pr_lookup_authorities
+            .lock()
+            .unwrap()
+            .remove(workspace_id);
         let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
         let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
         snapshot
@@ -4998,6 +5325,33 @@ impl AppStateStore {
         })
     }
 
+    /// Where an agent notification for a terminal session should lead.
+    pub fn notification_target_for_session(&self, session_id: &str) -> Option<NotificationTarget> {
+        self.notification_target(|root| find_terminal_pane_id(root, session_id))
+    }
+
+    /// Where an agent notification for a chat thread should lead.
+    pub fn notification_target_for_thread(&self, thread_id: &str) -> Option<NotificationTarget> {
+        self.notification_target(|root| find_agent_chat_pane_id(root, thread_id))
+    }
+
+    fn notification_target(
+        &self,
+        find_pane: impl Fn(&PaneNodeSnapshot) -> Option<PaneId>,
+    ) -> Option<NotificationTarget> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().find_map(|ws| {
+            let pane_id = ws.surfaces.iter().find_map(|s| find_pane(&s.root))?;
+            Some(NotificationTarget {
+                workspace_id: ws.workspace_id.0.clone(),
+                workspace_title: ws.title.clone(),
+                pane_id: pane_id.0,
+                muted: ws.notifications_muted,
+                in_active_workspace: ws.workspace_id == snapshot.active_workspace_id,
+            })
+        })
+    }
+
     /// Clear working/permission status for a session (on terminal exit).
     pub fn clear_transient_pane_status_by_session(&self, session_id: &str) {
         let mut snapshot = self.inner.lock().unwrap();
@@ -5191,11 +5545,7 @@ impl AppStateStore {
 
         match kind {
             TabKind::Terminal => {
-                let count = workspace
-                    .tabs
-                    .iter()
-                    .filter(|t| t.kind == TabKind::Terminal)
-                    .count();
+                let title = next_terminal_tab_title(&workspace.tabs);
                 let surface_id = SurfaceId(next_id("surface"));
                 let pane_id = PaneId(next_id("pane"));
                 let session_id = SessionId(next_id("session"));
@@ -5239,7 +5589,7 @@ impl AppStateStore {
                 workspace.tabs.push(TabSnapshot {
                     tab_id: tab_id.clone(),
                     kind: TabKind::Terminal,
-                    title: format!("Terminal {}", count + 1),
+                    title,
                     surface_id: Some(surface_id.clone()),
                     browser_id: None,
                     icon: None,
@@ -6244,6 +6594,7 @@ fn default_app_state() -> AppStateSnapshot {
             }],
             host_id: None,
             remote_cwd: None,
+            remote_root: None,
             attach_only: false,
             imported_snapshot_only: Some(false),
             last_active_at: Some(current_time_ms_signed()),
@@ -6388,6 +6739,17 @@ fn collect_pane_ids_from_node(node: &PaneNodeSnapshot) -> Vec<String> {
             children.iter().flat_map(collect_pane_ids_from_node).collect()
         }
     }
+}
+
+/// The pane an agent notification is about, plus the workspace facts that
+/// decide whether to raise it and where clicking it should go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationTarget {
+    pub workspace_id: String,
+    pub workspace_title: String,
+    pub pane_id: String,
+    pub muted: bool,
+    pub in_active_workspace: bool,
 }
 
 pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -> Option<PaneId> {
@@ -7767,6 +8129,8 @@ mod tests {
         assert_eq!(w.git_branch.as_deref(), Some("feature/y"));
         assert_eq!(w.project_uid.as_deref(), Some("uid-svc"));
         assert_eq!(w.workspace_kind.as_deref(), Some("worktree"));
+        // The host's project root is the root env names on the host.
+        assert_eq!(w.remote_root.as_deref(), Some("/home/agent/svc"));
         // It opens ready-to-use: one terminal surface, and it's active.
         assert_eq!(w.surfaces.len(), 1, "a single terminal pane to attach");
         assert!(matches!(
@@ -7785,6 +8149,96 @@ mod tests {
         );
     }
 
+    fn device_thread_spec() -> RemoteAttachWorkspace {
+        RemoteAttachWorkspace {
+            title: "feat-x".into(),
+            host_id: 4,
+            remote_cwd: "/home/deus/.codemux/worktrees/app/feat-x".into(),
+            is_git: true,
+            git_branch: Some("feat-x".into()),
+            project_root: Some("/home/zeus/projects/app".into()),
+            remote_root: Some("/home/deus/.codemux/projects/app-1a2b3c4d".into()),
+            project_uid: Some("uid-app".into()),
+            workspace_kind: Some("worktree".into()),
+        }
+    }
+
+    #[test]
+    fn device_thread_workspace_opens_on_its_chat_pane() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let sessions_before = store.snapshot().terminal_sessions.len();
+        let wid = store.create_remote_workspace_with_selection(
+            device_thread_spec(),
+            Some(InitialChatPane {
+                provider: ProviderKind::Codex,
+                thread_id: "thread-1".into(),
+            }),
+            true,
+        );
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        assert!(w.attach_only);
+        assert_eq!(w.host_id, Some(4));
+        assert_eq!(w.remote_cwd.as_deref(), Some(w.cwd.as_str()));
+        // Groups under the local project in the sidebar.
+        assert_eq!(w.project_root.as_deref(), Some("/home/zeus/projects/app"));
+        // The device checkout is kept for env on the device, and reaches
+        // the terminal hydration plan.
+        assert_eq!(
+            w.remote_root.as_deref(),
+            Some("/home/deus/.codemux/projects/app-1a2b3c4d")
+        );
+        assert_eq!(
+            build_pty_hydration_plan(&snap, w).workspace.remote_root,
+            w.remote_root
+        );
+        assert_eq!(
+            snap.terminal_sessions.len(),
+            sessions_before,
+            "a chat thread starts without a terminal"
+        );
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.surfaces.len(), 1);
+        match &w.surfaces[0].root {
+            PaneNodeSnapshot::AgentChat {
+                thread_id,
+                provider,
+                cwd,
+                ..
+            } => {
+                assert_eq!(thread_id.as_deref(), Some("thread-1"));
+                assert_eq!(*provider, Some(ProviderKind::Codex));
+                assert_eq!(
+                    cwd.as_deref(),
+                    Some("/home/deus/.codemux/worktrees/app/feat-x")
+                );
+            }
+            other => panic!("expected the agent chat pane, got {other:?}"),
+        }
+        assert_eq!(snap.active_workspace_id, wid);
+    }
+
+    #[test]
+    fn device_thread_workspace_can_skip_selection_and_fall_back_to_a_terminal() {
+        let store = AppStateStore::default();
+        let current = store.snapshot().active_workspace_id;
+        let mut spec = device_thread_spec();
+        spec.is_git = false;
+        let wid = store.create_remote_workspace_with_selection(spec, None, false);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.active_workspace_id, current, "selection is kept");
+        let w = workspace_by_id(&snap, &wid);
+        assert!(!w.is_git);
+        assert!(matches!(
+            w.surfaces[0].root,
+            PaneNodeSnapshot::Terminal { .. }
+        ));
+    }
+
     #[test]
     fn workspace_mute_toggles_and_scopes_to_the_owning_session() {
         let store = AppStateStore::default();
@@ -7801,23 +8255,29 @@ mod tests {
             other => panic!("Single layout should have a terminal root, got {other:?}"),
         };
 
+        let muted = |session_id: &str| {
+            store
+                .notification_target_for_session(session_id)
+                .map(|target| target.muted)
+        };
+
         // Default: not muted — the hook handler would NOT suppress.
         assert!(!workspace.notifications_muted);
-        assert!(!store.is_session_workspace_muted(&session_id));
+        assert_eq!(muted(&session_id), Some(false));
 
         // Mute: both the snapshot flag and the session lookup flip.
         assert!(store.set_workspace_muted(&workspace_id.0, true));
-        assert!(store.is_session_workspace_muted(&session_id));
+        assert_eq!(muted(&session_id), Some(true));
         assert!(
             workspace_by_id(&store.snapshot(), &workspace_id).notifications_muted
         );
 
-        // Muting is scoped: an unknown session is never reported muted.
-        assert!(!store.is_session_workspace_muted("session-does-not-exist"));
+        // Muting is scoped: an unknown session has no target at all.
+        assert_eq!(muted("session-does-not-exist"), None);
 
         // Unmute: back to the un-suppressed state.
         assert!(store.set_workspace_muted(&workspace_id.0, false));
-        assert!(!store.is_session_workspace_muted(&session_id));
+        assert_eq!(muted(&session_id), Some(false));
 
         // Unknown workspace id: the mutator reports "not found".
         assert!(!store.set_workspace_muted("workspace-does-not-exist", true));
@@ -8436,6 +8896,65 @@ mod tests {
             NotificationLevel::from_str_or_attention("bogus"),
             NotificationLevel::Attention
         ));
+    }
+
+    fn tab_titled(title: &str) -> TabSnapshot {
+        TabSnapshot {
+            tab_id: next_id("tab"),
+            kind: TabKind::Terminal,
+            title: title.into(),
+            surface_id: None,
+            browser_id: None,
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn next_terminal_tab_title_ignores_agent_chat_tabs() {
+        assert_eq!(next_terminal_tab_title(&[]), "Terminal 1");
+        assert_eq!(
+            next_terminal_tab_title(&[tab_titled("Agent Chat")]),
+            "Terminal 1"
+        );
+        assert_eq!(
+            next_terminal_tab_title(&[tab_titled("Terminal")]),
+            "Terminal 2"
+        );
+    }
+
+    #[test]
+    fn next_terminal_tab_title_fills_the_lowest_gap() {
+        let tabs = [
+            tab_titled("Terminal"),
+            tab_titled("Terminal 3"),
+            tab_titled("Agent Chat"),
+        ];
+        assert_eq!(next_terminal_tab_title(&tabs), "Terminal 2");
+        let tabs = [tab_titled("Terminal 1"), tab_titled("Terminal 2")];
+        assert_eq!(next_terminal_tab_title(&tabs), "Terminal 3");
+    }
+
+    #[test]
+    fn create_tab_reuses_the_number_of_a_closed_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-tab-numbering"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+        let (t2, _) = store.create_tab(&ws_id.0, TabKind::Terminal).expect("t2");
+        let (_t3, _) = store.create_tab(&ws_id.0, TabKind::Terminal).expect("t3");
+        store.close_tab(&ws_id.0, &t2).expect("close t2");
+        let (t4, _) = store.create_tab(&ws_id.0, TabKind::Terminal).expect("t4");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        let titles: Vec<&str> = ws.tabs.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Terminal", "Terminal 3", "Terminal 2"]);
+        assert_eq!(
+            ws.tabs.iter().find(|t| t.tab_id == t4).map(|t| t.title.as_str()),
+            Some("Terminal 2")
+        );
     }
 
     #[test]
@@ -10541,6 +11060,32 @@ mod tests {
     }
 
     #[test]
+    fn notification_target_for_thread_names_its_workspace_and_pane() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane.0, Some("thread-a".into()));
+        let title = workspace_by_id(&store.snapshot(), &ws_id).title.clone();
+
+        assert_eq!(
+            store.notification_target_for_thread("thread-a"),
+            Some(NotificationTarget {
+                workspace_id: ws_id.0.clone(),
+                workspace_title: title,
+                pane_id: pane.0.clone(),
+                muted: false,
+                in_active_workspace: true,
+            })
+        );
+        assert_eq!(store.notification_target_for_thread("thread-b"), None);
+
+        store.set_workspace_muted(&ws_id.0, true);
+        assert!(store.notification_target_for_thread("thread-a").unwrap().muted);
+    }
+
+    #[test]
     fn find_agent_chat_pane_id_walks_splits_and_skips_unbound() {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
@@ -12017,6 +12562,323 @@ mod workspace_activity_tests {
 #[cfg(test)]
 mod metadata_change_tests {
     use super::*;
+
+    fn pr_lookup_result(number: u32) -> crate::github::WorkspacePrsOutcome {
+        crate::github::WorkspacePrsOutcome::Write(vec![crate::github::SourcedPr {
+            pr: serde_json::from_value(serde_json::json!({
+                "number": number, "state": "OPEN", "title": "Synthetic PR",
+                "url": format!("https://example.test/pr/{number}"),
+                "head_branch": format!("feature-{number}"), "base_branch": "main",
+            }))
+            .unwrap(),
+            source: crate::github::PrSource::Branch,
+            checkout_branch: Some(format!("feature-{number}")),
+        }])
+    }
+
+    fn assert_pr(store: &AppStateStore, id: &str, number: Option<u32>) {
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id.0 == id)
+            .unwrap();
+        assert_eq!(ws.pr_number, number, "scalar publication");
+        assert_eq!(
+            ws.prs.first().map(|pr| pr.number),
+            number,
+            "list publication"
+        );
+        assert_eq!(ws.pr_state, number.map(|_| "OPEN".into()));
+        assert_eq!(
+            ws.pr_url,
+            number.map(|n| format!("https://example.test/pr/{n}"))
+        );
+        assert_eq!(ws.pr_head_branch, number.map(|n| format!("feature-{n}")));
+    }
+
+    fn delayed_batch_cannot_overwrite_refresh(clear: bool) {
+        let store = Arc::new(AppStateStore::default());
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        store.update_workspace_cwd(&a, "/synthetic/repo-a".into());
+        store.update_workspace_cwd(&b, "/synthetic/repo-b".into());
+        let captured = store.workspace_pr_poll_lookups();
+        let (a_done_tx, a_done_rx) = std::sync::mpsc::channel();
+        let (b_release_tx, b_release_rx) = std::sync::mpsc::channel();
+        let worker_store = store.clone();
+        let worker_a = a.clone();
+        let worker_b = b.clone();
+        let batch = std::thread::spawn(move || {
+            // Repo A has its answer, but the actual batch cannot publish it
+            // until the later repo B lookup returns. No sleeps or real I/O.
+            let answer_a = pr_lookup_result(10);
+            a_done_tx.send(()).unwrap();
+            b_release_rx.recv().unwrap();
+            let a_changed = worker_store.publish_workspace_pr_lookup(
+                captured
+                    .iter()
+                    .find(|t| t.workspace_id == worker_a)
+                    .unwrap(),
+                answer_a,
+            );
+            let b_changed = worker_store.publish_workspace_pr_lookup(
+                captured
+                    .iter()
+                    .find(|t| t.workspace_id == worker_b)
+                    .unwrap(),
+                pr_lookup_result(20),
+            );
+            (a_changed, b_changed)
+        });
+        a_done_rx.recv().unwrap();
+        let fresh = store.begin_workspace_pr_refresh(&a).unwrap();
+        let outcome = if clear {
+            crate::github::WorkspacePrsOutcome::Clear
+        } else {
+            pr_lookup_result(11)
+        };
+        store.publish_workspace_pr_lookup(&fresh, outcome);
+        b_release_tx.send(()).unwrap();
+        let (a_changed, b_changed) = batch.join().unwrap();
+        assert_pr(&store, &a, if clear { None } else { Some(11) });
+        assert!(!a_changed, "a stale result must not open the emit gate");
+        assert!(b_changed, "refresh A must not invalidate unrelated B");
+        assert_pr(&store, &b, Some(20));
+    }
+
+    #[test]
+    fn pr_publication_delayed_batch_refuses_old_a_after_refresh_write() {
+        delayed_batch_cannot_overwrite_refresh(false);
+    }
+
+    #[test]
+    fn pr_publication_delayed_batch_refuses_old_a_after_refresh_clear() {
+        delayed_batch_cannot_overwrite_refresh(true);
+    }
+
+    #[test]
+    fn pr_publication_authority_inventory_is_runtime_only_and_removed_on_close_clear() {
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        let captured = store.workspace_pr_poll_lookups();
+        assert_eq!(store.pr_lookup_authorities.lock().unwrap().len(), 2);
+        let serialized = serde_json::to_string(&store.snapshot()).unwrap();
+        assert!(!serialized.contains("pr_lookup_authorit"));
+        store.close_workspace(&a).unwrap();
+        assert_eq!(store.pr_lookup_authorities.lock().unwrap().len(), 1);
+        store.clear_workspaces();
+        assert!(store.pr_lookup_authorities.lock().unwrap().is_empty());
+        assert!(captured
+            .iter()
+            .all(|t| !store.publish_workspace_pr_lookup(t, pr_lookup_result(10))));
+        assert!(!store.update_workspace_prs(&b, Vec::new()));
+        assert!(store.begin_workspace_pr_refresh("missing").is_err());
+        assert!(store.pr_lookup_authorities.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pr_publication_immediate_noop_list_write_revokes_old_lookup() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.update_workspace_prs(&id, Vec::new()));
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_immediate_noop_scalar_write_revokes_old_lookup() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.update_workspace_pr_info(&id, None, None, None, None));
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_replaced_snapshot_revokes_same_id_and_path() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        store.replace_snapshot(store.snapshot());
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_returning_to_same_cwd_does_not_reauthorize() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        store.update_workspace_cwd(&id, "/synthetic/moved".into());
+        store.update_workspace_cwd(&id, old.cwd.clone());
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_returning_to_same_worktree_does_not_reauthorize() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        store.set_workspace_worktree(&id, "/synthetic/worktree".into(), "fixture".into());
+        let old = store.begin_workspace_pr_refresh(&id).unwrap();
+        store.set_workspace_worktree(&id, "/synthetic/other".into(), "fixture".into());
+        store.set_workspace_worktree(&id, old.cwd.clone(), "fixture".into());
+        assert!(!store.publish_workspace_pr_lookup(&old, pr_lookup_result(10)));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_path_mutation_revokes_siblings_not_unrelated_workspaces() {
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        let c = store.create_workspace().0;
+        for (id, path) in [
+            (&a, "/synthetic/a"),
+            (&b, "/synthetic/b"),
+            (&c, "/synthetic/c"),
+        ] {
+            store.update_workspace_cwd(id, path.into());
+        }
+        store.set_workspace_project_root(&a, "/synthetic/repository".into());
+        store.set_workspace_project_root(&b, "/synthetic/repository".into());
+        let captured = store.workspace_pr_poll_lookups();
+        store.invalidate_workspace_pr_lookups_for_path("/synthetic/a");
+        for token in captured {
+            let changed = store.publish_workspace_pr_lookup(&token, pr_lookup_result(10));
+            assert_eq!(
+                changed,
+                token.workspace_id == c,
+                "only the unrelated workspace keeps authority"
+            );
+        }
+        assert_pr(&store, &a, None);
+        assert_pr(&store, &b, None);
+        assert_pr(&store, &c, Some(10));
+    }
+
+    #[test]
+    fn pr_publication_overlapping_refresh_preserve_cannot_reauthorize_old_batch() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let batch = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        let first = store.begin_workspace_pr_refresh(&id).unwrap();
+        let second = store.begin_workspace_pr_refresh(&id).unwrap();
+        let during = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        assert!(store.publish_workspace_pr_lookup(&second, pr_lookup_result(11)));
+        assert!(!store.publish_workspace_pr_lookup(&first, pr_lookup_result(11)));
+        assert!(!store
+            .publish_workspace_pr_lookup(&first, crate::github::WorkspacePrsOutcome::Preserve));
+        assert!(
+            !store.publish_workspace_pr_lookup(&first, crate::github::WorkspacePrsOutcome::Clear)
+        );
+        assert!(!store.publish_workspace_pr_lookup(&batch, pr_lookup_result(10)));
+        assert!(!store.publish_workspace_pr_lookup(&during, pr_lookup_result(10)));
+        assert_pr(&store, &id, Some(11));
+    }
+
+    #[test]
+    fn pr_publication_begin_refresh_fences_even_before_its_lookup_finishes() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let batch = store
+            .workspace_pr_poll_lookups()
+            .into_iter()
+            .find(|t| t.workspace_id == id)
+            .unwrap();
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.publish_workspace_pr_lookup(&batch, pr_lookup_result(10)));
+        assert!(!store.publish_workspace_pr_lookup(
+            &fresh,
+            crate::github::workspace_prs_outcome(Err("fixture lookup failure".into()))
+        ));
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_none_and_error_preserve_data_and_emit_gate() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(store.publish_workspace_pr_lookup(&fresh, pr_lookup_result(11)));
+        for outcome in [
+            crate::github::WorkspacePrsOutcome::Preserve,
+            crate::github::workspace_prs_outcome(Err("fixture lookup failure".into())),
+        ] {
+            let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+            assert!(!store.publish_workspace_pr_lookup(&fresh, outcome));
+            assert_pr(&store, &id, Some(11));
+        }
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(!store.publish_workspace_pr_lookup(&fresh, pr_lookup_result(11)));
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(
+            store.publish_workspace_pr_lookup(&fresh, crate::github::WorkspacePrsOutcome::Clear)
+        );
+        let fresh = store.begin_workspace_pr_refresh(&id).unwrap();
+        assert!(
+            !store.publish_workspace_pr_lookup(&fresh, crate::github::WorkspacePrsOutcome::Clear)
+        );
+        assert_pr(&store, &id, None);
+    }
+
+    #[test]
+    fn pr_publication_moved_deleted_and_remote_targets_refuse_write_and_clear() {
+        for clear in [false, true] {
+            for change in ["move", "delete", "attach"] {
+                let store = AppStateStore::default();
+                let id = store.create_workspace().0;
+                let seed = store.begin_workspace_pr_refresh(&id).unwrap();
+                store.publish_workspace_pr_lookup(&seed, pr_lookup_result(11));
+                let captured = store.begin_workspace_pr_refresh(&id).unwrap();
+                match change {
+                    "move" => {
+                        store.update_workspace_cwd(&id, "/synthetic/moved".into());
+                    }
+                    "delete" => {
+                        store.close_workspace(&id).unwrap();
+                    }
+                    "attach" => {
+                        store
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .workspaces
+                            .iter_mut()
+                            .find(|w| w.workspace_id.0 == id)
+                            .unwrap()
+                            .attach_only = true;
+                        assert!(store.begin_workspace_pr_refresh(&id).is_err());
+                    }
+                    _ => unreachable!(),
+                }
+                let outcome = if clear {
+                    crate::github::WorkspacePrsOutcome::Clear
+                } else {
+                    pr_lookup_result(10)
+                };
+                assert!(!store.publish_workspace_pr_lookup(&captured, outcome));
+                if change != "delete" {
+                    assert_pr(&store, &id, Some(11));
+                }
+            }
+        }
+    }
 
     #[test]
     fn git_info_reports_change_only_when_a_field_moves() {

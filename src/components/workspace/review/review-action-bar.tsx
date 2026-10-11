@@ -215,7 +215,7 @@ function ResolveWithAgentButton({ onResolve }: { onResolve: () => Promise<unknow
         if (starting) return;
         setStarting(true);
         onResolve()
-          .catch((err) => toast.error(String(err)))
+          .catch((err) => toast.failure("Couldn't hand the conflicts to an agent", err))
           .finally(() => setStarting(false));
       }}
     >
