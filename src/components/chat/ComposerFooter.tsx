@@ -3,6 +3,8 @@ import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
   Check,
+  CornerDownRight,
+  ListEnd,
   ListTodo,
   LoaderCircle,
   Plus,
@@ -20,10 +22,23 @@ import type {
 } from "@/tauri/types";
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
+import { FOOTER_SEPARATOR } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
+
+const DELIVERY_SEND_LABEL: Record<MessageDelivery, string> = {
+  queue: "Queue message",
+  steer: "Steer",
+  interrupt: "Interrupt and send",
+};
+
+const DELIVERY_SEND_TITLE: Record<MessageDelivery, string> = {
+  queue: "Send after this turn finishes",
+  steer: "Guide the current task without stopping tools",
+  interrupt: "Stop current work and send",
+};
 
 /** 34px circle shared by attach / send / stop so the row's two ends sit on
  *  one optical baseline, concentric with the 44px pill (5px inset). */
@@ -33,6 +48,7 @@ const ROUND_CONTROL =
 interface Props {
   hermesThreadId?: string | null;
   hermesProjectPath?: string | null;
+  customAgentsAllowed?: boolean;
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
@@ -45,6 +61,10 @@ interface Props {
   ultrathinkInBodyText: boolean;
   streaming: boolean;
   canSubmit: boolean;
+  /** The draft holds text to send. While a turn runs this swaps the Stop
+   *  button for the queue/steer/interrupt send button — one slot, never
+   *  both. Defaults to `canSubmit`. */
+  hasDraft?: boolean;
   delivery?: MessageDelivery;
   supportsSteering?: boolean;
   onDeliveryChange?: (value: MessageDelivery) => void;
@@ -58,7 +78,7 @@ interface Props {
   mode: ChatMode;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
-    model: string,
+    model: string | null,
   ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
@@ -113,7 +133,7 @@ interface Props {
  * send pinned right, a flexible gap in between.
  */
 export function ComposerFooter({
-  hermesThreadId, hermesProjectPath,
+  hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
   provider,
   model,
   permissionMode,
@@ -126,6 +146,7 @@ export function ComposerFooter({
   ultrathinkInBodyText,
   streaming,
   canSubmit,
+  hasDraft = canSubmit,
   delivery = "queue",
   supportsSteering = false,
   onDeliveryChange,
@@ -235,8 +256,8 @@ export function ComposerFooter({
                   : undefined
               }
               className={cn(
-                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors duration-150",
-                modelLeafLabel && "w-[34px] justify-center px-0",
+                "inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md border-0 px-2 text-body-sm font-medium leading-none transition-colors duration-150",
+                modelLeafLabel && "w-[30px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -263,14 +284,15 @@ export function ComposerFooter({
                 </>
               )}
             </button>
-            <span className="mx-0.5 h-4 w-px shrink-0 bg-border/50" aria-hidden />
+            <span className={FOOTER_SEPARATOR} aria-hidden />
           </>
         )}
 
-        {showProviderPicker || provider === "hermes" ? (
+        {showProviderPicker || provider === "hermes" || provider === "acp" ? (
           <MultiProviderModelPicker
             hermesThreadId={hermesThreadId}
             hermesProjectPath={hermesProjectPath}
+            customAgentsAllowed={customAgentsAllowed}
             provider={provider}
             model={model}
             onProviderModelChange={onProviderModelChange}
@@ -288,7 +310,7 @@ export function ComposerFooter({
             leafLabel={modelLeafLabel}
           />
         )}
-        {!configInMenu && (
+        {!configInMenu && provider !== "acp" && (
           <>
             <ReasoningPicker
               model={activeModel}
@@ -319,12 +341,25 @@ export function ComposerFooter({
         )}
 
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} />}
-        {streaming && showStopButton ? (
-          <>
-          {onDeliveryChange && <button type="button" onClick={onSubmit} disabled={!canSubmit} aria-label={delivery === "interrupt" ? "Interrupt and send" : delivery === "steer" ? "Steer" : "Queue message"}
-            title={delivery === "interrupt" ? "Stop current work and send" : delivery === "steer" ? "Guide the current task without stopping tools" : "Send after this turn finishes"}
-            className={cn(ROUND_CONTROL, "bg-primary/90 text-primary-foreground disabled:opacity-30 disabled:cursor-not-allowed")}><ArrowUp className="size-4" /></button>}
-
+        {streaming && onDeliveryChange && hasDraft ? (
+          // One action slot, as in t3code: with a draft, the slot sends it
+          // (queue / steer / interrupt); otherwise it's Stop.
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            aria-label={DELIVERY_SEND_LABEL[delivery]}
+            title={DELIVERY_SEND_TITLE[delivery]}
+            className={cn(
+              ROUND_CONTROL,
+              "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
+              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-primary active:scale-100",
+              "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
+            )}
+          >
+            {delivery === "queue" ? <ListEnd className="size-4" /> : delivery === "steer" ? <CornerDownRight className="size-4" /> : <ArrowUp className="size-4" />}
+          </button>
+        ) : streaming && showStopButton ? (
           <button
             type="button"
             onClick={onStop}
@@ -338,7 +373,6 @@ export function ComposerFooter({
           >
             <Square className="size-3" fill="currentColor" />
           </button>
-          </>
         ) : (
           <button
             type="button"

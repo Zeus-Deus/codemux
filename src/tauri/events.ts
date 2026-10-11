@@ -16,6 +16,11 @@ import type { AutomationRunView } from "./commands";
 
 export type EventCallback<T> = (payload: T) => void;
 
+export const onCustomAcpChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen<unknown>("custom_acp_changed", () => cb());
+export const onCustomAcpCatalogChanged = (cb: EventCallback<{ thread_id: string; catalog: import("./custom-acp").AcpCatalog }>): Promise<UnlistenFn> =>
+  listen<{ thread_id: string; catalog: import("./custom-acp").AcpCatalog }>("custom_acp_catalog_changed", e => cb(e.payload));
+
 export const onAppStateChanged = (cb: EventCallback<AppStateSnapshot>): Promise<UnlistenFn> =>
   listen<AppStateSnapshot>("app-state-changed", (e) => cb(e.payload));
 

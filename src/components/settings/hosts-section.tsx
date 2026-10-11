@@ -31,6 +31,7 @@ import {
   type HostView,
 } from "@/tauri/commands";
 import { useHostsStore } from "@/stores/hosts-store";
+import { useHostStatuses } from "@/stores/host-status-store";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
@@ -118,6 +119,16 @@ export function HostsSection() {
     {},
   );
   const [testingId, setTestingId] = useState<number | null>(null);
+  // The background poller's view, so the list shows who is online without a
+  // Test press. A Test result wins only until the poller reports again, so the
+  // dot always shows the newest observation.
+  const liveStatuses = useHostStatuses();
+  const [testIsNewer, setTestIsNewer] = useState<ReadonlySet<number>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    setTestIsNewer((prev) => (prev.size === 0 ? prev : new Set()));
+  }, [liveStatuses]);
   const [installingId, setInstallingId] = useState<number | null>(null);
   const [reinstallingId, setReinstallingId] = useState<number | null>(null);
 
@@ -249,6 +260,7 @@ export function HostsSection() {
         },
       }));
     } finally {
+      setTestIsNewer((prev) => new Set(prev).add(host.id));
       setTestingId(null);
     }
   }, []);
@@ -358,8 +370,11 @@ export function HostsSection() {
 
         <ul className="space-y-px">
           {hosts.map((host) => {
-            const result = testResults[host.id];
-            const isOnline = result?.ok === true;
+            const tested = testResults[host.id];
+            const live = liveStatuses[host.id];
+            const useTest = tested !== undefined && (testIsNewer.has(host.id) || !live);
+            const isOnline = useTest ? tested.ok : live?.reachable === true;
+            const checked = useTest || live?.probed === true;
             return (
               <li key={host.id}>
                 <button
@@ -374,6 +389,9 @@ export function HostsSection() {
                 >
                   <span
                     aria-hidden
+                    data-testid="host-status-dot"
+                    data-online={isOnline}
+                    title={isOnline ? "Online" : checked ? "Unreachable" : "Not checked yet"}
                     className={cn(
                       "size-1.5 shrink-0 rounded-full transition-colors duration-150",
                       isOnline ? "bg-success" : "bg-muted-foreground/40",

@@ -21,6 +21,32 @@
  */
 
 /**
+ * The width the panel opens at until the user drags it, on a roomy window.
+ *
+ * Modest on purpose: enough for a couple of labelled tabs beside the
+ * titlebar cluster, without taking over the chat. The tab row scrolls rather
+ * than wraps, so nothing needs a wider panel to look right.
+ */
+export const RIGHT_PANEL_DEFAULT_WIDTH = 540;
+
+/**
+ * The most of the content row the *default* width may take. On a small
+ * window 540px would leave the chat and terminal beside it a sliver, so
+ * there the default scales down instead. A dragged width is the user's
+ * call and isn't held to this.
+ */
+export const RIGHT_PANEL_DEFAULT_FRACTION = 0.4;
+
+/**
+ * Where the dragged width persists (`ui_state`).
+ *
+ * `_v2` drops widths saved before the tab row stopped wrapping: until then
+ * dragging the panel very wide was the only way to keep its tabs on one
+ * line, so those values say little about the size anyone actually wanted.
+ */
+export const RIGHT_PANEL_WIDTH_UI_KEY = "right_panel_width_v2";
+
+/**
  * Never narrower than this — below it the tab strip stops being usable.
  *
  * It used to be 240, back when the panel's tab row had the panel's full
@@ -28,22 +54,13 @@
  * end is spoken for by the fixed panel cluster and the native window buttons
  * drawn above it — `topRightReserve()` in `@/lib/titlebar-geometry`, 174px on
  * desktop. At 240 that left about 60px for the tabs *and* the active pane's
- * actions, i.e. no visible tab at all. 360 leaves roughly one full tab plus
- * stubs beside a pane's controls, which is the least this row can do and
- * still be a tab row.
+ * actions. 360 leaves room for about one tab, with the rest scrolled.
  *
  * Deliberately larger than {@link MIN_CONTENT_WIDTH} now: the two floors stop
  * meaning the same thing. The chat side's floor is about *reading*; this one
  * is about the panel's own chrome fitting.
  */
 export const RIGHT_PANEL_MIN_WIDTH = 360;
-
-/**
- * Width a fresh install opens the panel at, and what double-clicking the seam
- * returns to. It sits below {@link RIGHT_PANEL_MIN_WIDTH}, which bounds drags
- * and key presses, so resetting must not go through the drag setter.
- */
-export const RIGHT_PANEL_DEFAULT_WIDTH = 320;
 
 /** The panel's share of the content row when the fraction rule binds. */
 export const RIGHT_PANEL_MAX_FRACTION = 0.75;
@@ -72,6 +89,35 @@ export const MIN_CONTENT_WIDTH = 240;
  * producing an absurd inline style.
  */
 export const RIGHT_PANEL_MAX_STORED_WIDTH = 4000;
+
+/** The width an undragged panel opens at, given the space it shares. */
+export function defaultRightPanelWidth(available: number): number {
+  if (!Number.isFinite(available) || available <= 0) {
+    return RIGHT_PANEL_DEFAULT_WIDTH;
+  }
+  return Math.max(
+    RIGHT_PANEL_MIN_WIDTH,
+    Math.min(
+      RIGHT_PANEL_DEFAULT_WIDTH,
+      Math.round(available * RIGHT_PANEL_DEFAULT_FRACTION),
+    ),
+  );
+}
+
+/**
+ * The width the panel actually renders at: the stored width (or the
+ * default, if the user never dragged it) clamped to what fits. Before the
+ * row has been measured (first paint, or a test with no ResizeObserver) it
+ * skips the clamp — the observer corrects it on the very next frame, and
+ * clamping against a width of 0 would snap every panel to its minimum.
+ */
+export function resolveRightPanelWidth(
+  stored: number | null,
+  available: number,
+): number {
+  const width = stored ?? defaultRightPanelWidth(available);
+  return available > 0 ? clampRightPanelWidth(width, available) : width;
+}
 
 /** The widest the panel may render given the space it has to share. */
 export function maxRightPanelWidth(available: number): number {
@@ -103,13 +149,4 @@ export function clampRightPanelWidth(
     RIGHT_PANEL_MIN_WIDTH,
     Math.min(maxRightPanelWidth(available), width),
   );
-}
-
-/**
- * The width the panel is drawn at. A measured row only caps the stored width
- * so the content keeps its room; it never raises it to the drag minimum.
- * The title bar uses the same value so its band stops at the panel's edge.
- */
-export function renderedRightPanelWidth(stored: number, available: number): number {
-  return available > 0 ? Math.min(stored, maxRightPanelWidth(available)) : stored;
 }

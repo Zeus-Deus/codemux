@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  renderedRightPanelWidth,
   MIN_CONTENT_WIDTH,
+  RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
   clampRightPanelWidth,
+  defaultRightPanelWidth,
   maxRightPanelWidth,
+  resolveRightPanelWidth,
 } from "./right-panel-width";
 
 describe("maxRightPanelWidth", () => {
@@ -62,17 +64,40 @@ describe("clampRightPanelWidth", () => {
   });
 });
 
-describe("renderedRightPanelWidth", () => {
-  it("keeps a stored width below the drag minimum as it is", () => {
-    expect(renderedRightPanelWidth(320, 800)).toBe(320);
+describe("defaultRightPanelWidth", () => {
+  it("opens at the full default on a roomy window", () => {
+    expect(defaultRightPanelWidth(1600)).toBe(RIGHT_PANEL_DEFAULT_WIDTH);
+  });
+
+  // A 1280px window with the sidebar open leaves a ~990px row; 540 of it
+  // would squeeze the chat and terminal beside the panel.
+  it("scales down on a small window, never below the minimum", () => {
+    expect(defaultRightPanelWidth(990)).toBe(396);
+    expect(defaultRightPanelWidth(600)).toBe(RIGHT_PANEL_MIN_WIDTH);
+  });
+
+  it("falls back to the full default before the row is measured", () => {
+    expect(defaultRightPanelWidth(0)).toBe(RIGHT_PANEL_DEFAULT_WIDTH);
+  });
+});
+
+describe("resolveRightPanelWidth", () => {
+  it("uses the default until the user drags", () => {
+    expect(resolveRightPanelWidth(null, 990)).toBe(396);
+  });
+
+  // A dragged width is the user's call, not held to the default's share.
+  it("keeps a dragged width, clamped only to what fits", () => {
+    expect(resolveRightPanelWidth(700, 990)).toBe(700);
+    expect(resolveRightPanelWidth(5000, 990)).toBe(maxRightPanelWidth(990));
   });
 
   it("caps a stored width that would squeeze the content", () => {
     // min(800 * 0.75, 800 - 240) = 560
-    expect(renderedRightPanelWidth(3000, 800)).toBe(560);
+    expect(resolveRightPanelWidth(3000, 800)).toBe(560);
   });
 
   it("uses the stored width until the row is measured", () => {
-    expect(renderedRightPanelWidth(900, 0)).toBe(900);
+    expect(resolveRightPanelWidth(900, 0)).toBe(900);
   });
 });

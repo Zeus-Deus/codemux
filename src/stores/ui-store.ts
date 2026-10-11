@@ -1,7 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import {
-  RIGHT_PANEL_DEFAULT_WIDTH,
   RIGHT_PANEL_MAX_STORED_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
@@ -93,7 +92,10 @@ interface UIStore {
    *  next to its width so the two halves of one preference survive a
    *  restart together. */
   sidebarOpen: boolean;
-  rightPanelWidth: number;
+  /** The panel width the user dragged to, or `null` until they do — the
+   *  panel then opens at a window-relative default. See
+   *  `resolveRightPanelWidth` in `@/lib/right-panel-width`. */
+  rightPanelWidth: number | null;
   /** Measured width of the row the panel shares with the workspace content
    *  (`workspace-main.tsx` owns the measurement). Runtime-only, never
    *  persisted, `0` until first layout.
@@ -201,8 +203,9 @@ interface UIStore {
    *  open on what is running now, so this is never persisted. */
   subagentsHistoryOpen: boolean;
   /** Subagent ids whose failure card the user has waved off. Failures hold
-   *  the pane until acknowledged; the acknowledgement itself is per-session
-   *  (the run is over next launch), so this is transient too. */
+   *  the pane until acknowledged, and the cards are rebuilt from persisted
+   *  chat history, so the acknowledgement is persisted too (newest
+   *  `MAX_DISMISSED_SUBAGENTS` kept) or every restart would re-raise them. */
   dismissedSubagentAttention: string[];
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
@@ -237,8 +240,8 @@ interface UIStore {
   ) => void;
   setSidebarWidth: (width: number) => void;
   setSidebarOpen: (open: boolean) => void;
-  setRightPanelWidth: (width: number) => void;
-  /** Back to the default width, which sits below the drag minimum. */
+  setRightPanelWidth: (width: number | null) => void;
+  /** Back to the window-relative default (`null`), as if never dragged. */
   resetRightPanelWidth: () => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
@@ -297,6 +300,10 @@ interface UIStore {
   dismissSubagentAttention: (id: string) => void;
 }
 
+/** Only the latest wave's failures can raise a card, so a short memory of
+ *  dismissals is enough and keeps the persisted list from growing forever. */
+const MAX_DISMISSED_SUBAGENTS = 200;
+
 export const useUIStore = create<UIStore>()(
   persist(
     (set, get) => ({
@@ -306,7 +313,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
       sidebarOpen: true,
-      rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH,
+      rightPanelWidth: null,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
       fileSearchTarget: "editor",
@@ -543,14 +550,16 @@ export const useUIStore = create<UIStore>()(
       // instead of being permanently clipped down to it.
       setRightPanelWidth: (width) =>
         set({
-          rightPanelWidth: Math.max(
-            RIGHT_PANEL_MIN_WIDTH,
-            Math.min(RIGHT_PANEL_MAX_STORED_WIDTH, width),
-          ),
+          rightPanelWidth:
+            width === null
+              ? null
+              : Math.max(
+                  RIGHT_PANEL_MIN_WIDTH,
+                  Math.min(RIGHT_PANEL_MAX_STORED_WIDTH, width),
+                ),
         }),
 
-      resetRightPanelWidth: () =>
-        set({ rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH }),
+      resetRightPanelWidth: () => set({ rightPanelWidth: null }),
 
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
 
@@ -704,12 +713,17 @@ export const useUIStore = create<UIStore>()(
         set((s) =>
           s.dismissedSubagentAttention.includes(id)
             ? s
-            : { dismissedSubagentAttention: [...s.dismissedSubagentAttention, id] },
+            : {
+                dismissedSubagentAttention: [
+                  ...s.dismissedSubagentAttention,
+                  id,
+                ].slice(-MAX_DISMISSED_SUBAGENTS),
+              },
         ),
     }),
     {
       name: "codemux-ui",
-      version: 1,
+      version: 2,
       partialize: (state) => ({
         rightPanelTabs: state.rightPanelTabs,
         rightPanelLastTabs: state.rightPanelLastTabs,
@@ -721,16 +735,22 @@ export const useUIStore = create<UIStore>()(
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
+        dismissedSubagentAttention: state.dismissedSubagentAttention,
       }),
       // v0 → v1: the right-panel tab id `"pr"` was renamed to `"review"`
       // when the panel itself was renamed (Phase 3). Rewrite any persisted
       // values so users keep their active tab on upgrade instead of having
       // it silently fall back to the default.
+      //
+      // v1 → v2: drop the saved panel width, for the same reason the
+      // SQLite copy moved to a new key (see `RIGHT_PANEL_WIDTH_UI_KEY`).
       migrate: (persistedState, version) => {
-        if (version >= 1) return persistedState;
         const state = persistedState as {
           rightPanelTabs?: Record<string, string | null>;
+          rightPanelWidth?: number;
         };
+        if (version < 2 && state) delete state.rightPanelWidth;
+        if (version >= 1) return persistedState;
         if (state?.rightPanelTabs) {
           const migrated: Record<string, string | null> = {};
           for (const [wsId, tab] of Object.entries(state.rightPanelTabs)) {

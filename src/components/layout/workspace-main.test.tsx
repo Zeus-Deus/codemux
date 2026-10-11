@@ -20,7 +20,7 @@ const state = {
   rightPanelTabs: {} as Record<string, string | null>,
   rightPanelMaximized: false,
   rightPanelWidth: 320,
-  rowWidths: [] as number[],
+  setRightPanelRowWidth: vi.fn(),
   panelWidths: [] as number[],
   panelResets: 0,
 };
@@ -121,7 +121,7 @@ vi.mock("@/stores/ui-store", () => ({
         resetRightPanelWidth: () => {
           state.panelResets += 1;
         },
-        setRightPanelRowWidth: (width: number) => state.rowWidths.push(width),
+        setRightPanelRowWidth: state.setRightPanelRowWidth,
       }),
     },
   ),
@@ -134,6 +134,7 @@ vi.mock("@/tauri/commands", () => ({
 
 import { WorkspaceMain } from "./workspace-main";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
+import { RIGHT_PANEL_WIDTH_UI_KEY } from "@/lib/right-panel-width";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -194,7 +195,6 @@ beforeEach(() => {
   state.rightPanelTabs = {};
   state.rightPanelMaximized = false;
   state.rightPanelWidth = 320;
-  state.rowWidths = [];
   state.panelWidths = [];
   state.panelResets = 0;
 });
@@ -479,13 +479,14 @@ describe("WorkspaceMain right-panel full expand", () => {
       rectSpy.mockRestore();
     });
 
-    // Raising the stored default to the drag minimum took that width from
-    // the workspace column on a narrow window.
-    it("keeps a stored width below the drag minimum as it is", () => {
+    // The measurement only caps a panel that would squeeze the workspace
+    // column; a stored width that fits is drawn as it is.
+    it("keeps a stored width that fits as it is", () => {
       state.enableAgentChat = true;
       state.rightPanelTabs = { "ws-1": "files" };
+      state.rightPanelWidth = 400;
       const { getByTestId } = render(<WorkspaceMain />);
-      expect(getByTestId("right-panel-column").style.width).toBe("320px");
+      expect(getByTestId("right-panel-column").style.width).toBe("400px");
     });
 
     it("caps a wide stored width so the workspace column keeps its room", () => {
@@ -531,6 +532,38 @@ describe("WorkspaceMain right-panel full expand", () => {
 describe("WorkspaceMain content row measurement", () => {
   afterEach(() => vi.unstubAllGlobals());
 
+  // The panel is clamped against this row. WorkspaceMain renders nothing
+  // until a workspace exists, so the row mounts *after* the first render —
+  // and has to be measured then, not only on mount.
+  it("measures the row when it mounts after the first render", () => {
+    const observed: Element[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(el: Element) {
+          observed.push(el);
+        }
+        disconnect() {}
+      },
+    );
+    const rect = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({ width: 990 } as DOMRect);
+    try {
+      state.workspace = null;
+      const view = render(<WorkspaceMain />);
+      expect(observed).toHaveLength(0);
+
+      state.workspace = makeWorkspace();
+      view.rerender(<WorkspaceMain />);
+      expect(observed).toHaveLength(1);
+      expect(state.setRightPanelRowWidth).toHaveBeenLastCalledWith(990);
+    } finally {
+      rect.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
   // Regression: the observer attached in an effect keyed on a stable ref
   // object. A first mount through an early return (no workspace yet) left
   // the ref null, and the effect never re-ran once the row appeared, so the
@@ -566,7 +599,7 @@ describe("WorkspaceMain content row measurement", () => {
         {} as ResizeObserver,
       );
     });
-    expect(state.rowWidths[state.rowWidths.length - 1]).toBe(1200);
+    expect(state.setRightPanelRowWidth).toHaveBeenLastCalledWith(1200);
   });
 });
 
@@ -587,7 +620,7 @@ describe("WorkspaceMain right panel resizer keyboard and reset", () => {
     const seam = getByRole("separator", { name: "Resize right panel" });
     fireEvent.keyDown(seam, { key: "ArrowLeft", shiftKey: true });
     expect(state.panelWidths).toEqual([384]);
-    expect(dbSetUiState).toHaveBeenCalledWith("right_panel_width", "384");
+    expect(dbSetUiState).toHaveBeenCalledWith(RIGHT_PANEL_WIDTH_UI_KEY, "384");
 
     fireEvent.keyDown(seam, { key: "ArrowRight" });
     // 320 - 16 is under the floor, so it clamps to the minimum.
@@ -598,21 +631,22 @@ describe("WorkspaceMain right panel resizer keyboard and reset", () => {
     state.rightPanelTabs = { "ws-1": "files" };
     const { getByRole } = render(<WorkspaceMain />);
     fireEvent.doubleClick(getByRole("separator", { name: "Resize right panel" }));
-    // The default as is: the clamping drag setter is not involved.
+    // Back to the window-relative default, with the saved width cleared so
+    // a restart does not restore the dragged one.
     expect(state.panelResets).toBe(1);
     expect(state.panelWidths).toEqual([]);
-    expect(dbSetUiState).toHaveBeenLastCalledWith("right_panel_width", "320");
+    expect(dbSetUiState).toHaveBeenLastCalledWith(RIGHT_PANEL_WIDTH_UI_KEY, "");
   });
 
-  it("restores a saved default without widening it to the drag minimum", async () => {
-    vi.mocked(dbGetUiState).mockResolvedValueOnce("320");
+  it("keeps the default after a reset was saved", async () => {
+    vi.mocked(dbGetUiState).mockResolvedValueOnce("");
     render(<WorkspaceMain />);
     await act(async () => {});
-    expect(state.panelResets).toBe(1);
+    expect(state.panelResets).toBe(0);
     expect(state.panelWidths).toEqual([]);
   });
 
-  it("restores any other saved width through the drag setter", async () => {
+  it("restores a saved width through the drag setter", async () => {
     vi.mocked(dbGetUiState).mockResolvedValueOnce("480");
     render(<WorkspaceMain />);
     await act(async () => {});

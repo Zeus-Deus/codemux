@@ -35,6 +35,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
@@ -79,6 +80,9 @@ import {
   mockWebRemoteEndpoints,
   mockUsageSummary,
   mockUsageExportCsv,
+  mockUsageQuota,
+  mockUsagePriceOverrides,
+  mockSetUsagePriceOverride,
   mockWebRemotePairing,
   mockWebRemoteSessions,
   richChatTurnEnvelopes,
@@ -89,6 +93,7 @@ import {
   workflowCompleteEnvelopes,
   workflowRunningEnvelopes,
 } from "./mock-fixtures";
+import { HTML_RENDER_FIXTURE_HTML, HTML_RENDER_FIXTURE_TITLE } from "./html-render-fixture";
 import {
   STRESS_THREAD_PREFIX,
   getStressFixture,
@@ -196,6 +201,53 @@ function startStressDeltaDriver(): void {
     stressDeltaCount += 1;
     emitAppStateDelta({ domain: "pane_status", pane_id: paneId, status });
   }, periodMs);
+}
+
+// ── Changes pane mock state ──
+//
+// The dirty checkout's status, copied so Stage and Unstage in the Changes
+// pane move rows between sections for the session.
+const mockDirtyFiles: typeof MOCK_CREATE_PR_DIRTY = structuredClone(MOCK_CREATE_PR_DIRTY);
+
+function setMockStaged(path: unknown, files: unknown, staged: boolean): void {
+  if (String(path ?? "") !== MOCK_CREATE_PR_PATH || !Array.isArray(files)) return;
+  for (const file of mockDirtyFiles) {
+    if (!files.includes(file.path)) continue;
+    file.is_staged = staged;
+    file.is_unstaged = !staged;
+  }
+}
+
+/** Two hunks and one long line, so hunk navigation and soft wrap have
+ *  something to act on. */
+function mockFileDiff(file: string): string {
+  return [
+    `diff --git a/${file} b/${file}`,
+    `--- a/${file}`,
+    `+++ b/${file}`,
+    "@@ -1,6 +1,8 @@",
+    ' import { useEffect, useRef } from "react";',
+    '-import { subscribe } from "./events";',
+    '+import { openChannel } from "@/lib/agent-chat/channel";',
+    '+import type { ChannelEvent } from "@/lib/agent-chat/channel";',
+    " ",
+    " const RECONNECT_DELAY_MS = 500;",
+    "+const MAX_BUFFERED_EVENTS = 256;",
+    " ",
+    "@@ -40,7 +42,12 @@ export function useChannel(threadId: string) {",
+    "   const queue = useRef<ChannelEvent[]>([]);",
+    "   useEffect(() => {",
+    "-    return subscribe(threadId, (event) => queue.current.push(event));",
+    "+    const channel = openChannel(threadId, { bufferLimit: MAX_BUFFERED_EVENTS, reconnectDelayMs: RECONNECT_DELAY_MS, onOverflow: (dropped) => console.warn(`channel ${threadId} dropped ${dropped} events while the view was hidden`) });",
+    "+    channel.on((event) => {",
+    "+      queue.current.push(event);",
+    "+    });",
+    "+    return () => channel.close();",
+    "   }, [threadId]);",
+    " ",
+    "   return queue;",
+    "",
+  ].join("\n");
 }
 
 // ── Pull request mock state ──
@@ -404,6 +456,42 @@ let prStatsOutage = false;
  * here.
  */
 let prBudgetSpent = false;
+
+/** Console switches for the review gate; they survive a reload because
+ *  the frontend caches a usable auth verdict for a minute. See
+ *  `__codemuxMockNoRemote` and `__codemuxMockSignedOut` at the bottom. */
+function storedFlag(key: string): boolean {
+  try {
+    return localStorage.getItem(`codemux:dev:${key}`) === "1";
+  } catch {
+    return false;
+  }
+}
+function storeFlag(key: string, on: boolean): void {
+  try {
+    if (on) localStorage.setItem(`codemux:dev:${key}`, "1");
+    else localStorage.removeItem(`codemux:dev:${key}`);
+  } catch {
+    // Dev-only convenience; the session value still applies.
+  }
+}
+/** personal-site behaves like a repository with no remote. */
+let mockNoRemote = storedFlag("no-remote");
+/** Every supported host's CLI reports signed out. */
+let mockSignedOut = storedFlag("signed-out");
+
+/** The checkout or root at `path` belongs to the project the no-remote
+ *  knob strips the remote from. */
+function mockLacksRemote(path: string): boolean {
+  if (!mockNoRemote) return false;
+  const siteRoot = appState.workspaces.find((w) => w.workspace_id === "ws-site-main")?.project_root;
+  if (!siteRoot) return false;
+  return appState.workspaces.some(
+    (w) =>
+      w.project_root === siteRoot &&
+      (w.cwd === path || w.worktree_path === path || w.project_root === path),
+  );
+}
 
 /** Verbatim what `gh pr list` prints when the GraphQL budget is gone. */
 const RATE_LIMIT_REFUSAL =
@@ -676,7 +764,66 @@ const ptyChannels = new Map<string, MockPtyChannelEntry>();
 
 const MOCK_TERMINAL_BANNER =
   "\r\n  \x1b[2m(mock terminal — no PTY in plain-browser dev; " +
-  "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n";
+  "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n" +
+  "  \x1b[2mtyped lines echo back; `exit [code]` ends the shell\x1b[0m\r\n$ ";
+
+/** Mirror a lifecycle change into the session record, as the backend's
+ *  `update_terminal_session_status` does. */
+function setMockSessionState(
+  sessionId: string,
+  state: "ready" | "exited",
+  message: string | null,
+  exitCode: number | null,
+): void {
+  const session = appState.terminal_sessions.find((t) => t.session_id === sessionId);
+  if (!session) return;
+  session.state = state;
+  session.last_message = message;
+  session.exit_code = exitCode;
+}
+
+/** Typed-but-unsubmitted input per session, for the mock line echo. */
+const ptyLineBuffers = new Map<string, string>();
+
+/** A stand-in shell: echo what is typed so links and find have text to
+ *  work on, and treat `exit [code]` as the shell exiting so the terminal's
+ *  exited state and Restart are reachable without a PTY. */
+function mockShellInput(sessionId: string, data: string): void {
+  const entry = ptyChannels.get(sessionId);
+  let line = ptyLineBuffers.get(sessionId) ?? "";
+  let echo = "";
+  for (const ch of data) {
+    if (ch === "\r") {
+      echo += "\r\n";
+      const exit = /^exit(?:\s+(\d+))?$/.exec(line.trim());
+      line = "";
+      if (exit) {
+        if (entry) ptyChannelPush(entry, echo);
+        ptyLineBuffers.delete(sessionId);
+        const code = Number(exit[1] ?? 0);
+        const message =
+          code === 0 ? "Shell exited successfully" : `Shell exited with code ${code}`;
+        setMockSessionState(sessionId, "exited", message, code);
+        emitEvent("terminal-status", {
+          session_id: sessionId,
+          state: "exited",
+          message,
+          exit_code: code,
+        });
+        return;
+      }
+      echo += "$ ";
+    } else if (ch === "\x7f") {
+      if (line) echo += "\b \b";
+      line = line.slice(0, -1);
+    } else if (ch >= " ") {
+      line += ch;
+      echo += ch;
+    }
+  }
+  ptyLineBuffers.set(sessionId, line);
+  if (entry && echo) ptyChannelPush(entry, echo);
+}
 
 // ── MCP fixtures (Settings → MCP Servers) ──
 
@@ -1368,6 +1515,65 @@ function seedPendingAskQuestion(threadId: string): void {
   }, 600);
 }
 
+// ── Pending tool approval seed (`?approval=1`) ──────────────────────
+//
+// Like `?askq=1`, a pending approval has to arrive as a live event:
+// replay expires orphan requests. Seeds a running turn parked on a Bash
+// approval so the approval card, its "Allow always" rules and the
+// composer strip's "Needs approval" row can be inspected.
+
+const MOCK_APPROVAL_REQUEST_ID = "seed-approval-pending";
+let approvalSeeded = false;
+
+function approvalSeedEnabled(): boolean {
+  try {
+    return new URLSearchParams(location.search).get("approval") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function seedPendingApproval(threadId: string): void {
+  if (approvalSeeded || !approvalSeedEnabled()) return;
+  if (threadId !== MOCK_CHAT_THREAD_ID) return;
+  approvalSeeded = true;
+  const turnId = "seed-approval-turn";
+  const toolUseId = "seed-approval-tool";
+  setTimeout(() => {
+    emitChatEvent(threadId, {
+      type: "session_state_changed",
+      thread_id: threadId,
+      status: { status: "running", active_turn: turnId },
+    });
+    emitChatEvent(threadId, {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "Bash",
+        tool_use_id: toolUseId,
+        input: {
+          command: "npm run test -- src/lib/settings",
+          description: "Run the settings tests",
+        },
+      },
+    });
+    emitChatEvent(threadId, {
+      type: "request_opened",
+      thread_id: threadId,
+      turn_id: turnId,
+      request_id: MOCK_APPROVAL_REQUEST_ID,
+      request_kind: "command",
+      payload: {
+        tool_name: "Bash",
+        tool_input: { command: "npm run test -- src/lib/settings" },
+      },
+      tool_use_id: toolUseId,
+    });
+  }, 600);
+}
+
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
   label: "Mock Sonnet",
@@ -1922,6 +2128,78 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
         text: "Keep going on the importer.",
       });
     }
+  }
+
+  // `?visual=1` seeds a turn where the agent answers with an `html_render`
+  // page, shown inline above its closing reply.
+  if (new URLSearchParams(location.search).get("visual") === "1") {
+    const visualTurnId = "seed-visual";
+    push({
+      type: "user_message",
+      thread_id: T,
+      client_nonce: "seed-nonce-visual",
+      text: "Render some insights from last quarter's agent activity as a visualization in the thread",
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "Bash",
+        input: { command: "sqlite3 activity.db < quarterly_turns.sql" },
+        tool_use_id: "seed-visual-query",
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_result",
+        tool_use_id: "seed-visual-query",
+        content: "18412 rows",
+        is_error: false,
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "mcp__codemux__mcp__codemux__html_render",
+        input: { title: HTML_RENDER_FIXTURE_TITLE, html: HTML_RENDER_FIXTURE_HTML },
+        tool_use_id: "seed-visual-render",
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_result",
+        tool_use_id: "seed-visual-render",
+        content: "Shown to the reader above your reply.",
+        is_error: false,
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "assistant_text",
+        text: "The Codex jump lines up with the sandbox release in the week of Aug 24; Claude's share fell by about the same amount, so total volume stayed flat.",
+      },
+    });
+    push({
+      type: "turn_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      status: { kind: "success" },
+      usage: null,
+    });
   }
 
   mockChatTranscriptCache.set(threadId, out);
@@ -2838,6 +3116,8 @@ function streamMockRunStalled(
 /** Provider-health QA: per-provider override served by the
  *  `agent_chat_provider_health` mock handler. Absent → healthy. */
 type MockProviderKind =
+  | "acp"
+  | "hermes"
   | "claude"
   | "codex"
   | "cursor"
@@ -2957,8 +3237,45 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   emitOsc7,
 };
 
+// ── Editor disk overlay ──────────────────────────────────────────────
+//
+// `write_file` lands here and `read_file` prefers it, so saves round-trip
+// in browser dev. `file_signature` bumps with every write, which lets the
+// editor's on-disk change detection be exercised: simulate an agent edit to
+// the most recently opened file with Ctrl+Alt+Shift+E, or
+//   window.__codemuxEditorMock.agentWrite("/path/file.ts", "new content")
+
+const mockDiskFiles = new Map<string, { content: string; version: number }>();
+let lastMockReadPath: string | null = null;
+
+function mockDiskWrite(path: string, content: string): void {
+  const version = (mockDiskFiles.get(path)?.version ?? 0) + 1;
+  mockDiskFiles.set(path, { content, version });
+}
+
+function mockFileSignature(path: string): string {
+  return `mock:${mockDiskFiles.get(path)?.version ?? 0}`;
+}
+
+function mockAgentEdit(path = lastMockReadPath): void {
+  if (!path) return;
+  const current = mockDiskFiles.get(path)?.content ?? mockReadFile(path);
+  const stamp = new Date().toLocaleTimeString();
+  mockDiskWrite(path, `${current.trimEnd()}\n// Edited by an agent at ${stamp}\n`);
+  console.info(`[mock::editor] agent edit -> ${path}`);
+}
+
+(
+  window as unknown as {
+    __codemuxEditorMock: {
+      agentWrite: typeof mockDiskWrite;
+      agentEdit: typeof mockAgentEdit;
+    };
+  }
+).__codemuxEditorMock = { agentWrite: mockDiskWrite, agentEdit: mockAgentEdit };
+
 // CLI-drivable triggers: the browser is driven by `codemux browser
-// key-press` (no JS eval), so bind two RARE combos to the same helpers.
+// key-press` (no JS eval), so bind RARE combos to the same helpers.
 // Capture phase + preventDefault/stopPropagation so the chord never
 // reaches xterm. `e.code` (physical key) is used so the binding is
 // layout-independent even while Alt mangles `e.key`.
@@ -2978,6 +3295,10 @@ window.addEventListener(
         "[mock::terminal] key-combo Ctrl+Alt+Shift+S -> emitSerializeBuffers()",
       );
       emitSerializeBuffers();
+    } else if (e.code === "KeyE") {
+      e.preventDefault();
+      e.stopPropagation();
+      mockAgentEdit();
     }
   },
   true,
@@ -3492,7 +3813,9 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+const customAcpMock = createCustomAcpMock(emitEvent);
 const handlers: Record<string, Handler> = {
+  ...customAcpMock.handlers,
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
     if (update) {
@@ -3523,6 +3846,19 @@ const handlers: Record<string, Handler> = {
   get_auth_token: () => "mock-token",
   get_sync_status: () => ({ syncAvailable: true, authMethod: "github" }),
   sign_out: () => undefined,
+  // Login screen (reachable after Sign out). The browser never calls back,
+  // so GitHub sign-in stays pending until it is cancelled or times out. An
+  // address starting with "unverified" reproduces the not-verified state.
+  start_oauth_flow: () => undefined,
+  signin_email: (a) => {
+    if (String(a.email ?? "").startsWith("unverified")) {
+      throw "Email not verified";
+    }
+    return { user: MOCK_USER, token: "mock-token", expires_at: "2099-01-01T00:00:00Z" };
+  },
+  signup_email: () => undefined,
+  forgot_password: () => undefined,
+  resend_verification_email: () => undefined,
   skills_sync_status: () => ({ state: "idle", lastSyncAtMillis: null }),
   // ── Usage ──
   // `tzOffsetMinutes` is accepted and ignored: the fixture derives its
@@ -3538,6 +3874,26 @@ const handlers: Record<string, Handler> = {
     rows_updated: 0,
     reimported: false,
   }),
+  // Plan limits as a direct read would report them: Claude and Codex
+  // answer, after a short delay like the real CLI spawn.
+  usage_refresh_quota: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const now = Date.now();
+    return {
+      quota: mockUsageQuota(now),
+      statuses: [
+        { provider: "claude", outcome: "ok" },
+        { provider: "codex", outcome: "ok" },
+      ],
+      refreshed_at_ms: now,
+    };
+  },
+  usage_price_overrides: () => mockUsagePriceOverrides(),
+  usage_set_price_override: (args: Args) =>
+    mockSetUsagePriceOverride(
+      String(args.model ?? ""),
+      (args.price as Parameters<typeof mockSetUsagePriceOverride>[1]) ?? null,
+    ),
 
   skills_sync_now: () => ({
     pushedCount: 0,
@@ -3734,8 +4090,16 @@ const handlers: Record<string, Handler> = {
   // Browser dev has no filesystem; every path "exists" so chat file links
   // stay clickable against the synthetic contents `read_file` fabricates.
   file_exists: () => true,
+  file_signature: (a) => mockFileSignature(String(a.path ?? "")),
+  write_file: (a) => {
+    mockDiskWrite(String(a.path ?? ""), String(a.content ?? ""));
+    return null;
+  },
   read_file: (a) => {
     const path = String(a.path ?? "");
+    lastMockReadPath = path;
+    const written = mockDiskFiles.get(path);
+    if (written !== undefined) return written.content;
     // Template lookup is a series of speculative reads, and the answer
     // that matters most is "no". `mockReadFile` returns prose for any
     // `.md`, which would make every repository look like it had a
@@ -4420,6 +4784,7 @@ const handlers: Record<string, Handler> = {
   // resume, New Chat).
   agent_chat_start_session: (a) => {
     const threadId = (a.input as { thread_id: string }).thread_id;
+    if (a.provider === "acp") customAcpMock.start(a.input as { thread_id: string; cwd: string; model: string | null; extra?: unknown });
     const expectedThread =
       typeof a.expectedThread === "string" ? a.expectedThread : null;
     const pane = findChatPaneNode(a.paneId);
@@ -4668,10 +5033,10 @@ const handlers: Record<string, Handler> = {
     });
     return undefined;
   },
-  agent_chat_set_model: () => undefined,
+  agent_chat_set_model: (a) => { if (a.provider === "acp") customAcpMock.setModel(String(a.threadId), String(a.model)); },
   agent_chat_set_fast_mode: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
-  agent_chat_stop_session: () => undefined,
+  agent_chat_stop_session: (a) => customAcpMock.handlers.agent_chat_stop_session(a),
   agent_chat_rename_session: () => undefined,
   agent_chat_delete_session: () => undefined,
   agent_chat_list_turn_checkpoints: (a) => {
@@ -4722,6 +5087,7 @@ const handlers: Record<string, Handler> = {
       nextIndex: 0,
     });
     seedPendingAskQuestion(threadId);
+    seedPendingApproval(threadId);
     seedAsyncQuestion(threadId);
     return generation;
   },
@@ -4839,16 +5205,30 @@ const handlers: Record<string, Handler> = {
   // GitLab copy path rather than falling through to GitHub's.
   check_provider_auth: (a) => {
     const path = a.path as string;
+    if (mockLacksRemote(path)) {
+      return {
+        kind: "unknown",
+        supported: false,
+        installed: false,
+        authenticated: false,
+        username: null,
+        operations: NO_MOCK_OPERATIONS,
+        has_remote: false,
+      };
+    }
     const workspace = appState.workspaces.find(
       (w) => w.cwd === path || w.project_root === path,
     );
     const kind = workspace?.provider_kind ?? "github";
+    const supported = kind === "github" || kind === "gitlab";
+    const signedOut = supported && mockSignedOut;
     return {
       kind,
-      supported: kind === "github" || kind === "gitlab",
+      supported,
       installed: true,
-      authenticated: true,
-      username: kind === "gitlab" ? "mock-glab" : "mock-dev",
+      authenticated: !signedOut,
+      has_remote: true,
+      username: signedOut ? null : kind === "gitlab" ? "mock-glab" : "mock-dev",
       // Standing in for the adapters' own declarations — see
       // `git_provider/provider.rs`. GitLab is missing exactly one
       // operation, and Bitbucket declares nothing at all, so both the
@@ -4973,6 +5353,9 @@ const handlers: Record<string, Handler> = {
   // anything.
   list_prs_overview: async (a) => {
     const path = String(a.path ?? "");
+    // Answered before any refusal, like the real command: no remote means
+    // nothing to ask, not a failure.
+    if (mockLacksRemote(path)) return { viewer: null, items: [], local_only: true };
     if (path === MOCK_UNREACHABLE_ROOT) {
       return Promise.reject(
         "could not resolve host: git.scratchpad.example.com",
@@ -5915,12 +6298,25 @@ const handlers: Record<string, Handler> = {
   //    overlay), then push a one-shot "(mock terminal)" banner through
   //    the PTY output channel so the pane reads as an intentional mock
   //    rather than a dead black box. ──
-  get_terminal_status: (a) => ({
-    session_id: a.sessionId as string,
-    state: "ready",
-    message: null,
-    exit_code: null,
-  }),
+  get_terminal_status: (a) => {
+    const session = appState.terminal_sessions.find((t) => t.session_id === a.sessionId);
+    // A shell exited through the mock line echo stays exited across remounts,
+    // like the backend's runtime-less answer.
+    if (session?.state === "exited") {
+      return {
+        session_id: a.sessionId as string,
+        state: "exited",
+        message: session.last_message,
+        exit_code: session.exit_code,
+      };
+    }
+    return {
+      session_id: a.sessionId as string,
+      state: "ready",
+      message: null,
+      exit_code: null,
+    };
+  },
   attach_pty_output: (a) => {
     const sessionId = a.sessionId as string;
     // Newest attach wins: a fresh Channel has an empty ordering buffer,
@@ -5934,7 +6330,22 @@ const handlers: Record<string, Handler> = {
     return ++ptyOutputGeneration;
   },
   resize_pty: () => undefined,
-  write_to_pty: () => undefined,
+  write_to_pty: (a) => {
+    mockShellInput(a.sessionId as string, String(a.data ?? ""));
+    return undefined;
+  },
+  restart_terminal_session: (a) => {
+    const sessionId = a.sessionId as string;
+    ptyLineBuffers.delete(sessionId);
+    setMockSessionState(sessionId, "ready", null, null);
+    emitEvent("terminal-status", {
+      session_id: sessionId,
+      state: "ready",
+      message: null,
+      exit_code: null,
+    });
+    return undefined;
+  },
   detach_pty_output: (a) => {
     ptyChannels.delete(a.sessionId as string);
     return undefined;
@@ -6025,7 +6436,11 @@ const handlers: Record<string, Handler> = {
   // from has uncommitted work, because the form's warning row is only
   // reachable when something is actually uncommitted.
   get_git_status: (a) =>
-    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? MOCK_CREATE_PR_DIRTY : [],
+    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? structuredClone(mockDirtyFiles) : [],
+  get_git_diff: (a) =>
+    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? mockFileDiff(String(a.file ?? "")) : "",
+  git_stage_files: (a) => setMockStaged(a.path, a.files, true),
+  git_unstage_files: (a) => setMockStaged(a.path, a.files, false),
   get_merge_state: () => null,
   check_claude_available: () => false,
 
@@ -6097,6 +6512,13 @@ const handlers: Record<string, Handler> = {
     await sleep(300);
     return targetDir;
   },
+
+  // Project onboarding's setup checklist. The default `null` fallback
+  // threw inside the wizard's mount load, so the agent picker never filled.
+  detect_package_manager: () => [
+    { id: "npm-install", label: "Install dependencies (npm)", command: "npm install", enabled: true },
+    { id: "copy-env", label: "Copy .env from root", command: "cp \"$CODEMUX_ROOT_PATH/.env\" .env", enabled: false },
+  ],
 
   // ── Deferred worktree first-send (Thread Scope) ──
   //
@@ -6182,7 +6604,14 @@ const handlers: Record<string, Handler> = {
     const surfaceId = `surface-mock-tab-${n}`;
     const tabId = `tab-mock-tab-${n}`;
     const sessionId = `sess-mock-tab-${n}`;
-    const label = `Terminal ${ws.tabs.filter((t) => t.kind === "terminal").length + 1}`;
+    // Twin of `next_terminal_tab_title`: lowest unused number, with the
+    // default "Terminal" tab counting as 1 and Agent Chat tabs ignored.
+    const used = new Set(
+      ws.tabs.map((t) => (t.title === "Terminal" ? 1 : Number(/^Terminal (\d+)$/.exec(t.title)?.[1]))),
+    );
+    let next = 1;
+    while (used.has(next)) next++;
+    const label = `Terminal ${next}`;
 
     ws.surfaces.push({
       surface_id: surfaceId,
@@ -6328,6 +6757,21 @@ const handlers: Record<string, Handler> = {
   // with what the renderer already derived from the delta.
   touch_workspace: (a) => {
     if (!findWorkspace(a.workspaceId)) throw new Error(`No workspace found for ${a.workspaceId}`);
+  },
+  activate_pane: (a) => {
+    const paneId = String(a.paneId ?? "");
+    for (const workspace of appState.workspaces) {
+      const surface = workspace.surfaces.find((s) => leafPaneIds(s.root).includes(paneId));
+      if (!surface) continue;
+      workspace.active_surface_id = surface.surface_id;
+      surface.active_pane_id = paneId;
+      const tab = workspace.tabs.find((t) => t.surface_id === surface.surface_id);
+      if (tab) workspace.active_tab_id = tab.tab_id;
+      appState = { ...appState };
+      emitAppState();
+      return undefined;
+    }
+    return undefined;
   },
   activate_workspace: (a) => {
     const target = findWorkspace(a.workspaceId);
@@ -6918,25 +7362,57 @@ const internals: TauriInternals = {
   providerRuntimeCommands: providerRuntimeCommandCount,
 });
 
-// Dev affordance: fire a backend-style global `notification` event from the
-// browser console to exercise the web-remote notification bridge
-// (`useWebNotifications`). Enable the remote flag first so the hook is live:
+// Dev affordances for agent notifications.
+//
+// `__codemuxMockNotify` fires a backend-style global `notification` event to
+// exercise the web-remote bridge (`useWebNotifications`). Enable the remote
+// flag first so the hook is live; the toast's Open button goes to the pane:
 //   window.__CODEMUX_REMOTE__ = true
-//   __codemuxMockNotify("Agent finished — Demo", "Ready for review", "Demo")
+//   __codemuxMockNotify("Agent finished — agent-chat-demo", undefined, "ws-codemux-chat")
+//
+// `__codemuxMockNotificationClick` stands in for clicking a native desktop
+// notification (`useNotificationActivate`):
+//   __codemuxMockNotificationClick("ws-codemux-chat")
+function firstPaneOf(workspaceId: string): string {
+  const workspace = findWorkspace(workspaceId);
+  const surface = workspace?.surfaces.find((s) => s.surface_id === workspace.active_surface_id)
+    ?? workspace?.surfaces[0];
+  return surface ? leafPaneIds(surface.root)[0] ?? "" : "";
+}
+
 (
   window as unknown as {
     __codemuxMockNotify: (
       title: string,
       body?: string,
-      workspaceTitle?: string,
+      workspaceId?: string,
+      paneId?: string,
     ) => void;
   }
 ).__codemuxMockNotify = (
   title,
   body = "Codemux is waiting for your review.",
-  workspaceTitle = "Demo",
+  workspaceId = "ws-codemux-chat",
+  paneId = firstPaneOf(workspaceId),
 ) => {
-  emitEvent("notification", { title, body, workspace_title: workspaceTitle });
+  emitEvent("notification", {
+    title,
+    body,
+    workspace_title: findWorkspace(workspaceId)?.title ?? "Demo",
+    workspace_id: workspaceId,
+    pane_id: paneId,
+  });
+};
+
+(
+  window as unknown as {
+    __codemuxMockNotificationClick: (workspaceId?: string, paneId?: string) => void;
+  }
+).__codemuxMockNotificationClick = (
+  workspaceId = "ws-codemux-chat",
+  paneId = firstPaneOf(workspaceId),
+) => {
+  emitEvent("notification-activate", { workspace_id: workspaceId, pane_id: paneId });
 };
 
 // Dev affordance: rewrite a PR's branch under you.
@@ -7148,6 +7624,32 @@ function kickPrOverview(): void {
   PR_LIST_DELAY_MS = Math.max(0, ms);
   localStorage.setItem("codemux:dev:pr-list-delay", String(PR_LIST_DELAY_MS));
   return `the listing now takes ${PR_LIST_DELAY_MS}ms (across reloads)`;
+};
+
+// Dev affordances for the review gate. Both survive a reload; set them,
+// reload, then open the Review tab.
+//
+//   __codemuxMockNoRemote()        // personal-site has no remote
+//   __codemuxMockSignedOut()       // gh/glab report signed out
+//   __codemuxMockSignedOut(false)  // signed back in; the open pane notices
+(
+  window as unknown as { __codemuxMockNoRemote: (on?: boolean) => string }
+).__codemuxMockNoRemote = (on = true) => {
+  mockNoRemote = on;
+  storeFlag("no-remote", on);
+  kickPrOverview();
+  return on
+    ? "personal-site now has no remote (across reloads)"
+    : "personal-site has its remote back";
+};
+(
+  window as unknown as { __codemuxMockSignedOut: (on?: boolean) => string }
+).__codemuxMockSignedOut = (on = true) => {
+  mockSignedOut = on;
+  storeFlag("signed-out", on);
+  return on
+    ? "host CLIs now report signed out (across reloads)"
+    : "host CLIs signed in again — an open Review pane picks it up";
 };
 
 export {};

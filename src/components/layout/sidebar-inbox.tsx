@@ -7,7 +7,9 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Layers,
   Loader2,
+  Undo2,
 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
@@ -88,6 +90,7 @@ import {
   providerRefLabel,
 } from "@/lib/source-control";
 import {
+  isSingleStack,
   prSetLabel,
   prSetSummary,
   prsDescribeThisCheckout,
@@ -568,6 +571,7 @@ const SettledRow = memo(function SettledRow({
       data-settled-row={workspace.workspace_id}
       data-selected={selected ? "true" : undefined}
       data-active={isActive ? "true" : undefined}
+      aria-current={isActive ? "page" : undefined}
       onClick={handleClick}
       onKeyDown={(e) => {
         if (!isRowActivationKey(e)) return;
@@ -587,9 +591,9 @@ const SettledRow = memo(function SettledRow({
         // 10px JetBrains Mono ref, which is 6px per glyph, so `#1234` needs
         // 54px and 56px leaves it a hair of slack. The meta track is sized to
         // the age label, not to the hover control: the widest common label
-        // (`14h19m`, six 6.6px glyphs) is ~40px, and the text-only Un-settle
-        // button is ~49px, so 48px fits both without leaving a wide gutter
-        // between the PR badge and the age at rest.
+        // (`14h19m`, six 6.6px glyphs) is ~40px, and the Un-settle glyph is
+        // 12px, so 48px fits both without leaving a wide gutter between the PR
+        // badge and the age at rest.
         "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_56px_48px] items-center gap-2 rounded-lg px-2",
         // Same off-screen containment as the cards (see `SidebarInboxCard`):
         // the Settled shelf is the list that actually grows without bound, and
@@ -684,11 +688,19 @@ const SettledRow = memo(function SettledRow({
                 built-in `text-status-open`/etc. Swap that argument order inside
                 the icon and this badge silently goes back to a colored glyph on
                 a grey number — there is a test pinning it. */}
-            <PrStatusIcon
-              state={prState}
-              size={3}
-              className="shrink-0 text-current"
-            />
+            {isSingleStack(prs) ? (
+              <Layers
+                aria-hidden
+                data-pr-stack-icon
+                className="size-3 shrink-0"
+              />
+            ) : (
+              <PrStatusIcon
+                state={prState}
+                size={3}
+                className="shrink-0 text-current"
+              />
+            )}
             {primaryPr && (
               <span className="truncate">
                 {providerRef(provider, primaryPr.number)}
@@ -719,24 +731,23 @@ const SettledRow = memo(function SettledRow({
             onUnsettle(workspace.workspace_id);
           }}
           aria-label={`Un-settle "${workspace.title}"`}
+          title="Un-settle"
           className={cn(
-            // Borderless, matching the cards' action cluster: a settled row is
-            // 30px tall and mostly negative space, and a bordered pill inside it
-            // read as a second object competing with the row rather than as the
-            // row's own affordance. The word stays — this is the one control on
-            // the shelf that changes a lifecycle, and an undo arrow alone is too
-            // close to "go back" to be trusted with it. The word alone is also
-            // what lets the meta column stay as narrow as the age label.
+            // Borderless and bare, matching the cards' Pin/Snooze glyphs: a
+            // settled row is 30px tall and mostly negative space, and the word
+            // "Un-settle" was wider than this column and rendered clipped. The
+            // undo arrow is the same glyph the right-click "Un-settle
+            // workspace" entry uses, and `title` names the verb on hover.
             // Filling the slot (`inset-0`, right-aligned content) makes the
             // control's hit area exactly its own column — never a pixel of it
             // over the PR badge next door.
-            "absolute inset-0 hidden items-center justify-end gap-1 border-none bg-transparent p-0",
-            "text-label font-semibold text-muted-foreground transition-colors duration-150",
+            "absolute inset-0 hidden items-center justify-end border-none bg-transparent p-0",
+            "text-muted-foreground transition-colors duration-150",
             "hover:text-foreground",
             "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
           )}
         >
-          Un-settle
+          <Undo2 className="size-3" />
         </button>
       </div>
     </div>
@@ -813,6 +824,7 @@ const SnoozeRow = memo(function SnoozeRow({
         data-snoozed-row={workspace.workspace_id}
         data-selected={selected ? "true" : undefined}
         data-active={isActive ? "true" : undefined}
+        aria-current={isActive ? "page" : undefined}
         onClick={handleClick}
         onKeyDown={(e) => {
           if (!isRowActivationKey(e)) return;
@@ -2197,84 +2209,94 @@ export function SidebarInbox() {
           </>
         )}
 
-        {snoozedRows.length > 0 && (
-          <>
-            <ShelfHeader
-              label="Snoozed"
-              count={snoozedRows.length}
-              showCount={snoozeCollapsed}
-              collapsed={snoozeCollapsed}
-              onToggle={() => setSnoozeCollapsed((c) => !c)}
-            />
-            {visibleSnoozed.map(({ entry, workspace }) => {
-              const repo = repoByWorkspace.get(workspace.workspace_id);
-              if (!repo) return null;
-              return (
-                <SnoozeRow
-                  key={workspace.workspace_id}
-                  workspace={workspace}
-                  repo={repo}
-                  isActive={workspace.workspace_id === activeWorkspaceId}
-                  selected={selectedIds.has(workspace.workspace_id)}
-                  status={statusOf(workspace)}
-                  timeUntil={formatTimeUntil(entry.until - now)}
-                  onWake={handleWake}
-                  onSelect={handleSelect}
-                  onMarkUnread={handleMarkUnread}
+        {/* The parked shelves sit on the floor of the sidebar, not under
+            the last active card. `mt-auto` soaks up the free space above
+            them, so a short active list keeps its breathing room and parked
+            work reads as a separate, out-of-the-way drawer. Once the list
+            outgrows the viewport the margin collapses to zero and everything
+            scrolls as one column. */}
+        {(snoozedRows.length > 0 || settledRows.length > 0) && (
+          <div data-parked-shelves className="mt-auto flex flex-col">
+            {snoozedRows.length > 0 && (
+              <>
+                <ShelfHeader
+                  label="Snoozed"
+                  count={snoozedRows.length}
+                  showCount={snoozeCollapsed}
+                  collapsed={snoozeCollapsed}
+                  onToggle={() => setSnoozeCollapsed((c) => !c)}
                 />
-              );
-            })}
-          </>
-        )}
+                {visibleSnoozed.map(({ entry, workspace }) => {
+                  const repo = repoByWorkspace.get(workspace.workspace_id);
+                  if (!repo) return null;
+                  return (
+                    <SnoozeRow
+                      key={workspace.workspace_id}
+                      workspace={workspace}
+                      repo={repo}
+                      isActive={workspace.workspace_id === activeWorkspaceId}
+                      selected={selectedIds.has(workspace.workspace_id)}
+                      status={statusOf(workspace)}
+                      timeUntil={formatTimeUntil(entry.until - now)}
+                      onWake={handleWake}
+                      onSelect={handleSelect}
+                      onMarkUnread={handleMarkUnread}
+                    />
+                  );
+                })}
+              </>
+            )}
 
-        {settledRows.length > 0 && (
-          <>
-            <ShelfHeader
-              label="Settled"
-              count={settledRows.length}
-              showCount
-              collapsed={settledCollapsed}
-              onToggle={() => setSettledCollapsed((c) => !c)}
-            />
-            {visibleSettled.map(({ entry, workspace }) => {
-              const repo = repoByWorkspace.get(workspace.workspace_id);
-              if (!repo) return null;
-              return (
-                <SettledRow
-                  key={workspace.workspace_id}
-                  workspace={workspace}
-                  repo={repo}
-                  isActive={workspace.workspace_id === activeWorkspaceId}
-                  selected={selectedIds.has(workspace.workspace_id)}
-                  status={statusOf(workspace)}
-                  time={formatElapsed(now - resolveSettledTimestamp(entry))}
-                  unread={isUnread(workspace)}
-                  justSettled={justSettledId === workspace.workspace_id}
-                  onUnsettle={handleUnsettle}
-                  onSelect={handleSelect}
-                  onMarkUnread={handleMarkUnread}
+            {settledRows.length > 0 && (
+              <>
+                <ShelfHeader
+                  label="Settled"
+                  count={settledRows.length}
+                  showCount
+                  collapsed={settledCollapsed}
+                  onToggle={() => setSettledCollapsed((c) => !c)}
                 />
-              );
-            })}
-            {!settledCollapsed &&
-              settledHidden > 0 &&
-              (() => {
-                const next = Math.min(SETTLED_PAGE_COUNT, settledHidden);
-                return (
-                  <button
-                    type="button"
-                    data-settled-more
-                    aria-label={`Show ${next} more settled workspaces (${settledHidden} hidden)`}
-                    onClick={() =>
-                      setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
-                    }
-                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
-                  >
-                    {`Show ${next} more (${settledHidden} hidden)`}
-                  </button>
-                );
-              })()}
-          </>
+                {visibleSettled.map(({ entry, workspace }) => {
+                  const repo = repoByWorkspace.get(workspace.workspace_id);
+                  if (!repo) return null;
+                  return (
+                    <SettledRow
+                      key={workspace.workspace_id}
+                      workspace={workspace}
+                      repo={repo}
+                      isActive={workspace.workspace_id === activeWorkspaceId}
+                      selected={selectedIds.has(workspace.workspace_id)}
+                      status={statusOf(workspace)}
+                      time={formatElapsed(now - resolveSettledTimestamp(entry))}
+                      unread={isUnread(workspace)}
+                      justSettled={justSettledId === workspace.workspace_id}
+                      onUnsettle={handleUnsettle}
+                      onSelect={handleSelect}
+                      onMarkUnread={handleMarkUnread}
+                    />
+                  );
+                })}
+                {!settledCollapsed &&
+                  settledHidden > 0 &&
+                  (() => {
+                    const next = Math.min(SETTLED_PAGE_COUNT, settledHidden);
+                    return (
+                      <button
+                        type="button"
+                        data-settled-more
+                        aria-label={`Show ${next} more settled workspaces (${settledHidden} hidden)`}
+                        onClick={() =>
+                          setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
+                        }
+                        className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                      >
+                        {`Show ${next} more (${settledHidden} hidden)`}
+                      </button>
+                    );
+                  })()}
+              </>
+            )}
+          </div>
         )}
       </div>
 

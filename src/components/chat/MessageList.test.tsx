@@ -30,6 +30,7 @@ import {
   resetTranscriptFadeCacheForTests,
   setRendererMode,
 } from "./transcript-fade";
+import { USER_INPUT_SKIPPED_MESSAGE } from "./ComposerPendingInputPanel";
 import { MessageList } from "./MessageList";
 import { TranscriptTopInsetContext } from "./transcript-top-inset";
 
@@ -226,6 +227,49 @@ describe("MessageList retained scroll state", () => {
     expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
+  it("re-pins the end when the list itself leaves it while follow intent holds", async () => {
+    // A tail-first cold open backfills history while LegendList is still
+    // settling its initial scroll; on a phone that settle can land at the
+    // tail's old end, hundreds of turns up. No gesture released follow.
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    // Let the mount-time advance (two frames) drain before the list moves.
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("keeps following when Space activates a control in the transcript", async () => {
+    // Space on a focused Copy / fold / approval button activates it; it does
+    // not scroll, so it must not retire follow the way PageUp does.
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    const control = document.createElement("button");
+    viewport.appendChild(control);
+    fireEvent.keyDown(control, { key: " " });
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("treats keyboard scrolling as the reader leaving the end", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a"), readCall(1, "/b")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector('[data-slot="transcript-list"]')!;
+    fireEvent.keyDown(viewport, { key: "PageUp" });
+    scrollToEndSpy.mockClear();
+    act(() => emitIsAtEnd(false));
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
   it("reveals background growth when a resumed tail follower misses the built-in end pin", async () => {
     listState.isAtEnd = true;
     listState.isNearEnd = true;
@@ -260,6 +304,29 @@ describe("MessageList retained scroll state", () => {
     await act(() => new Promise<void>((resolve) => window.setTimeout(resolve, 180)));
     view.rerender(tree("visible"));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Jump to latest" })).not.toBeNull());
+  });
+
+  it("says an approval is waiting when the reader is off the live edge", async () => {
+    const pendingTool: ToolCallItem = {
+      ...readCall(1, "/b"),
+      tool_name: "Bash",
+      input: { command: "npm test" },
+      status: "running",
+      approval_request_id: "req-pill",
+    };
+    const messages: ChatViewItem[] = [
+      readCall(0, "/a"),
+      pendingTool,
+      planReq({ request_id: "req-pill", request_kind: "command", tool_use_id: "tu-1" }),
+    ];
+    const view = render(<MessageList messages={messages} {...noopHandlers} />);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    fireEvent.wheel(viewport, { deltaY: -100 });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Approval needed" })).not.toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
   });
 });
 
@@ -504,13 +571,26 @@ describe("MessageList dispatch", () => {
     expect(screen.getByText("Styling")).toBeInTheDocument();
   });
 
-  it("falls back to the plain marker when a resolved user-input carries no answer", () => {
+  it("falls back to a plain marker when a user-input was cancelled without an answer", () => {
     renderList([
       askReq({
         resolution: { state: "resolved", decision: { decision: "cancel" } },
       }),
     ]);
-    expect(screen.getByText("Answered")).toBeInTheDocument();
+    expect(screen.getByText("Not answered")).toBeInTheDocument();
+  });
+
+  it("marks a skipped user-input prompt as skipped, not answered", () => {
+    renderList([
+      askReq({
+        resolution: {
+          state: "resolved",
+          decision: { decision: "deny", message: USER_INPUT_SKIPPED_MESSAGE },
+        },
+      }),
+    ]);
+    expect(screen.getByText("Skipped")).toBeInTheDocument();
+    expect(screen.queryByText("Answered")).toBeNull();
   });
 
   it("falls back to PermissionRequestBlock for unknown request_kind", () => {
@@ -705,6 +785,35 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("2 tools")).toBeInTheDocument();
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
+  });
+
+  it("keeps the approval footer on an html_render call waiting for approval", () => {
+    const pending: ToolCallItem = {
+      kind: "tool_call",
+      id: "tc-page",
+      seq: 0,
+      tool_use_id: "tu-page",
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+      status: "running",
+      result_content: null,
+      approval_request_id: "req-page",
+    };
+    const approval: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "req-page",
+      seq: 1,
+      request_id: "req-page",
+      turn_id: "turn-1",
+      request_kind: "tool",
+      payload: { tool_name: pending.tool_name, tool_input: pending.input },
+      tool_use_id: "tu-page",
+      resolution: { state: "pending" },
+    };
+    renderList([pending, approval]);
+    expect(screen.getByText("Allow")).toBeInTheDocument();
+    expect(screen.getByText("Deny")).toBeInTheDocument();
+    expect(screen.queryByText("Building visualization…")).toBeNull();
   });
 });
 
