@@ -1223,10 +1223,23 @@ impl AcpSession {
             duration_ms: usage.api_duration_ms,
             num_turns: usage.num_turns,
         });
-        let status = match response {
-            Ok(result) => turn_status_from_result(&result, self.dialect),
-            Err(error) => turn_status_from_rpc_error(&error, self.dialect),
+        let status = match &response {
+            Ok(result) => turn_status_from_result(result, self.dialect),
+            Err(error) => turn_status_from_rpc_error(error, self.dialect),
         };
+        if let TurnStatus::Error { subtype, message } = &status {
+            if subtype == crate::agent_provider::events::RATE_LIMIT_SUBTYPE {
+                let payload = match &response {
+                    Ok(result) => result,
+                    Err(RpcChildError::RpcError(error)) => error.data.as_ref().unwrap_or(&Value::Null),
+                    Err(_) => &Value::Null,
+                };
+                let notice = crate::agent_provider::usage_limit::usage_limit_notice(
+                    &self.thread_id, self.dialect.provider(), payload, message,
+                );
+                if let Some(notice) = notice { let _ = self.event_tx.send(notice); }
+            }
+        }
         let _ = self.event_tx.send(ProviderRuntimeEvent::TurnCompleted {
             thread_id: self.thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -2470,7 +2483,9 @@ fn context_window_from_value(value: &Value) -> Option<u64> {
 fn turn_status_from_result(result: &Value, dialect: AcpDialect) -> TurnStatus {
     match result.get("stopReason").and_then(Value::as_str) {
         Some("error") => TurnStatus::Error {
-            subtype: format!("{}_acp", dialect.id_prefix()),
+            subtype: if crate::agent_provider::usage_limit::is_usage_limit_error(
+                &agent_result_message(result).unwrap_or_default(), result,
+            ) { "rate_limit".into() } else { format!("{}_acp", dialect.id_prefix()) },
             message: agent_result_message(result)
                 .unwrap_or_else(|| format!("{} turn failed", dialect.label())),
         },
@@ -2490,13 +2505,11 @@ fn turn_status_from_rpc_error(error: &RpcChildError, dialect: AcpDialect) -> Tur
         _ => None,
     };
     let message = detail.unwrap_or_else(|| error.to_string());
-    let lower = message.to_ascii_lowercase();
-    let rate_limited = lower.contains("rate limit")
-        || lower.contains("usage limit")
-        || matches!(error, RpcChildError::RpcError(error) if error.data.as_ref().is_some_and(|data| {
-            data.get("http_status").and_then(Value::as_u64) == Some(429)
-                || data.get("httpStatus").and_then(Value::as_u64) == Some(429)
-        }));
+    let payload = match error {
+        RpcChildError::RpcError(error) => error.data.as_ref().unwrap_or(&Value::Null),
+        _ => &Value::Null,
+    };
+    let rate_limited = crate::agent_provider::usage_limit::is_usage_limit_error(&message, payload);
     TurnStatus::Error {
         subtype: if rate_limited {
             "rate_limit".into()
@@ -3618,6 +3631,23 @@ mod tests {
             ),
             TurnStatus::Error { ref subtype, .. } if subtype == "rate_limit"
         ));
+    }
+
+    #[test]
+    fn usage_limit_acp_results_preserve_reset_metadata() {
+        for dialect in [AcpDialect::Cursor, AcpDialect::Grok] {
+            let result = json!({"stopReason":"error", "_meta":{"agentResult":"Usage limit reached",
+                "reset_at_ms":1_800_000_000_000_i64}});
+            let status = turn_status_from_result(&result, dialect);
+            let TurnStatus::Error { subtype, message } = status else { panic!("expected limit"); };
+            assert_eq!(subtype, "rate_limit");
+            let notice = crate::agent_provider::usage_limit::usage_limit_notice(
+                &ThreadId("acp-limit".into()), dialect.provider(), &result, &message,
+            ).unwrap();
+            assert!(matches!(notice, ProviderRuntimeEvent::UsageLimitReached {
+                resets_at_ms: Some(1_800_000_000_000), ..
+            }));
+        }
     }
 
     #[test]
