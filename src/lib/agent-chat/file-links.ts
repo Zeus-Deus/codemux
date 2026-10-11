@@ -37,7 +37,9 @@ function slash(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
-function normalizePath(path: string): string {
+/** Collapse `.`/`..` segments and use `/` separators, keeping a leading `/`
+ *  or Windows drive (`C:/`). Shared with terminal file links. */
+export function normalizePath(path: string): string {
   const windowsPrefix = WINDOWS_ABSOLUTE.test(path) ? path.slice(0, 2) : "";
   const absolute = path.startsWith("/") || !!windowsPrefix;
   const source = slash(windowsPrefix ? path.slice(2) : path);
@@ -55,7 +57,7 @@ function normalizePath(path: string): string {
   return `${prefix}${parts.join("/")}` || (absolute ? prefix : ".");
 }
 
-function isAbsolute(path: string): boolean {
+export function isAbsolute(path: string): boolean {
   return path.startsWith("/") || WINDOWS_ABSOLUTE.test(path);
 }
 

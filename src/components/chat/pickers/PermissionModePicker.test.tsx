@@ -157,16 +157,37 @@ describe("PermissionModePicker — interaction", () => {
     expect(onChange).toHaveBeenCalledWith("read-only");
   });
 
+  it("starts the keyboard highlight on the current mode", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({
+      modes: CLAUDE_MODES,
+      value: "acceptEdits",
+    });
+    await user.click(trigger!);
+    const highlighted = await screen.findByRole("option", { selected: true });
+    expect(highlighted).toHaveTextContent("Auto-accept edits");
+  });
+
+  it("starts the keyboard highlight on the default mode when none is set", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ modes: CLAUDE_MODES, value: null });
+    await user.click(trigger!);
+    const highlighted = await screen.findByRole("option", { selected: true });
+    expect(highlighted).toHaveTextContent("Full access");
+  });
+
   it("arrow keys navigate + Enter selects after popover open", async () => {
     const user = userEvent.setup();
-    const { trigger, onChange } = renderPicker({ modes: CLAUDE_MODES });
+    // Open on the first row so ArrowDown has somewhere to move (the list
+    // does not loop, so it would be a no-op from the last row).
+    const { trigger, onChange } = renderPicker({
+      modes: CLAUDE_MODES,
+      value: "default",
+    });
     await user.click(trigger!);
     await screen.findAllByRole("option");
     await user.keyboard("{ArrowDown}{Enter}");
     expect(onChange).toHaveBeenCalledTimes(1);
-    const picked = onChange.mock.calls[0][0];
-    expect(
-      ["default", "acceptEdits", "bypassPermissions"].includes(picked as string),
-    ).toBe(true);
+    expect(onChange).toHaveBeenCalledWith("acceptEdits");
   });
 });

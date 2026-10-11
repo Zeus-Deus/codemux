@@ -48,6 +48,7 @@ import {
   resolveSkillSelection,
   skillsForProvider,
 } from "@/lib/agent-chat/skill-tokens";
+import { useCustomAcp, selectedAcpCatalog } from "@/stores/custom-acp-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import type {
   ChatViewItem,
@@ -156,6 +157,7 @@ import { Composer } from "./Composer";
 import { Button } from "@/components/ui/button";
 import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
+  approvalOccupant,
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
@@ -170,12 +172,14 @@ import { DebugExitDialog, type DebugExitChoice } from "./DebugExitDialog";
 import {
   type AskUserQuestionOutput,
   ComposerPendingInputPanel,
+  USER_INPUT_SKIPPED_MESSAGE,
 } from "./ComposerPendingInputPanel";
 import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
+import { MobileComposerChips } from "@/components/mobile/mobile-composer-chips";
 import { RevertTurnDialog } from "./revert-turn-dialog";
 import { randomUUID } from "@/lib/uuid";
 
@@ -202,6 +206,7 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   cursor: "Cursor",
   grok: "Grok",
   hermes: "Hermes",
+  acp: "Custom agent",
   opencode: "OpenCode",
 };
 
@@ -251,6 +256,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (state) => state.observe,
   );
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  // Stable draft identity lets an unbound custom pane select a harness before
+  // launching anything. Native providers retain their existing startup path.
+  const [pendingAcpThreadId] = useState(() => initialProvider === "acp" ? `chat-${pane.pane_id}-acp-${randomUUID()}` : "");
+  const pendingAcpAgentId = useCustomAcp(s => s.selections[pendingAcpThreadId]);
+  const [pendingAcpModel, setPendingAcpModel] = useState<string | null>(null);
   const [sessionMetadata, setSessionMetadata] = useState<{
     threadId: string;
     imported: boolean;
@@ -636,9 +646,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Chat-side capabilities for the active provider. `null` until the
   // refresh hook resolves (or when the backend errors — pickers render
   // a disabled "unavailable" state in that case).
-  const capabilities = useProviderCapabilities((s) =>
+  const nativeCapabilities = useProviderCapabilities((s) =>
     selectCapabilities(s, provider),
   );
+  const acpCatalog = useCustomAcp(s => selectedAcpCatalog(s, threadId));
+  const capabilities = provider === "acp" ? acpCatalog?.capabilities ?? null : nativeCapabilities;
 
   // Field-level subscriptions, grouped by update cadence, instead of one
   // whole-slice read. Every store write mints a new slice object, so a
@@ -955,7 +967,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     settings.permissionMode ??
     providerDefaultPermissionMode ??
     DEFAULT_THREAD_PERMISSION_MODE;
-  const activeModel = selectModel(capabilities, model);
+  const activeModel = provider === "acp" ? capabilities?.models.find(m => m.id === model) ?? null : selectModel(capabilities, model);
   // Context meter (composer footer). The snapshot rides on the thread
   // state, so it survives hydrate-replay and the silent-restart slice
   // migration for free. The seed only covers the window between the
@@ -1488,9 +1500,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
     if (starting || startAttempted.current) return;
     if (!cwd) return;
+    if (provider === "acp" && !pendingAcpAgentId) return;
     startAttempted.current = true;
     setStarting(true);
-    const localThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+    const localThreadId = provider === "acp" ? pendingAcpThreadId : `chat-${pane.pane_id}-${Date.now()}`;
     startupThreadRef.current = localThreadId;
     // For a brand-new thread with no slice yet, use this provider's
     // native default. OpenCode deliberately launches with a null
@@ -1501,7 +1514,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const startInput = {
       thread_id: localThreadId,
       cwd,
-      model: null,
+      model: provider === "acp" ? pendingAcpModel : null,
       resume_cursor: null,
       permission_mode: startMode,
       fast_mode: false,
@@ -1549,6 +1562,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     threadId,
     promotedDraftThreadId,
     recoveryDraft,
+    pendingAcpAgentId, pendingAcpThreadId, pendingAcpModel,
     starting,
     pane.pane_id,
     provider,
@@ -1771,7 +1785,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const sdkText = applyAllPrefixes(
         skillSelection.text,
         mode,
-        effort,
+        provider === "acp" ? null : effort,
         null,
         attachmentBlock,
         selectProviderCommands(provider, cwd, threadId)(useProviderCommandsStore.getState()).commands,
@@ -2966,6 +2980,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (next: string) => {
       if (!threadId) return;
       if (grokConfigurationBusy || restartInFlightRef.current) return;
+      if (provider === "acp") {
+        if (useCustomAcp.getState().busy[threadId]) return;
+        void useCustomAcp.getState().setModel(threadId, next).then(catalog => setStoreModel(threadId, catalog.current_model)).catch(err => toast.error(`Failed to change custom agent model: ${formatProviderError(err)}`));
+        return;
+      }
       const previous = useAgentChatStore.getState().threads[threadId];
       if (!previous) return;
       const rollback = () => {
@@ -3319,11 +3338,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   ]);
 
   const handleProviderModelChange = useCallback(
-    (nextProvider: AgentChatProviderKind, nextModel: string) => {
+    (nextProvider: AgentChatProviderKind, nextModel: string | null) => {
       if (grokConfigurationBusy || restartInFlightRef.current) return;
       // A model pick inside the current provider is the cheap live setter.
+      if (provider === "acp" && nextProvider !== provider && threadId && useCustomAcp.getState().bindings[threadId]) {
+        toast.error("This chat is bound to its custom agent. Create a new chat to change harnesses.");
+        return;
+      }
       if (nextProvider === provider) {
-        handleModelChange(nextModel);
+        if (provider === "acp" && !threadId) { setPendingAcpModel(nextModel); observeProviderRuntimeIntent(provider); return; }
+        if (nextModel !== null) handleModelChange(nextModel);
         return;
       }
       if (!threadId || !cwd) return;
@@ -3440,6 +3464,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       cwd,
       pane.pane_id,
       handleModelChange,
+      observeProviderRuntimeIntent,
       migrateThreadId,
       setStoreModel,
       setStoreEffort,
@@ -3460,7 +3485,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const sessionAwaitingIntent =
     threadId == null &&
     !starting &&
-    !providerRuntimeIntent &&
+    (!providerRuntimeIntent || (provider === "acp" && !pendingAcpAgentId)) &&
     promotedDraftThreadId == null;
 
   // ── Thread Scope (new-thread empty state) ──
@@ -3613,6 +3638,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [pendingUserInput, handleRespond],
   );
 
+  // "Skip · answer in chat": decline the prompt with a note the agent can
+  // act on, then hand the keyboard to the composer for the real answer.
+  const handleSkipUserInput = useCallback(() => {
+    if (!pendingUserInput || pendingUserInput.kind !== "permission_request") {
+      return;
+    }
+    void handleRespond(pendingUserInput.request_id, {
+      decision: "deny",
+      message: USER_INPUT_SKIPPED_MESSAGE,
+    });
+    requestAnimationFrame(() => {
+      paneRootRef.current
+        ?.querySelector<HTMLTextAreaElement>(
+          '[data-testid="composer-wrapper"] textarea',
+        )
+        ?.focus();
+    });
+  }, [pendingUserInput, handleRespond]);
+
   const pendingInputPanelEl =
     pendingUserInput && pendingUserInput.kind === "permission_request" ? (
       <ComposerPendingInputPanel
@@ -3622,6 +3666,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         key={pendingUserInput.request_id}
         item={pendingUserInput}
         onSubmit={handleSubmitUserInput}
+        onSkip={handleSkipUserInput}
       />
     ) : null;
 
@@ -3776,6 +3821,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     goalSourceInTranscript,
     goalLastRun,
   ]);
+  const pendingApprovalOccupant = useMemo(
+    () =>
+      conversationWritable
+        ? approvalOccupant(messages, {
+            onRespond: (requestId, decision) => {
+              void handleRespond(requestId, decision);
+            },
+            onJump: (itemId) =>
+              setMessageJumpRequest((current) => ({
+                itemId,
+                nonce: (current?.nonce ?? 0) + 1,
+              })),
+          })
+        : null,
+    [conversationWritable, messages, handleRespond],
+  );
   // Hidden in a subagent drill-in: the design only shows it in the
   // conversation view. Keyed by thread so the open list never leaks
   // across a thread switch.
@@ -3784,6 +3845,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       key={threadId ?? "no-thread"}
       goal={stripGoal}
       occupants={[
+        pendingApprovalOccupant,
         errorOccupant,
         usageOccupant,
         monitoringOccupant,
@@ -3948,7 +4010,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onTasksClick={handleTasksClick}
       provider={provider}
       workspaceId={paneWorkspaceId}
-      threadId={threadId}
+      threadId={threadId ?? (provider === "acp" ? pendingAcpThreadId : null)}
       model={model}
       permissionMode={permissionMode}
       effort={effort}
@@ -3996,7 +4058,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachPr={conversationWritable ? handleAttachPr : undefined}
       onAttachSession={conversationWritable ? handleAttachSession : undefined}
       onAttachImage={conversationWritable ? handleAttachImage : undefined}
-      modelSupportsImages={activeModel?.supports_images ?? false}
+      modelSupportsImages={provider === "acp" ? acpCatalog?.supports_images ?? false : activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={workspaceProviderKind}
       providerCliInstalled={providerCliInstalled}
@@ -4034,6 +4096,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   return (
     <div
       ref={paneRootRef}
+      data-agent-chat-pane=""
       className="relative flex h-full w-full flex-col bg-background"
       onDragEnter={handlePaneDragEnter}
       onDragLeave={handlePaneDragLeave}
@@ -4143,6 +4206,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               // Docked in a `pointer-events-none` region, so the banner's
               // own buttons have to opt back in.
               <div className="pointer-events-auto">{debugBannerEl}</div>
+            )}
+            {mobile && conversationWritable && !enteredSubagent && paneWorkspaceId && (
+              <MobileComposerChips workspaceId={paneWorkspaceId} />
             )}
             {composerEl}
           </div>

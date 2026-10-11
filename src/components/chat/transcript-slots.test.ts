@@ -176,6 +176,60 @@ describe("buildTranscriptSlots — activity grouping", () => {
     expect(slots[1].messageId).toBe("tc-2");
   });
 
+  it("keeps an html_render page out of the work log and the turn fold", () => {
+    const page = tool(2, {
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+    });
+    const slots = buildTranscriptSlots([
+      userMsg(0, "chart it", 1_000),
+      tool(1, { tool_name: "Bash", input: { command: "ls" } }),
+      page,
+      assistantMsg(3, "Done."),
+      turnEnd(4, 5_000),
+    ]);
+    expect(slots.map((s) => s.body.kind)).toEqual(["item", "turn_fold", "item", "item"]);
+    expect(slots[2].messageId).toBe("tc-2");
+  });
+
+  it("keeps an approval-gated html_render call on its own tool card row", () => {
+    const gated = tool(1, {
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+      status: "running",
+      approval_request_id: "req-1",
+    });
+    const request: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "pr-2",
+      seq: 2,
+      request_id: "req-1",
+      turn_id: "t1",
+      request_kind: "tool",
+      payload: {},
+      tool_use_id: "tu-1",
+      resolution: { state: "pending" },
+    };
+    const slots = buildTranscriptSlots([
+      tool(0, { tool_name: "Bash", input: { command: "ls" } }),
+      gated,
+      request,
+    ]);
+    // The request row merges into the call's card footer rather than rendering twice.
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item"]);
+    expect(slots[1].messageId).toBe("tc-1");
+  });
+
+  it("folds a failed html_render call like any other failed step", () => {
+    const failed = tool(1, {
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+      status: "error",
+    });
+    const slots = buildTranscriptSlots([tool(0), failed]);
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity"]);
+  });
+
   it("breaks a run at a non-step item, yielding two activity blocks", () => {
     const slots = buildTranscriptSlots([
       tool(0),

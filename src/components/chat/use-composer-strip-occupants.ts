@@ -10,9 +10,12 @@ import {
 } from "@/lib/agent-chat/subagents";
 import type {
   ChatViewItem,
+  PermissionRequestItem,
   SubagentView,
+  ToolCallItem,
   UsageLimitState,
   UserMessageItem,
+  WorkflowRunItem,
 } from "@/lib/agent-chat/types";
 import {
   countdownIntervalMs,
@@ -24,8 +27,10 @@ import {
 } from "@/lib/agent-chat/usage-limit";
 import { resolveOrbState } from "@/lib/orb-state";
 import { toast } from "@/lib/toast";
+import type { ApprovalDecision } from "@/tauri/events";
 
 import type { StripAction, StripOccupant, StripRow } from "./ComposerStrip";
+import { isHermesPermission } from "./HermesPermissionOptions";
 
 /** How long the "just finished" row stays before it leaves the strip. */
 export const FINISHED_FLASH_MS = 2500;
@@ -418,6 +423,104 @@ export function queuedOccupant(
     };
   });
   return { kind: "queued", summary: rows[0], rows };
+}
+
+/**
+ * Approval occupant: the run is parked on a decision only the user can
+ * make. It leads the strip so a waiting run never passes for an idle one,
+ * even while the transcript is scrolled away from the card. A plain tool
+ * approval can be answered from the row; a plan, a workflow or a
+ * provider-specific choice needs its card, so the row jumps there.
+ * AskUserQuestion prompts are excluded: they already sit above the
+ * composer.
+ */
+export function approvalOccupant(
+  messages: ChatViewItem[],
+  handlers: {
+    onRespond: (requestId: string, decision: ApprovalDecision) => void;
+    onJump: (itemId: string) => void;
+  },
+): StripOccupant | null {
+  const pending = messages.filter(
+    (m): m is PermissionRequestItem =>
+      m.kind === "permission_request" &&
+      m.request_kind !== "user-input" &&
+      m.resolution.state === "pending",
+  );
+  if (pending.length === 0) return null;
+
+  const rows = pending.map<StripRow>((request) => {
+    const tool = messages.find(
+      (m): m is ToolCallItem =>
+        m.kind === "tool_call" && m.approval_request_id === request.request_id,
+    );
+    const workflow = messages.find(
+      (m): m is WorkflowRunItem =>
+        m.kind === "workflow_run" && m.approvalRequestId === request.request_id,
+    );
+    const targetId = tool?.id ?? workflow?.id ?? request.id;
+    const review: StripAction = {
+      label: "Review",
+      title: "Jump to the request in the thread",
+      onClick: () => handlers.onJump(targetId),
+    };
+    const answerable =
+      tool !== undefined &&
+      request.request_kind !== "plan" &&
+      !isHermesPermission(request.payload);
+    const detail = workflow
+      ? `Workflow · ${workflow.name ?? "run as a workflow"}`
+      : request.request_kind === "plan"
+        ? "Plan ready to review"
+        : tool
+          ? [tool.tool_name, toolInputSummary(tool.input)]
+              .filter(Boolean)
+              .join(" · ")
+          : request.request_kind;
+    return {
+      id: `approval:${request.request_id}`,
+      mark: { kind: "orb", activity: { awaitingUser: true } },
+      label: "Needs approval",
+      detail,
+      secondaryAction: answerable
+        ? {
+            label: "Deny",
+            title: "Deny this request",
+            tone: "quiet",
+            testId: "composer-strip-approval-deny",
+            onClick: () =>
+              handlers.onRespond(request.request_id, {
+                decision: "deny",
+                message: "User denied",
+              }),
+          }
+        : null,
+      action: answerable
+        ? {
+            label: "Allow",
+            title: "Allow this once",
+            tone: "solid",
+            testId: "composer-strip-approval-allow",
+            onClick: () =>
+              handlers.onRespond(request.request_id, { decision: "allow" }),
+          }
+        : review,
+    };
+  });
+  return { kind: "approval", summary: rows[0], rows };
+}
+
+/** The one input field that says what a tool call is about to touch. */
+function toolInputSummary(input: unknown): string {
+  if (typeof input !== "object" || input === null) return "";
+  const record = input as Record<string, unknown>;
+  for (const key of ["command", "file_path", "notebook_path", "url", "pattern", "path"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.replace(/\s+/g, " ").trim();
+    }
+  }
+  return "";
 }
 
 const SESSION_ERROR_PREFIX = /^Session error:\s*/;
