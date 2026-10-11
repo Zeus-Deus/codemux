@@ -11,6 +11,11 @@ import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
+import {
+  summarizeTurnChanges,
+  turnChangesEqual,
+  type TurnChangeSummary,
+} from "./turn-changes";
 
 /** A mechanical step rendered through the compact work log. */
 export type ActivityStep = ReasoningItem | ToolCallItem;
@@ -29,6 +34,8 @@ export interface TurnFoldBody {
   pinnedBy: readonly string[];
   hiddenCount: number;
   failedCount: number;
+  /** Files the turn's edit calls wrote; absent when it wrote none. */
+  changes?: TurnChangeSummary;
 }
 
 export type SlotBody =
@@ -330,6 +337,8 @@ function buildPresentationEntries(
       hiddenCount: hidden.length,
       failedCount: hidden.filter(itemFailed).length,
     };
+    const changes = summarizeTurnChanges(segment.items);
+    if (changes) body.changes = changes;
     let foldInserted = false;
 
     for (const item of segment.items) {
@@ -505,7 +514,8 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.pinnedBy.length === b.pinnedBy.length &&
       a.pinnedBy.every((id, index) => id === b.pinnedBy[index]) &&
       a.hiddenCount === b.hiddenCount &&
-      a.failedCount === b.failedCount
+      a.failedCount === b.failedCount &&
+      turnChangesEqual(a.changes, b.changes)
     );
   }
   if (a.kind === "activity" && b.kind === "activity") {
