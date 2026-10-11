@@ -2,13 +2,6 @@ import { useState, useRef, useCallback, memo } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import {
-  ContextMenu,
-  ContextMenuTrigger,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuSeparator,
-} from "@/components/ui/context-menu";
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -22,16 +15,19 @@ import {
   createTab,
   createBrowserPane,
   reorderTabs,
-  renameTab,
-  splitPane,
 } from "@/tauri/commands";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, TabKind, ActivePaneStatus, PaneStatus, PaneNodeSnapshot } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
-import { useEditorStore } from "@/stores/editor-store";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { cn } from "@/lib/utils";
 import { StatusIndicator } from "@/components/ui/status-indicator";
+import {
+  EditorDirtyDot,
+  TabContextMenu,
+  TabTitleInput,
+  middleClickCloseProps,
+} from "./tab-strip-actions";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -44,6 +40,10 @@ const tabIcon: Record<TabKind, React.ReactNode> = {
   diff: <GitCompare className="size-3" />,
   editor: <FileCode className="size-3" />,
 };
+
+// Stable empty ref so the pane_statuses selector doesn't return a fresh
+// object every render (which would loop useSyncExternalStore).
+const EMPTY_PANE_STATUSES: Record<string, PaneStatus> = {};
 
 function collectPaneIds(node: PaneNodeSnapshot): string[] {
   if (node.kind === "split") return node.children.flatMap(collectPaneIds);
@@ -73,7 +73,9 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
   };
 
   // Compute per-tab status from pane statuses
-  const paneStatuses = useAppStore((s) => s.appState?.pane_statuses ?? {});
+  const paneStatuses = useAppStore(
+    (s) => s.appState?.pane_statuses ?? EMPTY_PANE_STATUSES,
+  );
   const tabStatusMap = new Map<string, ActivePaneStatus>();
   for (const tab of workspace.tabs) {
     if (!tab.surface_id) continue;
@@ -203,37 +205,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
     [],
   );
 
-  // --- Context menu handlers ---
-  const handleCloseOtherTabs = async (keepTabId: string) => {
-    for (const tab of workspace.tabs) {
-      if (tab.tab_id !== keepTabId) {
-        await closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
-      }
-    }
-  };
-
-  const handleCloseTabsToRight = async (tabId: string) => {
-    const idx = workspace.tabs.findIndex((t) => t.tab_id === tabId);
-    for (let i = workspace.tabs.length - 1; i > idx; i--) {
-      await closeTab(workspace.workspace_id, workspace.tabs[i].tab_id).catch(console.error);
-    }
-  };
-
-  const handleSplit = (direction: "horizontal" | "vertical") => {
-    const surface = workspace.surfaces.find(
-      (s) => s.surface_id === workspace.active_surface_id,
-    );
-    if (surface) {
-      splitPane(surface.active_pane_id, direction).catch(console.error);
-    }
-  };
-
-  const handleRenameTab = (tabId: string, currentTitle: string) => {
-    const newTitle = window.prompt("Rename tab", currentTitle);
-    if (newTitle && newTitle !== currentTitle) {
-      renameTab(workspace.workspace_id, tabId, newTitle).catch(console.error);
-    }
-  };
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
 
   // Compute drop indicator position
   let dropIndicatorLeft: number | null = null;
@@ -280,71 +252,62 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
           )}
           <TabsList variant="line" className="!h-full !p-0 gap-0">
             {workspace.tabs.map((tab, idx) => (
-              <ContextMenu key={tab.tab_id}>
-                <ContextMenuTrigger asChild>
-                  <div
-                    data-tab-id={tab.tab_id}
-                    data-tab-index={idx}
-                    draggable
-                    onDragStart={handleDragStart(tab.tab_id)}
-                    className={cn("group relative h-full", dragTabId === tab.tab_id && "opacity-40")}
-                  >
-                    <TabsTrigger
-                      value={tab.tab_id}
-                      className="relative gap-1 pl-3 pr-8 !h-full !py-0 !m-0 text-label !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
-                    >
+              <TabContextMenu
+                key={tab.tab_id}
+                workspace={workspace}
+                tabId={tab.tab_id}
+                onRename={() => setRenamingTabId(tab.tab_id)}
+              >
+                <div
+                  data-tab-id={tab.tab_id}
+                  data-tab-index={idx}
+                  draggable={renamingTabId !== tab.tab_id}
+                  onDragStart={handleDragStart(tab.tab_id)}
+                  {...middleClickCloseProps(() => {
+                    closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+                  })}
+                  className={cn("group relative h-full", dragTabId === tab.tab_id && "opacity-40")}
+                >
+                  {renamingTabId === tab.tab_id ? (
+                    <div className="flex h-full items-center gap-1 bg-card px-3 text-label text-foreground">
                       {tab.icon ? <PresetIcon icon={tab.icon} className="size-3" /> : tabIcon[tab.kind]}
-                      <span className="truncate max-w-[120px]">{tab.title}</span>
-                      {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
-                      {tabStatusMap.has(tab.tab_id) && (
-                        <StatusIndicator status={tabStatusMap.get(tab.tab_id)!} />
-                      )}
-                    </TabsTrigger>
-                    {/* A sibling over the trigger, not a child of it: a button
-                        nested inside the tab's own button is invalid and
-                        screen readers flatten it into the tab's name. */}
-                    <button
-                      type="button"
-                      className="absolute right-3 top-1/2 -translate-y-1/2 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-                      onClick={(e) => handleCloseTab(e, tab.tab_id)}
-                      aria-label={`Close ${tab.title}`}
-                      title="Close tab"
-                    >
-                      <X className="size-3" />
-                    </button>
-                  </div>
-                </ContextMenuTrigger>
-                <ContextMenuContent>
-                  <ContextMenuItem
-                    onClick={() => closeTab(workspace.workspace_id, tab.tab_id).catch(console.error)}
-                  >
-                    Close tab
-                  </ContextMenuItem>
-                  <ContextMenuItem
-                    onClick={() => handleCloseOtherTabs(tab.tab_id)}
-                    disabled={workspace.tabs.length <= 1}
-                  >
-                    Close other tabs
-                  </ContextMenuItem>
-                  <ContextMenuItem
-                    onClick={() => handleCloseTabsToRight(tab.tab_id)}
-                    disabled={idx >= workspace.tabs.length - 1}
-                  >
-                    Close tabs to the right
-                  </ContextMenuItem>
-                  <ContextMenuSeparator />
-                  <ContextMenuItem onClick={() => handleSplit("horizontal")}>
-                    Split right
-                  </ContextMenuItem>
-                  <ContextMenuItem onClick={() => handleSplit("vertical")}>
-                    Split down
-                  </ContextMenuItem>
-                  <ContextMenuSeparator />
-                  <ContextMenuItem onClick={() => handleRenameTab(tab.tab_id, tab.title)}>
-                    Rename tab
-                  </ContextMenuItem>
-                </ContextMenuContent>
-              </ContextMenu>
+                      <TabTitleInput
+                        workspaceId={workspace.workspace_id}
+                        tabId={tab.tab_id}
+                        title={tab.title}
+                        onDone={() => setRenamingTabId(null)}
+                      />
+                    </div>
+                  ) : (
+                    <>
+                      <TabsTrigger
+                        value={tab.tab_id}
+                        onDoubleClick={() => setRenamingTabId(tab.tab_id)}
+                        className="relative gap-1 pl-3 pr-8 !h-full !py-0 !m-0 text-label !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
+                      >
+                        {tab.icon ? <PresetIcon icon={tab.icon} className="size-3" /> : tabIcon[tab.kind]}
+                        <span className="truncate max-w-[120px]">{tab.title}</span>
+                        {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
+                        {tabStatusMap.has(tab.tab_id) && (
+                          <StatusIndicator status={tabStatusMap.get(tab.tab_id)!} />
+                        )}
+                      </TabsTrigger>
+                      {/* A sibling over the trigger, not a child of it: a button
+                          nested inside the tab's own button is invalid and
+                          screen readers flatten it into the tab's name. */}
+                      <button
+                        type="button"
+                        className="absolute right-3 top-1/2 -translate-y-1/2 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                        onClick={(e) => handleCloseTab(e, tab.tab_id)}
+                        aria-label={`Close ${tab.title}`}
+                        title="Close tab"
+                      >
+                        <X className="size-3" />
+                      </button>
+                    </>
+                  )}
+                </div>
+              </TabContextMenu>
             ))}
           </TabsList>
           {!hideActions && <DropdownMenu>
@@ -390,12 +353,6 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
       </Button>}
     </div>
   );
-}
-
-function EditorDirtyDot({ tabId }: { tabId: string }) {
-  const isDirty = useEditorStore((s) => s.getTab(tabId)?.isDirty ?? false);
-  if (!isDirty) return null;
-  return <span className="size-1.5 rounded-full bg-foreground/50 shrink-0" title="Unsaved changes" />;
 }
 
 // #127: memo is effective because setAppState performs structural sharing, so
