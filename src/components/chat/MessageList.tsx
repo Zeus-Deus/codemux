@@ -1731,6 +1731,7 @@ function transcriptSlotType(slot: TranscriptSlot): string {
 
 function ItemRow({
   item,
+  commentary,
   approval,
   subagentName,
   onRespondToRequest,
@@ -1748,6 +1749,7 @@ function ItemRow({
   referencePaths,
 }: {
   item: ChatViewItem;
+  commentary?: boolean;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
@@ -1830,6 +1832,7 @@ function ItemRow({
   }
 
   return renderAssistantBody(item, {
+    commentary,
     approval,
     subagentName,
     workspaceId,
@@ -1845,6 +1848,7 @@ function ItemRow({
 function renderAssistantBody(
   item: Exclude<ChatViewItem, { kind: "user_message" }>,
   handlers: {
+    commentary?: boolean;
     approval: PermissionRequestItem | null;
     subagentName: string | null;
     workspaceId?: string | null;
@@ -1863,6 +1867,7 @@ function renderAssistantBody(
       return (
         <AssistantMessage
           item={item}
+          commentary={handlers.commentary}
           workspaceId={handlers.workspaceId}
           cwd={handlers.cwd}
           referenceCwd={handlers.referenceCwd}
@@ -2118,6 +2123,7 @@ function SlotRow({
       ) : (
         <ItemRowMemo
           item={slot.body.item}
+          commentary={slot.body.commentary}
           approval={approval}
           subagentName={subagentName}
           onRespondToRequest={onRespondToRequest}

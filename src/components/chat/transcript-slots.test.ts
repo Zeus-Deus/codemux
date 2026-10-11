@@ -330,6 +330,29 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
     if (expanded.kind === "turn_fold") expect(expanded.expanded).toBe(true);
   });
 
+  it("marks narration as commentary and only the settled final answer as the reply", () => {
+    const commentaryOf = (slots: ReturnType<typeof buildTranscriptSlots>) =>
+      slots.flatMap((slot) =>
+        slot.body.kind === "item" && slot.body.item.kind === "assistant_message"
+          ? [[slot.body.item.id, slot.body.commentary]]
+          : [],
+      );
+
+    expect(
+      commentaryOf(buildTranscriptSlots(settledTurn(), false, new Set(["t1"]))),
+    ).toEqual([
+      ["am-1", true],
+      ["am-4", false],
+    ]);
+
+    // While the turn runs, even its latest message is narration.
+    const live = settledTurn().slice(0, -1);
+    expect(commentaryOf(buildTranscriptSlots(live, true))).toEqual([
+      ["am-1", true],
+      ["am-4", true],
+    ]);
+  });
+
   it("leaves pending approvals visible even after a terminal event", () => {
     const gated = tool(2, {
       status: "running",

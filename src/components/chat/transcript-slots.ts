@@ -28,7 +28,10 @@ export interface TurnFoldBody {
 }
 
 export type SlotBody =
-  | { kind: "item"; item: ChatViewItem }
+  /** `commentary` marks assistant prose that is not a settled turn's final
+   *  answer: running narration between work. It renders without the footer
+   *  strip so it sits tight against the work around it. */
+  | { kind: "item"; item: ChatViewItem; commentary?: boolean }
   | { kind: "activity"; items: WorkEntry[]; working: boolean }
   | TurnFoldBody;
 
@@ -256,16 +259,33 @@ function buildPresentationEntries(
   messages: ChatViewItem[],
   streaming: boolean,
   expandedTurnIds: ReadonlySet<string>,
-): { entries: PresentationEntry[]; workingEntryId: string | null } {
+): {
+  entries: PresentationEntry[];
+  workingEntryId: string | null;
+  commentaryIds: Set<string>;
+} {
   const segments = splitTurns(messages);
   const activeIndex = activeTurnIndex(segments, streaming);
   const pendingIds = pendingRequestIds(messages);
   const entries: PresentationEntry[] = [];
+  const commentaryIds = new Set<string>();
   let workingEntryId: string | null = null;
 
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
     const segment = segments[segmentIndex];
     const ended = lastTurnEnd(segment);
+    const terminalId = terminalAssistantId(segment);
+
+    // Only a finished turn's last answer is the reply; everything else the
+    // assistant said along the way is narration.
+    for (const item of segment.items) {
+      if (
+        item.kind === "assistant_message" &&
+        (segmentIndex === activeIndex || item.id !== terminalId)
+      ) {
+        commentaryIds.add(item.id);
+      }
+    }
 
     if (segmentIndex === activeIndex) {
       for (let i = segment.items.length - 1; i >= 0; i--) {
@@ -284,7 +304,6 @@ function buildPresentationEntries(
       continue;
     }
 
-    const terminalId = terminalAssistantId(segment);
     const hidden = segment.items.filter((item) =>
       isFoldableSettledItem(item, terminalId, pendingIds),
     );
@@ -312,7 +331,7 @@ function buildPresentationEntries(
     }
   }
 
-  return { entries, workingEntryId };
+  return { entries, workingEntryId, commentaryIds };
 }
 
 export function buildTranscriptSlots(
@@ -331,7 +350,7 @@ export function buildTranscriptSlots(
     }
   }
 
-  const { entries, workingEntryId } = buildPresentationEntries(
+  const { entries, workingEntryId, commentaryIds } = buildPresentationEntries(
     messages,
     streaming,
     expandedTurnIds,
@@ -394,7 +413,7 @@ export function buildTranscriptSlots(
       continue;
     }
     flush();
-    bodies.push({ kind: "item", item });
+    bodies.push({ kind: "item", item, commentary: commentaryIds.has(item.id) });
   }
   flush();
 
@@ -450,7 +469,9 @@ function slotsEquivalent(a: TranscriptSlot, b: TranscriptSlot): boolean {
 }
 
 function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
-  if (a.kind === "item" && b.kind === "item") return a.item === b.item;
+  if (a.kind === "item" && b.kind === "item") {
+    return a.item === b.item && a.commentary === b.commentary;
+  }
   if (a.kind === "turn_fold" && b.kind === "turn_fold") {
     return (
       a.turnId === b.turnId &&

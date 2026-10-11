@@ -15,22 +15,26 @@ import { ChatMarkdown } from "./ChatMarkdown";
  * treatment. Live progress is communicated by the transcript's dedicated
  * streaming marker rather than extra chrome appended to the prose.
  *
- * A settled message gets a footer strip under the prose that fades in on hover
- * or keyboard focus, holding a copy action aligned to the start of the text.
- * It copies `item.text` — the markdown source, not the rendered DOM — so
- * pasting into another editor keeps the formatting. It stays hidden while the
- * message streams, where only half the answer exists yet. The hover target is
- * a *named* group: prose can contain its own unnamed `group`s (an inline image
- * zooms on hover), which an unnamed one here would fire on every hover.
+ * A turn's settled final answer gets a footer strip under the prose that fades
+ * in on hover or keyboard focus, holding a copy action aligned to the start of
+ * the text. It copies `item.text` — the markdown source, not the rendered DOM —
+ * so pasting into another editor keeps the formatting. It stays hidden while
+ * the message streams, where only half the answer exists yet, and on
+ * `commentary` (narration between work), where the strip's reserved height
+ * would push the surrounding work rows apart. The hover target is a *named*
+ * group: prose can contain its own unnamed `group`s (an inline image zooms on
+ * hover), which an unnamed one here would fire on every hover.
  */
 export const AssistantMessage = memo(function AssistantMessage({
   item,
+  commentary = false,
   workspaceId,
   cwd,
   referenceCwd,
   referencePaths,
 }: {
   item: AssistantMessageItem;
+  commentary?: boolean;
   workspaceId?: string | null;
   cwd?: string | null;
   referenceCwd?: string | null;
@@ -52,7 +56,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       >
         {item.text}
       </ChatMarkdown>
-      {!item.streaming && item.text ? (
+      {!item.streaming && !commentary && item.text ? (
         <MessageCopyButton
           text={item.text}
           label="Copy response"
