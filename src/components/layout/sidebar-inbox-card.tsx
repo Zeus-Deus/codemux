@@ -5,6 +5,7 @@ import {
   Check,
   CircleDotDashed,
   Cloud,
+  Layers,
   Pin,
   PinOff,
   Terminal,
@@ -42,6 +43,7 @@ import { CardProgressSweep } from "./sidebar-creating-card";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import { providerForWorkspace, providerRef } from "@/lib/source-control";
 import {
+  isSingleStack,
   prSetLabel,
   prSetSummary,
   workspacePrs,
@@ -328,6 +330,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const prState = prSummary.state ?? normalizePrState(workspace.pr_state);
   const primaryPr = prs[0] ?? null;
   const extraPrCount = prSummary.total - 1;
+  const prStack = isSingleStack(prs);
   // `scProvider` — the *hosting* product. Distinct from `providers`
   // above, which is the set of AI agent backends running in this
   // workspace's panes.
@@ -932,14 +935,26 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           "cursor-default opacity-65",
                     )}
                   >
-                    <PrStatusIcon
-                      state={prState}
-                      size={3}
-                      className={cn(
-                        "shrink-0",
-                        visuallyReceded && "text-current",
-                      )}
-                    />
+                    {/* A set that is one stack swaps the PR glyph for a
+                        stack glyph, so `+8` reads as "eight more layers on
+                        this one" rather than eight unrelated PRs. The set's
+                        state still rides on the chip's color. */}
+                    {prStack ? (
+                      <Layers
+                        aria-hidden
+                        data-pr-stack-icon
+                        className="size-3 shrink-0"
+                      />
+                    ) : (
+                      <PrStatusIcon
+                        state={prState}
+                        size={3}
+                        className={cn(
+                          "shrink-0",
+                          visuallyReceded && "text-current",
+                        )}
+                      />
+                    )}
                     {primaryPr && (
                       <span>{providerRef(scProvider, primaryPr.number)}</span>
                     )}

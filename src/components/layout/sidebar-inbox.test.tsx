@@ -455,13 +455,15 @@ describe("SidebarInbox — cards", () => {
     await renderInbox();
 
     const chip = screen.getByRole("button", {
-      name: "9 pull requests — 5 open, 4 merged. Opens #372",
+      name: "Stack of 9 pull requests — 5 open, 4 merged. Opens #372",
     });
     // The primary is still a specific PR the click opens, so the count reads
     // as "+8 more" rather than replacing the reference with a total.
     expect(chip).toHaveTextContent("#372");
     expect(chip).toHaveTextContent("+8");
     expect(chip).not.toHaveTextContent("#380");
+    // The set is one stack, so the chip says so with its glyph.
+    expect(chip.querySelector("[data-pr-stack-icon]")).not.toBeNull();
   });
 
   it("renders the PR chip icon alone when the number is unknown", async () => {
