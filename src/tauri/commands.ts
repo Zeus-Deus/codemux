@@ -882,9 +882,13 @@ export const submitPrReview = (path: string, prNumber: number, event: string, bo
 
 /** The whole unified diff, for the Code tab. Uncapped where
  *  `getGithubPrDiffByPath` is capped at 100 KB, and uncached on the
- *  backend so a force-push shows the new patch immediately. */
-export const getPrReviewDiff = (path: string, prNumber: number) =>
-  invoke<string>("get_pr_review_diff", { path, prNumber });
+ *  backend so a force-push shows the new patch immediately. Supplying the
+ *  cache key's SHA makes GitHub reject a patch read across a head change. */
+export const getPrReviewDiff = (path: string, prNumber: number, expectedHeadSha?: string | null) =>
+  invoke<string>("get_pr_review_diff", {
+    path, prNumber,
+    ...(expectedHeadSha == null ? {} : { expectedHeadSha }),
+  });
 
 /** The host's own history of a pull request, oldest first.
  *

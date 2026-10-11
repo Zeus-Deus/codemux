@@ -204,6 +204,15 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("the Code tab", () => {
+  it("binds each diff request to the head in its query key", async () => {
+    const user = userEvent.setup();
+    const { rerenderWith } = renderDetail();
+    await openCodeTab(user);
+    expect(mockGetPrReviewDiff).toHaveBeenLastCalledWith("/repo", 172, "head-one");
+    rerenderWith({ pr: makePr({ head_ref_oid: "head-two" }) });
+    await waitFor(() => expect(mockGetPrReviewDiff).toHaveBeenLastCalledWith("/repo", 172, "head-two"));
+  });
+
   it("counts the changed files on the strip and lists every file", async () => {
     const user = userEvent.setup();
     renderDetail();

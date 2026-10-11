@@ -253,6 +253,180 @@ pub(crate) fn workspace_pr_rows(
         .collect()
 }
 
+/// Publish the answers from one completed batch. Count shape mismatches are
+/// non-authoritative and leave every workspace untouched.
+fn publish_workspace_pr_batch(
+    state: &state::AppStateStore,
+    targets: &[state::WorkspacePrLookup],
+    results: Vec<Result<Vec<github::SourcedPr>, String>>,
+) -> (bool, usize) {
+    if results.len() != targets.len() {
+        return (false, 0);
+    }
+    let mut changed = false;
+    let mut refreshed = 0;
+    for (target, lookup) in targets.iter().zip(results) {
+        if let Err(error) = &lookup {
+            eprintln!(
+                "[codemux::pr-poll] workspace PR lookup failed for {}: {error}",
+                target.workspace_id
+            );
+        }
+        let outcome = github::workspace_prs_outcome(lookup);
+        if !matches!(outcome, github::WorkspacePrsOutcome::Preserve) {
+            refreshed += 1;
+        }
+        changed |= state.publish_workspace_pr_lookup(target, outcome);
+    }
+    (changed, refreshed)
+}
+
+#[cfg(test)]
+mod pr_publication_wiring_tests {
+    use super::*;
+
+    fn rows(number: u32) -> Vec<github::SourcedPr> {
+        vec![github::SourcedPr {
+            pr: serde_json::from_value(serde_json::json!({
+                "number": number, "state": "OPEN", "title": "Synthetic PR",
+                "url": format!("https://example.test/pr/{number}"), "head_branch": "fixture",
+            }))
+            .unwrap(),
+            source: github::PrSource::Branch,
+            checkout_branch: Some("fixture".into()),
+        }]
+    }
+
+    fn delayed_batch(clear: bool) {
+        let store = std::sync::Arc::new(state::AppStateStore::default());
+        store.clear_workspaces();
+        let a = store.create_workspace().0;
+        let b = store.create_workspace().0;
+        store.update_workspace_cwd(&a, "/synthetic/a".into());
+        store.update_workspace_cwd(&b, "/synthetic/b".into());
+        let targets = store.workspace_pr_poll_lookups();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = store.clone();
+        let batch = std::thread::spawn(move || {
+            let answer_a = Ok(rows(10));
+            done_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            publish_workspace_pr_batch(&worker, &targets, vec![answer_a, Ok(rows(20))])
+        });
+        done_rx.recv().unwrap();
+        let fresh = store.begin_workspace_pr_refresh(&a).unwrap();
+        store.publish_workspace_pr_lookup(
+            &fresh,
+            if clear {
+                github::WorkspacePrsOutcome::Clear
+            } else {
+                github::WorkspacePrsOutcome::Write(rows(11))
+            },
+        );
+        release_tx.send(()).unwrap();
+        let (changed, _) = batch.join().unwrap();
+        assert!(changed, "unrelated B still opens the emit gate");
+        let snapshot = store.snapshot();
+        let ws_a = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == a)
+            .unwrap();
+        let expected = if clear { None } else { Some(11) };
+        assert_eq!(ws_a.pr_number, expected);
+        assert_eq!(ws_a.prs.first().map(|p| p.number), expected);
+        let ws_b = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == b)
+            .unwrap();
+        assert_eq!(ws_b.pr_number, Some(20));
+        assert_eq!(ws_b.prs[0].number, 20);
+    }
+
+    #[test]
+    fn actual_batch_publication_delayed_b_refuses_old_a_write() {
+        delayed_batch(false);
+    }
+
+    #[test]
+    fn actual_batch_publication_delayed_b_refuses_old_a_clear() {
+        delayed_batch(true);
+    }
+
+    #[test]
+    fn actual_batch_preserve_bad_count_and_emit_gate() {
+        let store = state::AppStateStore::default();
+        store.clear_workspaces();
+        let id = store.create_workspace().0;
+        let targets = store.workspace_pr_poll_lookups();
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![]),
+            (false, 0)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Err("fixture unavailable".into())]),
+            (false, 0)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(rows(11))]),
+            (true, 1)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(rows(11))]),
+            (false, 1)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(vec![])]),
+            (true, 1)
+        );
+        assert_eq!(
+            publish_workspace_pr_batch(&store, &targets, vec![Ok(vec![])]),
+            (false, 1)
+        );
+        assert!(store
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == id)
+            .unwrap()
+            .prs
+            .is_empty());
+    }
+
+    #[test]
+    fn actual_callers_capture_before_io_and_use_guarded_publication() {
+        let source = include_str!("lib.rs");
+        let source = &source[source.rfind("pub fn run() {").unwrap()..];
+        let poll = source
+            .split("let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();")
+            .nth(1)
+            .unwrap();
+        let poll = poll
+            .split("if changed {\n                        // Coalesced")
+            .next()
+            .unwrap();
+        let poll: String = poll.chars().filter(|c| !c.is_whitespace()).collect();
+        let capture = poll
+            .find("letworkspaces=state.workspace_pr_poll_lookups();")
+            .unwrap();
+        assert!(capture < poll.find("spawn_blocking").unwrap());
+        assert!(poll.contains("publish_workspace_pr_batch(&state"));
+        assert!(poll.contains("state.publish_workspace_pr_lookup("));
+        assert!(!poll.contains("state.update_workspace_prs("));
+        let command = include_str!("commands/github.rs");
+        let refresh = command
+            .split("pub async fn refresh_workspace_pr<")
+            .nth(1)
+            .unwrap()
+            .split("/// List issues by repo path")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("refresh_workspace_pr_with_lookup("));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     diagnostics::record_startup_milestone("startup.run-enter");
@@ -1838,11 +2012,10 @@ fn build_core_app<R: tauri::Runtime>(
             // workspace, so active and inactive rows share one cadence and one
             // preserve/write/clear decision matrix.
             //
-            // Sequential per tick on purpose — each branch PR query is a
-            // subprocess fork, and we'd rather take ~Nx longer than slam
-            // `gh` with N parallel children. Provider subprocess helpers own
-            // hard kill+reap deadlines; awaiting the blocking task itself
-            // prevents a timed-out task from overlapping the next workspace.
+            // Provider classification and auth stay sequential. GitHub siblings
+            // then share bounded lightweight branch batches; other providers use
+            // their existing per-workspace lookup. Await each blocking owner so
+            // a slow tick cannot overlap the next one.
             //
             // Skips a workspace whose provider CLI is missing or logged
             // out. The probe is per *instance* (product + host) rather
@@ -1883,7 +2056,7 @@ fn build_core_app<R: tauri::Runtime>(
                         std::collections::HashMap::new();
 
                     let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();
-                    let workspaces = state.workspace_provider_poll_targets();
+                    let workspaces = state.workspace_pr_poll_lookups();
 
                     // `refreshed` counts workspaces this tick wrote to (the
                     // log's unit of work); `changed` is the narrower
@@ -1893,8 +2066,11 @@ fn build_core_app<R: tauri::Runtime>(
                     let mut refreshed = 0usize;
                     let mut skipped_unsupported = 0usize;
                     let mut skipped_unauthenticated = 0usize;
+                    let mut github_targets = Vec::new();
 
-                    for (workspace_id, cwd) in workspaces {
+                    for target in workspaces {
+                        let workspace_id = target.workspace_id.clone();
+                        let cwd = target.cwd.clone();
                         let path = std::path::PathBuf::from(&cwd);
 
                         // Classify from the local remote config, so a repo
@@ -1916,6 +2092,9 @@ fn build_core_app<R: tauri::Runtime>(
                             // not clear a last-known provider/PR pill.
                             Ok(Err(_)) | Err(_) => continue,
                         };
+                        if !github::workspace_pr_poll_target_is_current(
+                            &state.workspace_provider_poll_targets(), &workspace_id, &cwd,
+                        ) { continue; }
                         changed |= state.update_workspace_provider_kind(
                             &workspace_id,
                             git_provider::provider_kind_field(&detected),
@@ -1981,6 +2160,11 @@ fn build_core_app<R: tauri::Runtime>(
                             continue;
                         }
 
+                        if provider.kind() == git_provider::ProviderKind::GitHub {
+                            github_targets.push(target);
+                            continue;
+                        }
+
                         let path_for_pr = path.clone();
                         let provider_for_pr = provider.clone();
                         let queued_at = std::time::Instant::now();
@@ -1993,6 +2177,9 @@ fn build_core_app<R: tauri::Runtime>(
                         })
                         .await;
 
+                        if !github::workspace_pr_poll_target_is_current(
+                            &state.workspace_provider_poll_targets(), &workspace_id, &cwd,
+                        ) { continue; }
                         match pr_result {
                             Ok(lookup) => {
                                 if let Err(e) = &lookup {
@@ -2012,27 +2199,44 @@ fn build_core_app<R: tauri::Runtime>(
                                 // emits at most one snapshot per pass, so an
                                 // update that does not set the flag is an
                                 // update the renderer never hears about.
-                                match github::workspace_prs_outcome(lookup) {
-                                    github::WorkspacePrsOutcome::Write(prs) => {
-                                        changed |= state.update_workspace_prs(
-                                            &workspace_id,
-                                            workspace_pr_rows(prs),
-                                        );
-                                        refreshed += 1;
-                                    }
-                                    github::WorkspacePrsOutcome::Clear => {
-                                        changed |=
-                                            state.update_workspace_prs(&workspace_id, Vec::new());
-                                        refreshed += 1;
-                                    }
-                                    github::WorkspacePrsOutcome::Preserve => {}
+                                let outcome = github::workspace_prs_outcome(lookup);
+                                if !matches!(outcome, github::WorkspacePrsOutcome::Preserve) {
+                                    refreshed += 1;
                                 }
+                                changed |= state.publish_workspace_pr_lookup(&target, outcome);
                             }
                             Err(e) => {
                                 eprintln!(
                                     "[codemux::pr-poll] join error for {workspace_id}: {e}"
                                 );
                             }
+                        }
+                    }
+
+                    // GitHub siblings are resolved together after classification
+                    // and the per-instance auth gate. Other providers keep their
+                    // existing bounded per-workspace lookup.
+                    if !github_targets.is_empty() {
+                        let paths = github_targets
+                            .iter()
+                            .map(|target| std::path::PathBuf::from(&target.cwd))
+                            .collect::<Vec<_>>();
+                        let queued_at = std::time::Instant::now();
+                        let batch = tokio::task::spawn_blocking(move || {
+                            diagnostics::record_perf_timing("background.pr-poll.queue-delay", queued_at.elapsed());
+                            github::get_workspace_prs_batch(&paths)
+                        })
+                        .await;
+                        match batch {
+                            Ok(results) if results.len() == github_targets.len() => {
+                                let (batch_changed, batch_refreshed) = publish_workspace_pr_batch(&state, &github_targets, results);
+                                changed |= batch_changed;
+                                refreshed += batch_refreshed;
+                            }
+                            Ok(_) => {
+                                eprintln!("[codemux::pr-poll] invalid GitHub batch result count; preserving PRs")
+                            }
+                            Err(error) => eprintln!("[codemux::pr-poll] GitHub batch join error: {error}"),
                         }
                     }
 
