@@ -46,8 +46,8 @@ for line in sys.stdin:
 fn start(thread_id: ThreadId, cwd: &std::path::Path) -> StartSessionInput {
     StartSessionInput { thread_id, cwd: cwd.into(), model: None, resume_cursor: None,
         fresh_session: true, permission_mode: None, effort: None, context_window: None,
-        fast_mode: false, additional_directories: vec![], env: None, workspace_id: None,
-        extra: json!({}), recorded_usage_baseline: None }
+        fast_mode: false, service_tier: None, additional_directories: vec![], env: None,
+        workspace_id: None, remote: None, extra: json!({}), recorded_usage_baseline: None }
 }
 fn send(thread_id: ThreadId) -> SendTurnInput {
     SendTurnInput { thread_id, text: "Fixture only".into(), display_text: None, images: vec![],

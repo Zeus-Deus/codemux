@@ -310,9 +310,12 @@ impl LiveWorkflowDriver {
             effort: dispatch.route.effort.clone(),
             context_window: None,
             fast_mode: false,
+            service_tier: None,
             additional_directories: vec![],
             env: None,
             workspace_id: Some(dispatch.workspace_id.clone()),
+            // Managed attempts run in a local checkout under host containment.
+            remote: None,
             extra: Value::Null,
             recorded_usage_baseline: None,
         };

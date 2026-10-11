@@ -61,9 +61,11 @@ async fn managed_opencode_native_readiness_and_verified_stop_without_tokens() {
         permission_mode: None,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         env: None,
         workspace_id: None,
+        remote: None,
         extra: json!({}),
         recorded_usage_baseline: None,
     };

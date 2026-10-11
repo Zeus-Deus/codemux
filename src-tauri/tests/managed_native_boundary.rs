@@ -115,6 +115,7 @@ fn start(id: ThreadId, dir: &TempDir, capture: &PathBuf, mode: &str) -> StartSes
         effort: None,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         env: Some(HashMap::from([
             ("FAKE_MANAGED_MODE".into(), mode.into()),
@@ -124,6 +125,7 @@ fn start(id: ThreadId, dir: &TempDir, capture: &PathBuf, mode: &str) -> StartSes
             ),
         ])),
         workspace_id: None,
+        remote: None,
         extra: json!({"maxBudgetUsd":0.2,"maxTurns":6}),
         recorded_usage_baseline: None,
     }
