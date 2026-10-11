@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  isSingleStack,
   prSetLabel,
   prSetSummary,
   prsDescribeThisCheckout,
+  stackGroups,
   stackOrder,
   stackedOn,
   workspacePrs,
@@ -257,7 +259,14 @@ describe("prSetLabel", () => {
       "OPEN",
     ]);
     expect(prSetLabel(github, prs, prSetSummary(prs))).toBe(
-      "9 pull requests — 5 open, 4 merged. Opens #372",
+      "Stack of 9 pull requests — 5 open, 4 merged. Opens #372",
+    );
+  });
+
+  it("does not call unrelated PRs a stack", () => {
+    const prs = [pr(9, "OPEN", "a"), pr(3, "MERGED", "b")];
+    expect(prSetLabel(github, prs, prSetSummary(prs))).toBe(
+      "2 pull requests — 1 open, 1 merged. Opens #9",
     );
   });
 
@@ -288,3 +297,57 @@ describe("stackOrder", () => {
   });
 });
 
+
+describe("stackGroups", () => {
+  it("keeps a chain together, bottom first", () => {
+    const stack = stackOfNine(Array(9).fill("OPEN"));
+    const groups = stackGroups([stack[3], ...stack.slice(0, 3), ...stack.slice(4)]);
+    expect(groups.map((g) => g.map((p) => p.number))).toEqual([
+      [372, 373, 374, 375, 376, 377, 378, 379, 380],
+    ]);
+    expect(isSingleStack(stack)).toBe(true);
+  });
+
+  it("separates a stack from PRs that build on nothing", () => {
+    const prs = [
+      pr(10, "OPEN", "solo"),
+      pr(12, "OPEN", "top", "bottom"),
+      pr(11, "MERGED", "bottom"),
+    ];
+    expect(stackGroups(prs).map((g) => g.map((p) => p.number))).toEqual([
+      [11, 12],
+      [10],
+    ]);
+    expect(isSingleStack(prs)).toBe(false);
+  });
+
+  it("keeps two PRs on the same base in one stack", () => {
+    const prs = [pr(1, "OPEN", "base"), pr(2, "OPEN", "left", "base"), pr(3, "OPEN", "right", "base")];
+    expect(stackGroups(prs).map((g) => g.map((p) => p.number))).toEqual([[1, 2, 3]]);
+  });
+
+  it("keeps PRs based on each other in one group whatever order they arrive in", () => {
+    const a = pr(1, "OPEN", "x", "y");
+    const b = pr(2, "OPEN", "y", "x");
+    expect(stackGroups([a, b])).toHaveLength(1);
+    expect(stackGroups([b, a])).toHaveLength(1);
+  });
+
+  it("keeps a PR with the cycle it builds on when another cycle arrives between them", () => {
+    const prs = [
+      pr(9, "OPEN", "h9", "h5"),
+      pr(6, "OPEN", "h6", "h8"),
+      pr(5, "OPEN", "h5", "h7"),
+      pr(7, "OPEN", "h7", "h5"),
+      pr(8, "OPEN", "h8", "h6"),
+    ];
+    const groups = stackGroups(prs).map((g) => g.map((p) => p.number).sort());
+    expect(groups).toHaveLength(2);
+    expect(groups).toContainEqual([5, 7, 9]);
+    expect(groups).toContainEqual([6, 8]);
+  });
+
+  it("does not call a single PR a stack", () => {
+    expect(isSingleStack([pr(1, "OPEN")])).toBe(false);
+  });
+});

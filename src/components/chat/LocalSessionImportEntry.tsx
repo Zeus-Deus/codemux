@@ -5,14 +5,21 @@ import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { Button } from "@/components/ui/button";
 
-export function LocalSessionImportEntry({ firstRun = false }: { firstRun?: boolean }) {
+/** Importing reads chat history from this computer, so it needs agent chat,
+ *  the desktop app itself (not a web remote client) and the desktop layout. */
+export function useCanImportLocalSessions(): boolean {
   const enabled = useFeatureFlags((s) => s.enableAgentChat);
   const mobile = useMobileLayout();
+  return enabled && !isRemoteClient() && !mobile;
+}
+
+export function LocalSessionImportEntry({ firstRun = false }: { firstRun?: boolean }) {
+  const canImport = useCanImportLocalSessions();
   const empty = useAppStore((s) => s.appState !== null && (s.appState.workspaces?.length ?? 0) === 0);
   const dismissed = useUIStore((s) => s.localSessionImportOfferDismissed);
   const dismiss = useUIStore((s) => s.dismissLocalSessionImportOffer);
   const setOpen = useUIStore((s) => s.setShowLocalSessionImport);
-  if (!enabled || isRemoteClient() || mobile || (firstRun && (!empty || dismissed))) return null;
+  if (!canImport || (firstRun && (!empty || dismissed))) return null;
   return <div className="space-y-2 text-body text-muted-foreground">
     <p>{firstRun ? "Already working with Claude Code or Codex?" : "Copy recent Claude Code and Codex chats from this computer into read-only conversations."}</p>
     <div className="flex items-center gap-2">

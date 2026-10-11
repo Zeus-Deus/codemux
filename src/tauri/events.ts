@@ -20,6 +20,11 @@ export type UsageResumeBlockedReason =
   | "disabled" | "unknown_reset" | "reset_passed" | "reset_too_far"
   | "attempts_exhausted" | "cancelled" | "dispatch_failed" | "storage_failed";
 
+export const onCustomAcpChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen<unknown>("custom_acp_changed", () => cb());
+export const onCustomAcpCatalogChanged = (cb: EventCallback<{ thread_id: string; catalog: import("./custom-acp").AcpCatalog }>): Promise<UnlistenFn> =>
+  listen<{ thread_id: string; catalog: import("./custom-acp").AcpCatalog }>("custom_acp_catalog_changed", e => cb(e.payload));
+
 export const onAppStateChanged = (cb: EventCallback<AppStateSnapshot>): Promise<UnlistenFn> =>
   listen<AppStateSnapshot>("app-state-changed", (e) => cb(e.payload));
 

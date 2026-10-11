@@ -4,58 +4,43 @@
  * Closing the last tab used to collapse the whole panel, and opening a panel
  * whose deck was empty gave you a blank column with a one-line apology in
  * the middle of it ("No panes open — use + to add one"), pointing at a `+`
- * the eye had no reason to have found yet. Both now land here: a titled
- * placeholder over a grid of the surfaces this panel can actually open.
+ * the eye had no reason to have found yet. Both now land here: a titled,
+ * compact list of the surfaces this panel can actually open. It used to be
+ * a grid of described cards, which read heavier than anything else in the
+ * panel; each surface's description is now its tooltip.
  *
- * The cards are not a second menu. They render the exact `SurfaceAction`
+ * The rows are not a second menu. They render the exact `SurfaceAction`
  * array the `+` menu renders (built in `right-panel.tsx`), so availability
- * rules and handlers can't diverge — a Browser card opens the docked
- * browser pane, a Terminal card opens a real terminal in the main area,
+ * rules and handlers can't diverge — a Browser row opens the docked
+ * browser pane, a Terminal row opens a real terminal in the main area,
  * same as the menu items.
- *
- * The grid is container-relative, not viewport-relative: the panel can be
- * 240px or 1400px wide inside the same window, so a `sm:` breakpoint would
- * be measuring the wrong box.
  */
-import { cn } from "@/lib/utils";
-
 import type { SurfaceAction } from "./surface-actions";
 
 export function PanePicker({ surfaces }: { surfaces: SurfaceAction[] }) {
   return (
     <div
       data-testid="right-panel-picker"
-      className="@container flex h-full min-h-0 items-center justify-center overflow-y-auto p-6"
+      // The bottom padding matches the tab row above, so the list sits at
+      // the optical centre of the whole panel rather than of its body.
+      className="flex h-full min-h-0 items-center justify-center overflow-y-auto px-6 pb-10"
     >
-      <div className="w-full max-w-[520px]">
-        <div className="mb-4 text-center">
-          <h3 className="text-body font-medium text-foreground">
-            Open a surface
-          </h3>
-          <p className="mt-1 text-label text-muted-foreground">
-            Choose what to show in the right panel.
-          </p>
-        </div>
-        <div className="grid grid-cols-1 gap-2 @[380px]:grid-cols-2">
+      <div className="w-full max-w-[280px] py-6">
+        <h3 className="mb-3 text-center text-body font-medium text-foreground">
+          Open a surface
+        </h3>
+        <div className="flex flex-col gap-0.5">
           {surfaces.map((surface) => (
             <button
               key={surface.id}
               type="button"
               data-testid={`right-panel-picker-${surface.id}`}
+              title={surface.description}
               onClick={surface.onOpen}
-              className={cn(
-                "flex w-full flex-col items-start rounded-lg border border-border/70 bg-card p-3 text-left",
-                "transition-colors duration-100",
-                "hover:border-border hover:bg-surface-2",
-              )}
+              className="flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-body text-foreground/70 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground"
             >
-              <surface.icon className="mb-2 size-[18px] text-foreground/70" />
-              <span className="text-body font-medium text-foreground">
-                {surface.label}
-              </span>
-              <span className="mt-0.5 text-label leading-relaxed text-muted-foreground">
-                {surface.description}
-              </span>
+              <surface.icon className="size-4 shrink-0" />
+              <span className="min-w-0 flex-1 truncate">{surface.label}</span>
             </button>
           ))}
         </div>

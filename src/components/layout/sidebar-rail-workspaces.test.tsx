@@ -429,6 +429,44 @@ describe("SidebarRailWorkspaces", () => {
     expect(state.activity).toEqual({});
   });
 
+  it("names each button with its status and pin and marks the current one", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Blocked", surfaces: surfaceWithPane("p1"), pinned_at: 100 }),
+      makeWorkspace({ title: "Quiet" }),
+    ];
+    paneStatuses = { p1: "permission" };
+    activeWorkspaceId = "ws-2";
+    const { container } = await renderRail();
+
+    const blocked = container.querySelector('[data-rail-ws="ws-1"]');
+    const quiet = container.querySelector('[data-rail-ws="ws-2"]');
+    expect(blocked).toHaveAttribute("aria-label", "Blocked, Needs you, pinned");
+    expect(blocked).not.toHaveAttribute("aria-current");
+    expect(quiet).toHaveAttribute("aria-label", "Quiet");
+    expect(quiet).toHaveAttribute("aria-current", "page");
+  });
+
+  it("gives workspaces that share a project a monogram, and a lone one none", async () => {
+    workspaces = [
+      makeWorkspace({ title: "bom-import" }),
+      makeWorkspace({ title: "supplier sync" }),
+      makeWorkspace({
+        title: "Solo",
+        cwd: "/home/u/projects/other",
+        project_root: "/home/u/projects/other",
+      }),
+    ];
+    const { container } = await renderRail();
+
+    const monogram = (id: string) =>
+      container
+        .querySelector(`[data-rail-ws="${id}"] [data-rail-monogram]`)
+        ?.textContent ?? null;
+    expect(monogram("ws-1")).toBe("BI");
+    expect(monogram("ws-2")).toBe("SS");
+    expect(monogram("ws-3")).toBeNull();
+  });
+
   it("clicking a button activates its workspace", async () => {
     workspaces = [makeWorkspace({ title: "Open me" })];
     const { container } = await renderRail();

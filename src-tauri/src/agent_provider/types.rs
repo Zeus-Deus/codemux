@@ -30,6 +30,8 @@ pub enum ProviderKind {
     Grok,
     /// Official Hermes ACP, bound to an existing local profile.
     Hermes,
+    /// User-configured instances speaking the standard Agent Client Protocol.
+    Acp,
     /// OpenCode via the `opencode` HTTP server. Step 12 Stage 1 scaffold —
     /// the runtime adapter is not implemented yet and command dispatch
     /// returns a placeholder error.

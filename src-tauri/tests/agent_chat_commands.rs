@@ -2519,11 +2519,13 @@ fn usage_limit_codex_turn_waits_for_weekly_and_hourly_windows() {
             used_pct: 100.0,
             resets_at_ms: Some(hourly_reset),
             label: Some("five_hour".into()),
+            window_mins: None,
         }, PlanUsageWindow {
             kind: PlanWindowKind::SevenDay,
             used_pct: 100.0,
             resets_at_ms: Some(reset),
             label: Some("seven_day".into()),
+            window_mins: None,
         }],
         None,
         None,
