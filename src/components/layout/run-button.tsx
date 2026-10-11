@@ -18,6 +18,7 @@ import {
   getWorkspaceConfig,
   runProjectDevCommand,
 } from "@/tauri/commands";
+import { reportFailure } from "@/lib/toast";
 
 interface RunButtonProps {
   workspaceId: string;
@@ -70,7 +71,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   const setShowSettings = useUIStore.getState().setShowSettings;
 
   const handleRun = () => {
-    runProjectDevCommand(workspaceId).catch(console.error);
+    runProjectDevCommand(workspaceId).catch(reportFailure("Couldn't run the dev command"));
   };
 
   const handleConfigure = () => {

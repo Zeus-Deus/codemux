@@ -59,7 +59,7 @@ import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
-import { toast } from "@/lib/toast";
+import { toast, reportFailure } from "@/lib/toast";
 import { applyPreset, openInEditor } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
@@ -111,9 +111,12 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
       if (!workspacePath || isLoading) return;
       setIsLoading(true);
       useSyncedSettingsStore.getState().updateSetting("editor", "default_ide", editorId);
-      openInEditor(editorId, workspacePath).finally(() => setIsLoading(false));
+      const editorName = editors.find((e) => e.id === editorId)?.name ?? "the editor";
+      openInEditor(editorId, workspacePath)
+        .catch(reportFailure(`Couldn't open in ${editorName}`))
+        .finally(() => setIsLoading(false));
     },
-    [workspacePath, isLoading],
+    [workspacePath, isLoading, editors],
   );
 
   const defaultEditor = editors.find((e) => e.id === defaultEditorId);

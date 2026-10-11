@@ -32,7 +32,8 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 vi.mock("@/lib/toast", () => ({
-  toast: { info: vi.fn(), warning: vi.fn(), error: vi.fn(), success: vi.fn() },
+  toast: { info: vi.fn(), warning: vi.fn(), error: vi.fn(), failure: vi.fn(), success: vi.fn() },
+  errorMessage: (err: unknown) => String(err),
 }));
 
 import {
@@ -255,8 +256,9 @@ describe("ProjectOnboarding — failures", () => {
       failActivate("window busy");
     });
 
-    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
-      "The workspace was created but couldn't be opened: window busy",
+    expect(vi.mocked(toast.failure)).toHaveBeenCalledWith(
+      "The workspace was created but couldn't be opened",
+      "window busy",
     );
     expect(mockCloseWorkspace).not.toHaveBeenCalled();
   });
@@ -317,8 +319,9 @@ describe("ProjectOnboarding — failures", () => {
     await importAll();
     await flushMountEffects();
 
-    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
-      "Imported, but couldn't open the workspace: window busy",
+    expect(vi.mocked(toast.failure)).toHaveBeenCalledWith(
+      "Imported, but couldn't open the workspace",
+      "window busy",
     );
   });
 

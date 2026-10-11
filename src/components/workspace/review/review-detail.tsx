@@ -587,7 +587,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onRefresh();
         toast.success(`Merged #${pr.number}`);
       } catch (err) {
-        toast.error(String(err));
+        toast.failure("Couldn't merge the pull request", err);
       } finally {
         setMerging(false);
       }
@@ -601,7 +601,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       onRefresh();
       toast.success("Marked ready for review");
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't mark it ready for review", err);
     }
   }, [cwd, pr.number, onRefresh]);
 
@@ -611,7 +611,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       onRefresh();
       toast.success(`Closed #${pr.number}`);
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't close the pull request", err);
     }
   }, [cwd, pr.number, onRefresh]);
 
@@ -621,7 +621,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       const branch = await checkoutDefaultBranchInWorkspace(workspaceId);
       toast.success(`Switched to ${branch}`);
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't switch to the default branch", err);
     }
   }, [workspaceId]);
 
@@ -631,7 +631,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       onRefresh();
       toast.success("Pulled");
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't pull", err);
     }
   }, [cwd, onRefresh]);
 
@@ -642,7 +642,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       onRefresh();
       toast.success("Stashed and pulled");
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't stash and pull", err);
     }
   }, [cwd, onRefresh]);
 
@@ -663,7 +663,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const openPrPath = useCallback(
     (suffix: string) => {
-      openUrl(`${pr.url}${suffix}`).catch((err) => toast.error(String(err)));
+      openUrl(`${pr.url}${suffix}`).catch((err) => toast.failure("Couldn't open the link", err));
     },
     [pr.url],
   );
@@ -1007,7 +1007,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       prNumber: pr.number,
       existingWorkspaceId,
     })
-      .catch((err) => toast.error(String(err)))
+      .catch((err) => toast.failure("Couldn't check out the pull request", err))
       .finally(() => setCheckingOut(false));
   }, [checkingOut, projectRoot, pr.head_branch, pr.number, existingWorkspaceId]);
 

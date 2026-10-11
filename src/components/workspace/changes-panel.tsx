@@ -169,7 +169,7 @@ function FileRow({
       else await gitStageFiles(cwd, [file.path]);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(staged ? "Couldn't unstage the file" : "Couldn't stage the file", err);
     }
   };
 
@@ -187,7 +187,7 @@ function FileRow({
       await gitDiscardFile(cwd, file.path);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't discard the changes", err);
     }
     setConfirmDiscard(false);
   };
@@ -327,7 +327,7 @@ function FileSection({
       else await gitUnstageFiles(cwd, paths);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(bulkAction === "stage" ? "Couldn't stage the files" : "Couldn't unstage the files", err);
     }
   };
   return (
@@ -559,7 +559,7 @@ export function ChangesPanel({
         await gitStageFiles(cwd, unstaged.map((f) => f.path));
         refresh();
       } catch (err) {
-        toast.error(`Stage failed: ${err}`);
+        toast.failure("Stage failed", err);
         return;
       }
     }
@@ -597,14 +597,14 @@ export function ChangesPanel({
         try {
           await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
         } catch (err) {
-          toast.error(`Push after commit failed: ${err}`);
+          toast.failure("Push after commit failed", err);
         }
         setPushAfterCommit(false);
       }
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Commit failed: ${err}`);
+      toast.failure("Commit failed", err);
     } finally {
       setBusy(null);
     }
@@ -622,7 +622,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Amend failed: ${err}`);
+      toast.failure("Amend failed", err);
     } finally {
       setBusy(null);
     }
@@ -637,7 +637,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Undo failed: ${err}`);
+      toast.failure("Undo failed", err);
     } finally {
       setBusy(null);
     }
@@ -651,7 +651,7 @@ export function ChangesPanel({
       toast.success("Stashed changes");
       refresh();
     } catch (err) {
-      toast.error(`Stash failed: ${err}`);
+      toast.failure("Stash failed", err);
     } finally {
       setBusy(null);
     }
@@ -665,7 +665,7 @@ export function ChangesPanel({
       toast.success("Popped stash");
       refresh();
     } catch (err) {
-      toast.error(`Stash pop failed: ${err}`);
+      toast.failure("Stash pop failed", err);
     } finally {
       setBusy(null);
     }
@@ -689,7 +689,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Push failed: ${err}`);
+      toast.failure("Push failed", err);
     } finally {
       setBusy(null);
     }
@@ -703,7 +703,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Pull failed: ${err}`);
+      toast.failure("Pull failed", err);
     } finally {
       setBusy(null);
     }
@@ -718,7 +718,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Sync failed: ${err}`);
+      toast.failure("Sync failed", err);
     } finally {
       setBusy(null);
     }
@@ -731,7 +731,7 @@ export function ChangesPanel({
       await gitFetchChanges(cwd);
       refresh();
     } catch (err) {
-      toast.error(`Fetch failed: ${err}`);
+      toast.failure("Fetch failed", err);
     } finally {
       setBusy(null);
     }
@@ -744,7 +744,7 @@ export function ChangesPanel({
       await abortMerge(cwd);
       refresh();
     } catch (err) {
-      toast.error(`Abort failed: ${err}`);
+      toast.failure("Abort failed", err);
     } finally {
       setBusy(null);
     }
@@ -758,7 +758,7 @@ export function ChangesPanel({
       refresh();
       invalidateReviewQueries();
     } catch (err) {
-      toast.error(`Continue failed: ${err}`);
+      toast.failure("Continue failed", err);
     } finally {
       setBusy(null);
     }

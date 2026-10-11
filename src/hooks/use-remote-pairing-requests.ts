@@ -52,7 +52,7 @@ function askToApprove(session: WebRemoteSessionView): void {
             }
           })
           .catch((err) =>
-            toast.error(`Couldn't approve ${device.title}: ${String(err)}`),
+            toast.failure(`Couldn't approve ${device.title}`, err),
           );
       },
     },
@@ -60,7 +60,7 @@ function askToApprove(session: WebRemoteSessionView): void {
       label: "Reject",
       onClick: () => {
         webRemoteRejectSession(session.id).catch((err) =>
-          toast.error(`Couldn't reject ${device.title}: ${String(err)}`),
+          toast.failure(`Couldn't reject ${device.title}`, err),
         );
       },
     },

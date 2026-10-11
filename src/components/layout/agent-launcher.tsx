@@ -27,7 +27,7 @@ import { BAND_CONTROL_RADIUS } from "@/components/layout/titlebar-control-style"
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
 import { cn } from "@/lib/utils";
-import { toast } from "@/lib/toast";
+import { toast, reportFailure } from "@/lib/toast";
 import type { ChatDraft } from "@/stores/chat-draft-store";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -346,7 +346,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
 
   const createTerminal = () => {
     setOpen(false);
-    createTab(workspaceId, "terminal").catch(console.error);
+    createTab(workspaceId, "terminal").catch(reportFailure("Couldn't open a terminal tab"));
   };
 
   const createBrowser = () => {
@@ -354,7 +354,7 @@ export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps)
     const surface = workspace.surfaces.find(
       (s) => s.surface_id === workspace.active_surface_id,
     );
-    if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
+    if (surface) createBrowserPane(surface.active_pane_id).catch(reportFailure("Couldn't open a browser pane"));
   };
 
   const managePresets = () => {

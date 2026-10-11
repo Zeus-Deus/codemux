@@ -318,7 +318,7 @@ export function ReviewCodeTab({
           onPosted();
           toast.success("Comment posted");
         })
-        .catch((err) => toast.error(String(err)))
+        .catch((err) => toast.failure("Couldn't post the comment", err))
         .finally(() => setPosting(false));
     },
     [selection, headOid, cwd, prNumber, onPosted],

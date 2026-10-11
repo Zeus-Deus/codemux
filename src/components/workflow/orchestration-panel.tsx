@@ -125,7 +125,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
       (err: unknown) => {
         useAgentChatStore.getState().markRequestPending(threadId, approvalRequestId);
         setSending(null);
-        toast.error(`Failed to send decision: ${err}`);
+        toast.failure("Failed to send decision", err);
       },
     );
   };
