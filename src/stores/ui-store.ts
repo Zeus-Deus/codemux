@@ -88,6 +88,10 @@ interface UIStore {
    *  rather than in `SidebarProvider` because full-screen pages (Settings,
    *  Automations, …) unmount the provider. Clamped by the provider. */
   sidebarWidth: number;
+  /** Left sidebar expanded (true) or collapsed to the icon rail. Persisted
+   *  next to its width so the two halves of one preference survive a
+   *  restart together. */
+  sidebarOpen: boolean;
   /** The panel width the user dragged to, or `null` until they do — the
    *  panel then opens at a window-relative default. See
    *  `resolveRightPanelWidth` in `@/lib/right-panel-width`. */
@@ -235,7 +239,10 @@ interface UIStore {
     order: readonly RightPanelTab[],
   ) => void;
   setSidebarWidth: (width: number) => void;
+  setSidebarOpen: (open: boolean) => void;
   setRightPanelWidth: (width: number | null) => void;
+  /** Back to the window-relative default (`null`), as if never dragged. */
+  resetRightPanelWidth: () => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
@@ -305,6 +312,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
       sidebarWidth: 288,
+      sidebarOpen: true,
       rightPanelWidth: null,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
@@ -551,7 +559,11 @@ export const useUIStore = create<UIStore>()(
                 ),
         }),
 
+      resetRightPanelWidth: () => set({ rightPanelWidth: null }),
+
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
+
+      setSidebarOpen: (open) => set({ sidebarOpen: open }),
 
       setRightPanelRowWidth: (width) =>
         set((state) =>
@@ -718,6 +730,7 @@ export const useUIStore = create<UIStore>()(
         rightPanelPanes: state.rightPanelPanes,
         rightPanelDismissedPanes: state.rightPanelDismissedPanes,
         sidebarWidth: state.sidebarWidth,
+        sidebarOpen: state.sidebarOpen,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,
