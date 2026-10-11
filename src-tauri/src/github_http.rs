@@ -317,6 +317,9 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows hands back accepted sockets in the listener's
+                        // non-blocking mode; the read loop below needs blocking reads.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
