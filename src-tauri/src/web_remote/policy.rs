@@ -39,6 +39,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "archive_workspace"
             | "activate_pane"
             | "file_exists"
+            | "file_signature"
             | "grep_count_pattern"
             | "git_log_entries"
             | "git_commits_ahead"

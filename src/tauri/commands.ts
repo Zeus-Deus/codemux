@@ -1476,6 +1476,11 @@ export const readFile = (path: string) =>
 export const writeFile = (path: string, content: string) =>
   invoke<void>("write_file", { path, content });
 
+/** Opaque size + mtime token. Cheap enough to poll; when it moves, re-read
+ *  the file to learn whether its content actually changed. */
+export const fileSignature = (path: string) =>
+  invoke<string>("file_signature", { path });
+
 export const grepCountPattern = (cwd: string, pattern: string) =>
   invoke<number>("grep_count_pattern", { cwd, pattern });
 
