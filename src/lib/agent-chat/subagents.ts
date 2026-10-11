@@ -1,5 +1,10 @@
 import type { SubagentSnapshot, SubagentStatus } from "@/tauri/events";
 
+import {
+  formatDelegationElapsed,
+  isDelegatedRow,
+  isDelegationResultsText,
+} from "./delegation";
 import type {
   ChatViewItem,
   SubagentRunItem,
@@ -114,6 +119,7 @@ export function mergeSnapshot(
   // `task_kind`, so a null must never un-classify a known watch loop.
   if (snap.task_kind != null) next.taskKind = snap.task_kind;
   if (snap.model != null) next.model = snap.model;
+  if (snap.effort != null) next.effort = snap.effort;
   if (snap.activity != null) next.activity = snap.activity;
   if (snap.result_text != null) next.resultText = snap.result_text;
   if (snap.tool_use_count != null) next.toolUseCount = snap.tool_use_count;
@@ -174,11 +180,28 @@ export function subagentElapsedMs(
   if (isRunning(view)) return Math.max(0, now - view.startedAt);
   // Settled: freeze at the settle stamp. A settled row with no stamp gets
   // no elapsed at all rather than a readout that keeps growing from its
-  // start time forever (the "18295m" tombstones).
-  if (view.finishedAt != null) {
+  // start time forever (the "18295m" tombstones). A delegated task's only
+  // honest figure is the backend's duration: one that ended without it
+  // (Codemux closed mid-task) would otherwise count the closed hours.
+  if (view.finishedAt != null && !isDelegatedRow(view)) {
     return Math.max(0, view.finishedAt - view.startedAt);
   }
   return null;
+}
+
+/** Longest elapsed among delegated rows ("2m 14s", see
+ *  `formatDelegationElapsed`), "" when none has one. A group of parallel
+ *  tasks took as long as its longest. */
+export function delegationElapsedLabel(
+  views: ReadonlyArray<SubagentView | null>,
+  now: number,
+): string {
+  let longest: number | null = null;
+  for (const view of views) {
+    const ms = view ? subagentElapsedMs(view, now) : null;
+    if (ms != null) longest = Math.max(longest ?? 0, ms);
+  }
+  return longest == null ? "" : formatDelegationElapsed(longest);
 }
 
 /** "2m 41s" style compact duration. */
@@ -461,7 +484,7 @@ export function subagentRunItems(messages: ChatViewItem[]): SubagentRunItem[] {
 /**
  * Whether a subagent row should read as **live activity** right now.
  *
- * Running/pending is necessary but not sufficient, for two independent
+ * Running/pending is necessary but not sufficient, for three independent
  * reasons:
  *
  * - A **watch loop** (`taskKind === "monitor"`) is never agent work at
@@ -478,9 +501,14 @@ export function subagentRunItems(messages: ChatViewItem[]): SubagentRunItem[] {
  *   including across a restart (the snapshots are persisted and
  *   hydrate-replayed).
  *
- * The two classifications are complementary and a row can carry both:
- * `taskKind` is precise but needs the SDK to report `task_type`, while
- * `backgroundTask` is derived from the launch registry and works
+ * - A **cross-provider delegation** runs in its own chat tab and reports
+ *   back between turns. The parent is not waiting on it, so it never
+ *   counts as the parent's work ("Waiting on a background task", the
+ *   subagent bar); the delegation occupant tracks it instead.
+ *
+ * The first two classifications are complementary and a row can carry
+ * both: `taskKind` is precise but needs the SDK to report `task_type`,
+ * while `backgroundTask` is derived from the launch registry and works
  * regardless. Either one alone is enough to drop the row from the bar.
  */
 export function isLiveActivity(
@@ -488,7 +516,7 @@ export function isLiveActivity(
   streaming: boolean,
 ): boolean {
   if (!isRunning(view)) return false;
-  if (isMonitorTask(view)) return false;
+  if (isMonitorTask(view) || isDelegatedRow(view)) return false;
   return streaming || !view.backgroundTask;
 }
 
@@ -580,6 +608,20 @@ export function runningSubagentEntries(
     }
   });
   return entries;
+}
+
+/** Every cross-provider delegation still in flight, in spawn order. The
+ *  backend owns their settle, so nothing here infers one. */
+export function runningDelegations(messages: ChatViewItem[]): SubagentView[] {
+  // Re-derived on every pane render; most threads have nothing running.
+  if (!hasRunningSubagents(messages)) return [];
+  const out: SubagentView[] = [];
+  for (const card of subagentRunItems(messages)) {
+    for (const sub of card.subagents) {
+      if (isDelegatedRow(sub) && isRunning(sub)) out.push(sub);
+    }
+  }
+  return out;
 }
 
 // ── Transcript index ──
@@ -841,6 +883,10 @@ export function settleSubagentsForToolResult(
  * hydrate reconciliation, so a transcript that ends mid-run never renders
  * a perpetual spinner. Returns the SAME array reference when none were
  * running.
+ *
+ * Cross-provider delegations are exempt: they outlive the parent's turn and
+ * session by design, and the backend persists their terminal snapshot
+ * (including "Codemux closed before this task finished" after a restart).
  */
 export function interruptRunningSubagents(
   messages: ChatViewItem[],
@@ -850,7 +896,7 @@ export function interruptRunningSubagents(
   // and hydrate settle — is that nothing is running. Skip the map.
   if (!hasRunningSubagents(messages)) return messages;
   return mapAllSubagents(messages, (sub) => {
-    if (!isRunning(sub)) return sub;
+    if (!isRunning(sub) || isDelegatedRow(sub)) return sub;
     const settled: SubagentView = {
       ...sub,
       status: "interrupted",
@@ -905,7 +951,10 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
   for (const item of ordered) {
     if (item.kind === "user_message") {
       if (item.queued || item.inflight) continue;
-      const line = firstLine(item.text);
+      // The results turn reads as the trail and divider name it.
+      const line = isDelegationResultsText(item.text)
+        ? "Delegated results"
+        : firstLine(item.text);
       prompt = line.length > 0 ? line : null;
       promptId = prompt == null ? null : item.id;
       continue;

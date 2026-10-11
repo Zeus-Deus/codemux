@@ -434,10 +434,12 @@ export function ChangesPanel({
   }, [loaded, returnFocusPath]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
-  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
+  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | "stash-pop" | null>(null);
   const [editing, setEditing] = useState(false);
   const [editedMsg, setEditedMsg] = useState("");
   const [pushAfterCommit, setPushAfterCommit] = useState(false);
+  const [justDone, setJustDone] = useState<RemoteAction | null>(null);
+  const justDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -610,15 +612,38 @@ export function ChangesPanel({
     }
   };
 
+  // Push, Pull and Sync confirm on the button itself — a brief check
+  // where the spinner was — instead of a toast for something you just
+  // watched happen.
+  const flashDone = useCallback((action: RemoteAction) => {
+    if (justDoneTimer.current) clearTimeout(justDoneTimer.current);
+    setJustDone(action);
+    justDoneTimer.current = setTimeout(() => setJustDone(null), DONE_FLASH_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (justDoneTimer.current) clearTimeout(justDoneTimer.current);
+    },
+    [],
+  );
+
   const handleAmend = async () => {
     if (busy) return;
     setBusy("amend");
     try {
-      if (unstaged.length > 0 && staged.length === 0) {
+      // Nothing staged means "amend with everything", and the menu item
+      // says so; the toast repeats it so the scope is never a surprise.
+      const stagedAll = unstaged.length > 0 && staged.length === 0;
+      if (stagedAll) {
         await gitStageFiles(cwd, unstaged.map((f) => f.path));
       }
       await gitAmendCommit(cwd, null);
-      toast.success("Amended last commit");
+      toast.success(
+        stagedAll
+          ? `Amended last commit with ${unstaged.length} ${unstaged.length === 1 ? "file" : "files"}`
+          : "Amended last commit",
+      );
       refresh();
       invalidateReviewQueries();
     } catch (err) {
@@ -659,7 +684,7 @@ export function ChangesPanel({
 
   const handleStashPop = async () => {
     if (busy) return;
-    setBusy("stash");
+    setBusy("stash-pop");
     try {
       await gitStashPop(cwd);
       toast.success("Popped stash");
@@ -688,6 +713,7 @@ export function ChangesPanel({
       await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
       refresh();
       invalidateReviewQueries();
+      flashDone("push");
     } catch (err) {
       toast.failure("Push failed", err);
     } finally {
@@ -702,6 +728,7 @@ export function ChangesPanel({
       await gitPullChanges(cwd);
       refresh();
       invalidateReviewQueries();
+      flashDone("pull");
     } catch (err) {
       toast.failure("Pull failed", err);
     } finally {
@@ -717,6 +744,7 @@ export function ChangesPanel({
       await gitPushChanges(cwd, false);
       refresh();
       invalidateReviewQueries();
+      flashDone("sync");
     } catch (err) {
       toast.failure("Sync failed", err);
     } finally {
@@ -993,6 +1021,7 @@ export function ChangesPanel({
             isGenerating={isGenerating ?? false}
             isMerging={isMerging}
             busy={busy}
+            justDone={justDone}
             onCommit={() => beginCommit(false)}
             onCommitAndPush={() => beginCommit(true)}
             onAmend={handleAmend}
@@ -1013,19 +1042,42 @@ export function ChangesPanel({
   );
 }
 
+type RemoteAction = "push" | "pull" | "sync";
+
+const DONE_FLASH_MS = 1200;
+
+/** What the primary says while an action from it or its menu runs. */
+const IN_FLIGHT_LABEL: Partial<Record<string, string>> = {
+  push: "Pushing…",
+  pull: "Pulling…",
+  sync: "Syncing…",
+  fetch: "Fetching…",
+  amend: "Amending…",
+  undo: "Undoing…",
+  stash: "Stashing…",
+  "stash-pop": "Popping…",
+};
+
+const DONE_LABEL: Record<RemoteAction, string> = {
+  push: "Pushed",
+  pull: "Pulled",
+  sync: "Synced",
+};
+
 // ── SmartCommitButton ──
 //
 // Primary action morphs with state: Commit when there's something to
 // commit, Push when ahead, Pull when behind, Sync when both, Fetch when
 // clean and even. Dropdown always exposes every action so power users
 // aren't trapped by the heuristic.
-function SmartCommitButton({
+export function SmartCommitButton({
   loading,
   hasChanges,
   staged,
   isGenerating,
   isMerging,
   busy,
+  justDone,
   onCommit,
   onCommitAndPush,
   onAmend,
@@ -1046,6 +1098,7 @@ function SmartCommitButton({
   isGenerating: boolean;
   isMerging: boolean;
   busy: string | null;
+  justDone: RemoteAction | null;
   onCommit: () => void;
   onCommitAndPush: () => void;
   onAmend: () => void;
@@ -1089,7 +1142,23 @@ function SmartCommitButton({
     return { label: "Fetch", icon: <Download className="size-3" />, action: onFetch, disabled: busy !== null };
   })();
 
-  if (!primary) {
+  // A running action (from the primary or the menu) takes over the
+  // primary's label in place, then briefly confirms; the box never moves.
+  const inFlight = busy ? IN_FLIGHT_LABEL[busy] : undefined;
+  const display = !primary
+    ? null
+    : inFlight
+      ? { label: inFlight, icon: <Loader2 className="size-3 motion-safe:animate-spin" /> }
+      : justDone && !hasChanges
+        ? {
+            label: DONE_LABEL[justDone],
+            icon: (
+              <Check className="size-3 text-status-open motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150" />
+            ),
+          }
+        : primary;
+
+  if (!primary || !display) {
     return (
       <div className="text-caption text-muted-foreground/60 text-center py-1">
         Resolve or abort the merge above.
@@ -1116,9 +1185,10 @@ function SmartCommitButton({
         )}
         onClick={primary.action}
         disabled={primary.disabled}
+        aria-busy={inFlight ? true : undefined}
       >
-        {primary.icon}
-        {primary.label}
+        {display.icon}
+        {display.label}
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -1148,7 +1218,7 @@ function SmartCommitButton({
               </DropdownMenuItem>
               <DropdownMenuItem onClick={onAmend}>
                 <Pencil className="size-3 mr-2" />
-                Amend last commit
+                {staged > 0 ? "Amend last commit" : "Amend with all changes"}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
             </>

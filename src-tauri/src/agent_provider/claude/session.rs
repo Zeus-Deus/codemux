@@ -386,7 +386,16 @@ impl ClaudeSession {
             // server. Tools added after session start aren't visible
             // until the chat is restarted (Stage 4 polish will add a
             // `setMcpServers` push path so dynamic refreshes work).
-            mcp_tools: collect_mcp_tools(mcp_registry.as_ref()).await,
+            mcp_tools: collect_mcp_tools(
+                mcp_registry.as_ref(),
+                &crate::mcp::registry::HostCaller {
+                    thread_id: thread_id.0.clone(),
+                    provider: crate::agent_provider::ProviderKind::Claude,
+                    workspace_id: input.workspace_id.clone(),
+                    permission_mode: input.permission_mode.clone(),
+                },
+            )
+            .await,
         };
         let params_value = serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
             message: "failed to serialize start-session params".into(),
@@ -826,6 +835,16 @@ impl ClaudeSession {
             },
         });
         Ok(turn_id)
+    }
+
+    /// This session as a host-tool caller, with its current permission mode.
+    async fn host_caller(&self) -> crate::mcp::registry::HostCaller {
+        crate::mcp::registry::HostCaller {
+            thread_id: self.thread_id.0.clone(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: self.workspace_id.clone(),
+            permission_mode: self.state.lock().await.permission_mode.clone(),
+        }
     }
 
     /// Whether the child-exit watchdog has declared this session's sidecar
@@ -1355,7 +1374,8 @@ async fn push_mcp_refresh(
     session: &Arc<ClaudeSession>,
     registry: &crate::mcp::registry::McpRegistry,
 ) {
-    let tools = collect_shared_tools_for_claude(registry).await;
+    let caller = session.host_caller().await;
+    let tools = collect_shared_tools_for_claude(registry, &caller).await;
     let entries: Vec<super::protocol::McpToolEntry> = tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1397,11 +1417,12 @@ async fn push_mcp_refresh(
 /// just doesn't register the in-process MCP server.
 async fn collect_mcp_tools(
     registry: Option<&crate::mcp::registry::McpRegistry>,
+    caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<super::protocol::McpToolEntry> {
     let Some(registry) = registry else {
         return Vec::new();
     };
-    let tools = collect_shared_tools_for_claude(registry).await;
+    let tools = collect_shared_tools_for_claude(registry, caller).await;
     tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1414,16 +1435,22 @@ async fn collect_mcp_tools(
         .collect()
 }
 
+/// The single choke point for the tools a Claude session sees, at start and
+/// on every live refresh: the shared registry surface plus the host tools
+/// Codemux serves to this particular chat.
 async fn collect_shared_tools_for_claude(
     registry: &crate::mcp::registry::McpRegistry,
+    caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<crate::mcp::runtime::McpTool> {
-    registry
+    let mut tools = registry
         .list_all_tools_excluding_sources(&[
             crate::mcp::McpConfigSource::ClaudeUser,
             crate::mcp::McpConfigSource::ClaudeLocal,
             crate::mcp::McpConfigSource::ClaudeProject,
         ])
-        .await
+        .await;
+    tools.extend(registry.host_tools(caller));
+    tools
 }
 
 /// Format a tool result payload the way Anthropic's MCP SDK expects:
@@ -1462,8 +1489,10 @@ async fn handle_mcp_tool_call(
     };
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    let caller = session.host_caller().await;
     let (payload, failure) = run_mcp_tool_call(
         session.mcp_registry.as_ref(),
+        &caller,
         session.workspace_id.as_deref(),
         &prefixed_name,
         arguments,
@@ -1483,6 +1512,7 @@ async fn handle_mcp_tool_call(
 /// dispatch failure worth a runtime warning, if any.
 async fn run_mcp_tool_call(
     registry: Option<&crate::mcp::registry::McpRegistry>,
+    caller: &crate::mcp::registry::HostCaller,
     workspace_id: Option<&str>,
     prefixed_name: &str,
     arguments: Value,
@@ -1497,6 +1527,12 @@ async fn run_mcp_tool_call(
             None,
         );
     };
+
+    // Host tools first. The caller carries the LIVE permission mode, so a
+    // Plan/Ask pill flipped after the session started is honoured.
+    if let Some(result) = registry.host_call(caller, prefixed_name, &arguments) {
+        return (result, None);
+    }
 
     match registry
         .dispatch_tool_call(prefixed_name, arguments, workspace_id)
@@ -1783,14 +1819,24 @@ mod tests {
         assert_eq!(ids, ["a", "c"]);
     }
 
+    fn test_caller() -> crate::mcp::registry::HostCaller {
+        crate::mcp::registry::HostCaller {
+            thread_id: "thread".into(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: Some("ws-42".into()),
+            permission_mode: None,
+        }
+    }
+
     #[tokio::test]
     async fn local_session_publishes_and_runs_shared_tools() {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        assert_eq!(collect_mcp_tools(local.as_ref()).await.len(), 1);
+        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 1);
         let (payload, failure) = run_mcp_tool_call(
             local.as_ref(),
+            &test_caller(),
             Some("ws-42"),
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
@@ -1811,12 +1857,15 @@ mod tests {
             host_name: "ai-node".into(),
         };
         let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
-        assert!(collect_mcp_tools(on_device.as_ref()).await.is_empty());
+        assert!(collect_mcp_tools(on_device.as_ref(), &test_caller())
+            .await
+            .is_empty());
 
         // A call the device sends anyway, by a name it guessed, is answered
         // with a tool error and never reaches the registry.
         let (payload, _) = run_mcp_tool_call(
             on_device.as_ref(),
+            &test_caller(),
             Some("ws-42"),
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),

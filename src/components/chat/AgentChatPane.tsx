@@ -106,6 +106,7 @@ import {
   agentChatListMessagesAfter,
   agentChatListSessions,
   agentChatRevertTurnCheckpoint,
+  agentChatUndoTurnRevert,
   agentChatRespondToRequest,
   agentChatSendTurn,
   agentChatSetServiceTier,
@@ -163,10 +164,12 @@ import {
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
+  useDelegationOccupant,
   useMonitoringOccupant,
   useSubagentOccupant,
   useUsageLimitOccupant,
 } from "./use-composer-strip-occupants";
+import { openDelegatedChat, stopDelegatedTask } from "./delegation-actions";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
 import { SubagentView } from "./SubagentView";
 import { DebugCleanupBanner } from "./DebugCleanupBanner";
@@ -183,6 +186,11 @@ import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { MobileComposerChips } from "@/components/mobile/mobile-composer-chips";
 import { RevertTurnDialog } from "./revert-turn-dialog";
+import {
+  captureRevertedPrompt,
+  findRevertedUserMessage,
+  mergeRevertedDraft,
+} from "./reverted-prompt";
 import { randomUUID } from "@/lib/uuid";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
@@ -892,35 +900,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     },
     [transcriptStreaming, turnCheckpoints],
   );
-  const handleConfirmTurnRevert = useCallback(async () => {
-    if (!threadId || !revertTarget || revertingTurnIndex !== null) return;
-    setRevertingTurnIndex(revertTarget.turn_index);
-    try {
-      await agentChatRevertTurnCheckpoint(threadId, revertTarget.turn_index);
-      await refreshAfterTurnRevert({
-        thread_id: threadId,
-        turn_index: revertTarget.turn_index,
-        transcript_cutoff_id: revertTarget.transcript_cutoff_id,
-        remaining_checkpoints: turnCheckpoints.filter(
-          (checkpoint) => checkpoint.turn_index < revertTarget.turn_index,
-        ),
-      });
-      setRevertTarget(null);
-      toast.success("Turn reverted", {
-        description: "Workspace and Codex conversation restored.",
-      });
-    } catch (error) {
-      toast.error("Could not revert turn", { description: String(error) });
-    } finally {
-      setRevertingTurnIndex(null);
-    }
-  }, [
-    refreshAfterTurnRevert,
-    revertTarget,
-    revertingTurnIndex,
-    threadId,
-    turnCheckpoints,
-  ]);
   const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
     cardId: string;
     nonce: number;
@@ -2352,6 +2331,86 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, addStagedAttachment, updateStagedAttachment],
   );
 
+  const handleConfirmTurnRevert = useCallback(async () => {
+    if (!threadId || !revertTarget || revertingTurnIndex !== null) return;
+    const target = revertTarget;
+    setRevertingTurnIndex(target.turn_index);
+    try {
+      // Captured first: the revert deletes the images only this turn used.
+      const revertedMessage = findRevertedUserMessage(
+        useAgentChatStore.getState().threads[threadId]?.messages ?? [],
+        target.client_nonce,
+      );
+      const prompt = revertedMessage
+        ? await captureRevertedPrompt(revertedMessage)
+        : null;
+      await agentChatRevertTurnCheckpoint(threadId, target.turn_index);
+      // The revert has landed: a failed transcript refresh must not report it
+      // as failed or skip the prompt hand-back and the undo below.
+      try {
+        await refreshAfterTurnRevert({
+          thread_id: threadId,
+          turn_index: target.turn_index,
+          transcript_cutoff_id: target.transcript_cutoff_id,
+          remaining_checkpoints: turnCheckpoints.filter(
+            (checkpoint) => checkpoint.turn_index < target.turn_index,
+          ),
+        });
+      } catch (error) {
+        console.warn("[agent-chat] failed to refresh reverted transcript:", error);
+      }
+      setRevertTarget(null);
+      // The usual reason to revert is to rephrase, so the prompt comes back
+      // ready to edit rather than vanishing with the turn.
+      if (prompt) {
+        const current =
+          useAgentChatStore.getState().threads[threadId]?.inputDraft ?? "";
+        setInputDraft(threadId, mergeRevertedDraft(prompt.text, current));
+        for (const image of prompt.images) void handleAttachImage(image);
+        requestAnimationFrame(() => {
+          const textarea = paneRootRef.current?.querySelector<HTMLTextAreaElement>(
+            '[data-testid="composer-wrapper"] textarea',
+          );
+          if (!textarea) return;
+          textarea.focus();
+          const end = textarea.value.length;
+          textarea.setSelectionRange(end, end);
+        });
+      }
+      const restoredNote = prompt
+        ? prompt.missingImages > 0
+          ? `Prompt restored to the composer; ${prompt.missingImages} image${prompt.missingImages === 1 ? "" : "s"} could not be restored.`
+          : "Prompt restored to the composer."
+        : "Workspace and conversation rewound.";
+      const revertedThreadId = threadId;
+      toast.undoable({
+        message: "Turn reverted",
+        description: restoredNote,
+        undoLabel: "Restore files",
+        durationMs: 15_000,
+        onUndo: async () => {
+          await agentChatUndoTurnRevert(revertedThreadId);
+          toast.success("Files restored", {
+            description:
+              "The workspace is back to how it was before the revert. The conversation stays rewound.",
+          });
+        },
+      });
+    } catch (error) {
+      toast.error("Could not revert turn", { description: String(error) });
+    } finally {
+      setRevertingTurnIndex(null);
+    }
+  }, [
+    handleAttachImage,
+    refreshAfterTurnRevert,
+    revertTarget,
+    revertingTurnIndex,
+    setInputDraft,
+    threadId,
+    turnCheckpoints,
+  ]);
+
   useEffect(() => {
     if (streaming || messages.length > 0) localSendFocusRef.current = false;
   }, [streaming, messages.length]);
@@ -3687,8 +3746,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   // ── Composer strip ──
   // One strip above the pill for everything pending: session error,
-  // monitoring, running / just-finished subagents, queued follow-ups. The
-  // strip picks the lead occupant; these only describe what exists.
+  // monitoring, delegated tasks, running / just-finished subagents, queued
+  // follow-ups. The strip picks the lead occupant; these only describe what
+  // exists.
+  const delegationOccupant = useDelegationOccupant({
+    messages,
+    threadId,
+    streaming: transcriptStreaming,
+    onOpen: openDelegatedChat,
+    onStop: stopDelegatedTask,
+  });
   const subagentOccupant = useSubagentOccupant({
     messages,
     threadId,
@@ -3864,6 +3931,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         errorOccupant,
         usageOccupant,
         monitoringOccupant,
+        delegationOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
       ]}
@@ -4235,6 +4303,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       />
       <RevertTurnDialog
         checkpoint={revertTarget}
+        turnCount={
+          revertTarget
+            ? turnCheckpoints.filter(
+                (checkpoint) => checkpoint.turn_index >= revertTarget.turn_index,
+              ).length
+            : 0
+        }
         reverting={revertingTurnIndex !== null}
         onOpenChange={(open) => {
           if (!open) setRevertTarget(null);

@@ -1229,10 +1229,14 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // session start (Stage 4 polish will wire `setMcpServers` for
     // dynamic registration). A session on a device gets none of this
     // computer's tools, so there is nothing to start for it.
-    if device.is_none() {
-        use crate::mcp::registry::McpRegistry;
+    //
+    // Skipped when no registry is managed (headless tests): priming spawns
+    // the `codemux mcp` child from the current executable.
+    if let Some(mcp_registry) = app
+        .try_state::<crate::mcp::registry::McpRegistry>()
+        .filter(|_| device.is_none())
+    {
         use std::time::Duration;
-        let mcp_registry: State<'_, McpRegistry> = app.state();
         let registry = mcp_registry.inner().clone_handle();
         let project_path = input.cwd.clone();
         const MCP_PRIME_BUDGET: Duration = Duration::from_secs(8);
@@ -1322,7 +1326,9 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // An explicit rebind (provider handoff / New Chat on a live pane) leaves
     // the previous thread's CLI child running with no pane pointing at it.
     // Callers already stop it themselves and `stop_session` is idempotent,
-    // so this is a best-effort backstop against an orphaned process.
+    // so this is a best-effort backstop against an orphaned process. It is
+    // also what closes the old thread's delegated tasks: a chat that left its
+    // pane can no longer receive their reports.
     if let (Some(previous_provider), Some(previous_thread)) = claim.previous.clone() {
         if previous_thread != session.thread_id.0 {
             shutdown_agent_chat_threads(&app, vec![(previous_provider, previous_thread)]);
@@ -1628,6 +1634,24 @@ fn turn_checkpoint_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// for a freshly-minted replacement.
 fn forget_turn_checkpoint_lock(thread_id: &str) {
     turn_checkpoint_locks().lock().unwrap().remove(thread_id);
+    revert_undos().lock().unwrap().remove(thread_id);
+}
+
+/// The safety snapshot a successful turn revert took of the workspace, kept so
+/// the user can bring those files back right after reverting. The provider
+/// conversation rewind is durable, so only the files can be restored.
+#[derive(Clone)]
+struct TurnRevertUndo {
+    repo_path: String,
+    safety: crate::git::GitCheckpoint,
+    /// Checkpoints left after the revert. Any later turn changes this list,
+    /// and restoring files under a newer turn would clobber its work.
+    remaining_turns: Vec<i64>,
+}
+
+fn revert_undos() -> &'static Mutex<HashMap<String, TurnRevertUndo>> {
+    static UNDOS: OnceLock<Mutex<HashMap<String, TurnRevertUndo>>> = OnceLock::new();
+    UNDOS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn prepare_turn_checkpoint_blocking(
@@ -1951,6 +1975,19 @@ fn restore_turn_checkpoint_workspace_blocking(
     Ok(safety)
 }
 
+/// Put the workspace back to the safety snapshot a turn revert took. The
+/// current (reverted) state is snapshotted first, so this is itself undoable
+/// through the same pre-restore ref.
+fn restore_reverted_files_blocking(thread_id: &str, undo: &TurnRevertUndo) -> Result<(), String> {
+    crate::git::git_checkpoint_restore(
+        std::path::Path::new(&undo.repo_path),
+        &undo.safety.snapshot_commit,
+        &undo.safety.head_commit,
+        undo.safety.branch.as_deref(),
+        &crate::git::pre_restore_ref_name(thread_id),
+    )
+}
+
 fn compensate_failed_provider_rollback(
     target: &AgentChatTurnCheckpointRecord,
     safety: &crate::git::GitCheckpoint,
@@ -2129,6 +2166,17 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         db.list_agent_chat_turn_checkpoints(&thread_id)
     };
+    revert_undos().lock().unwrap().insert(
+        thread_id.clone(),
+        TurnRevertUndo {
+            repo_path: target.repo_path.clone(),
+            safety,
+            remaining_turns: remaining_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.turn_index)
+                .collect(),
+        },
+    );
     let payload = AgentChatTurnCheckpointRevertedEventPayload {
         thread_id: ThreadId(thread_id),
         turn_index,
@@ -2140,6 +2188,53 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         eprintln!("[codemux::agent_chat] failed to emit turn revert: {error}");
     }
     Ok(remaining_checkpoints)
+}
+
+/// Restore the workspace files a turn revert replaced. Only offered right
+/// after the revert: once another turn has started, its work would be lost.
+#[tauri::command]
+pub async fn agent_chat_undo_turn_revert<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let _timeline_guard = turn_checkpoint_lock_for(&thread_id).lock_owned().await;
+    let undo = revert_undos()
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .cloned()
+        .ok_or_else(|| "There is no revert to undo for this chat.".to_string())?;
+    let (session, current_turns) = {
+        let db: State<'_, DatabaseStore> = app.state();
+        let session = db
+            .get_agent_chat_session(&thread_id)
+            .ok_or_else(|| "Chat session not found.".to_string())?;
+        let turns: Vec<i64> = db
+            .list_agent_chat_turn_checkpoints(&thread_id)
+            .iter()
+            .map(|checkpoint| checkpoint.turn_index)
+            .collect();
+        (session, turns)
+    };
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let provider = lookup_provider(&registry, stored_provider_kind(&session.provider)?).await?;
+    if current_turns != undo.remaining_turns
+        || provider.turn_active(&ThreadId(thread_id.clone())).await
+    {
+        revert_undos().lock().unwrap().remove(&thread_id);
+        return Err(
+            "A newer turn has started since the revert, so those files can no longer be restored safely."
+                .to_string(),
+        );
+    }
+    let restore_thread = thread_id.clone();
+    tokio::task::spawn_blocking(move || restore_reverted_files_blocking(&restore_thread, &undo))
+        .await
+        .map_err(|error| format!("file restore task failed: {error}"))??;
+    revert_undos().lock().unwrap().remove(&thread_id);
+    Ok(())
 }
 
 // ── Backend auto-resume ──────────────────────────────────────────────
@@ -2392,7 +2487,7 @@ impl HermesSendGate {
 /// duplicated here as a cheap `&'static str` rather than building the full
 /// capabilities bundle (which allocates the model list) just to read one
 /// field. OpenCode has no permission modes, so it stays `None`.
-fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
+pub(super) fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
@@ -2423,7 +2518,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
 /// user explicitly picked a mode). OpenCode's fallback is `None`, so a
 /// `None` request stays `None` — it has no permission modes and there is
 /// nothing to heal.
-fn resolve_start_permission_mode(
+pub(super) fn resolve_start_permission_mode(
     provider: ProviderKind,
     requested: Option<String>,
 ) -> Option<String> {
@@ -2916,6 +3011,10 @@ pub enum TurnOrigin {
     /// NOT count as user activity, or the scheduler's own dispatch would
     /// reset the attempt cap it is bounded by.
     UsageResume,
+    /// Cross-provider delegation: a delegated child's task, or a parent's
+    /// round of results. Not user activity either — it must not start a new
+    /// delegation round or forget a pending usage resume.
+    Delegation,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
@@ -2944,9 +3043,12 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if origin == TurnOrigin::User {
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
+        // A user message starts a new delegation round for this chat.
+        super::delegation::on_user_turn(&app, &input.thread_id.0);
     }
-    // Resume callers already hold this lock. User sends disarm immediately,
-    // then wait for any already-claimed resume to finish dispatching.
+    // Resume and delegation callers already hold this lock. User sends
+    // disarm immediately, then wait for any already-claimed resume to finish
+    // dispatching.
     let _activity_guard = if origin == TurnOrigin::User {
         Some(
             super::usage_resume::activity_lock(&input.thread_id.0)
@@ -4058,6 +4160,9 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 ) -> Result<bool, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Before the lock: a delegated child's starter holds it while it starts,
+    // and the task must read Stopped at once rather than after the start.
+    super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
@@ -4276,7 +4381,10 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
         .respond_to_request(thread_id.clone(), request_id.clone(), decision)
         .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            super::delegation::on_request_answered(&app, &thread_id.0, &request_id.0);
+            Ok(())
+        }
         // A provider can lose the callback between the liveness check and
         // the response, or a recovered external session may no longer know
         // the request. Persist one terminal failure so remount/hydration
@@ -4812,6 +4920,10 @@ pub async fn agent_chat_stop_session<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // A restart in place: a delegated child's task stops quietly, a
+    // parent's tasks keep running (New Chat / history pick rebinds the
+    // pane afterwards, and that rebind is what stops them).
+    super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Restart);
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
@@ -4860,6 +4972,7 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     for (_, thread_id) in &threads {
         tracker.clear_thread(thread_id);
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
+        super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Close);
     }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -6386,16 +6499,28 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
     // and PaneNode borders reflect chat agents exactly like terminal
     // agents (whose status flows in through hooks.rs). This is the whole
     // reason chat workspaces previously showed no status dot.
-    let tracker: State<'_, SubagentTracker> = app.state();
-    publish_pane_status(app, &tracker, &event);
+    //
+    // A delegated task's card is the exception: it reports another chat's
+    // work, so it must not hold this pane's status, settle its turn or count
+    // as liveness for the stall watchdog.
+    let delegated_card = matches!(
+        &event,
+        ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if super::delegation::is_delegated_row(&subagent.subagent_id)
+    );
+    if !delegated_card {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        publish_pane_status(app, &tracker, &event);
 
-    // Record last-activity for the stall watchdog. Keyed on the event's
-    // thread; thread-less events (global warnings) and the transient
-    // `RunStalled` itself are no-ops inside the tracker.
-    if let Some(activity_thread) = thread_id_for_event(&event) {
-        let activity: State<'_, RunActivityTracker> = app.state();
-        activity.record(&activity_thread.0, &event, SystemTime::now());
+        // Record last-activity for the stall watchdog. Keyed on the event's
+        // thread; thread-less events (global warnings) and the transient
+        // `RunStalled` itself are no-ops inside the tracker.
+        if let Some(activity_thread) = thread_id_for_event(&event) {
+            let activity: State<'_, RunActivityTracker> = app.state();
+            activity.record(&activity_thread.0, &event, SystemTime::now());
+        }
     }
+    super::delegation::observe(app, &event, persisted_id);
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
@@ -7733,7 +7858,8 @@ impl RunActivityTracker {
 
     /// Snapshot the threads that have been mid-turn and silent for at
     /// least `threshold`, with how long (seconds) each has been silent.
-    fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
+    /// Public so integration tests can see which threads would stall.
+    pub fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
         let threads = self.threads.lock().expect("activity tracker poisoned");
         threads
             .iter()
@@ -8175,6 +8301,64 @@ mod tests {
                 .unwrap();
             assert!(!status.success(), "{ref_name} should be deleted");
         }
+    }
+
+    #[test]
+    fn undo_turn_revert_brings_back_the_reverted_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("code.txt"), "before turn").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        let thread_id = "undo-thread";
+        let ref_name = crate::git::turn_checkpoint_ref_name(thread_id, 1);
+        let baseline = crate::git::git_checkpoint_create(repo, &ref_name, "turn 1")
+            .unwrap()
+            .unwrap();
+        // The turn's work: an edit and a new file.
+        std::fs::write(repo.join("code.txt"), "after turn").unwrap();
+        std::fs::write(repo.join("new.txt"), "created by turn").unwrap();
+
+        let target = AgentChatTurnCheckpointRecord {
+            thread_id: thread_id.to_string(),
+            workspace_id: "ws".to_string(),
+            repo_path: repo.to_string_lossy().to_string(),
+            turn_index: 1,
+            client_nonce: None,
+            transcript_cutoff_id: 0,
+            ref_name,
+            snapshot_commit: baseline.snapshot_commit,
+            head_commit: baseline.head_commit,
+            branch: baseline.branch,
+            created_at: String::new(),
+        };
+        let safety = restore_turn_checkpoint_workspace_blocking(&target).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "before turn");
+        assert!(!repo.join("new.txt").exists());
+
+        let undo = TurnRevertUndo {
+            repo_path: target.repo_path.clone(),
+            safety,
+            remaining_turns: Vec::new(),
+        };
+        restore_reverted_files_blocking(thread_id, &undo).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "after turn");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("new.txt")).unwrap(),
+            "created by turn"
+        );
     }
 
     #[test]
