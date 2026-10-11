@@ -1148,7 +1148,7 @@ export function SmartCommitButton({
   const display = !primary
     ? null
     : inFlight
-      ? { label: inFlight, icon: <Loader2 className="size-3 motion-safe:animate-spin" /> }
+      ? { label: inFlight, icon: <Spinner className="size-3" aria-hidden /> }
       : justDone && !hasChanges
         ? {
             label: DONE_LABEL[justDone],
