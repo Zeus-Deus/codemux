@@ -2607,6 +2607,7 @@ fn usage_limit_claude_assistant_error_uses_the_last_reported_quota_reset() {
     let reset = now_ms() + 3_600_000;
     quota.record("claude", vec![PlanUsageWindow {
         kind: PlanWindowKind::FiveHour, used_pct:100.0, resets_at_ms:Some(reset), label:Some("five_hour".into()),
+        window_mins: None,
     }], None, None, now_ms());
     app.manage(quota);
     let handle = app.handle().clone();
