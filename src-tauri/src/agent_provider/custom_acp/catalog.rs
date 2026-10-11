@@ -134,6 +134,7 @@ pub(crate) fn catalog_from(
                 supports_adaptive_thinking: false,
                 supports_thinking_toggle: false,
                 supports_fast_mode: false,
+                service_tiers: vec![],
                 supports_images: caps.images,
                 sub_provider: None,
                 is_free: false,

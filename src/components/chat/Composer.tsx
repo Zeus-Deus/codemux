@@ -2793,7 +2793,7 @@ export function Composer({
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     permissionMode,
     busy,
     delivery.delivery,
