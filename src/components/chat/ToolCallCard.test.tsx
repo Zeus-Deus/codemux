@@ -55,6 +55,21 @@ function makePendingApproval(
   };
 }
 
+/** The `data-state` each Reveal held before it changed while `run` ran. A
+ *  body mounted already open never changes, so it records nothing. */
+function revealStatesBefore(run: () => void): (string | null)[] {
+  const observer = new MutationObserver(() => {});
+  observer.observe(document.body, {
+    subtree: true,
+    attributeFilter: ["data-state"],
+    attributeOldValue: true,
+  });
+  run();
+  const records = observer.takeRecords();
+  observer.disconnect();
+  return records.map((record) => record.oldValue);
+}
+
 describe("ToolCallCard", () => {
   beforeEach(() => {
     vi.mocked(toast.success).mockReset();
@@ -68,26 +83,34 @@ describe("ToolCallCard", () => {
         onDecide={() => {}}
       />,
     );
-    expect(screen.queryByTestId("tool-call-body")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
-    expect(screen.getByTestId("tool-call-body")).toHaveClass(
-      "animate-in",
-      "duration-150",
-    );
+    const toggle = screen.getByRole("button", { expanded: false });
+    // Reveal commits a freshly opened body collapsed, then flips it open,
+    // so the height eases in instead of landing in one frame.
+    expect(revealStatesBefore(() => fireEvent.click(toggle))).toEqual(["closed"]);
+    const body = document.getElementById(toggle.getAttribute("aria-controls") ?? "");
+    expect(body).toHaveAttribute("data-state", "open");
+    expect(body).toHaveClass("duration-150");
   });
 
   it("does not replay the ease on a card that mounts expanded", () => {
-    render(
-      <ToolCallCard
-        item={makeTool({
-          status: "error",
-          result_content: "boom",
-        })}
-        approval={null}
-        onDecide={() => {}}
-      />,
+    const states = revealStatesBefore(() =>
+      render(
+        <ToolCallCard
+          item={makeTool({
+            status: "error",
+            result_content: "boom",
+          })}
+          approval={null}
+          onDecide={() => {}}
+        />,
+      ),
     );
-    expect(screen.getByTestId("tool-call-body")).not.toHaveClass("animate-in");
+    // Mounted open: no collapsed frame for the height to ease out of.
+    expect(states).toEqual([]);
+    const toggle = screen.getByRole("button", { expanded: true });
+    expect(
+      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
+    ).toHaveAttribute("data-state", "open");
   });
 
   it("pending_approval state renders the approval controls and input preview", () => {
