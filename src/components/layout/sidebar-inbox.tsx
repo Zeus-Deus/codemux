@@ -1,14 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlarmClock,
-  AlertCircle,
   ChevronDown,
   ChevronRight,
   Folder,
   FolderOpen,
   FolderPlus,
   Layers,
-  Loader2,
   Undo2,
 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
@@ -56,6 +54,7 @@ import {
   type InboxRepo,
 } from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
+import { PendingWorkspaceRow } from "./pending-workspace-row";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import {
   computeSnoozePresets,
@@ -2172,22 +2171,7 @@ export function SidebarInbox() {
         {topTier.map((ws, index) => renderCard(ws, pinnedCards.length + index))}
 
         {filteredPending.map((pw) => (
-          <div
-            key={pw.id}
-            className={cn(
-              "flex items-center gap-2 px-2 py-2 text-body",
-              pw.status === "failed" ? "opacity-60" : "motion-safe:animate-pulse opacity-70",
-            )}
-          >
-            {pw.status === "creating" ? (
-              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-            ) : (
-              <AlertCircle className="size-3.5 shrink-0 text-destructive" />
-            )}
-            <span className="truncate text-label text-muted-foreground">
-              {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
-            </span>
-          </div>
+          <PendingWorkspaceRow key={pw.id} pending={pw} className="gap-2 px-2 py-2" />
         ))}
 
         {/* Wrapping up, Snoozed and Settled sit on the floor of the sidebar,
