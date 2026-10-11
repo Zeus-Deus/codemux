@@ -4930,9 +4930,13 @@ pub async fn agent_chat_set_model<R: Runtime>(
         // Resume takes this same lock. Finish it before locking the mutation;
         // a missing session is never acknowledgement of a model request.
         ensure_live_session(&app, provider, &thread_id).await?;
+        // The live session orders the change against its own turns. Lock only
+        // after the agent acknowledges it: starts and settings take this lock
+        // under the native gate, so holding it here would queue sends,
+        // interrupts and Stop behind the acknowledgement.
+        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
-        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
         let acp = app.state::<Arc<crate::agent_provider::custom_acp::GenericAcpProvider>>();
         let catalog = acp.catalog(&thread_id).await.map_err(provider_err)?;
         return super::custom_acp::persist_catalog(&app.state::<DatabaseStore>(), &thread_id.0, &catalog);

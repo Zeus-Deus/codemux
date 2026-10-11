@@ -96,9 +96,11 @@ pub(super) fn persist_catalog(db: &DatabaseStore, thread_id: &str, _catalog: &Ac
 pub async fn acp_set_config<R: Runtime>(app: AppHandle<R>, db: State<'_, DatabaseStore>, provider: State<'_, Arc<GenericAcpProvider>>, thread_id: String, config_id: String, value: Value) -> Result<AcpCatalog, String> {
     let thread = ThreadId(thread_id.clone());
     super::agent_chat::ensure_live_session(&app, ProviderKind::Acp, &thread).await?;
+    // Like the model setter: never hold the resume lock across the agent's
+    // acknowledgement, or gated starts and settings stall sends and Stop.
+    let catalog = provider.set_config(thread, config_id, value).await.map_err(|e| e.to_string())?;
     let lock = super::agent_chat::resume_lock_for(&thread_id);
     let _guard = lock.lock().await;
-    let catalog = provider.set_config(thread, config_id, value).await.map_err(|e| e.to_string())?;
     // Accepted configuration, not an optimistic UI request, becomes restart intent.
     persist_catalog(&db, &thread_id, &catalog)?;
     let _ = app.emit("custom_acp_catalog_changed", serde_json::json!({"thread_id":thread_id,"catalog":catalog}));
