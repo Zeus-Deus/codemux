@@ -1063,7 +1063,7 @@ function SmartCommitButton({
     if (loading) {
       return {
         label: "Checking changes…",
-        icon: <Loader2 className="size-3 motion-safe:animate-spin" />,
+        icon: <Spinner className="size-3" aria-hidden />,
         action: () => {},
         disabled: true,
       };

@@ -1,8 +1,9 @@
 import { useCustomAcpEvents } from "@/hooks/use-custom-acp-events";
 import { useEffect, useState } from "react";
-import { Plus, Pencil, Trash2, FlaskConical, LoaderCircle, Terminal } from "lucide-react";
+import { Plus, Pencil, Trash2, FlaskConical, Terminal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import { acpDeleteAgent, acpSaveAgent, type AcpAgent, type AcpAgentInput } from "@/tauri/custom-acp";
 import { acpCatalogKey, useCustomAcp } from "@/stores/custom-acp-store";
 
@@ -75,7 +76,7 @@ export function CustomAcpSettings() {
           <div className="flex items-center gap-2">
             <Terminal className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0 flex-1"><div className="truncate text-body font-medium">{agent.name} {!agent.enabled && <span className="text-label font-normal text-muted-foreground">· Disabled</span>}</div><code className="block truncate text-label text-muted-foreground" title={agent.executable}>{agent.executable} · {agent.args.length} arguments</code></div>
-            <Button size="sm" variant="ghost" aria-label={`Probe ${agent.name}`} disabled={!!busy || !agent.enabled} onClick={() => void probe(agent.id)}>{busy === agent.id ? <LoaderCircle className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}Probe</Button>
+            <Button size="sm" variant="ghost" aria-label={`Probe ${agent.name}`} disabled={!!busy || !agent.enabled} onClick={() => void probe(agent.id)}>{busy === agent.id ? <Spinner className="size-3.5" aria-hidden /> : <FlaskConical className="size-3.5" />}Probe</Button>
             <Button size="icon" variant="ghost" aria-label={`Edit ${agent.name}`} disabled={!!busy} onClick={() => edit(agent)}><Pencil className="size-3.5" /></Button>
             <Button size="icon" variant="ghost" aria-label={`Delete ${agent.name}`} disabled={!!busy} onClick={() => setDeleting(agent.id)}><Trash2 className="size-3.5" /></Button>
           </div>
@@ -103,7 +104,7 @@ export function CustomAcpSettings() {
         <datalist id="custom-acp-auth-methods">{(() => { const agent = agents?.find(a => a.id === editor.id); return agent ? catalogs[acpCatalogKey(agent.id, agent.revision)]?.auth_methods.map(method => <option key={method.id} value={method.id}>{method.name}{method.description ? ` · ${method.description}` : ""}</option>) : null; })()}</datalist>
         <p className="text-label text-muted-foreground">Use an advertised authentication ID only if required. Sign in with the harness itself. Saving does not launch it; Probe starts a temporary session without a coding prompt.</p>
         {editor.id && <p className="text-label text-muted-foreground">Edits affect future starts. Existing sessions retain their launch configuration; bound chats will not silently switch instances.</p>}
-        <div className="flex justify-end gap-2"><Button type="button" variant="ghost" size="sm" onClick={cancel}>Cancel</Button><Button type="submit" size="sm">{busy === "save" && <LoaderCircle className="size-3.5 animate-spin" />}Save agent</Button></div>
+        <div className="flex justify-end gap-2"><Button type="button" variant="ghost" size="sm" onClick={cancel}>Cancel</Button><Button type="submit" size="sm">{busy === "save" && <Spinner className="size-3.5" aria-hidden />}Save agent</Button></div>
       </fieldset>
     </form>}
     <p className="mt-3 text-label text-muted-foreground">ACP approvals stay supervised. Agent modes are not a sandbox. Codemux-specific MCP injection, delegation and host-managed skills are unavailable for custom harnesses.</p>

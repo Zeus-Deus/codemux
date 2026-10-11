@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Check,
-  Loader2,
   Minus,
   Monitor,
   MoreHorizontal,
@@ -730,7 +729,7 @@ function AddDeviceForm({
 
       <DialogFooter>
         <Button type="submit" disabled={!sshTarget || running}>
-          {running && <Loader2 className="animate-spin" aria-hidden />}
+          {running && <Spinner aria-hidden />}
           {running ? "Connecting…" : failure ? "Retry" : "Connect"}
         </Button>
       </DialogFooter>
@@ -741,7 +740,7 @@ function AddDeviceForm({
 function StepIcon({ state }: { state: StepState }) {
   switch (state) {
     case "running":
-      return <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-hidden />;
+      return <Spinner className="size-3.5 text-muted-foreground" aria-hidden />;
     case "done":
       return <Check className="size-3.5 text-status-open" aria-hidden />;
     case "skipped":

@@ -1,5 +1,5 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
-import { Eye, EyeOff, Github, Loader2, Mail } from "lucide-react";
+import { Eye, EyeOff, Github, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { WindowChrome } from "@/components/layout/window-chrome";
@@ -92,7 +92,7 @@ export function LoginScreen() {
   if (oauthPending) {
     body = (
       <div className="flex w-full flex-col items-center text-center">
-        <Loader2 className="size-4 text-muted-foreground mb-4 motion-safe:animate-spin" />
+        <Spinner className="size-4 text-muted-foreground mb-4" aria-hidden />
         {/* Only the message is live; the actions below stay out of it. */}
         <div role="status" className="mb-6">
           <h2 className="text-body font-medium text-foreground mb-2">
@@ -441,7 +441,7 @@ function ResendVerification({
         onClick={() => void resend.send()}
       >
         {status === "sending" && (
-          <Loader2 className="size-3.5 motion-safe:animate-spin" />
+          <Spinner className="size-3.5" aria-hidden />
         )}
         {cooldown > 0 ? (
           <span>
