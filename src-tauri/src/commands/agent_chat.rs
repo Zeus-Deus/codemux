@@ -36,6 +36,7 @@ use crate::database::{
     AgentChatVisibleMessage, DatabaseStore,
 };
 use crate::observability::ObservabilityStore;
+use crate::notifications::AgentNotice;
 use crate::state::{AppStateStore, PaneClaimConflict, PaneNodeSnapshot, PaneStatus};
 use crate::utility_ai::{generate_utility_text, UtilityModelSelection};
 
@@ -6783,6 +6784,10 @@ fn publish_pane_status<R: Runtime>(
     }
     if matches!(event, ProviderRuntimeEvent::QuestionsAsked { .. }) {
         crate::web_remote::push::agent_status(app, &thread_id.0, PaneStatus::Permission);
+        let state: State<'_, AppStateStore> = app.state();
+        if let Some(target) = state.notification_target_for_thread(&thread_id.0) {
+            crate::notifications::notify_agent(app, AgentNotice::NeedsInput, &target);
+        }
     }
     if matches!(
         event,
@@ -6832,6 +6837,21 @@ fn should_release_browser(origin: SettleOrigin, status: PaneStatus) -> bool {
     matches!(origin, SettleOrigin::ProviderEvent) && run_finished(status)
 }
 
+/// Which notification, if any, a settle to `status` deserves. Decided before
+/// the active-workspace downgrade so a turn that finishes while Codemux is in
+/// the background still notifies. A forced backstop settle is not evidence
+/// the agent finished, so it stays silent.
+fn agent_notice(origin: SettleOrigin, status: &PaneStatus) -> Option<AgentNotice> {
+    if origin != SettleOrigin::ProviderEvent {
+        return None;
+    }
+    match status {
+        PaneStatus::Review => Some(AgentNotice::Finished),
+        PaneStatus::Permission => Some(AgentNotice::NeedsInput),
+        _ => None,
+    }
+}
+
 /// Write `status` for `thread_id` into the shared `pane_statuses` store,
 /// release the workspace's background agent browser once the run is
 /// provably over, and emit a stamped `app-state-changed` snapshot when
@@ -6853,6 +6873,7 @@ fn apply_pane_status<R: Runtime>(
         crate::web_remote::push::agent_status(app, thread_id, status.clone());
     }
     let state: State<'_, AppStateStore> = app.state();
+    let notice = agent_notice(origin, &status);
     // Mirror the terminal path: a turn that finishes in the workspace the
     // user is already looking at clears to Idle instead of nagging with a
     // review dot for output they can already see.
@@ -6867,6 +6888,12 @@ fn apply_pane_status<R: Runtime>(
         status = PaneStatus::Idle;
     }
     let status_changed = state.set_pane_status_by_thread(thread_id, status.clone());
+    // Only a real transition notifies, so a repeated status never re-pings.
+    if let (true, Some(notice)) = (status_changed, notice) {
+        if let Some(target) = state.notification_target_for_thread(thread_id) {
+            crate::notifications::notify_agent(app, notice, &target);
+        }
+    }
     // A finished run (turn complete and settled to `Review`/`Idle`, or the
     // session closed/errored into `Idle`) releases the workspace's
     // background agent browser session, if any, so the GUI-mode chip /
@@ -10513,6 +10540,19 @@ mod tests {
             assert!(!should_release_browser(origin, PaneStatus::Working));
             assert!(!should_release_browser(origin, PaneStatus::Permission));
         }
+    }
+
+    #[test]
+    fn chat_agents_notify_on_finish_and_on_approval_but_not_on_a_forced_settle() {
+        let event = SettleOrigin::ProviderEvent;
+        assert_eq!(agent_notice(event, &PaneStatus::Review), Some(AgentNotice::Finished));
+        assert_eq!(
+            agent_notice(event, &PaneStatus::Permission),
+            Some(AgentNotice::NeedsInput)
+        );
+        assert_eq!(agent_notice(event, &PaneStatus::Working), None);
+        assert_eq!(agent_notice(event, &PaneStatus::Idle), None);
+        assert_eq!(agent_notice(SettleOrigin::ForcedBackstop, &PaneStatus::Review), None);
     }
 
     // Real post-turn subagent activity refreshes the silence clock, so a
