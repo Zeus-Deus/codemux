@@ -1055,6 +1055,23 @@ fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
     collect_terminal_sessions(&workspace.surfaces).len()
 }
 
+/// Title for a new terminal tab: the lowest "Terminal N" no tab in the
+/// workspace already uses. Counting terminal-kind tabs instead misnumbers,
+/// because Agent Chat tabs share `TabKind::Terminal` and closing a middle tab
+/// would hand out a number that is still taken. A workspace's default tab is
+/// a bare "Terminal", which reads as number 1.
+fn next_terminal_tab_title(tabs: &[TabSnapshot]) -> String {
+    let used: std::collections::HashSet<usize> = tabs
+        .iter()
+        .filter_map(|tab| match tab.title.as_str() {
+            "Terminal" => Some(1),
+            title => title.strip_prefix("Terminal ")?.parse().ok(),
+        })
+        .collect();
+    let n = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+    format!("Terminal {n}")
+}
+
 /// Drop every manual-monitor flag whose pane no longer exists.
 ///
 /// A flag is a claim by a live process about a specific pane, so the pane
@@ -5191,11 +5208,7 @@ impl AppStateStore {
 
         match kind {
             TabKind::Terminal => {
-                let count = workspace
-                    .tabs
-                    .iter()
-                    .filter(|t| t.kind == TabKind::Terminal)
-                    .count();
+                let title = next_terminal_tab_title(&workspace.tabs);
                 let surface_id = SurfaceId(next_id("surface"));
                 let pane_id = PaneId(next_id("pane"));
                 let session_id = SessionId(next_id("session"));
@@ -5239,7 +5252,7 @@ impl AppStateStore {
                 workspace.tabs.push(TabSnapshot {
                     tab_id: tab_id.clone(),
                     kind: TabKind::Terminal,
-                    title: format!("Terminal {}", count + 1),
+                    title,
                     surface_id: Some(surface_id.clone()),
                     browser_id: None,
                     icon: None,
@@ -8436,6 +8449,65 @@ mod tests {
             NotificationLevel::from_str_or_attention("bogus"),
             NotificationLevel::Attention
         ));
+    }
+
+    fn tab_titled(title: &str) -> TabSnapshot {
+        TabSnapshot {
+            tab_id: next_id("tab"),
+            kind: TabKind::Terminal,
+            title: title.into(),
+            surface_id: None,
+            browser_id: None,
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn next_terminal_tab_title_ignores_agent_chat_tabs() {
+        assert_eq!(next_terminal_tab_title(&[]), "Terminal 1");
+        assert_eq!(
+            next_terminal_tab_title(&[tab_titled("Agent Chat")]),
+            "Terminal 1"
+        );
+        assert_eq!(
+            next_terminal_tab_title(&[tab_titled("Terminal")]),
+            "Terminal 2"
+        );
+    }
+
+    #[test]
+    fn next_terminal_tab_title_fills_the_lowest_gap() {
+        let tabs = [
+            tab_titled("Terminal"),
+            tab_titled("Terminal 3"),
+            tab_titled("Agent Chat"),
+        ];
+        assert_eq!(next_terminal_tab_title(&tabs), "Terminal 2");
+        let tabs = [tab_titled("Terminal 1"), tab_titled("Terminal 2")];
+        assert_eq!(next_terminal_tab_title(&tabs), "Terminal 3");
+    }
+
+    #[test]
+    fn create_tab_reuses_the_number_of_a_closed_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-tab-numbering"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+        let (t2, _) = store.create_tab(&ws_id.0, TabKind::Terminal).expect("t2");
+        let (_t3, _) = store.create_tab(&ws_id.0, TabKind::Terminal).expect("t3");
+        store.close_tab(&ws_id.0, &t2).expect("close t2");
+        let (t4, _) = store.create_tab(&ws_id.0, TabKind::Terminal).expect("t4");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        let titles: Vec<&str> = ws.tabs.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Terminal", "Terminal 3", "Terminal 2"]);
+        assert_eq!(
+            ws.tabs.iter().find(|t| t.tab_id == t4).map(|t| t.title.as_str()),
+            Some("Terminal 2")
+        );
     }
 
     #[test]
