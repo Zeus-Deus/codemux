@@ -24,6 +24,7 @@
  */
 import type {
   AgentBrowserSession,
+  AgentChatProviderKind,
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   AuthUser,
@@ -155,11 +156,16 @@ export const MOCK_USER_IMAGE_DATA_URL =
  *  `null` for a fresh pane with no thread bound yet — exactly the
  *  state `create_agent_chat_pane` leaves a new pane in, which drives
  *  the start_session → attach channel → streamed `content_delta`
- *  flow (issue #75). */
+ *  flow (issue #75).
+ *
+ *  `provider` must match the provider the thread's mock session record
+ *  names: the real backend persists the pane and its thread as one
+ *  binding, and the composer picks its logo from the pane. */
 function chatSurface(
   label: string,
   cwd: string,
   threadId: string | null = MOCK_CHAT_THREAD_ID,
+  provider: AgentChatProviderKind = "codex",
 ): { pane: PaneNodeSnapshot; surface: SurfaceSnapshot; tab: TabSnapshot } {
   const n = ++paneSeq;
   const paneId = `pane-${n}`;
@@ -171,7 +177,7 @@ function chatSurface(
     pane_id: paneId,
     title: label,
     thread_id: threadId,
-    provider: "codex",
+    provider,
     cwd,
   };
   const surface: SurfaceSnapshot = {
@@ -565,6 +571,7 @@ const wsCodemuxMonitoring = (() => {
     "Agent Chat",
     cwd,
     MOCK_MONITORING_THREAD_ID,
+    "claude",
   );
   // Steady cyan dot. Seeded through BOTH halves of the feature — the
   // effective `pane_statuses` entry the sidebar reads, and the runtime-only
@@ -604,6 +611,7 @@ const wsCodemuxUsageLimit = (() => {
     "Agent Chat",
     cwd,
     MOCK_USAGE_LIMIT_THREAD_ID,
+    "claude",
   );
   return {
     ...ws,
@@ -700,6 +708,7 @@ const wsCodemuxWorkflowApproval = (() => {
     "Agent Chat",
     cwd,
     MOCK_WORKFLOW_APPROVAL_THREAD_ID,
+    "claude",
   );
   // Red "permission" dot: the run is gated on the user's decision.
   paneStatuses[pane.pane_id] = "permission";
@@ -712,8 +721,10 @@ const wsCodemuxWorkflowApproval = (() => {
   };
 })();
 
-/** Running workflow: approved and mid-phase-2, with a mix of done /
- *  running / queued subagents auditing route files. */
+/** Workflow cut off mid-phase-2, with a mix of done / running / queued
+ *  subagents auditing route files. The mock has no live turn for it, so the
+ *  cold replay settles it the way the app settles any dead run: "Workflow
+ *  stopped", in-flight agents interrupted, and an idle pane. */
 const wsCodemuxWorkflowRunning = (() => {
   const cwd = `${HOME}/.codemux/worktrees/codemux/demo-workflow-running`;
   const ws = makeWorkspace({
@@ -726,13 +737,12 @@ const wsCodemuxWorkflowRunning = (() => {
     workspace_kind: "worktree",
     git_branch: "demo/workflow-running",
   });
-  const { pane, surface, tab } = chatSurface(
+  const { surface, tab } = chatSurface(
     "Agent Chat",
     cwd,
     MOCK_WORKFLOW_RUNNING_THREAD_ID,
+    "claude",
   );
-  // Amber "working" dot: the workflow is actively spawning/running agents.
-  paneStatuses[pane.pane_id] = "working";
   return {
     ...ws,
     tabs: [tab],
@@ -760,6 +770,7 @@ const wsCodemuxWorkflowComplete = (() => {
     "Agent Chat",
     cwd,
     MOCK_WORKFLOW_COMPLETE_THREAD_ID,
+    "claude",
   );
   // Green "review" dot: the run finished and is ready to look at.
   paneStatuses[pane.pane_id] = "review";
