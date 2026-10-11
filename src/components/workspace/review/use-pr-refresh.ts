@@ -23,7 +23,7 @@ export function usePrRefresh(path: string, scope: string, invalidate: () => Prom
         await invalidate();
       } catch (error) {
         if (currentVisit.current === visit) {
-          toast.error(`Couldn't refresh pull request: ${String(error)}`);
+          toast.failure("Couldn't refresh pull request", error);
         }
       }
     })().finally(() => { visit.pending = null; });

@@ -8,6 +8,7 @@ vi.mock("@/lib/toast", () => ({
     info: vi.fn(),
     success: vi.fn(),
     error: vi.fn(),
+    failure: vi.fn(),
     dismiss: vi.fn(),
   },
 }));
@@ -196,11 +197,11 @@ describe("useRemotePairingRequests", () => {
 
     opts.action.onClick();
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("Couldn't approve iPhone: db locked"),
+      expect(toast.failure).toHaveBeenCalledWith("Couldn't approve iPhone", "db locked"),
     );
     opts.cancel.onClick();
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("Couldn't reject iPhone: db locked"),
+      expect(toast.failure).toHaveBeenCalledWith("Couldn't reject iPhone", "db locked"),
     );
   });
 

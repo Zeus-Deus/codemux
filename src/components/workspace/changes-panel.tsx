@@ -327,7 +327,7 @@ function FileSection({
       else await gitUnstageFiles(cwd, paths);
       onRefresh();
     } catch (err) {
-      toast.error(String(err));
+      toast.failure(bulkAction === "stage" ? "Couldn't stage the files" : "Couldn't unstage the files", err);
     }
   };
   return (

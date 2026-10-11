@@ -440,7 +440,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     // The wizard is usually gone by now (the imports dismiss it), so a
     // failed open is reported as a toast rather than inline.
     await activateWorkspace(imported[imported.length - 1]).catch((err) => {
-      toast.error(`Imported, but couldn't open the workspace: ${String(err)}`);
+      toast.failure("Imported, but couldn't open the workspace", err);
     });
     await closeWorkspace(tempWorkspaceId, false).catch(() => {});
     const pName = basename(projectDir);
