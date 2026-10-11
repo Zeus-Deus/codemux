@@ -109,6 +109,7 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { toast, reportFailure } from "@/lib/toast";
 
 interface Props {
@@ -1405,7 +1406,7 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
       </span>
       {row.keys && (
         <span className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
-          {row.keys}
+          {formatKeyCombo(row.keys)}
         </span>
       )}
       <EnterBadge />
