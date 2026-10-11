@@ -561,6 +561,7 @@ fn child_input(
         effort,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: Vec::new(),
         env: None,
         workspace_id: None,
@@ -1031,6 +1032,7 @@ fn delegate<R: Runtime>(
         context_window: Some(None),
         permission_mode: Some(fallback_permission_mode(provider).map(str::to_string)),
         fast_mode: Some(false),
+        service_tier: None,
     };
     let rows = db
         .upsert_agent_chat_session(&child, &workspace_id, Some(&cwd), provider_id(provider))
