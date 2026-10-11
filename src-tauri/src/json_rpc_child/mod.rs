@@ -955,7 +955,8 @@ async fn route_incoming_line(
     }
 }
 
-#[cfg(test)]
+// This fixture probes owned Unix process liveness with kill(pid, 0).
+#[cfg(all(test, unix))]
 mod safety_tests {
     use super::*;
     #[tokio::test]
