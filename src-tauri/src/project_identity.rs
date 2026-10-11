@@ -44,6 +44,13 @@ const CODEMUX_PROJECT_NAMESPACE: Uuid = Uuid::from_bytes([
 ///
 /// Returns `None` for an empty / unparseable remote.
 pub fn canonical_remote(remote: &str) -> Option<String> {
+    remote_host_path(remote).map(|s| s.to_lowercase())
+}
+
+/// [`canonical_remote`] without the lowercasing: `host/owner/repo` in the
+/// remote's own spelling. For building URLs (an https clone fallback) and
+/// display names, where the original case should survive.
+pub fn remote_host_path(remote: &str) -> Option<String> {
     let s = remote.trim();
     if s.is_empty() {
         return None;
@@ -80,7 +87,7 @@ pub fn canonical_remote(remote: &str) -> Option<String> {
     if s.is_empty() {
         return None;
     }
-    Some(s.to_lowercase())
+    Some(s.to_string())
 }
 
 /// Compute the deterministic `project_uid` from the canonical key
@@ -173,6 +180,19 @@ mod tests {
         );
         assert_eq!(canonical_remote(""), None);
         assert_eq!(canonical_remote("   "), None);
+    }
+
+    #[test]
+    fn remote_host_path_keeps_original_case() {
+        assert_eq!(
+            remote_host_path("git@github.com:Acme/App.git").as_deref(),
+            Some("github.com/Acme/App")
+        );
+        assert_eq!(
+            remote_host_path("https://user:token@GitHub.com/Acme/App/").as_deref(),
+            Some("GitHub.com/Acme/App")
+        );
+        assert_eq!(remote_host_path(""), None);
     }
 
     #[test]

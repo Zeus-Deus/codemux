@@ -146,6 +146,7 @@ impl AgentProvider for CursorAgentProvider {
                 binary: self.config.binary.clone(),
                 dialect: AcpDialect::Cursor,
                 slash_command_cache: Arc::clone(&self.slash_command_cache),
+                remote: input.remote,
             },
             self.event_tx.clone(),
         )

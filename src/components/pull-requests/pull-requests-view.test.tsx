@@ -44,6 +44,7 @@ vi.mock("@/lib/pr-overview-query", () => ({
     rows: overview.rows,
     viewerByRoot: overview.viewerByRoot,
     failures: [],
+    localOnly: [],
     roots: [],
     updatedAt: Date.now(),
     carried: false,

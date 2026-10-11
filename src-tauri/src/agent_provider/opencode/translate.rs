@@ -1030,12 +1030,17 @@ fn translate_session_error(
         }];
     };
     let (subtype, message) = err.display_pair();
-    vec![ProviderRuntimeEvent::TurnCompleted {
+    let mut events = crate::agent_provider::usage_limit::usage_limit_notice(
+        &ctx.thread_id, crate::agent_provider::ProviderKind::OpenCode,
+        &serde_json::json!({"name": err.name, "data": err.data}), &message,
+    ).into_iter().collect::<Vec<_>>();
+    events.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: ctx.thread_id.clone(),
         turn_id: ctx.turn_id.clone(),
         status: TurnStatus::Error { subtype, message },
         usage: None,
-    }]
+    });
+    events
 }
 
 fn translate_assistant_error(
@@ -1043,12 +1048,17 @@ fn translate_assistant_error(
     ctx: &EventContext,
 ) -> Vec<ProviderRuntimeEvent> {
     let (subtype, message) = err.display_pair();
-    vec![ProviderRuntimeEvent::TurnCompleted {
+    let mut events = crate::agent_provider::usage_limit::usage_limit_notice(
+        &ctx.thread_id, crate::agent_provider::ProviderKind::OpenCode,
+        &serde_json::json!({"name": err.name, "data": err.data}), &message,
+    ).into_iter().collect::<Vec<_>>();
+    events.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: ctx.thread_id.clone(),
         turn_id: ctx.turn_id.clone(),
         status: TurnStatus::Error { subtype, message },
         usage: None,
-    }]
+    });
+    events
 }
 
 #[cfg(test)]
@@ -1381,6 +1391,27 @@ mod tests {
                 other => panic!("wrong status: {other:?}"),
             },
             other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_limit_opencode_errors_report_retry_timing_and_a_failed_turn() {
+        for assistant in [false, true] {
+            let error = OpenCodeApiError {
+                name: "APIError".into(),
+                data: json!({"statusCode":429,"message":"Too many requests",
+                    "responseHeaders":{"retry-after":"120"}}),
+            };
+            let before = crate::agent_provider::usage_limit::now_ms();
+            let out = if assistant { translate_assistant_error(error, &ctx()) }
+                else { translate_session_error(Some(error), &ctx()) };
+            assert!(matches!(&out[0], ProviderRuntimeEvent::UsageLimitReached {
+                provider: crate::agent_provider::ProviderKind::OpenCode,
+                resets_at_ms: Some(at), ..
+            } if *at >= before + 120_000));
+            assert!(matches!(&out[1], ProviderRuntimeEvent::TurnCompleted {
+                status: TurnStatus::Error { subtype, .. }, ..
+            } if subtype == "rate_limit"));
         }
     }
 

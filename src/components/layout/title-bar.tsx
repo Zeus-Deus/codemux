@@ -25,7 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { groupEditors } from "@/lib/editor-groups";
-import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import { resolveRightPanelWidth } from "@/lib/right-panel-width";
 import {
   RIGHT_PANEL_RESIZER_REACH,
   panelClusterRight,
@@ -59,7 +59,7 @@ import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
-import { toast } from "@/lib/toast";
+import { toast, reportFailure } from "@/lib/toast";
 import { applyPreset, openInEditor } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
@@ -111,9 +111,12 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
       if (!workspacePath || isLoading) return;
       setIsLoading(true);
       useSyncedSettingsStore.getState().updateSetting("editor", "default_ide", editorId);
-      openInEditor(editorId, workspacePath).finally(() => setIsLoading(false));
+      const editorName = editors.find((e) => e.id === editorId)?.name ?? "the editor";
+      openInEditor(editorId, workspacePath)
+        .catch(reportFailure(`Couldn't open in ${editorName}`))
+        .finally(() => setIsLoading(false));
     },
-    [workspacePath, isLoading],
+    [workspacePath, isLoading, editors],
   );
 
   const defaultEditor = editors.find((e) => e.id === defaultEditorId);
@@ -178,6 +181,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
           <button
             type="button"
             disabled={isLoading}
+            aria-label="Choose editor"
             className={cn(
               "flex items-center justify-center",
               !compact && "border bg-secondary/50",
@@ -534,11 +538,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // The *rendered* width, not the stored one: the panel's stored width can
   // exceed what fits in the current window (see `right-panel-width.ts`), and
   // the band has to stop at the panel's real edge.
-  const rightPanelWidth = useUIStore((s) => {
-    const stored = s.rightPanelWidth ?? 320;
-    const row = s.rightPanelRowWidth ?? 0;
-    return row > 0 ? clampRightPanelWidth(stored, row) : stored;
-  });
+  const rightPanelWidth = useUIStore((s) =>
+    resolveRightPanelWidth(s.rightPanelWidth, s.rightPanelRowWidth ?? 0),
+  );
   const activeWorkspacePanelOpen = useUIStore((s) =>
     activeWorkspaceId
       ? (s.rightPanelTabs[activeWorkspaceId] ?? null) !== null
@@ -647,11 +649,18 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           data-testid="titlebar-drag-layer"
           data-tauri-drag-region
           className="pointer-events-auto absolute inset-y-0 left-0"
-          style={{
-            right: rightPanelOpen
-              ? `${panelBandWidth + (panelMaximized ? 0 : RIGHT_PANEL_RESIZER_REACH)}px`
-              : 0,
-          }}
+          // Maximized, the panel owns everything right of the sidebar, so
+          // the layer is sized from the left instead of trusting a row
+          // measurement that may not have landed yet.
+          style={
+            panelMaximized
+              ? { width: `${sidebarGapWidth}px` }
+              : {
+                  right: rightPanelOpen
+                    ? `${panelBandWidth + RIGHT_PANEL_RESIZER_REACH}px`
+                    : 0,
+                }
+          }
         />
       )}
 
