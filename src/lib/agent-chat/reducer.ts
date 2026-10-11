@@ -8,6 +8,7 @@ import type {
   WorkflowSnapshot,
 } from "@/tauri/events";
 
+import { isDelegatedId, isDelegatedRow } from "./delegation";
 import { runtimeNoticeFromWarning } from "./runtime-notice";
 import {
   appendTranscriptItem,
@@ -586,6 +587,10 @@ function capSubagentItems(items: ChatViewItem[]): ChatViewItem[] {
  * trailing `subagent_run` card when it is the transcript tail (one card
  * per contiguous spawn group per turn); otherwise a fresh card is opened.
  * Returns the (possibly new) messages array plus the card / sub indices.
+ *
+ * Cross-provider delegations and native subagents never share a card: a
+ * delegation renders as its own transcript card while native runs fold
+ * into the work log, so a card is always all one or all the other.
  */
 function locateOrCreateSubagent(
   state: ChatThreadState,
@@ -618,7 +623,12 @@ function locateOrCreateSubagent(
   const tailIndex = sealed.length - 1;
   const tail = sealed[tailIndex];
   const view = newSubagentView(subagentId, now());
-  if (tail && tail.kind === "subagent_run") {
+  const delegated = isDelegatedId(subagentId);
+  if (
+    tail &&
+    tail.kind === "subagent_run" &&
+    tail.subagents.every((sub) => isDelegatedRow(sub) === delegated)
+  ) {
     const nextCard: SubagentRunItem = {
       ...tail,
       subagents: [...tail.subagents, view],
@@ -1005,7 +1015,14 @@ function hasLiveDelegatedWork(messages: ChatViewItem[]): boolean {
     }
     if (item.kind !== "subagent_run") continue;
     for (const sub of item.subagents) {
-      if (isRunning(sub) && !sub.backgroundTask && !isMonitorTask(sub)) {
+      // A cross-provider delegation reports back in a later turn of its
+      // own, so the parent's turn settles normally around it.
+      if (
+        isRunning(sub) &&
+        !sub.backgroundTask &&
+        !isMonitorTask(sub) &&
+        !isDelegatedRow(sub)
+      ) {
         return true;
       }
     }
@@ -1975,6 +1992,19 @@ function applyEventInner(
           resolution: { state: "resolved", decision: event.decision },
         };
         messages = replaceItem(messages, found.index, next);
+        // The gated call only starts executing now; stamp it so its timer
+        // does not include the time the request waited for an answer. A
+        // re-delivered resolution (a second window) keeps the first stamp.
+        const toolMatch =
+          found.item.resolution.state !== "resolved" && found.item.tool_use_id
+          ? findToolCallByUseId(messages, found.item.tool_use_id)
+          : null;
+        if (toolMatch && toolMatch.item.status === "running") {
+          messages = replaceItem(messages, toolMatch.index, {
+            ...toolMatch.item,
+            approved_at: now(),
+          });
+        }
       }
       // A workflow gated on this request resumes (`running`) on allow,
       // or is considered abandoned (`stopped`) on deny/cancel — the
@@ -2120,6 +2150,7 @@ function applyEventInner(
           provider: event.provider,
           resetsAtMs,
           autoResumeAtMs: event.auto_resume_at_ms ?? null,
+          autoResumeBlockedReason: event.auto_resume_blocked_reason ?? null,
           window,
           at: now(),
         },
@@ -2128,12 +2159,22 @@ function applyEventInner(
     }
 
     case "usage_resume_cancelled": {
-      if (!state.usageLimit || state.usageLimit.autoResumeAtMs === null) {
+      const reason = event.reason ?? "cancelled";
+      // Disarming nothing changes nothing, but a failed dispatch is news even
+      // when no resume was armed (a manual Resume on an unscheduled limit).
+      if (
+        !state.usageLimit ||
+        (state.usageLimit.autoResumeAtMs === null && reason !== "dispatch_failed")
+      ) {
         return state;
       }
       return {
         ...state,
-        usageLimit: { ...state.usageLimit, autoResumeAtMs: null },
+        usageLimit: {
+          ...state.usageLimit,
+          autoResumeAtMs: null,
+          autoResumeBlockedReason: reason,
+        },
       };
     }
 

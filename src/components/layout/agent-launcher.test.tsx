@@ -47,6 +47,7 @@ vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  reportFailure: () => vi.fn(),
 }));
 
 vi.mock("@/stores/ui-store", () => ({
@@ -512,6 +513,27 @@ describe("DraftAgentLauncher", () => {
   it("disables the trigger while the draft is promoting", () => {
     render(<DraftAgentLauncher draft={makeDraft({ promoting: true })} />);
     expect(screen.getByTestId("draft-agent-launcher-trigger")).toBeDisabled();
+  });
+
+  it("keeps chat presets but disables CLI presets for a draft on a device", () => {
+    render(<DraftAgentLauncher draft={makeDraft({ hostId: 2 })} />);
+    openDraftLauncher();
+    const cli = screen.getByTestId("draft-launcher-cli-builtin-claude");
+    expect(cli).toHaveAttribute("data-disabled", "true");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-claude"),
+    ).toHaveTextContent("local only");
+    act(() => {
+      fireEvent.click(cli);
+    });
+    expect(mocks.launchDraftWithPreset).not.toHaveBeenCalled();
+
+    act(() => {
+      fireEvent.click(
+        screen.getByTestId("draft-launcher-gui-builtin-chat-agent"),
+      );
+    });
+    expect(mocks.launchDraftWithPreset).toHaveBeenCalledTimes(1);
   });
 });
 

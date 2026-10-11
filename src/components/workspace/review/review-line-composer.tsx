@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
-import { btnCard, btnCardStrong, tzBodyLg, tzMeta } from "./review-ui";
+import { modEnterLabel } from "@/lib/keybind-utils";
+import { btnCard, btnCardStrong, kbdChip, tzBodyLg, tzMeta } from "./review-ui";
 
 interface Props {
   /** "line 43" or "lines 43–44". */
@@ -131,7 +132,7 @@ export function ReviewLineComposer({
             </button>
           )}
           <span className="flex-1" />
-          <span className={cn("font-mono text-muted-foreground", tzMeta)}>⌘↵</span>
+          <kbd className={kbdChip}>{modEnterLabel()}</kbd>
         </div>
       </div>
     </div>

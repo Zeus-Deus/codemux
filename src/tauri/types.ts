@@ -112,6 +112,9 @@ export interface ProviderAuthStatus {
   username: string | null;
   /** What may be *done* here, per operation — see `ProviderOperations`. */
   operations: ProviderOperations;
+  /** `false` only when git answered that this checkout has no remote.
+   *  Absent is treated as having one. */
+  has_remote?: boolean;
 }
 
 /** Mirrors src-tauri/src/git_provider/provider.rs:OperationCapabilities.
@@ -749,6 +752,8 @@ export interface GhRateLimit {
 export interface PrsOverview {
   viewer: string | null;
   items: PrOverviewItem[];
+  /** The checkout has no remote, so there was nothing to list. */
+  local_only?: boolean;
 }
 
 export interface CheckInfo {
@@ -885,6 +890,7 @@ export type AgentChatProviderKind =
   | "cursor"
   | "grok"
   | "hermes"
+  | "acp"
   | "opencode";
 
 /** Launch-time model / reasoning / context choice for a CLI agent
@@ -977,6 +983,12 @@ export interface ContextWindowOption {
   context_window_tokens?: number | null;
 }
 
+export interface ServiceTierOption {
+  value: string;
+  label: string;
+  description: string;
+}
+
 export interface ChatModelInfo {
   id: string;
   label: string;
@@ -994,6 +1006,8 @@ export interface ChatModelInfo {
   supports_adaptive_thinking: boolean;
   supports_thinking_toggle: boolean;
   supports_fast_mode: boolean;
+  /** Provider-advertised tiers; missing on older capability payloads. */
+  service_tiers?: ServiceTierOption[];
   /** Step 8 Stage 6 — true when the model accepts image attachments.
    *  Drives the `+ → Image…` enable state and whether the composer's
    *  paste/drop handlers stage attachments at all. */
@@ -1157,6 +1171,10 @@ export interface WorkspaceSnapshot {
    *  "open on host" / attach-in-place workspaces (terminals spawn here
    *  on the remote). `null`/undefined for local + pushed workspaces. */
   remote_cwd?: string | null;
+  /** The project's checkout ON ITS HOST for an attach-in-place
+   *  workspace. A thread started on a device keeps this computer's path in
+   *  `project_root` for sidebar grouping. `null`/undefined elsewhere. */
+  remote_root?: string | null;
   /** True when this workspace is operated in place on its host with no
    *  local copy of the files (`cwd` is a host path). The UI shows a
    *  host badge and offers only "Close (detach)" — never delete/push.

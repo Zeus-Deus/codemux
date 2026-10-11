@@ -25,7 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { groupEditors } from "@/lib/editor-groups";
-import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import { resolveRightPanelWidth } from "@/lib/right-panel-width";
 import {
   RIGHT_PANEL_RESIZER_REACH,
   panelClusterRight,
@@ -59,7 +59,8 @@ import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
-import { toast } from "@/lib/toast";
+import { selectUtilityPage } from "@/lib/utility-pages";
+import { toast, reportFailure } from "@/lib/toast";
 import { applyPreset, openInEditor } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
@@ -111,9 +112,12 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
       if (!workspacePath || isLoading) return;
       setIsLoading(true);
       useSyncedSettingsStore.getState().updateSetting("editor", "default_ide", editorId);
-      openInEditor(editorId, workspacePath).finally(() => setIsLoading(false));
+      const editorName = editors.find((e) => e.id === editorId)?.name ?? "the editor";
+      openInEditor(editorId, workspacePath)
+        .catch(reportFailure(`Couldn't open in ${editorName}`))
+        .finally(() => setIsLoading(false));
     },
-    [workspacePath, isLoading],
+    [workspacePath, isLoading, editors],
   );
 
   const defaultEditor = editors.find((e) => e.id === defaultEditorId);
@@ -178,6 +182,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
           <button
             type="button"
             disabled={isLoading}
+            aria-label="Choose editor"
             className={cn(
               "flex items-center justify-center",
               !compact && "border bg-secondary/50",
@@ -535,17 +540,19 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // The *rendered* width, not the stored one: the panel's stored width can
   // exceed what fits in the current window (see `right-panel-width.ts`), and
   // the band has to stop at the panel's real edge.
-  const rightPanelWidth = useUIStore((s) => {
-    const stored = s.rightPanelWidth ?? 320;
-    const row = s.rightPanelRowWidth ?? 0;
-    return row > 0 ? clampRightPanelWidth(stored, row) : stored;
-  });
+  const rightPanelWidth = useUIStore((s) =>
+    resolveRightPanelWidth(s.rightPanelWidth, s.rightPanelRowWidth ?? 0),
+  );
   const activeWorkspacePanelOpen = useUIStore((s) =>
     activeWorkspaceId
       ? (s.rightPanelTabs[activeWorkspaceId] ?? null) !== null
       : false,
   );
   const rightPanelMaximized = useUIStore((s) => s.rightPanelMaximized);
+  // A utility page (Pull requests, Devices, …) covers the workspace and
+  // draws its own header in this band, so the workspace's tabs, actions
+  // and panel controls step aside while it is open.
+  const pageOpen = useUIStore((s) => selectUtilityPage(s) !== null);
   // The measured content row — the only honest width for "the panel covers
   // everything" while full-expand is on, since the panel then has no inline
   // width of its own.
@@ -648,11 +655,20 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           data-testid="titlebar-drag-layer"
           data-tauri-drag-region
           className="pointer-events-auto absolute inset-y-0 left-0"
-          style={{
-            right: rightPanelOpen
-              ? `${panelBandWidth + (panelMaximized ? 0 : RIGHT_PANEL_RESIZER_REACH)}px`
-              : 0,
-          }}
+          // Maximized, the panel owns everything right of the sidebar, so
+          // the layer is sized from the left instead of trusting a row
+          // measurement that may not have landed yet. An open utility page
+          // gets the same: its header is its own drag surface, and a layer
+          // over it would swallow clicks on its controls.
+          style={
+            panelMaximized || pageOpen
+              ? { width: `${sidebarGapWidth}px` }
+              : {
+                  right: rightPanelOpen
+                    ? `${panelBandWidth + RIGHT_PANEL_RESIZER_REACH}px`
+                    : 0,
+                }
+          }
         />
       )}
 
@@ -693,7 +709,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         data-testid="titlebar-floating-band"
         className={cn(
           "absolute top-1 z-10 flex h-8 min-w-0 items-center gap-2",
-          panelMaximized && "hidden",
+          (panelMaximized || pageOpen) && "hidden",
         )}
         style={{
           left: `${sidebarGapWidth + 6}px`,
@@ -764,7 +780,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           the native buttons — the one cluster in this band whose position
           never depends on the panel. Workspace-only: a draft renders no
           right panel, so there is nothing for it to control. */}
-      {guiChrome && activeWorkspaceId && (
+      {guiChrome && activeWorkspaceId && !pageOpen && (
         <RightPanelChromeCluster workspaceId={activeWorkspaceId} />
       )}
 
