@@ -87,7 +87,11 @@ impl SourceControlProvider for GitHubProvider {
             GhStatus::Authenticated { username } if !username.is_empty() => Some(username),
             _ => None,
         };
-        Ok(PrsOverview { viewer, items })
+        Ok(PrsOverview {
+            viewer,
+            items,
+            local_only: false,
+        })
     }
 
     fn pull_requests_overview_stats(

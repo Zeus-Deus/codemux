@@ -112,6 +112,9 @@ export interface ProviderAuthStatus {
   username: string | null;
   /** What may be *done* here, per operation — see `ProviderOperations`. */
   operations: ProviderOperations;
+  /** `false` only when git answered that this checkout has no remote.
+   *  Absent is treated as having one. */
+  has_remote?: boolean;
 }
 
 /** Mirrors src-tauri/src/git_provider/provider.rs:OperationCapabilities.
@@ -749,6 +752,8 @@ export interface GhRateLimit {
 export interface PrsOverview {
   viewer: string | null;
   items: PrOverviewItem[];
+  /** The checkout has no remote, so there was nothing to list. */
+  local_only?: boolean;
 }
 
 export interface CheckInfo {
