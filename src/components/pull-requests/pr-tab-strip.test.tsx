@@ -37,6 +37,7 @@ function renderStrip() {
       candidates={tabs}
       onSelect={onSelect}
       onClose={onClose}
+      onClosePanel={vi.fn()}
       onOpenInBrowser={vi.fn()}
     />,
   );

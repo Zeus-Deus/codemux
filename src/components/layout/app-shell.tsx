@@ -1,11 +1,12 @@
 import { useNotificationLink } from "@/hooks/use-notification-link";
 import { useRemotePairingRequests } from "@/hooks/use-remote-pairing-requests";
 import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
-import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
+import { lazy, useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import { selectUtilityPage, type UtilityPage } from "@/lib/utility-pages";
 import {
   useSettingsStore,
   selectDensity,
@@ -26,6 +27,7 @@ import { EmptyState } from "./empty-state";
 import { NeedsYouAnnouncer } from "./needs-you-announcer";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { UtilityPageStandaloneContext } from "./utility-page";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { scheduleSequentialIdlePrefetch } from "@/lib/idle-prefetch";
 
@@ -53,6 +55,11 @@ const DevicesView = lazy(() =>
 const PullRequestsView = lazy(() =>
   import("@/components/pull-requests/pull-requests-view").then((module) => ({
     default: module.PullRequestsView,
+  })),
+);
+const UsageView = lazy(() =>
+  import("@/components/settings/usage-view").then((module) => ({
+    default: module.UsageView,
   })),
 );
 const CommandPalette = lazy(() =>
@@ -97,11 +104,10 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // main app shell alive even before any workspace exists. The draft
   // surface is rendered by WorkspaceMain.
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
-  const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
+  const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
+  const hasActiveDraft = activeDraftId !== null;
   const showSettings = useUIStore((s) => s.showSettings);
-  const showAutomations = useUIStore((s) => s.showAutomations);
-  const showDevices = useUIStore((s) => s.showDevices);
-  const showPullRequests = useUIStore((s) => s.showPullRequests);
+  const utilityPage = useUIStore(selectUtilityPage);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
   const fileSearchOpen = useUIStore((s) => s.showFileSearch);
@@ -114,8 +120,9 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
     if (browserPeekOpen) setBrowserPeekMounted(true);
   }, [browserPeekOpen]);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
-  // Open state and width live in the persisted UI store: the full-screen
-  // pages below unmount `SidebarProvider`, which would otherwise reset them.
+  // Open state and width live in the persisted UI store: Settings and the
+  // standalone pages below unmount `SidebarProvider`, which would otherwise
+  // reset them.
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const setSidebarOpen = useUIStore((s) => s.setSidebarOpen);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
@@ -186,6 +193,31 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   }, [appearanceReady, legacyPalette, syncedThemeId, updateSyncedSetting]);
 
   useWorktreeIncludeToast();
+
+  // Picking a workspace or starting a new agent while a utility page is
+  // open means "take me there", not "switch underneath the page". Every
+  // workspace activation stamps `pendingActivationAt` — even re-picking
+  // the workspace already under the page. A subscription, not a selector:
+  // a fast backend confirms (and clears the stamp) before React renders.
+  useEffect(
+    () =>
+      useAppStore.subscribe((state, prev) => {
+        if (
+          state.pendingActivationAt !== null &&
+          state.pendingActivationAt !== prev.pendingActivationAt
+        ) {
+          useUIStore.getState().closeUtilityPages();
+        }
+      }),
+    [],
+  );
+  const lastDraftId = useRef(activeDraftId);
+  useEffect(() => {
+    if (activeDraftId !== null && activeDraftId !== lastDraftId.current) {
+      useUIStore.getState().closeUtilityPages();
+    }
+    lastDraftId.current = activeDraftId;
+  }, [activeDraftId]);
 
   useEffect(() => {
     if (isLoading || !settingsLoaded || syncedLoading) return;
@@ -263,32 +295,18 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
     );
   }
 
-  // Full-screen Automations — a first-class destination, like Settings
-  if (showAutomations) {
+  // Utility pages normally open beside the sidebar (see the main layout
+  // below). With no sidebar to sit beside — on mobile, or before any
+  // workspace exists — they take the whole window and bring their own
+  // back arrow.
+  const shellAvailable = hasWorkspaces || (lazyEnabled && hasActiveDraft);
+  if (utilityPage && (mobile || !shellAvailable)) {
     return (
-      <LazyBoundary label="Automations" className="h-screen">
-        <AutomationsView />
-      </LazyBoundary>
-    );
-  }
-
-  // Full-screen Devices page — the account's other machines and the work
-  // that lives on them. Same overlay shape as Settings / Automations.
-  if (showDevices) {
-    return (
-      <LazyBoundary label="Devices" className="h-screen">
-        <DevicesView />
-      </LazyBoundary>
-    );
-  }
-
-  // Full-screen Pull requests — the review surface for work that isn't
-  // in a workspace yet. Same overlay shape as the pages above it.
-  if (showPullRequests) {
-    return (
-      <LazyBoundary label="Pull requests" className="h-screen">
-        <PullRequestsView />
-      </LazyBoundary>
+      <UtilityPageStandaloneContext.Provider value={true}>
+        <LazyBoundary label={UTILITY_PAGE_LABEL[utilityPage]} className="h-screen">
+          <UtilityPageContent page={utilityPage} />
+        </LazyBoundary>
+      </UtilityPageStandaloneContext.Provider>
     );
   }
 
@@ -331,12 +349,27 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
         <SidebarToggleBridge />
         <AppSidebar />
         <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
-          <WorkspaceMain />
+          {/* The workspace stays mounted under a utility page, so Back is
+              instant and terminals and chats keep their state. `inert`
+              keeps focus and pointer input out of it meanwhile. */}
+          <div
+            className="flex min-h-0 min-w-0 flex-1 flex-col"
+            inert={utilityPage !== null}
+          >
+            <WorkspaceMain />
+          </div>
+          {utilityPage && (
+            <div className="absolute inset-0 z-20 flex flex-col bg-background">
+              <LazyBoundary label={UTILITY_PAGE_LABEL[utilityPage]} className="h-full">
+                <UtilityPageContent page={utilityPage} />
+              </LazyBoundary>
+            </div>
+          )}
           {/* GUI-mode background browser peek — absolutely positioned
               inside this `relative` SidebarInset, so it floats over
               WorkspaceMain without resizing it. Renders nothing unless
               GUI chrome applies and the peek is explicitly opened. */}
-          {(browserPeekOpen || browserPeekMounted) && (
+          {(browserPeekOpen || browserPeekMounted) && !utilityPage && (
             <LazyBoundary
               label="browser peek"
               className="absolute right-3.5 top-3.5 z-30 h-[300px] w-[440px] rounded-lg border border-border"
@@ -378,6 +411,20 @@ function AppShellContent({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
       </SidebarProvider>
     </div>
   );
+}
+
+const UTILITY_PAGE_LABEL: Record<UtilityPage, string> = {
+  automations: "Automations",
+  devices: "Devices",
+  "pull-requests": "Pull requests",
+  usage: "Usage",
+};
+
+function UtilityPageContent({ page }: { page: UtilityPage }) {
+  if (page === "automations") return <AutomationsView />;
+  if (page === "devices") return <DevicesView />;
+  if (page === "usage") return <UsageView />;
+  return <PullRequestsView />;
 }
 
 /**
