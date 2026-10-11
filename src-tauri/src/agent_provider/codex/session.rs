@@ -1764,10 +1764,22 @@ fn spawn_incoming_requests_task(
                     let Some(req) = maybe_req else { break; };
                     let msg = ServerRequestMessage::from_raw(&req.method, req.params.clone());
                     if let ServerRequestMessage::ToolCall(params) = msg {
-                        let actor={let state=session.state.lock().await;
-                            let owned=params.get("threadId").and_then(Value::as_str)==Some(state.codex_thread_id.as_str())
-                                && params.get("turnId").and_then(Value::as_str)==state.active_turn.as_ref().map(|t|t.0.as_str());
-                            owned.then(||crate::delegation::app::NativeActor {thread_id:session.thread_id.0.clone(),provider:crate::agent_provider::ProviderKind::Codex,workspace_id:session.workspace_id.clone(),session_id:session.provider_session_id.0.clone(),permission_mode:state.permission_mode.clone(),permit:session.native_authority.capture()})};
+                        let actor = {
+                            let state = session.state.lock().await;
+                            let turn = params.get("turnId").and_then(Value::as_str);
+                            let owned = params.get("threadId").and_then(Value::as_str) == Some(state.codex_thread_id.as_str())
+                                && turn.is_some_and(|turn| state.active_turn.as_ref().is_some_and(|active| active.0 == turn)
+                                    || state.pending_generation.is_some());
+                            owned.then(|| crate::delegation::app::NativeActor {
+                                thread_id: session.thread_id.0.clone(), provider: crate::agent_provider::ProviderKind::Codex,
+                                workspace_id: session.workspace_id.clone(), session_id: session.provider_session_id.0.clone(),
+                                permission_mode: state.permission_mode.clone(),
+                                permit: session.native_authority.capture_for_turn(turn.unwrap()),
+                            })
+                        };
+                        if let Some(actor) = &actor {
+                            let _ = actor.permit.wait_ready().await;
+                        }
                         let result = handle_dynamic_tool_call_native(
                             mcp_registry.as_ref(),
                             session.workspace_id.as_deref(),

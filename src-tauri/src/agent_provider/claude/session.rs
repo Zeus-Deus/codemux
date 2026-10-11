@@ -755,11 +755,13 @@ impl ClaudeSession {
             }
             None => self.sidecar.request(METHOD_SEND_TURN, params).await,
         }
-        .map_err(|e| ProviderError::RpcError {
-            message: format!("send-turn RPC failed: {e}"),
+        .map_err(|e| {
+            self.native_authority.finish_pending(generation);
+            ProviderError::RpcError { message: format!("send-turn RPC failed: {e}") }
         })?;
         if let Some(guard) = dispatch_guard.as_ref() {
             if ack.get("turnStarted").and_then(Value::as_bool) != Some(true) {
+                self.native_authority.finish_pending(generation);
                 return Err(ProviderError::RpcError {
                     message: "Malformed guarded send-turn acknowledgement; native outcome unknown"
                         .into(),
@@ -1256,6 +1258,9 @@ fn spawn_incoming_requests_task(
                             }
                         };
                         let job = tokio::spawn(async move {
+                            // The SDK can call tools before send-turn acknowledges.
+                            // Wait only for this captured generation to bind.
+                            let _ = actor.permit.wait_ready().await;
                             handle_mcp_tool_call(session_for_task, event_tx_for_task, req, actor).await;
                         });
                         session.native_authority.track(job.abort_handle());
@@ -1618,7 +1623,7 @@ async fn mutate_state_from_notification(
                 // SDK completion can precede the send RPC acknowledgement.
                 // Invalidate the generation even before active_turn is bound;
                 // the delayed acknowledgement must not revive its authority.
-                session.native_authority.invalidate();
+                session.native_authority.finish_current();
                 state.active_turn = None;
                 if matches!(state.status, SessionStatus::Running { .. }) {
                     state.status = SessionStatus::Ready;
@@ -1664,7 +1669,7 @@ async fn mutate_state_from_notification(
                 .remove(&RequestId(request_id.clone()));
         }
         SidecarNotification::SessionError { error, .. } => {
-            session.native_authority.invalidate();
+            session.native_authority.finish_current();
             let mut state = session.state.lock().await;
             state.status = SessionStatus::Error {
                 message: error.message.clone(),

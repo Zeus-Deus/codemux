@@ -23,6 +23,17 @@ pub enum TaskCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Read complete retained JSON for a large native event, in UTF-8 chunks.
+    Event {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        sequence: i64,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     Cancel {
         #[arg(long)]
         id: String,
@@ -74,6 +85,9 @@ pub async fn dispatch(command: TaskCommand) -> Result<Option<serde_json::Value>,
             wait_ms,
             state_dir,
         } => serde_json::to_value(super::read(&root(state_dir)?, &id, after, wait_ms).await?),
+        TaskCommand::Event { id, sequence, offset, state_dir } => {
+            serde_json::to_value(super::TaskStore::open(&root(state_dir)?)?.event_blob(&id, sequence, offset)?)
+        }
         TaskCommand::Cancel { id, state_dir } => {
             serde_json::to_value(super::cancel(&root(state_dir)?, &id)?)
         }

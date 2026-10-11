@@ -10,7 +10,7 @@ use crate::{
         lookup_provider, send_turn_with_origin, ProviderRegistry, SendTurnCommandInput,
         SubagentTracker, TurnOrigin,
     },
-    remote::tasks::TaskRead as RemoteRead,
+    remote_task_protocol::TaskRead as RemoteRead,
 };
 use std::{
     collections::HashSet,
@@ -194,7 +194,7 @@ impl Coordinator {
         let attempted = store.attempted(id)?;
         if task.cancel_requested && !attempted && !launched {
             store.update(id, |t| {
-                t.status = crate::remote::tasks::TaskStatus::Cancelled;
+                t.status = crate::remote_task_protocol::TaskStatus::Cancelled;
                 t.connection_error = None;
             })?;
             return Ok(true);
@@ -218,13 +218,13 @@ impl Coordinator {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            match serde_json::from_value::<crate::remote::tasks::CancelReceipt>(receipt)
+            match serde_json::from_value::<crate::remote_task_protocol::CancelReceipt>(receipt)
                 .map_err(|e| format!("Remote cancel receipt: {e}"))?
             {
-                crate::remote::tasks::CancelReceipt::Task(read) => {
+                crate::remote_task_protocol::CancelReceipt::Task(read) => {
                     serde_json::to_value(read).map_err(|e| e.to_string())?
                 }
-                crate::remote::tasks::CancelReceipt::Absent(fence) => {
+                crate::remote_task_protocol::CancelReceipt::Absent(fence) => {
                     if fence.id != id || !fence.absent_and_fenced {
                         return Err("Invalid receiver absence fence".into());
                     }
@@ -402,16 +402,16 @@ pub(super) async fn wake_open<R: Runtime>(handle: &AppHandle<R>, id: &str) -> Re
     // Keep the complete result/trust boundary in provider context. The normal
     // send path persists this explicit presentation, not a text-prefix filter.
     let outcome = match remote.status {
-        crate::remote::tasks::TaskStatus::Completed => "completed",
-        crate::remote::tasks::TaskStatus::Failed => "failed",
-        crate::remote::tasks::TaskStatus::Interrupted => "was interrupted (execution may be uncertain)",
-        crate::remote::tasks::TaskStatus::Cancelled => "was stopped",
+        crate::remote_task_protocol::TaskStatus::Completed => "completed",
+        crate::remote_task_protocol::TaskStatus::Failed => "failed",
+        crate::remote_task_protocol::TaskStatus::Interrupted => "was interrupted (execution may be uncertain)",
+        crate::remote_task_protocol::TaskStatus::Cancelled => "was stopped",
         _ => "reported a non-final outcome",
     };
     let display_text = format!(
         "Remote task “{}” on {} {}.{}",
         task.title, task.target_host_name, outcome,
-        if remote.status == crate::remote::tasks::TaskStatus::Completed && remote.result.is_none() {
+        if remote.status == crate::remote_task_protocol::TaskStatus::Completed && remote.result.is_none() {
             " No final assistant output was returned."
         } else { "" },
     );

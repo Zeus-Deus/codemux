@@ -95,6 +95,7 @@ function refreshEntry(entry: Entry): Promise<void> {
         if (!isCurrent(entry, generation)) return;
         if (entry.revision !== revision) { entry.dirty = true; continue; }
         const unique = new Map(tasks.filter(task => task.parent_thread_id === entry.threadId).map(task => [task.id, frozenTask(task)]));
+        entry.revision++;
         publish(entry, { tasks: Object.freeze([...unique.values()]), error: null });
       } catch (error) {
         if (isCurrent(entry, generation)) publish(entry, { error: errorText(error) });
@@ -144,6 +145,18 @@ export function refreshDelegationTasks(paneId: string, threadId: string): Promis
   const entry = owners.get(paneId);
   return entry?.threadId === threadId ? refreshEntry(entry) : Promise.resolve();
 }
+/** Task snapshot publication fence, independent of approval-response phases.
+ * Lists and confirmed upserts advance it; loading/errors/consent do not. */
+export interface TaskReadBoundary { owner: object; revision: number }
+export function delegationTaskReadBoundary(paneId: string, threadId: string): TaskReadBoundary | undefined {
+  const entry = owners.get(paneId);
+  return entry && isCurrent(entry) && entry.threadId === threadId ? { owner: entry, revision: entry.revision } : undefined;
+}
+export function qualifiesDelegationTaskRead(paneId: string, threadId: string, boundary: TaskReadBoundary | undefined): boolean {
+  const current = delegationTaskReadBoundary(paneId, threadId);
+  return !!current && current.owner === boundary?.owner && current.revision === boundary?.revision;
+}
+
 /** A read is qualified only in the same live owner and settled phase in which
  * it BEGAN. Phase identity changes on both start and settlement, even on error.
  * These task-wide phases survive detail closure, but not pane-owner disposal. */

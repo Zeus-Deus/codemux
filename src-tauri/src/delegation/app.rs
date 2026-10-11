@@ -400,7 +400,7 @@ fn project_task<R:Runtime>(app:&AppHandle<R>,store:&Journal,parent:&Parent,mut t
         DeliveryOutcome::Accepted=>Some(DeliveryReason::Accepted),
         DeliveryOutcome::Unknown=>Some(DeliveryReason::Unknown),
         DeliveryOutcome::InFlight=>Some(DeliveryReason::InFlight),
-        _ if task.cancel_requested || task.status==crate::remote::tasks::TaskStatus::Cancelled || task.remote.as_ref().is_some_and(|r|r.cancel_requested)=>Some(DeliveryReason::Cancelled),
+        _ if task.cancel_requested || task.status==crate::remote_task_protocol::TaskStatus::Cancelled || task.remote.as_ref().is_some_and(|r|r.cancel_requested)=>Some(DeliveryReason::Cancelled),
         _ if task.remote.is_none()=>Some(DeliveryReason::NoResult),
         _ if !task.status.is_terminal()=>Some(DeliveryReason::NotTerminal),
         _ if task.wake_state==WakeState::Delivered=>Some(DeliveryReason::AlreadyDelivered),
@@ -516,7 +516,7 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
             .and_then(Value::as_i64)
             .ok_or("hostId is required")?;
         let host = host(app, id)?;
-        let info: crate::remote::tasks::TaskCapabilities = serde_json::from_value(
+        let info: crate::remote_task_protocol::TaskCapabilities = serde_json::from_value(
             transport(app, &host.ssh_target, Operation::Capabilities, None).await?,
         )
         .map_err(|e| e.to_string())?;
@@ -546,7 +546,7 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
                 serde_json::from_value(args.get("input").cloned().ok_or("input is required")?)
                     .map_err(|e| e.to_string())?;
             let host = host(app, input.host_id)?;
-            let info: crate::remote::tasks::TaskCapabilities = serde_json::from_value(
+            let info: crate::remote_task_protocol::TaskCapabilities = serde_json::from_value(
                 transport(app, &host.ssh_target, Operation::Capabilities, None).await?,
             )
             .map_err(|e| e.to_string())?;
@@ -666,9 +666,9 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
                     .ok_or("decision is required")?,
             )
             .map_err(|e| e.to_string())?;
-            let original:crate::remote::tasks::RemoteApproval=serde_json::from_value(args.get("originalRequest").cloned().ok_or("Original displayed approval consent identity is required")?).map_err(|e|e.to_string())?;
+            let original:crate::remote_task_protocol::RemoteApproval=serde_json::from_value(args.get("originalRequest").cloned().ok_or("Original displayed approval consent identity is required")?).map_err(|e|e.to_string())?;
             if original.request_id!=request_id || !task.remote.as_ref().is_some_and(|t|t.pending_requests.iter().any(|r|r==&original)) {return Err("Displayed approval kind/payload changed before consent admission".into());}
-            let immutable = crate::remote::tasks::RespondRequest {
+            let immutable = crate::remote_task_protocol::RespondRequest {
                 original_request: Some(original),
                 request_id: request_id.clone(),
                 decision,
@@ -698,7 +698,7 @@ async fn invoke_open<R: Runtime>(app: &AppHandle<R>, cmd: &str, args: Value) -> 
                 let result = match result {
                     Ok(data) => {
                         let acknowledgement = (|| {
-                            let read: crate::remote::tasks::TaskRead =
+                            let read: crate::remote_task_protocol::TaskRead =
                                 serde_json::from_value(data.clone()).map_err(|e| e.to_string())?;
                             let expected = serde_json::to_value(&immutable.decision)
                                 .map_err(|e| e.to_string())?;
@@ -804,7 +804,7 @@ fn validate_question_decision(payload:&Value,decision:&crate::agent_provider::Ap
 }
 struct RemoteDispatch<R:Runtime> {
     app:AppHandle<R>, store:Arc<Journal>, id:String, thread:String,
-    response:Option<crate::remote::tasks::RespondRequest>,
+    response:Option<crate::remote_task_protocol::RespondRequest>,
     waker:Arc<futures_util::task::AtomicWaker>,
 }
 impl<R:Runtime> std::fmt::Debug for RemoteDispatch<R> {
@@ -822,7 +822,7 @@ impl<R:Runtime> crate::json_rpc_child::dispatch::DispatchGuard for RemoteDispatc
         })
     }
 }
-pub(crate) fn remote_dispatch_guard<R:Runtime>(app:&AppHandle<R>,store:&Arc<Journal>,task:&LocalTask,response:Option<crate::remote::tasks::RespondRequest>)->Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard> {
+pub(crate) fn remote_dispatch_guard<R:Runtime>(app:&AppHandle<R>,store:&Arc<Journal>,task:&LocalTask,response:Option<crate::remote_task_protocol::RespondRequest>)->Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard> {
     let waker=Arc::new(futures_util::task::AtomicWaker::new());store.register_dispatch(&waker);
     Arc::new(RemoteDispatch {app:app.clone(),store:store.clone(),id:task.id.clone(),thread:task.parent_thread_id.clone(),response,waker})
 }

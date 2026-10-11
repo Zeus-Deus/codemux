@@ -8,28 +8,13 @@ use checkout::CheckoutIdentity;
 mod worker;
 
 use crate::agent_provider::{ProviderChatCapabilities, ProviderKind};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use store::TaskStore;
 
-mod types;
-pub use types::*;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderAvailability {
-    pub provider: ProviderKind,
-    pub capabilities: Option<ProviderChatCapabilities>,
-    pub error: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskCapabilities {
-    pub protocol_version: u32,
-    pub providers: Vec<ProviderAvailability>,
-    pub workspaces: Vec<super::workspace::Workspace>,
-}
+pub use crate::remote_task_protocol::*;
 
 /// Called by the single-threaded CLI before constructing Tokio. This pins a
 /// server-distributed Claude sidecar for the existing live capability cache.

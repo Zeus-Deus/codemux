@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { useHostsStore } from '@/stores/hosts-store';
 import { delegateTask, delegationAuthorize, delegationGrants, delegationHostInfo, delegationRead, type DelegateTaskInput, type DelegationHostInfo, type DelegationProvider, type LocalTask } from '@/lib/delegation';
 import { isDelegationPaneOwner, upsertDelegationTask } from '@/stores/delegation-store';
+import { randomUUID } from '@/lib/uuid';
 import { DelegationGrants } from './DelegationGrants';
 
 export interface DelegateTaskDialogProps {
@@ -117,9 +118,9 @@ export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
     };
     setError(null);
     setPhase('authorizing');
-    const currentAttempt = attempt.current ?? { requestId: crypto.randomUUID(), dispatched: false };
-    attempt.current = currentAttempt;
     try {
+      const currentAttempt = attempt.current ?? { requestId: randomUUID(), dispatched: false };
+      attempt.current = currentAttempt;
       assertTarget();
       if (!currentAttempt.taskId) {
         if (!selectedHost || !workspace || !selectedModel || !selectedPermission) throw new Error('Receiver launch capabilities are unavailable.');
@@ -156,9 +157,10 @@ export function DelegateTaskDialog(props: DelegateTaskDialogProps) {
       setConsent(false);
       latest.current.onOpenChange(false);
     } catch (cause) {
+      const currentAttempt = attempt.current;
       if (token === operation.current) {
-        setRetrying(!!currentAttempt.dispatched);
-        setError(`${currentAttempt.dispatched ? 'Launch not confirmed. Retry the same task; do not create a replacement. ' : ''}${errorText(cause)}`);
+        setRetrying(!!currentAttempt?.dispatched);
+        setError(`${currentAttempt?.dispatched ? 'Launch not confirmed. Retry the same task; do not create a replacement. ' : ''}${errorText(cause)}`);
       }
     } finally {
       if (token === operation.current) { pending.current = false; setPhase('idle'); }

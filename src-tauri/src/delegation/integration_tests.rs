@@ -16,7 +16,7 @@ impl TaskTransport for CapacityTransport {
         let permit = self.release.acquire().await.unwrap();
         permit.forget();
         self.live.fetch_sub(1, Ordering::SeqCst);
-        let mut page = super::tests::remote(&self.store.task(&id)?, crate::remote::tasks::TaskStatus::Completed);
+        let mut page = super::tests::remote(&self.store.task(&id)?, crate::remote_task_protocol::TaskStatus::Completed);
         if cursor > 0 { page.events.clear(); page.next_cursor = cursor; }
         serde_json::to_value(page).map_err(|e| e.to_string())
     }
@@ -286,9 +286,9 @@ async fn checkpoint_case(kind: ProviderKind, action: &str) {
         journal.put_grant(&ws, &grant).unwrap();
         let task = journal.admit(&parent, &grant, "checkout", &input).unwrap();
         let mut page = super::tests::remote(&task, match action {
-            "presentation-failed" => crate::remote::tasks::TaskStatus::Failed,
-            "presentation-interrupted" => crate::remote::tasks::TaskStatus::Interrupted,
-            _ => crate::remote::tasks::TaskStatus::Completed,
+            "presentation-failed" => crate::remote_task_protocol::TaskStatus::Failed,
+            "presentation-interrupted" => crate::remote_task_protocol::TaskStatus::Interrupted,
+            _ => crate::remote_task_protocol::TaskStatus::Completed,
         });
         if action == "presentation-no-output" { page.task.result = None; }
         if matches!(action, "presentation-failed" | "presentation-interrupted") { page.task.error = Some("Specific child failure detail".into()); }
@@ -741,6 +741,13 @@ async fn validation_claude_inner_result_preserves_parent_before_and_after_ack() 
     completion_before_ack(ProviderKind::Claude, "inner").await;
     completion_before_ack(ProviderKind::Claude, "inner-normal").await;
 }
+#[tokio::test]
+async fn ordinary_queue_and_stop_before_ack_preserve_native_turn_tracking() {
+    for kind in [ProviderKind::Codex, ProviderKind::Claude] {
+        completion_before_ack(kind, "activity-queue").await;
+        completion_before_ack(kind, "activity-stop").await;
+    }
+}
 async fn completion_before_ack(kind: ProviderKind, mode: &str) {
     use crate::agent_provider::{ProviderRuntimeEvent, SendTurnInput, SessionStatus};
     use futures_util::StreamExt;
@@ -775,6 +782,16 @@ async fn completion_before_ack(kind: ProviderKind, mode: &str) {
             {"after":"send-turn","emit":"notification","method":"sdk-message","params":{"threadId":thread,"message":{"type":"tool_progress","tool_use_id":"processed-inner-marker"}}},
             {"after":"send-turn","wait_for":parent_gate,"emit":"notification","method":"sdk-message","params":{"threadId":thread,"message":{"type":"result","subtype":"success","result":"genuine parent","usage":{}}}}
         ]);
+    }
+    let activity = mode.starts_with("activity-");
+    if activity {
+        // Hold acknowledgement without a completed turn or turn/started.
+        // The marker proves execution crossed stdin before the second action.
+        script = if kind == ProviderKind::Codex {
+            json!([{"after":"turn/start","emit":"notification","method":"fixture/admitted","params":{}}])
+        } else {
+            json!([{"after":"send-turn","emit":"notification","method":"sdk-message","params":{"threadId":thread,"message":{"type":"tool_progress","tool_use_id":"admitted"}}}])
+        };
     }
     if mode == "no-start" {
         script.as_array_mut().unwrap().remove(0);
@@ -851,6 +868,25 @@ async fn completion_before_ack(kind: ProviderKind, mode: &str) {
     })
     .await
     .unwrap();
+    if activity {
+        let app = tauri::test::mock_app();
+        app::user_activity(app.handle(), &thread, mode == "activity-stop").unwrap();
+        std::fs::write(gate, "release").unwrap();
+        let first = send.await.unwrap().unwrap();
+        assert!(provider.turn_active(&ThreadId(thread.clone())).await,
+            "acknowledged ordinary execution lost its lifecycle after concurrent user activity");
+        assert!(super::authority::NativeAuthority::current_permit(&thread).admit().is_err());
+        if mode == "activity-queue" {
+            let second = provider.send_turn(serde_json::from_value(
+                json!({"thread_id":thread,"text":"second","images":[]})
+            ).unwrap()).await.unwrap();
+            assert!(second.queued_id.is_some(), "second ordinary send must queue behind the first");
+        } else {
+            provider.interrupt_turn(ThreadId(thread.clone()), Some(first.turn_id)).await.unwrap();
+        }
+        provider.stop_session(ThreadId(thread)).await.unwrap();
+        return;
+    }
     std::fs::write(gate, "release").unwrap();
     send.await.unwrap().unwrap();
     let expired = super::authority::NativeAuthority::current_permit(&thread)
@@ -1435,7 +1471,7 @@ async fn control_launch_lost_reply_restart_follow_and_normal_idle_native_parent_
     .unwrap();
     assert_eq!(
         journal.task(&approval.id).unwrap().status,
-        crate::remote::tasks::TaskStatus::Cancelled
+        crate::remote_task_protocol::TaskStatus::Cancelled
     );
     let held = crate::control::dispatch_request(
         handle,
@@ -1656,7 +1692,8 @@ async fn claude_callback_authority_ends_with_turn_and_callback_job_ends_with_run
 async fn l3_cli_receipt_reconciles_lost_reply_without_reclaiming_callback() {
     use super::transport::TransportError;
     use crate::agent_provider::ApprovalDecision;
-    use crate::remote::tasks::{RemoteApproval, RespondRequest, TaskStatus, TaskStore};
+    use crate::remote_task_protocol::{RemoteApproval, RespondRequest, TaskStatus};
+    use crate::remote::tasks::TaskStore;
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
     for folder in ["home", "bin", "remote-state", "local-journal"] {
@@ -1832,7 +1869,7 @@ async fn l2_attempted_never_admitted_cancel_settles_and_fences_delayed_launch() 
     );
     assert_eq!(
         store.task(&task.id).unwrap().status,
-        crate::remote::tasks::TaskStatus::Cancelled
+        crate::remote_task_protocol::TaskStatus::Cancelled
     );
     assert_eq!(*transport.calls.lock().unwrap(), vec!["cancel"]);
     let receiver = crate::remote::tasks::TaskStore::open(&root.join("remote-state")).unwrap();
@@ -1896,7 +1933,7 @@ async fn cancel_of_terminal_receiver_drains_saved_cursor_after_restart() {
     }
     receiver
         .update(&task.id, |t| {
-            t.status = crate::remote::tasks::TaskStatus::Completed;
+            t.status = crate::remote_task_protocol::TaskStatus::Completed;
             t.result = Some("immutable fixture result".into());
         })
         .unwrap();
@@ -2145,4 +2182,72 @@ async fn codex_delayed_native_admission_is_denied_after_completed_stop() {
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn native_callbacks_before_ack_keep_the_original_turn_authority() {
+    use crate::agent_provider::{ProviderRuntimeEvent, SendTurnInput};
+    use futures_util::StreamExt;
+    use std::os::unix::fs::PermissionsExt;
+    for kind in [ProviderKind::Codex, ProviderKind::Claude] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let thread = format!("early-live-{kind:?}");
+        let codex = kind == ProviderKind::Codex;
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug")
+            .join(if codex { "fake_codex_app_server" } else { "fake_claude_sidecar" });
+        let gate = root.join("ack-release");
+        let script = if codex {
+            json!([
+                {"after":"turn/start","emit":"server_request","method":"item/tool/call","params":{"threadId":"c-1","turnId":"t-1","callId":"early","tool":"codemux_mcp__codemux-self__delegation_targets","arguments":{}}},
+                {"after":"turn/start","delay_ms":100,"emit":"notification","method":"fixture/admitted","params":{}}
+            ])
+        } else {
+            json!([
+                {"after":"send-turn","emit":"server_request","method":"mcp-tool-call","params":{"name":"mcp__codemux-self__delegation_targets","arguments":{}}},
+                {"after":"send-turn","delay_ms":100,"emit":"notification","method":"sdk-message","params":{"threadId":thread,"message":{"type":"tool_progress","tool_use_id":"admitted"}}}
+            ])
+        };
+        std::fs::write(root.join("script.json"), script.to_string()).unwrap();
+        let prefix = if codex { "CODEX" } else { "CLAUDE" };
+        let script_key = if codex { "FAKE_CODEX_SCRIPT" } else { "FAKE_CLAUDE_SIDECAR_SCRIPT" };
+        let binary = root.join("fixture");
+        std::fs::write(&binary, format!("#!/bin/sh\nexport {script_key}='{}'\nexport FAKE_{prefix}_FIRST_ACK_GATE='{}'\nexec '{}' \"$@\"\n", root.join("script.json").display(), gate.display(), helper.display())).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = crate::mcp::registry::McpRegistry::new();
+        registry.insert_native_delegation_tools_for_test().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        registry.set_native_delegation_handler(Arc::new(move |actor, _, _| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let result = actor.permit.admit().map(|_| json!({"qualified":true}));
+                let _ = tx.lock().unwrap().take().unwrap().send(result.clone());
+                result
+            })
+        }));
+        let provider: Arc<dyn AgentProvider> = if codex {
+            Arc::new(crate::agent_provider::codex::CodexAgentProvider::new(
+                crate::agent_provider::codex::CodexProviderConfig { codex_binary: binary, mcp_registry: Some(registry), ..Default::default() }
+            ))
+        } else {
+            Arc::new(crate::agent_provider::claude::ClaudeAgentProvider::new(
+                crate::agent_provider::claude::ClaudeProviderConfig { sidecar_binary: Some(binary), claude_binary: Some(helper), mcp_registry: Some(registry), ..Default::default() }
+            ).await.unwrap())
+        };
+        provider.start_session(serde_json::from_value(json!({"thread_id":thread,"cwd":root,"additional_directories":[]})).unwrap()).await.unwrap();
+        let mut events = provider.event_stream();
+        let p = provider.clone();
+        let input: SendTurnInput = serde_json::from_value(json!({"thread_id":thread,"text":"early tool","images":[]})).unwrap();
+        let send = tokio::spawn(async move { p.send_turn(input).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(events.next().await.unwrap(), ProviderRuntimeEvent::RuntimeWarning { .. }) {}
+        }).await.unwrap();
+        assert!(!send.is_finished(), "fixture must keep acknowledgement pending until after callback arrives");
+        std::fs::write(gate, "release").unwrap();
+        send.await.unwrap().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), rx).await.unwrap().unwrap();
+        provider.stop_session(ThreadId(thread)).await.unwrap();
+        assert_eq!(result.unwrap(), json!({"qualified":true}), "early live callback lost its original authority");
+    }
 }

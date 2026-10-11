@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
-import { useDelegationTasks } from '@/stores/delegation-store';
+import { delegationResponseReadBoundary, upsertDelegationTask, useDelegationTasks } from '@/stores/delegation-store';
 import { remoteFixture, taskFixture } from '@/lib/delegation.test-fixtures';
 import type { LocalTask } from '@/lib/delegation';
 import userEvent from '@testing-library/user-event';
@@ -8,6 +8,197 @@ const native = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn().mockResolved
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: native.listen }));
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (cause: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+/** Synthetic IPC DTOs derived from Journal::cancel/app::project_task and the
+ * receiver's terminal projection, not a native-runtime capture. */
+function stopSnapshots() {
+  const running = taskFixture({ remote: remoteFixture() });
+  const stopping = { ...running, updated_at: '2026-10-08T10:00:01Z', status: 'stopping' as const, cancel_requested: true, wake_state: 'suppressed' as const, delivery: { outcome: 'not_attempted' as const, eligible: false, reason: 'cancelled' as const } };
+  const cancelled = { ...stopping, updated_at: '2026-10-08T10:00:02Z', status: 'cancelled' as const, remote: remoteFixture({ updated_at: '2026-10-08T10:00:02Z', status: 'cancelled', cancel_requested: true, pending_requests: [], activity: null, result: null, error: null }) };
+  return { running, stopping, cancelled };
+}
+
+it('F6 preserves a newer cancelled shared-list publication when an older Stop readback resolves last in the same owner', async () => {
+  const Card = await component();
+  const { running, stopping, cancelled } = stopSnapshots();
+  const original = JSON.stringify({ running, stopping, cancelled });
+  const cancel = deferred<LocalTask>();
+  const read = deferred<import('@/lib/delegation').TaskRead>();
+  const terminalList = deferred<LocalTask[]>();
+  let invalidate!: (event: { payload: { parent_thread_id: string } }) => void;
+  const unlisten = vi.fn();
+  let invalidations = 0;
+  native.listen.mockImplementation((event, callback) => { expect(event).toBe('delegation-changed'); invalidate = notice => { invalidations++; callback(notice); }; return Promise.resolve(unlisten); });
+  let lists = 0;
+  native.invoke.mockImplementation((command, args) => {
+    if (command === 'delegation_cancel') { expect(args).toEqual({ paneId: 'pane', taskId: running.id }); return cancel.promise; }
+    if (command === 'delegation_read') { expect(args).toEqual({ paneId: 'pane', taskId: running.id, cursor: 0 }); return read.promise; }
+    expect(command).toBe('delegation_list');
+    expect(args).toEqual({ paneId: 'pane' });
+    lists++;
+    if (lists === 1) return Promise.resolve([running]);
+    if (lists === 2) return Promise.resolve([stopping]);
+    expect(lists).toBe(3);
+    return terminalList.promise;
+  });
+  let state!: ReturnType<typeof useDelegationTasks>;
+  function Owner() {
+    state = useDelegationTasks('pane', 'thread-1');
+    return state.tasks[0] ? <Card key={state.tasks[0].id} task={state.tasks[0]} paneId="pane" writable onOpen={vi.fn()} /> : null;
+  }
+  const view = render(<Owner />);
+  await waitFor(() => { expect(state.subscriptionHealth).toBe('connected'); expect(state.loading).toBe(false); expect(screen.getByText('Running')).toBeInTheDocument(); });
+  const article = screen.getByRole('article');
+  const open = screen.getByRole('button', { name: 'View task' });
+  const owner = delegationResponseReadBoundary('pane', 'thread-1', running.id)!.owner;
+  fireEvent.click(screen.getByRole('button', { name: 'Stop task' }));
+  const notices = [{ payload: { parent_thread_id: 'thread-1' } }, { payload: { parent_thread_id: 'thread-1' } }];
+  await act(async () => invalidate(notices[0]));
+  await waitFor(() => { expect(state.tasks[0]).toEqual(stopping); expect(state.loading).toBe(false); });
+  expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_read')).toHaveLength(0);
+  await act(async () => cancel.resolve(stopping));
+  await waitFor(() => expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_read')).toHaveLength(1));
+  await act(async () => invalidate(notices[1]));
+  expect(state.loading).toBe(true);
+  await act(async () => terminalList.resolve([cancelled]));
+  await waitFor(() => { expect(state.tasks[0]).toEqual(cancelled); expect(state.loading).toBe(false); expect(screen.getByText('Stopped')).toBeInTheDocument(); });
+  expect(screen.getByRole('article')).toBe(article);
+  expect(screen.getByRole('button', { name: 'View task' })).toBe(open);
+  expect(delegationResponseReadBoundary('pane', 'thread-1', running.id)!.owner).toBe(owner);
+  // No additional invalidation or corrective refresh after this old response.
+  await act(async () => read.resolve({ task: stopping, events: [], next_cursor: 0, has_more: false }));
+  expect(state.tasks[0], 'F6: old Stop read must not replace a fully settled cancelled list').toEqual(cancelled);
+  expect(screen.getByText('Stopped')).toBeInTheDocument();
+  expect(screen.getByRole('article')).toBe(article);
+  expect(screen.queryByRole('button', { name: 'Stop task' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(native.invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['delegation_list', 'delegation_cancel', 'delegation_list', 'delegation_read', 'delegation_list']);
+  expect(invalidations).toBe(2);
+  expect(delegationResponseReadBoundary('pane', 'thread-1', running.id)!.owner).toBe(owner);
+  expect(native.listen).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify({ running, stopping, cancelled })).toBe(original);
+  view.unmount();
+  expect(unlisten).toHaveBeenCalledTimes(1);
+});
+
+async function pendingCardStop() {
+  const Card = await component();
+  const snapshots = stopSnapshots();
+  const cancel = deferred<LocalTask>();
+  const read = deferred<import('@/lib/delegation').TaskRead>();
+  const list = deferred<LocalTask[]>();
+  let invalidate!: (event: { payload: { parent_thread_id: string } }) => void;
+  const unlisten = vi.fn();
+  native.listen.mockImplementation((event, callback) => { expect(event).toBe('delegation-changed'); invalidate = callback; return Promise.resolve(unlisten); });
+  let lists = 0;
+  native.invoke.mockImplementation(command => {
+    if (command === 'delegation_cancel') return cancel.promise;
+    if (command === 'delegation_read') return read.promise;
+    expect(command).toBe('delegation_list');
+    lists++;
+    return lists === 1 ? Promise.resolve([snapshots.running]) : lists === 2 ? list.promise : Promise.resolve([snapshots.cancelled]);
+  });
+  let state!: ReturnType<typeof useDelegationTasks>;
+  function Owner({ writable }: { writable: boolean }) {
+    state = useDelegationTasks('pane', 'thread-1');
+    return state.tasks[0] ? <Card key={state.tasks[0].id} task={state.tasks[0]} paneId="pane" writable={writable} onOpen={vi.fn()} /> : null;
+  }
+  const view = render(<Owner writable />);
+  await waitFor(() => { expect(state.subscriptionHealth).toBe('connected'); expect(state.loading).toBe(false); expect(state.tasks[0]).toEqual(snapshots.running); });
+  fireEvent.click(screen.getByRole('button', { name: 'Stop task' }));
+  await act(async () => cancel.resolve(snapshots.stopping));
+  await waitFor(() => expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_read')).toHaveLength(1));
+  return { ...snapshots, view, read, list, unlisten, state: () => state, invalidate: () => invalidate({ payload: { parent_thread_id: 'thread-1' } }), readonly: () => view.rerender(<Owner writable={false} />) };
+}
+
+it('F6 accepts read-first Stop confirmation and fences an already pending older list before fresh cancelled reconciliation', async () => {
+  const h = await pendingCardStop();
+  await act(async () => h.invalidate());
+  expect(h.state().loading).toBe(true);
+  await act(async () => h.read.resolve({ task: h.stopping, events: [], next_cursor: 0, has_more: false }));
+  expect(h.state().tasks[0]).toEqual(h.stopping);
+  expect(screen.getByText('Stopping')).toBeInTheDocument();
+  await act(async () => h.list.resolve([h.running]));
+  await waitFor(() => { expect(h.state().tasks[0]).toEqual(h.cancelled); expect(h.state().loading).toBe(false); });
+  expect(screen.getByText('Stopped')).toBeInTheDocument();
+  expect(native.invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['delegation_list', 'delegation_cancel', 'delegation_read', 'delegation_list', 'delegation_list']);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+});
+
+it('F6 does not replace a newer confirmed shared upsert with an older Stop readback', async () => {
+  const h = await pendingCardStop();
+  act(() => upsertDelegationTask('pane', 'thread-1', h.cancelled));
+  expect(h.state().tasks[0]).toEqual(h.cancelled);
+  await act(async () => h.read.resolve({ task: h.stopping, events: [], next_cursor: 0, has_more: false }));
+  expect(h.state().tasks[0]).toEqual(h.cancelled);
+  expect(screen.getByText('Stopped')).toBeInTheDocument();
+  expect(native.invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['delegation_list', 'delegation_cancel', 'delegation_read']);
+});
+
+it.each(['resolve', 'reject'] as const)('F6 discards superseded read $0 without fabricating a Stop error', async completion => {
+  const h = await pendingCardStop();
+  await act(async () => h.invalidate());
+  await act(async () => h.list.resolve([h.cancelled]));
+  await waitFor(() => expect(h.state().loading).toBe(false));
+  await act(async () => { if (completion === 'resolve') h.read.resolve({ task: h.stopping, events: [], next_cursor: 0, has_more: false }); else h.read.reject(new Error('Obsolete read transport failure')); });
+  expect(h.state().tasks[0]).toEqual(h.cancelled);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(native.invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['delegation_list', 'delegation_cancel', 'delegation_read', 'delegation_list']);
+});
+
+it('F6 retains genuine current read failure and permits a fresh exact Stop retry', async () => {
+  const h = await pendingCardStop();
+  await act(async () => h.read.reject(new Error('Actual read transport failure')));
+  expect(screen.getByRole('alert')).toHaveTextContent('Stop unconfirmed: Actual read transport failure. Retry stop to confirm; the remote task may still be running.');
+  expect(h.state().tasks[0]).toEqual(h.running);
+  const fresh = deferred<import('@/lib/delegation').TaskRead>();
+  native.invoke.mockImplementation(command => command === 'delegation_cancel' ? Promise.resolve(h.stopping) : command === 'delegation_read' ? fresh.promise : Promise.resolve([h.running]));
+  fireEvent.click(screen.getByRole('button', { name: 'Retry stop' }));
+  await waitFor(() => expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_read')).toHaveLength(2));
+  await act(async () => fresh.resolve({ task: h.cancelled, events: [], next_cursor: 0, has_more: false }));
+  expect(h.state().tasks[0]).toEqual(h.cancelled);
+  expect(screen.getByText('Stopped')).toBeInTheDocument();
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_cancel')).toHaveLength(2);
+});
+
+it('F6 retains genuine readback identity errors without publishing foreign tasks', async () => {
+  const h = await pendingCardStop();
+  await act(async () => h.read.resolve({ task: { ...h.stopping, parent_thread_id: 'foreign' }, events: [], next_cursor: 0, has_more: false }));
+  expect(screen.getByRole('alert')).toHaveTextContent('Task readback did not match this conversation.');
+  expect(h.state().tasks[0]).toEqual(h.running);
+});
+
+it('F6 a failed shared list does not disqualify a current successful Stop read', async () => {
+  const h = await pendingCardStop();
+  await act(async () => h.invalidate());
+  await act(async () => h.list.reject(new Error('Actual list transport failure')));
+  await waitFor(() => expect(h.state().loading).toBe(false));
+  await act(async () => h.read.resolve({ task: h.stopping, events: [], next_cursor: 0, has_more: false }));
+  expect(h.state().tasks[0]).toEqual(h.stopping);
+  expect(h.state().error).toBe('Actual list transport failure');
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+});
+
+it.each(['readonly', 'disposed'] as const)('F6 denies old read settlement after $0 ownership', async ownership => {
+  const h = await pendingCardStop();
+  if (ownership === 'readonly') h.readonly();
+  else h.view.unmount();
+  await act(async () => h.read.resolve({ task: h.stopping, events: [], next_cursor: 0, has_more: false }));
+  if (ownership === 'readonly') {
+    expect(h.state().tasks[0]).toEqual(h.running);
+    expect(screen.getByRole('button', { name: 'Stop task' })).toBeDisabled();
+  } else expect(h.unlisten).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(native.invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['delegation_list', 'delegation_cancel', 'delegation_read']);
+});
+
 async function component() {
   const modules = import.meta.glob('./RemoteTaskCard.tsx');
   expect(modules['./RemoteTaskCard.tsx'], 'standalone remote receipt must exist').toBeTypeOf('function');

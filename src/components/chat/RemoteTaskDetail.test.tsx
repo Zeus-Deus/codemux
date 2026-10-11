@@ -7,6 +7,10 @@ import type { LocalTask, RemoteApproval, TaskRead } from '@/lib/delegation';
 const native = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn().mockResolvedValue(() => {}) }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: native.listen }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 async function component() {
   const modules = import.meta.glob('./RemoteTaskDetail.tsx');
@@ -17,7 +21,9 @@ async function component() {
 // emitter -> parser -> raw translator -> worker projection to the actual source
 // so changing task.provider or inventing a metadata envelope cannot qualify it.
 function claudeRawApprovalFixture(toolName: string, kind: string, rawSidecarInput: Record<string, unknown>, requestId = 'raw-tool'): RemoteApproval {
-  const source = (path: string) => readFileSync(`${process.cwd()}/${path}`, 'utf8');
+  // Checkout EOLs are source formatting, not wire/request data. Keep the exact
+  // producer assertions and never apply this conversion to any actual payload.
+  const source = (path: string) => readFileSync(`${process.cwd()}/${path}`, 'utf8').replace(/\r\n/g, '\n');
   expect(source('sidecar/claude-agent/src/permissions.ts')).toContain('emit.notification("request-opened", {\n      threadId,\n      requestId,\n      toolName,\n      toolInput,');
   expect(source('src-tauri/src/agent_provider/claude/protocol.rs')).toContain('tool_input: field_value(&params, "toolInput")');
   expect(source('src-tauri/src/agent_provider/claude/translate.rs')).toContain('payload: tool_input,');
@@ -27,6 +33,62 @@ function claudeRawApprovalFixture(toolName: string, kind: string, rawSidecarInpu
   const translated = { request_id: parsed.request_id, request_kind: parsed.kind, payload: parsed.tool_input };
   return { request_id: translated.request_id, request_kind: translated.request_kind, payload: translated.payload };
 }
+
+it.each(['LF', 'CRLF'] as const)('source-faithful %s checkout preserves original approval bytes through the actual detail and exact native Allow', async eol => {
+  const Detail = await component();
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+  const paths = [
+    'sidecar/claude-agent/src/permissions.ts',
+    'src-tauri/src/agent_provider/claude/protocol.rs',
+    'src-tauri/src/agent_provider/claude/translate.rs',
+    'src-tauri/src/remote/tasks/worker.rs',
+  ].map(path => `${process.cwd()}/${path}`);
+  const seen: string[] = [];
+  // Only the file-I/O seam changes: every specimen is the actual repository
+  // source, with checkout line endings converted. No invented producer projection.
+  const sourceReads = vi.mocked(readFileSync);
+  sourceReads.mockImplementation(((path, options) => {
+    const original = actual.readFileSync(path, options);
+    if (typeof path !== 'string' || !paths.includes(path)) return original;
+    expect(options).toBe('utf8');
+    expect(original).toBeTypeOf('string');
+    const lf = (original as string).replace(/\r\n/g, '\n');
+    const checkout = eol === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
+    expect(checkout).toContain(eol === 'CRLF' ? '\r\n' : '\n');
+    if (eol === 'CRLF') expect(checkout.replace(/\r\n/g, '')).not.toContain('\n');
+    seen.push(path);
+    return checkout;
+  }) as typeof readFileSync);
+  try {
+    const rawSidecarInput = { query: 'Original\r\nCRLF\nLF\rCR', input: { text: 'Nested\r\nbytes', flag: false, value: null }, tool_input: ['Array\r\nbytes', 'λ\n雪'] };
+    const originalBytes = JSON.stringify(rawSidecarInput);
+    const request = claudeRawApprovalFixture('WebSearch', 'other', rawSidecarInput, 'checkout-eol');
+    expect(seen).toEqual(paths);
+    expect(request).toEqual({ request_id: 'checkout-eol', request_kind: 'other', payload: rawSidecarInput });
+    expect(request.payload).toBe(rawSidecarInput);
+    const requestBytes = JSON.stringify(request);
+    const task = taskFixture({ provider: 'claude', status: 'awaiting_approval', remote: remoteFixture({ pending_requests: [request] }) });
+    native.invoke.mockImplementation(cmd => Promise.resolve(cmd === 'delegation_read' ? { task, events: [], next_cursor: 0, has_more: false } : cmd === 'delegation_respond' ? task : [task]));
+    renderHook(() => useDelegationTasks('pane', 'thread-1'));
+    const view = render(<Detail task={task} paneId="pane" writable onBack={vi.fn()} />);
+    const allow = await screen.findByRole('button', { name: 'Allow request checkout-eol' });
+    await waitFor(() => expect(allow).toBeEnabled());
+    expect(JSON.stringify(JSON.parse(screen.getByLabelText('Original tool input').textContent!))).toBe(originalBytes);
+    const disclosure = screen.getByText('Full request details').closest('details')!;
+    expect(disclosure).not.toHaveAttribute('open');
+    expect(JSON.stringify(JSON.parse(disclosure.querySelector('pre')!.textContent!))).toBe(requestBytes);
+    expect(view.container.querySelector('a,img')).toBeNull();
+    fireEvent.click(allow); fireEvent.click(allow);
+    await waitFor(() => expect(native.invoke.mock.calls.filter(([cmd]) => cmd === 'delegation_respond')).toEqual([['delegation_respond', { paneId: 'pane', taskId: task.id, requestId: request.request_id, originalRequest: request, decision: { decision: 'allow' } }]]));
+    const outgoing = native.invoke.mock.calls.find(([cmd]) => cmd === 'delegation_respond')![1].originalRequest;
+    expect(outgoing).toBe(request);
+    expect(outgoing.payload).toBe(rawSidecarInput);
+    expect(JSON.stringify(outgoing)).toBe(requestBytes);
+    expect(JSON.stringify(rawSidecarInput)).toBe(originalBytes);
+  } finally {
+    sourceReads.mockImplementation(actual.readFileSync);
+  }
+});
 
 it('P3 cancelled delivery notice detail preserves the full diagnostic as muted information after authoritative readback', async () => {
   const Detail = await component();

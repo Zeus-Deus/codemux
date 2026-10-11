@@ -1,5 +1,5 @@
 use crate::agent_provider::ProviderKind;
-use crate::remote::tasks::{LaunchRequest, TaskEvent, TaskSnapshot, TaskStatus};
+use crate::remote_task_protocol::{LaunchRequest, TaskEvent, TaskSnapshot, TaskStatus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

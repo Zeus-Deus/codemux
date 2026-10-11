@@ -25,7 +25,7 @@ fn setup(root: &std::path::Path, name: &str) -> (tauri::App<tauri::test::MockRun
 fn contract_native_delivery_projection_uses_ledger_and_current_authority() {
     let dir=tempfile::TempDir::new().unwrap();
     let (app,store,task,pane,_,_)=setup(dir.path(),"contract-delivery-projection");
-    store.apply_remote(&task.id,&tests::remote(&task,crate::remote::tasks::TaskStatus::Completed)).unwrap();
+    store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
     for (wake,state,cancel,result,eligible) in [
         (WakeState::Held,"before_send",false,true,true),
         (WakeState::Suppressed,"before_send",false,true,true),
@@ -43,7 +43,7 @@ fn contract_native_delivery_projection_uses_ledger_and_current_authority() {
         let list=tauri::async_runtime::block_on(app::invoke(app.handle(),"delegation_list",args)).unwrap();
         assert_eq!(list[0]["delivery"],read["task"]["delivery"]);
     }
-    store.update(&task.id,|t|{t.cancel_requested=false;t.remote=Some(tests::remote(&task,crate::remote::tasks::TaskStatus::Completed).task);}).unwrap();
+    store.update(&task.id,|t|{t.cancel_requested=false;t.remote=Some(tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed).task);}).unwrap();
     store.conn.lock().unwrap().execute("UPDATE delivery_outcomes SET state='in_flight' WHERE task=?1",[&task.id]).unwrap();
     let reopened=journal::Journal::open(dir.path()).unwrap(); reopened.recover_deliveries().unwrap();
     let read=tauri::async_runtime::block_on(app::invoke(app.handle(),"delegation_read",serde_json::json!({"paneId":pane,"taskId":task.id}))).unwrap();
@@ -59,13 +59,13 @@ fn contract_native_delivery_projection_uses_ledger_and_current_authority() {
 fn ui_recovery_response_projection_retains_immutable_decision_and_fail_closed_outcomes() {
     let dir=tempfile::TempDir::new().unwrap();
     let (app,store,task,pane,_,_)=setup(dir.path(),"ui-recovery-response");
-    let mut remote=tests::remote(&task,crate::remote::tasks::TaskStatus::AwaitingApproval);
-    remote.task.pending_requests.push(crate::remote::tasks::RemoteApproval {request_id:"question".into(),request_kind:"user-input".into(),payload:serde_json::json!({"questions":[{"question":"Answer?","options":[]}]})});
+    let mut remote=tests::remote(&task,crate::remote_task_protocol::TaskStatus::AwaitingApproval);
+    remote.task.pending_requests.push(crate::remote_task_protocol::RemoteApproval {request_id:"question".into(),request_kind:"user-input".into(),payload:serde_json::json!({"questions":[{"question":"Answer?","options":[]}]})});
     store.apply_remote(&task.id,&remote).unwrap();
     let read=||tauri::async_runtime::block_on(app::invoke(app.handle(),"delegation_read",serde_json::json!({"paneId":pane,"taskId":task.id}))).unwrap();
     assert_eq!(read()["task"]["responses"][0]["outcome"],"not_attempted","native cannot qualify a preclaim retry");
     assert_eq!(read()["task"]["responses"][0]["eligible"],true);
-    let response=crate::remote::tasks::RespondRequest {original_request:Some(remote.task.pending_requests[0].clone()),request_id:"question".into(),decision:serde_json::from_value(serde_json::json!({"decision":"allow","updated_input":{"questions":[{"question":"Answer?","options":[]}],"answers":{"Answer?":"Exact immutable answer"}}})).unwrap()};
+    let response=crate::remote_task_protocol::RespondRequest {original_request:Some(remote.task.pending_requests[0].clone()),request_id:"question".into(),decision:serde_json::from_value(serde_json::json!({"decision":"allow","updated_input":{"questions":[{"question":"Answer?","options":[]}],"answers":{"Answer?":"Exact immutable answer"}}})).unwrap()};
     assert!(store.claim_response(&task.id,&response).unwrap());
     for (state,eligible) in [("in_flight",false),("before_send",true),("accepted",false),("unknown",false)] {
         store.conn.lock().unwrap().execute("UPDATE response_outcomes SET state=?2 WHERE task=?1",rusqlite::params![task.id,state]).unwrap();
@@ -99,8 +99,8 @@ async fn consent_boundary_original_request_survives_reopen_and_all_decisions() {
             let dir=tempfile::TempDir::new().unwrap();let root=dir.path();
             let (app,store,task,pane,_,_)=setup(&root.join("journal"),"consent-original");
             let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap();receiver.admit(&task.request(None)).unwrap();
-            let request=crate::remote::tasks::RemoteApproval {request_id:"opaque/request:01".into(),request_kind:kind.into(),payload:serde_json::json!({"questions":[{"question":"Original?","options":[]}],"nested":{"all":[null,true,1,"exact"]}})};
-            receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests=vec![request.clone()];}).unwrap();
+            let request=crate::remote_task_protocol::RemoteApproval {request_id:"opaque/request:01".into(),request_kind:kind.into(),payload:serde_json::json!({"questions":[{"question":"Original?","options":[]}],"nested":{"all":[null,true,1,"exact"]}})};
+            receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests=vec![request.clone()];}).unwrap();
             store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
             let channel=Arc::new(RecoveryCli {cli:PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()},before_send:true,sends:Default::default(),reads:Default::default()});
             app.manage(channel.clone() as Arc<dyn transport::TaskTransport>);
@@ -138,8 +138,8 @@ async fn consent_boundary_initial_display_and_actual_prepare_recheck_full_reques
         let dir=tempfile::TempDir::new().unwrap();let root=dir.path();
         let (app,store,task,pane,_,_)=setup(&root.join("journal"),"consent-prepare");
         let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap();receiver.admit(&task.request(None)).unwrap();
-        let request=crate::remote::tasks::RemoteApproval {request_id:"original".into(),request_kind:"command_execution".into(),payload:serde_json::json!({"command":"original","extra":{"flag":false}})};
-        receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests=vec![request.clone()];}).unwrap();store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
+        let request=crate::remote_task_protocol::RemoteApproval {request_id:"original".into(),request_kind:"command_execution".into(),payload:serde_json::json!({"command":"original","extra":{"flag":false}})};
+        receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests=vec![request.clone()];}).unwrap();store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
         let channel=Arc::new(PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()});app.manage(channel.clone() as Arc<dyn transport::TaskTransport>);
         let mut args=serde_json::json!({"paneId":pane,"taskId":task.id,"requestId":request.request_id,"originalRequest":request,"decision":{"decision":"allow"}});
         if change=="missing" {args.as_object_mut().unwrap().remove("originalRequest");}
@@ -163,8 +163,8 @@ async fn consent_target_projection_matches_original_admitted_tuple() {
         let dir=tempfile::TempDir::new().unwrap();let root=dir.path();
         let (app,store,task,pane,mut grant,host)=setup(&root.join("journal"),"consent-target");
         let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap();receiver.admit(&task.request(None)).unwrap();
-        let request=crate::remote::tasks::RemoteApproval {request_id:"target".into(),request_kind:"command".into(),payload:serde_json::json!({"cmd":"original"})};
-        receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests=vec![request.clone()];}).unwrap();store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
+        let request=crate::remote_task_protocol::RemoteApproval {request_id:"target".into(),request_kind:"command".into(),payload:serde_json::json!({"cmd":"original"})};
+        receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests=vec![request.clone()];}).unwrap();store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
         let channel=Arc::new(RecoveryCli {cli:PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()},before_send:true,sends:Default::default(),reads:Default::default()});app.manage(channel.clone() as Arc<dyn transport::TaskTransport>);
         let args=serde_json::json!({"paneId":pane,"taskId":task.id,"requestId":request.request_id,"originalRequest":request,"decision":{"decision":"deny","message":"Exact"}});
         if attempted {let before=app::invoke(app.handle(),"delegation_respond",args.clone()).await.unwrap();assert_eq!(before["responses"][0]["outcome"],"before_send");}
@@ -184,7 +184,7 @@ async fn consent_target_projection_matches_original_admitted_tuple() {
         if field=="cosmetic" {app::invoke(app.handle(),"delegation_respond",args.clone()).await.unwrap();} else {
             assert!(app::invoke(app.handle(),"delegation_respond",args).await.is_err());assert_eq!(channel.sends.load(std::sync::atomic::Ordering::SeqCst),usize::from(attempted));
         }
-        receiver.update(&task.id,|t|t.status=crate::remote::tasks::TaskStatus::Completed).unwrap();
+        receiver.update(&task.id,|t|t.status=crate::remote_task_protocol::TaskStatus::Completed).unwrap();
         store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
         store.update(&task.id,|t|t.wake_state=WakeState::Held).unwrap();
         store.conn.lock().unwrap().execute("INSERT OR REPLACE INTO delivery_outcomes(task,attempt,state) VALUES(?1,'fixture','before_send')",[&task.id]).unwrap();
@@ -203,7 +203,7 @@ fn contract_oversized_legacy_grant_revoke_disables_and_cancels_without_quota_byp
     assert!(store.put_grant(&task.parent_workspace_id,&grant).is_err(),"enabled grant size bound was lifted");
     assert!(store.disable_grant("foreign-workspace",&grant.id).is_err(),"disable-only transaction crossed grant scope");
     assert!(store.grant_for_task(&task.id).unwrap().enabled);
-    store.apply_remote(&task.id,&tests::remote(&task,crate::remote::tasks::TaskStatus::Completed)).unwrap();
+    store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
     let result=tauri::async_runtime::block_on(app::invoke(app.handle(),"delegation_revoke",serde_json::json!({"paneId":pane,"targetId":grant.id})));
     assert!(result.is_ok(),"actual revoke cannot disable oversized retained metadata: {result:?}");
     let retained=store.grant_for_task(&task.id).unwrap();
@@ -246,7 +246,7 @@ fn s4_native_canonical_mutation_is_fenced_through_actual_write_syscall() {
         let thread=format!("atomic-canonical-{action}");
         let (app,store,task,pane,_grant,host_id)=setup(dir.path(),&thread);
         let _authority=authority::NativeAuthority::new(&thread);
-        store.apply_remote(&task.id,&tests::remote(&task,crate::remote::tasks::TaskStatus::Completed)).unwrap();
+        store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
         store.claim_delivery(&task.id).unwrap().unwrap();
         let guard=app::dispatch_guard(app.handle(),&thread,Some(&format!("delegation:{}",task.id))).unwrap();
         let (start_tx,start_rx)=std::sync::mpsc::channel();
@@ -315,7 +315,7 @@ async fn contract_user_input_refuses_bare_allow_before_receiver_callback() {
     let dir=tempfile::TempDir::new().unwrap(); let root=dir.path();
     let (app,store,task,pane,_,_)=setup(&root.join("journal"),"contract-question");
     let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap(); receiver.admit(&task.request(None)).unwrap();
-    receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote::tasks::RemoteApproval {request_id:"question".into(),request_kind:"user-input".into(),payload:serde_json::json!({"questions":[{"question":"Which route?","options":[{"label":"Safe"}]}]})});}).unwrap();
+    receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote_task_protocol::RemoteApproval {request_id:"question".into(),request_kind:"user-input".into(),payload:serde_json::json!({"questions":[{"question":"Which route?","options":[{"label":"Safe"}]}]})});}).unwrap();
     store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
     let channel=Arc::new(PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()}); channel.release.notify_one();
     app.manage(channel.clone() as Arc<dyn transport::TaskTransport>);
@@ -364,7 +364,7 @@ async fn ui_recovery_actual_native_response_before_send_retry_and_unknown_read_o
         let (app,store,task,pane,_,_)=setup(&root.join("journal"),if before_send {"ui-recovery-before"} else {"ui-recovery-unknown"});
         let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap();receiver.admit(&task.request(None)).unwrap();
         let payload=serde_json::json!({"questions":[{"question":"Exact answer?","options":[]}],"hint":"Original native payload"});
-        receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote::tasks::RemoteApproval {request_id:"recovery".into(),request_kind:"user-input".into(),payload:payload.clone()});}).unwrap();
+        receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote_task_protocol::RemoteApproval {request_id:"recovery".into(),request_kind:"user-input".into(),payload:payload.clone()});}).unwrap();
         store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
         let channel=Arc::new(RecoveryCli {cli:PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()},before_send,sends:Default::default(),reads:Default::default()});
         app.manage(channel.clone() as Arc<dyn transport::TaskTransport>);
@@ -399,7 +399,7 @@ async fn owned_respond_case(drop_caller:bool) {
     let (app,store,task,pane,_,_)=setup(&root.join("journal"),"contract-owned-respond");
     let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap();
     receiver.admit(&task.request(None)).unwrap();
-    receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote::tasks::RemoteApproval {request_id:"approval".into(),request_kind:"permission".into(),payload:serde_json::Value::Null});}).unwrap();
+    receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote_task_protocol::RemoteApproval {request_id:"approval".into(),request_kind:"permission".into(),payload:serde_json::Value::Null});}).unwrap();
     store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
     let channel=Arc::new(PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()});
     let coordinator=coordinator::Coordinator::new(channel.clone()); app.manage(coordinator.clone());
@@ -432,7 +432,7 @@ async fn contract_manual_respond_actual_admission_is_bounded_and_survives_all_rp
     let dir=tempfile::TempDir::new().unwrap(); let root=dir.path();
     let (app,store,task,pane,_,_)=setup(&root.join("journal"),"contract-respond-capacity");
     let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap(); receiver.admit(&task.request(None)).unwrap();
-    receiver.update(&task.id,|t|{t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests=(0..9).map(|n|crate::remote::tasks::RemoteApproval {request_id:format!("approval-{n}"),request_kind:"permission".into(),payload:serde_json::Value::Null}).collect();}).unwrap();
+    receiver.update(&task.id,|t|{t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests=(0..9).map(|n|crate::remote_task_protocol::RemoteApproval {request_id:format!("approval-{n}"),request_kind:"permission".into(),payload:serde_json::Value::Null}).collect();}).unwrap();
     store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
     let channel=Arc::new(PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()});
     let coordinator=coordinator::Coordinator::new(channel.clone()); app.manage(coordinator.clone()); app.manage(channel.clone() as Arc<dyn transport::TaskTransport>);
@@ -481,7 +481,7 @@ async fn prepared_case(respond:bool,action:&str) {
     let receiver=crate::remote::tasks::TaskStore::open(&root.join("receiver")).unwrap();
     if respond {
         receiver.admit(&task.request(None)).unwrap();
-        receiver.update(&task.id,|t| {t.status=crate::remote::tasks::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote::tasks::RemoteApproval {request_id:"approval".into(),request_kind:"command_execution".into(),payload:serde_json::Value::Null});}).unwrap();
+        receiver.update(&task.id,|t| {t.status=crate::remote_task_protocol::TaskStatus::AwaitingApproval;t.pending_requests.push(crate::remote_task_protocol::RemoteApproval {request_id:"approval".into(),request_kind:"command_execution".into(),payload:serde_json::Value::Null});}).unwrap();
         store.apply_remote(&task.id,&receiver.read(&task.id,0).unwrap()).unwrap();
     }
     let channel=Arc::new(PreparedCli {root:root.into(),entered:Default::default(),release:Default::default()});
@@ -563,7 +563,7 @@ async fn s4_actual_native_and_transport_stdin_keep_canonical_leases_through_posi
             let (app,store,task,pane,mut grant,host_id)=setup(&root.join("journal"),&thread);
             let _authority=authority::NativeAuthority::new(&thread);
             let inner=if native {
-                store.apply_remote(&task.id,&tests::remote(&task,crate::remote::tasks::TaskStatus::Completed)).unwrap();
+                store.apply_remote(&task.id,&tests::remote(&task,crate::remote_task_protocol::TaskStatus::Completed)).unwrap();
                 store.claim_delivery(&task.id).unwrap().unwrap();
                 app::dispatch_guard(app.handle(),&thread,Some(&format!("delegation:{}",task.id))).unwrap()
             } else {

@@ -59,6 +59,9 @@ pub mod project;
 pub mod pty_daemon;
 #[cfg(unix)]
 pub mod remote;
+// Wire DTOs are shared by portable delegation clients and the Unix receiver.
+#[path = "remote/tasks/types.rs"]
+pub mod remote_task_protocol;
 // SSH transport for the cloud-push feature. Unix-only — relies on
 // the system `ssh` + `scp` binaries (with the user's existing
 // `~/.ssh/config`, agent, and known_hosts).

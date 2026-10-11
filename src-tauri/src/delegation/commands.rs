@@ -20,7 +20,7 @@ use tauri::{AppHandle, Runtime};
 pub async fn delegation_host_info<R: Runtime>(
     app: AppHandle<R>,
     host_id: i64,
-) -> Result<crate::remote::tasks::TaskCapabilities, String> {
+) -> Result<crate::remote_task_protocol::TaskCapabilities, String> {
     serde_json::from_value(
         super::app::invoke(&app, "delegation_host_info", json!({"hostId":host_id})).await?,
     )
@@ -134,7 +134,7 @@ pub async fn delegation_respond<R: Runtime>(
     task_id: String,
     request_id: String,
     decision: crate::agent_provider::ApprovalDecision,
-    original_request: Option<crate::remote::tasks::RemoteApproval>,
+    original_request: Option<crate::remote_task_protocol::RemoteApproval>,
 ) -> Result<LocalTask, String> {
     serde_json::from_value(
         super::app::invoke(

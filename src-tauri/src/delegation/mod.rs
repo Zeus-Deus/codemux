@@ -8,9 +8,9 @@ pub mod permissions;
 pub mod transport;
 pub mod types;
 pub use types::*;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod integration_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod ownership_tests;

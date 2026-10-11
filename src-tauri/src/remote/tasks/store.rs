@@ -52,19 +52,26 @@ impl TaskStore {
         let mut bytes = 2;
         let mut has_more = false;
         while let Some(row) = rows.next().map_err(db_error)? {
+            let sequence = row.get(0).map_err(db_error)?;
+            let payload: String = row.get(1).map_err(db_error)?;
             let event = TaskEvent {
-                sequence: row.get(0).map_err(db_error)?,
-                event: serde_json::from_str(&row.get::<_, String>(1).map_err(db_error)?)
-                    .map_err(db_error)?,
+                sequence,
+                event: if payload.len() > 1_000_000 {
+                    // Keep the full immutable event in the host journal. A
+                    // bounded reference advances the normal cursor, so later
+                    // approvals, terminal snapshots and Stop remain readable.
+                    serde_json::json!({
+                        "type": "runtime_warning", "thread_id": task.child_thread_id,
+                        "message": format!("Large native event retained on host. Read its complete JSON with codemux-remote task event --id {id} --sequence {sequence} --offset 0; continue at next_offset."),
+                        "original_payload": {"remote_event_blob": {
+                            "task_id": id, "sequence": sequence, "bytes": payload.len(),
+                            "encoding": "utf-8-json"
+                        }}
+                    })
+                } else { serde_json::from_str(&payload).map_err(db_error)? },
             };
             let size = serde_json::to_vec(&event).map_err(db_error)?.len() + 1;
             if events.len() == 100 || bytes + size > 1_048_576 {
-                if events.is_empty() {
-                    return Err(
-                        "native event exceeds the 1 MiB page budget; inspect the host journal"
-                            .into(),
-                    );
-                }
                 has_more = true;
                 break;
             }
@@ -85,14 +92,46 @@ impl TaskStore {
             has_more,
         })
     }
+    /// Read a retained native-event blob without coupling it to task pages.
+    /// Offsets are UTF-8 byte offsets; each chunk fits the SSH reply budget.
+    pub fn event_blob(&self, id: &str, sequence: i64, offset: usize) -> Result<super::EventBlobChunk, String> {
+        validate_id(id)?;
+        if sequence <= 0 { return Err("event sequence must be positive".into()); }
+        let conn = self.conn.lock().map_err(db_error)?;
+        let payload: String = conn.query_row(
+            "SELECT event FROM task_events WHERE task_id=?1 AND sequence=?2",
+            rusqlite::params![id, sequence], |row| row.get(0),
+        ).map_err(db_error)?;
+        if offset > payload.len() || !payload.is_char_boundary(offset) {
+            return Err("event blob offset is not a valid UTF-8 boundary".into());
+        }
+        let mut end = payload.len().min(offset.saturating_add(128 * 1024));
+        while !payload.is_char_boundary(end) { end -= 1; }
+        Ok(super::EventBlobChunk {
+            task_id: id.into(), sequence, offset, next_offset: end,
+            bytes: payload.len(), has_more: end < payload.len(), data: payload[offset..end].into(),
+        })
+    }
     pub fn update(&self, id: &str, f: impl FnOnce(&mut TaskSnapshot)) -> Result<(), String> {
         self.append_optional(id, None, f)
     }
     pub fn claim(&self, id: &str) -> Result<std::fs::File, String> {
         validate_id(id)?;
-        let lease = self
-            .try_lease(id)?
-            .ok_or("task worker already owns its lease")?;
+        // Reconciliation briefly owns the same flock before the first worker
+        // claims launch. Wait for it, but reject an already claimed worker
+        // without waiting for that worker's lifetime lease.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lease = loop {
+            if let Some(lease) = self.try_lease(id)? { break lease; }
+            let claimed: bool = self.conn.lock().map_err(db_error)?.query_row(
+                "SELECT claimed FROM tasks WHERE id=?1", [id], |row| row.get(0),
+            ).map_err(db_error)?;
+            if claimed { return Err("task launch was already claimed; replay is forbidden".into()); }
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out waiting for task reconciliation lease".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let mut conn = self.conn.lock().map_err(db_error)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -549,6 +588,23 @@ mod tests {
         assert!(!journal.admit(&request).unwrap());
     }
     #[test]
+    fn first_worker_waits_for_transient_reconciliation_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = super::super::tests::request();
+        let journal = std::sync::Arc::new(TaskStore::open(dir.path()).unwrap());
+        journal.admit(&request).unwrap();
+        let reconciliation = journal.try_lease(&request.id).unwrap().unwrap();
+        let worker_store = journal.clone();
+        let id = request.id.clone();
+        let worker = std::thread::spawn(move || worker_store.claim(&id));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!worker.is_finished(), "first launch must wait rather than abandon admission");
+        drop(reconciliation);
+        let lease = worker.join().unwrap().unwrap();
+        assert!(journal.claim(&request.id).is_err(), "duplicate must remain forbidden");
+        drop(lease);
+    }
+    #[test]
     fn native_event_pages_have_stable_cursors_and_honest_more() {
         let dir = tempfile::TempDir::new().unwrap();
         let request = super::super::tests::request();
@@ -585,6 +641,38 @@ mod tests {
         assert!(page.events.len() < 20);
         assert!(page.has_more);
         assert!(serde_json::to_vec(&page.events).unwrap().len() <= 1_048_576);
+    }
+    #[test]
+    fn oversized_event_preserves_blob_and_does_not_block_terminal_or_cancel_receipts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = super::super::tests::request();
+        let journal = TaskStore::open(dir.path()).unwrap();
+        journal.admit(&request).unwrap();
+        let event = serde_json::json!({"type":"tool_result","output":"🦀\"\n".repeat(400_000)});
+        journal.append(&request.id, &event, |_| {}).unwrap();
+        journal.append(&request.id, &serde_json::json!({"type":"runtime_warning","message":"later"}), |_| {}).unwrap();
+        journal.cancel(&request.id).unwrap();
+        let stopped = journal.read(&request.id, 0).unwrap();
+        assert!(stopped.task.cancel_requested);
+        assert_eq!(stopped.next_cursor, 2);
+        assert!(!stopped.has_more);
+        assert!(serde_json::to_vec(&stopped).unwrap().len() < 1_048_576);
+        assert_eq!(stopped.events[0].event["original_payload"]["remote_event_blob"]["sequence"], 1);
+        let mut payload = String::new();
+        let mut offset = 0;
+        loop {
+            let chunk = journal.event_blob(&request.id, 1, offset).unwrap();
+            assert!(serde_json::to_vec(&chunk).unwrap().len() < 1_048_576);
+            payload.push_str(&chunk.data);
+            offset = chunk.next_offset;
+            if !chunk.has_more { break; }
+        }
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&payload).unwrap(), event);
+        assert!(journal.event_blob(&request.id, 1, payload.len()+1).is_err());
+        journal.update(&request.id, |task| { task.status = TaskStatus::Cancelled; task.result = Some("settled".into()); }).unwrap();
+        let terminal = journal.read(&request.id, stopped.next_cursor).unwrap();
+        assert_eq!(terminal.task.status, TaskStatus::Cancelled);
+        assert_eq!(terminal.task.result.as_deref(), Some("settled"));
     }
     #[test]
     fn consent_boundary_receiver_binds_enqueue_and_once_only_claim() {

@@ -117,6 +117,76 @@ it('consent boundary belongs to the actual owner, settles once and strands every
  expect(store.qualifiesDelegationResponseRead('phase-pane','thread-2','task-1',after)).toBe(false);
  hook.unmount();expect(store.qualifiesDelegationResponseRead('phase-pane','thread-2','task-1',replacement)).toBe(false);
 });
+it('F6 publication boundary observes lists and upserts, permits fresh reads, and leaves approval phases independent', async () => {
+  const store = await import('./delegation-store');
+  let invalidate!: (event: { payload: { parent_thread_id: string } }) => void;
+  native.listen.mockImplementation((event, callback) => { expect(event).toBe('delegation-changed'); invalidate = callback; return Promise.resolve(vi.fn()); });
+  native.invoke.mockResolvedValue([taskFixture()]);
+  const hook = renderHook(() => store.useDelegationTasks('fence-pane', 'thread-1'));
+  await waitFor(() => { expect(hook.result.current.subscriptionHealth).toBe('connected'); expect(hook.result.current.loading).toBe(false); });
+  const first = store.delegationTaskReadBoundary('fence-pane', 'thread-1');
+  const approval = store.delegationResponseReadBoundary('fence-pane', 'thread-1', 'task-1');
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', first)).toBe(true);
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', undefined)).toBe(false);
+  // Even identical authoritative list bytes represent a newer publication.
+  await act(async () => invalidate({ payload: { parent_thread_id: 'thread-1' } }));
+  await waitFor(() => expect(hook.result.current.loading).toBe(false));
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', first)).toBe(false);
+  expect(store.qualifiesDelegationResponseRead('fence-pane', 'thread-1', 'task-1', approval)).toBe(true);
+  const fresh = store.delegationTaskReadBoundary('fence-pane', 'thread-1');
+  expect(fresh?.owner).toBe(first?.owner);
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', fresh)).toBe(true);
+  act(() => store.upsertDelegationTask('fence-pane', 'thread-1', taskFixture({ status: 'cancelled' })));
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', fresh)).toBe(false);
+  const afterUpsert = store.delegationTaskReadBoundary('fence-pane', 'thread-1');
+  let settle!: () => void;
+  act(() => { settle = store.beginDelegationResponse('fence-pane', 'thread-1', 'task-1'); });
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', afterUpsert)).toBe(true);
+  expect(store.qualifiesDelegationResponseRead('fence-pane', 'thread-1', 'task-1', approval)).toBe(false);
+  act(() => settle());
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', afterUpsert)).toBe(true);
+  hook.unmount();
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', afterUpsert)).toBe(false);
+  const replacement = renderHook(() => store.useDelegationTasks('fence-pane', 'thread-1'));
+  await waitFor(() => expect(replacement.result.current.loading).toBe(false));
+  expect(store.delegationTaskReadBoundary('fence-pane', 'thread-1')?.owner).not.toBe(first?.owner);
+  expect(store.qualifiesDelegationTaskRead('fence-pane', 'thread-1', afterUpsert)).toBe(false);
+});
+
+it('F6 does not invent a terminal-priority merge rule for fresh authoritative lists or confirmed upserts', async () => {
+  const store = await import('./delegation-store');
+  native.listen.mockResolvedValue(vi.fn());
+  native.invoke.mockResolvedValue([taskFixture({ status: 'cancelled' })]);
+  const hook = renderHook(() => store.useDelegationTasks('payload-pane', 'thread-1'));
+  await waitFor(() => expect(hook.result.current.tasks[0]?.status).toBe('cancelled'));
+  native.invoke.mockResolvedValue([taskFixture({ status: 'stopping' })]);
+  await act(async () => hook.result.current.refresh());
+  expect(hook.result.current.tasks[0].status).toBe('stopping');
+  act(() => store.upsertDelegationTask('payload-pane', 'thread-1', taskFixture({ status: 'running' })));
+  expect(hook.result.current.tasks[0].status).toBe('running');
+});
+
+it('F6 errors and loading alone do not advance the publication fence', async () => {
+  const store = await import('./delegation-store');
+  native.listen.mockResolvedValue(vi.fn());
+  native.invoke.mockResolvedValue([taskFixture()]);
+  const hook = renderHook(() => store.useDelegationTasks('error-fence-pane', 'thread-1'));
+  await waitFor(() => expect(hook.result.current.tasks).toHaveLength(1));
+  const boundary = store.delegationTaskReadBoundary('error-fence-pane', 'thread-1');
+  let reject!: (error: Error) => void;
+  native.invoke.mockImplementationOnce(() => new Promise<LocalTask[]>((_resolve, no) => { reject = no; }));
+  let flight!: Promise<void>;
+  act(() => { flight = hook.result.current.refresh(); });
+  expect(hook.result.current.loading).toBe(true);
+  expect(store.qualifiesDelegationTaskRead('error-fence-pane', 'thread-1', boundary)).toBe(true);
+  await act(async () => { reject(new Error('Actual list rejection')); await flight; });
+  expect(hook.result.current.error).toBe('Actual list rejection');
+  expect(store.qualifiesDelegationTaskRead('error-fence-pane', 'thread-1', boundary)).toBe(true);
+  await act(async () => hook.result.current.refresh());
+  expect(store.qualifiesDelegationTaskRead('error-fence-pane', 'thread-1', boundary)).toBe(false);
+  expect(store.qualifiesDelegationTaskRead('error-fence-pane', 'thread-1', store.delegationTaskReadBoundary('error-fence-pane', 'thread-1'))).toBe(true);
+});
+
 it('keeps subscription failure distinct from successful refresh and disposes a late listener', async () => {
   const store = await import('./delegation-store');
   native.listen.mockRejectedValueOnce(new Error('event transport unavailable'));

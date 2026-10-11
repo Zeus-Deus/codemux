@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, Circle, LoaderCircle, Server, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { delegationCancel, delegationRead, type LocalTask, type TaskStatus } from '@/lib/delegation';
-import { isDelegationPaneOwner, refreshDelegationTasks, upsertDelegationTask } from '@/stores/delegation-store';
+import { delegationTaskReadBoundary, isDelegationPaneOwner, qualifiesDelegationTaskRead, refreshDelegationTasks, upsertDelegationTask, type TaskReadBoundary } from '@/stores/delegation-store';
 
 export interface RemoteTaskCardProps {
   task: LocalTask;
@@ -48,17 +48,20 @@ export function RemoteTaskCard({ task, paneId, writable, onOpen }: RemoteTaskCar
     pending.current = true;
     setBusy(true);
     setError(null);
-    const current = () => mounted.current && latest.current.key === key && latest.current.writable && isDelegationPaneOwner(paneId, task.parent_thread_id);
+    const owner = delegationTaskReadBoundary(paneId, task.parent_thread_id)?.owner;
+    const current = () => mounted.current && latest.current.key === key && latest.current.writable && !!owner && delegationTaskReadBoundary(paneId, task.parent_thread_id)?.owner === owner;
+    let readBoundary: TaskReadBoundary | undefined;
     try {
       await delegationCancel(paneId, task.id);
       if (!current()) return;
       setRequested(key);
+      readBoundary = delegationTaskReadBoundary(paneId, task.parent_thread_id);
       const readback = await delegationRead(paneId, task.id, 0);
-      if (!current()) return;
+      if (!current() || !qualifiesDelegationTaskRead(paneId, task.parent_thread_id, readBoundary)) return;
       if (readback.task.id !== task.id || readback.task.parent_thread_id !== task.parent_thread_id) throw new Error('Task readback did not match this conversation.');
       upsertDelegationTask(paneId, task.parent_thread_id, readback.task);
     } catch (cause) {
-      if (current()) setError({ key, message: `Stop unconfirmed: ${cause instanceof Error ? cause.message : String(cause)}. Retry stop to confirm; the remote task may still be running.` });
+      if (current() && (!readBoundary || qualifiesDelegationTaskRead(paneId, task.parent_thread_id, readBoundary))) setError({ key, message: `Stop unconfirmed: ${cause instanceof Error ? cause.message : String(cause)}. Retry stop to confirm; the remote task may still be running.` });
     } finally {
       if (mounted.current && latest.current.key === key) { pending.current = false; setBusy(false); }
     }

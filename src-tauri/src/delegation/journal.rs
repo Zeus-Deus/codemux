@@ -172,7 +172,7 @@ impl Journal {
     pub fn cache_host(
         &self,
         id: i64,
-        info: &crate::remote::tasks::TaskCapabilities,
+        info: &crate::remote_task_protocol::TaskCapabilities,
     ) -> Result<(), String> {
         let data = encode(info)?;
         let conn = self.conn.lock().unwrap();
@@ -182,7 +182,7 @@ impl Journal {
         conn.execute("INSERT INTO host_info(host,data) VALUES(?1,?2) ON CONFLICT(host) DO UPDATE SET data=excluded.data",params![id,data]).map_err(|e|e.to_string())?;
         Ok(())
     }
-    pub fn host_info(&self, id: i64) -> Result<crate::remote::tasks::TaskCapabilities, String> {
+    pub fn host_info(&self, id: i64) -> Result<crate::remote_task_protocol::TaskCapabilities, String> {
         let data: String = self
             .conn
             .lock()
@@ -248,7 +248,7 @@ impl Journal {
         if !task.cancel_requested || task.remote.is_some() {
             return Err("Unexpected receiver absence fence for an admitted/live intent".into());
         }
-        task.status = crate::remote::tasks::TaskStatus::Cancelled;
+        task.status = crate::remote_task_protocol::TaskStatus::Cancelled;
         task.connection_error = None;
         task.updated_at = chrono::Utc::now().to_rfc3339();
         tx.execute(
@@ -264,7 +264,7 @@ impl Journal {
     pub fn claim_response(
         &self,
         id: &str,
-        response: &crate::remote::tasks::RespondRequest,
+        response: &crate::remote_task_protocol::RespondRequest,
     ) -> Result<bool, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -363,7 +363,7 @@ impl Journal {
 }
 
 use super::types::*;
-use crate::remote::tasks::{LaunchRequest, TaskRead as RemoteRead};
+use crate::remote_task_protocol::{LaunchRequest, TaskRead as RemoteRead};
 fn encode<T: serde::Serialize>(v: &T) -> Result<String, String> {
     serde_json::to_string(v).map_err(|e| e.to_string())
 }
@@ -641,7 +641,7 @@ impl Journal {
             return Err("invalid remote cursor".into());
         }
         task.status = if task.cancel_requested && !read.task.status.is_terminal() {
-            crate::remote::tasks::TaskStatus::Stopping
+            crate::remote_task_protocol::TaskStatus::Stopping
         } else {
             read.task.status
         };
@@ -678,7 +678,7 @@ impl Journal {
                 break;
             }
             bytes += data.len();
-            events.push(crate::remote::tasks::TaskEvent {
+            events.push(crate::remote_task_protocol::TaskEvent {
                 sequence,
                 event: decode(&data)?,
             });
@@ -713,12 +713,12 @@ impl Journal {
             })
             .map_err(|_| "Parent dispatch ceiling is missing".into())
     }
-    pub(crate) fn response_outcome(&self, id:&str, request:&str)->Result<(DeliveryOutcome,Option<crate::agent_provider::ApprovalDecision>,Option<crate::remote::tasks::RemoteApproval>),String> {
+    pub(crate) fn response_outcome(&self, id:&str, request:&str)->Result<(DeliveryOutcome,Option<crate::agent_provider::ApprovalDecision>,Option<crate::remote_task_protocol::RemoteApproval>),String> {
         let conn=self.conn.lock().unwrap();
         let prior:Option<(String,String,Option<String>)>=conn.query_row("SELECT state,decision,original_request FROM response_outcomes WHERE task=?1 AND request=?2",params![id,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
         if let Some((state,decision,binding))=prior {
             let decision=serde_json::from_str(&decision).ok();
-            let binding=binding.and_then(|b|serde_json::from_str::<crate::remote::tasks::RemoteApproval>(&b).ok()).filter(|b|b.request_id==request);
+            let binding=binding.and_then(|b|serde_json::from_str::<crate::remote_task_protocol::RemoteApproval>(&b).ok()).filter(|b|b.request_id==request);
             let outcome=if decision.is_some() {match state.as_str() {"accepted"=>DeliveryOutcome::Accepted,"before_send" if binding.is_some()=>DeliveryOutcome::BeforeSend,"in_flight" if binding.is_some()=>DeliveryOutcome::InFlight,_=>DeliveryOutcome::Unknown}} else {DeliveryOutcome::Unknown};
             return Ok((outcome,decision,binding));
         }
@@ -855,7 +855,7 @@ impl Journal {
             t.cancel_requested = true;
             t.wake_state = WakeState::Suppressed;
             if !t.status.is_terminal() {
-                t.status = crate::remote::tasks::TaskStatus::Stopping;
+                t.status = crate::remote_task_protocol::TaskStatus::Stopping;
             }
         })?;
         self.wake_dispatches();
@@ -873,7 +873,7 @@ impl Journal {
                     Some("Parent user activity superseded automatic result delivery".into());
                 if stop && !t.status.is_terminal() {
                     t.cancel_requested = true;
-                    t.status = crate::remote::tasks::TaskStatus::Stopping;
+                    t.status = crate::remote_task_protocol::TaskStatus::Stopping;
                 }
             })?;
         }
@@ -889,7 +889,7 @@ fn read_task(conn: &Connection, id: &str) -> Result<LocalTask, String> {
 
 impl Journal {
     pub(crate) fn poll_transport(
-        &self, id:&str, response:Option<&crate::remote::tasks::RespondRequest>,
+        &self, id:&str, response:Option<&crate::remote_task_protocol::RespondRequest>,
         validate:impl FnOnce(&LocalTask,&Grant,&str)->Result<(),String>,
         write:&mut dyn FnMut()->crate::json_rpc_child::dispatch::WritePoll,
     )->Result<crate::json_rpc_child::dispatch::WritePoll,String> {

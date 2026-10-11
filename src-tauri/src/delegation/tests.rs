@@ -7,11 +7,11 @@ fn validation_journal_metadata_bounds_preserve_existing_decisions_and_grant_revo
     let (parent, mut grant, input) = fixture();
     store.put_grant(&parent.workspace_id, &grant).unwrap();
     let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
-    let caps = crate::remote::tasks::TaskCapabilities { protocol_version: 1, providers: vec![], workspaces: vec![] };
+    let caps = crate::remote_task_protocol::TaskCapabilities { protocol_version: 1, providers: vec![], workspaces: vec![] };
     for id in 0..128 { store.cache_host(id, &caps).unwrap(); }
     let host_refused = store.cache_host(128, &caps).is_err();
     store.cache_host(0, &caps).unwrap();
-    let response = crate::remote::tasks::RespondRequest { original_request:Some(crate::remote::tasks::RemoteApproval {request_id:"existing".into(),request_kind:"tool".into(),payload:serde_json::Value::Null}), request_id: "existing".into(), decision: crate::agent_provider::ApprovalDecision::Deny { message: "fixture".into() } };
+    let response = crate::remote_task_protocol::RespondRequest { original_request:Some(crate::remote_task_protocol::RemoteApproval {request_id:"existing".into(),request_kind:"tool".into(),payload:serde_json::Value::Null}), request_id: "existing".into(), decision: crate::agent_provider::ApprovalDecision::Deny { message: "fixture".into() } };
     store.update(&task.id,|t|{let mut remote=remote(&task,TaskStatus::AwaitingApproval).task;remote.pending_requests=vec![response.original_request.clone().unwrap()];t.remote=Some(remote);}).unwrap();
     assert!(store.claim_response(&task.id, &response).unwrap());
     {
@@ -259,8 +259,8 @@ async fn l3_real_before_send_failure_allows_only_identical_durable_decision_retr
     let (parent, grant, input) = fixture();
     journal.put_grant(&parent.workspace_id, &grant).unwrap();
     let task = journal.admit(&parent, &grant, "checkout", &input).unwrap();
-    let decision = crate::remote::tasks::RespondRequest {
-        original_request:Some(crate::remote::tasks::RemoteApproval {request_id:"approval".into(),request_kind:"tool".into(),payload:serde_json::Value::Null}),
+    let decision = crate::remote_task_protocol::RespondRequest {
+        original_request:Some(crate::remote_task_protocol::RemoteApproval {request_id:"approval".into(),request_kind:"tool".into(),payload:serde_json::Value::Null}),
         request_id: "approval".into(),
         decision: crate::agent_provider::ApprovalDecision::Deny {
             message: "No".into(),
@@ -278,7 +278,7 @@ async fn l3_real_before_send_failure_allows_only_identical_durable_decision_retr
         reopened.claim_response(&task.id, &decision).unwrap(),
         "definite before-send failure permanently consumed the approval"
     );
-    let conflicting = crate::remote::tasks::RespondRequest {
+    let conflicting = crate::remote_task_protocol::RespondRequest {
         original_request:decision.original_request.clone(),
         request_id: "approval".into(),
         decision: crate::agent_provider::ApprovalDecision::Allow {
@@ -529,7 +529,7 @@ async fn native_commands_are_dispatched_against_real_pane_and_db_ownership() {
 
 use super::*;
 use crate::agent_provider::ProviderKind;
-use crate::remote::tasks::{TaskEvent, TaskRead as RemoteRead, TaskSnapshot, TaskStatus};
+use crate::remote_task_protocol::{TaskEvent, TaskRead as RemoteRead, TaskSnapshot, TaskStatus};
 pub(super) fn fixture() -> (Parent, Grant, DelegateTaskInput) {
     (
         Parent {
@@ -695,4 +695,29 @@ fn durable_identity_survives_reopen_and_conflicting_retry_is_rejected() {
             .unwrap(),
         id
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn oversized_receiver_event_reference_reconciles_in_portable_parent_journal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Journal::open(&dir.path().join("parent")).unwrap();
+    let (parent, grant, input) = fixture();
+    store.put_grant(&parent.workspace_id, &grant).unwrap();
+    let task = store.admit(&parent, &grant, "checkout", &input).unwrap();
+    let request = task.request(None);
+    let receiver = crate::remote::tasks::TaskStore::open(&dir.path().join("receiver")).unwrap();
+    receiver.admit(&request).unwrap();
+    let payload = serde_json::json!({"type":"tool_result","output":"x".repeat(2_500_000)});
+    receiver.append(&task.id, &payload, |_| {}).unwrap();
+    receiver.append(&task.id, &serde_json::json!({"type":"runtime_warning","message":"later event"}), |_| {}).unwrap();
+    receiver.update(&task.id, |remote| {remote.status=TaskStatus::Completed;remote.result=Some("complete correlated result".into());}).unwrap();
+    let page = receiver.read(&task.id, 0).unwrap();
+    store.apply_remote(&task.id, &page).unwrap();
+    let cached = store.read(&task.id, 0).unwrap();
+    assert_eq!(cached.next_cursor, 2);
+    assert_eq!(cached.events[0].event["original_payload"]["remote_event_blob"]["bytes"], serde_json::to_string(&payload).unwrap().len());
+    assert_eq!(cached.task.remote.unwrap().result.as_deref(), Some("complete correlated result"));
+    assert!(!store.tail_pending(&task.id).unwrap());
+    assert_eq!(store.follow_intent(&task.id).unwrap().1, 2);
 }

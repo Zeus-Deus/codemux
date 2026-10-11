@@ -6,7 +6,7 @@ import { grantFixture, receiverFixture, taskFixture } from '@/lib/delegation.tes
 const native = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn().mockResolvedValue(() => {}) }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: native.listen }));
-afterEach(() => { cleanup(); __resetHostsStoreForTests(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); __resetHostsStoreForTests(); vi.clearAllMocks(); vi.unstubAllGlobals(); });
 function hosts() {
   useHostsStore.setState({ loaded: true, hosts: [{ id: 7, name: 'Build host', ssh_target: 'builder@example.test', server_id: null, created_at: '', updated_at: '', dirty: false }], error: null });
 }
@@ -55,8 +55,17 @@ it('shows exact receiver model/checkout/consent and Cancel never authorizes or l
   expect(native.invoke.mock.calls.some(([command]) => command === 'delegation_authorize' || command === 'delegate_task')).toBe(false);
 });
 
-it('verifies the grant, guards duplicate clicks, preserves prompt and retries the identical launch key', async () => {
+it.each(['native', 'insecure'] as const)('verifies the grant, guards duplicate clicks, preserves prompt and retries the identical launch key in a %s context', async context => {
   const Dialog = await component();
+  const getRandomValues = vi.fn(globalThis.crypto.getRandomValues.bind(globalThis.crypto));
+  if (context === 'insecure') {
+    // Plain-HTTP webviews retain the RNG but do not expose randomUUID.
+    // Exercise the actual dialog, store, and native command wrappers, not a mocked UUID helper.
+    vi.stubGlobal('isSecureContext', false);
+    vi.stubGlobal('crypto', { getRandomValues });
+    expect(globalThis.isSecureContext).toBe(false);
+    expect(globalThis.crypto.randomUUID).toBeUndefined();
+  }
   hosts();
   let rejectLaunch!: (error: Error) => void;
   let launches = 0;
@@ -91,6 +100,9 @@ it('verifies the grant, guards duplicate clicks, preserves prompt and retries th
   const requests = native.invoke.mock.calls.filter(([command]) => command === 'delegate_task').map(([, args]) => args.input);
   expect(requests).toHaveLength(2);
   expect(requests[0]).toEqual(requests[1]);
+  expect(requests[0]).toBe(requests[1]);
+  expect(requests[0].client_request_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  if (context === 'insecure') expect(getRandomValues).toHaveBeenCalledTimes(1);
   expect(requests[0]).toMatchObject({ target_id: 'grant-1', model: 'receiver-model', effort: 'low', prompt: 'Audit route access', client_request_id: expect.any(String) });
   expect(close).toHaveBeenCalledWith(false);
 });
@@ -230,4 +242,36 @@ it.each(['cancel', 'readonly', 'checkout-removed'] as const)('does not launch af
   await act(async () => { resolveVerification(response); });
   expect(native.invoke.mock.calls.some(([command]) => command === 'delegation_authorize' || command === 'delegate_task')).toBe(false);
   if (reason === 'checkout-removed') expect(screen.getByRole('alert')).toHaveTextContent('no longer available');
+});
+
+it('clears the launch phase when UUID initialization throws and allows a retry', async () => {
+  const Dialog = await component();
+  const randomUUID = vi.fn().mockImplementationOnce(() => { throw new Error('RNG unavailable'); })
+    .mockReturnValue('00000000-0000-4000-8000-000000000001');
+  vi.stubGlobal('crypto', { randomUUID });
+  hosts();
+  native.invoke.mockImplementation(command => {
+    if (command === 'delegation_host_info') return Promise.resolve(receiverFixture());
+    if (command === 'delegation_authorize') return Promise.resolve(grantFixture);
+    if (command === 'delegation_grants') return Promise.resolve([grantFixture]);
+    if (command === 'delegate_task') return Promise.resolve(taskFixture());
+    if (command === 'delegation_read') return Promise.resolve({ task: taskFixture(), events: [], next_cursor: 0, has_more: false });
+    return Promise.resolve([]);
+  });
+  renderHook(() => useDelegationTasks('pane', 'thread-1'));
+  const launched = vi.fn();
+  render(<Dialog open onOpenChange={vi.fn()} paneId="pane" threadId="thread-1" writable onLaunched={launched} />);
+  fireEvent.change(screen.getByLabelText('Host'), { target: { value: '7' } });
+  await screen.findByRole('option', { name: 'Receiver model' });
+  fireEvent.change(screen.getByLabelText('Existing checkout'), { target: { value: 'checkout-1' } });
+  fireEvent.change(screen.getByLabelText('Task'), { target: { value: 'Audit route access' } });
+  fireEvent.click(screen.getByLabelText(/Authorize this host and checkout/i));
+  fireEvent.click(screen.getByRole('button', { name: 'Run on host' }));
+  await screen.findByText('RNG unavailable');
+  const retry = screen.getByRole('button', { name: 'Run on host' });
+  expect(retry).toBeEnabled();
+  expect(native.invoke.mock.calls.some(([command]) => command === 'delegation_authorize' || command === 'delegate_task')).toBe(false);
+  fireEvent.click(retry);
+  await waitFor(() => expect(launched).toHaveBeenCalledOnce());
+  expect(randomUUID).toHaveBeenCalledTimes(2);
 });
