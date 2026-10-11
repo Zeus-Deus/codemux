@@ -1296,6 +1296,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     ) as HTMLElement;
     expect(row).not.toBeNull();
     expect(row).toHaveAttribute("data-active", "true");
+    expect(row).toHaveAttribute("aria-current", "page");
     expect(activateWorkspace).not.toHaveBeenCalled();
   });
 
@@ -2471,7 +2472,7 @@ describe("SidebarInbox — snooze shelf", () => {
     expect(container.querySelectorAll("[data-snoozed-row]").length).toBe(1);
     expect(
       container.querySelector('[data-snoozed-row="ws-2"]'),
-    ).not.toBeNull();
+    ).toHaveAttribute("aria-current", "page");
   });
 });
 

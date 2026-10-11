@@ -571,6 +571,7 @@ const SettledRow = memo(function SettledRow({
       data-settled-row={workspace.workspace_id}
       data-selected={selected ? "true" : undefined}
       data-active={isActive ? "true" : undefined}
+      aria-current={isActive ? "page" : undefined}
       onClick={handleClick}
       onKeyDown={(e) => {
         if (!isRowActivationKey(e)) return;
@@ -823,6 +824,7 @@ const SnoozeRow = memo(function SnoozeRow({
         data-snoozed-row={workspace.workspace_id}
         data-selected={selected ? "true" : undefined}
         data-active={isActive ? "true" : undefined}
+        aria-current={isActive ? "page" : undefined}
         onClick={handleClick}
         onKeyDown={(e) => {
           if (!isRowActivationKey(e)) return;

@@ -178,6 +178,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
           <button
             type="button"
             disabled={isLoading}
+            aria-label="Choose editor"
             className={cn(
               "flex items-center justify-center",
               !compact && "border bg-secondary/50",
