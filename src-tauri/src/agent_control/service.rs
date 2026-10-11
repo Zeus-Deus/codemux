@@ -45,7 +45,7 @@ pub(crate) fn permission_ceiling(caller: &ControlCaller, provider: ProviderKind,
         ProviderKind::Claude => matches!(mode, Some("default" | "acceptEdits")),
         ProviderKind::Codex => matches!(mode, Some("read-only" | "workspace-write")),
         ProviderKind::Cursor | ProviderKind::Grok => matches!(mode, Some("ask" | "plan")),
-        ProviderKind::Hermes | ProviderKind::OpenCode => false,
+        ProviderKind::Hermes | ProviderKind::Acp | ProviderKind::OpenCode => false,
     };
     if supervised { Ok(()) } else {
         Err(ControlError::new("permission_ceiling", "This worker mode needs full-access consent; supervised clients cannot target full-access or unknown modes"))
@@ -62,7 +62,7 @@ pub(crate) async fn capabilities<R: Runtime>(app: &AppHandle<R>, provider: Provi
         if let Some(caps) = state.fixture_capabilities.lock().unwrap().get(&provider).cloned() { return Ok(caps); }
     }
     agent_chat::list_chat_provider_capabilities(
-        app.clone(), provider,
+        app.clone(), provider, None,
         app.state::<std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>>(),
         app.state::<std::sync::Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>>(),
@@ -170,7 +170,7 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
     db.update_agent_chat_session_config(thread, &AgentChatSessionConfig {
         model: Some(input.model.clone()), effort: Some(input.effort.clone()),
         context_window: Some(input.context_window.clone()), permission_mode: Some(input.permission_mode.clone()),
-        fast_mode: Some(input.fast_mode),
+        fast_mode: Some(input.fast_mode), service_tier: None,
     })?;
     if let Some(title) = &input.title { db.set_agent_chat_title(thread, title)?; }
     let pane = agent_chat::agent_chat_create_pane(
@@ -180,8 +180,8 @@ async fn materialize<R: Runtime>(app: &AppHandle<R>, caller: &ControlCaller, inp
     let start = StartSessionInput {
         thread_id: ThreadId(thread.into()), cwd: workspace.cwd.into(), model: input.model,
         resume_cursor: None, fresh_session: true, permission_mode: input.permission_mode,
-        effort: input.effort, context_window: input.context_window, fast_mode: input.fast_mode,
-        additional_directories: vec![], env: None, workspace_id: None, extra: Value::Null, recorded_usage_baseline: None,
+        effort: input.effort, context_window: input.context_window, fast_mode: input.fast_mode, service_tier: None,
+        additional_directories: vec![], env: None, workspace_id: None, remote: None, extra: Value::Null, recorded_usage_baseline: None,
     };
     let control = NativeControlGuard { caller:caller.clone(),workspace_id:input.workspace_id.clone(),thread_id:thread.into(),provider:input.provider,admission:None }.retain_admission(app);
     let actual = agent_chat::agent_chat_start_session_guarded(app.clone(), pane.clone(), input.provider, start, Some(thread.into()), Some(control.clone())).await?;

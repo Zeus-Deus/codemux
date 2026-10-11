@@ -326,9 +326,9 @@ async fn mario_r3_queue_boundary(mode: &str) {
     });
     agent_chat::agent_chat_start_session(app.handle().clone(), pane, ProviderKind::Cursor, StartSessionInput {
         thread_id:ThreadId(thread.into()),cwd:root.path().canonicalize().unwrap(),model:None,resume_cursor:None,fresh_session:true,
-        permission_mode:Some("ask".into()),effort:None,context_window:None,fast_mode:false,additional_directories:vec![],
+        permission_mode:Some("ask".into()),effort:None,context_window:None,fast_mode:false,service_tier:None,additional_directories:vec![],
         env:Some(std::collections::HashMap::from([("CODEMUX_AGENT_CONTROL_FIXTURE_ROOT".into(),rig.to_string_lossy().into_owned())])),
-        workspace_id:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
+        workspace_id:None,remote:None,extra:serde_json::Value::Null,recorded_usage_baseline:None,
     }, Some(thread.into())).await.unwrap();
     let first = agent_chat::agent_chat_send_turn(app.handle().clone(), ProviderKind::Cursor, serde_json::from_value(json!({
         "thread_id":thread,"text":"review-hold","delivery":"queue","client_nonce":"mario-parent-nonce",
