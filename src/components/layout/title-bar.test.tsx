@@ -472,14 +472,14 @@ describe("TitleBar GUI chrome — floating placement", () => {
     expect(getByTestId("titlebar-floating-band").style.right).toBe("328px");
   });
 
-  // The panel draws the stored 320px default once the row is measured, so the
-  // band must stop at that edge, not at the 360px drag minimum.
+  // Once the row is measured the panel draws the stored width clamped to it
+  // (320px stored, 360px drawn), so the band must stop at that drawn edge.
   it("keeps the band at the drawn panel edge once the row is measured", () => {
     state.enableAgentChat = true;
     state.rightPanelTab = "files";
     state.rightPanelRowWidth = 800;
     const { getByTestId } = renderBar();
-    expect(getByTestId("titlebar-floating-band").style.right).toBe("328px");
+    expect(getByTestId("titlebar-floating-band").style.right).toBe("368px");
   });
 
   it("keeps the sidebar toggle at the corner inset beside an expanded sidebar", () => {

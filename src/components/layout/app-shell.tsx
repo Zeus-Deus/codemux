@@ -1,7 +1,7 @@
 import { useNotificationLink } from "@/hooks/use-notification-link";
 import { useRemotePairingRequests } from "@/hooks/use-remote-pairing-requests";
 import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
-import { lazy, useEffect, useLayoutEffect, useMemo } from "react";
+import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";

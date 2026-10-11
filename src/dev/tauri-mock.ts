@@ -6680,12 +6680,6 @@ const handlers: Record<string, Handler> = {
     patchSurface(loc.surface, { root, active_pane_id: paneId });
     return paneId;
   },
-  activate_pane: (a) => {
-    const loc = findSurfaceForPane(a.paneId);
-    if (!loc || typeof a.paneId !== "string") return undefined;
-    patchSurface(loc.surface, { active_pane_id: a.paneId });
-    return undefined;
-  },
   resize_split: (a) => {
     const loc = findSurfaceForPane(a.paneId);
     if (!loc || !Array.isArray(a.childSizes)) return undefined;
@@ -6764,11 +6758,11 @@ const handlers: Record<string, Handler> = {
       const surface = workspace.surfaces.find((s) => leafPaneIds(s.root).includes(paneId));
       if (!surface) continue;
       workspace.active_surface_id = surface.surface_id;
-      surface.active_pane_id = paneId;
       const tab = workspace.tabs.find((t) => t.surface_id === surface.surface_id);
       if (tab) workspace.active_tab_id = tab.tab_id;
-      appState = { ...appState };
-      emitAppState();
+      // Fresh workspace and surface objects, so a split's active-pane border
+      // re-renders: the store keeps references that did not change.
+      patchSurface(surface, { active_pane_id: paneId });
       return undefined;
     }
     return undefined;
