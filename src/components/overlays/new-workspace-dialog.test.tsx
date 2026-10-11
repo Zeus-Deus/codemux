@@ -1428,7 +1428,6 @@ describe("Failure recovery", () => {
           baseBranch: "main",
           branchMode: "create_new",
           openExistingBranch: null,
-          hostId: null,
         },
       });
       useUIStore.getState().reopenPendingWorkspace("pending-i");
@@ -1486,7 +1485,6 @@ describe("Failure recovery", () => {
           baseBranch: "develop",
           branchMode: "create_new",
           openExistingBranch: null,
-          hostId: null,
         },
       });
       useUIStore.getState().reopenPendingWorkspace("pending-a");
@@ -1550,7 +1548,6 @@ describe("Failure recovery", () => {
           baseBranch: "main",
           branchMode: "create_new",
           openExistingBranch: null,
-          hostId: null,
         },
       });
       useUIStore.getState().reopenPendingWorkspace("pending-m");

@@ -35,7 +35,7 @@ import {
   FolderOpen,
   GitBranch,
 } from "lucide-react";
-import { toast, errorMessage } from "@/lib/toast";
+import { toast } from "@/lib/toast";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -881,7 +881,6 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     baseBranch,
     branchMode,
     openExistingBranch,
-    hostId,
   });
   const closeDialog = () => onOpenChange(false);
 

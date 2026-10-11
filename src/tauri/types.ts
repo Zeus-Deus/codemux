@@ -632,7 +632,6 @@ export interface NewWorkspaceDraft {
   baseBranch: string;
   branchMode: "create_new" | "open_existing";
   openExistingBranch: string | null;
-  hostId: number | null;
 }
 
 export interface PendingWorkspace {

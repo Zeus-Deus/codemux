@@ -18,7 +18,6 @@ const draft: NewWorkspaceDraft = {
   baseBranch: "main",
   branchMode: "create_new",
   openExistingBranch: null,
-  hostId: null,
 };
 
 function renderRow(pending: PendingWorkspace) {
