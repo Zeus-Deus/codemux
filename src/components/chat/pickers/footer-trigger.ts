@@ -50,6 +50,11 @@ export const PICKER_ROW_DESCRIPTION =
 export const PICKER_ROW_CHECK = "mt-px size-3.5 text-foreground/70";
 export const PICKER_SEPARATOR = "mx-0 my-1 bg-border/60";
 
+/** Narrow composer: a FOOTER_TRIGGER reduced to its icon, a square the
+ *  size of its 30px hover plate. The chevron goes too; the hover
+ *  surface and tooltip carry the affordance. */
+export const FOOTER_TRIGGER_ICON_ONLY = "w-[30px] justify-center px-0";
+
 /** A model label's leaf name — what the composer's narrow width ladder
  *  shows instead of the full label: the last `/` segment of routed ids
  *  ("openrouter/qwen3-coder" → "qwen3-coder"); plain labels pass through. */

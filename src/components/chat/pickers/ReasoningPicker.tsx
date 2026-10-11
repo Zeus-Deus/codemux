@@ -20,6 +20,7 @@ import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
   FOOTER_SEPARATOR,
   FOOTER_TRIGGER,
+  FOOTER_TRIGGER_ICON_ONLY,
   PICKER_COLLISION_PADDING,
   PICKER_COMMAND,
   PICKER_CONTENT,
@@ -189,6 +190,8 @@ export function ReasoningPicker({
     return effortLabelText ?? contextLabelText ?? null;
   })();
   const triggerLabel = reasoningLabel ?? (fastMode ? "Fast" : "Standard");
+  // Plain "Standard" has no icon to fall back to, so it keeps its text.
+  const showIconOnly = iconOnly && (fastMode || !!reasoningLabel);
   const triggerAriaLabel = reasoningLabel
     ? `Reasoning: ${reasoningLabel}; service tier: ${fastMode ? "Fast" : "Standard"}`
     : `Service tier: ${fastMode ? "Fast" : "Standard"}`;
@@ -235,7 +238,7 @@ export function ReasoningPicker({
             disabled={disabled}
             aria-label={triggerAriaLabel}
             title={triggerAriaLabel}
-            className={FOOTER_TRIGGER}
+            className={cn(FOOTER_TRIGGER, showIconOnly && FOOTER_TRIGGER_ICON_ONLY)}
           >
             {fastMode ? (
               <Zap
@@ -246,10 +249,12 @@ export function ReasoningPicker({
             ) : reasoningLabel ? (
               <Brain className="size-3.5" />
             ) : null}
-            {!(iconOnly && (fastMode || reasoningLabel)) && (
-              <span className="max-w-[200px] truncate">{triggerLabel}</span>
+            {!showIconOnly && (
+              <>
+                <span className="max-w-[200px] truncate">{triggerLabel}</span>
+                <ChevronDown className="size-3 opacity-50" />
+              </>
             )}
-            <ChevronDown className="size-3 opacity-50" />
           </button>
         </PopoverTrigger>
         <PopoverContent

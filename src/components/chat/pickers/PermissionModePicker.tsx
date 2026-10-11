@@ -19,6 +19,7 @@ import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import {
   FOOTER_SEPARATOR,
   FOOTER_TRIGGER,
+  FOOTER_TRIGGER_ICON_ONLY,
   PICKER_COLLISION_PADDING,
   PICKER_COMMAND,
   PICKER_CONTENT,
@@ -97,15 +98,17 @@ export function PermissionModePicker({
           <button
             type="button"
             disabled={disabled}
-            className={FOOTER_TRIGGER}
+            className={cn(FOOTER_TRIGGER, iconOnly && FOOTER_TRIGGER_ICON_ONLY)}
             aria-label={iconOnly ? `Access: ${label}` : undefined}
             title={iconOnly ? `Access: ${label}` : undefined}
           >
             <Lock className="size-3.5" />
             {!iconOnly && (
-              <span className="max-w-[140px] truncate">{label}</span>
+              <>
+                <span className="max-w-[140px] truncate">{label}</span>
+                <ChevronDown className="size-3 opacity-50" />
+              </>
             )}
-            <ChevronDown className="size-3 opacity-50" />
           </button>
         </PopoverTrigger>
         <PopoverContent
