@@ -1302,6 +1302,18 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
   useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
 
+  // Resizes are skipped while the pane is hidden, so a split or a panel change
+  // made then leaves the shell at its old width. Re-sync on the first frame
+  // the pane is shown again, before the next keystroke can wrap at the stale
+  // width.
+  useEffect(() => {
+    if (!visible) return;
+    const frame = requestAnimationFrame(() => {
+      void syncTerminalSize();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [visible, syncTerminalSize]);
+
   const handleRestart = useCallback(() => {
     void restartRef.current?.();
   }, []);
