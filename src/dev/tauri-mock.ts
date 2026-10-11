@@ -89,6 +89,7 @@ import {
   workflowCompleteEnvelopes,
   workflowRunningEnvelopes,
 } from "./mock-fixtures";
+import { HTML_RENDER_FIXTURE_HTML, HTML_RENDER_FIXTURE_TITLE } from "./html-render-fixture";
 import {
   STRESS_THREAD_PREFIX,
   getStressFixture,
@@ -1871,6 +1872,78 @@ function mockChatTranscript(threadId = MOCK_CHAT_THREAD_ID): string[] {
         text: "Keep going on the importer.",
       });
     }
+  }
+
+  // `?visual=1` seeds a turn where the agent answers with an `html_render`
+  // page, shown inline above its closing reply.
+  if (new URLSearchParams(location.search).get("visual") === "1") {
+    const visualTurnId = "seed-visual";
+    push({
+      type: "user_message",
+      thread_id: T,
+      client_nonce: "seed-nonce-visual",
+      text: "Render some insights from last quarter's agent activity as a visualization in the thread",
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "Bash",
+        input: { command: "sqlite3 activity.db < quarterly_turns.sql" },
+        tool_use_id: "seed-visual-query",
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_result",
+        tool_use_id: "seed-visual-query",
+        content: "18412 rows",
+        is_error: false,
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "mcp__codemux__mcp__codemux__html_render",
+        input: { title: HTML_RENDER_FIXTURE_TITLE, html: HTML_RENDER_FIXTURE_HTML },
+        tool_use_id: "seed-visual-render",
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "tool_result",
+        tool_use_id: "seed-visual-render",
+        content: "Shown to the reader above your reply.",
+        is_error: false,
+      },
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      item: {
+        kind: "assistant_text",
+        text: "The Codex jump lines up with the sandbox release in the week of Aug 24; Claude's share fell by about the same amount, so total volume stayed flat.",
+      },
+    });
+    push({
+      type: "turn_completed",
+      thread_id: T,
+      turn_id: visualTurnId,
+      status: { kind: "success" },
+      usage: null,
+    });
   }
 
   mockChatTranscriptCache.set(threadId, out);

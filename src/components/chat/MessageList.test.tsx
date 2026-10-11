@@ -706,6 +706,35 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
   });
+
+  it("keeps the approval footer on an html_render call waiting for approval", () => {
+    const pending: ToolCallItem = {
+      kind: "tool_call",
+      id: "tc-page",
+      seq: 0,
+      tool_use_id: "tu-page",
+      tool_name: "mcp__codemux__mcp__codemux__html_render",
+      input: { title: "Chart", html: "<p>hi</p>" },
+      status: "running",
+      result_content: null,
+      approval_request_id: "req-page",
+    };
+    const approval: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "req-page",
+      seq: 1,
+      request_id: "req-page",
+      turn_id: "turn-1",
+      request_kind: "tool",
+      payload: { tool_name: pending.tool_name, tool_input: pending.input },
+      tool_use_id: "tu-page",
+      resolution: { state: "pending" },
+    };
+    renderList([pending, approval]);
+    expect(screen.getByText("Allow")).toBeInTheDocument();
+    expect(screen.getByText("Deny")).toBeInTheDocument();
+    expect(screen.queryByText("Building visualization…")).toBeNull();
+  });
 });
 
 describe("MessageList provider identity", () => {
