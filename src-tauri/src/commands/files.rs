@@ -475,6 +475,32 @@ pub async fn file_exists(path: String) -> Result<bool, String> {
         .map_err(|e| format!("file_exists task join failed: {e}"))
 }
 
+/// Cheap change token for a file the editor has open: size plus modification
+/// time. The editor polls this instead of re-reading the file, and only reads
+/// the content again when the token moves.
+#[tauri::command]
+pub async fn file_signature(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&path).map_err(|e| format!("Cannot stat {path}: {e}"))?;
+        if !metadata.is_file() {
+            return Err(format!("Not a file: {path}"));
+        }
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        Ok(format!(
+            "{}:{}.{:09}",
+            metadata.len(),
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ))
+    })
+    .await
+    .map_err(|e| format!("file_signature task join failed: {e}"))?
+}
+
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
 
 // `async fn` so the metadata stat + file read run on the blocking pool
@@ -828,8 +854,8 @@ pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::{
-        build_clipboard_image_payload, clipboard_image_extension, encode_rgba_to_png,
-        file_exists, grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
+        build_clipboard_image_payload, clipboard_image_extension, encode_rgba_to_png, file_exists,
+        file_signature, grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
         search_in_files, write_file, MAX_CLIPBOARD_IMAGE_BYTES,
     };
     use std::fs;
@@ -853,6 +879,27 @@ mod tests {
             .await
             .unwrap();
         assert!(!dir_hit);
+    }
+
+    #[tokio::test]
+    async fn file_signature_changes_when_the_file_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        fs::write(&file, "one").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let first = file_signature(path.clone()).await.unwrap();
+        assert_eq!(first, file_signature(path.clone()).await.unwrap());
+
+        fs::write(&file, "one two").unwrap();
+        assert_ne!(first, file_signature(path.clone()).await.unwrap());
+
+        assert!(file_signature(dir.path().to_string_lossy().to_string())
+            .await
+            .is_err());
+        assert!(file_signature(dir.path().join("nope").to_string_lossy().to_string())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

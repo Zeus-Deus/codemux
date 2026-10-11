@@ -122,7 +122,7 @@ export function useAgentChatSessionActions(
         }
         // Hermes history is identified by the durable local binding. A new local
         // id would lose that binding and cannot safely resume the native history.
-        const newLocalThreadId = targetProvider === "hermes"
+        const newLocalThreadId = (targetProvider === "hermes" || targetProvider === "acp")
           ? record.thread_id
           : `chat-${paneId}-${Date.now()}`;
         // Hydrate the new slice with the picked session's persisted
@@ -186,7 +186,7 @@ export function useAgentChatSessionActions(
             permission_mode: resolvedMode,
             effort: record.effort,
             context_window: record.context_window,
-            fast_mode: record.fast_mode ?? false,
+            service_tier: record.service_tier ?? "default",
             additional_directories: [],
             env: null,
           },
@@ -205,7 +205,7 @@ export function useAgentChatSessionActions(
         store.setModel(newThreadId, resolvedModel);
         store.setEffort(newThreadId, record.effort);
         store.setContextWindow(newThreadId, record.context_window);
-        store.setFastMode(newThreadId, record.fast_mode ?? false);
+        store.setServiceTier(newThreadId, record.service_tier ?? "default");
         if (resolvedMode !== null) {
           store.setPermissionMode(newThreadId, resolvedMode);
         }
@@ -243,6 +243,12 @@ export function useAgentChatSessionActions(
       }
       const newLocalThreadId = `chat-${paneId}-${Date.now()}`;
       if (hermesProfile) useHermes.getState().select(newLocalThreadId, cwd, hermesProfile, false);
+      if (provider === "acp" && threadId) {
+        const { useCustomAcp } = await import("@/stores/custom-acp-store");
+        await useCustomAcp.getState().restore(threadId);
+        const agentId = useCustomAcp.getState().selections[threadId];
+        if (agentId) useCustomAcp.getState().select(newLocalThreadId, agentId);
+      }
       // Launch in the provider default mode (Full access) — the same mode
       // the fresh store slice advertises in the footer pill. Passing `null`
       // here would boot the provider in `default` (prompt-for-every-tool)
@@ -259,7 +265,7 @@ export function useAgentChatSessionActions(
           model: null,
           resume_cursor: null,
           permission_mode: startMode,
-          fast_mode: false,
+          service_tier: "default",
           additional_directories: [],
           env: null,
           ...(hermesProfile ? { extra: { hermes_profile: hermesProfile } } : {}),
@@ -278,7 +284,7 @@ export function useAgentChatSessionActions(
       if (startMode !== null) {
         store.setPermissionMode(newThreadId, startMode);
       }
-      store.setFastMode(newThreadId, false);
+      store.setServiceTier(newThreadId, "default");
       store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {
       if (adoptPaneBindingFromError(error)) return;

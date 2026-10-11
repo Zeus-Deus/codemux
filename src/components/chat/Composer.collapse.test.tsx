@@ -15,7 +15,16 @@ vi.mock("@/tauri/commands", async (importActual) => {
   };
 });
 
-import { Composer, composerWidthLadder, MIN_TEXTAREA_PX } from "./Composer";
+import {
+  collapseDisabledFor,
+  Composer,
+  composerFooterLadder,
+  FOOTER_COMPACT_STEPS,
+  FOOTER_MIN_GAP_PX,
+  MIN_TEXTAREA_PX,
+  nextFooterFit,
+  type FooterFit,
+} from "./Composer";
 
 type ComposerProps = ComponentProps<typeof Composer>;
 
@@ -223,23 +232,69 @@ describe("Composer pill collapse", () => {
   });
 });
 
-describe("composerWidthLadder", () => {
-  it("steps down at 620 / 540 / 500 / 460 / 400", () => {
-    expect(composerWidthLadder(760)).toEqual({
+describe("collapseDisabledFor", () => {
+  it("keeps the pill expanded below 400px", () => {
+    expect(collapseDisabledFor(400)).toBe(false);
+    expect(collapseDisabledFor(399)).toBe(true);
+  });
+});
+
+describe("composerFooterLadder", () => {
+  it("gives up labels in order: leaf model, access, effort, model, config", () => {
+    expect(composerFooterLadder(0)).toEqual({
       leafModelLabel: false,
       accessIconOnly: false,
       effortIconOnly: false,
+      modelIconOnly: false,
       configInMenu: false,
-      collapseDisabled: false,
     });
-    expect(composerWidthLadder(619).leafModelLabel).toBe(true);
-    expect(composerWidthLadder(539)).toMatchObject({
+    expect(composerFooterLadder(2)).toMatchObject({
+      leafModelLabel: true,
       accessIconOnly: true,
       effortIconOnly: false,
     });
-    expect(composerWidthLadder(499).effortIconOnly).toBe(true);
-    expect(composerWidthLadder(459).configInMenu).toBe(true);
-    expect(composerWidthLadder(399).collapseDisabled).toBe(true);
-    expect(composerWidthLadder(null).collapseDisabled).toBe(false);
+    expect(composerFooterLadder(4)).toMatchObject({
+      modelIconOnly: true,
+      configInMenu: false,
+    });
+    expect(composerFooterLadder(FOOTER_COMPACT_STEPS).configInMenu).toBe(true);
+  });
+});
+
+describe("nextFooterFit", () => {
+  const fit = (level: number, fitWidths: number[] = []): FooterFit => ({
+    key: "k",
+    level,
+    fitWidths,
+  });
+
+  it("holds while the gap is wide enough", () => {
+    const prev = fit(0);
+    expect(nextFooterFit(prev, "k", 700, FOOTER_MIN_GAP_PX)).toBe(prev);
+  });
+
+  it("steps in and records the width at which the step fits again", () => {
+    expect(nextFooterFit(fit(0), "k", 540, FOOTER_MIN_GAP_PX - 30)).toEqual(
+      fit(1, [570]),
+    );
+  });
+
+  it("steps back out once the pill reaches the recorded width", () => {
+    const prev = fit(2, [570, 600]);
+    expect(nextFooterFit(prev, "k", 599, 200)).toBe(prev);
+    expect(nextFooterFit(prev, "k", 600, 200)).toEqual(fit(1, [570]));
+  });
+
+  it("stops at the last step", () => {
+    const prev = fit(FOOTER_COMPACT_STEPS, [500, 520, 540, 560, 580]);
+    expect(nextFooterFit(prev, "k", 300, 10)).toBe(prev);
+  });
+
+  it("re-fits from step 0 when the content changes", () => {
+    expect(nextFooterFit(fit(3, [500, 520, 540]), "k2", 400, 10)).toEqual({
+      key: "k2",
+      level: 0,
+      fitWidths: [],
+    });
   });
 });

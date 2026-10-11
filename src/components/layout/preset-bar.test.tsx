@@ -26,7 +26,8 @@ vi.mock("@/tauri/commands", () => ({
   agentChatCreatePane: (...args: unknown[]) => mockAgentChatCreatePane(...args),
 }));
 
-vi.mock("@/lib/agent-chat/materialize", () => ({
+vi.mock("@/lib/agent-chat/materialize", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/agent-chat/materialize")>(),
   materializeWithPreset: (...args: unknown[]) => mockMaterializeWithPreset(...args),
 }));
 
@@ -426,6 +427,40 @@ describe("PresetBar — Home-draft full gating (Task 7b revised)", () => {
     await flushPromises();
 
     expect(screen.getByRole("button", { name: /claude code/i })).not.toBeDisabled();
+  });
+
+  it("Project draft on a device → CLI presets are disabled, chat presets still launch", async () => {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/projects/foo");
+    useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 2 });
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const cli = makePreset({ id: "cli-1", name: "Claude Code", kind: "cli" });
+    const chat = makePreset({
+      id: "chat-1",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([cli, chat]));
+
+    renderDraftPresetBar({ presets: [cli, chat], draftId: draft.draftId });
+    await flushPromises();
+
+    const cliButton = screen.getByRole("button", { name: /claude code/i });
+    expect(cliButton).toBeDisabled();
+    // The wrapper still takes the hover, so the reason shows.
+    await userEvent.hover(cliButton.parentElement!);
+    expect(
+      (await screen.findAllByText("Terminal presets can't run on a device yet."))
+        .length,
+    ).toBeGreaterThan(0);
+
+    await userEvent.click(screen.getByRole("button", { name: /chat agent/i }));
+    await flushPromises();
+    expect(mockMaterializeWithPreset).toHaveBeenCalledTimes(1);
+    expect(mockMaterializeWithPreset.mock.calls[0][1].id).toBe("chat-1");
   });
 
   it("disabled prop (materializing) → every preset button is disabled", async () => {

@@ -60,6 +60,7 @@ impl ProviderInstanceId {
             ProviderKind::Cursor => "cursor",
             ProviderKind::Grok => "grok",
             ProviderKind::Hermes => "hermes",
+            ProviderKind::Acp => "acp",
             ProviderKind::OpenCode => "opencode",
         };
         Self(slug.to_string())

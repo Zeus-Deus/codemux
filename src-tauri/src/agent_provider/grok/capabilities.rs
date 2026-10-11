@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::agent_provider::acp::protocol::{current_model_id, grok_auth_method, initialize_params};
+use crate::agent_provider::acp::protocol::{
+    current_model_id, grok_auth_method, initialize_params, local_xai_api_key_set,
+};
 use crate::agent_provider::{
     ChatModelInfo, EffortGranularity, PermissionModeOption, ProviderChatCapabilities,
 };
@@ -126,7 +128,7 @@ pub async fn probe_grok_health(binary_path: &Path) -> Result<GrokHealthProbe, Ha
         let version = string_at_pointer(&initialize, "/_meta/agentVersion");
         // `grok_auth_method` accepts only an advertised non-browser method,
         // including future headless methods selected by the CLI itself.
-        let method_id = grok_auth_method(&initialize, &HashMap::new());
+        let method_id = grok_auth_method(&initialize, &HashMap::new(), local_xai_api_key_set());
         let Some(method_id) = method_id else {
             return Ok(GrokHealthProbe {
                 authenticated: false,
@@ -289,6 +291,7 @@ pub(crate) fn build_capabilities(
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            service_tiers: vec![],
             supports_images,
             sub_provider: None,
             is_free: false,

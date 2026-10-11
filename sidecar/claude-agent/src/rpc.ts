@@ -49,6 +49,10 @@ export const RPC_INVALID_REQUEST = -32600;
 export const RPC_METHOD_NOT_FOUND = -32601;
 export const RPC_INVALID_PARAMS = -32602;
 export const RPC_INTERNAL_ERROR = -32603;
+/** Server-defined: the deployed Claude CLI does not implement a control
+ *  request the sidecar forwarded (an older CLI). Callers treat it as
+ *  "update the CLI", not as a failure. */
+export const RPC_CLI_UNSUPPORTED = -32001;
 
 /**
  * Discriminate a parsed incoming message: `true` means the sender is

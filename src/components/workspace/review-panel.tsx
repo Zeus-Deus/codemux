@@ -40,12 +40,14 @@ import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
 import { CreatePrForm } from "./review/create-pr-form";
 import { ReviewDetail } from "./review/review-detail";
+import { usePrRefresh } from "./review/use-pr-refresh";
 import { ReviewThreads } from "./review/review-threads";
 import { IncomingPrsView } from "./review/incoming-prs-view";
 import {
   BranchLocalOnlyState,
   CliMissingState,
   NoPullRequestState,
+  NoRemoteState,
   RepoUnreachableState,
   SignedOutState,
   UnsupportedHostState,
@@ -69,7 +71,8 @@ interface Props {
 // Only successful results are cached. NotAuthenticated/NotInstalled and
 // "no integration for this repo" responses bypass the cache so the user
 // sees the recovery (e.g. after a CLI login or after a `git remote add
-// origin`) on the very next render, not 60 seconds later.
+// origin`) on the next probe, not 60 seconds later. While one of those
+// states is on screen the panel re-probes on its own (`useRecheckWhile`).
 //
 // The auth half of this lives in `@/lib/provider-auth`, shared with the
 // composer and the new-workspace preflight and keyed by *path* as well
@@ -87,9 +90,38 @@ interface CacheEntry<T> { value: T; ts: number; }
  * the fourth and it is not one of them: a checkout on a host Codemux has
  * no adapter for has no CLI to install or sign in to, so it must render
  * the not-a-supported-repo state rather than an install prompt for a
- * tool that is very possibly already installed.
+ * tool that is very possibly already installed. A checkout with no remote
+ * is unsupported too, but its fix is adding a remote, so it says so.
  */
-type ProviderGate = GhStatus | { status: "Unsupported" };
+type ProviderGate = GhStatus | { status: "Unsupported"; hasRemote: boolean };
+
+/**
+ * While the pane is waiting on a fix made outside Codemux (a CLI login,
+ * an install, a `git remote add`), it asks again on window focus and on
+ * a short clock, so the fix shows up without switching panes. The clock
+ * stops after a while; focus and "Check again" keep working after that.
+ */
+const RECHECK_INTERVAL_MS = 5_000;
+const RECHECK_WINDOW_MS = 120_000;
+
+function useRecheckWhile(active: boolean, recheck: () => void) {
+  useEffect(() => {
+    if (!active) return;
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      if (Date.now() - startedAt >= RECHECK_WINDOW_MS) {
+        window.clearInterval(timer);
+        return;
+      }
+      if (document.visibilityState === "visible") recheck();
+    }, RECHECK_INTERVAL_MS);
+    window.addEventListener("focus", recheck);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", recheck);
+    };
+  }, [active, recheck]);
+}
 
 const repoCheckCache = new Map<string, CacheEntry<boolean>>();
 
@@ -136,7 +168,9 @@ async function fetchProviderAuthStatus(
 
 /** The probe's verdict in the vocabulary this panel already renders. */
 function toProviderGate(status: ProviderAuthStatus): ProviderGate {
-  if (!status.supported) return { status: "Unsupported" };
+  if (!status.supported) {
+    return { status: "Unsupported", hasRemote: status.has_remote !== false };
+  }
   if (!status.installed) return { status: "NotInstalled" };
   if (!status.authenticated) return { status: "NotAuthenticated" };
   return { status: "Authenticated", username: status.username ?? "" };
@@ -217,6 +251,7 @@ export function ReviewPanel({ workspace }: Props) {
       getCachedRepoCheck(cwd) === undefined,
   );
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [pushing, setPushing] = useState(false);
 
   const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
@@ -229,6 +264,10 @@ export function ReviewPanel({ workspace }: Props) {
     getDefaultBranch(cwd).then(setDefaultBranch).catch(() => setDefaultBranch(null));
   }, [cwd]);
 
+  // Bumped to ask the auth question again without remounting.
+  const [authProbe, setAuthProbe] = useState(0);
+  const recheckAuth = useCallback(() => setAuthProbe((n) => n + 1), []);
+
   // Auth init — uses module-level cache with TTL
   useEffect(() => {
     let cancelled = false;
@@ -237,21 +276,21 @@ export function ReviewPanel({ workspace }: Props) {
         const status = await fetchProviderAuthStatus(cwd, provider);
         if (cancelled) return;
         const gate = toProviderGate(status);
+
+        // The repo check lands before the gate opens, so a re-check that
+        // finds a fresh login goes straight to the review rather than
+        // through a no-PR state first.
+        if (gate.status === "Authenticated") {
+          let isRepo = getCachedRepoCheck(cwd);
+          if (isRepo === undefined) {
+            isRepo = await checkGithubRepo(cwd);
+            setCachedRepoCheck(cwd, isRepo);
+          }
+          if (cancelled) return;
+          setRepoSupported(isRepo);
+        }
         setGhStatus(gate);
         setOperations(status.operations ?? NO_OPERATIONS);
-
-        if (gate.status !== "Authenticated") {
-          setInitialLoading(false);
-          return;
-        }
-
-        let isRepo = getCachedRepoCheck(cwd);
-        if (isRepo === undefined) {
-          isRepo = await checkGithubRepo(cwd);
-          setCachedRepoCheck(cwd, isRepo);
-        }
-        if (cancelled) return;
-        setRepoSupported(isRepo);
       } catch (err) {
         console.error("Source control auth init failed:", err);
       } finally {
@@ -261,7 +300,13 @@ export function ReviewPanel({ workspace }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [cwd, provider]);
+  }, [cwd, provider, authProbe]);
+
+  const awaitingOutsideFix =
+    ghStatus?.status === "NotInstalled" ||
+    ghStatus?.status === "NotAuthenticated" ||
+    (ghStatus?.status === "Unsupported" && !ghStatus.hasRemote);
+  useRecheckWhile(awaitingOutsideFix, recheckAuth);
 
   // Only the mounted review pane watches this PR. All PR surfaces share
   // the visibility/idle clock and the account's refusal cooldown.
@@ -363,12 +408,19 @@ export function ReviewPanel({ workspace }: Props) {
 
   // Helper to invalidate every PR query for this workspace at once.
   const invalidatePrQueries = useCallback(() => {
-    queryClient.invalidateQueries({
+    return queryClient.invalidateQueries({
       predicate: (q) =>
         q.queryKey[0] === "pr" &&
-        q.queryKey[2] === workspace.workspace_id,
+        ((q.queryKey[2] === workspace.workspace_id &&
+          (q.queryKey[3] === prNumber || q.queryKey[1] === "branch-info")) ||
+          (q.queryKey[2] === cwd && q.queryKey[3] === prNumber)),
     });
-  }, [queryClient, workspace.workspace_id]);
+  }, [queryClient, workspace.workspace_id, cwd, prNumber]);
+  const refresh = usePrRefresh(
+    cwd,
+    JSON.stringify([workspace.workspace_id, prNumber, workspace.git_branch, provider.kind]),
+    invalidatePrQueries,
+  );
 
   const openChangesPane = useCallback(() => {
     useUIStore.getState().setRightPanelTab(workspace.workspace_id, "changes");
@@ -402,7 +454,11 @@ export function ReviewPanel({ workspace }: Props) {
 
   // A host with no adapter is not a missing-CLI problem, and telling a
   // user with `gh` on their PATH to install it is simply wrong — so
-  // both no-adapter cases are answered before the CLI states below.
+  // the no-adapter cases are answered before the CLI states below.
+  if (ghStatus?.status === "Unsupported" && !ghStatus.hasRemote) {
+    return <NoRemoteState onOpenChanges={openChangesPane} onRecheck={recheckAuth} />;
+  }
+
   if (ghStatus?.status === "Unsupported" || repoSupported === false) {
     return (
       <UnsupportedHostState provider={provider} url={workspace.pr_url ?? null} />
@@ -410,11 +466,11 @@ export function ReviewPanel({ workspace }: Props) {
   }
 
   if (ghStatus?.status === "NotInstalled") {
-    return <CliMissingState provider={provider} />;
+    return <CliMissingState provider={provider} onRecheck={recheckAuth} />;
   }
 
   if (ghStatus?.status === "NotAuthenticated") {
-    return <SignedOutState provider={provider} />;
+    return <SignedOutState provider={provider} onRecheck={recheckAuth} />;
   }
 
   // Authenticated and the repo is supported, but the PR itself can't be
@@ -425,7 +481,7 @@ export function ReviewPanel({ workspace }: Props) {
       <RepoUnreachableState
         repoSlug={repoSlugFromUrl(workspace.pr_url)}
         provider={provider}
-        onRetry={invalidatePrQueries}
+        onRetry={refresh}
       />
     );
   }
@@ -457,6 +513,7 @@ export function ReviewPanel({ workspace }: Props) {
         gitDirtyFiles={workspace.git_changed_files ?? 0}
         staleAgeMs={staleAgeMs}
         onRefresh={invalidatePrQueries}
+        onManualRefresh={refresh}
         onOpenChanges={openChangesPane}
       />
     );
@@ -515,6 +572,7 @@ export function ReviewPanel({ workspace }: Props) {
         <BranchLocalOnlyState
           changedFiles={dirtyFiles}
           pushOnly={dirtyFiles === 0}
+          pushing={pushing}
           onOpenChanges={openChangesPane}
           onCommitAndPush={() => {
             if (dirtyFiles > 0) {
@@ -523,13 +581,16 @@ export function ReviewPanel({ workspace }: Props) {
               openChangesPane();
               return;
             }
+            if (pushing) return;
+            setPushing(true);
             gitPushChanges(cwd, true)
               .then(() => {
                 toast.success("Branch pushed");
                 invalidatePrQueries();
                 void branchInfoQuery.refetch();
               })
-              .catch((err) => toast.error(String(err)));
+              .catch((err) => toast.failure("Couldn't push the branch", err))
+              .finally(() => setPushing(false));
           }}
         />
       )}
