@@ -106,6 +106,7 @@ fn start_input(thread_id: &str, cwd: &str) -> StartSessionInput {
         env: None,
         workspace_id: None,
         extra: Value::Null,
+        remote: None,
     }
 }
 
@@ -1397,6 +1398,7 @@ mod delegation {
                 provider: ProviderKind::Codex,
                 resets_at_ms: Some(reset),
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 window: None,
             },
         );
@@ -1476,6 +1478,7 @@ mod delegation {
                 provider: ProviderKind::Codex,
                 resets_at_ms: Some(now_ms() + 3_600_000),
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 window: None,
             },
         );
@@ -1536,6 +1539,7 @@ mod delegation {
                 provider: ProviderKind::Codex,
                 resets_at_ms: Some(now_ms() + 3_600_000),
                 auto_resume_at_ms: None,
+                auto_resume_blocked_reason: None,
                 window: None,
             },
         );

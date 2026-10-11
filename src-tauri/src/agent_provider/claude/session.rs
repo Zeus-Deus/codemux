@@ -1819,14 +1819,24 @@ mod tests {
         assert_eq!(ids, ["a", "c"]);
     }
 
+    fn test_caller() -> crate::mcp::registry::HostCaller {
+        crate::mcp::registry::HostCaller {
+            thread_id: "thread".into(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: Some("ws-42".into()),
+            permission_mode: None,
+        }
+    }
+
     #[tokio::test]
     async fn local_session_publishes_and_runs_shared_tools() {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        assert_eq!(collect_mcp_tools(local.as_ref()).await.len(), 1);
+        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 1);
         let (payload, failure) = run_mcp_tool_call(
             local.as_ref(),
+            &test_caller(),
             Some("ws-42"),
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),
@@ -1847,12 +1857,15 @@ mod tests {
             host_name: "ai-node".into(),
         };
         let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
-        assert!(collect_mcp_tools(on_device.as_ref()).await.is_empty());
+        assert!(collect_mcp_tools(on_device.as_ref(), &test_caller())
+            .await
+            .is_empty());
 
         // A call the device sends anyway, by a name it guessed, is answered
         // with a tool error and never reaches the registry.
         let (payload, _) = run_mcp_tool_call(
             on_device.as_ref(),
+            &test_caller(),
             Some("ws-42"),
             "mcp__codemux-remote__echo",
             json!({"text": "hi"}),

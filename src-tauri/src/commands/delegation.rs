@@ -475,6 +475,7 @@ fn provider_id(provider: ProviderKind) -> &'static str {
         ProviderKind::Cursor => "cursor",
         ProviderKind::Grok => "grok",
         ProviderKind::Hermes => "hermes",
+        ProviderKind::Acp => "acp",
         ProviderKind::OpenCode => "opencode",
     }
 }
@@ -486,6 +487,7 @@ fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::Cursor => "Cursor",
         ProviderKind::Grok => "Grok",
         ProviderKind::Hermes => "Hermes",
+        ProviderKind::Acp => "Custom agent",
         ProviderKind::OpenCode => "OpenCode",
     }
 }
@@ -564,6 +566,8 @@ fn child_input(
         workspace_id: None,
         extra: Value::Null,
         recorded_usage_baseline: None,
+        // Filled by `agent_chat_start_session` from the workspace.
+        remote: None,
     }
 }
 

@@ -2314,8 +2314,14 @@ mod tests {
     async fn device_session_gets_and_runs_none_of_this_computers_tools() {
         let (_server, registry, call) =
             crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let caller = crate::mcp::registry::HostCaller {
+            thread_id: "codemux-chat".into(),
+            provider: crate::agent_provider::ProviderKind::Codex,
+            workspace_id: Some("ws-42".into()),
+            permission_mode: None,
+        };
         let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
-        let published = dynamic_tool_specs(local.as_ref(), false).await.unwrap();
+        let published = dynamic_tool_specs(local.as_ref(), false, &caller).await.unwrap();
         assert_eq!(published.len(), 1);
 
         let device = crate::agent_provider::types::RemoteSpawnTarget {
@@ -2324,13 +2330,14 @@ mod tests {
             host_name: "ai-node".into(),
         };
         let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
-        assert!(dynamic_tool_specs(on_device.as_ref(), true).await.is_none());
+        assert!(dynamic_tool_specs(on_device.as_ref(), true, &caller).await.is_none());
 
         // A call the device sends anyway, by a name it guessed, fails and
         // never reaches the registry.
         let response = handle_dynamic_tool_call(
             on_device.as_ref(),
             Some("ws-42"),
+            None,
             json!({
                 "threadId": "thread",
                 "turnId": "turn",
