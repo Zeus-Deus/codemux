@@ -141,6 +141,8 @@ vi.mock("@/tauri/commands", () => ({
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
   usageExportCsv: vi.fn().mockResolvedValue(""),
+  usageRefreshQuota: vi.fn().mockResolvedValue({ quota: {}, statuses: [], refreshed_at_ms: 0 }),
+  usagePriceOverrides: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("@/tauri/events", () => ({
