@@ -62,6 +62,7 @@ fn fixture_turn(thread_id: &str) -> SendTurnInput {
         display_text: None,
         skill_invocations: vec![],
         turn_checkpoint: None,
+        dispatch_guard: None,
     }
 }
 

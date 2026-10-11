@@ -153,7 +153,7 @@ impl Drop for CodexAgentProvider {
                     std::mem::take(&mut *guard)
                 };
                 for (_, session) in map {
-                    session.shutdown().await;
+                    let _ = session.shutdown().await;
                 }
             });
         }
@@ -205,7 +205,7 @@ impl AgentProvider for CodexAgentProvider {
         if let Some(dead) = dead_evicted {
             // Best-effort: reap the dead child's tasks before spawning the
             // replacement. The child is already gone; this just tidies handles.
-            dead.shutdown().await;
+            dead.shutdown().await?;
         }
 
         let session = CodexSession::spawn_and_initialize(
@@ -442,7 +442,7 @@ impl AgentProvider for CodexAgentProvider {
         let session = session.ok_or_else(|| ProviderError::SessionNotFound {
             thread_id: thread_id.clone(),
         })?;
-        session.shutdown().await;
+        session.shutdown().await?;
         let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
             thread_id,
             status: SessionStatus::Closed,

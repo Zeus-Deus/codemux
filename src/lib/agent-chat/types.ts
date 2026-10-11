@@ -1,6 +1,7 @@
 import type { UserQuestionSet, QuestionResolution } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { GoalSnapshot } from "./goal";
+import type { LocalTask } from "@/lib/delegation";
 import type {
   ApprovalDecision,
   ContextUsageSnapshot,
@@ -422,7 +423,16 @@ export interface AsyncQuestionItem {
   resolution: QuestionResolution;
 }
 
+/** View projection of the native delegation journal, never a provider event. */
+export interface RemoteTaskItem {
+  kind: "remote_task";
+  id: ChatItemId;
+  seq: number;
+  task: LocalTask;
+}
+
 export type ChatViewItem =
+  | RemoteTaskItem
   | AsyncQuestionItem
   | UserMessageItem
   | AssistantMessageItem

@@ -273,6 +273,9 @@ pub struct SendTurnInput {
     /// data and therefore deliberately skipped by serde.
     #[serde(skip)]
     pub turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>>,
+    /// In-process only. Never a serialized IPC capability.
+    #[serde(skip)]
+    pub dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
 }
 
 // ---------------------------------------------------------------------------

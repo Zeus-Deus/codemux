@@ -43,4 +43,5 @@ pub mod mcp_register;
 pub mod pty;
 pub mod server;
 pub mod tools;
+pub mod tasks;
 pub mod workspace;

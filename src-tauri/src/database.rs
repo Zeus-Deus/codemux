@@ -1,6 +1,35 @@
 pub mod async_questions;
 pub mod hermes;
 pub(crate) mod local_sessions;
+mod delegation;
+
+fn agent_chat_session(conn: &Connection, thread_id: &str) -> Option<AgentChatSessionRecord> {
+        conn.query_row(
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+             FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok(AgentChatSessionRecord {
+                    imported_from: row.get(13)?,
+                    thread_id: row.get(0)?,
+                    sdk_session_id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    cwd: row.get(3)?,
+                    provider: row.get(4)?,
+                    title: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_active_at: row.get(7)?,
+                    model: row.get(8)?,
+                    effort: row.get(9)?,
+                    context_window: row.get(10)?,
+                    permission_mode: row.get(11)?,
+                    fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                })
+            },
+        )
+        .ok()
+}
+
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -4444,31 +4473,7 @@ impl DatabaseStore {
 
     /// Fetch a single session record by thread_id.
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
-             FROM agent_chat_sessions WHERE thread_id = ?1",
-            params![thread_id],
-            |row| {
-                Ok(AgentChatSessionRecord {
-                    imported_from: row.get(13)?,
-                    thread_id: row.get(0)?,
-                    sdk_session_id: row.get(1)?,
-                    workspace_id: row.get(2)?,
-                    cwd: row.get(3)?,
-                    provider: row.get(4)?,
-                    title: row.get(5)?,
-                    created_at: row.get(6)?,
-                    last_active_at: row.get(7)?,
-                    model: row.get(8)?,
-                    effort: row.get(9)?,
-                    context_window: row.get(10)?,
-                    permission_mode: row.get(11)?,
-                    fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
-                })
-            },
-        )
-        .ok()
+        agent_chat_session(&self.conn.lock().unwrap(), thread_id)
     }
 }
 

@@ -27,6 +27,7 @@ pub mod browser_viewport;
 pub mod cli;
 pub mod commands;
 pub mod database;
+pub mod delegation;
 pub mod config;
 pub mod git;
 pub mod git_provider;
@@ -336,6 +337,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                if let Some(coordinator) = app.try_state::<delegation::coordinator::Coordinator>() {
+                    if let Err(error) = tauri::async_runtime::block_on(coordinator.shutdown()) {
+                        log::error!("Delegation shutdown could not join its owners: {error}");
+                    }
+                }
                 if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
                     tauri::async_runtime::block_on(manager.shutdown());
                 }
@@ -693,6 +699,9 @@ fn build_core_app<R: tauri::Runtime>(
                     if ids.is_empty() {Ok(())} else {state.persist_local_import_layout(&db,&ids)}
                 }) {log::warn!("Local import layout recovery remains pending: {error}");}
             }
+            // Reconciliation checks canonical pane/workspace ownership. Starting
+            // it before layout restore can incorrectly hold a saved child result.
+            delegation::coordinator::install(app.handle()).map_err(std::io::Error::other)?;
             // Headless (`codemux serve`) deliberately keeps the CWD workspace
             // `default_app_state()` creates. The clear above exists purely to
             // show the GUI's splash screen, and there is no splash screen to
@@ -2498,6 +2507,16 @@ fn build_core_app<R: tauri::Runtime>(
             commands::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
+            delegation::commands::delegation_host_info,
+            delegation::commands::delegation_grants,
+            delegation::commands::delegation_authorize,
+            delegation::commands::delegation_revoke,
+            delegation::commands::delegate_task,
+            delegation::commands::delegation_list,
+            delegation::commands::delegation_read,
+            delegation::commands::delegation_cancel,
+            delegation::commands::delegation_respond,
+            delegation::commands::delegation_deliver,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
             commands::hermes::hermes_profiles,

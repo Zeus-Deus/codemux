@@ -35,6 +35,26 @@
 //! before failing whatever is genuinely still outstanding. This applies to
 //! both the voluntary-exit and graceful-shutdown paths.
 
+pub mod dispatch;
+#[cfg(test)]
+pub(crate) static TEST_WRITE_GATES: std::sync::LazyLock<
+    Mutex<HashMap<String, Arc<TestWriteGate>>>,
+> = std::sync::LazyLock::new(Default::default);
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestWriteGate {
+    pub partial: bool,
+    pub entered: tokio::sync::Notify,
+    pub released: AtomicBool,
+    pub waker: futures_util::task::AtomicWaker,
+}
+#[cfg(test)]
+impl TestWriteGate {
+    pub fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.waker.wake();
+    }
+}
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -265,6 +285,29 @@ struct ExitInfo {
 ///
 /// Cheaply shareable — all internal state is `Arc`-guarded — so adapters can
 /// wrap the handle in an `Arc` and hand it to background tasks freely.
+struct PartialFrame {
+    started: bool,
+    complete: bool,
+    alive: Arc<AtomicBool>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    shutdown_started: Arc<AtomicBool>,
+}
+impl Drop for PartialFrame {
+    fn drop(&mut self) {
+        if self.started && !self.complete {
+            // Cancellation/error cannot put another RPC behind a truncated
+            // frame. Quarantine synchronously before releasing the writer;
+            // the existing R5 watchdog owns actual kill/wait/reap.
+            self.alive.store(false, Ordering::SeqCst);
+            if !self.shutdown_started.swap(true, Ordering::SeqCst) {
+                if let Some(tx) = self.shutdown_tx.lock().ok().and_then(|mut s| s.take()) {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    }
+}
+
 pub struct JsonRpcChild {
     writer: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
     pending: Arc<Mutex<PendingMap>>,
@@ -275,10 +318,11 @@ pub struct JsonRpcChild {
     alive: Arc<AtomicBool>,
     exit_info: Arc<Mutex<Option<ExitInfo>>>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    /// Set to `true` the first time [`shutdown`](Self::shutdown) runs. A
-    /// second call observes `true` via `swap` and returns early; the
-    /// original cleanup has already fired.
+    /// Set once to trigger independently owned cleanup. All callers still
+    /// await the shared explicit reap/join receipt.
     shutdown_started: Arc<AtomicBool>,
+    // Published only by the watchdog after wait() and bounded pump joins.
+    reaped_rx: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
 }
 
 impl JsonRpcChild {
@@ -327,9 +371,10 @@ impl JsonRpcChild {
         let exit_info: Arc<Mutex<Option<ExitInfo>>> = Arc::new(Mutex::new(None));
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (reaped_tx, reaped_rx) = tokio::sync::watch::channel(None);
 
         // Stderr drain task: accumulates the tail buffer and finishes on EOF.
-        {
+        let mut stderr_handle = {
             let stderr_tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
@@ -345,13 +390,13 @@ impl JsonRpcChild {
                         Err(_) => break,
                     }
                 }
-            });
-        }
+            })
+        };
 
         // Reader task: parses stdout lines and routes them. The JoinHandle
         // is handed to the watchdog so it can await EOF before failing
         // pending requests (the module-level "Exit-drain guarantee").
-        let reader_handle = {
+        let mut reader_handle = {
             let pending_reader = Arc::clone(&pending);
             let notifications_tx_reader = notifications_tx.clone();
             let incoming_tx_reader = incoming_tx.clone();
@@ -414,6 +459,10 @@ impl JsonRpcChild {
 
                 alive_watchdog.store(false, Ordering::SeqCst);
 
+                let reap_result = exit_status
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|e| format!("owned child wait failed: {e}"));
                 let code = exit_status.ok().and_then(|s| s.code());
                 // Publish exit info immediately so requests arriving from
                 // here on fail with the informative `ChildExited` rather
@@ -440,7 +489,20 @@ impl JsonRpcChild {
                 // Wait for the reader to reach EOF so every buffered message
                 // is routed first; bounded because a grandchild inheriting
                 // the stdout fd can hold the pipe open indefinitely.
-                let _ = tokio::time::timeout(PIPE_DRAIN_TIMEOUT, reader_handle).await;
+                if tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut reader_handle)
+                    .await
+                    .is_err()
+                {
+                    reader_handle.abort();
+                    let _ = reader_handle.await;
+                }
+                if tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut stderr_handle)
+                    .await
+                    .is_err()
+                {
+                    stderr_handle.abort();
+                    let _ = stderr_handle.await;
+                }
 
                 // Refresh the stderr tail: the drain window may have let the
                 // stderr task capture the child's final diagnostics too.
@@ -472,6 +534,7 @@ impl JsonRpcChild {
                         data: None,
                     }));
                 }
+                let _ = reaped_tx.send(Some(reap_result));
                 // Dropping `_incoming_keepalive` now closes the
                 // incoming-request channel.
             });
@@ -488,6 +551,7 @@ impl JsonRpcChild {
             exit_info,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
+            reaped_rx,
         })
     }
 
@@ -504,6 +568,26 @@ impl JsonRpcChild {
         method: &str,
         params: Value,
         timeout: Duration,
+    ) -> Result<Value, RpcChildError> {
+        self.request_inner(method, params, timeout, None).await
+    }
+
+    pub async fn request_guarded(
+        &self,
+        method: &str,
+        params: Value,
+        guard: &dyn dispatch::DispatchGuard,
+    ) -> Result<Value, RpcChildError> {
+        self.request_inner(method, params, self.default_timeout, Some(guard))
+            .await
+    }
+
+    async fn request_inner(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        guard: Option<&dyn dispatch::DispatchGuard>,
     ) -> Result<Value, RpcChildError> {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(self.exit_or_shutdown());
@@ -529,7 +613,20 @@ impl JsonRpcChild {
             "method": method,
             "params": params,
         });
-        if let Err(err) = self.write_line(&request).await {
+        let written = match guard {
+            Some(guard) => {
+                match tokio::time::timeout(timeout, self.write_line_guarded(&request, guard)).await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(RpcChildError::Timeout {
+                        method: format!("guarded write: {method}"),
+                        elapsed: timeout,
+                    }),
+                }
+            }
+            None => self.write_line(&request).await,
+        };
+        if let Err(err) = written {
             // Roll back the pending entry so it does not leak.
             if let Ok(mut map) = self.pending.lock() {
                 map.remove(id);
@@ -607,45 +704,42 @@ impl JsonRpcChild {
         self.notifications_tx.subscribe()
     }
 
-    /// Close stdin, wait up to 2s for the child to exit on its own, and
-    /// then kill it if it has not.
-    ///
-    /// Idempotent: a second call after the first one started observes the
-    /// internal `shutdown_started` flag and returns `Ok(())` immediately
-    /// without re-running the shutdown sequence. This lets `Arc<Self>`
-    /// holders coordinate cleanup without needing to decide who "owns"
-    /// the single shutdown call.
+    /// Trigger EOF/kill cleanup once; every caller waits for the same explicit
+    /// owned-child reap and pump-join receipt. Transport EOF is not a reap.
     pub async fn shutdown(&self) -> Result<(), RpcChildError> {
-        if self.shutdown_started.swap(true, Ordering::SeqCst) {
-            // Someone else already kicked off shutdown. Nothing to do.
-            return Ok(());
+        if !self.shutdown_started.swap(true, Ordering::SeqCst) {
+            // Signal before an async lock: dropping this caller cannot cancel
+            // the independently owned watchdog's cleanup.
+            let tx = self
+                .shutdown_tx
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
         }
-
-        // Close stdin so the child observes EOF.
-        {
-            let mut guard = self.writer.lock().await;
-            *guard = None;
-        }
-
-        // Trigger the watchdog timer if it has not fired already.
-        let tx = self
-            .shutdown_tx
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        if let Some(tx) = tx {
-            let _ = tx.send(());
-        }
-
-        // Poll alive for a short while to give the watchdog a chance to
-        // actually reap the process; this keeps the caller's ordering
-        // predictable.
-        let deadline = std::time::Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT + Duration::from_secs(1);
-        while self.alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        Ok(())
+        let mut receipt = self.reaped_rx.clone();
+        let cleanup = async {
+            *self.writer.lock().await = None;
+            loop {
+                if let Some(result) = receipt.borrow().clone() {
+                    return result.map_err(RpcChildError::ProtocolError);
+                }
+                receipt.changed().await.map_err(|_| {
+                    RpcChildError::ProtocolError(
+                        "child reap watchdog disappeared without acknowledgement".into(),
+                    )
+                })?;
+            }
+        };
+        let budget = GRACEFUL_SHUTDOWN_TIMEOUT + PIPE_DRAIN_TIMEOUT * 2 + Duration::from_secs(1);
+        tokio::time::timeout(budget, cleanup)
+            .await
+            .map_err(|_| RpcChildError::Timeout {
+                method: "owned child reap".into(),
+                elapsed: budget,
+            })?
     }
 
     /// Whether the child process is still running (best-effort).
@@ -655,14 +749,93 @@ impl JsonRpcChild {
 
     async fn write_line(&self, value: &Value) -> Result<(), RpcChildError> {
         let mut guard = self.writer.lock().await;
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(self.exit_or_shutdown());
+        }
         let writer = guard.as_mut().ok_or(RpcChildError::AlreadyShutdown)?;
         let mut line = serde_json::to_vec(value).map_err(|err| {
             RpcChildError::ProtocolError(format!("failed to encode outgoing message: {err}"))
         })?;
         line.push(b'\n');
-        writer.write_all(&line).await.map_err(RpcChildError::IoError)?;
+        writer
+            .write_all(&line)
+            .await
+            .map_err(RpcChildError::IoError)?;
         writer.flush().await.map_err(RpcChildError::IoError)?;
         Ok(())
+    }
+
+    async fn write_line_guarded(
+        &self,
+        value: &Value,
+        admission: &dyn dispatch::DispatchGuard,
+    ) -> Result<(), RpcChildError> {
+        use std::{pin::Pin, task::Poll};
+        use tokio::io::AsyncWrite;
+        let mut line =
+            serde_json::to_vec(value).map_err(|e| RpcChildError::ProtocolError(e.to_string()))?;
+        line.push(b'\n');
+        #[cfg(test)]
+        let test_gate = TEST_WRITE_GATES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| String::from_utf8_lossy(&line).contains(key.as_str()))
+            .map(|(_, g)| g.clone());
+        let mut guard = self.writer.lock().await;
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(self.exit_or_shutdown());
+        }
+        let writer = guard.as_mut().ok_or(RpcChildError::AlreadyShutdown)?;
+        let mut frame = PartialFrame {
+            started: false,
+            complete: false,
+            alive: self.alive.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
+            shutdown_started: self.shutdown_started.clone(),
+        };
+        let mut offset = 0;
+        // Once bytes cross stdin, finish the frame under the writer lock.
+        // Never leave a partial frame in the shared ordinary RPC stream.
+        while offset < line.len() {
+            let n = std::future::poll_fn(|cx| {
+                if offset == 0 {
+                    admission.register(cx.waker());
+                }
+                let mut write = || {
+                    #[cfg(test)]
+                    if let Some(gate) = &test_gate {
+                        if (offset > 0 || !gate.partial) && !gate.released.load(Ordering::SeqCst) {
+                            gate.waker.register(cx.waker());
+                            gate.entered.notify_one();
+                            if !gate.released.load(Ordering::SeqCst) {
+                                return Poll::Pending;
+                            }
+                        }
+                        if offset == 0 && gate.partial {
+                            return Pin::new(&mut *writer).poll_write(cx, &line[..8]);
+                        }
+                    }
+                    Pin::new(&mut *writer).poll_write(cx, &line[offset..])
+                };
+                if offset == 0 {
+                    match admission.poll_first(&mut write) {
+                        Ok(poll) => poll.map_err(RpcChildError::IoError),
+                        Err(error) => Poll::Ready(Err(RpcChildError::ProtocolError(error))),
+                    }
+                } else {
+                    write().map_err(RpcChildError::IoError)
+                }
+            })
+            .await?;
+            if n == 0 {
+                return Err(RpcChildError::IoError(std::io::ErrorKind::WriteZero.into()));
+            }
+            frame.started = true;
+            offset += n;
+        }
+        frame.complete = true;
+        writer.flush().await.map_err(RpcChildError::IoError)
     }
 
     /// Pick the most informative error given that [`alive`] has flipped
@@ -706,10 +879,7 @@ async fn route_incoming_line(
     let obj = match value.as_object() {
         Some(o) => o.clone(),
         None => {
-            eprintln!(
-                "[json_rpc_child] dropping non-object JSON: {}",
-                value
-            );
+            eprintln!("[json_rpc_child] dropping non-object JSON: {}", value);
             return;
         }
     };
@@ -732,9 +902,7 @@ async fn route_incoming_line(
             };
             let sender = pending.lock().ok().and_then(|mut m| m.remove(id_u64));
             let Some(tx) = sender else {
-                eprintln!(
-                    "[json_rpc_child] response for unknown id {id_u64} (possibly timed out)"
-                );
+                eprintln!("[json_rpc_child] response for unknown id {id_u64} (possibly timed out)");
                 return;
             };
             let outcome: PendingResult = if let Some(err_val) = obj.get("error") {
@@ -784,6 +952,48 @@ async fn route_incoming_line(
         (None, None) => {
             eprintln!("[json_rpc_child] dropping message with neither id nor method");
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    #[tokio::test]
+    async fn r5_stdout_eof_and_concurrent_shutdown_require_owned_reap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let child = Arc::new(JsonRpcChild::spawn(SpawnConfig {
+            program: which::which("python3").unwrap(),
+            args: vec!["-c".into(), "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); os.close(1); time.sleep(30)".into(), pid_file.to_string_lossy().into()],
+            env: HashMap::new(), cwd: Some(dir.path().into()), default_timeout: Duration::from_secs(1),
+        }).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !pid_file.exists() || child.is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        // stdout EOF is deliberately not process death.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        let a = child.clone();
+        let b = child.clone();
+        let (first, second) = tokio::join!(a.shutdown(), b.shutdown());
+        let was_reaped = unsafe { libc::kill(pid, 0) } != 0;
+        // Keep failing RED runs from leaving the test-owned child behind.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(first.is_ok() && second.is_ok());
+        assert!(
+            was_reaped,
+            "successful shutdown (including concurrent caller) preceded actual owned child reaping"
+        );
     }
 }
 

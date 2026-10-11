@@ -49,6 +49,8 @@ struct ScriptEntry {
     after: String,
     #[serde(default)]
     delay_ms: u64,
+    #[serde(default)]
+    wait_for: Option<String>,
     emit: String,
     method: String,
     #[serde(default)]
@@ -111,6 +113,13 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
     }
     std::thread::spawn(move || {
         for entry in matches {
+            if let Some(path) = &entry.wait_for {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !std::path::Path::new(path).exists() {
+                    if std::time::Instant::now() >= deadline { return; }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
             if entry.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(entry.delay_ms));
             }
@@ -118,6 +127,14 @@ fn fire_script_entries_for(method: &str, script: &[ScriptEntry]) {
                 "notification" => {
                     write_line(&json!({
                         "jsonrpc": "2.0",
+                        "method": entry.method,
+                        "params": entry.params,
+                    }));
+                }
+                "server_request" => {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": "fixture-mcp-call",
                         "method": entry.method,
                         "params": entry.params,
                     }));
@@ -204,6 +221,24 @@ fn main() {
                 fire_script_entries_for(method, &script);
             }
             "send-turn" => {
+                capture_params(method, &msg.params);
+                // Regression fixture: SDK callbacks/results may precede the
+                // send-turn acknowledgement, just as in the real sidecar.
+                let early_delay = std::env::var("FAKE_CLAUDE_SEND_ACK_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
+                let ack_gate = std::env::var("FAKE_CLAUDE_FIRST_ACK_GATE")
+                    .ok()
+                    .filter(|gate| !std::path::Path::new(gate).exists());
+                if let Some(gate) = &ack_gate {
+                    fire_script_entries_for(method, &script);
+                    while !std::path::Path::new(gate).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                } else if let Some(delay) = early_delay {
+                    fire_script_entries_for(method, &script);
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",
@@ -211,7 +246,9 @@ fn main() {
                         "result": { "turnStarted": true },
                     }));
                 }
-                fire_script_entries_for(method, &script);
+                if early_delay.is_none() && ack_gate.is_none() {
+                    fire_script_entries_for(method, &script);
+                }
             }
             "interrupt" | "set-model" | "set-permission-mode" => {
                 if let Some(id) = id {
@@ -224,6 +261,7 @@ fn main() {
                 fire_script_entries_for(method, &script);
             }
             "respond-to-request" => {
+                capture_params(method, &msg.params);
                 let request_id = msg
                     .params
                     .get("requestId")

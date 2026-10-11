@@ -103,6 +103,7 @@ pub struct McpRegistry {
     /// Lazily-started authenticated loopback gateway shared by provider
     /// adapters that need a remote MCP URL (OpenCode and future providers).
     gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
+    native_delegation: Arc<std::sync::Mutex<Option<NativeDelegationHandler>>>,
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -157,11 +158,25 @@ impl Default for McpRegistry {
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
             gateway: Arc::new(OnceCell::new()),
+            native_delegation: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
 
+pub(crate) type NativeDelegationHandler=Arc<dyn Fn(crate::delegation::app::NativeActor,String,serde_json::Value)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<serde_json::Value,String>>+Send>>+Send+Sync>;
 impl McpRegistry {
+    pub(crate) fn set_native_delegation_handler(&self,handler:NativeDelegationHandler){*self.native_delegation.lock().unwrap()=Some(handler);}
+    pub(crate) async fn dispatch_native_tool_call(&self,name:&str,arguments:serde_json::Value,actor:crate::delegation::app::NativeActor)->Result<serde_json::Value,String>{
+        let raw={let inner=self.inner.lock().await;
+            inner.handles.values().filter(|h|h.config.id=="codemux-self" && h.config.sources.contains(&super::McpConfigSource::Codemux) && h.status.is_running())
+                .flat_map(|h|h.tools.iter()).find(|t|t.prefixed_name==name).map(|t|t.name.clone())};
+        if let Some(raw)=raw.filter(|r|matches!(r.as_str(),"delegation_targets"|"delegate_task"|"task_status"|"task_cancel")){
+            let handler=self.native_delegation.lock().unwrap().clone().ok_or("Native delegation coordinator is unavailable")?;
+            let value=handler(actor,raw,arguments).await?;
+            return Ok(serde_json::json!({"content":[{"type":"text","text":value.to_string()}]}));
+        }
+        self.dispatch_tool_call(name,arguments,actor.workspace_id.as_deref()).await
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -442,6 +457,14 @@ impl McpRegistry {
         tools
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_native_delegation_tools_for_test(&self){
+        self.insert_running_server_for_test("codemux-self",vec![McpConfigSource::Codemux]).await;
+        let mut inner=self.inner.lock().await;let handle=inner.handles.get_mut("codemux-self").unwrap();handle.tools.clear();
+        for name in ["delegation_targets","delegate_task","task_status","task_cancel"]{
+            handle.tools.push(McpTool{name:name.into(),prefixed_name:format!("mcp__codemux-self__{name}"),description:None,input_schema:serde_json::json!({}),server_id:"codemux-self".into()});
+        }
+    }
     /// Stage a running server with a single tool, for tests in sibling
     /// modules (the gateway) that need a populated registry without
     /// spawning real MCP children.

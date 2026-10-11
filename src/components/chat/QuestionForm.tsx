@@ -258,7 +258,12 @@ export function QuestionForm({
     if (!enabled || !globalShortcuts || questions.length === 0) return;
 
     const handler = (e: globalThis.KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      const form = formRef.current;
+      // A foreign modal owns all interaction, including document-targeted
+      // shortcuts. Leave native buttons, Tab and the modal's own form alone.
+      const modal = document.querySelector('[role="dialog"]:not([aria-hidden="true"]):not([data-state="closed"]), [role="alertdialog"]:not([aria-hidden="true"]):not([data-state="closed"])');
+      if (modal && (!form || !modal.contains(form))) return;
       const target = e.target;
       if (
         target instanceof HTMLInputElement ||
@@ -275,7 +280,8 @@ export function QuestionForm({
       }
       // Inside the questionnaire form the primitive's own key handling
       // is authoritative — bail so a keystroke isn't applied twice.
-      if (target instanceof Node && formRef.current?.contains(target)) return;
+      if (target instanceof Node && form?.contains(target)) return;
+      if (target instanceof HTMLElement && target.closest('form, [role="dialog"], [role="alertdialog"]')) return;
 
       // Digit 1-9 → toggle Nth option on the current question.
       const digit = Number.parseInt(e.key, 10);

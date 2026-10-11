@@ -466,7 +466,7 @@ fn pane_claim_error(conflict: &PaneClaimConflict, requested: ProviderKind) -> St
     }
 }
 
-pub(super) async fn lookup_provider(
+pub(crate) async fn lookup_provider(
     registry: &ProviderRegistry,
     kind: ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>, String> {
@@ -749,7 +749,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
     if provider == ProviderKind::Hermes {
         let state: State<'_, AppStateStore> = app.state();
         let workspace = state.workspace_id_for_pane(&pane_id);
-        if state.snapshot().workspaces.iter().any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some()) {
+        if state
+            .snapshot()
+            .workspaces
+            .iter()
+            .any(|w| Some(&w.workspace_id.0) == workspace.as_ref() && w.host_id.is_some())
+        {
             return Err("unsupported: Hermes v1 runs on local workspaces only".into());
         }
         // A new chat binds the caller's profile; an existing binding is host-owned.
@@ -1279,8 +1284,7 @@ pub async fn agent_chat_restore_checkpoint<R: Runtime>(
 // ── Per-turn checkpoints with provider conversation rollback ────────
 
 pub const AGENT_CHAT_TURN_CHECKPOINT_EVENT: &str = "agent_chat_turn_checkpoint";
-pub const AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT: &str =
-    "agent_chat_turn_checkpoint_reverted";
+pub const AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT: &str = "agent_chat_turn_checkpoint_reverted";
 pub const AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT: &str =
     "agent_chat_turn_checkpoints_invalidated";
 const TURN_CHECKPOINT_KEEP_PER_THREAD: usize = 500;
@@ -1432,9 +1436,7 @@ impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
 #[async_trait::async_trait]
 impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
     async fn prepare(&self) {
-        let guard = turn_checkpoint_lock_for(&self.thread_id)
-            .lock_owned()
-            .await;
+        let guard = turn_checkpoint_lock_for(&self.thread_id).lock_owned().await;
         let app = self.app.clone();
         let thread_id = self.thread_id.clone();
         let workspace_id = self.workspace_id.clone();
@@ -1493,9 +1495,9 @@ impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
                             );
                         }
                     }
-                    Err(error) => eprintln!(
-                        "[codemux::agent_chat] failed to prune turn checkpoints: {error}"
-                    ),
+                    Err(error) => {
+                        eprintln!("[codemux::agent_chat] failed to prune turn checkpoints: {error}")
+                    }
                 }
                 let payload = AgentChatTurnCheckpointEventPayload {
                     thread_id: ThreadId(self.thread_id.clone()),
@@ -1715,9 +1717,7 @@ fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &
                     }
                 }
             }
-            Err(error) => eprintln!(
-                "[codemux::agent_chat] skipped reverted image {path}: {error}"
-            ),
+            Err(error) => eprintln!("[codemux::agent_chat] skipped reverted image {path}: {error}"),
         }
     }
 }
@@ -1806,10 +1806,9 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         )?
     };
     for (repo_path, ref_name) in outcome.removed_refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!("[codemux::agent_chat] failed to delete reverted ref: {error}");
         }
     }
@@ -1875,11 +1874,19 @@ struct HermesSendGate {
 }
 fn hermes_send_gate(thread_id: &str) -> Arc<HermesSendGate> {
     static GATES: OnceLock<Mutex<HashMap<String, Arc<HermesSendGate>>>> = OnceLock::new();
-    GATES.get_or_init(Default::default).lock().unwrap()
-        .entry(thread_id.into()).or_default().clone()
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(thread_id.into())
+        .or_default()
+        .clone()
 }
 impl HermesSendGate {
-    async fn before_dispatch(&self, generation: u64) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    async fn before_dispatch(
+        &self,
+        generation: u64,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
         let guard = self.dispatch.lock().await;
         if self.cancelled.load(Ordering::SeqCst) != generation {
             return Err("cancelled: Hermes send stopped before dispatch".into());
@@ -2037,7 +2044,7 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     thread_id: &ThreadId,
     require_original: bool,
 ) -> Result<(), String> {
-    crate::local_session_import::require_live_session(app,&thread_id.0)?;
+    crate::local_session_import::require_live_session(app, &thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider_kind).await?;
     // Fast path: a live session already exists, so no need to serialize
@@ -2071,7 +2078,12 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
 
     if provider_kind == ProviderKind::Hermes {
         let state: State<'_, AppStateStore> = app.state();
-        if state.snapshot().workspaces.iter().any(|w| w.workspace_id.0 == record.workspace_id && w.host_id.is_some()) {
+        if state
+            .snapshot()
+            .workspaces
+            .iter()
+            .any(|w| w.workspace_id.0 == record.workspace_id && w.host_id.is_some())
+        {
             return Err("unsupported: Hermes v1 runs on local workspaces only".into());
         }
     }
@@ -2377,6 +2389,10 @@ pub async fn agent_chat_send_turn<R: Runtime>(
 }
 
 /// Who initiated a turn going through [`send_turn_with_origin`].
+pub(crate) fn delegation_activity_lock(thread: &str) -> Arc<tokio::sync::Mutex<()>> {
+    super::usage_resume::activity_lock(thread)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOrigin {
     /// The user typed and sent it. Counts as user activity: any pending
@@ -2386,29 +2402,54 @@ pub enum TurnOrigin {
     /// NOT count as user activity, or the scheduler's own dispatch would
     /// reset the attempt cap it is bounded by.
     UsageResume,
+    /// App-owned, correlated remote result; idle-only and non-interrupting.
+    Delegation,
 }
 
 /// The one send path behind [`agent_chat_send_turn`] and the usage-limit
 /// resume dispatch: session ensure/resume, skill rendering, checkpointing,
 /// queue semantics, user-message persistence and fan-out are identical for
 /// both; only `origin` differs.
+#[cfg(test)]
+pub(crate) static DELEGATION_TEST_CHECKPOINTS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, Arc<dyn crate::agent_provider::TurnDispatchCheckpoint>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
 pub async fn send_turn_with_origin<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
     mut input: SendTurnCommandInput,
     origin: TurnOrigin,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
-    crate::local_session_import::require_live_session(&app,&input.thread_id.0)?;
+    if origin == TurnOrigin::Delegation
+        && !matches!(provider, ProviderKind::Codex | ProviderKind::Claude)
+    {
+        return Err("Guarded remote result delivery is unsupported for this parent provider; result held without provider side effects".into());
+    }
+    crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    let hermes_gate = (provider == ProviderKind::Hermes).then(|| hermes_send_gate(&input.thread_id.0));
-    let send_generation = hermes_gate.as_ref().map(|gate| gate.cancelled.load(Ordering::SeqCst));
+    let hermes_gate =
+        (provider == ProviderKind::Hermes).then(|| hermes_send_gate(&input.thread_id.0));
+    let send_generation = hermes_gate
+        .as_ref()
+        .map(|gate| gate.cancelled.load(Ordering::SeqCst));
     if origin == TurnOrigin::User {
+        crate::delegation::app::user_activity(&app, &input.thread_id.0, false)?;
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
+    }
+    if origin == TurnOrigin::Delegation {
+        crate::delegation::app::guard_wake(
+            &app,
+            &input.thread_id.0,
+            input.client_nonce.as_deref(),
+        )?;
     }
     // Resume callers already hold this lock. User sends disarm immediately,
     // then wait for any already-claimed resume to finish dispatching.
@@ -2463,9 +2504,8 @@ pub async fn send_turn_with_origin<R: Runtime>(
     let (saved_images, image_inputs) =
         finalize_chat_images(&thread_id_for_persist, &input.images).await?;
     let db: State<'_, DatabaseStore> = app.state();
-    let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled()
-        && impl_.capabilities().supports_conversation_rollback
-    {
+    let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> =
+        if run_checkpoints_enabled() && impl_.capabilities().supports_conversation_rollback {
             db.get_agent_chat_session(&thread_id_for_persist)
                 .and_then(|session| {
                     session.cwd.map(|repo_path| {
@@ -2527,10 +2567,9 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if turn_checkpoint.is_none() && db.has_agent_chat_turn_checkpoints(&thread_id_for_persist) {
         let stale_refs = db.clear_agent_chat_turn_checkpoints(&thread_id_for_persist)?;
         for (repo_path, ref_name) in stale_refs {
-            if let Err(error) = crate::git::git_checkpoint_delete_ref(
-                std::path::Path::new(&repo_path),
-                &ref_name,
-            ) {
+            if let Err(error) =
+                crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+            {
                 eprintln!("[codemux::agent_chat] failed to delete stale turn ref: {error}");
             }
         }
@@ -2541,6 +2580,12 @@ pub async fn send_turn_with_origin<R: Runtime>(
     }
     drop(invalidation_guard);
     // Build the provider's byte-carrying input from the command DTO.
+    #[cfg(test)]
+    let turn_checkpoint = DELEGATION_TEST_CHECKPOINTS
+        .lock()
+        .unwrap()
+        .remove(&input.thread_id.0)
+        .or(turn_checkpoint);
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
         text: rendered_text,
@@ -2552,6 +2597,15 @@ pub async fn send_turn_with_origin<R: Runtime>(
         permission_mode_override: input.permission_mode_override.clone(),
         client_nonce: input.client_nonce.clone(),
         turn_checkpoint,
+        dispatch_guard: if origin == TurnOrigin::Delegation {
+            Some(crate::delegation::app::dispatch_guard(
+                &app,
+                &input.thread_id.0,
+                input.client_nonce.as_deref(),
+            )?)
+        } else {
+            None
+        },
     };
     let dispatch_guard = match (&hermes_gate, send_generation) {
         (Some(gate), Some(generation)) => Some(gate.before_dispatch(generation).await?),
@@ -2560,6 +2614,18 @@ pub async fn send_turn_with_origin<R: Runtime>(
     // Register attachments before the provider can emit TurnQueued and
     // immediately dispatch it. The event bridge and RPC return race to
     // transfer this entry, so exactly one owns its deferred persistence.
+    if origin == TurnOrigin::Delegation {
+        crate::delegation::app::guard_wake(
+            &app,
+            &input.thread_id.0,
+            input.client_nonce.as_deref(),
+        )?;
+        if impl_.turn_active(&input.thread_id).await {
+            return Err(
+                "Parent became busy; remote result is held rather than interrupting".into(),
+            );
+        }
+    }
     let pending_key = (
         thread_id_for_persist.clone(),
         input.client_nonce.clone().unwrap(),
@@ -2731,6 +2797,7 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    crate::delegation::app::user_activity(&app, &thread_id.0, false)?;
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
         .await;
@@ -3518,6 +3585,7 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 ) -> Result<bool, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
@@ -3530,7 +3598,9 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     let _dispatch_guard = if let Some(gate) = hermes_gate.as_ref() {
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         Some(gate.dispatch.lock().await)
-    } else { None };
+    } else {
+        None
+    };
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -3796,11 +3866,18 @@ pub async fn agent_chat_set_model<R: Runtime>(
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
         let hermes = app.state::<Arc<crate::agent_provider::hermes::HermesProvider>>();
-        hermes.validate_intent(&thread_id.0, Some(&model), None).map_err(provider_err)?;
+        hermes
+            .validate_intent(&thread_id.0, Some(&model), None)
+            .map_err(provider_err)?;
         if impl_.has_session(&thread_id).await {
-            impl_.set_model(thread_id.clone(), model.clone()).await.map_err(provider_err)?;
+            impl_
+                .set_model(thread_id.clone(), model.clone())
+                .await
+                .map_err(provider_err)?;
         }
-        return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, Some(&model), None);
+        return app
+            .state::<DatabaseStore>()
+            .update_hermes_intent(&thread_id.0, Some(&model), None);
     }
 
     // Persist first so a restart / next auto-resume uses the new model
@@ -3885,11 +3962,18 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
         let hermes = app.state::<Arc<crate::agent_provider::hermes::HermesProvider>>();
-        hermes.validate_intent(&thread_id.0, None, Some(&mode)).map_err(provider_err)?;
+        hermes
+            .validate_intent(&thread_id.0, None, Some(&mode))
+            .map_err(provider_err)?;
         if impl_.has_session(&thread_id).await {
-            impl_.set_permission_mode(thread_id.clone(), mode.clone()).await.map_err(provider_err)?;
+            impl_
+                .set_permission_mode(thread_id.clone(), mode.clone())
+                .await
+                .map_err(provider_err)?;
         }
-        return app.state::<DatabaseStore>().update_hermes_intent(&thread_id.0, None, Some(&mode));
+        return app
+            .state::<DatabaseStore>()
+            .update_hermes_intent(&thread_id.0, None, Some(&mode));
     }
     // Persist first so the value survives a restart / next auto-resume.
     {
@@ -3957,7 +4041,10 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
         '_,
         std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
     >,
-    opencode_manager: State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    opencode_manager: State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
@@ -4071,9 +4158,14 @@ pub async fn agent_chat_hooks(
     feature_flag_on(&observability)?;
     let directory = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => std::path::PathBuf::from(cwd),
-        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?,
+        None => {
+            dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?
+        }
     };
-    lookup_provider(&registry, provider).await?.manage_hooks(&directory, thread_id, update).await
+    lookup_provider(&registry, provider)
+        .await?
+        .manage_hooks(&directory, thread_id, update)
+        .await
 }
 
 /// List the provider-native slash commands available to a chat thread
@@ -4099,23 +4191,36 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
     >,
-    opencode_manager: tauri::State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    opencode_manager: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >,
     force: Option<bool>,
     thread_id: Option<ThreadId>,
     registry: tauri::State<'_, ProviderRegistry>,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     let cwd = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => cwd,
-        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?.to_string_lossy().into_owned(),
+        None => dirs::home_dir()
+            .ok_or_else(|| "Cannot resolve your home directory.".to_string())?
+            .to_string_lossy()
+            .into_owned(),
     };
     if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
         if let Some(thread_id) = thread_id {
-            return lookup_provider(&registry, provider).await?
-                .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err);
+            return lookup_provider(&registry, provider)
+                .await?
+                .session_slash_commands(thread_id, std::path::Path::new(&cwd))
+                .await
+                .map_err(provider_err);
         }
     }
     match provider {
-        ProviderKind::Claude => slash_cache.get_or_harvest_with_refresh(&cwd, force.unwrap_or(false)).await,
+        ProviderKind::Claude => {
+            slash_cache
+                .get_or_harvest_with_refresh(&cwd, force.unwrap_or(false))
+                .await
+        }
         ProviderKind::Grok => {
             let binary_path = which::which("grok").map_err(|_| {
                 crate::agent_provider::grok::capabilities::HarvestError::NotInstalled {
@@ -4144,29 +4249,37 @@ pub async fn list_chat_slash_commands(
             .await),
         ProviderKind::OpenCode => {
             let handle = opencode_manager.ensure_running().await?;
-            let mut config = crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
+            let mut config =
+                crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
             config.server_password = Some(handle.server_password);
             let client = crate::agent_provider::opencode::OpenCodeClient::new(config)?;
-            let mut commands = vec![crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
-                name: "compact".into(),
-                description: "Summarize conversation history to free up context".into(),
-                argument_hint: String::new(),
-            }];
+            let mut commands = vec![
+                crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                    name: "compact".into(),
+                    description: "Summarize conversation history to free up context".into(),
+                    argument_hint: String::new(),
+                },
+            ];
             for command in client.list_commands(std::path::Path::new(&cwd)).await? {
                 if command.name != "compact" && command.source.as_deref() != Some("skill") {
-                    commands.push(crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
-                        name: command.name,
-                        description: command.description.unwrap_or_default(),
-                        argument_hint: command.hints.join(" "),
-                    });
+                    commands.push(
+                        crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                            name: command.name,
+                            description: command.description.unwrap_or_default(),
+                            argument_hint: command.hints.join(" "),
+                        },
+                    );
                 }
             }
             Ok(commands)
         }
         ProviderKind::Codex => Ok(crate::agent_provider::codex::slash_commands::commands()),
         ProviderKind::Hermes => match thread_id {
-            Some(thread_id) => lookup_provider(&registry, provider).await?
-                .session_slash_commands(thread_id, std::path::Path::new(&cwd)).await.map_err(provider_err),
+            Some(thread_id) => lookup_provider(&registry, provider)
+                .await?
+                .session_slash_commands(thread_id, std::path::Path::new(&cwd))
+                .await
+                .map_err(provider_err),
             None => Ok(Vec::new()),
         },
     }
@@ -4181,6 +4294,7 @@ pub async fn agent_chat_stop_session<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    crate::delegation::app::user_activity(&app, &thread_id.0, true)?;
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
@@ -4935,7 +5049,10 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     if db.hermes_binding(&thread_id)?.is_some() {
         let registry: State<'_, ProviderRegistry> = app.state();
         if let Some(provider) = registry.get(ProviderKind::Hermes).await {
-            provider.stop_session(ThreadId(thread_id.clone())).await.map_err(|e| e.to_string())?;
+            provider
+                .stop_session(ThreadId(thread_id.clone()))
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
     // Best-effort: drop the thread's on-disk image directory alongside the
@@ -4969,8 +5086,14 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     }
     checkpoint_refs.extend(safety_repos.into_iter().flat_map(|repo_path| {
         [
-            (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
-            (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+            (
+                repo_path.clone(),
+                crate::git::pre_restore_ref_name(&thread_id),
+            ),
+            (
+                repo_path,
+                crate::git::pre_restore_failed_ref_name(&thread_id),
+            ),
         ]
     }));
     db.delete_agent_chat_session(&thread_id)?;
@@ -4978,10 +5101,9 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
     for (repo_path, ref_name) in checkpoint_refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!("[codemux::agent_chat] failed to delete session checkpoint ref: {error}");
         }
     }
@@ -5005,16 +5127,21 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
             .into_iter()
             .flat_map(|(thread_id, repo_path)| {
                 [
-                    (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
-                    (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+                    (
+                        repo_path.clone(),
+                        crate::git::pre_restore_ref_name(&thread_id),
+                    ),
+                    (
+                        repo_path,
+                        crate::git::pre_restore_failed_ref_name(&thread_id),
+                    ),
                 ]
             }),
     );
     for (repo_path, ref_name) in refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!(
                 "[codemux::agent_chat] failed to delete merged-session checkpoint ref: {error}"
             );
@@ -6786,13 +6913,15 @@ fn publish_pane_status<R: Runtime>(
     }
     if matches!(
         event,
-        ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Error { .. }, .. }
-            | ProviderRuntimeEvent::TurnCompleted {
-                status: crate::agent_provider::TurnStatus::Error { .. }
-                    | crate::agent_provider::TurnStatus::MaxTurns
-                    | crate::agent_provider::TurnStatus::MaxBudget,
-                ..
-            }
+        ProviderRuntimeEvent::SessionStateChanged {
+            status: SessionStatus::Error { .. },
+            ..
+        } | ProviderRuntimeEvent::TurnCompleted {
+            status: crate::agent_provider::TurnStatus::Error { .. }
+                | crate::agent_provider::TurnStatus::MaxTurns
+                | crate::agent_provider::TurnStatus::MaxBudget,
+            ..
+        }
     ) {
         crate::web_remote::push::agent_failure(app, &thread_id.0);
     }
@@ -7417,10 +7546,19 @@ mod tests {
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         assert!(gate.before_dispatch(pending_generation).await.is_err());
         // An explicit new send after Stop is allowed; another profile is independent.
-        assert!(gate.before_dispatch(gate.cancelled.load(Ordering::SeqCst)).await.is_ok());
-        assert!(hermes_send_gate("hermes-independent-send-test").before_dispatch(0).await.is_ok());
+        assert!(gate
+            .before_dispatch(gate.cancelled.load(Ordering::SeqCst))
+            .await
+            .is_ok());
+        assert!(hermes_send_gate("hermes-independent-send-test")
+            .before_dispatch(0)
+            .await
+            .is_ok());
         // Stop must order behind an enqueue that has already committed to dispatch.
-        let dispatch = gate.before_dispatch(gate.cancelled.load(Ordering::SeqCst)).await.unwrap();
+        let dispatch = gate
+            .before_dispatch(gate.cancelled.load(Ordering::SeqCst))
+            .await
+            .unwrap();
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         assert!(gate.dispatch.try_lock().is_err());
         drop(dispatch);
@@ -8382,7 +8520,10 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(text, "hi there");
-                    assert_eq!(steered_turn_id.as_ref().map(|id| id.0.as_str()), Some("active-turn"));
+                    assert_eq!(
+                        steered_turn_id.as_ref().map(|id| id.0.as_str()),
+                        Some("active-turn")
+                    );
                     assert_eq!(client_nonce.as_deref(), Some("nonce-1"));
                     assert_eq!(images.len(), 1);
                     assert_eq!(images[0].path, "/tmp/a.png");

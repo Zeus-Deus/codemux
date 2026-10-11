@@ -1,4 +1,4 @@
-import type { ChatViewItem } from "./types";
+import type { ChatViewItem, RemoteTaskItem } from "./types";
 
 /**
  * Decide whether to render the transcript-tail "thinking" pulse.
@@ -19,8 +19,14 @@ export function shouldShowThinkingIndicator(
   streaming: boolean,
 ): boolean {
   if (!streaming) return false;
-  if (messages.length === 0) return true;
-  const last = messages[messages.length - 1];
+  // App-owned remote receipts have a separate execution clock. They neither
+  // create nor suppress the local provider's heartbeat.
+  let last: Exclude<ChatViewItem, RemoteTaskItem> | undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const item = messages[index];
+    if (item.kind !== "remote_task") { last = item; break; }
+  }
+  if (!last) return true;
   switch (last.kind) {
     case "assistant_message":
       // A streaming assistant tail normally renders its own caret, so the

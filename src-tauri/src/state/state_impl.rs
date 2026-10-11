@@ -1179,6 +1179,11 @@ fn build_pty_hydration_plan(
 }
 
 impl AppStateStore {
+    /// Synchronous canonical admission; state -> database -> delegation journal.
+    /// Never call a state getter/mutator recursively or await in this callback.
+    pub(crate) fn with_canonical_snapshot<T>(&self, f: impl FnOnce(&AppStateSnapshot) -> T) -> T {
+        f(&self.inner.lock().unwrap())
+    }
     pub fn snapshot(&self) -> AppStateSnapshot {
         let mut snapshot = self.inner.lock().unwrap().clone();
         apply_manual_monitors(&mut snapshot);
@@ -5981,7 +5986,7 @@ fn agent_chat_thread_for_pane(
 /// `(provider, thread_id)` pair. `None` when the pane id does not match,
 /// is not an agent-chat leaf, or has not yet been bound to a thread —
 /// callers (workspace/tab/pane close) treat that as nothing to tear down.
-fn agent_chat_thread_pair_for_pane(
+pub(crate) fn agent_chat_thread_pair_for_pane(
     root: &PaneNodeSnapshot,
     target_pane_id: &str,
 ) -> Option<(crate::agent_provider::ProviderKind, String)> {

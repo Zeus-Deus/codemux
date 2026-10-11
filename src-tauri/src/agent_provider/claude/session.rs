@@ -31,15 +31,14 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
     InterruptParams, RespondToRequestParams, RespondToUserInputParams, SendTurnImage,
-    SendTurnParams, SetModelParams, SetPermissionModeParams, SidecarDecision,
-    SidecarNotification, StartSessionParams, StartSessionResponse, StopSessionParams,
-    StopSessionResponse, METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST,
-    METHOD_RESPOND_TO_USER_INPUT, METHOD_SEND_TURN, METHOD_SET_MODEL,
-    METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION, METHOD_STOP_SESSION,
+    SendTurnParams, SetModelParams, SetPermissionModeParams, SidecarDecision, SidecarNotification,
+    StartSessionParams, StartSessionResponse, StopSessionParams, StopSessionResponse,
+    METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST, METHOD_RESPOND_TO_USER_INPUT, METHOD_SEND_TURN,
+    METHOD_SET_MODEL, METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION, METHOD_STOP_SESSION,
 };
+use super::translate::{translate_notification_with, SubagentDemux};
 use crate::agent_provider::ImageInput;
 use base64::Engine;
-use super::translate::{translate_notification_with, SubagentDemux};
 
 /// Default per-RPC timeout for the sidecar. Matches the value
 /// production integrations use.
@@ -208,6 +207,7 @@ pub(crate) struct ClaudeSession {
     /// session's workspace — the registry's shared MCP child cannot
     /// learn the caller from its env.
     workspace_id: Option<String>,
+    native_authority: Arc<crate::delegation::authority::NativeAuthority>,
 }
 
 impl ClaudeSession {
@@ -262,12 +262,13 @@ impl ClaudeSession {
 
         // Claim the single incoming-request receiver before any
         // background task starts.
-        let incoming_rx = sidecar.incoming_requests().ok_or_else(|| {
-            ProviderError::ProcessError {
-                message: "sidecar incoming-request channel already claimed".into(),
-                source: None,
-            }
-        })?;
+        let incoming_rx =
+            sidecar
+                .incoming_requests()
+                .ok_or_else(|| ProviderError::ProcessError {
+                    message: "sidecar incoming-request channel already claimed".into(),
+                    source: None,
+                })?;
 
         // Build `start-session` params from the trait-level input.
         //
@@ -276,15 +277,12 @@ impl ClaudeSession {
         // passthrough. Context window is encoded into the model id
         // itself via `resolve_claude_api_model_id` — Anthropic's API
         // expects the `[1m]` suffix as part of the model string.
-        let resolved_model = input
-            .model
-            .as_deref()
-            .map(|m| {
-                crate::agent_provider::claude::capabilities::resolve_claude_api_model_id(
-                    m,
-                    input.context_window.as_deref(),
-                )
-            });
+        let resolved_model = input.model.as_deref().map(|m| {
+            crate::agent_provider::claude::capabilities::resolve_claude_api_model_id(
+                m,
+                input.context_window.as_deref(),
+            )
+        });
         let resolved_effort = input.effort.clone().or_else(|| {
             input
                 .extra
@@ -311,10 +309,7 @@ impl ClaudeSession {
             } else {
                 Some(input.additional_directories.clone())
             },
-            settings: input
-                .extra
-                .get("settings")
-                .cloned(),
+            settings: input.extra.get("settings").cloned(),
             resume: input
                 .resume_cursor
                 .as_ref()
@@ -340,10 +335,11 @@ impl ClaudeSession {
             // `setMcpServers` push path so dynamic refreshes work).
             mcp_tools: collect_mcp_tools(spawn.mcp_registry.as_ref()).await,
         };
-        let params_value = serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
-            message: "failed to serialize start-session params".into(),
-            source: Some(e.to_string()),
-        })?;
+        let params_value =
+            serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
+                message: "failed to serialize start-session params".into(),
+                source: Some(e.to_string()),
+            })?;
         let resp = sidecar
             .request(METHOD_START_SESSION, params_value)
             .await
@@ -380,6 +376,7 @@ impl ClaudeSession {
             dead: Arc::new(AtomicBool::new(false)),
             mcp_registry: spawn.mcp_registry.clone(),
             workspace_id: input.workspace_id.clone(),
+            native_authority: crate::delegation::authority::NativeAuthority::new(&thread_id.0),
         });
 
         // Announce the session up front.
@@ -416,10 +413,8 @@ impl ClaudeSession {
         // (Running ↔ Stopped / Errored), re-collect tools and push the
         // fresh snapshot to the sidecar via `update-mcp-tools`. The
         // task does nothing when no registry is configured.
-        let mcp_refresh_task = spawn_mcp_refresh_task(
-            Arc::clone(&session),
-            shutdown_tx.subscribe(),
-        );
+        let mcp_refresh_task =
+            spawn_mcp_refresh_task(Arc::clone(&session), shutdown_tx.subscribe());
 
         {
             let mut guard = session.tasks.lock().await;
@@ -453,6 +448,11 @@ impl ClaudeSession {
         {
             let mut state = self.state.lock().await;
             if state.turn_busy() {
+                if input.dispatch_guard.is_some() {
+                    return Err(ProviderError::ValidationError {
+                        message: "Guarded result cannot queue behind a busy parent".into(),
+                    });
+                }
                 let queued_id = mint_queued_id();
                 let text = input
                     .display_text
@@ -478,7 +478,12 @@ impl ClaudeSession {
             checkpoint.prepare().await;
         }
         let sent = self
-            .do_send(input.text, input.images, input.model_override)
+            .do_send(
+                input.text,
+                input.images,
+                input.model_override,
+                input.dispatch_guard,
+            )
             .await;
         match sent {
             Ok(turn_id) => {
@@ -541,6 +546,7 @@ impl ClaudeSession {
                     queued.input.text,
                     queued.input.images,
                     queued.input.model_override,
+                    queued.input.dispatch_guard,
                 )
                 .await
             {
@@ -581,10 +587,12 @@ impl ClaudeSession {
                         ),
                         original_payload: None,
                     });
-                    let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                        thread_id: self.thread_id.clone(),
-                        queued_id: queued.queued_id,
-                    });
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                            thread_id: self.thread_id.clone(),
+                            queued_id: queued.queued_id,
+                        });
                     continue;
                 }
             }
@@ -610,10 +618,12 @@ impl ClaudeSession {
             }
         };
         if removed {
-            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                thread_id: self.thread_id.clone(),
-                queued_id: queued_id.to_string(),
-            });
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id: queued_id.to_string(),
+                });
         }
         Ok(removed)
     }
@@ -676,11 +686,7 @@ impl ClaudeSession {
                     // queue silently rearranged.
                     {
                         let mut state = self.state.lock().await;
-                        restore_queued_position(
-                            &mut state.queued_turns,
-                            queued_id,
-                            original_index,
-                        );
+                        restore_queued_position(&mut state.queued_turns, queued_id, original_index);
                     }
                     Err(err)
                 }
@@ -702,10 +708,12 @@ impl ClaudeSession {
             state.queued_turns.drain(..).map(|q| q.queued_id).collect()
         };
         for queued_id in drained {
-            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                thread_id: self.thread_id.clone(),
-                queued_id,
-            });
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id,
+                });
         }
     }
 
@@ -718,6 +726,7 @@ impl ClaudeSession {
         text: String,
         images: Vec<ImageInput>,
         model_override: Option<String>,
+        dispatch_guard: Option<Arc<dyn crate::json_rpc_child::dispatch::DispatchGuard>>,
     ) -> Result<TurnId, ProviderError> {
         // Encode raw bytes as standard base64 here so the JSON-RPC
         // frame stays text-only and the sidecar pipes the data
@@ -736,34 +745,58 @@ impl ClaudeSession {
             model_override,
             images: encoded_images,
         };
-        self.sidecar
-            .request(
-                METHOD_SEND_TURN,
-                serde_json::to_value(&params).unwrap(),
-            )
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("send-turn RPC failed: {e}"),
-            })?;
+        let generation = self.native_authority.begin();
+        let params = serde_json::to_value(&params).unwrap();
+        let ack = match dispatch_guard.as_deref() {
+            Some(guard) => {
+                self.sidecar
+                    .request_guarded(METHOD_SEND_TURN, params, guard)
+                    .await
+            }
+            None => self.sidecar.request(METHOD_SEND_TURN, params).await,
+        }
+        .map_err(|e| ProviderError::RpcError {
+            message: format!("send-turn RPC failed: {e}"),
+        })?;
+        if let Some(guard) = dispatch_guard.as_ref() {
+            if ack.get("turnStarted").and_then(Value::as_bool) != Some(true) {
+                return Err(ProviderError::RpcError {
+                    message: "Malformed guarded send-turn acknowledgement; native outcome unknown"
+                        .into(),
+                });
+            }
+            guard
+                .accepted()
+                .map_err(|message| ProviderError::RpcError { message })?;
+        }
         let turn_id = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
         {
             let mut state = self.state.lock().await;
+            if !self.native_authority.bind(generation, &turn_id.0) {
+                // Completion/Stop already settled this generation. The RPC
+                // receipt is still successful, but cannot recreate busy state.
+                return Ok(turn_id);
+            }
             state.active_turn = Some(turn_id.clone());
             state.status = SessionStatus::Running {
                 active_turn: turn_id.clone(),
             };
+            // Announce under the lifecycle lock before a concurrent result can
+            // settle this turn and publish completion.
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: self.thread_id.clone(),
+                    status: SessionStatus::Running {
+                        active_turn: turn_id.clone(),
+                    },
+                });
         }
         // Announce the state flip so subscribers (composer, reducer)
         // learn that a turn is in flight. Claude's SDK never emits a
         // text delta for a pure-tool turn, so without this event the
         // frontend's streaming flag would stay false for the entire
         // turn and let the user queue a second one.
-        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: self.thread_id.clone(),
-            status: SessionStatus::Running {
-                active_turn: turn_id.clone(),
-            },
-        });
         Ok(turn_id)
     }
 
@@ -775,6 +808,7 @@ impl ClaudeSession {
     }
 
     pub async fn interrupt(self: &Arc<Self>, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
+        self.native_authority.invalidate();
         let active = {
             let state = self.state.lock().await;
             state.active_turn.clone()
@@ -824,10 +858,12 @@ impl ClaudeSession {
                 // Announce Ready while holding the lock so subscribers
                 // never observe `Ready` in the struct with no
                 // corresponding event in flight.
-                let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: self.thread_id.clone(),
-                    status: SessionStatus::Ready,
-                });
+                let _ = self
+                    .event_tx
+                    .send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: self.thread_id.clone(),
+                        status: SessionStatus::Ready,
+                    });
             }
         }
         // Fallback drain: if the notification hasn't run yet, this
@@ -961,7 +997,8 @@ impl ClaudeSession {
     /// Close the session: send `stop-session` (with tight timeout),
     /// signal background tasks to exit, shut the sidecar down,
     /// flip local state.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), ProviderError> {
+        self.native_authority.revoke();
         {
             let mut flag = self.intentionally_closed.write().await;
             *flag = true;
@@ -996,10 +1033,11 @@ impl ClaudeSession {
         };
         for t in tasks {
             t.abort();
+            let _ = t.await;
         }
 
         // Close the sidecar's JSON-RPC child (EOF → 2s grace → kill).
-        let _ = self.sidecar.shutdown().await;
+        let stopped = self.sidecar.shutdown().await;
 
         // Flip local status.
         {
@@ -1010,6 +1048,10 @@ impl ClaudeSession {
             // a later `respond_to_request` sees an empty map.
             state.pending_approvals.clear();
         }
+        stopped.map_err(|e| ProviderError::ProcessError {
+            message: "Native owned child teardown was not acknowledged".into(),
+            source: Some(e.to_string()),
+        })
     }
 }
 
@@ -1093,6 +1135,13 @@ fn spawn_notifications_task(
                 maybe_note = notifications.recv() => {
                     match maybe_note {
                         Ok(note) => {
+                            // The sidecar connection owns exactly this outer
+                            // thread. SDK subagent payloads retain that outer id;
+                            // a foreign envelope is not parent lifecycle evidence.
+                            if note.params.get("threadId").and_then(Value::as_str).is_some_and(|t|t!=session.thread_id.0) {
+                                let _=event_tx.send(ProviderRuntimeEvent::RuntimeWarning {thread_id:Some(session.thread_id.clone()),message:"Ignored foreign sidecar notification".into(),original_payload:None});
+                                continue;
+                            }
                             // Update local state for specific notifications
                             // before broadcasting.
                             let structured = SidecarNotification::from_method_params(
@@ -1195,9 +1244,21 @@ fn spawn_incoming_requests_task(
                     if req.method == METHOD_MCP_TOOL_CALL {
                         let session_for_task = Arc::clone(&session);
                         let event_tx_for_task = event_tx.clone();
-                        tokio::spawn(async move {
-                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req).await;
+                        let actor = {
+                            let state = session.state.lock().await;
+                            crate::delegation::app::NativeActor {
+                                thread_id: session.thread_id.0.clone(),
+                                provider: crate::agent_provider::ProviderKind::Claude,
+                                workspace_id: session.workspace_id.clone(),
+                                session_id: session.provider_session_id.0.clone(),
+                                permission_mode: state.permission_mode.clone(),
+                                permit: session.native_authority.capture(),
+                            }
+                        };
+                        let job = tokio::spawn(async move {
+                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req, actor).await;
                         });
+                        session.native_authority.track(job.abort_handle());
                         continue;
                     }
 
@@ -1316,10 +1377,7 @@ async fn push_mcp_refresh(
     };
     if let Err(err) = session
         .sidecar
-        .request(
-            super::protocol::METHOD_UPDATE_MCP_TOOLS,
-            params_value,
-        )
+        .request(super::protocol::METHOD_UPDATE_MCP_TOOLS, params_value)
         .await
     {
         let _ = session.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
@@ -1379,6 +1437,7 @@ async fn handle_mcp_tool_call(
     session: Arc<ClaudeSession>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     req: crate::json_rpc_child::IncomingRequest,
+    actor: crate::delegation::app::NativeActor,
 ) {
     // Validate params shape.
     let params = req.params.clone();
@@ -1419,7 +1478,7 @@ async fn handle_mcp_tool_call(
     };
 
     match registry
-        .dispatch_tool_call(&prefixed_name, arguments, session.workspace_id.as_deref())
+        .dispatch_native_tool_call(&prefixed_name, arguments, actor)
         .await
     {
         Ok(result) => {
@@ -1552,8 +1611,14 @@ async fn mutate_state_from_notification(
             // a Ready → TurnCompleted ordering inversion that briefly
             // re-armed the send button before the turn was visually
             // complete.
-            if message.get("type").and_then(|v| v.as_str()) == Some("result") {
+            if message.get("type").and_then(|v| v.as_str()) == Some("result")
+                && super::translate::parent_tool_use_id(message).is_none()
+            {
                 let mut state = session.state.lock().await;
+                // SDK completion can precede the send RPC acknowledgement.
+                // Invalidate the generation even before active_turn is bound;
+                // the delayed acknowledgement must not revive its authority.
+                session.native_authority.invalidate();
                 state.active_turn = None;
                 if matches!(state.status, SessionStatus::Running { .. }) {
                     state.status = SessionStatus::Ready;
@@ -1562,6 +1627,12 @@ async fn mutate_state_from_notification(
         }
         SidecarNotification::SessionEnded { reason, .. } => {
             let mut state = session.state.lock().await;
+            if let Some(turn) = &state.active_turn {
+                session.native_authority.finish(&turn.0);
+            }
+            if reason != "iteration-complete" {
+                session.native_authority.revoke();
+            }
             state.active_turn = None;
             state.status = if reason == "iteration-complete" {
                 SessionStatus::Ready
@@ -1593,6 +1664,7 @@ async fn mutate_state_from_notification(
                 .remove(&RequestId(request_id.clone()));
         }
         SidecarNotification::SessionError { error, .. } => {
+            session.native_authority.invalidate();
             let mut state = session.state.lock().await;
             state.status = SessionStatus::Error {
                 message: error.message.clone(),
@@ -1659,6 +1731,7 @@ mod tests {
                 display_text: None,
                 skill_invocations: vec![],
                 turn_checkpoint: None,
+                dispatch_guard: None,
             },
         }
     }
