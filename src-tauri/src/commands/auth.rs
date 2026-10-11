@@ -514,6 +514,40 @@ pub async fn forgot_password(email: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Re-send the sign-up verification email through Better Auth's own
+/// endpoint. Without a session it answers success whether or not the address
+/// exists (or is already verified), so this never leaks account existence.
+#[tauri::command]
+pub async fn resend_verification_email(email: String) -> Result<(), String> {
+    if email.is_empty() {
+        return Err("Email is required".into());
+    }
+
+    let base = api_base_url();
+    let url = format!("{base}/api/auth/send-verification-email");
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "email": email }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(resend_verification_error(resp.status()).into());
+    }
+
+    Ok(())
+}
+
+fn resend_verification_error(status: reqwest::StatusCode) -> &'static str {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        "Too many requests. Wait a minute, then try again."
+    } else {
+        "Couldn't resend the verification email"
+    }
+}
+
 #[tauri::command]
 pub async fn check_auth<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -640,6 +674,16 @@ mod tests {
             name: None,
             image: None,
         }
+    }
+
+    #[test]
+    fn resend_verification_rate_limit_says_to_wait() {
+        assert!(resend_verification_error(reqwest::StatusCode::TOO_MANY_REQUESTS)
+            .contains("Wait a minute"));
+        assert_eq!(
+            resend_verification_error(reqwest::StatusCode::BAD_GATEWAY),
+            "Couldn't resend the verification email"
+        );
     }
 
     #[test]

@@ -449,3 +449,19 @@ describe("use-keyboard-shortcuts dispatch — failures are visible", () => {
     log.mockRestore();
   });
 });
+
+describe("use-keyboard-shortcuts dispatch — closeOverlay", () => {
+  it("closes settings on Escape", () => {
+    useUIStore.setState({ showSettings: true });
+    expect(dispatch("closeOverlay", new KeyboardEvent("keydown", { key: "Escape" }))).toBe(true);
+    expect(useUIStore.getState().showSettings).toBe(false);
+  });
+
+  it("leaves settings open when a dialog above it already handled the Escape", () => {
+    useUIStore.setState({ showSettings: true });
+    const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    event.preventDefault();
+    expect(dispatch("closeOverlay", event)).toBe(false);
+    expect(useUIStore.getState().showSettings).toBe(true);
+  });
+});

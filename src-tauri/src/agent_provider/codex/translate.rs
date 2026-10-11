@@ -1010,7 +1010,22 @@ fn codex_window(window: Option<&RateLimitWindow>) -> Option<PlanUsageWindow> {
         // Epoch seconds → ms.
         resets_at_ms: window.resets_at.map(|secs| (secs * 1000.0) as i64),
         label,
+        window_mins: window
+            .window_duration_mins
+            .filter(|mins| mins.is_finite() && *mins > 0.0)
+            .map(|mins| mins.round() as i64),
     })
+}
+
+/// The primary and secondary windows of a Codex rate-limit snapshot.
+pub(crate) fn plan_windows_from_rate_limits(snapshot: &RateLimitSnapshot) -> Vec<PlanUsageWindow> {
+    [
+        codex_window(snapshot.primary.as_ref()),
+        codex_window(snapshot.secondary.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Translate an `account/rateLimits/updated` push into a plan snapshot.
@@ -1023,14 +1038,7 @@ pub(crate) fn plan_usage_from_rate_limits(
     thread_id: &ThreadId,
     snapshot: &RateLimitSnapshot,
 ) -> Vec<ProviderRuntimeEvent> {
-    let windows: Vec<PlanUsageWindow> = [
-        codex_window(snapshot.primary.as_ref()),
-        codex_window(snapshot.secondary.as_ref()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
+    let windows = plan_windows_from_rate_limits(snapshot);
     if windows.is_empty() {
         return Vec::new();
     }

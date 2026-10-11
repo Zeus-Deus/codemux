@@ -113,13 +113,13 @@ const FIELD =
 /** A chip on the card background — the description's helpers. */
 const CHIP =
   "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-sm border-0 bg-card px-2.5 " +
-  `${tzMeta} text-foreground/90 transition-colors hover:bg-accent/50 ` +
+  `${tzMeta} text-foreground/90 transition-colors duration-100 hover:bg-accent/50 ` +
   "disabled:opacity-50 outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 
 /** A chip that is an invitation rather than an action. */
 const DASHED_CHIP =
   "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-full border border-dashed " +
-  `border-border px-2.5 ${tzBody} text-muted-foreground transition-colors ` +
+  `border-border px-2.5 ${tzBody} text-muted-foreground transition-colors duration-100 ` +
   "hover:border-foreground/40 hover:text-foreground outline-none " +
   "focus-visible:ring-2 focus-visible:ring-ring/60";
 

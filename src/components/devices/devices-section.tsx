@@ -249,7 +249,7 @@ function DeviceCardView({
           : "bg-surface-1 opacity-80",
       )}
     >
-      <div className="flex items-center gap-2.5 px-[13px] py-3">
+      <div className="flex items-center gap-2.5 px-[13px] py-3" data-device-card-header={card.remoteControlServing ? "serving" : "idle"}>
         <button
           type="button"
           onClick={toggle}
@@ -487,7 +487,7 @@ function WorkspaceRow({
         : null;
 
   return (
-    <li className="grid h-8 grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg px-2 hover:bg-surface-2">
+    <li className="grid h-8 grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg px-2 hover:bg-surface-2" data-device-sync-row>
       <span
         aria-hidden
         className="size-1.5 justify-self-center rounded-full bg-status-remote/70"
