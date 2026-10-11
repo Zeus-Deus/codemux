@@ -10,7 +10,7 @@ export function ToolCallStatus({ item }: { item: ToolCallItem }) {
   const { verb, target, argument } = describeToolCall(item);
 
   return (
-    <div className="font-mono text-body-sm leading-5 text-muted-foreground break-words">
+    <span className="block font-mono text-body-sm leading-5 text-muted-foreground break-words">
       <span>{verb}</span>
       {target && (
         <>
@@ -24,7 +24,7 @@ export function ToolCallStatus({ item }: { item: ToolCallItem }) {
           <span className="text-muted-foreground/60">{argument}</span>
         </>
       )}
-    </div>
+    </span>
   );
 }
 

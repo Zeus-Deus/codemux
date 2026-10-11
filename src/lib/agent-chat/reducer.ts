@@ -1975,6 +1975,19 @@ function applyEventInner(
           resolution: { state: "resolved", decision: event.decision },
         };
         messages = replaceItem(messages, found.index, next);
+        // The gated call only starts executing now; stamp it so its timer
+        // does not include the time the request waited for an answer. A
+        // re-delivered resolution (a second window) keeps the first stamp.
+        const toolMatch =
+          found.item.resolution.state !== "resolved" && found.item.tool_use_id
+          ? findToolCallByUseId(messages, found.item.tool_use_id)
+          : null;
+        if (toolMatch && toolMatch.item.status === "running") {
+          messages = replaceItem(messages, toolMatch.index, {
+            ...toolMatch.item,
+            approved_at: now(),
+          });
+        }
       }
       // A workflow gated on this request resumes (`running`) on allow,
       // or is considered abandoned (`stopped`) on deny/cancel — the

@@ -296,6 +296,8 @@ it.each((["model", "config"] as const).flatMap(kind => [false, true].flatMap(ctr
   useAgentChatStore.getState().ensureThread(record.thread_id);
   useAgentChatStore.getState().setInputDraft(record.thread_id, "retain racing draft");
   const { container } = render(<TooltipProvider><AgentChatPane pane={pane} /></TooltipProvider>);
+  // The pane swaps its composer in once history loads; open the picker after that.
+  await waitFor(() => expect(screen.queryByTestId("transcript-skeleton")).toBeNull());
   await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).not.toBeDisabled());
   fireEvent.click(screen.getByTestId("multi-provider-model-picker-trigger"));
   const controls = within(await screen.findByRole("dialog"));
