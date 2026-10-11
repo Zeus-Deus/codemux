@@ -99,6 +99,16 @@ export function formatKeyCombo(combo: string): string {
   return [...mods, ...rest].join("");
 }
 
+/**
+ * The platform-formatted combo for a `keybind-registry` action, following the
+ * user's rebinds. Empty when the action is unbound, so callers can drop the
+ * hint instead of promising a gesture that does nothing.
+ */
+export function useShortcutLabel(actionId: string | undefined): string {
+  const { getKeysForAction } = useResolvedKeybinds();
+  return actionId ? formatKeyCombo(getKeysForAction(actionId)) : "";
+}
+
 interface KeycapProps {
   /** A `keybind-registry` action id. Resolved through the user's overrides so
    *  a rebound shortcut shows the binding that actually fires. */

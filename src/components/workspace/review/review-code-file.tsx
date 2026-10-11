@@ -12,6 +12,7 @@ import {
   type PrDiffFile,
 } from "@/lib/pr-diff";
 import { groupDigits, tzBody, tzMeta, tzMetaNum } from "./review-ui";
+import { getDiffFileState } from "@/stores/settings-store";
 import type { DiffLayout } from "./pr-drafts";
 
 interface Props {
@@ -26,6 +27,9 @@ interface Props {
   pendingNotes: number;
   /** Force the body open (the re-anchor flow scrolls here). */
   forceOpen?: boolean;
+  /** The header's chevron folded the file; lets the owner stop forcing
+   *  it open. */
+  onCollapse?: () => void;
 }
 
 /**
@@ -44,13 +48,28 @@ export function ReviewCodeFile({
   selection,
   pendingNotes,
   forceOpen = false,
+  onCollapse,
 }: Props) {
-  const [manuallyCollapsed, setManuallyCollapsed] = useState(false);
+  // Settings → Git → Diffs decides whether files start open; the header
+  // toggle still flips each one.
+  const [manuallyCollapsed, setManuallyCollapsed] = useState(
+    () => getDiffFileState() === "collapsed",
+  );
   // Numbers, not vibes: a 2,000-line file is opened on request, not by
   // default — otherwise the file you came to read is ten screens down.
   const [loadedAnyway, setLoadedAnyway] = useState(false);
 
-  const collapsed = !forceOpen && (viewed || manuallyCollapsed);
+  // Viewed folds a file away, but its chevron can still open it: checking
+  // one line again must not cost the Viewed mark. Marking or unmarking
+  // starts the file folded or open by its own state again.
+  const [openWhileViewed, setOpenWhileViewed] = useState(false);
+  const [viewedSeen, setViewedSeen] = useState(viewed);
+  if (viewedSeen !== viewed) {
+    setViewedSeen(viewed);
+    setOpenWhileViewed(false);
+  }
+
+  const collapsed = !forceOpen && (viewed ? !openWhileViewed : manuallyCollapsed);
   const renderable = isRenderable(file);
   const large = isLargeFile(file);
   const changed = changedLines(file);
@@ -76,7 +95,21 @@ export function ReviewCodeFile({
           type="button"
           aria-label={collapsed ? `Expand ${file.path}` : `Collapse ${file.path}`}
           aria-expanded={!collapsed}
-          onClick={() => setManuallyCollapsed((c) => !c)}
+          // Set from what is shown, not toggled: a file held open by
+          // `forceOpen` can already be marked collapsed underneath, and a
+          // toggle would then unfold it while the label says Collapse. A
+          // viewed file folds through its own open state, so it keeps its
+          // Viewed mark.
+          onClick={() => {
+            if (collapsed) {
+              if (viewed) setOpenWhileViewed(true);
+              else setManuallyCollapsed(false);
+              return;
+            }
+            if (viewed) setOpenWhileViewed(false);
+            else setManuallyCollapsed(true);
+            onCollapse?.();
+          }}
           className="shrink-0 text-muted-foreground hover:text-foreground"
         >
           {collapsed ? (

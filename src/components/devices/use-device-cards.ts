@@ -6,6 +6,7 @@ import { useHostStatuses } from "@/stores/host-status-store";
 import { useWorkspacesSync } from "@/stores/workspaces-sync-store";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { relativeTime } from "@/components/settings/remote-access-utils";
+import { isUpdating } from "@/lib/devices-attention";
 import {
   detectDivergedRows,
   type DivergenceInfo,
@@ -25,7 +26,7 @@ import type {
  */
 
 /** How a card header reads: colour and default expansion follow this. */
-export type DeviceTone = "online" | "attention" | "offline" | "checking";
+export type DeviceTone = "online" | "updating" | "attention" | "offline" | "checking";
 
 /** A synced row plus the facts the row view needs beyond the row itself. */
 export interface DeviceRow {
@@ -129,8 +130,9 @@ export interface DeviceStatusSummary {
  * One-line reachability summary for a card header. A host the poller has
  * not reached yet this session is "checking", not offline — the app just
  * started, and a stale "unreachable" is a false alarm. A host that answers
- * SSH but reports a problem (no host agent, inventory failed) is online in
- * the network sense and useless in every other, so it asks for attention.
+ * SSH but reports a problem (helper missing, damaged or out of date) is
+ * online in the network sense and useless in every other, so it asks for
+ * attention.
  */
 export function describeStatus(
   status: HostStatusView | null,
@@ -138,6 +140,9 @@ export function describeStatus(
 ): DeviceStatusSummary {
   if (!status || !status.probed) {
     return { tone: "checking", label: "checking…", detail: null };
+  }
+  if (status.reachable && isUpdating(status)) {
+    return { tone: "updating", label: "updating…", detail: status.last_error };
   }
   if (status.reachable) {
     return status.last_error

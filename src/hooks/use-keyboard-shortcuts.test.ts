@@ -12,13 +12,21 @@ vi.mock("@/tauri/commands", () => ({
   runProjectDevCommand: vi.fn().mockResolvedValue(undefined),
   undockBrowserFromRightPanel: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock("sonner", () => ({
+  toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn(), dismiss: vi.fn() },
+}));
 
+import { toast } from "sonner";
 import { dispatch } from "./use-keyboard-shortcuts";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
-import { activateWorkspace, undockBrowserFromRightPanel } from "@/tauri/commands";
+import {
+  activateWorkspace,
+  runProjectDevCommand,
+  undockBrowserFromRightPanel,
+} from "@/tauri/commands";
 import {
   setJumpTargets,
 } from "@/components/layout/sidebar-inbox-jump";
@@ -41,6 +49,7 @@ beforeEach(() => {
     showNewWorkspaceDialog: false,
     renameWorkspaceId: null,
     themeStudio: null,
+    showShortcutsSheet: false,
   });
   // Restore the store's boot state (GUI on) so a case that opts out
   // doesn't leak into the next one.
@@ -217,6 +226,17 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(s.showSettings).toBe(true);
     });
 
+    it("closes the shortcuts sheet before the settings page under it", () => {
+      useUIStore.setState({ showShortcutsSheet: true, showSettings: true });
+
+      const handled = dispatch("closeOverlay", FAKE_EVENT);
+
+      expect(handled).toBe(true);
+      const s = useUIStore.getState();
+      expect(s.showShortcutsSheet).toBe(false);
+      expect(s.showSettings).toBe(true);
+    });
+
     it("closes the rename dialog before settings", () => {
       // The rename dialog opts out of Radix's own Escape dismissal so this
       // ladder is the single closer: one press must take exactly one layer.
@@ -317,10 +337,20 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(useUIStore.getState().renameWorkspaceId).toBe("ws-2");
     });
 
-    it("showShortcuts opens settings", () => {
-      const handled = dispatch("showShortcuts", FAKE_EVENT);
-      expect(handled).toBe(true);
-      expect(useUIStore.getState().showSettings).toBe(true);
+    it("showShortcuts toggles the cheat sheet without leaving the current view", () => {
+      expect(dispatch("showShortcuts", FAKE_EVENT)).toBe(true);
+      expect(useUIStore.getState().showShortcutsSheet).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(false);
+
+      dispatch("showShortcuts", FAKE_EVENT);
+      expect(useUIStore.getState().showShortcutsSheet).toBe(false);
+    });
+
+    it("openLauncher asks the launcher to open, even with no workspace", () => {
+      useAppStore.setState({ appState: null });
+      const before = useUIStore.getState().launcherOpenRequest;
+      expect(dispatch("openLauncher", FAKE_EVENT)).toBe(true);
+      expect(useUIStore.getState().launcherOpenRequest).toBe(before + 1);
     });
   });
 
@@ -412,5 +442,48 @@ describe("use-keyboard-shortcuts dispatch — toggleRightPanel", () => {
 
     expect(undockBrowserFromRightPanel).not.toHaveBeenCalled();
     expect(useUIStore.getState().getRightPanelTab("ws-1")).toBeNull();
+  });
+});
+
+describe("use-keyboard-shortcuts dispatch — failures are visible", () => {
+  it("toasts the backend's reason when the dev command can't run", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(runProjectDevCommand).mockRejectedValueOnce(
+      "No run command configured. Set one in Settings > Projects.",
+    );
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: "ws-1",
+        workspaces: [{ workspace_id: "ws-1", surfaces: [] }],
+      } as unknown as NonNullable<ReturnType<typeof useAppStore.getState>["appState"]>,
+    });
+
+    expect(dispatch("runDevCommand", FAKE_EVENT)).toBe(true);
+
+    await vi.waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Couldn't run the dev command",
+        expect.objectContaining({
+          description: "No run command configured. Set one in Settings > Projects.",
+        }),
+      ),
+    );
+    log.mockRestore();
+  });
+});
+
+describe("use-keyboard-shortcuts dispatch — closeOverlay", () => {
+  it("closes settings on Escape", () => {
+    useUIStore.setState({ showSettings: true });
+    expect(dispatch("closeOverlay", new KeyboardEvent("keydown", { key: "Escape" }))).toBe(true);
+    expect(useUIStore.getState().showSettings).toBe(false);
+  });
+
+  it("leaves settings open when a dialog above it already handled the Escape", () => {
+    useUIStore.setState({ showSettings: true });
+    const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    event.preventDefault();
+    expect(dispatch("closeOverlay", event)).toBe(false);
+    expect(useUIStore.getState().showSettings).toBe(true);
   });
 });

@@ -123,6 +123,7 @@ import { useForceDelete } from "@/hooks/use-force-delete";
 import { useDefaultBranch } from "./default-branch-cache";
 import { useDetectedEditors } from "@/stores/editor-discovery-store";
 import { computeSnoozePresets } from "./sidebar-snooze";
+import { getTimeFormat } from "@/stores/settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
@@ -294,7 +295,7 @@ function SnoozeUntilSubmenu({
 }: {
   onSnooze: (until: number) => void;
 }) {
-  const [presets] = useState(() => computeSnoozePresets(Date.now()));
+  const [presets] = useState(() => computeSnoozePresets(Date.now(), getTimeFormat()));
   return (
     <ContextMenuSub>
       <ContextMenuSubTrigger className={MENU_ROW}>

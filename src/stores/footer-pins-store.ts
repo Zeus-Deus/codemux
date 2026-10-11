@@ -15,6 +15,7 @@ export const DEFAULT_FOOTER_PINS: FooterPin[] = [
   { id: "codemux.automations.open" },
   { id: "codemux.devices.open" },
   { id: "codemux.pull-requests.open" },
+  { id: "codemux.settings.usage" },
   { id: "codemux.ports.open" },
 ];
 export const FOOTER_STORAGE_KEY = "codemux:footer-pins";

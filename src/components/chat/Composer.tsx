@@ -23,7 +23,7 @@ import {
   Settings,
   SquareSlash,
 } from "lucide-react";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { basename } from "@/lib/path";
 import { relativeTime } from "@/lib/relative-time";
@@ -46,6 +46,9 @@ import {
   sessionProviderLabel,
 } from "@/lib/agent-chat/session-mentions";
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
+import { useAppStore } from "@/stores/app-store";
+import { useCustomAcpThread } from "@/hooks/use-custom-acp-thread";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 import { isChatModeSupported } from "@/lib/agent-chat/mode-compatibility";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
@@ -173,7 +176,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -243,7 +246,7 @@ interface Props {
   zone1Override?: React.ReactNode;
   /** Thread Scope redesign — optional slot rendered BELOW the composer
    *  card (inside the same shared chat column), under the footer.
-   *  The draft surface uses this for `ThreadScopeRow` (location ·
+   *  The draft surface uses this for `ThreadScopeRow` (device ·
    *  checkout · from-branch + the centered scope hint). `undefined`
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
@@ -356,13 +359,13 @@ interface Props {
   onStop: () => void;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
-    model: string,
+    model: string | null,
   ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onModeActivate: (mode: ActivePillMode) => void;
   onModeRemove: () => void;
 }
@@ -380,38 +383,80 @@ export const MIN_TEXTAREA_PX = 94;
  *  doesn't snap shut under the message that was just sent. */
 const SEND_HOLD_MS = 400;
 
-/** What the controls row gives up as the pill narrows. */
-export interface ComposerWidthLadder {
-  /** < 620px: the model label shortens to its leaf name. */
-  leafModelLabel: boolean;
-  /** < 540px: access drops its text label. */
-  accessIconOnly: boolean;
-  /** < 500px: effort drops its text label too. */
-  effortIconOnly: boolean;
-  /** < 460px: effort + access move into the `+` menu. */
-  configInMenu: boolean;
-  /** < 400px: the pill never collapses. */
-  collapseDisabled: boolean;
+/** Below this pill width the composer never collapses. */
+const COLLAPSE_DISABLED_BELOW_PX = 400;
+
+export function collapseDisabledFor(pillWidth: number): boolean {
+  return pillWidth < COLLAPSE_DISABLED_BELOW_PX;
 }
 
-/** `null` (not measured yet, or no layout — jsdom) reads as full width. */
-export function composerWidthLadder(width: number | null): ComposerWidthLadder {
-  if (width === null) {
+/** The controls row compacts until the gap beside the placeholder is at
+ *  least this wide, so the placeholder stays readable. */
+export const FOOTER_MIN_GAP_PX = 96;
+
+/** What the controls row gives up, one step at a time, while its gap is
+ *  narrower than `FOOTER_MIN_GAP_PX`. The steps key on the measured gap
+ *  rather than fixed pill widths, so a short label ("gpt-5.4") keeps its
+ *  text where a long one ("Claude Opus 5.5") would already be truncated. */
+export interface ComposerFooterLadder {
+  /** Step 1: the model label shortens to its leaf name. */
+  leafModelLabel: boolean;
+  /** Step 2: access, tasks and delivery drop their text labels. */
+  accessIconOnly: boolean;
+  /** Step 3: effort drops its text label too. */
+  effortIconOnly: boolean;
+  /** Step 4: the model keeps only its provider mark. */
+  modelIconOnly: boolean;
+  /** Step 5: effort + access move into the `+` menu. */
+  configInMenu: boolean;
+}
+
+export const FOOTER_COMPACT_STEPS = 5;
+
+export function composerFooterLadder(level: number): ComposerFooterLadder {
+  return {
+    leafModelLabel: level >= 1,
+    accessIconOnly: level >= 2,
+    effortIconOnly: level >= 3,
+    modelIconOnly: level >= 4,
+    configInMenu: level >= 5,
+  };
+}
+
+export interface FooterFit {
+  /** Signature of the footer's content; a change re-fits from step 0. */
+  key: string;
+  level: number;
+  /** `fitWidths[i]`: pill width at which step `i` fits again. Recorded
+   *  when stepping past it, so widening steps back without re-measuring
+   *  every step. */
+  fitWidths: number[];
+}
+
+/** One fit step from measured widths. Returns `prev` when nothing changes,
+ *  so a no-op measurement never re-renders the composer. */
+export function nextFooterFit(
+  prev: FooterFit,
+  key: string,
+  pillWidth: number,
+  gapWidth: number,
+): FooterFit {
+  if (prev.key !== key) return { key, level: 0, fitWidths: [] };
+  if (gapWidth < FOOTER_MIN_GAP_PX && prev.level < FOOTER_COMPACT_STEPS) {
     return {
-      leafModelLabel: false,
-      accessIconOnly: false,
-      effortIconOnly: false,
-      configInMenu: false,
-      collapseDisabled: false,
+      key,
+      level: prev.level + 1,
+      fitWidths: [...prev.fitWidths, pillWidth + FOOTER_MIN_GAP_PX - gapWidth],
     };
   }
-  return {
-    leafModelLabel: width < 620,
-    accessIconOnly: width < 540,
-    effortIconOnly: width < 500,
-    configInMenu: width < 460,
-    collapseDisabled: width < 400,
-  };
+  if (prev.level > 0 && pillWidth >= prev.fitWidths[prev.level - 1]) {
+    return {
+      key,
+      level: prev.level - 1,
+      fitWidths: prev.fitWidths.slice(0, -1),
+    };
+  }
+  return prev;
 }
 
 export function Composer({
@@ -423,7 +468,7 @@ export function Composer({
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -480,7 +525,7 @@ export function Composer({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onModeActivate,
   onModeRemove,
 }: Props) {
@@ -488,7 +533,18 @@ export function Composer({
   const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
   const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
   const addonActions = useAddonComposerActions(addonComposer);
-  const configurationEnabled = sessionReady && configurationReady;
+  const customAgentsAllowed = useAppStore(s => {
+    const workspace = s.appState?.workspaces.find(w => w.workspace_id === workspaceId);
+    return !workspace?.attach_only && workspace?.host_id == null;
+  });
+  const acp = useCustomAcpThread(threadId, provider === "acp" && customAgentsAllowed);
+  if (provider === "acp") {
+    modelSupportsImages = acp.catalog?.supports_images ?? false;
+    if (!acp.ready || !modelSupportsImages) onAttachImage = undefined;
+    permissionModes = [];
+  }
+  const unsupportedAcpImages = provider === "acp" && !acp.catalog?.supports_images && stagedAttachments.some(a => a.kind === "image");
+  const configurationEnabled = (sessionReady || (provider === "acp" && sessionAwaitingIntent)) && configurationReady && !acp.busy && !acp.loading;
   // Named apart from the `provider` prop above, which is the AI agent
   // backend (claude/codex/…) — a different axis entirely.
   const scProvider = resolveProvider(providerKind);
@@ -690,7 +746,7 @@ export function Composer({
       }).map((item) => ({
         ...item,
         disabled:
-          item.disabled ||
+          item.disabled || provider === "acp" ||
           !configurationEnabled ||
           (item.id === "mode:plan" &&
             !isChatModeSupported(provider, "plan")) ||
@@ -882,7 +938,11 @@ export function Composer({
         { name: "settings", label: "Agent settings", section: "agent", description: "Open Codemux agent settings" },
         { name: "usage", label: "Usage", section: "usage", description: "View provider usage and limits" }].map((action): SlashCommandItem => ({
           id: `composer:${action.name}`, label: action.label, command: `/${action.name}`, icon: Settings,
-          description: action.description, group: "CHAT", onSelect: () => useUIStore.getState().setShowSettings(true, action.section),
+          description: action.description, disabled: provider === "acp" && action.name !== "settings", group: "CHAT",
+          // Usage opens beside the sidebar; the others are Settings sections.
+          onSelect: () => action.section === "usage"
+            ? useUIStore.getState().setShowUsage(true)
+            : useUIStore.getState().setShowSettings(true, action.section),
         })),
       ...(provider === "codex" ? [{
         id: "composer:hooks", label: "Hooks", command: "/hooks", icon: Settings,
@@ -903,7 +963,7 @@ export function Composer({
       },
       {
         id: "composer:mcp", label: "MCP servers", command: "/mcp", icon: Server,
-        description: "View and manage connected tools", group: "CHAT",
+        description: provider === "acp" ? "Host MCP injection is unavailable for custom harnesses" : "View and manage connected tools", disabled: provider === "acp", group: "CHAT",
         onSelect: () => { setAttachOpen(true); setAttachSubmode("mcp"); setAttachQuery(""); },
       },
     ],
@@ -1931,7 +1991,8 @@ export function Composer({
         {
           id: "attach:mcp",
           label: "MCP Servers…",
-          description: "Toggle integrations the agent can call",
+          description: provider === "acp" ? "Host MCP injection unavailable for custom harnesses" : "Toggle integrations the agent can call",
+          disabled: provider === "acp",
           command: "",
           icon: Server,
           tone: "green",
@@ -2620,24 +2681,44 @@ export function Composer({
   const [dragDepth, setDragDepth] = useState(0);
   const isDragging = dragDepth > 0;
 
-  // ─── Pill collapse ───────────────────────────────────────────────
-  // The width ladder keys on the pill's own width, so a split pane and a
+  // ─── Pill collapse + footer fit ──────────────────────────────────
+  // Both key on the pill's own measured size, so a split pane and a
   // narrow window degrade the same way.
   const wrapperRef = useRef<HTMLDivElement | null>(null);
-  const [pillWidth, setPillWidth] = useState<number | null>(null);
-  useEffect(() => {
-    const el = wrapperRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const sync = () => {
-      const width = el.getBoundingClientRect().width;
-      setPillWidth(width > 0 ? Math.round(width) : null);
-    };
-    sync();
-    const observer = new ResizeObserver(sync);
-    observer.observe(el);
-    return () => observer.disconnect();
+  const footerGapRef = useRef<HTMLDivElement | null>(null);
+  const [collapseDisabled, setCollapseDisabled] = useState(false);
+  const [footerFit, setFooterFit] = useState<FooterFit>({
+    key: "",
+    level: 0,
+    fitWidths: [],
+  });
+  // The fit the DOM currently shows. A measurement only describes that
+  // fit, so an update queued against an older one is dropped — the
+  // layout effect re-measures after the newer fit commits.
+  const committedFitRef = useRef(footerFit);
+  // Measures the pill and the controls row's gap, then takes one fit step.
+  // Resize callbacks omit `key` and keep the current content signature.
+  const fitFooter = useCallback((key?: string) => {
+    const pill = wrapperRef.current?.getBoundingClientRect().width ?? 0;
+    const gap = footerGapRef.current?.getBoundingClientRect().width ?? 0;
+    // No layout yet (or jsdom): stay at full width.
+    if (pill <= 0) return;
+    setCollapseDisabled(collapseDisabledFor(pill));
+    const measured = committedFitRef.current;
+    setFooterFit((prev) =>
+      prev === measured ? nextFooterFit(prev, key ?? prev.key, pill, gap) : prev,
+    );
   }, []);
-  const ladder = composerWidthLadder(pillWidth);
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    // The gap is observed too: a label that resolves late ("Loading…" →
+    // the model name) narrows it without resizing the pill.
+    const observer = new ResizeObserver(() => fitFooter());
+    if (wrapperRef.current) observer.observe(wrapperRef.current);
+    if (footerGapRef.current) observer.observe(footerGapRef.current);
+    return () => observer.disconnect();
+  }, [fitFooter]);
+  const footerLadder = composerFooterLadder(footerFit.level);
 
   const [focusWithin, setFocusWithin] = useState(false);
   const handleWrapperFocus = useCallback(() => {
@@ -2672,7 +2753,10 @@ export function Composer({
     [],
   );
   const submit = useCallback((background = false) => {
-    if (remoteDisconnected) return;
+    // Read admission synchronously: a picker click may precede React's
+    // subscribed busy-state commit in the same event batch.
+    if (provider === "acp" && threadId && useCustomAcp.getState().busy[threadId]) return;
+    if (remoteDisconnected || (provider === "acp" && (!acp.ready || acp.busy || !customAgentsAllowed || unsupportedAcpImages))) return;
     const action = allSlashItems.find((item) => item.id.startsWith("composer:") && item.command.toLowerCase() === draft.trim().toLowerCase());
     if (action) {
       if (action.disabled) return;
@@ -2697,7 +2781,7 @@ export function Composer({
     }, SEND_HOLD_MS);
     if (background && onBackgroundSubmit) onBackgroundSubmit();
     else onSubmit();
-  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems]);
+  }, [onSubmit, onBackgroundSubmit, remoteDisconnected, draft, onDraftChange, allSlashItems, provider, threadId, acp.ready, acp.busy, customAgentsAllowed, unsupportedAcpImages]);
 
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's
@@ -2706,9 +2790,28 @@ export function Composer({
   // mid-flight (`busy`).
   const busy = streaming || sending;
   const delivery = parseMessageDelivery(draft);
+  // Anything that changes the controls' natural widths. A change re-fits
+  // from step 0, so a shorter label can win its text back.
+  const footerKey = [
+    provider,
+    model,
+    effort,
+    contextWindow,
+    serviceTier,
+    permissionMode,
+    busy,
+    delivery.delivery,
+    tasks ? `${tasks.completed}/${tasks.total}` : "",
+  ].join("|");
+  // Layout effect: each fit step re-renders and re-measures before paint,
+  // so the row never flashes an overflowing intermediate state.
+  useLayoutEffect(() => {
+    committedFitRef.current = footerFit;
+    fitFooter(footerKey);
+  }, [fitFooter, footerKey, footerFit]);
   const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
   const discoveringCommands = draftLeadsWithSlash && providerCommandsEntry.loading && !providerCommandsEntry.loaded;
-  const canSubmit = !remoteDisconnected && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
+  const canSubmit = !remoteDisconnected && (provider !== "acp" || (acp.ready && !acp.busy && customAgentsAllowed && !unsupportedAcpImages)) && sessionReady && !sending && !discoveringCommands && delivery.text.length > 0 && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
@@ -2720,7 +2823,7 @@ export function Composer({
   // collapsed pill and then jumps.
   const expanded =
     isDraft ||
-    ladder.collapseDisabled ||
+    collapseDisabled ||
     draft.length > 0 ||
     (focusWithin && !restingFocus) ||
     stagedAttachments.length > 0 ||
@@ -2764,7 +2867,7 @@ export function Composer({
     // textarea via native tab navigation.
     if (e.shiftKey && e.key === "Tab") {
       e.preventDefault();
-      if (!configurationEnabled) return;
+      if (!configurationEnabled || provider === "acp") return;
       // Grok exposes ask/agent as restart-scoped permissions, not the
       // client-controlled Plan/Ask chat modes. Keep keyboard cycling useful
       // by skipping those two unsupported states.
@@ -3093,7 +3196,7 @@ export function Composer({
               footerNote={attachPopupFooter}
               submode={attachSubmode}
               headerSlot={
-                ladder.configInMenu && attachSubmode === "main" ? (
+                footerLadder.configInMenu && provider !== "acp" && attachSubmode === "main" ? (
                   <>
                     <ReasoningPicker
                       model={activeModel}
@@ -3101,10 +3204,10 @@ export function Composer({
                       contextWindowValue={contextWindow}
                       labelMap={effortLabelMap}
                       ultrathinkInBodyText={ultrathinkInBodyText}
-                      fastMode={fastMode}
+                      serviceTier={serviceTier}
                       onEffortChange={onEffortChange}
                       onContextWindowChange={onContextWindowChange}
-                      onFastModeChange={onFastModeChange}
+                      onServiceTierChange={onServiceTierChange}
                       disabled={!configurationEnabled}
                     />
                     <PermissionModePicker
@@ -3161,6 +3264,9 @@ export function Composer({
                   </span>
                 </div>
               )}
+              {unsupportedAcpImages && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">This custom agent does not advertise image support. Remove image attachments to send a text prompt.</p>}
+              {provider === "acp" && !customAgentsAllowed && <p role="alert" className="px-3 pt-2 text-body-sm text-muted-foreground">Custom agents are local-workspace only. Create a local chat to use this harness.</p>}
+              {provider === "acp" && (acp.error || acp.loading || acp.warning) && <p role={acp.error ? "alert" : "status"} className="px-3 pt-2 text-body-sm text-muted-foreground">{acp.error ?? acp.warning ?? "Restoring custom agent identity…"}</p>}
               {/* Step 8 Stage 3 refactor — strip above textarea hosts
                   the active mode pill + image attachment chips. File /
                   folder chips render INSIDE the textarea via the mirror
@@ -3567,12 +3673,13 @@ export function Composer({
           <ComposerFooter
             hermesThreadId={threadId}
             hermesProjectPath={cwd}
+            customAgentsAllowed={customAgentsAllowed}
             provider={provider}
             model={model}
             permissionMode={permissionMode}
             effort={effort}
             contextWindow={contextWindow}
-            fastMode={fastMode}
+            serviceTier={serviceTier}
             activeModel={activeModel}
             effortLabelMap={effortLabelMap}
             permissionModes={permissionModes}
@@ -3585,6 +3692,7 @@ export function Composer({
               requestAnimationFrame(() => textareaRef.current?.focus());
             } : undefined}
             canSubmit={canSubmit}
+            hasDraft={delivery.text.length > 0}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
             mode={mode}
@@ -3593,7 +3701,7 @@ export function Composer({
             onPermissionModeChange={onPermissionModeChange}
             onEffortChange={onEffortChange}
             onContextWindowChange={onContextWindowChange}
-            onFastModeChange={onFastModeChange}
+            onServiceTierChange={onServiceTierChange}
             onSubmit={() => submit()}
             onBackgroundSubmit={onBackgroundSubmit ? () => submit(true) : undefined}
             onStop={onStop}
@@ -3622,17 +3730,20 @@ export function Composer({
                   {steeringUnavailable ? "Steer unavailable" : `Enter to ${delivery.delivery}`}
                 </span>
               ) : onBackgroundSubmit ? (
-                <span className="truncate text-label leading-none text-muted-foreground/70">
+                // A keyboard shortcut is noise on a phone's touch keyboard.
+                <span className="truncate text-label leading-none text-muted-foreground/70 pointer-coarse:hidden">
                   Ctrl+Enter to send in background
                 </span>
               ) : null
             }
             onGapPointerDown={handleGapPointerDown}
             showContextMeter={expanded}
-            modelLeafLabel={ladder.leafModelLabel}
-            effortIconOnly={ladder.effortIconOnly}
-            accessIconOnly={ladder.accessIconOnly}
-            configInMenu={ladder.configInMenu}
+            gapRef={footerGapRef}
+            modelLeafLabel={footerLadder.leafModelLabel}
+            modelIconOnly={footerLadder.modelIconOnly}
+            effortIconOnly={footerLadder.effortIconOnly}
+            accessIconOnly={footerLadder.accessIconOnly}
+            configInMenu={footerLadder.configInMenu}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches

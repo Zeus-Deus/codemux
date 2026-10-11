@@ -15,11 +15,14 @@ import {
   gitPullChanges,
   gitStashPush,
   mergePullRequest,
+  readFile,
+  reopenPullRequest,
   replyToPrThread,
   setPrReady,
   setPrThreadResolved,
   submitPrReview,
   submitPrReviewWithComments,
+  writeFile,
 } from "@/tauri/commands";
 import type {
   CheckInfo,
@@ -43,13 +46,24 @@ import {
   type ReviewThreadTask,
 } from "@/lib/pr-agent-handoff";
 import { checkOutPr } from "@/lib/pr-checkout";
+import { indexDiffRows } from "@/lib/pr-anchor";
+import { joinPath } from "@/lib/pr-draft";
+import { applySuggestion, hasSuggestion, originalLines } from "@/lib/pr-suggestion";
 import { ReviewHeader } from "./review-header";
 import { ReviewTabStrip, type ReviewTab } from "./review-tab-strip";
 import { ReviewChecks } from "./review-checks";
 import { ReviewReviewers } from "./review-reviewers";
 import { ReviewDescription } from "./review-description";
-import { ReviewThreads } from "./review-threads";
-import { ReviewActionBar, type ActionBarState } from "./review-action-bar";
+import {
+  ReviewThreads,
+  type JumpToLine,
+  type SuggestionResolver,
+} from "./review-threads";
+import {
+  ReviewActionBar,
+  type ActionBarState,
+  type PendingWork,
+} from "./review-action-bar";
 import { MergeSheet, type MergeRequestPayload } from "./merge-sheet";
 import {
   ReviewDriftNotice,
@@ -80,6 +94,7 @@ import {
   submitBlockedReason,
   useLineDrafts,
 } from "./pr-drafts";
+
 
 /**
  * Head-SHA history, so a force-push can be noticed at all.
@@ -183,9 +198,14 @@ export interface ReviewDetailProps {
    *  polls are healthy. Content is never blanked either way. */
   staleAgeMs: number | null;
   onRefresh: () => void;
+  /** Explicit refresh clears native successful reads first. Mutations
+   * use onRefresh because the host already invalidates after writes. */
+  onManualRefresh?: () => void;
   /** Absent on surfaces with no Changes pane to open. */
   onOpenChanges?: () => void;
 }
+
+const NO_THREADS: PrReviewThread[] = [];
 
 /**
  * The PR detail surface.
@@ -217,6 +237,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     gitDirtyFiles,
     staleAgeMs,
     onRefresh,
+    onManualRefresh = onRefresh,
     onOpenChanges,
   } = props;
 
@@ -228,6 +249,10 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const [activeTab, setActiveTab] = useState("summary");
   const [mergeSheetOpen, setMergeSheetOpen] = useState(false);
   const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [inFlight, setInFlight] = useState<PendingWork | null>(null);
+  // The state above lags a render behind a double-click; this does not.
+  const inFlightRef = useRef(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [strategy, setStrategy] = useState(() => getMergeStrategy());
@@ -261,19 +286,54 @@ export function ReviewDetail(props: ReviewDetailProps) {
     setForcePushedAt(null);
   }, [key]);
 
+  const pollingActive = usePrPollingActive();
+  const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
+  const canFetch = pollingActive && !paused;
+
+  // ── Review threads ──
+  //
+  // Like the other conversation queries — a reply is not something
+  // you sit and watch arrive. Gated on `list_read` rather than on the
+  // two thread *write* operations, because reading who said what is
+  // reading: a host that serves threads but declares neither write shows
+  // them, without a composer or a Resolve button. A host that declares
+  // nothing never reaches this component at all.
+  const threadsQuery = useQuery({
+    queryKey: ["pr", "review-threads", cwd, pr.number] as const,
+    queryFn: () => getPrReviewThreads(cwd, pr.number),
+    enabled: canFetch && operations.list_read,
+    refetchOnWindowFocus: false,
+    staleTime: PR_CONVERSATION_POLL_MS,
+    refetchInterval: PR_CONVERSATION_POLL_MS,
+    retry: prQueryRetry,
+  });
+
+  // Stale and labelled beats blank: a failed refetch keeps the threads
+  // that are on screen (react-query holds the last good data), and the
+  // notice slot already says how old the surface's data is.
+  const threads: PrReviewThread[] = threadsQuery.data ?? NO_THREADS;
+
   // ── The diff ──
   //
   // Fetched for the Code tab, and also whenever notes are pending even
   // if you're reading Summary: a force-push has to be able to tell you
   // how many of your notes stopped matching without you going looking.
-  // Keyed on the head sha, so a rewrite refetches by itself.
-  const pollingActive = usePrPollingActive();
-  const paused = useRateLimitPause() > 0 && budgetApplies(provider.kind);
-  const canFetch = pollingActive && !paused;
-  const needsDiff = activeTab === "code" || lineDrafts.length > 0;
+  // Keyed AND fetched against the head SHA. Native rejects a changed head
+  // before/after fetching: concurrent detail refreshes must never put a
+  // new patch into an old-head cache entry or re-anchor notes against it.
+  //
+  // A suggestion is shown as a change against the lines it replaces, and
+  // those lines come from the diff — so a thread carrying one is a reason
+  // to fetch it even on Summary.
+  const threadsHaveSuggestions = useMemo(
+    () => threads.some((t) => t.comments.some((c) => hasSuggestion(c.body))),
+    [threads],
+  );
+
+  const needsDiff = activeTab === "code" || lineDrafts.length > 0 || threadsHaveSuggestions;
   const diffQuery = useQuery({
     queryKey: ["pr", "review-diff", cwd, pr.number, pr.head_ref_oid],
-    queryFn: () => getPrReviewDiff(cwd, pr.number),
+    queryFn: () => getPrReviewDiff(cwd, pr.number, pr.head_ref_oid),
     enabled: canFetch && needsDiff,
     refetchOnWindowFocus: false,
     retry: prQueryRetry,
@@ -289,6 +349,41 @@ export function ReviewDetail(props: ReviewDetailProps) {
     putDiffSnapshot(key, pr.head_ref_oid, diffText);
     reanchorLineDrafts(key, diffText, pr.head_ref_oid);
   }, [diffText, pr.head_ref_oid, key]);
+
+  // ── Suggestions ──
+  //
+  // Applied only where this branch is checked out, and only on the new
+  // side: that is the file a suggestion edits. Anywhere else the change
+  // is still shown, and the thread's Send to agent still hands it over.
+  const anchorIndex = useMemo(() => indexDiffRows(diffText), [diffText]);
+  const canApplySuggestions = checkedOutHere && !readOnly;
+  // Kept up here, not in the suggestion block: folding a thread in Code
+  // remounts its comments, and a block that forgot it was applied would
+  // offer Apply again, then fail the match check on the second click.
+  const appliedSuggestions = useRef(new Set<string>());
+  const suggestionTargetFor = useCallback<SuggestionResolver>(
+    ({ path, side, start, end }) => {
+      const original = originalLines(anchorIndex, path, side, start, end);
+      const applicable = canApplySuggestions && side === "RIGHT" && original != null;
+      const appliedKey = (replacement: string[]) =>
+        [cwd, pr.number, path, start, end, replacement.join("\n")].join("\u0000");
+      return {
+        start,
+        original,
+        isApplied: (replacement) => appliedSuggestions.current.has(appliedKey(replacement)),
+        onApply: applicable
+          ? async (replacement: string[]) => {
+              const file = joinPath(cwd, path);
+              const text = await readFile(file);
+              await writeFile(file, applySuggestion(text, start, end, original, replacement));
+              appliedSuggestions.current.add(appliedKey(replacement));
+              toast.success(`Applied to ${path}`);
+            }
+          : undefined,
+      };
+    },
+    [anchorIndex, canApplySuggestions, cwd, pr.number],
+  );
 
   const unanchoredCount = lineDrafts.filter((d) => d.status === "unanchored").length;
   const blockedSubmitReason = submitBlockedReason(lineDrafts, pr.head_ref_oid);
@@ -335,30 +430,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
     retry: prQueryRetry,
   });
 
-  // ── Review threads ──
-  //
-  // Like the other conversation queries — a reply is not something
-  // you sit and watch arrive. Gated on `list_read` rather than on the
-  // two thread *write* operations, because reading who said what is
-  // reading: a host that serves threads but declares neither write shows
-  // them, without a composer or a Resolve button. A host that declares
-  // nothing never reaches this component at all.
-  const threadsQuery = useQuery({
-    queryKey: ["pr", "review-threads", cwd, pr.number] as const,
-    queryFn: () => getPrReviewThreads(cwd, pr.number),
-    enabled: canFetch && operations.list_read,
-    refetchOnWindowFocus: false,
-    staleTime: PR_CONVERSATION_POLL_MS,
-    refetchInterval: PR_CONVERSATION_POLL_MS,
-    retry: prQueryRetry,
-  });
-
   usePrRefusal(cwd, provider.kind, [diffQuery, timelineQuery, threadsQuery]);
 
-  // Stale and labelled beats blank: a failed refetch keeps the threads
-  // that are on screen (react-query holds the last good data), and the
-  // notice slot already says how old the surface's data is.
-  const threads: PrReviewThread[] = threadsQuery.data ?? [];
 
   const replyToThread = useCallback(
     async (thread: PrReviewThread, body: string) => {
@@ -417,9 +490,21 @@ export function ReviewDetail(props: ReviewDetailProps) {
       ? Date.now() - timelineQuery.dataUpdatedAt
       : null;
 
-  const openCodeTab = useCallback((kind: CodeTabIntent["kind"]) => {
+  const openCodeTab = useCallback((kind: "repin" | "old-diff") => {
     setActiveTab("code");
     setCodeIntent({ kind, nonce: Date.now() });
+  }, []);
+
+  const jumpToLine = useCallback<JumpToLine>((path, side, line) => {
+    setActiveTab("code");
+    setCodeIntent({ kind: "focus", path, side, line, nonce: Date.now() });
+  }, []);
+
+  // Dropped once the Code tab has acted on it: that tab remounts on
+  // every visit (and per PR), and a kept intent would replay the old
+  // jump each time.
+  const clearCodeIntent = useCallback((nonce: number) => {
+    setCodeIntent((current) => (current?.nonce === nonce ? null : current));
   }, []);
 
   // ── Check arithmetic, shared by the bar sentence and the rail ──
@@ -568,6 +653,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const confirmMerge = useCallback(
     async (payload: MergeRequestPayload) => {
       setMerging(true);
+      setMergeError(null);
       try {
         await mergePullRequest(
           cwd,
@@ -581,7 +667,9 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onRefresh();
         toast.success(`Merged #${pr.number}`);
       } catch (err) {
-        toast.error(String(err));
+        // The sheet stays open with the refusal in it, so the fix (or
+        // Cancel) is decided with the reason still on screen.
+        setMergeError(String(err));
       } finally {
         setMerging(false);
       }
@@ -589,25 +677,59 @@ export function ReviewDetail(props: ReviewDetailProps) {
     [cwd, pr.number, onRefresh],
   );
 
-  const markReady = useCallback(async () => {
-    try {
-      await setPrReady(cwd, pr.number, true);
-      onRefresh();
-      toast.success("Marked ready for review");
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, pr.number, onRefresh]);
+  /**
+   * Run one request with its button showing progress.
+   *
+   * A second click while one is in flight is dropped: these requests
+   * (ready, close, pull) are not idempotent from the user's side, and a
+   * duplicate either errors or does the thing twice.
+   */
+  const track = useCallback(
+    async (work: PendingWork, failTitle: string, run: () => Promise<void>) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      setInFlight(work);
+      try {
+        await run();
+      } catch (err) {
+        toast.failure(failTitle, err);
+      } finally {
+        inFlightRef.current = false;
+        setInFlight(null);
+      }
+    },
+    [],
+  );
 
-  const closePr = useCallback(async () => {
-    try {
-      await closePullRequest(cwd, pr.number);
-      onRefresh();
-      toast.success(`Closed #${pr.number}`);
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, pr.number, onRefresh]);
+  const markReady = useCallback(
+    () =>
+      track("ready", "Couldn't mark it ready for review", async () => {
+        await setPrReady(cwd, pr.number, true);
+        onRefresh();
+        toast.success("Marked ready for review");
+      }),
+    [track, cwd, pr.number, onRefresh],
+  );
+
+  const closePr = useCallback(
+    () =>
+      track("close", "Couldn't close the pull request", async () => {
+        await closePullRequest(cwd, pr.number);
+        onRefresh();
+        toast.success(`Closed #${pr.number}`);
+      }),
+    [track, cwd, pr.number, onRefresh],
+  );
+
+  const reopenPr = useCallback(
+    () =>
+      track("reopen", "Couldn't reopen the pull request", async () => {
+        await reopenPullRequest(cwd, pr.number);
+        onRefresh();
+        toast.success(`Reopened #${pr.number}`);
+      }),
+    [track, cwd, pr.number, onRefresh],
+  );
 
   const switchToDefaultBranch = useCallback(async () => {
     if (!workspaceId) return;
@@ -615,30 +737,30 @@ export function ReviewDetail(props: ReviewDetailProps) {
       const branch = await checkoutDefaultBranchInWorkspace(workspaceId);
       toast.success(`Switched to ${branch}`);
     } catch (err) {
-      toast.error(String(err));
+      toast.failure("Couldn't switch to the default branch", err);
     }
   }, [workspaceId]);
 
-  const pull = useCallback(async () => {
-    try {
-      await gitPullChanges(cwd);
-      onRefresh();
-      toast.success("Pulled");
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, onRefresh]);
+  const pull = useCallback(
+    () =>
+      track("pull", "Couldn't pull", async () => {
+        await gitPullChanges(cwd);
+        onRefresh();
+        toast.success("Pulled");
+      }),
+    [track, cwd, onRefresh],
+  );
 
-  const stashAndPull = useCallback(async () => {
-    try {
-      await gitStashPush(cwd, false);
-      await gitPullChanges(cwd);
-      onRefresh();
-      toast.success("Stashed and pulled");
-    } catch (err) {
-      toast.error(String(err));
-    }
-  }, [cwd, onRefresh]);
+  const stashAndPull = useCallback(
+    () =>
+      track("stash-pull", "Couldn't stash and pull", async () => {
+        await gitStashPush(cwd, false);
+        await gitPullChanges(cwd);
+        onRefresh();
+        toast.success("Stashed and pulled");
+      }),
+    [track, cwd, onRefresh],
+  );
 
   const copyDraft = useCallback(
     (label: string) => {
@@ -657,7 +779,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const openPrPath = useCallback(
     (suffix: string) => {
-      openUrl(`${pr.url}${suffix}`).catch((err) => toast.error(String(err)));
+      openUrl(`${pr.url}${suffix}`).catch((err) => toast.failure("Couldn't open the link", err));
     },
     [pr.url],
   );
@@ -848,7 +970,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
                   label: "Refresh",
                   onClick: () => {
                     acknowledgeForcePush();
-                    onRefresh();
+                    onManualRefresh();
                   },
                   emphasis: "strong" as const,
                 },
@@ -877,7 +999,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
             ...(onOpenChanges
               ? [{ label: "Review changes", onClick: onOpenChanges }]
               : []),
-            { label: "Stash and pull", onClick: () => void stashAndPull() },
+            {
+              label: "Stash and pull",
+              onClick: () => void stashAndPull(),
+              busy: inFlight === "stash-pull",
+              busyLabel: "Pulling",
+              // track() drops this click while a bar state change runs.
+              disabled: inFlight != null,
+            },
             ...(onOpenChanges
               ? [
                   {
@@ -901,7 +1030,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
           ),
           actions: [
             { label: "What changed", onClick: () => openPrPath("/commits") },
-            { label: "Pull", onClick: () => void pull(), emphasis: "strong" },
+            {
+              label: "Pull",
+              onClick: () => void pull(),
+              emphasis: "strong",
+              busy: inFlight === "pull",
+              busyLabel: "Pulling",
+              disabled: inFlight != null,
+            },
           ],
         });
       }
@@ -949,7 +1085,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         tone: "muted",
         // Stale and labelled beats blank: the content above stays put.
         message: <>Showing data from {shortAge(staleAgeMs)} ago</>,
-        actions: [{ label: "Retry now", onClick: onRefresh }],
+        actions: [{ label: "Retry now", onClick: onManualRefresh }],
       });
     }
 
@@ -976,10 +1112,12 @@ export function ReviewDetail(props: ReviewDetailProps) {
     copyDraft,
     switchToDefaultBranch,
     onRefresh,
+    onManualRefresh,
     onOpenChanges,
     openPrPath,
     pull,
     stashAndPull,
+    inFlight,
     runSubmit,
     lineDrafts,
     unanchoredCount,
@@ -1000,7 +1138,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       prNumber: pr.number,
       existingWorkspaceId,
     })
-      .catch((err) => toast.error(String(err)))
+      .catch((err) => toast.failure("Couldn't check out the pull request", err))
       .finally(() => setCheckingOut(false));
   }, [checkingOut, projectRoot, pr.head_branch, pr.number, existingWorkspaceId]);
 
@@ -1058,7 +1196,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
               }
             : undefined
         }
-        onRefresh={onRefresh}
+        onRefresh={onManualRefresh}
       />
 
       <ReviewTabStrip
@@ -1110,6 +1248,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
           canCommentNow={operations.line_comments && !readOnly}
           onPosted={onRefresh}
           intent={codeIntent}
+          onIntentHandled={clearCodeIntent}
+          threads={threads}
+          onSendToAgent={canHandOff ? sendThreadToAgent : undefined}
+          onReply={operations.thread_reply && !readOnly ? replyToThread : undefined}
+          onSetResolved={
+            operations.thread_resolve && !readOnly ? setThreadResolved : undefined
+          }
+          suggestionTargetFor={suggestionTargetFor}
         />
       ) : (
       /* Status before description, deliberately: what you need to know
@@ -1162,6 +1308,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
           onSetResolved={
             operations.thread_resolve && !readOnly ? setThreadResolved : undefined
           }
+          suggestionTargetFor={suggestionTargetFor}
+          onJumpToLine={jumpToLine}
         />
       </div>
       )}
@@ -1194,6 +1342,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         canComment={operations.comment}
         canMerge={operations.merge_with_strategies}
         canChangeState={operations.draft_ready_close_reopen}
+        pending={inFlight}
         // A verdict from the bar sends the pending line notes with it.
         //
         // The bar and the submit sheet are two doors onto the same act,
@@ -1207,13 +1356,23 @@ export function ReviewDetail(props: ReviewDetailProps) {
             ? submitWithNotes(event, body)
             : runSubmit(event, body))
         }
-        onOpenMergeSheet={() => setMergeSheetOpen(true)}
+        onOpenMergeSheet={() => {
+          setMergeError(null);
+          setMergeSheetOpen(true);
+        }}
         onPickStrategy={(next) => {
           setStrategy(next);
           setMergeStrategy(next);
         }}
         onReadyForReview={() => void markReady()}
         onClose={() => void closePr()}
+        // Closed, not merged: the one record a state change can undo.
+        // Offered to the author, like Close itself.
+        onReopen={
+          closed && isAuthor && operations.draft_ready_close_reopen
+            ? () => void reopenPr()
+            : undefined
+        }
         onRebase={() => openPrPath("/conflicts")}
         onResolveConflicts={canHandOff ? resolveConflictsWithAgent : undefined}
       />
@@ -1258,6 +1417,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
           prTitle={pr.title}
           headBranch={pr.head_branch}
           merging={merging}
+          blockedReason={blockedReason}
+          error={mergeError}
           onCancel={() => setMergeSheetOpen(false)}
           onConfirm={(payload) => void confirmMerge(payload)}
         />

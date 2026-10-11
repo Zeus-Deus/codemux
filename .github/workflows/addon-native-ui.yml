@@ -109,6 +109,10 @@ jobs:
         env:
           CODEMUX_NATIVE_UI_GITHUB_TOKEN: ${{ github.token }}
         run: dbus-run-session -- xvfb-run -a node scripts/addons/native-ui.mjs
+      - name: Match the Linux display size (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/addons/windows-display-resolution.ps1
       - name: Native desktop UI acceptance (Windows)
         if: runner.os == 'Windows'
         env:

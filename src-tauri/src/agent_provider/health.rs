@@ -91,6 +91,7 @@ pub async fn check_provider_health(provider: ProviderKind) -> ProviderHealthRepo
         ProviderKind::Cursor => check_cursor_health().await,
         ProviderKind::Grok => check_grok_health().await,
         ProviderKind::Hermes => ProviderHealthReport::warning(ProviderKind::Hermes, None, "Select an existing Hermes profile to probe its official ACP runtime. Configure credentials and ACP dependencies in Hermes.".into()),
+        ProviderKind::Acp => ProviderHealthReport::warning(ProviderKind::Acp, None, "Select a custom ACP agent. Test its configured executable in Agent settings; there is no family-wide runtime to probe.".into()),
         ProviderKind::OpenCode => check_opencode_health().await,
     }
 }
