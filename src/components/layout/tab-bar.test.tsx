@@ -14,7 +14,7 @@ vi.mock("@/tauri/commands", () => ({
   splitPane: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { activateTab, closeTab } from "@/tauri/commands";
+import { activateTab, closeTab, renameTab } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
 
 function workspace(): WorkspaceSnapshot {
@@ -62,5 +62,27 @@ describe("TabBar", () => {
     fireEvent.click(close);
     expect(closeTab).toHaveBeenCalledWith("ws-1", "tab-b");
     expect(activateTab).not.toHaveBeenCalled();
+  });
+
+  it("renames inline from the context menu instead of a window prompt", async () => {
+    const prompt = vi.spyOn(window, "prompt");
+    render(<TabBar workspace={workspace()} hideActions />);
+    fireEvent.contextMenu(screen.getByText("term-b"));
+    fireEvent.click(await screen.findByText("Rename tab"));
+
+    const input = await screen.findByLabelText("Tab name");
+    fireEvent.change(input, { target: { value: "logs" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(renameTab).toHaveBeenCalledWith("ws-1", "tab-b", "logs");
+    prompt.mockRestore();
+  });
+
+  it("closes a tab on middle-click", () => {
+    render(<TabBar workspace={workspace()} hideActions />);
+    const tab = screen.getByText("term-b").closest("[data-tab-id]") as HTMLElement;
+    fireEvent(tab, new MouseEvent("auxclick", { button: 1, bubbles: true }));
+    expect(closeTab).toHaveBeenCalledWith("ws-1", "tab-b");
   });
 });

@@ -66,3 +66,43 @@ it.each([true, false])("selects a reused chat within its workspace with select:%
   expect(target.surfaces.find((s) => s.surface_id === surface.surface_id)!.active_pane_id).toBe(pane.pane_id);
   expect(target.surfaces).toHaveLength(workspace.surfaces.length);
 });
+
+it("renames and closes a tab so the title-bar tab menu works in dev", async () => {
+  const before = await invoke("get_app_state") as AppStateSnapshot;
+  const workspace = before.workspaces.find((w) => w.workspace_id === "ws-codemux-chat")!;
+  const [first, second] = workspace.tabs;
+  await invoke("activate_tab", { workspaceId: workspace.workspace_id, tabId: first.tab_id });
+
+  await invoke("rename_tab", { workspaceId: workspace.workspace_id, tabId: second.tab_id, title: "Renamed" });
+  const renamed = (await invoke("get_app_state") as AppStateSnapshot).workspaces
+    .find((w) => w.workspace_id === workspace.workspace_id)!;
+  expect(renamed.tabs[1].title).toBe("Renamed");
+
+  await invoke("close_tab", { workspaceId: workspace.workspace_id, tabId: first.tab_id });
+  const closed = (await invoke("get_app_state") as AppStateSnapshot).workspaces
+    .find((w) => w.workspace_id === workspace.workspace_id)!;
+  expect(closed.tabs.map((t) => t.tab_id)).toEqual([second.tab_id]);
+  expect(closed.active_tab_id).toBe(second.tab_id);
+  expect(closed.active_surface_id).toBe(second.surface_id);
+  expect(closed.surfaces.some((s) => s.surface_id === first.surface_id)).toBe(false);
+});
+
+it("drops a closed tab's terminal session, as the backend does", async () => {
+  const before = await invoke("get_app_state") as AppStateSnapshot;
+  const workspaceId = before.workspaces[0].workspace_id;
+  const tabId = await invoke("create_tab", { workspaceId, kind: "terminal" }) as string;
+  const opened = await invoke("get_app_state") as AppStateSnapshot;
+  const workspace = opened.workspaces.find((w) => w.workspace_id === workspaceId)!;
+  const tab = workspace.tabs.find((t) => t.tab_id === tabId)!;
+  const surface = workspace.surfaces.find((s) => s.surface_id === tab.surface_id)!;
+  if (surface.root.kind !== "terminal") throw new Error("Expected a terminal pane");
+  const sessionId = surface.root.session_id;
+  expect(opened.terminal_sessions.some((s) => s.session_id === sessionId)).toBe(true);
+
+  await invoke("close_tab", { workspaceId, tabId });
+  const after = await invoke("get_app_state") as AppStateSnapshot;
+  expect(after.terminal_sessions.some((s) => s.session_id === sessionId)).toBe(false);
+  await expect(invoke("close_tab", { workspaceId: "missing-ws", tabId })).rejects.toThrow(
+    "No workspace found for missing-ws",
+  );
+});
