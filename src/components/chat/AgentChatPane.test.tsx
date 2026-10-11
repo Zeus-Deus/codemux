@@ -1488,10 +1488,10 @@ describe("AgentChatPane turn revert", () => {
     const reverted = success.mock.calls.find(([message]) => message === "Turn reverted");
     expect(reverted?.[1]?.description).toBe("Prompt restored to the composer.");
     const action = reverted?.[1]?.action as
-      | { label: string; onClick: () => void }
+      | { label: string; onClick: (event: { preventDefault: () => void }) => void }
       | undefined;
     expect(action?.label).toBe("Restore files");
-    action?.onClick();
+    action?.onClick({ preventDefault: vi.fn() });
     await waitFor(() => {
       expect(vi.mocked(agentChatUndoTurnRevert)).toHaveBeenCalledWith("thread-x");
     });
