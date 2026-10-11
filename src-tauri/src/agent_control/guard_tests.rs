@@ -1317,8 +1317,10 @@ async fn c1_stop_control(mode: &'static str) {
         assert!(!stop.is_finished(), "Stop returned while owned checkpoint cleanup was outstanding");
         schedule.release.add_permits(1);
     }
-    tokio::time::timeout(std::time::Duration::from_secs(3), stop).await.unwrap().unwrap().unwrap();
+    // Child shutdown joins the watchdog's reap, which follows pending-RPC
+    // cleanup, so Stop can only return after the held watchdog is released.
     if let Some(exit) = exit { tokio::time::timeout(std::time::Duration::from_secs(3), exit.entered.notified()).await.unwrap(); exit.release.add_permits(1); }
+    tokio::time::timeout(std::time::Duration::from_secs(3), stop).await.unwrap().unwrap().unwrap();
     if let Some(before_prepare) = before_prepare { before_prepare.release.add_permits(1); }
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !observed.lock().unwrap().iter().any(|e| matches!(e, ProviderRuntimeEvent::SessionStateChanged {status:SessionStatus::Closed,..})) { tokio::task::yield_now().await; }
