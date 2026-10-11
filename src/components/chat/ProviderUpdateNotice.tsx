@@ -8,7 +8,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { ProviderLogo } from "./provider-logo";
 
 const labels: Record<AgentChatProviderKind, string> = {
-  claude: "Claude", codex: "Codex", cursor: "Cursor", grok: "Grok", hermes: "Hermes", opencode: "OpenCode",
+  claude: "Claude", codex: "Codex", cursor: "Cursor", grok: "Grok", hermes: "Hermes", acp: "Custom agent", opencode: "OpenCode",
 };
 const docs: Record<AgentChatProviderKind, string> = {
   claude: "https://code.claude.com/docs/en/setup",
@@ -16,6 +16,7 @@ const docs: Record<AgentChatProviderKind, string> = {
   cursor: "https://cursor.com/docs/cli/installation",
   grok: "https://www.npmjs.com/package/@xai-official/grok",
   hermes: "https://hermes-agent.nousresearch.com/docs/getting-started/updating",
+  acp: "",
   opencode: "https://opencode.ai/docs/cli/",
 };
 
@@ -24,7 +25,7 @@ export function ProviderUpdateNotice({ provider, threadId, remote = false }: { p
   const health = useProviderHealth(s => selectVisibleHealthReport(s, provider));
   const profile = useHermes(s => threadId ? s.selections[threadId] : undefined);
   const installation = provider === "hermes" ? profile?.installation : undefined;
-  const enabled = !remote && !isRemoteClient() && (provider !== "hermes" || !!profile);
+  const enabled = provider !== "acp" && !remote && !isRemoteClient() && (provider !== "hermes" || !!profile);
   const target = useMemo(() => ({ provider, installation }), [provider, installation]);
   const slot = useProviderUpdates(s => s.slots[updateTargetKey(target)]);
   const check = useProviderUpdates(s => s.check);

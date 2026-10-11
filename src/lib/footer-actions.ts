@@ -46,9 +46,11 @@ export const FOOTER_ACTIONS: readonly FooterAction[] = [
     icon: GitPullRequest,
   },
   { id: "codemux.ports.open", label: "Ports", icon: Plug },
+  // Usage keeps its settings-shaped ID so existing pins survive, but it
+  // opens the Usage page beside the sidebar rather than Settings.
   ...SETTINGS_SECTIONS.map((section) => ({
     id: `codemux.settings.${section.id}` as const,
-    label: `Settings · ${section.label}`,
+    label: section.id === "usage" ? section.label : `Settings · ${section.label}`,
     icon: section.icon,
     section: section.id,
   })),

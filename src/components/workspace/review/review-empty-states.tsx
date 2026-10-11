@@ -3,7 +3,15 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { Empty, EmptyActions, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
-import { btnCard, btnEmberSolid, plural, tzBody, tzMetaNum, tzRowTitle } from "./review-ui";
+import {
+  btnCard,
+  btnEmberSolid,
+  plural,
+  spinnerRing,
+  tzBody,
+  tzMetaNum,
+  tzRowTitle,
+} from "./review-ui";
 import type { ProviderPresentation } from "@/lib/source-control";
 
 /**
@@ -94,6 +102,7 @@ export function BranchLocalOnlyState({
   onCommitAndPush,
   onOpenChanges,
   pushOnly,
+  pushing = false,
 }: {
   changedFiles: number;
   onCommitAndPush: () => void;
@@ -101,6 +110,8 @@ export function BranchLocalOnlyState({
   /** Nothing to commit — the branch just needs pushing, so the primary
    *  says so instead of sending you to a Changes pane with no work. */
   pushOnly: boolean;
+  /** The push is in flight; the button shows it and takes no second click. */
+  pushing?: boolean;
 }) {
   return (
     <EmptyState
@@ -114,8 +125,22 @@ export function BranchLocalOnlyState({
       }
       actions={
         <>
-          <button type="button" className={btnEmberSolid} onClick={onCommitAndPush}>
-            {pushOnly ? "Push branch" : "Commit and push"}
+          <button
+            type="button"
+            className={btnEmberSolid}
+            onClick={onCommitAndPush}
+            disabled={pushing}
+          >
+            {pushing ? (
+              <>
+                <span aria-hidden className={spinnerRing} />
+                Pushing
+              </>
+            ) : pushOnly ? (
+              "Push branch"
+            ) : (
+              "Commit and push"
+            )}
           </button>
           <button type="button" className={btnCard} onClick={onOpenChanges}>
             Changes
@@ -126,14 +151,38 @@ export function BranchLocalOnlyState({
   );
 }
 
+/**
+ * The fallback for a fix that happens outside Codemux. The pane re-checks
+ * on its own for a while, but a person who has just finished in a
+ * terminal should not have to wait for the next tick.
+ */
+function CheckAgainButton({ onRecheck }: { onRecheck?: () => void }) {
+  if (!onRecheck) return null;
+  return (
+    <button type="button" className={btnCard} onClick={onRecheck}>
+      Check again
+    </button>
+  );
+}
+
 /** The host CLI is installed but signed out. */
-export function SignedOutState({ provider }: { provider: ProviderPresentation }) {
+export function SignedOutState({
+  provider,
+  onRecheck,
+}: {
+  provider: ProviderPresentation;
+  onRecheck?: () => void;
+}) {
   const command = provider.loginCommand;
   const copyCommand = () => {
     if (!command) return;
     navigator.clipboard
       .writeText(command)
-      .then(() => toast.success(`Copied — run \`${command}\` in any terminal`))
+      .then(() =>
+        toast.success(
+          `Copied — run \`${command}\` in a terminal. This panel updates once you're signed in.`,
+        ),
+      )
       .catch(() => toast.error("Couldn't copy the command"));
   };
   return (
@@ -142,23 +191,30 @@ export function SignedOutState({ provider }: { provider: ProviderPresentation })
       title={`Sign in to ${provider.name}`}
       body="Reviewing needs a signed-in host. Everything else in this workspace keeps working."
       actions={
-        command ? (
-          <>
-            {/* Signing in happens in a terminal, so the button hands you
-                the command rather than pretending to open a dialog. */}
+        <>
+          {/* Signing in happens in a terminal, so the button hands you
+              the command rather than pretending to open a dialog. */}
+          {command && (
             <button type="button" className={btnEmberSolid} onClick={copyCommand}>
               Sign in
             </button>
-            <Mono>{command}</Mono>
-          </>
-        ) : null
+          )}
+          <CheckAgainButton onRecheck={onRecheck} />
+          {command && <Mono>{command}</Mono>}
+        </>
       }
     />
   );
 }
 
 /** The CLI is missing entirely. */
-export function CliMissingState({ provider }: { provider: ProviderPresentation }) {
+export function CliMissingState({
+  provider,
+  onRecheck,
+}: {
+  provider: ProviderPresentation;
+  onRecheck?: () => void;
+}) {
   return (
     <EmptyState
       testId="empty-cli-missing"
@@ -170,22 +226,56 @@ export function CliMissingState({ provider }: { provider: ProviderPresentation }
         </>
       }
       actions={
-        provider.installUrl ? (
-          <button
-            type="button"
-            className={btnEmberSolid}
-            onClick={() => {
-              // `installUrl` is stored without a scheme so it reads as
-              // prose next to the CLI name.
-              const url = /^https?:\/\//.test(provider.installUrl!)
-                ? provider.installUrl!
-                : `https://${provider.installUrl}`;
-              openUrl(url).catch((err) => toast.error(String(err)));
-            }}
-          >
-            Install {provider.cli}
+        <>
+          {provider.installUrl && (
+            <button
+              type="button"
+              className={btnEmberSolid}
+              onClick={() => {
+                // `installUrl` is stored without a scheme so it reads as
+                // prose next to the CLI name.
+                const url = /^https?:\/\//.test(provider.installUrl!)
+                  ? provider.installUrl!
+                  : `https://${provider.installUrl}`;
+                openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
+              }}
+            >
+              Install {provider.cli}
+            </button>
+          )}
+          <CheckAgainButton onRecheck={onRecheck} />
+        </>
+      }
+    />
+  );
+}
+
+/**
+ * A git repository with no remote at all.
+ *
+ * Not an unsupported host: nothing is hosted anywhere yet, so the next
+ * step is adding a remote, and local review still works in the meantime.
+ */
+export function NoRemoteState({
+  onOpenChanges,
+  onRecheck,
+}: {
+  onOpenChanges: () => void;
+  onRecheck?: () => void;
+}) {
+  return (
+    <EmptyState
+      testId="empty-no-remote"
+      title="This repository has no remote yet"
+      body="Changes stay on this machine. Add a remote to open pull requests and review them here."
+      actions={
+        <>
+          <button type="button" className={btnEmberSolid} onClick={onOpenChanges}>
+            Review changes
           </button>
-        ) : null
+          <CheckAgainButton onRecheck={onRecheck} />
+          <Mono>git remote add origin &lt;url&gt;</Mono>
+        </>
       }
     />
   );
@@ -261,7 +351,7 @@ export function UnsupportedHostState({
             type="button"
             className={btnCard}
             onClick={() => {
-              openUrl(url).catch((err) => toast.error(String(err)));
+              openUrl(url).catch((err) => toast.failure("Couldn't open the link", err));
             }}
           >
             Open in browser

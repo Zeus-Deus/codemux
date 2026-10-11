@@ -4,7 +4,9 @@ import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   btnCard,
+  btnGreenMuted,
   btnGreenSolid,
+  spinnerRing,
   tzBody,
   tzBodyLg,
   tzEyebrow,
@@ -34,6 +36,12 @@ interface Props {
   /** Prefilled body — blank when no cheap source of commit messages. */
   initialBody?: string;
   merging: boolean;
+  /** What the bar says is blocking the merge, in words; null when green.
+   *  The host still has the final say, so the sheet warns, not refuses. */
+  blockedReason?: string | null;
+  /** The host's refusal of the last attempt. Shown here, beside the
+   *  button that caused it, rather than in a toast that slips away. */
+  error?: string | null;
   onCancel: () => void;
   onConfirm: (payload: MergeRequestPayload) => void;
 }
@@ -51,6 +59,8 @@ export function MergeSheet({
   headBranch,
   initialBody = "",
   merging,
+  blockedReason = null,
+  error = null,
   onCancel,
   onConfirm,
 }: Props) {
@@ -105,6 +115,20 @@ export function MergeSheet({
             ))}
           </div>
         </div>
+
+        {blockedReason && (
+          <p
+            role="status"
+            data-testid="merge-blocked-reason"
+            className={cn(
+              "flex items-center gap-2 border-b border-border/40 bg-status-working/10 px-3.5 py-2.5 leading-snug text-foreground/85",
+              tzBody,
+            )}
+          >
+            <span aria-hidden className="size-2 shrink-0 rounded-full bg-status-working" />
+            {blockedReason} — the host may refuse this merge.
+          </p>
+        )}
 
         <div className="flex flex-col gap-3 px-3.5 py-3">
           <label className="flex flex-col gap-1.5">
@@ -178,6 +202,20 @@ export function MergeSheet({
           </p>
         </div>
 
+        {error && (
+          <p
+            role="alert"
+            data-testid="merge-error"
+            className={cn(
+              "flex items-start gap-2 border-t border-border/40 bg-destructive/10 px-3.5 py-2.5 leading-snug text-foreground/85 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150",
+              tzBody,
+            )}
+          >
+            <span aria-hidden className="mt-1.5 size-2 shrink-0 rounded-full bg-destructive" />
+            <span className="min-w-0 flex-1 break-words">Didn't merge — {error}</span>
+          </p>
+        )}
+
         <div className="flex items-center gap-1.5 border-t border-border/40 bg-muted/30 px-3 py-2.5">
           <span className="flex-1" />
           <button type="button" className={btnCard} onClick={onCancel} disabled={merging}>
@@ -185,7 +223,9 @@ export function MergeSheet({
           </button>
           <button
             type="button"
-            className={btnGreenSolid}
+            // Blocked, the confirm drops to the muted fill and says what
+            // it is doing: merging over the reason above, not past it.
+            className={blockedReason ? btnGreenMuted : btnGreenSolid}
             data-testid="merge-confirm"
             onClick={() =>
               onConfirm({ method, deleteBranch, commitTitle: title, commitBody: body })
@@ -194,12 +234,11 @@ export function MergeSheet({
           >
             {merging ? (
               <>
-                <span
-                  aria-hidden
-                  className="size-2.5 animate-spin rounded-full border-[1.6px] border-current border-r-transparent"
-                />
+                <span aria-hidden className={spinnerRing} />
                 Merging
               </>
+            ) : blockedReason ? (
+              "Merge anyway"
             ) : (
               `${strategyLabel} and merge`
             )}

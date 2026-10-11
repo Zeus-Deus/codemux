@@ -437,6 +437,22 @@ mod tests {
         assert!(!authed.approved, "pending session reports approved=false");
     }
 
+    #[test]
+    fn withdrawing_removes_only_a_pending_session() {
+        let db = init_test_database();
+        db.web_remote_insert_session("sess-p", None, None, "hash-p", false)
+            .unwrap();
+        db.web_remote_insert_session("sess-a", None, None, "hash-a", true)
+            .unwrap();
+        assert!(db.web_remote_delete_pending_session("sess-p").unwrap());
+        assert!(db.web_remote_get_session("sess-p").is_none());
+        assert!(
+            !db.web_remote_delete_pending_session("sess-a").unwrap(),
+            "an approved session is not withdrawn"
+        );
+        assert!(db.web_remote_get_session("sess-a").is_some());
+    }
+
     fn headers_with(origin: Option<&str>, host: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Some(o) = origin {

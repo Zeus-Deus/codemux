@@ -16,6 +16,7 @@ import type {
   ReviewComment,
 } from "@/tauri/types";
 import type { ReviewThreadTask } from "@/lib/pr-agent-handoff";
+import { modEnterLabel } from "@/lib/keybind-utils";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { CollapsibleSection } from "./collapsible-section";
@@ -23,6 +24,7 @@ import {
   btnCard,
   btnCardXs,
   btnEmberXs,
+  kbdChip,
   tzBody,
   tzEyebrow,
   tzMeta,
@@ -118,7 +120,7 @@ function SendToAgentButton({ onSend }: { onSend: () => Promise<unknown> }) {
         if (sending) return;
         setSending(true);
         onSend()
-          .catch((err) => toast.error(String(err)))
+          .catch((err) => toast.failure("Couldn't send the thread to an agent", err))
           .finally(() => setSending(false));
       }}
     >
@@ -225,7 +227,7 @@ function ThreadReplyBox({
           {sending ? "Sending" : "Reply"}
         </button>
         <span className="flex-1" />
-        <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>⌘↵</span>
+        <kbd className={kbdChip}>{modEnterLabel()}</kbd>
       </div>
       {error && (
         // The drift notice's language, at comment scale: a dot, the
@@ -526,7 +528,7 @@ export function ReviewThreads({
         delete next[thread.id];
         return next;
       });
-      toast.error(String(err));
+      toast.failure(resolved ? "Couldn't resolve the thread" : "Couldn't reopen the thread", err);
     });
   };
 

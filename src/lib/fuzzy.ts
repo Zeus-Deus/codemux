@@ -89,7 +89,7 @@ export function fuzzyMatch(text: string, query: string): boolean {
  * next to a name) sounds helpful and isn't: subsequence matching over
  * a long path matches almost any short query, so the list stops
  * narrowing. Pick the haystack the query is aimed at instead — see
- * `ThreadScopeRow`'s `/`-switches-to-paths rule.
+ * `ProjectScopePopover`'s `/`-switches-to-paths rule.
  */
 export function fuzzyFilter<T>(
   items: readonly T[],

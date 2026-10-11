@@ -8,14 +8,21 @@ import { Button } from "@/components/ui/button";
 const INLINE_LINK =
   "rounded-sm text-foreground/80 underline-offset-4 transition-colors duration-100 hover:text-foreground hover:underline";
 
-export function LocalSessionImportEntry({ firstRun = false }: { firstRun?: boolean }) {
+/** Importing reads chat history from this computer, so it needs agent chat,
+ *  the desktop app itself (not a web remote client) and the desktop layout. */
+export function useCanImportLocalSessions(): boolean {
   const enabled = useFeatureFlags((s) => s.enableAgentChat);
   const mobile = useMobileLayout();
+  return enabled && !isRemoteClient() && !mobile;
+}
+
+export function LocalSessionImportEntry({ firstRun = false }: { firstRun?: boolean }) {
+  const canImport = useCanImportLocalSessions();
   const empty = useAppStore((s) => s.appState !== null && (s.appState.workspaces?.length ?? 0) === 0);
   const dismissed = useUIStore((s) => s.localSessionImportOfferDismissed);
   const dismiss = useUIStore((s) => s.dismissLocalSessionImportOffer);
   const setOpen = useUIStore((s) => s.setShowLocalSessionImport);
-  if (!enabled || isRemoteClient() || mobile || (firstRun && (!empty || dismissed))) return null;
+  if (!canImport || (firstRun && (!empty || dismissed))) return null;
   // First run: one quiet line under the project actions, which are the
   // primary way in. Import is an aside for people arriving with history.
   if (firstRun) {

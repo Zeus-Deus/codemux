@@ -24,6 +24,8 @@ vi.mock("@/tauri/commands", () => ({
   checkoutDefaultBranchInWorkspace: vi.fn().mockResolvedValue("main"),
   gitPullChanges: vi.fn().mockResolvedValue(undefined),
   gitStashPush: vi.fn().mockResolvedValue(undefined),
+  // The layout and whitespace toggles persist through the settings store.
+  dbSetSetting: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -42,6 +44,7 @@ vi.mock("@/lib/pr-agent-handoff", () => ({
 
 import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
 import { _resetPrDrafts } from "./pr-drafts";
+import { useSettingsStore } from "@/stores/settings-store";
 import { resolveProvider } from "@/lib/source-control";
 import { ALL_OPERATIONS } from "@/lib/provider-auth";
 
@@ -204,6 +207,15 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("the Code tab", () => {
+  it("binds each diff request to the head in its query key", async () => {
+    const user = userEvent.setup();
+    const { rerenderWith } = renderDetail();
+    await openCodeTab(user);
+    expect(mockGetPrReviewDiff).toHaveBeenLastCalledWith("/repo", 172, "head-one");
+    rerenderWith({ pr: makePr({ head_ref_oid: "head-two" }) });
+    await waitFor(() => expect(mockGetPrReviewDiff).toHaveBeenLastCalledWith("/repo", 172, "head-two"));
+  });
+
   it("counts the changed files on the strip and lists every file", async () => {
     const user = userEvent.setup();
     renderDetail();
@@ -251,6 +263,26 @@ describe("the Code tab", () => {
       expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
     );
     expect(file).toHaveAttribute("data-viewed", "true");
+  });
+
+  it("starts files collapsed when that is the setting, and opens one on request", async () => {
+    useSettingsStore.setState((s) => ({
+      settings: { ...s.settings, "diff.file_state": "collapsed" },
+    }));
+    try {
+      const user = userEvent.setup();
+      renderDetail();
+      await openCodeTab(user);
+      const [file] = screen.getAllByTestId("code-file");
+      expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0);
+      await user.click(within(file).getByRole("button", { expanded: false }));
+      expect(file.querySelectorAll("[data-diff-line]").length).toBeGreaterThan(0);
+    } finally {
+      useSettingsStore.setState((s) => {
+        const { "diff.file_state": _state, ...settings } = s.settings;
+        return { settings };
+      });
+    }
   });
 });
 
@@ -828,5 +860,34 @@ describe("after a force-push", () => {
     expect(banner).toHaveTextContent("as it was when you wrote these notes");
     // Selecting on a superseded diff would anchor to lines that are gone.
     expect(document.querySelector("[data-diff-line]")).toBeNull();
+  });
+});
+
+describe("a viewed file", () => {
+  it("reopens from its chevron without losing the Viewed mark", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+    await openCodeTab(user);
+    const file = screen.getAllByTestId("code-file")[0];
+    await user.click(within(file).getByTestId("viewed-toggle"));
+    await waitFor(() =>
+      expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
+    );
+    expect(screen.getByTestId("viewed-count")).toHaveTextContent("1 of 3 viewed");
+    expect(screen.getByRole("progressbar", { name: "Files viewed" })).toHaveAttribute(
+      "aria-valuenow",
+      "1",
+    );
+
+    await user.click(within(file).getByRole("button", { expanded: false }));
+    expect(file.querySelectorAll("[data-diff-line]").length).toBeGreaterThan(0);
+    expect(file).toHaveAttribute("data-viewed", "true");
+
+    // Unmarking and marking again folds it away like the first time.
+    await user.click(within(file).getByTestId("viewed-toggle"));
+    await user.click(within(file).getByTestId("viewed-toggle"));
+    await waitFor(() =>
+      expect(file.querySelectorAll("[data-diff-line]")).toHaveLength(0),
+    );
   });
 });
