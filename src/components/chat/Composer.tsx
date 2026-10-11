@@ -3585,6 +3585,7 @@ export function Composer({
               requestAnimationFrame(() => textareaRef.current?.focus());
             } : undefined}
             canSubmit={canSubmit}
+            hasDraft={delivery.text.length > 0}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
             mode={mode}

@@ -3,6 +3,8 @@ import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
   Check,
+  CornerDownRight,
+  ListEnd,
   ListTodo,
   LoaderCircle,
   Plus,
@@ -25,6 +27,18 @@ import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
 
+const DELIVERY_SEND_LABEL: Record<MessageDelivery, string> = {
+  queue: "Queue message",
+  steer: "Steer",
+  interrupt: "Interrupt and send",
+};
+
+const DELIVERY_SEND_TITLE: Record<MessageDelivery, string> = {
+  queue: "Send after this turn finishes",
+  steer: "Guide the current task without stopping tools",
+  interrupt: "Stop current work and send",
+};
+
 /** 34px circle shared by attach / send / stop so the row's two ends sit on
  *  one optical baseline, concentric with the 44px pill (5px inset). */
 const ROUND_CONTROL =
@@ -45,6 +59,10 @@ interface Props {
   ultrathinkInBodyText: boolean;
   streaming: boolean;
   canSubmit: boolean;
+  /** The draft holds text to send. While a turn runs this swaps the Stop
+   *  button for the queue/steer/interrupt send button — one slot, never
+   *  both. Defaults to `canSubmit`. */
+  hasDraft?: boolean;
   delivery?: MessageDelivery;
   supportsSteering?: boolean;
   onDeliveryChange?: (value: MessageDelivery) => void;
@@ -126,6 +144,7 @@ export function ComposerFooter({
   ultrathinkInBodyText,
   streaming,
   canSubmit,
+  hasDraft = canSubmit,
   delivery = "queue",
   supportsSteering = false,
   onDeliveryChange,
@@ -319,12 +338,25 @@ export function ComposerFooter({
         )}
 
         {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} />}
-        {streaming && showStopButton ? (
-          <>
-          {onDeliveryChange && <button type="button" onClick={onSubmit} disabled={!canSubmit} aria-label={delivery === "interrupt" ? "Interrupt and send" : delivery === "steer" ? "Steer" : "Queue message"}
-            title={delivery === "interrupt" ? "Stop current work and send" : delivery === "steer" ? "Guide the current task without stopping tools" : "Send after this turn finishes"}
-            className={cn(ROUND_CONTROL, "bg-primary/90 text-primary-foreground disabled:opacity-30 disabled:cursor-not-allowed")}><ArrowUp className="size-4" /></button>}
-
+        {streaming && onDeliveryChange && hasDraft ? (
+          // One action slot, as in t3code: with a draft, the slot sends it
+          // (queue / steer / interrupt); otherwise it's Stop.
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            aria-label={DELIVERY_SEND_LABEL[delivery]}
+            title={DELIVERY_SEND_TITLE[delivery]}
+            className={cn(
+              ROUND_CONTROL,
+              "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
+              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-primary active:scale-100",
+              "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
+            )}
+          >
+            {delivery === "queue" ? <ListEnd className="size-4" /> : delivery === "steer" ? <CornerDownRight className="size-4" /> : <ArrowUp className="size-4" />}
+          </button>
+        ) : streaming && showStopButton ? (
           <button
             type="button"
             onClick={onStop}
@@ -338,7 +370,6 @@ export function ComposerFooter({
           >
             <Square className="size-3" fill="currentColor" />
           </button>
-          </>
         ) : (
           <button
             type="button"
