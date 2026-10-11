@@ -10,7 +10,7 @@ import type { WorkflowCapability, WorkflowScript } from "@/tauri/workflows";
 import { WORKFLOW_STARTER } from "./workflow-starter";
 
 const PROVIDERS: AgentChatProviderKind[] = ["claude", "codex", "hermes", "opencode", "cursor", "grok"];
-const LABELS: Record<AgentChatProviderKind, string> = { claude: "Claude", codex: "Codex", hermes: "Hermes", opencode: "OpenCode", cursor: "Cursor", grok: "Grok" };
+const LABELS: Record<AgentChatProviderKind, string> = { claude: "Claude", codex: "Codex", hermes: "Hermes", opencode: "OpenCode", cursor: "Cursor", grok: "Grok", acp: "Custom agent" };
 const SELECT = "h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-body-sm text-foreground focus-visible:outline-2 focus-visible:outline-ring";
 const SUMMARY = "cursor-pointer py-2 text-body-sm font-medium focus-visible:rounded-md focus-visible:outline-2 focus-visible:outline-ring";
 const validOpenCodeModel = (model: string) => /^[A-Za-z0-9._-]+\/\S+$/.test(model);

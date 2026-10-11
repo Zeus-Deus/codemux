@@ -2,7 +2,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import type { WorkflowAttempt, WorkflowRunSnapshot, WorkflowRunStatus, WorkflowTaskSnapshot } from "@/tauri/workflows";
 
 const PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
-  claude: "Claude", codex: "Codex", hermes: "Hermes", opencode: "OpenCode", cursor: "Cursor", grok: "Grok",
+  claude: "Claude", codex: "Codex", hermes: "Hermes", opencode: "OpenCode", cursor: "Cursor", grok: "Grok", acp: "Custom agent",
 };
 
 export interface SnapshotArtifact {

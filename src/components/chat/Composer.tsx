@@ -1,4 +1,3 @@
-import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { usePopupArrowNavigation } from "./use-popup-arrow-navigation";
