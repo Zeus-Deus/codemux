@@ -72,6 +72,7 @@ import {
 } from "@/stores/settings-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { ThemeSettings } from "./theme-settings";
+import { CustomAcpSettings } from "./custom-acp-settings";
 import { UtilityAgentSetting } from "./utility-agent-setting";
 import { NewChatModelSetting } from "./new-chat-model-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
@@ -80,7 +81,6 @@ import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
 import {
-  setNotificationSoundEnabled,
   setAiCommitMessageEnabled,
   setAiCommitMessageCli,
   setAiCommitMessageModel,
@@ -1204,8 +1204,8 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         onProviderModelChange={(nextProvider, nextModel) => {
           setAiCommitMessageCli(nextProvider).catch(console.error);
           storeSet("ai_commit_message_cli", nextProvider);
-          setAiCommitMessageModel(nextModel).catch(console.error);
-          storeSet("ai_commit_message_model", nextModel);
+          setAiCommitMessageModel(nextModel ?? "").catch(console.error);
+          storeSet("ai_commit_message_model", nextModel ?? "");
         }}
         disabled={disabled}
       />
@@ -2039,8 +2039,8 @@ export function SettingsView() {
                     onProviderModelChange={(provider, model) => {
                       setAiResolverCli(provider).catch(console.error);
                       storeSet("ai_resolver_cli", provider);
-                      setAiResolverModel(model).catch(console.error);
-                      storeSet("ai_resolver_model", model);
+                      setAiResolverModel(model ?? "").catch(console.error);
+                      storeSet("ai_resolver_model", model ?? "");
                     }}
                   />
                 </SettingRow>
@@ -2138,6 +2138,8 @@ export function SettingsView() {
                 >
                   <HermesDefaultProfileSetting />
                 </SettingRow>
+                <Separator />
+                <CustomAcpSettings />
                 <Separator />
                 <SettingRow
                   label="Auto-configure MCP for workspaces"
@@ -2416,12 +2418,12 @@ export function SettingsView() {
             <div className="space-y-1">
               <SettingRow
                 label="Notification sounds"
-                description="Play a sound when an agent finishes or needs attention."
+                description="Play a sound when an agent finishes, or when a chat agent needs your approval or an answer."
               >
                 <Switch
-                  checked={config?.notification_sound_enabled ?? false}
+                  aria-label="Notification sounds"
+                  checked={syncedSettings.notifications.sound_enabled}
                   onCheckedChange={(checked) => {
-                    setNotificationSoundEnabled(checked).catch(console.error);
                     updateSyncedSetting("notifications", "sound_enabled", checked).catch(console.error);
                   }}
                 />
@@ -2429,12 +2431,12 @@ export function SettingsView() {
               <Separator />
               <SettingRow
                 label="Desktop notifications"
-                description="Show system notifications via D-Bus when events occur."
+                description="Show a system notification when an agent finishes, or when a chat agent needs your approval or an answer. Click it to open the agent."
               >
                 <Switch
+                  aria-label="Desktop notifications"
                   checked={syncedSettings.notifications.desktop_enabled}
                   onCheckedChange={(checked) => {
-                    // TODO: wire to actual desktop notification system when implemented
                     updateSyncedSetting("notifications", "desktop_enabled", checked).catch(console.error);
                   }}
                 />

@@ -111,6 +111,11 @@ vi.mock("@/stores/auth-store", () => ({
     }),
 }));
 
+const mockUpdateSyncedSetting = vi.fn().mockResolvedValue(undefined);
+// The synced sound flag differs from `config.notification_sound_enabled`
+// above on purpose: the switches must follow the synced values.
+const syncedNotifications = { sound_enabled: false, desktop_enabled: true };
+
 vi.mock("@/stores/synced-settings-store", () => ({
   useSyncedSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
@@ -120,9 +125,9 @@ vi.mock("@/stores/synced-settings-store", () => ({
         terminal: { scrollback_limit: 10000, cursor_style: "bar" },
         git: { default_base_branch: "main" },
         keyboard: { shortcuts: {} },
-        notifications: { sound_enabled: true, desktop_enabled: true },
+        notifications: syncedNotifications,
       },
-      updateSetting: vi.fn(),
+      updateSetting: mockUpdateSyncedSetting,
     }),
   selectTerminalCursorStyle: () => "bar",
   selectDefaultEditor: () => "",
@@ -133,7 +138,6 @@ vi.mock("@/stores/synced-settings-store", () => ({
 
 vi.mock("@/tauri/commands", () => ({
   detectEditors: vi.fn().mockResolvedValue([]),
-  setNotificationSoundEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageCli: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageModel: vi.fn().mockResolvedValue(undefined),
@@ -153,6 +157,8 @@ vi.mock("@/tauri/commands", () => ({
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
   usageExportCsv: vi.fn().mockResolvedValue(""),
+  usageRefreshQuota: vi.fn().mockResolvedValue({ quota: {}, statuses: [], refreshed_at_ms: 0 }),
+  usagePriceOverrides: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("@/tauri/events", () => ({
@@ -462,6 +468,43 @@ describe("SettingsPanel — Git section diff defaults", () => {
       .closest("div")!.parentElement!;
     fireEvent.click(within(row).getByRole("switch"));
     expect(mockSettingsSet).toHaveBeenCalledWith("diff.hide_whitespace", "true");
+  });
+});
+
+describe("SettingsPanel — Notifications section", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openNotifications() {
+    render(<SettingsView />);
+    fireEvent.click(screen.getAllByRole("button", { name: /Notifications/i })[0]);
+  }
+
+  it("shows the synced sound and desktop preferences", () => {
+    openNotifications();
+    expect(
+      screen.getAllByRole("switch", { name: "Notification sounds" })[0],
+    ).toHaveAttribute("aria-checked", "false");
+    expect(
+      screen.getAllByRole("switch", { name: "Desktop notifications" })[0],
+    ).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("writes each toggle to the synced notification settings", () => {
+    openNotifications();
+    fireEvent.click(screen.getAllByRole("switch", { name: "Notification sounds" })[0]);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith(
+      "notifications",
+      "sound_enabled",
+      true,
+    );
+    fireEvent.click(screen.getAllByRole("switch", { name: "Desktop notifications" })[0]);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith(
+      "notifications",
+      "desktop_enabled",
+      false,
+    );
   });
 });
 

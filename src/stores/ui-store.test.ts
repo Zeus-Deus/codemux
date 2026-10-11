@@ -597,3 +597,27 @@ describe("ui-store — forgetting add-on panes", () => {
     expect(useUIStore.getState().rightPanelPanes["ws-1"]).toEqual(["files"]);
   });
 });
+
+describe("ui-store — subagent attention dismissals", () => {
+  beforeEach(() => {
+    useUIStore.setState({ dismissedSubagentAttention: [] });
+    window.localStorage.clear();
+  });
+
+  it("persists dismissals so failure cards stay dismissed after a restart", () => {
+    useUIStore.getState().dismissSubagentAttention("sub-1");
+
+    const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+    expect(persisted.state.dismissedSubagentAttention).toEqual(["sub-1"]);
+  });
+
+  it("keeps only the newest dismissals", () => {
+    for (let i = 0; i < 205; i++) {
+      useUIStore.getState().dismissSubagentAttention(`sub-${i}`);
+    }
+    const dismissed = useUIStore.getState().dismissedSubagentAttention;
+    expect(dismissed).toHaveLength(200);
+    expect(dismissed[0]).toBe("sub-5");
+    expect(dismissed[dismissed.length - 1]).toBe("sub-204");
+  });
+});

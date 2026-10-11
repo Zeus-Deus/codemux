@@ -12,7 +12,9 @@ import {
 
 import type {
   ChatViewItem,
+  PermissionRequestItem,
   SubagentRunItem,
+  WorkflowRunItem,
   SubagentView,
   UsageLimitState,
 } from "@/lib/agent-chat/types";
@@ -24,6 +26,7 @@ import {
   type StripGoal,
 } from "./ComposerStrip";
 import {
+  approvalOccupant,
   queuedMessages,
   queuedOccupant,
   sessionErrorOccupant,
@@ -779,5 +782,141 @@ describe("ComposerStrip — usage limit", () => {
     );
     expect(screen.queryByTestId("composer-strip-goal-more")).toBeNull();
     expect(screen.queryByTestId("composer-strip-goal-resume")).toBeNull();
+  });
+});
+
+describe("ComposerStrip — pending approval", () => {
+  function bashCall(requestId: string | null, command = "npm test"): ChatViewItem {
+    return {
+      kind: "tool_call",
+      id: `tool-${requestId}`,
+      seq: 1,
+      tool_use_id: `tu-${requestId}`,
+      tool_name: "Bash",
+      input: { command },
+      status: "running",
+      result_content: null,
+      approval_request_id: requestId,
+    };
+  }
+  function request(
+    requestId: string,
+    overrides: Partial<PermissionRequestItem> = {},
+  ): PermissionRequestItem {
+    return {
+      kind: "permission_request",
+      id: `req-item-${requestId}`,
+      seq: 2,
+      request_id: requestId,
+      turn_id: "t1",
+      request_kind: "command",
+      payload: {},
+      tool_use_id: `tu-${requestId}`,
+      resolution: { state: "pending" },
+      ...overrides,
+    };
+  }
+  const handlers = () => ({ onRespond: vi.fn(), onJump: vi.fn() });
+
+  it("leads the strip ahead of everything else and answers from the row", () => {
+    const h = handlers();
+    const messages = [bashCall("r1"), request("r1"), errorNotice("Session error: x")];
+    render(
+      <ComposerStrip
+        occupants={[
+          sessionErrorOccupant(messages, false),
+          approvalOccupant(messages, h),
+        ]}
+      />,
+    );
+    const lead = rows()[0];
+    expect(lead).toHaveAttribute("data-kind", "approval");
+    expect(within(lead).getByText("Needs approval")).toBeInTheDocument();
+    expect(within(lead).getByText("Bash · npm test")).toBeInTheDocument();
+    expect(orbStates()).toEqual(["listening"]);
+
+    fireEvent.click(screen.getByTestId("composer-strip-approval-allow"));
+    expect(h.onRespond).toHaveBeenCalledWith("r1", { decision: "allow" });
+    fireEvent.click(screen.getByTestId("composer-strip-approval-deny"));
+    expect(h.onRespond).toHaveBeenLastCalledWith("r1", {
+      decision: "deny",
+      message: "User denied",
+    });
+  });
+
+  it("sends a plan or a workflow to its card instead of answering blind", () => {
+    const h = handlers();
+    const occupant = approvalOccupant([request("p1", { request_kind: "plan" })], h);
+    render(<ComposerStrip occupants={[occupant]} />);
+    expect(screen.queryByTestId("composer-strip-approval-allow")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(h.onJump).toHaveBeenCalledWith("req-item-p1");
+  });
+
+  it("sends a workflow gate to its card", () => {
+    const h = handlers();
+    const workflow: WorkflowRunItem = {
+      kind: "workflow_run",
+      id: "wf-item-1",
+      seq: 3,
+      workflowId: "wf-1",
+      status: "running",
+      name: "deploy",
+      description: null,
+      script: null,
+      plannedPhases: [],
+      phases: [],
+      resultText: null,
+      totalTokens: null,
+      agentCount: null,
+      startedAt: 0,
+      durationMs: null,
+      approvalRequestId: "w1",
+    };
+    const occupant = approvalOccupant([request("w1"), workflow], h);
+    render(<ComposerStrip occupants={[occupant]} />);
+    expect(screen.getByText("Workflow · deploy")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-strip-approval-allow")).toBeNull();
+    expect(screen.queryByTestId("composer-strip-approval-deny")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(h.onJump).toHaveBeenCalledWith("wf-item-1");
+  });
+
+  it("ignores AskUserQuestion prompts and settled requests", () => {
+    expect(
+      approvalOccupant(
+        [
+          request("q1", { request_kind: "user-input" }),
+          request("r2", {
+            resolution: { state: "responding", decision: { decision: "allow" } },
+          }),
+        ],
+        handlers(),
+      ),
+    ).toBeNull();
+  });
+
+  it("takes its own row above a goal", () => {
+    const messages = [bashCall("r1"), request("r1")];
+    const goal: StripGoal = {
+      goal: {
+        text: "Port the importer",
+        setAt: Date.now(),
+        sourceMessageId: "user-1",
+        status: "standing",
+      },
+      resumePhrase: "/goal resume",
+      onResume: vi.fn(),
+      onEditResume: vi.fn(),
+      onClear: vi.fn(),
+      onCopy: vi.fn(),
+      onJump: null,
+      stopped: null,
+    };
+    render(
+      <ComposerStrip goal={goal} occupants={[approvalOccupant(messages, handlers())]} />,
+    );
+    expect(rows()[0]).toHaveAttribute("data-kind", "approval");
+    expect(screen.queryByTestId("composer-strip-goal-more")).toBeNull();
   });
 });

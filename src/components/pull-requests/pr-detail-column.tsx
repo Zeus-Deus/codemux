@@ -13,6 +13,7 @@ import { fetchProviderAuth } from "@/lib/provider-auth";
 import type { PrRow } from "@/lib/pr-overview";
 import type { CheckInfo } from "@/tauri/types";
 import { ReviewDetail } from "@/components/workspace/review/review-detail";
+import { usePrRefresh } from "@/components/workspace/review/use-pr-refresh";
 import { RepoUnreachableState } from "@/components/workspace/review/review-empty-states";
 import { usePrPollingActive } from "@/hooks/use-pr-polling-active";
 import {
@@ -139,19 +140,18 @@ export function PrDetailColumn({
 
   usePrRefusal(path, row.providerKind, [checksQuery, detailQuery, reviewsQuery, inlineQuery]);
 
-  const refresh = useCallback(() => {
-    queryClient.invalidateQueries({
+  const invalidatePrQueries = useCallback(() => {
+    return queryClient.invalidateQueries({
       predicate: (q) =>
-        q.queryKey[0] === "pr" &&
-        typeof q.queryKey[1] === "string" &&
-        q.queryKey[1].startsWith("page-") &&
-        q.queryKey[2] === path &&
-        q.queryKey[3] === number,
+        (q.queryKey[0] === "pr" &&
+          q.queryKey[2] === path &&
+          q.queryKey[3] === number) ||
+        // The summary and its stats belong to this repository, not every
+        // repository on the overview. Invalidation keeps their old rows.
+        (q.queryKey[0] === "prs" && q.queryKey[2] === path),
     });
-    // The row's own summary (checks colour, review decision) came from
-    // the overview, so the list has to hear about it too.
-    queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] === "prs" });
   }, [queryClient, path, number]);
+  const refresh = usePrRefresh(path, JSON.stringify([number, row.providerKind]), invalidatePrQueries);
 
   const pr = detailQuery.data ?? null;
   const operations = opsQuery.data?.operations ?? null;
@@ -208,7 +208,8 @@ export function PrDetailColumn({
       gitBehind={0}
       gitDirtyFiles={0}
       staleAgeMs={staleAgeMs}
-      onRefresh={refresh}
+      onRefresh={invalidatePrQueries}
+      onManualRefresh={refresh}
     />
   );
 }

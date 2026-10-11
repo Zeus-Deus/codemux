@@ -180,6 +180,7 @@ export function NewProjectScreen() {
                 onClick={handleBrowse}
                 disabled={loading}
                 className="shrink-0"
+                aria-label="Browse for folder"
               >
                 <FolderOpen className="size-4" />
               </Button>
@@ -281,6 +282,7 @@ export function NewProjectScreen() {
               <button
                 type="button"
                 onClick={() => setError(null)}
+                aria-label="Dismiss error"
                 className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
               >
                 <X className="size-3.5" />
