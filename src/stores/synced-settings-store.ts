@@ -186,10 +186,12 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     try {
       const result = await getSyncedSettings();
       if (isCurrent(token) && currentInflight(_inflightWrites) === 0) {
-        set({ settings: result.settings, isLoading: false });
+        set({ settings: result.settings });
         if (result.synced) clearQueuedIssues(set);
       }
     } catch {
+      // Keep the last local snapshot when the backend cannot be reached.
+    } finally {
       if (sameSession(token)) set({ isLoading: false });
     }
   },

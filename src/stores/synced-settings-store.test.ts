@@ -87,6 +87,21 @@ describe("synced-settings-store", () => {
   });
 
   describe("loadSettings", () => {
+    it("finishes loading without replacing an edit made during the read", async () => {
+      const read = deferred<UserSettings>();
+      mockGetSyncedSettings.mockReturnValue(read.promise);
+      const loading = useSyncedSettingsStore.getState().loadSettings();
+      mockUpdateSetting.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
+        git: { default_base_branch: "local-edit" },
+      });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "local-edit");
+      read.resolve(DARK_SETTINGS);
+      await loading;
+      expect(useSyncedSettingsStore.getState().isLoading).toBe(false);
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("local-edit");
+    });
+
     it("fetches settings and updates store", async () => {
       mockGetSyncedSettings.mockResolvedValue(DARK_SETTINGS);
 
