@@ -1851,10 +1851,13 @@ impl OpenCodeSession {
         }
         let result = if self.server_handle.api == super::api::OpenCodeApi::V2 {
             let mut teardown = self.native_teardown.lock().await;
-            let retryable = teardown.as_ref().is_some_and(|request| {
-                matches!(request.borrow().as_ref(), Some(Err(error)) if error.starts_with("native_http_status_"))
-            });
+            let retryable = teardown
+                .as_ref()
+                .is_some_and(|request| matches!(request.borrow().as_ref(), Some(Err(_))));
             if retryable {
+                // Completed cleanup can safely repeat cancel/interrupt/wait.
+                // Pending owners stay attached, and admission errors are still
+                // fenced by await_native_admissions without replaying a wake.
                 *teardown = None;
             }
             if teardown.is_none() {
@@ -2872,6 +2875,13 @@ pub(crate) mod tests {
         }
 
         async fn start_for(held_path: &'static str) -> Self {
+            Self::start_for_with_cleanup_failure(held_path, None).await
+        }
+
+        async fn start_for_with_cleanup_failure(
+            held_path: &'static str,
+            cleanup_failure: Option<(&'static str, bool)>,
+        ) -> Self {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -2880,6 +2890,7 @@ pub(crate) mod tests {
             let state = Arc::new(Mutex::new(NativeAdmissionState::default()));
             let server_state = state.clone();
             let held = Arc::new(AtomicBool::new(false));
+            let failed_cleanup = Arc::new(AtomicBool::new(false));
             let server = tokio::spawn(async move {
                 let mut connections = tokio::task::JoinSet::new();
                 loop {
@@ -2889,6 +2900,7 @@ pub(crate) mod tests {
                             let seen = seen.clone();
                             let state = server_state.clone();
                             let held = held.clone();
+                            let failed_cleanup = failed_cleanup.clone();
                             let mut released = released.clone();
                             connections.spawn(async move {
                                 let mut bytes = Vec::new();
@@ -2916,6 +2928,16 @@ pub(crate) mod tests {
                                 let _ = seen.send(NativeAdmissionRequest {
                                     method: method.clone(), path: path.clone(), body: body.clone(),
                                 });
+                                if let Some((failed_path, response_started)) = cleanup_failure {
+                                    if path == failed_path && !failed_cleanup.swap(true, Ordering::Relaxed) {
+                                        if response_started {
+                                            let _ = socket.write_all(
+                                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{"
+                                            ).await;
+                                        }
+                                        return;
+                                    }
+                                }
                                 // A native command may already be executing while its
                                 // callback response remains outstanding.
                                 if method == "POST" && path == "/api/session/s/command" {
@@ -3828,6 +3850,145 @@ pub(crate) mod tests {
         old_inbox.assert_async().await;
         resumed.dead.store(true, Ordering::Relaxed);
         resumed.handoff_dead_attachment().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_completed_cleanup_transport_failure_allows_retry_and_handoff() {
+        for path in [
+            "/api/session/s/interrupt?resume=false",
+            "/api/experimental/session/s/wait",
+        ] {
+            for response_started in [false, true] {
+                let mut peer = DelayedNativeAdmissionPeer::start_for_with_cleanup_failure(
+                    "/unused",
+                    Some((path, response_started)),
+                )
+                .await;
+                let (session, _, mut events) = mock_session_api(
+                    peer.base_url.clone(),
+                    "pw".into(),
+                    "s",
+                    super::super::api::OpenCodeApi::V2,
+                )
+                .await;
+                // This input was already acknowledged; no admission request
+                // remains in flight when the cleanup connection is dropped.
+                session
+                    .native_inputs
+                    .lock()
+                    .await
+                    .insert("msg_owned".into());
+                peer.state.lock().await.pending.insert(
+                    "msg_owned".into(),
+                    serde_json::json!({"id":"msg_owned","sessionID":"s","type":"user"}),
+                );
+                assert!(session.native_admissions.lock().await.is_empty());
+
+                let error = session.shutdown().await.unwrap_err();
+                let ProviderError::RpcError { message } = error else {
+                    panic!("expected a cleanup transport error");
+                };
+                assert!(message.starts_with(if response_started {
+                    "native_response_unconfirmed:"
+                } else {
+                    "native_admission_unconfirmed:"
+                }));
+                assert!(session.has_unconfirmed_native_admissions().await);
+                assert!(session.handoff_dead_attachment().await.is_err());
+                assert!(matches!(
+                    session
+                        .native_teardown
+                        .lock()
+                        .await
+                        .as_ref()
+                        .unwrap()
+                        .borrow()
+                        .as_ref(),
+                    Some(Err(_))
+                ));
+                let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+                assert!(emitted.iter().any(|event| matches!(
+                    event,
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        status: SessionStatus::Error { .. },
+                        ..
+                    }
+                )));
+                assert!(!emitted.iter().any(|event| matches!(
+                    event,
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        status: SessionStatus::Closed,
+                        ..
+                    }
+                )));
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), session.shutdown())
+                    .await
+                    .expect("the restored cleanup endpoint should respond")
+                    .expect("completed cleanup transport failure must be retryable");
+                assert!(!session.has_unconfirmed_native_admissions().await);
+                session.handoff_dead_attachment().await.unwrap();
+                assert!(matches!(
+                    std::iter::from_fn(|| events.try_recv().ok()).last(),
+                    Some(ProviderRuntimeEvent::SessionStateChanged {
+                        status: SessionStatus::Closed,
+                        ..
+                    })
+                ));
+                let state = peer.state.lock().await;
+                assert!(state.pending.is_empty());
+                assert_eq!(state.cancelled, vec!["msg_owned"]);
+                assert_eq!(state.wakes, 0);
+                assert!(!state.active);
+                assert!(state.waits > 0);
+                drop(state);
+                let requests: Vec<_> =
+                    std::iter::from_fn(|| peer.requests.try_recv().ok()).collect();
+                assert!(requests.iter().all(|request| matches!(
+                    (request.method.as_str(), request.path.as_str()),
+                    ("POST", "/api/session/s/interrupt?resume=false")
+                        | ("GET", "/api/session/s/inbox")
+                        | ("DELETE", "/api/session/s/inbox/msg_owned")
+                        | ("POST", "/api/experimental/session/s/wait")
+                )));
+                peer.stop().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_completed_cleanup_retry_preserves_unknown_admission_fence() {
+        let mut peer = DelayedNativeAdmissionPeer::start_for("/unused").await;
+        let (session, _, mut events) = mock_session_api(
+            peer.base_url.clone(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        let (_owner, admission) = tokio::sync::watch::channel(Some(Err(
+            "native_admission_unconfirmed: prompt connection reset".into(),
+        )));
+        session.native_admissions.lock().await.push(admission);
+        for _ in 0..2 {
+            assert!(session.shutdown().await.is_err());
+            assert!(session.has_unconfirmed_native_admissions().await);
+            assert!(session.handoff_dead_attachment().await.is_err());
+        }
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                event,
+                ProviderRuntimeEvent::SessionStateChanged {
+                    status: SessionStatus::Closed,
+                    ..
+                }
+            ))
+        );
+        let requests: Vec<_> = std::iter::from_fn(|| peer.requests.try_recv().ok()).collect();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.method == "POST"
+            && request.path == "/api/session/s/interrupt?resume=false"));
+        peer.stop().await;
     }
 
     #[tokio::test]
