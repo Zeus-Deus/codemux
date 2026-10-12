@@ -688,29 +688,45 @@ async fn native_watermark(
     session: &str,
     after: Option<u64>,
 ) -> Result<Option<u64>, String> {
-    let mut url = format!("{}/api/experimental/session/{}/log?follow=false",
-        base.trim_end_matches('/'), urlencoding::encode(session));
+    let mut url = format!(
+        "{}/api/experimental/session/{}/log?follow=false",
+        base.trim_end_matches('/'),
+        urlencoding::encode(session)
+    );
     if let Some(after) = after {
         url.push_str(&format!("&after={after}"));
     }
-    let response = client.get(url).basic_auth("opencode", Some(password))
-        .timeout(Duration::from_secs(10)).send().await.map_err(|e| e.to_string())?
-        .error_for_status().map_err(|e| e.to_string())?;
+    let response = client
+        .get(url)
+        .basic_auth("opencode", Some(password))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     while let Some(chunk) = stream.next().await {
         buffer.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
         while let Some(end) = find_record_end(&buffer) {
             let record = buffer.drain(..end).collect::<Vec<_>>();
-            let Some(data) = parse_sse_record(&String::from_utf8_lossy(&record)) else { continue };
-            let value: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
-            if value["type"] != "log.synced" { continue; }
+            let Some(data) = parse_sse_record(&String::from_utf8_lossy(&record)) else {
+                continue;
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&data).map_err(|e| e.to_string())?;
+            if value["type"] != "log.synced" {
+                continue;
+            }
             if value["aggregateID"] != session {
                 return Err("synced log marker has a different session".into());
             }
             // A newly created session has no durable execution records yet.
-            return value.get("seq").map(|seq| seq.as_u64()
-                .ok_or("invalid synced durable sequence".into())).transpose();
+            return value
+                .get("seq")
+                .map(|seq| seq.as_u64().ok_or("invalid synced durable sequence".into()))
+                .transpose();
         }
     }
     Err("native durable log was missing its synced marker".into())
@@ -817,23 +833,11 @@ async fn reconcile_native(
             }
         }
     }
-    let root = &peer.session_id;
-    let running = active["data"].get(root).is_some();
-    if running {
-        let mut ctx = peer.event_ctx.lock().await;
-        ctx.turn_active = true;
-        peer.router.lock().await.native.mark_running(root);
-        let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: ctx.thread_id.clone(),
-            status: crate::agent_provider::SessionStatus::Running {
-                active_turn: ctx.turn_id.clone(),
-            },
-        });
-    }
     let sessions = peer.router.lock().await.watched_sessions();
     for session in sessions {
         let session_running = active["data"].get(&session).is_some();
-        if session != peer.session_id || peer.event_ctx.lock().await.turn_active {
+        if session != peer.session_id || session_running || peer.event_ctx.lock().await.turn_active
+        {
             reconcile_native_history(
                 &client,
                 base,
@@ -870,7 +874,9 @@ async fn reconcile_native_history(
         // Coordinator ownership is process-local and includes pre-start/settlement
         // gaps. Read it inside the projection window, never from the earlier scan.
         let active = native_get(client, base, password, "/api/session/active").await?;
-        if !active["data"].is_object() { return Err("missing active-session snapshot".into()); }
+        if !active["data"].is_object() {
+            return Err("missing active-session snapshot".into());
+        }
         let running = active["data"].get(session).is_some();
         let mut messages = Vec::new();
         let mut cursor: Option<String> = None;
@@ -906,16 +912,46 @@ async fn reconcile_native_history(
         }
         let after = native_watermark(client, base, password, session, before).await?;
         let stable = before == after;
-        snapshot = Some((messages, idle_message, running, if stable { after } else { None }));
-        if stable || attempt == 2 { break; }
+        snapshot = Some((
+            messages,
+            idle_message,
+            running,
+            if stable { after } else { None },
+        ));
+        if stable || attempt == 2 {
+            break;
+        }
     }
     let (messages, idle_message, running, sequence) = snapshot.unwrap();
     // Moving/running snapshots must not retire lifecycle records. Completed
     // item tombstones still deduplicate their replay; live terminals settle it.
     if !running && idle_message.is_some() {
         if let Some(sequence) = sequence {
-            peer.router.lock().await.native.recover_through(session, sequence);
+            peer.router
+                .lock()
+                .await
+                .native
+                .recover_through(session, sequence);
         }
+    }
+    if running {
+        if session == peer.session_id {
+            let mut ctx = peer.event_ctx.lock().await;
+            admit_native_root(&mut ctx);
+            peer.router.lock().await.native.mark_running(session);
+            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ctx.thread_id.clone(),
+                status: crate::agent_provider::SessionStatus::Running {
+                    active_turn: ctx.turn_id.clone(),
+                },
+            });
+        } else {
+            peer.router.lock().await.native.mark_running(session);
+        }
+    } else if session == peer.session_id && !peer.event_ctx.lock().await.turn_active {
+        // The earlier coordinator scan can race settlement. Retire its old
+        // replay boundary above without admitting/completing an idle root.
+        return Ok(());
     }
     for message in messages
         .into_iter()
@@ -1019,9 +1055,14 @@ async fn reconcile_native_history(
     if !running && sequence.is_some() {
         // An admitted prompt can still be waiting to execute. Only a durable
         // idle marker proves completion; an empty/idle active snapshot cannot.
-        let Some(message) = idle_message else { return Ok(()) };
+        let Some(message) = idle_message else {
+            return Ok(());
+        };
         let boundary = message["id"].clone();
-        if !message["id"].as_str().is_some_and(|id| id.starts_with("msg_")) {
+        if !message["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_"))
+        {
             return Err("missing native idle message identity".into());
         }
         let mut router = peer.router.lock().await;
@@ -1030,7 +1071,9 @@ async fn reconcile_native_history(
         }
         router.native.mark_running(session);
         drop(router);
-        let outcome = message["outcome"].as_str().ok_or("missing native idle outcome")?;
+        let outcome = message["outcome"]
+            .as_str()
+            .ok_or("missing native idle outcome")?;
         handle_native(
             super::v2::Event {
                 durable: None,
@@ -1208,30 +1251,212 @@ mod tests {
     fn native_record(id: &str, kind: &str, data: serde_json::Value, seq: Option<u64>) -> String {
         let mut value = serde_json::json!({"id":id,"type":kind,"created":0,"data":data});
         if let Some(seq) = seq {
-            value["durable"] = serde_json::json!({"aggregateID":value["data"]["sessionID"],"seq":seq,"version":1});
+            value["durable"] =
+                serde_json::json!({"aggregateID":value["data"]["sessionID"],"seq":seq,"version":1});
         }
         format!("data: {value}\n\n")
     }
 
     fn watermark_record(session: &str, seq: u64) -> String {
-        format!("data: {}\n\n", serde_json::json!({"type":"log.synced","aggregateID":session,"seq":seq}))
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"log.synced","aggregateID":session,"seq":seq})
+        )
     }
 
-    async fn mock_watermarks(server: &mut mockito::ServerGuard, session: &str, seq: u64) -> Vec<mockito::Mock> {
+    async fn mock_watermarks(
+        server: &mut mockito::ServerGuard,
+        session: &str,
+        seq: u64,
+    ) -> Vec<mockito::Mock> {
         let mut mocks = Vec::new();
         for suffix in [String::new(), format!("&after={seq}")] {
-            mocks.push(server.mock("GET", format!("/api/experimental/session/{session}/log?follow=false{suffix}").as_str())
-                .with_status(200).with_body(watermark_record(session, seq)).expect_at_least(0).create_async().await);
+            mocks.push(
+                server
+                    .mock(
+                        "GET",
+                        format!("/api/experimental/session/{session}/log?follow=false{suffix}")
+                            .as_str(),
+                    )
+                    .with_status(200)
+                    .with_body(watermark_record(session, seq))
+                    .expect_at_least(0)
+                    .create_async()
+                    .await,
+            );
         }
         mocks
+    }
+
+    #[tokio::test]
+    async fn native_reconnect_admits_running_background_root_with_fresh_turn_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let _checkpoints = mock_watermarks(&mut server, "root", 10).await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body(r#"{"data":{"root":{}}}"#)
+            .create_async()
+            .await;
+        for path in [
+            "/api/session?parentID=root&limit=200&order=asc",
+            "/api/session/root/permission",
+            "/api/session/root/form",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(200)
+                .with_body(r#"{"data":[]}"#)
+                .create_async()
+                .await;
+        }
+        let history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"data":[{
+                    "id":"msg_callback","type":"assistant","time":{"completed":3},
+                    "content":[{"type":"text","text":"background result"}]
+                }]})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let previous_turn = p.event_ctx.lock().await.turn_id.clone();
+        let (tx, mut rx) = broadcast::channel(32);
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        let resumed_turn = p.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(resumed_turn, previous_turn);
+        assert!(p.event_ctx.lock().await.turn_active);
+        let mut events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(event,
+            ProviderRuntimeEvent::SessionStateChanged { status: crate::agent_provider::SessionStatus::Running { active_turn }, .. }
+                if active_turn == &resumed_turn
+        )));
+        assert!(events.iter().any(|event| matches!(event,
+            ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if turn_id == &resumed_turn && text == "background result"
+        )));
+        handle_record(
+            &native_record(
+                "evt_callback_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &resumed_turn
+                ))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &previous_turn
+        )));
+        active.assert_async().await;
+        history.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_reconnect_stale_active_scan_does_not_arm_an_idle_root() {
+        let mut server = mockito::Server::new_async().await;
+        let _checkpoints = mock_watermarks(&mut server, "root", 10).await;
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    r#"{"data":{"root":{}}}"#.into()
+                } else {
+                    r#"{"data":{}}"#.into()
+                }
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        for path in [
+            "/api/session?parentID=root&limit=200&order=asc",
+            "/api/session/root/permission",
+            "/api/session/root/form",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(200)
+                .with_body(r#"{"data":[]}"#)
+                .create_async()
+                .await;
+        }
+        let history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"msg_previous","type":"idle","outcome":"succeeded"}]}"#)
+            .create_async()
+            .await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let previous_turn = p.event_ctx.lock().await.turn_id.clone();
+        let (tx, mut rx) = broadcast::channel(16);
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        assert_eq!(p.event_ctx.lock().await.turn_id, previous_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(
+            p.router.lock().await.native.recovered_sequence("root"),
+            Some(10)
+        );
+        assert!(rx.try_recv().is_err());
+        handle_record(
+            &native_record(
+                "evt_old_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(5),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_previous",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+        active.assert_async().await;
+        history.assert_async().await;
     }
 
     #[tokio::test]
     async fn native_recovery_uses_independent_content_ordinals_without_replaying_items() {
         let mut server = mockito::Server::new_async().await;
         let checkpoints = mock_watermarks(&mut server, "root", 10).await;
-        let active = server.mock("GET", "/api/session/active").with_status(200)
-            .with_body("{\"data\":{\"root\":{}}}").create_async().await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body("{\"data\":{\"root\":{}}}")
+            .create_async()
+            .await;
         let history = server.mock("GET", "/api/session/root/message?limit=200&order=desc")
             .with_status(200).with_body(serde_json::json!({"data":[{
                 "id":"m","type":"assistant","time":{"completed":3},"content":[
@@ -1247,14 +1472,19 @@ mod tests {
         p.event_ctx.lock().await.turn_active = true;
         let (tx, mut rx) = broadcast::channel(32);
         for (kind, ordinal, text) in [
-            ("reasoning", 0, "reason 0"), ("text", 0, "text 0"),
-            ("reasoning", 1, "reason 1"), ("text", 1, "text 1"),
+            ("reasoning", 0, "reason 0"),
+            ("text", 0, "text 0"),
+            ("reasoning", 1, "reason 1"),
+            ("text", 1, "text 1"),
         ] {
             handle_record(&native_record(&format!("live-{kind}-{ordinal}"), &format!("session.{kind}.ended"),
                 serde_json::json!({"sessionID":"root","assistantMessageID":"m","ordinal":ordinal,"text":text}), None), &p, &tx).await;
         }
         for (kind, data) in [
-            ("session.tool.input.started", serde_json::json!({"name":"read"})),
+            (
+                "session.tool.input.started",
+                serde_json::json!({"name":"read"}),
+            ),
             ("session.tool.called", serde_json::json!({"input":{}})),
             ("session.tool.success", serde_json::json!({"content":[]})),
         ] {
@@ -1265,21 +1495,46 @@ mod tests {
             handle_record(&native_record(kind, kind, data, None), &p, &tx).await;
         }
         let original: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(original.iter().filter(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })).count(), 6);
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "root", true).await.unwrap();
-        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })),
-            "mixed reasoning/text/tool history must retain the live fragment identities");
+        assert_eq!(
+            original
+                .iter()
+                .filter(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. }))
+                .count(),
+            6
+        );
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "root",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })),
+            "mixed reasoning/text/tool history must retain the live fragment identities"
+        );
         history.assert_async().await;
         active.assert_async().await;
-        for checkpoint in checkpoints { checkpoint.assert_async().await; }
+        for checkpoint in checkpoints {
+            checkpoint.assert_async().await;
+        }
     }
 
     #[tokio::test]
     async fn native_recovery_deduplicates_buffered_child_execution_and_preserves_later_execution() {
         let mut server = mockito::Server::new_async().await;
         let checkpoints = mock_watermarks(&mut server, "child", 10).await;
-        let active = server.mock("GET", "/api/session/active").with_status(200)
-            .with_body("{\"data\":{}}").create_async().await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body("{\"data\":{}}")
+            .create_async()
+            .await;
         let history = server.mock("GET", "/api/session/child/message?limit=200&order=desc")
             .with_status(200).with_body(serde_json::json!({"data":[
                 {"id":"msg_child_done","type":"idle","outcome":"succeeded"},
@@ -1292,78 +1547,235 @@ mod tests {
         p.api = super::super::api::OpenCodeApi::V2;
         p.router.lock().await.watched.insert("child".into());
         let (tx, mut rx) = broadcast::channel(64);
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "child", false).await.unwrap();
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "child",
+            false,
+        )
+        .await
+        .unwrap();
         let mut observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for (id, kind, data, seq) in [
-            ("evt_old_start", "session.execution.started", serde_json::json!({"sessionID":"child"}), Some(5)),
-            ("evt_old_text", "session.text.ended", serde_json::json!({"sessionID":"child","assistantMessageID":"m","ordinal":0,"text":"recovered child"}), None),
-            ("evt_old_tool", "session.tool.success", serde_json::json!({"sessionID":"child","assistantMessageID":"m","id":"t","content":[]}), None),
-            ("evt_child_done", "session.execution.succeeded", serde_json::json!({"sessionID":"child"}), Some(10)),
+            (
+                "evt_old_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"child"}),
+                Some(5),
+            ),
+            (
+                "evt_old_text",
+                "session.text.ended",
+                serde_json::json!({"sessionID":"child","assistantMessageID":"m","ordinal":0,"text":"recovered child"}),
+                None,
+            ),
+            (
+                "evt_old_tool",
+                "session.tool.success",
+                serde_json::json!({"sessionID":"child","assistantMessageID":"m","id":"t","content":[]}),
+                None,
+            ),
+            (
+                "evt_child_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"child"}),
+                Some(10),
+            ),
         ] {
             handle_record(&native_record(id, kind, data, seq), &p, &tx).await;
         }
-        assert!(rx.try_recv().is_err(), "recovered child must not restart or repeat content/terminal during buffered replay");
+        assert!(
+            rx.try_recv().is_err(),
+            "recovered child must not restart or repeat content/terminal during buffered replay"
+        );
         for (id, kind, data, seq) in [
-            ("evt_new_start", "session.execution.started", serde_json::json!({"sessionID":"child"}), Some(11)),
-            ("evt_late_old_text", "session.text.ended", serde_json::json!({"sessionID":"child","assistantMessageID":"m","ordinal":0,"text":"recovered child"}), None),
-            ("evt_new_text", "session.text.ended", serde_json::json!({"sessionID":"child","assistantMessageID":"m2","ordinal":0,"text":"later child"}), None),
-            ("evt_new_end", "session.execution.succeeded", serde_json::json!({"sessionID":"child"}), Some(15)),
+            (
+                "evt_new_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"child"}),
+                Some(11),
+            ),
+            (
+                "evt_late_old_text",
+                "session.text.ended",
+                serde_json::json!({"sessionID":"child","assistantMessageID":"m","ordinal":0,"text":"recovered child"}),
+                None,
+            ),
+            (
+                "evt_new_text",
+                "session.text.ended",
+                serde_json::json!({"sessionID":"child","assistantMessageID":"m2","ordinal":0,"text":"later child"}),
+                None,
+            ),
+            (
+                "evt_new_end",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"child"}),
+                Some(15),
+            ),
         ] {
             handle_record(&native_record(id, kind, data, seq), &p, &tx).await;
         }
         observed.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-        assert_eq!(observed.iter().filter(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
-            if subagent.status == crate::agent_provider::SubagentStatus::Running)).count(), 1);
-        assert_eq!(observed.iter().filter(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
-            if subagent.status == crate::agent_provider::SubagentStatus::Completed)).count(), 2);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(
+                    |e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if subagent.status == crate::agent_provider::SubagentStatus::Running)
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(
+                    |e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if subagent.status == crate::agent_provider::SubagentStatus::Completed)
+                )
+                .count(),
+            2
+        );
         for expected in ["recovered child", "later child"] {
             assert_eq!(observed.iter().filter(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted {
                 item: crate::agent_provider::CompletedItem::AssistantText { text }, .. } if text == expected)).count(), 1);
         }
         history.assert_async().await;
         active.assert_async().await;
-        for checkpoint in checkpoints { checkpoint.assert_async().await; }
+        for checkpoint in checkpoints {
+            checkpoint.assert_async().await;
+        }
     }
 
     #[tokio::test]
     async fn native_recovery_buffered_old_execution_does_not_complete_the_next_queued_turn() {
         let mut server = mockito::Server::new_async().await;
         let checkpoints = mock_watermarks(&mut server, "root", 10).await;
-        let active = server.mock("GET", "/api/session/active").with_status(200)
-            .with_body("{\"data\":{}}").expect(2).create_async().await;
-        let prompts = server.mock("POST", "/api/session/root/prompt").with_status(200).expect(2).create_async().await;
-        let interrupt = server.mock("POST", "/api/session/root/interrupt?resume=false").with_status(200).create_async().await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body("{\"data\":{}}")
+            .expect(2)
+            .create_async()
+            .await;
+        let prompts = server
+            .mock("POST", "/api/session/root/prompt")
+            .with_status(200)
+            .expect(2)
+            .create_async()
+            .await;
+        let interrupt = server
+            .mock("POST", "/api/session/root/interrupt?resume=false")
+            .with_status(200)
+            .create_async()
+            .await;
         let history = server.mock("GET", "/api/session/root/message?limit=200&order=desc")
             .with_status(200).with_body(serde_json::json!({"data":[
                 {"id":"msg_a_done","type":"idle","outcome":"succeeded"},
                 {"id":"m_a","type":"assistant","time":{"completed":3},"content":[{"type":"text","text":"A"}]}
             ]}).to_string()).expect(2).create_async().await;
-        let (session, p, tx, mut rx) = super::super::session::tests::mock_native_peer(server.url()).await;
-        let input = |text: &str| serde_json::from_value(serde_json::json!({"thread_id":"t1","text":text,"model_override":null})).unwrap();
+        let (session, p, tx, mut rx) =
+            super::super::session::tests::mock_native_peer(server.url()).await;
+        let input = |text: &str| {
+            serde_json::from_value(
+                serde_json::json!({"thread_id":"t1","text":text,"model_override":null}),
+            )
+            .unwrap()
+        };
         let a = session.enqueue_or_send(input("A")).await.unwrap();
         let b = session.enqueue_or_send(input("B")).await.unwrap();
         assert!(b.queued_id.is_some());
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "root", false).await.unwrap();
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "root",
+            false,
+        )
+        .await
+        .unwrap();
         let mut observed = Vec::new();
         let b_turn = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = rx.recv().await.unwrap();
                 let dispatched = match &event {
-                    ProviderRuntimeEvent::QueuedTurnDispatched { turn_id, .. } => Some(turn_id.clone()),
+                    ProviderRuntimeEvent::QueuedTurnDispatched { turn_id, .. } => {
+                        Some(turn_id.clone())
+                    }
                     _ => None,
                 };
                 observed.push(event);
-                if let Some(turn) = dispatched { break turn; }
+                if let Some(turn) = dispatched {
+                    break turn;
+                }
             }
-        }).await.expect("the real queue worker must dispatch B after recovering A");
-        handle_record(&native_record("evt_b_start", "session.execution.started", serde_json::json!({"sessionID":"root"}), Some(11)), &p, &tx).await;
+        })
+        .await
+        .expect("the real queue worker must dispatch B after recovering A");
+        handle_record(
+            &native_record(
+                "evt_b_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
         // A stale idle snapshot and buffered A events must both preserve B.
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "root", false).await.unwrap();
-        handle_record(&native_record("evt_a_start", "session.execution.started", serde_json::json!({"sessionID":"root"}), Some(5)), &p, &tx).await;
-        handle_record(&native_record("evt_a_done", "session.execution.succeeded", serde_json::json!({"sessionID":"root"}), Some(10)), &p, &tx).await;
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "root",
+            false,
+        )
+        .await
+        .unwrap();
+        handle_record(
+            &native_record(
+                "evt_a_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(5),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_a_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
         assert!(session.turn_active().await);
         assert_eq!(p.event_ctx.lock().await.turn_id, b_turn);
-        handle_record(&native_record("evt_b_done", "session.execution.succeeded", serde_json::json!({"sessionID":"root"}), Some(15)), &p, &tx).await;
+        handle_record(
+            &native_record(
+                "evt_b_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(15),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
         observed.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         for turn in [&a.turn_id, &b_turn] {
             assert_eq!(observed.iter().filter(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn)).count(), 1);
@@ -1371,7 +1783,9 @@ mod tests {
         prompts.assert_async().await;
         history.assert_async().await;
         active.assert_async().await;
-        for checkpoint in checkpoints { checkpoint.assert_async().await; }
+        for checkpoint in checkpoints {
+            checkpoint.assert_async().await;
+        }
         session.shutdown().await;
         interrupt.assert_async().await;
     }
@@ -1379,19 +1793,45 @@ mod tests {
     #[tokio::test]
     async fn native_recovery_without_a_durable_idle_does_not_settle_pending_admission() {
         let mut server = mockito::Server::new_async().await;
-        let checkpoint = server.mock("GET", "/api/experimental/session/root/log?follow=false")
-            .with_status(200).with_body(format!("data: {}\n\n", serde_json::json!({
-                "type":"log.synced","aggregateID":"root"
-            }))).expect(2).create_async().await;
-        let active = server.mock("GET", "/api/session/active").with_status(200)
-            .with_body("{\"data\":{}}").create_async().await;
-        let history = server.mock("GET", "/api/session/root/message?limit=200&order=desc")
-            .with_status(200).with_body("{\"data\":[]}").create_async().await;
+        let checkpoint = server
+            .mock("GET", "/api/experimental/session/root/log?follow=false")
+            .with_status(200)
+            .with_body(format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "type":"log.synced","aggregateID":"root"
+                })
+            ))
+            .expect(2)
+            .create_async()
+            .await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body("{\"data\":{}}")
+            .create_async()
+            .await;
+        let history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body("{\"data\":[]}")
+            .create_async()
+            .await;
         let mut p = peer("root");
         p.api = super::super::api::OpenCodeApi::V2;
         p.event_ctx.lock().await.turn_active = true;
         let (tx, mut rx) = broadcast::channel(16);
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "root", false).await.unwrap();
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "root",
+            false,
+        )
+        .await
+        .unwrap();
         assert!(p.event_ctx.lock().await.turn_active);
         assert!(rx.try_recv().is_err());
         history.assert_async().await;
@@ -1403,13 +1843,30 @@ mod tests {
     async fn native_recovery_advancing_windows_preserve_live_lifecycle_without_failing() {
         let mut server = mockito::Server::new_async().await;
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
-        let log = server.mock("GET", mockito::Matcher::Regex(
-            "^/api/experimental/session/child/log\\?follow=false(?:&after=[0-9]+)?$".into()))
-            .with_status(200).with_body_from_request(move |_| {
-                watermark_record("child", counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-            }).expect(6).create_async().await;
-        let active = server.mock("GET", "/api/session/active").with_status(200)
-            .with_body("{\"data\":{}}").expect(3).create_async().await;
+        let log = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    "^/api/experimental/session/child/log\\?follow=false(?:&after=[0-9]+)?$".into(),
+                ),
+            )
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                watermark_record(
+                    "child",
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .expect(6)
+            .create_async()
+            .await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body("{\"data\":{}}")
+            .expect(3)
+            .create_async()
+            .await;
         let history = server.mock("GET", "/api/session/child/message?limit=200&order=desc")
             .with_status(200).with_body(serde_json::json!({"data":[
                 {"id":"msg_done","type":"idle","outcome":"succeeded"},
@@ -1419,16 +1876,62 @@ mod tests {
         p.api = super::super::api::OpenCodeApi::V2;
         p.router.lock().await.watched.insert("child".into());
         let (tx, mut rx) = broadcast::channel(32);
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "child", false).await.unwrap();
-        assert!(p.router.lock().await.native.recovered_sequence("child").is_none());
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "child",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(p
+            .router
+            .lock()
+            .await
+            .native
+            .recovered_sequence("child")
+            .is_none());
         let mut observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(!observed.iter().any(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
-            if subagent.status == crate::agent_provider::SubagentStatus::Completed)));
-        handle_record(&native_record("evt_start", "session.execution.started", serde_json::json!({"sessionID":"child"}), Some(5)), &p, &tx).await;
-        handle_record(&native_record("evt_done", "session.execution.succeeded", serde_json::json!({"sessionID":"child"}), Some(10)), &p, &tx).await;
+        assert!(!observed.iter().any(
+            |e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if subagent.status == crate::agent_provider::SubagentStatus::Completed)
+        ));
+        handle_record(
+            &native_record(
+                "evt_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"child"}),
+                Some(5),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"child"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
         observed.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-        assert_eq!(observed.iter().filter(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
-            if subagent.status == crate::agent_provider::SubagentStatus::Completed)).count(), 1);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(
+                    |e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+            if subagent.status == crate::agent_provider::SubagentStatus::Completed)
+                )
+                .count(),
+            1
+        );
         log.assert_async().await;
         active.assert_async().await;
         history.assert_async().await;
@@ -1438,27 +1941,80 @@ mod tests {
     async fn native_recovery_active_settlement_gap_preserves_the_live_terminal() {
         let mut server = mockito::Server::new_async().await;
         let checkpoints = mock_watermarks(&mut server, "root", 10).await;
-        let active = server.mock("GET", "/api/session/active").with_status(200)
-            .with_body("{\"data\":{\"root\":{}}}").create_async().await;
-        let history = server.mock("GET", "/api/session/root/message?limit=200&order=desc")
-            .with_status(200).with_body(serde_json::json!({"data":[
-                {"id":"msg_done","type":"idle","outcome":"succeeded"}
-            ]}).to_string()).create_async().await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body("{\"data\":{\"root\":{}}}")
+            .create_async()
+            .await;
+        let history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"data":[
+                    {"id":"msg_done","type":"idle","outcome":"succeeded"}
+                ]})
+                .to_string(),
+            )
+            .create_async()
+            .await;
         let mut p = peer("root");
         p.api = super::super::api::OpenCodeApi::V2;
         p.event_ctx.lock().await.turn_active = true;
         let (tx, mut rx) = broadcast::channel(16);
-        handle_record(&native_record("evt_start", "session.execution.started", serde_json::json!({"sessionID":"root"}), Some(5)), &p, &tx).await;
-        reconcile_native_history(&reqwest::Client::new(), &server.url(), "fixture", &p, &tx, "root", true).await.unwrap();
-        assert!(p.router.lock().await.native.recovered_sequence("root").is_none());
+        handle_record(
+            &native_record(
+                "evt_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(5),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        reconcile_native_history(
+            &reqwest::Client::new(),
+            &server.url(),
+            "fixture",
+            &p,
+            &tx,
+            "root",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(p
+            .router
+            .lock()
+            .await
+            .native
+            .recovered_sequence("root")
+            .is_none());
         assert!(p.event_ctx.lock().await.turn_active);
-        handle_record(&native_record("evt_done", "session.execution.succeeded", serde_json::json!({"sessionID":"root"}), Some(10)), &p, &tx).await;
+        handle_record(
+            &native_record(
+                "evt_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
         assert!(!p.event_ctx.lock().await.turn_active);
-        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|e|
-            matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })).count(), 1);
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
         active.assert_async().await;
         history.assert_async().await;
-        for checkpoint in checkpoints { checkpoint.assert_async().await; }
+        for checkpoint in checkpoints {
+            checkpoint.assert_async().await;
+        }
     }
 
     #[tokio::test]
@@ -1662,8 +2218,17 @@ mod tests {
             p.router.lock().await.native.mark_running("child");
             let (tx, mut rx) = broadcast::channel(64);
             if live_terminal_first {
-                handle_record(&native_record("evt_child_done", "session.execution.succeeded",
-                    serde_json::json!({"sessionID":"child"}), Some(10)), &p, &tx).await;
+                handle_record(
+                    &native_record(
+                        "evt_child_done",
+                        "session.execution.succeeded",
+                        serde_json::json!({"sessionID":"child"}),
+                        Some(10),
+                    ),
+                    &p,
+                    &tx,
+                )
+                .await;
             }
             reconcile_native(&server.url(), "fixture", &p, &tx)
                 .await
@@ -1788,7 +2353,9 @@ mod tests {
             for mock in mocks {
                 mock.assert_async().await;
             }
-            for checkpoint in checkpoints { checkpoint.assert_async().await; }
+            for checkpoint in checkpoints {
+                checkpoint.assert_async().await;
+            }
         }
         // Live native failures use the same fallback, not just the snapshot adapter.
         let mut p = peer("root");
