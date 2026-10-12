@@ -51,6 +51,8 @@ pub struct State {
     content: HashMap<(String, String, bool, u64), (String, bool)>,
     tools: HashMap<(String, String, String), Tool>,
     models: HashMap<String, Value>,
+    recovered_sequences: HashMap<String, u64>,
+    terminal_sequences: HashMap<String, (String, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -67,15 +69,34 @@ impl State {
     pub fn mark_running(&mut self, session: &str) {
         self.running.insert(session.into());
     }
+    pub fn recovered_sequence(&self, session: &str) -> Option<u64> {
+        self.recovered_sequences.get(session).copied()
+    }
+    pub fn recover_through(&mut self, session: &str, seq: u64) {
+        let boundary = self.recovered_sequences.entry(session.into()).or_default();
+        *boundary = (*boundary).max(seq);
+    }
     /// Claim a durable descendant terminal once per idle boundary. A live
     /// terminal already observed before the first snapshot must not repeat.
     pub fn recover_terminal(&mut self, session: &str, boundary: Value) -> bool {
         let previous = self.recovered_idle.insert(session.into(), boundary.clone());
+        if let Some(suffix) = boundary.as_str().and_then(|id| id.strip_prefix("msg_")) {
+            let event_id = format!("evt_{suffix}");
+            let observed = self.terminal_sequences.get(session)
+                .is_some_and(|(id, _)| id == &event_id);
+            return !observed && previous.as_ref().is_none_or(|old| old != &boundary);
+        }
         self.running.contains(session)
             || previous.as_ref().is_some_and(|old| old != &boundary)
             || (previous.is_none() && !self.settled.contains(session))
     }
     pub fn reduce(&mut self, event: &Event) -> Result<Vec<Update>, String> {
+        if let Some(session) = event.session_id() {
+            if event.sequence(session).zip(self.recovered_sequence(session))
+                .is_some_and(|(seq, boundary)| seq <= boundary) {
+                return Ok(vec![]);
+            }
+        }
         // Snapshot identities may recur with a newer partial value. Their
         // per-item state/high-water guards, not event IDs, reconcile them.
         if !event.id.starts_with("snapshot:") {
@@ -96,17 +117,17 @@ impl State {
         let mut out = Vec::new();
         match event.kind.as_str() {
             "session.execution.started" => {
-                if self.running.insert(session.into()) {
-                    self.content
-                        .retain(|(s, _, _, _), (_, ended)| s != session || !*ended);
-                    self.tools
-                        .retain(|(s, _, _), tool| s != session || !tool.ended);
-                }
+                // Message/tool identities span executions. Reconnect snapshots
+                // can complete them before their buffered live start arrives.
+                self.running.insert(session.into());
                 out.push(Update::Started);
             }
             "session.execution.succeeded"
             | "session.execution.failed"
             | "session.execution.interrupted" => {
+                if let Some(seq) = event.sequence(session) {
+                    self.terminal_sequences.insert(session.into(), (event.id.clone(), seq));
+                }
                 if self.running.remove(session) {
                     self.settled.insert(session.into());
                     out.push(Update::Terminal {
@@ -156,12 +177,13 @@ impl State {
                     }
                     content.0 = full.into();
                 } else if kind.ends_with(".ended") {
-                    content.0 = required_str(d, "text")?.into();
+                    let text = required_str(d, "text")?.into();
+                    content.0 = String::new();
                     content.1 = true;
                     out.push(Update::Content {
                         thinking,
                         complete: true,
-                        text: content.0.clone(),
+                        text,
                     });
                 }
             }
@@ -235,6 +257,10 @@ impl State {
                             detail: json!({"id":id,"input":tool.input,"metadata":metadata}),
                         });
                     }
+                }
+                if tool.ended {
+                    // Keep a completion tombstone, not the finished payload.
+                    *tool = Tool { called: true, ended: true, ..Tool::default() };
                 }
             }
             "permission.asked" => out.push(Update::Permission(d.clone())),
@@ -469,10 +495,20 @@ mod tests {
     use super::*;
     fn event(id: &str, kind: &str, data: Value) -> Event {
         Event {
+            durable: None,
             id: id.into(),
             kind: kind.into(),
             data,
         }
+    }
+
+    #[test]
+    fn native_event_fixtures_without_a_durable_envelope_still_decode() {
+        let decoded: Event = serde_json::from_value(json!({
+            "id":"evt_fixture", "type":"session.execution.started", "data":{"sessionID":"root"}
+        })).unwrap();
+        assert!(decoded.durable.is_none());
+        assert!(matches!(State::default().reduce(&decoded).unwrap().as_slice(), [Update::Started]));
     }
     #[test]
     fn reconnect_snapshot_appends_only_missing_partial_content_then_accepts_live_deltas() {
@@ -652,9 +688,21 @@ pub struct Event {
     #[serde(rename = "type")]
     pub kind: String,
     pub data: Value,
+    #[serde(default)]
+    pub durable: Option<Durable>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Durable {
+    #[serde(rename = "aggregateID")]
+    pub aggregate_id: String,
+    pub seq: u64,
 }
 
 impl Event {
+    fn sequence(&self, session: &str) -> Option<u64> {
+        self.durable.as_ref().filter(|d| d.aggregate_id == session).map(|d| d.seq)
+    }
     pub fn session_id(&self) -> Option<&str> {
         if self.kind.starts_with("form.") && self.kind == "form.created" {
             self.data.get("form")?.get("sessionID")?.as_str()

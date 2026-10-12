@@ -2027,6 +2027,22 @@ pub(crate) mod tests {
         (session, tx)
     }
 
+    pub(crate) async fn mock_native_peer(base_url: String) -> (
+        Arc<OpenCodeSession>, SsePeer, broadcast::Sender<ProviderRuntimeEvent>,
+        broadcast::Receiver<ProviderRuntimeEvent>,
+    ) {
+        let (session, tx, rx) = mock_session_api(base_url, "fixture".into(), "root",
+            super::super::api::OpenCodeApi::V2).await;
+        let peer = SsePeer {
+            api: super::super::api::OpenCodeApi::V2,
+            ready: tokio::sync::watch::channel(true).0,
+            directory: None, session_id: "root".into(),
+            event_ctx: session.event_ctx.clone(), router: session.router.clone(),
+            dead: session.dead.clone(), usage: session.usage.clone(),
+        };
+        (session, peer, tx, rx)
+    }
+
     #[tokio::test]
     async fn v2_gateway_registration_is_scoped_and_verified_connected() {
         let mut server = Server::new_async().await;
