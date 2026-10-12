@@ -153,6 +153,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "detach_pty_output"
             | "detect_editors"
             | "detect_package_manager"
+            | "detect_run_candidates"
             | "discover_source_control"
             | "dock_browser_in_right_panel"
             | "flush_scrollback_cache"
@@ -261,6 +262,7 @@ pub(super) fn allowed(cmd: &str) -> bool {
             | "start_skills_watcher"
             | "stop_skills_watcher"
             | "swap_panes"
+            | "terminal_foreground_jobs"
             | "terminal_session_cwds"
             | "touch_workspace"
             | "uncache_terminal_scrollback"
@@ -339,6 +341,7 @@ mod tests {
             "submit_pr_review_with_comments",
             "automations_create",
             "unarchive_workspace",
+            "detect_run_candidates",
         ] {
             assert!(allowed(cmd), "{cmd}");
         }

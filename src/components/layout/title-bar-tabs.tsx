@@ -1,3 +1,4 @@
+import { requestCloseTab } from "@/lib/close-guard";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
@@ -30,7 +31,7 @@ import { cn } from "@/lib/utils";
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { useAppStore } from "@/stores/app-store";
-import { activateTab, closeTab, reorderTabs } from "@/tauri/commands";
+import { activateTab, reorderTabs } from "@/tauri/commands";
 import type {
   ActivePaneStatus,
   PaneNodeSnapshot,
@@ -321,7 +322,7 @@ function TitleBarTab({
   };
   const rename = useTabRename();
   const close = () => {
-    closeTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
+    requestCloseTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -421,7 +422,7 @@ function ActiveChatTab({
   });
   const rename = useTabRename();
   const close = () => {
-    closeTab(workspaceId, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
+    requestCloseTab(workspaceId, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
