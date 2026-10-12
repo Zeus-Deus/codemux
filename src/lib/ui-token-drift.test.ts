@@ -60,7 +60,9 @@ const CATEGORIES: Category[] = [
     // `em` is left out: a preview that scales with its own container uses it
     // on purpose.
     pattern: /(?<![-\w])text-\[\d+(?:\.\d+)?(?:px|rem)\]/g,
-    budget: 11,
+    // Counted after main's Usage model dialog landed with another 22px
+    // display stat, the same untokened size as the Usage page's.
+    budget: 12,
     why:
       "display titles with no token yet (the scale tops out at text-body-lg) " +
       "and dense badges still to migrate",
