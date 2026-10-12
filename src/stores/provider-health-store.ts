@@ -55,11 +55,11 @@ interface ProviderHealthSlot {
   report: ProviderHealthReport | null;
   fetchedAt: number;
   /** In-flight probe, for single-flight coalescing. */
-  inFlight: Promise<void> | null;
+  inFlight: Promise<ProviderHealthReport | null> | null;
   /** A forced probe that arrived while `inFlight` was still running and
    *  is waiting to start after it settles. Held so several forced calls
    *  in one burst share ONE follow-up instead of stacking spawns. */
-  queuedForce: Promise<void> | null;
+  queuedForce: Promise<ProviderHealthReport | null> | null;
   /** Dismissal identity (`status\0message`) the user closed. A CHANGED
    *  failure re-surfaces the banner; the same one stays dismissed until
    *  the provider recovers (recovery clears it). */
@@ -70,13 +70,13 @@ type SlotMap = Record<AgentChatProviderKind, ProviderHealthSlot>;
 
 interface ProviderHealthStore {
   slots: SlotMap;
-  /** Probe `provider`, respecting TTL unless `force`. Resolves when the
-   *  slot is up to date (or the probe failed — failure keeps the last
-   *  report rather than fabricating one). */
+  /** Probe `provider`, respecting TTL unless `force`. Returns the cached
+   *  or newly verified report; `null` on a failed probe, which keeps the
+   *  previous report for advisory display without refreshing its age. */
   refresh: (
     provider: AgentChatProviderKind,
     opts?: { force?: boolean },
-  ) => Promise<void>;
+  ) => Promise<ProviderHealthReport | null>;
   /** A start/turn just SUCCEEDED — direct evidence the provider runs.
    *  Drops a stale failure banner and re-probes for ground truth. */
   noteProviderSuccess: (provider: AgentChatProviderKind) => Promise<void>;
@@ -155,7 +155,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
       return queued;
     }
     const fresh = Date.now() - slot.fetchedAt < HEALTH_TTL_MS;
-    if (fresh && !opts?.force) return;
+    if (fresh && !opts?.force) return slot.report;
     const probe = agentChatProviderHealth(provider)
       .then((report) => {
         set((state) => {
@@ -177,6 +177,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
             },
           };
         });
+        return report;
       })
       .catch((err) => {
         // Command-layer failure (mock without handler, IPC hiccup):
@@ -189,11 +190,11 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
             ...state.slots,
             [provider]: {
               ...state.slots[provider],
-              fetchedAt: Date.now(),
               inFlight: null,
             },
           },
         }));
+        return null;
       });
     set((state) => ({
       slots: {
@@ -242,13 +243,15 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     // Unlike the post-failure forced probes, this is a poll with no
     // triggering event, so an in-flight probe is a perfectly good
     // answer — coalesce instead of queueing another CLI spawn.
-    if (slot.inFlight) return slot.inFlight;
+    if (slot.inFlight) {
+      await slot.inFlight;
+      return;
+    }
     await get().refresh(provider, { force: true });
   },
   ensureReady: async (provider) => {
     const cached = get().slots[provider].report;
-    await get().refresh(provider, { force: healthBlocksSend(cached) });
-    const report = get().slots[provider].report;
+    const report = await get().refresh(provider, { force: healthBlocksSend(cached) });
     if (!report || !healthBlocksSend(report)) return null;
     set((state) => ({
       slots: {

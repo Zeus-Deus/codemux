@@ -203,7 +203,7 @@ export function refreshProviderCapabilitiesForIntent(
   // Health probes can launch provider runtimes too, so they share the exact
   // same explicit-intent boundary. The health store's TTL handles later
   // picker openings without another process spawn.
-  const healthRefresh = useProviderHealth.getState().refresh(provider);
+  const healthRefresh = useProviderHealth.getState().refresh(provider).then(() => {});
   const lastRefresh = providerIntentRefreshedAt.get(provider);
   // The Cursor and Grok catalogs are owned by their installed CLIs and used
   // to refresh on an app-level timer. Capability startup is now intent-driven,

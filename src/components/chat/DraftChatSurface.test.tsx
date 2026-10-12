@@ -787,6 +787,32 @@ describe("DraftChatSurface", () => {
       await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
     });
 
+    it("materializes a draft when the forced probe of a cached signed-out report rejects", async () => {
+      const signedOut = {
+        provider: "claude" as const, status: "error" as const, installed: true,
+        message: "Claude Code isn't signed in.", version: "2.1.0", login_command: "claude auth login",
+      };
+      const draft = seedProjectDraft("try after signing in");
+      const { container } = renderSurface();
+      // Seed after mount so a recovery poll cannot consume the failed probe
+      // intended for this submit's readiness gate.
+      act(() => useProviderHealth.setState((state) => ({ slots: {
+        ...state.slots, claude: { ...emptyHealthSlot(), report: signedOut, fetchedAt: Date.now() },
+      } })));
+      vi.mocked(agentChatProviderHealth).mockRejectedValueOnce(new Error("IPC down"));
+      vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+        await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+        expect(vi.mocked(materializeAndSend).mock.calls[0][0].draftId).toBe(draft.draftId);
+        expect(vi.mocked(materializeAndSend).mock.calls[0][1]).toBe("try after signing in");
+        expect(useProviderHealth.getState().slots.claude.report).toEqual(signedOut);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it("consumes background focus before a later visit to the same draft", () => {
       vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
       const draft = seedProjectDraft();

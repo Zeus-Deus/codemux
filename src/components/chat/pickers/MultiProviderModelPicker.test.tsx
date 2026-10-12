@@ -602,8 +602,8 @@ describe("MultiProviderModelPicker — empty + error states", () => {
     let finishHealthRefresh!: () => void;
     const refreshHealth = vi.fn(
       () =>
-        new Promise<void>((resolve) => {
-          finishHealthRefresh = resolve;
+        new Promise<null>((resolve) => {
+          finishHealthRefresh = () => resolve(null);
         }),
     );
     // Opening the picker is itself an intent to discover, so the store

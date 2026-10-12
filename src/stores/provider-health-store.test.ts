@@ -347,4 +347,50 @@ describe("provider-health-store", () => {
     expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
     expect(mockProbe).not.toHaveBeenCalled();
   });
+
+  it("lets a send proceed when re-probing a cached block fails, without renewing that block", async () => {
+    vi.useFakeTimers();
+    const signedOut: ProviderHealthReport = {
+      ...report("error", "Claude Code isn't signed in."),
+      installed: true,
+      login_command: "claude auth login",
+    };
+    seed(signedOut);
+    const fetchedAt = useProviderHealth.getState().slots.claude.fetchedAt;
+    vi.advanceTimersByTime(1000);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockProbe.mockRejectedValueOnce(new Error("IPC down"));
+    try {
+      expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
+      expect(mockProbe).toHaveBeenCalledOnce();
+      expect(useProviderHealth.getState().slots.claude).toMatchObject({
+        report: signedOut,
+        fetchedAt,
+        inFlight: null,
+      });
+      expect(selectVisibleHealthReport(useProviderHealth.getState(), "claude")).toEqual(signedOut);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("returns the failed queued re-probe result instead of an older blocking report", async () => {
+    const running = deferred();
+    const signedOut = { ...report("error", "Signed out."), installed: true, login_command: "claude auth login" };
+    seed(signedOut);
+    mockProbe.mockReturnValueOnce(running.promise);
+    mockProbe.mockRejectedValueOnce(new Error("IPC down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const refresh = useProviderHealth.getState().refresh("claude", { force: true });
+      const gate = useProviderHealth.getState().ensureReady("claude");
+      running.resolve(signedOut);
+      expect(await refresh).toEqual(signedOut);
+      expect(await gate).toBeNull();
+      expect(mockProbe).toHaveBeenCalledTimes(2);
+      expect(useProviderHealth.getState().slots.claude.report).toEqual(signedOut);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
