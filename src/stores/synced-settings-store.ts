@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { shareStructural } from "@/lib/structural-share";
 import type { UserSettings } from "@/tauri/types";
 import {
   getSyncedSettings,
@@ -89,42 +90,90 @@ interface SettingsOperationToken {
 
 const _inflightWrites = new Map<number, number>();
 const _inflightRemoteReconciles = new Map<number, number>();
-// A PATCH only confirms its own field. A full snapshot covers all edits up
-// to its captured generation, including edits whose PATCH is still pending.
-const _writeIssues = new Map<string, { generation: number; issue: SyncIssue }>();
-const _writeStatusGenerations = new Map<string, number>();
+interface FieldIntent {
+  generation: number;
+  section: string;
+  key: string;
+  value: unknown;
+  issue: SyncIssue | null;
+}
+
+// Keep requested values until a matching acknowledgement confirms them.
+// Server PATCH snapshots can omit other pending, queued, or failed edits.
+const _fieldIntents = new Map<string, FieldIntent>();
 const FULL_WRITE = "*";
+
+function fieldValue(settings: UserSettings, section: string, key: string): unknown {
+  const group: unknown = Reflect.get(settings, section);
+  return typeof group === "object" && group !== null ? Reflect.get(group, key) : undefined;
+}
+
+function matchesIntent(settings: UserSettings, intent: FieldIntent): boolean {
+  return Object.is(
+    shareStructural(intent.value, fieldValue(settings, intent.section, intent.key)),
+    intent.value,
+  );
+}
+
+function settingsWithIntents(settings: UserSettings): UserSettings {
+  const merged = structuredClone(settings);
+  for (const intent of _fieldIntents.values()) {
+    const group: unknown = Reflect.get(merged, intent.section);
+    if (typeof group === "object" && group !== null) {
+      Reflect.set(group, intent.key, structuredClone(intent.value));
+    }
+  }
+  return merged;
+}
+
+function rememberSnapshot(token: SettingsOperationToken, settings: UserSettings, replace: boolean) {
+  if (replace) _fieldIntents.clear();
+  for (const [section, group] of Object.entries(settings)) {
+    for (const [key, value] of Object.entries(group)) {
+      const scope = `${section}.${key}`;
+      if (replace || !_fieldIntents.has(scope)) {
+        _fieldIntents.set(scope, {
+          generation: token.settingsGeneration, section, key,
+          value: structuredClone(value), issue: null,
+        });
+      }
+    }
+  }
+}
+
+function syncIssue(): SyncIssue | null {
+  const intents = [..._fieldIntents.values()];
+  return intents.some((intent) => intent.issue === "failed")
+    ? "failed" : intents.some((intent) => intent.issue === "saved-locally") ? "saved-locally" : null;
+}
 
 function writeOutcome(
   token: SettingsOperationToken,
   scope: string,
   issue: SyncIssue | null,
   set: (partial: Partial<SyncedSettingsState>) => void,
+  settings?: UserSettings,
 ) {
   if (!sameSession(token)) return;
-  const generation = token.settingsGeneration;
-  if (generation < Math.max(
-    _writeStatusGenerations.get(scope) ?? 0,
-    _writeStatusGenerations.get(FULL_WRITE) ?? 0,
-  )) return;
-  _writeStatusGenerations.set(scope, generation);
-  if (scope === FULL_WRITE && issue !== "failed") {
-    for (const [field, status] of _writeIssues) {
-      if (status.generation <= generation) _writeIssues.delete(field);
+  for (const [field, intent] of _fieldIntents) {
+    if (scope !== FULL_WRITE && field !== scope) continue;
+    if (intent.generation > token.settingsGeneration) continue;
+    if (settings && matchesIntent(settings, intent)) {
+      if (issue === null) _fieldIntents.delete(field);
+      else intent.issue = issue;
+    } else if (issue === "failed" || scope === FULL_WRITE) {
+      // A failed retry cannot erase an earlier confirmed local save.
+      if (intent.issue !== "saved-locally") intent.issue = "failed";
     }
-  } else {
-    _writeIssues.delete(scope);
   }
-  if (issue) _writeIssues.set(scope, { generation, issue });
-  set({ syncIssue: [..._writeIssues.values()].some((s) => s.issue === "failed")
-    ? "failed" : _writeIssues.size > 0 ? "saved-locally" : null });
+  set({ syncIssue: syncIssue() });
 }
 
-function clearQueuedIssues(set: (partial: Partial<SyncedSettingsState>) => void) {
-  for (const [field, status] of _writeIssues) {
-    if (status.issue === "saved-locally") _writeIssues.delete(field);
+function clearQueuedIssues(settings: UserSettings, set: (partial: Partial<SyncedSettingsState>) => void) {
+  for (const [field, intent] of _fieldIntents) {
+    if (intent.issue === "saved-locally" && matchesIntent(settings, intent)) _fieldIntents.delete(field);
   }
-  set({ syncIssue: _writeIssues.size > 0 ? "failed" : null });
+  set({ syncIssue: syncIssue() });
 }
 
 function incrementInflight(map: Map<number, number>, sessionGeneration: number) {
@@ -186,8 +235,8 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     try {
       const result = await getSyncedSettings();
       if (isCurrent(token) && currentInflight(_inflightWrites) === 0) {
-        set({ settings: result.settings });
-        if (result.synced) clearQueuedIssues(set);
+        if (result.synced) clearQueuedIssues(result.settings, set);
+        set({ settings: settingsWithIntents(result.settings) });
       }
     } catch {
       // Keep the last local snapshot when the backend cannot be reached.
@@ -198,11 +247,12 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
 
   updateSettings: async (settings) => {
     const token = beginWrite();
-    set({ settings, isSyncing: true });
+    rememberSnapshot(token, settings, true);
+    set({ settings, isSyncing: true, syncIssue: syncIssue() });
     try {
       const result = await updateSyncedSettings(settings);
-      if (isCurrent(token)) set({ settings: result.settings });
-      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set);
+      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set, result.settings);
+      if (isCurrent(token)) set({ settings: settingsWithIntents(result.settings) });
     } catch {
       // Keep the optimistic value. A full write already saves locally when
       // the server is unreachable, so an error here was not saved at all.
@@ -215,38 +265,27 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
   updateSetting: async (section, key, value) => {
     const token = beginWrite();
     const scope = `${section}.${key}`;
-    // Optimistic update — apply locally first
-    set((s) => {
-      const json = JSON.parse(JSON.stringify(s.settings)) as Record<string, Record<string, unknown>>;
-      if (json[section]) {
-        json[section][key] = value;
-      }
-      return { settings: json as unknown as UserSettings, isSyncing: true };
+    _fieldIntents.set(scope, {
+      generation: token.settingsGeneration, section, key,
+      value: structuredClone(value), issue: null,
     });
+    // Optimistic update — apply locally first
+    set((s) => ({ settings: settingsWithIntents(s.settings), isSyncing: true, syncIssue: syncIssue() }));
     try {
       const result = await updateSettingCmd(section, key, value);
       const saved = result.settings;
-      writeOutcome(token, scope, result.synced ? null : "saved-locally", set);
+      writeOutcome(token, scope, result.synced ? null : "saved-locally", set, saved);
       if (isCurrent(token)) {
-        // Re-apply our intended value on top of the server response.
-        // The server PATCH deep-merges nested objects, so sending
-        // e.g. { shortcuts: {} } is a no-op from the server's
-        // perspective. Force-set the exact field we wrote.
-        const patched = JSON.parse(JSON.stringify(saved)) as Record<string, Record<string, unknown>>;
-        if (patched[section]) patched[section][key] = value;
-        const corrected = patched as unknown as UserSettings;
-        set({ settings: corrected });
-
-        // If the server response didn't match our intent (deep-merge
-        // semantics), do a background full PUT to correct the server.
-        const serverVal = JSON.stringify((saved as unknown as Record<string, Record<string, unknown>>)[section]?.[key]);
-        const intendedVal = JSON.stringify(value);
-        if (serverVal !== intendedVal) {
-          // Keep the correction in this write's lifetime so persistence
-          // failures and offline saves remain visible to the user.
-          const correctedResult = await updateSyncedSettings(corrected);
-          writeOutcome(token, FULL_WRITE, correctedResult.synced ? null : "saved-locally", set);
-        }
+        set({ settings: settingsWithIntents(saved) });
+      }
+      // Empty-map PATCHes deep-merge instead of clearing the map. Correct
+      // them even when another field was edited while this PATCH was pending.
+      const intent = _fieldIntents.get(scope);
+      if (sameSession(token) && intent?.generation === token.settingsGeneration && !matchesIntent(saved, intent)) {
+        const correctionToken = { ...token, settingsGeneration: _settingsGen };
+        const corrected = settingsWithIntents(get().settings);
+        const correctedResult = await updateSyncedSettings(corrected);
+        writeOutcome(correctionToken, FULL_WRITE, correctedResult.synced ? null : "saved-locally", set, correctedResult.settings);
       }
     } catch {
       // A single-field write has no offline path in the backend: it fails
@@ -254,10 +293,12 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
       // next refresh. A full write does save locally and syncs later, so
       // fall back to it with everything the user currently sees.
       if (!sameSession(token)) return;
+      const intent = _fieldIntents.get(scope);
+      if (!intent || intent.generation !== token.settingsGeneration) return;
       const fallbackToken = { ...token, settingsGeneration: _settingsGen };
       try {
-        const result = await updateSyncedSettings(get().settings);
-        writeOutcome(fallbackToken, FULL_WRITE, result.synced ? null : "saved-locally", set);
+        const result = await updateSyncedSettings(settingsWithIntents(get().settings));
+        writeOutcome(fallbackToken, FULL_WRITE, result.synced ? null : "saved-locally", set, result.settings);
       } catch {
         writeOutcome(token, scope, "failed", set);
       }
@@ -268,11 +309,12 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
 
   resetSettings: async () => {
     const token = beginWrite();
-    set({ settings: DEFAULT_SETTINGS, isSyncing: true });
+    rememberSnapshot(token, DEFAULT_SETTINGS, true);
+    set({ settings: DEFAULT_SETTINGS, isSyncing: true, syncIssue: syncIssue() });
     try {
       const result = await resetSyncedSettings();
-      if (isCurrent(token)) set({ settings: result.settings });
-      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set);
+      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set, result.settings);
+      if (isCurrent(token)) set({ settings: settingsWithIntents(result.settings) });
     } catch {
       // Keep the optimistic defaults. The backend owns offline persistence and
       // the next explicit refresh will reconcile them.
@@ -292,11 +334,13 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     ) {
       return;
     }
-    set({ settings });
-    if (synced) clearQueuedIssues(set);
+    if (synced) clearQueuedIssues(settings, set);
     else if (synced === false) {
-      writeOutcome({ sessionGeneration: _sessionGen, settingsGeneration: _settingsGen }, FULL_WRITE, "saved-locally", set);
+      const token = { sessionGeneration: _sessionGen, settingsGeneration: _settingsGen };
+      rememberSnapshot(token, settings, false);
+      writeOutcome(token, FULL_WRITE, "saved-locally", set, settings);
     }
+    set({ settings: settingsWithIntents(settings) });
   },
 
   remoteReconcileToken: () => {
@@ -322,8 +366,8 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     if (!isCurrent(token) || currentInflight(_inflightWrites) > 0) {
       return false;
     }
-    set({ settings, isLoading: false });
-    if (synced) clearQueuedIssues(set);
+    if (synced) clearQueuedIssues(settings, set);
+    set({ settings: settingsWithIntents(settings), isLoading: false });
     return true;
   },
 
@@ -334,8 +378,7 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     _settingsGen += 1;
     _inflightWrites.clear();
     _inflightRemoteReconciles.clear();
-    _writeIssues.clear();
-    _writeStatusGenerations.clear();
+    _fieldIntents.clear();
     set({ settings, isLoading: false, isSyncing: false, syncIssue: null });
   },
 }));
