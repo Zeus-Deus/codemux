@@ -21,6 +21,7 @@ import { normalizeKeyCombo } from "@/lib/keybind-utils";
 import { stepInterfaceSize } from "@/lib/typography";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
+import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
@@ -94,6 +95,7 @@ export function useKeyboardShortcuts() {
  * shortcut always execute the exact same code path.
  */
 export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
+  if (!isAppShortcutApplicable(actionId)) return false;
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
@@ -334,8 +336,6 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // Next / previous tab, wrapping at either end
   if (actionId === "nextTab" || actionId === "prevTab") {
-    // A single tab has nowhere to go: leave the key to whatever has focus.
-    if (ws.tabs.length < 2) return false;
     const at = ws.tabs.findIndex((t) => t.tab_id === ws.active_tab_id);
     const step = actionId === "nextTab" ? 1 : -1;
     const next = ws.tabs[(at + step + ws.tabs.length) % ws.tabs.length];
@@ -387,9 +387,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   if (actionId === "togglePaneZoom") {
-    // A lone pane already fills the surface; there is nothing to zoom, so the
-    // key stays with whatever has focus.
-    if (!surface || !activePaneId || surface.root.kind !== "split") return false;
+    if (!surface || !activePaneId) return false;
     usePaneZoomStore.getState().toggle(surface.surface_id, activePaneId);
     return true;
   }

@@ -9,8 +9,10 @@
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
 import { parseKeyCombo, normalizeKeyName } from "@/lib/keybind-utils";
 import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
+import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
 
 export interface AppShortcut {
+  actionId: string;
   key: string; // event.key (lowercase)
   ctrl: boolean;
   shift: boolean;
@@ -41,6 +43,7 @@ export function updateAppShortcuts(overrides: Record<string, string>) {
 
     const parsed = parseKeyCombo(entry.activeKeys);
     shortcuts.push({
+      actionId: id,
       key: parsed.key.toLowerCase(),
       ctrl: parsed.ctrl,
       shift: parsed.shift,
@@ -55,7 +58,7 @@ export function updateAppShortcuts(overrides: Record<string, string>) {
 updateAppShortcuts({});
 
 /**
- * Check if a keyboard event matches any app-level shortcut.
+ * Check if a keyboard event matches an applicable app-level shortcut.
  * Used by xterm's attachCustomKeyEventHandler to decide whether
  * to let the event bubble (return false) or keep it (return true).
  */
@@ -64,11 +67,12 @@ export function isAppShortcut(event: KeyboardEvent): boolean {
   // (via parseKeyCombo's canonical names) — otherwise Space, whose
   // event.key is " ", never matches its cached "space" entry.
   const key = normalizeKeyName(event.key).toLowerCase();
-  return _cached.some(
+  const shortcut = _cached.find(
     (s) =>
       s.key === key &&
       s.ctrl === event.ctrlKey &&
       s.shift === event.shiftKey &&
       s.alt === event.altKey,
   );
+  return !!shortcut && isAppShortcutApplicable(shortcut.actionId);
 }
