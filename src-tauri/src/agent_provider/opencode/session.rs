@@ -3082,6 +3082,82 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn native_held_stage_keeps_background_callback_and_user_execution_distinct() {
+        let mut server = DelayedNativeAdmissionPeer::start().await;
+        let (session, tx, mut events) = mock_session_api(
+            server.base_url.clone(), "pw".into(), "s", super::super::api::OpenCodeApi::V2,
+        ).await;
+        let sending = tokio::spawn({
+            let session = session.clone();
+            async move { session.enqueue_or_send(delivery_input("User X")).await }
+        });
+        let staged = server.next_request("POST", "/api/session/s/prompt").await;
+        let input_id = staged.body["id"].as_str().unwrap().to_string();
+        assert_eq!(staged.body["resume"], false);
+        assert_eq!(server.state.lock().await.wakes, 0);
+        let peer = SsePeer {
+            api: super::super::api::OpenCodeApi::V2,
+            ready: tokio::sync::watch::channel(true).0,
+            directory: None, session_id: "s".into(),
+            event_ctx: session.event_ctx.clone(), router: session.router.clone(),
+            dead: session.dead.clone(), usage: session.usage.clone(),
+        };
+        let event = |id: &str, kind: &str, data: serde_json::Value, seq: u64| {
+            serde_json::from_value::<super::super::v2::Event>(serde_json::json!({
+                "id":id,"type":kind,"created":0,"data":data,
+                "durable":{"aggregateID":"s","seq":seq,"version":1}
+            })).unwrap()
+        };
+        // The caller's admission remains masked/held while an independent
+        // background callback starts and settles. Its output cannot borrow X.
+        server.state.lock().await.active = true;
+        super::super::sse::handle_native(event("evt_b_start", "session.execution.started",
+            serde_json::json!({"sessionID":"s"}), 10), &peer, &tx).await;
+        let callback_turn = session.event_ctx.lock().await.turn_id.clone();
+        super::super::sse::handle_native(event("evt_b_text", "session.text.ended",
+            serde_json::json!({"sessionID":"s","assistantMessageID":"msg_b_assistant","ordinal":0,"text":"background B"}), 11), &peer, &tx).await;
+        super::super::sse::handle_native(event("evt_b_done", "session.execution.succeeded",
+            serde_json::json!({"sessionID":"s"}), 12), &peer, &tx).await;
+        server.state.lock().await.active = false;
+        assert!(!session.turn_active().await);
+        assert!(!sending.is_finished(), "the stage ACK must still be withheld");
+        server.release.send_replace(true);
+        let wake = server.next_request("POST", "/api/session/s/prompt").await;
+        assert_eq!(wake.body["id"], staged.body["id"]);
+        assert_eq!(wake.body["resume"], true);
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(3), sending)
+            .await.unwrap().unwrap().unwrap();
+        assert!(admitted.queued_id.is_none());
+        assert_ne!(admitted.turn_id, callback_turn,
+            "a callback completed before stage ACK must not consume the user's turn identity");
+        // Native Started precedes its first inbox drain. Delivery carries the
+        // exact client User ID, which associates this execution with X.
+        super::super::sse::handle_native(event("evt_x_start", "session.execution.started",
+            serde_json::json!({"sessionID":"s"}), 20), &peer, &tx).await;
+        server.state.lock().await.pending.remove(&input_id);
+        super::super::sse::handle_native(event("evt_x_delivered", "session.inbox.delivered",
+            serde_json::json!({"sessionID":"s","inboxID":input_id}), 21), &peer, &tx).await;
+        super::super::sse::handle_native(event("evt_x_text", "session.text.ended",
+            serde_json::json!({"sessionID":"s","assistantMessageID":"msg_x_assistant","ordinal":0,"text":"answer X"}), 22), &peer, &tx).await;
+        super::super::sse::handle_native(event("evt_x_done", "session.execution.succeeded",
+            serde_json::json!({"sessionID":"s"}), 23), &peer, &tx).await;
+        server.state.lock().await.active = false;
+        let observed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        for (text, turn) in [("background B", &callback_turn), ("answer X", &admitted.turn_id)] {
+            assert_eq!(observed.iter().filter(|event| matches!(event,
+                ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text: actual }, .. }
+                    if turn_id == turn && actual == text)).count(), 1);
+            assert_eq!(observed.iter().filter(|event| matches!(event,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn)).count(), 1);
+        }
+        assert!(!session.turn_active().await);
+        assert_eq!(server.state.lock().await.admitted.len(), 1);
+        assert_eq!(server.state.lock().await.wakes, 1);
+        session.shutdown().await.unwrap();
+        server.stop().await;
+    }
+
+    #[tokio::test]
     async fn native_shutdown_reports_unknown_admission_then_retries_after_owned_cleanup() {
         let mut peer = DelayedNativeAdmissionPeer::start().await;
         let (session, _, mut events) = mock_session_api(
