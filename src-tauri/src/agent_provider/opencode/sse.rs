@@ -4088,6 +4088,283 @@ mod tests {
         assert!(!p.event_ctx.lock().await.turn_active);
     }
 
+    async fn native_completed_user_fixture() -> (
+        SsePeer,
+        broadcast::Sender<ProviderRuntimeEvent>,
+        broadcast::Receiver<ProviderRuntimeEvent>,
+        TurnId,
+    ) {
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let user_turn = TurnId("completed_user_x".into());
+        p.router
+            .lock()
+            .await
+            .native
+            .remember_user_admission("root", "input_x", &user_turn.0);
+        let (tx, mut rx) = broadcast::channel(32);
+        for (id, kind, data, seq) in [
+            (
+                "evt_user_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                1,
+            ),
+            (
+                "evt_user_delivered",
+                "session.inbox.delivered",
+                serde_json::json!({"sessionID":"root","inboxID":"input_x"}),
+                2,
+            ),
+            (
+                "evt_user_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                10,
+            ),
+        ] {
+            handle_record(&native_record(id, kind, data, Some(seq)), &p, &tx).await;
+        }
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &user_turn))
+                .count(),
+            1
+        );
+        (p, tx, rx, user_turn)
+    }
+
+    #[tokio::test]
+    async fn native_empty_wake_after_completed_user_does_not_publish_a_phantom_turn() {
+        let (p, tx, mut rx, user_turn) = native_completed_user_fixture().await;
+        // The held stage ACK arrives after another execution delivered X.
+        // Repeating X's resume:true wake can start a native empty busy period.
+        handle_record(
+            &native_record(
+                "evt_empty_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(
+            p.router.lock().await.native.awaiting_execution("root"),
+            "the native busy period must still fence new admission"
+        );
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        assert!(
+            rx.try_recv().is_err(),
+            "Started alone must not publish a new Codemux turn"
+        );
+        handle_record(
+            &native_record(
+                "evt_empty_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(20),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(!p.router.lock().await.native.awaiting_execution("root"));
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!observed.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::TurnCompleted { .. }
+                | ProviderRuntimeEvent::ItemCompleted { .. }
+                | ProviderRuntimeEvent::SessionStateChanged {
+                    status: crate::agent_provider::SessionStatus::Running { .. },
+                    ..
+                }
+        )));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        status: crate::agent_provider::SessionStatus::Ready,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        handle_record(
+            &native_record(
+                "evt_empty_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(20),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate empty completion must not drain the queue twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_callback_content_claims_a_fresh_turn_after_unidentified_start() {
+        let (p, tx, mut rx, user_turn) = native_completed_user_fixture().await;
+        handle_record(
+            &native_record(
+                "evt_callback_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(p.router.lock().await.native.awaiting_execution("root"));
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        assert!(rx.try_recv().is_err());
+        handle_record(&native_record("evt_callback_text", "session.text.ended",
+            serde_json::json!({"sessionID":"root","assistantMessageID":"callback","ordinal":0,"text":"background answer"}), Some(12)), &p, &tx).await;
+        let callback_turn = p.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(callback_turn, user_turn);
+        assert!(p.event_ctx.lock().await.turn_active);
+        assert!(!p.router.lock().await.native.awaiting_execution("root"));
+        handle_record(
+            &native_record(
+                "evt_callback_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(20),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event,
+            ProviderRuntimeEvent::ItemCompleted { turn_id,
+                item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if turn_id == &callback_turn && text == "background answer"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &callback_turn))
+                .count(),
+            1
+        );
+        assert!(!observed.iter().any(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &user_turn)));
+        assert!(!p.event_ctx.lock().await.turn_active);
+    }
+
+    #[tokio::test]
+    async fn native_unidentified_failed_execution_preserves_its_error_on_a_fresh_turn() {
+        let (p, tx, mut rx, user_turn) = native_completed_user_fixture().await;
+        handle_record(
+            &native_record(
+                "evt_failed_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(p.router.lock().await.native.awaiting_execution("root"));
+        handle_record(&native_record("evt_failed_done", "session.execution.failed",
+            serde_json::json!({"sessionID":"root","error":{"type":"provider_unavailable","message":"provider refused execution"}}), Some(20)), &p, &tx).await;
+        let callback_turn = p.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(callback_turn, user_turn);
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(observed.iter().filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id,
+                status: crate::agent_provider::TurnStatus::Error { subtype, message }, .. }
+                if turn_id == &callback_turn && subtype == "provider_unavailable" && message == "provider refused execution")).count(), 1);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert!(!p.router.lock().await.native.awaiting_execution("root"));
+    }
+
+    #[tokio::test]
+    async fn native_delivered_user_empty_success_keeps_its_admitted_turn_identity() {
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let user_turn = TurnId("admitted_empty_user".into());
+        p.router
+            .lock()
+            .await
+            .native
+            .remember_user_admission("root", "input_empty", &user_turn.0);
+        let (tx, mut rx) = broadcast::channel(16);
+        handle_record(
+            &native_record(
+                "evt_admitted_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(1),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_admitted_delivery",
+                "session.inbox.delivered",
+                serde_json::json!({"sessionID":"root","inboxID":"input_empty"}),
+                Some(2),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(p.event_ctx.lock().await.turn_active);
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        handle_record(
+            &native_record(
+                "evt_admitted_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id,
+                status: crate::agent_provider::TurnStatus::Success, .. } if turn_id == &user_turn))
+                .count(),
+            1
+        );
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert!(!p.router.lock().await.native.awaiting_execution("root"));
+    }
+
     #[tokio::test]
     async fn native_live_root_start_resumes_after_parent_completion() {
         let mut p = peer("root");
