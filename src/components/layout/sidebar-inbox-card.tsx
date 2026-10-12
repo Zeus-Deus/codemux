@@ -4,9 +4,10 @@ import {
   AlarmClock,
   Check,
   CircleDotDashed,
-  Cloud,
+  Layers,
   Pin,
   PinOff,
+  Server,
   Terminal,
 } from "lucide-react";
 import { openExternalUrl } from "@/lib/open-url";
@@ -38,10 +39,14 @@ import { useProjectAppearance } from "./use-project-appearance";
 import { isRowActivationKey } from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
+import { getTimeFormat } from "@/stores/settings-store";
 import { CardProgressSweep } from "./sidebar-creating-card";
+import { useHosts } from "@/stores/hosts-store";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
+import type { HostView } from "@/tauri/commands";
 import { providerForWorkspace, providerRef } from "@/lib/source-control";
 import {
+  isSingleStack,
   prSetLabel,
   prSetSummary,
   workspacePrs,
@@ -57,6 +62,18 @@ export interface InboxRepo {
  *  so a card showing nothing there still can't pull its PR chip out past its
  *  neighbours'. */
 export const META_CLUSTER_MIN_WIDTH = 15;
+
+/** The device a workspace's thread runs on, or null for this machine.
+ *  `host_id` alone decides it. The hosts list loads asynchronously, so an id
+ *  it cannot resolve yet still gets a neutral name rather than letting the
+ *  sidebar pass a device thread off as local. */
+export function workspaceDeviceName(
+  hostId: number | null | undefined,
+  hosts: readonly HostView[],
+): string | null {
+  if (hostId == null) return null;
+  return hosts.find((h) => h.id === hostId)?.name ?? "Another device";
+}
 
 const PROVIDER_MARK_WIDTH = 14;
 const RUN_INDICATOR_WIDTH = 12;
@@ -76,8 +93,8 @@ const META_CLUSTER_GAP = 8;
  *  doesn't pay a permanent indent for indicators no card shows.
  *
  *  Applied as a `min-width`, not a fixed width, because unlike the source
- *  design this cluster can also carry a remote-host icon and a notification
- *  pill; those are per-card and rare, so they are allowed to push past the
+ *  design this cluster can also carry a device label and a notification pill;
+ *  those are per-card and rare, so they are allowed to push past the
  *  reservation rather than force every card to pay for them. */
 export function metaClusterWidth(
   maxProviderMarks: number,
@@ -150,7 +167,7 @@ interface Props {
 /** One active-workspace card in the flat sidebar inbox: repo eyebrow, work
  *  title + issue chip, optional blocker line (needs-you only), and a mono
  *  meta line, left-to-right: branch · ↑ahead · +/− — then, right-aligned,
- *  PR chip · provider marks / remote / notifications.
+ *  PR chip · device / running process / provider marks / notifications.
  *  The right side of the eyebrow shows the agent state, swapping to a
  *  "✓ Settle" button on hover/focus.
  *
@@ -188,6 +205,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   onMarkUnread,
 }: Props) {
   const appearance = useProjectAppearance(repo.path);
+  const hosts = useHosts();
 
   // Observe status transitions so elapsed labels (idle "26m") can be derived
   // client-side — the backend stamps no status-changed-at.
@@ -216,7 +234,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // nobody had opened — the exact cost that shows up with many workspaces.
   const [snoozePresets, setSnoozePresets] = useState<SnoozePreset[]>([]);
   const handleSnoozeMenuOpenChange = (open: boolean) => {
-    if (open) setSnoozePresets(computeSnoozePresets(Date.now()));
+    if (open) setSnoozePresets(computeSnoozePresets(Date.now(), getTimeFormat()));
     setSnoozeMenuOpen(open);
   };
 
@@ -248,8 +266,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     selectAndActivate();
   };
 
-  const isRemote =
-    workspace.host_id !== null && workspace.host_id !== undefined;
+  const deviceName = workspaceDeviceName(workspace.host_id, hosts);
 
   const isWorking = status === "working";
   const isNeeds = status === "permission";
@@ -328,6 +345,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const prState = prSummary.state ?? normalizePrState(workspace.pr_state);
   const primaryPr = prs[0] ?? null;
   const extraPrCount = prSummary.total - 1;
+  const prStack = isSingleStack(prs);
   // `scProvider` — the *hosting* product. Distinct from `providers`
   // above, which is the set of AI agent backends running in this
   // workspace's panes.
@@ -585,6 +603,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               role="button"
               tabIndex={0}
               data-inbox-card={workspace.workspace_id}
+              aria-current={isActive ? "page" : undefined}
               data-selected={selected || undefined}
               data-unread={unread || undefined}
               onClick={handleClick}
@@ -932,14 +951,26 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           "cursor-default opacity-65",
                     )}
                   >
-                    <PrStatusIcon
-                      state={prState}
-                      size={3}
-                      className={cn(
-                        "shrink-0",
-                        visuallyReceded && "text-current",
-                      )}
-                    />
+                    {/* A set that is one stack swaps the PR glyph for a
+                        stack glyph, so `+8` reads as "eight more layers on
+                        this one" rather than eight unrelated PRs. The set's
+                        state still rides on the chip's color. */}
+                    {prStack ? (
+                      <Layers
+                        aria-hidden
+                        data-pr-stack-icon
+                        className="size-3 shrink-0"
+                      />
+                    ) : (
+                      <PrStatusIcon
+                        state={prState}
+                        size={3}
+                        className={cn(
+                          "shrink-0",
+                          visuallyReceded && "text-current",
+                        )}
+                      />
+                    )}
                     {primaryPr && (
                       <span>{providerRef(scProvider, primaryPr.number)}</span>
                     )}
@@ -964,6 +995,25 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   className="flex shrink-0 items-center justify-end gap-2"
                   style={{ minWidth: `${metaClusterMinWidth}px` }}
                 >
+                  {/* Where the thread runs. Local cards show nothing: this
+                      machine is the default. Capped so a long device name
+                      can't push the PR chip far out of its column. */}
+                  {deviceName && (
+                    <span
+                      role="img"
+                      aria-label={`Runs on ${deviceName}`}
+                      title={`Runs on ${deviceName}`}
+                      className={cn(
+                        "flex max-w-[72px] shrink-0 items-center gap-1 transition-colors duration-150",
+                        visuallyReceded
+                          ? "text-muted-foreground/40 group-hover/card:text-muted-foreground/70 group-focus-within/card:text-muted-foreground/70"
+                          : "text-muted-foreground/70",
+                      )}
+                    >
+                      <Server aria-hidden className="size-3 shrink-0" />
+                      <span className="min-w-0 truncate">{deviceName}</span>
+                    </span>
+                  )}
                   {/* Long-running process. Distinct from the agent-state
                       readout on the eyebrow: that says whether an *agent* is
                       doing something, this says a dev server or watcher the
@@ -998,17 +1048,6 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       )}
                     />
                   ))}
-                  {isRemote && (
-                    <Cloud
-                      aria-label="Runs on a remote host"
-                      className={cn(
-                        "h-[13px] w-[13px] shrink-0 transition-colors duration-150",
-                        visuallyReceded
-                          ? "text-muted-foreground/40 group-hover/card:text-status-remote group-focus-within/card:text-status-remote"
-                          : "text-status-remote",
-                      )}
-                    />
-                  )}
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(

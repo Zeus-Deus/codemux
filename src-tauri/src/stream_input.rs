@@ -98,6 +98,31 @@ async fn send_msg(ws: &mut WsStream, msg: Value) -> Result<(), String> {
         .map_err(|e| format!("Failed to send stream message: {}", e))
 }
 
+/// Wait until the stream server has processed the preceding input messages.
+/// Closing immediately after enqueueing input can lose events when the server
+/// tries to send a screencast frame to the disconnected client. Its ordered
+/// receive loop handles the ping only after dispatching the input to CDP.
+async fn finish_input(mut ws: WsStream) -> Result<(), String> {
+    let marker = b"codemux-input-complete";
+    ws.send(Message::Ping(marker.to_vec().into()))
+        .await
+        .map_err(|e| format!("Failed to send input completion ping: {e}"))?;
+    timeout(Duration::from_secs(30), async {
+        while let Some(msg) = ws.next().await {
+            match msg.map_err(|e| format!("Input completion connection failed: {e}"))? {
+                Message::Pong(data) if data.as_ref() == marker => return Ok(()),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Err("Stream closed before input completion".to_string())
+    })
+    .await
+    .map_err(|_| "Timed out waiting for input completion".to_string())??;
+    let _ = ws.close(None).await;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Message builders
 // ---------------------------------------------------------------------------
@@ -129,39 +154,22 @@ fn kb_event(event_type: &str, key: &str, code: &str, text: &str, modifiers: i32,
 // ---------------------------------------------------------------------------
 
 pub async fn click_at(port: u16, x: f64, y: f64, click_type: &str) -> Result<String, String> {
-    // Pre-compute all random values before any .await (thread_rng is !Send)
-    let (points, delays, pause, dbl_pause) = {
-        let mut rng = rand::thread_rng();
-        let start_x = (x - 80.0 + rng.gen::<f64>() * 40.0).max(0.0);
-        let start_y = (y - 60.0 + rng.gen::<f64>() * 30.0).max(0.0);
-        let pts = generate_bezier_points((start_x, start_y), (x, y), 5);
-        let dls: Vec<u64> = (0..pts.len()).map(|_| 15 + rng.gen::<u64>() % 15).collect();
-        let p = 30 + rng.gen::<u64>() % 50;
-        let dp = 40 + rng.gen::<u64>() % 30;
-        (pts, dls, p, dp)
-    };
-
     let mut ws = connect_stream(port).await?;
-
-    for (i, (px, py)) in points.iter().enumerate() {
-        send_msg(&mut ws, mouse_event("mouseMoved", *px, *py, "none", 0, 0.0, 0.0, 0)).await?;
-        sleep(Duration::from_millis(delays[i])).await;
-    }
-
+    // CDP processes ordered input events; simulated travel adds latency
+    // without changing the target or the trusted mouse-event path.
     send_msg(&mut ws, mouse_event("mouseMoved", x, y, "none", 0, 0.0, 0.0, 0)).await?;
-    sleep(Duration::from_millis(pause)).await;
 
     let button = if click_type == "right" { "right" } else { "left" };
     send_msg(&mut ws, mouse_event("mousePressed", x, y, button, 1, 0.0, 0.0, 0)).await?;
     send_msg(&mut ws, mouse_event("mouseReleased", x, y, button, 1, 0.0, 0.0, 0)).await?;
 
     if click_type == "double" {
-        sleep(Duration::from_millis(dbl_pause)).await;
+        sleep(Duration::from_millis(50)).await;
         send_msg(&mut ws, mouse_event("mousePressed", x, y, "left", 2, 0.0, 0.0, 0)).await?;
         send_msg(&mut ws, mouse_event("mouseReleased", x, y, "left", 2, 0.0, 0.0, 0)).await?;
     }
 
-    let _ = ws.close(None).await;
+    finish_input(ws).await?;
     Ok(format!("Clicked ({click_type}) at ({x}, {y})"))
 }
 
@@ -170,15 +178,15 @@ pub async fn type_at(port: u16, text: &str, x: Option<f64>, y: Option<f64>) -> R
 
     if let (Some(cx), Some(cy)) = (x, y) {
         send_msg(&mut ws, mouse_event("mouseMoved", cx, cy, "none", 0, 0.0, 0.0, 0)).await?;
-        sleep(Duration::from_millis(50)).await;
         send_msg(&mut ws, mouse_event("mousePressed", cx, cy, "left", 1, 0.0, 0.0, 0)).await?;
         send_msg(&mut ws, mouse_event("mouseReleased", cx, cy, "left", 1, 0.0, 0.0, 0)).await?;
-        sleep(Duration::from_millis(100)).await;
     }
 
     for ch in text.chars() {
         if ch == '\n' {
-            send_msg(&mut ws, kb_event("rawKeyDown", "Enter", "Enter", "\r", 0, 13)).await?;
+            // keyDown dispatches the text-bearing character event; rawKeyDown
+            // alone does not insert a newline into textarea/contenteditable.
+            send_msg(&mut ws, kb_event("keyDown", "Enter", "Enter", "\r", 0, 13)).await?;
             send_msg(&mut ws, kb_event("keyUp", "Enter", "Enter", "", 0, 13)).await?;
         } else if ch == '\t' {
             send_msg(&mut ws, kb_event("rawKeyDown", "Tab", "Tab", "", 0, 9)).await?;
@@ -189,10 +197,9 @@ pub async fn type_at(port: u16, text: &str, x: Option<f64>, y: Option<f64>) -> R
             send_msg(&mut ws, kb_event("keyDown", &s, "", &s, 0, vk)).await?;
             send_msg(&mut ws, kb_event("keyUp", &s, "", "", 0, vk)).await?;
         }
-        sleep(Duration::from_millis(10)).await;
     }
 
-    let _ = ws.close(None).await;
+    finish_input(ws).await?;
     Ok(format!("Typed {} characters", text.len()))
 }
 
@@ -207,7 +214,7 @@ pub async fn scroll_at(port: u16, x: f64, y: f64, direction: &str, amount: i32) 
         _ => (0.0, (ticks as f64) * 120.0),
     };
     send_msg(&mut ws, mouse_event("mouseWheel", x, y, "none", 0, dx, dy, 0)).await?;
-    let _ = ws.close(None).await;
+    finish_input(ws).await?;
     Ok(format!("Scrolled {direction} by {ticks} ticks at ({x}, {y})"))
 }
 
@@ -216,20 +223,27 @@ pub async fn key_press(port: u16, key: &str) -> Result<String, String> {
     let (modifiers, base_key) = parse_key_combo(key);
 
     if let Some(info) = lookup_special_key(&base_key) {
-        send_msg(&mut ws, kb_event("rawKeyDown", info.key, info.code, "", modifiers, info.key_code)).await?;
+        // Enter and Space need character events for text insertion and
+        // focused-control activation; navigation keys need only key events.
+        let text = if modifiers == 0 {
+            match base_key.as_str() { "Enter" => "\r", "Space" | " " => " ", _ => "" }
+        } else { "" };
+        let event_type = if text.is_empty() { "rawKeyDown" } else { "keyDown" };
+        send_msg(&mut ws, kb_event(event_type, info.key, info.code, text, modifiers, info.key_code)).await?;
         send_msg(&mut ws, kb_event("keyUp", info.key, info.code, "", modifiers, info.key_code)).await?;
     } else if base_key.len() == 1 {
         let ch = base_key.chars().next().unwrap();
         let text = if modifiers == 0 { base_key.clone() } else { String::new() };
         let vk = if ch.is_ascii_alphabetic() { ch.to_ascii_uppercase() as u32 } else { 0 };
         let code = if ch.is_ascii_alphabetic() { format!("Key{}", ch.to_ascii_uppercase()) } else { String::new() };
-        send_msg(&mut ws, kb_event("rawKeyDown", &base_key, &code, &text, modifiers, vk)).await?;
+        let event_type = if text.is_empty() { "rawKeyDown" } else { "keyDown" };
+        send_msg(&mut ws, kb_event(event_type, &base_key, &code, &text, modifiers, vk)).await?;
         send_msg(&mut ws, kb_event("keyUp", &base_key, &code, "", modifiers, vk)).await?;
     } else {
         return Err(format!("Unknown key: {}", base_key));
     }
 
-    let _ = ws.close(None).await;
+    finish_input(ws).await?;
     Ok(format!("Pressed key: {key}"))
 }
 
@@ -253,7 +267,7 @@ pub async fn drag(port: u16, sx: f64, sy: f64, ex: f64, ey: f64) -> Result<Strin
     }
 
     send_msg(&mut ws, mouse_event("mouseReleased", ex, ey, "left", 1, 0.0, 0.0, 0)).await?;
-    let _ = ws.close(None).await;
+    finish_input(ws).await?;
     Ok(format!("Dragged from ({sx}, {sy}) to ({ex}, {ey})"))
 }
 
@@ -331,4 +345,56 @@ pub async fn handle_vision_action(port: u16, action: &str, params: Value, browse
         data: json!({ "result": text, "success": true }),
         message: Some(text),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn input_waits_for_dispatch_and_ignores_unrelated_pongs() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (dispatched_tx, mut dispatched_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::Pong(b"unrelated".to_vec().into())).await.unwrap();
+            let mut events = Vec::new();
+            while let Some(msg) = ws.next().await {
+                match msg.unwrap() {
+                    Message::Text(data) => {
+                        // Model a stream server that needs time to dispatch
+                        // input instead of merely receiving socket bytes.
+                        sleep(Duration::from_millis(5)).await;
+                        events.push(serde_json::from_str::<Value>(&data).unwrap());
+                    }
+                    Message::Ping(_) => {
+                        dispatched_tx.send(events).unwrap();
+                        ws.flush().await.unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        type_at(port, "a\né", Some(20.0), Some(30.0)).await.unwrap();
+        let events = dispatched_rx.try_recv().expect("input returned before the server dispatched it");
+        assert_eq!(events.len(), 9, "focus click and three complete keystrokes");
+        assert!(events.iter().any(|e| e["eventType"] == "keyDown" && e["key"] == "Enter" && e["text"] == "\r"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_reports_disconnect_before_dispatch_completion() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+        assert!(click_at(port, 20.0, 30.0, "left").await.is_err());
+        server.await.unwrap();
+    }
 }

@@ -1,0 +1,325 @@
+[
+  {
+    "name": "workflow_add_tasks",
+    "description": "Add bounded child tasks to this run. Reuse a stable idempotency_key when retrying the same request. Children inherit or narrow your permissions.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "tasks": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "access": {
+                "enum": [
+                  "read_only",
+                  "write"
+                ],
+                "type": "string"
+              },
+              "dependencies": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "id": {
+                "type": "string"
+              },
+              "output_schema": {
+                "type": [
+                  "object",
+                  "boolean",
+                  "null"
+                ]
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "route_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "prompt"
+            ],
+            "type": "object"
+          },
+          "maxItems": 500,
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks",
+        "idempotency_key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_list",
+    "description": "List this task and its descendants; statuses are evidence, not inferred from agent prose.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_wait",
+    "description": "Read child results or yield until they finish. If state is waiting, end your turn immediately; CodeMux will resume your task with results. Do not poll or launch native subagents.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 500,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_ids"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_message",
+    "description": "Send bounded guidance to this task or a descendant. It is delivered on the next dispatched attempt, without interrupting unrelated work.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "text",
+        "idempotency_key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_cancel",
+    "description": "Cancel this task or a descendant. Authority is revoked immediately; write ownership is retained until execution is known to have stopped.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "idempotency_key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_replace",
+    "description": "Replace a stopped child task. Creates a new generation and invalidates results that depend on its prior artifact.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "spec": {
+          "additionalProperties": false,
+          "properties": {
+            "access": {
+              "enum": [
+                "read_only",
+                "write"
+              ],
+              "type": "string"
+            },
+            "dependencies": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "output_schema": {
+              "type": [
+                "object",
+                "boolean",
+                "null"
+              ]
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "required": {
+              "type": "boolean"
+            },
+            "route_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scope": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "prompt"
+          ],
+          "type": "object"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "spec",
+        "idempotency_key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_retire",
+    "description": "Retire a child without deleting its evidence, conversation or files.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "idempotency_key"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_submit_result",
+    "description": "Submit the schema-validated JSON task result. Prose alone does not complete an attempt.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "additionalProperties": false,
+          "properties": {
+            "child_count": {
+              "const": 2,
+              "type": "integer"
+            },
+            "sum": {
+              "const": 42,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "sum",
+            "child_count"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "output"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_read_file",
+    "description": "Read a UTF-8 file inside this attempt checkout, at most 2 MiB",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_list_files",
+    "description": "List files in this attempt checkout",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "workflow_read_dependency_file",
+    "description": "Read an accepted dependency's file; task_id must be a declared or awaited successful dependency",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "path"
+      ],
+      "type": "object"
+    }
+  }
+]
