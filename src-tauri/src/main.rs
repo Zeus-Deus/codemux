@@ -4,6 +4,9 @@
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+mod vblank_fallback;
+
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 fn hide_console_for_release_build() {
     // Raw FFI to kernel32 + user32 — kept inline to avoid pulling in winapi/

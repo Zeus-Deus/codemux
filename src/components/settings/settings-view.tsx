@@ -177,7 +177,6 @@ import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { UsageSection } from "./usage-section";
 import { SkillsSection } from "./skills-section";
-import { SmoothScrollingSection } from "./smooth-scrolling-section";
 import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -1601,9 +1600,6 @@ export function SettingsView() {
                 </SettingRow>
               </div>
             </SectionGroup>
-
-            {/* Linux WebKitGTK only — renders null everywhere else. */}
-            <SmoothScrollingSection />
 
             <SectionGroup>
               <SubsectionHeader
