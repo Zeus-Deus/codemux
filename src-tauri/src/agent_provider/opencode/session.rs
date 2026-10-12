@@ -1104,10 +1104,66 @@ impl OpenCodeSession {
                 None => ("prompt_async", serde_json::to_value(&prompt).unwrap()),
             }
         };
+        if native_v2
+            && !steer
+            && self
+                .router
+                .lock()
+                .await
+                .native
+                .awaiting_execution(&self.provider_session_id.0)
+        {
+            // The active snapshot can fall between a terminal commit and its
+            // coordinator cleanup. Resolve that uncertainty with a read-only,
+            // bounded probe; do not wait for idle or block the SSE listener.
+            let response = self
+                .http
+                .get(format!(
+                    "{}/api/session/active",
+                    self.server_handle.base_url.trim_end_matches('/')
+                ))
+                .basic_auth("opencode", Some(&self.server_handle.server_password))
+                .timeout(NATIVE_SHUTDOWN_GRACE)
+                .send()
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: format!("native_active_probe_failed: {e}"),
+                })?
+                .error_for_status()
+                .map_err(|e| ProviderError::RpcError {
+                    message: format!("native_active_probe_failed: {e}"),
+                })?;
+            let active: serde_json::Value =
+                response.json().await.map_err(|e| ProviderError::RpcError {
+                    message: format!("native_active_probe_decode_failed: {e}"),
+                })?;
+            let sessions = active["data"]
+                .as_object()
+                .ok_or_else(|| ProviderError::RpcError {
+                    message: "native_active_probe_missing_data".into(),
+                })?;
+            if sessions.contains_key(&self.provider_session_id.0) {
+                return Ok(None);
+            }
+            self.router
+                .lock()
+                .await
+                .native
+                .clear_deferred_execution(&self.provider_session_id.0);
+        }
         let turn_id = {
             let mut ctx = self.event_ctx.lock().await;
             self.ensure_open()?;
-            if native_v2 && !steer && ctx.turn_active {
+            if native_v2
+                && !steer
+                && (ctx.turn_active
+                    || self
+                        .router
+                        .lock()
+                        .await
+                        .native
+                        .awaiting_execution(&self.provider_session_id.0))
+            {
                 return Ok(None);
             }
             if let Some(checkpoint) = &checkpoint {
@@ -1117,6 +1173,15 @@ impl OpenCodeSession {
                 ctx.turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
             }
             ctx.turn_active = true;
+            if native_v2 && endpoint == "prompt" {
+                if let Some(id) = body["id"].as_str() {
+                    self.router.lock().await.native.remember_user_admission(
+                        &self.provider_session_id.0,
+                        id,
+                        &ctx.turn_id.0,
+                    );
+                }
+            }
             ctx.turn_id.clone()
         };
         if !steer {
