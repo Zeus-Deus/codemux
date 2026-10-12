@@ -176,6 +176,107 @@ async fn real_opencode_models_approvals_tools_interrupt_and_resume() {
         .expect("Native child listing must use this server's dialect")
         .is_empty());
 
+    if expected == OpenCodeApi::V2 {
+        let user_id = &history
+            .iter()
+            .find(|message| message.info.role == "user")
+            .expect("The qualified native turn must retain its exact User identity")
+            .info
+            .id;
+        let http = reqwest::Client::new();
+        let session_url = format!(
+            "{}/api/session/{}",
+            handle.base_url.trim_end_matches('/'),
+            urlencoding::encode(&session.session_id.0)
+        );
+        let history_url = format!("{session_url}/message?limit=200&order=desc");
+        let before: serde_json::Value = http
+            .get(&history_url)
+            .basic_auth("opencode", Some(&handle.server_password))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let previous_idles: Vec<String> = before["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["type"] == "idle")
+            .map(|message| message["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!previous_idles.is_empty());
+        // Native idempotent admission still wakes an idle session. Its empty
+        // busy period must not become a second Codemux turn for this User.
+        http.post(format!("{session_url}/prompt"))
+            .basic_auth("opencode", Some(&handle.server_password))
+            .json(&json!({
+                "id":user_id,
+                "text":"OC_FIXTURE_EDIT: create opencode-proof.txt in this checkout",
+                "resume":true,
+                "delivery":"queue"
+            }))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let after: serde_json::Value = http
+                    .get(&history_url)
+                    .basic_auth("opencode", Some(&handle.server_password))
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if after["data"].as_array().unwrap().iter().any(|message| {
+                    message["type"] == "idle"
+                        && message["outcome"] == "succeeded"
+                        && message["id"]
+                            .as_str()
+                            .is_some_and(|id| !previous_idles.iter().any(|old| old == id))
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("Same-ID native wake must commit a new successful idle boundary");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, stream.next()).await {
+            let exposed = match &event {
+                ProviderRuntimeEvent::SessionStateChanged { thread_id, status }
+                    if thread_id == &thread =>
+                {
+                    !matches!(status, codemux_lib::agent_provider::SessionStatus::Ready)
+                }
+                ProviderRuntimeEvent::TurnCompleted { thread_id, .. }
+                | ProviderRuntimeEvent::ContentDelta { thread_id, .. }
+                | ProviderRuntimeEvent::ItemCompleted { thread_id, .. } => thread_id == &thread,
+                _ => false,
+            };
+            assert!(
+                !exposed,
+                "An acknowledged same-ID empty native wake must remain silent: {event:?}"
+            );
+        }
+    }
+
     let held = provider
         .send_turn(turn_input(
             &thread.0,
