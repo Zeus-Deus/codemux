@@ -557,6 +557,15 @@ async fn handle_record(
     }
 }
 
+fn admit_native_root(ctx: &mut EventContext) {
+    // A background execution restored while idle needs its own identity;
+    // a user turn already admitted locally keeps the identity it was given.
+    if !ctx.turn_active {
+        ctx.turn_id = crate::agent_provider::TurnId(format!("turn_{}", uuid::Uuid::new_v4()));
+        ctx.turn_active = true;
+    }
+}
+
 pub(super) async fn handle_native(
     event: super::v2::Event,
     peer: &SsePeer,
@@ -616,10 +625,8 @@ pub(super) async fn handle_native(
         // A background child's callback can admit a new root execution after
         // the user turn settled. Only a live start accepted by the reducer
         // may reactivate it; recovery and replay filtering happen above.
-        if subagent.is_none() && matches!(&update, super::v2::Update::Started) && !live.turn_active
-        {
-            live.turn_id = crate::agent_provider::TurnId(format!("turn_{}", uuid::Uuid::new_v4()));
-            live.turn_active = true;
+        if subagent.is_none() && matches!(&update, super::v2::Update::Started) {
+            admit_native_root(&mut live);
         }
         // Root content that precedes attachment is already in durable history.
         // Child callbacks and lifecycle remain live after the parent settles.
