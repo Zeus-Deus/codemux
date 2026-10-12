@@ -10,7 +10,7 @@ import type {
   RevisionHeartbeat,
   TerminalStatusPayload,
   ThemeColors,
-  UserSettings,
+  SettingsPersistence,
 } from "./types";
 import type { AutomationRunView } from "./commands";
 
@@ -131,9 +131,9 @@ export const onGitCloneProgress = (
   listen<GitCloneProgress>(GIT_CLONE_PROGRESS_EVENT, (e) => cb(e.payload));
 
 export const onSettingsSynced = (
-  cb: EventCallback<UserSettings>,
+  cb: EventCallback<SettingsPersistence>,
 ): Promise<UnlistenFn> =>
-  listen<UserSettings>("settings-synced", (e) => cb(e.payload));
+  listen<SettingsPersistence>("settings-synced", (e) => cb(e.payload));
 
 export const onAuthStateChanged = (
   cb: EventCallback<AuthStatePayload>,

@@ -2,7 +2,7 @@ use tauri::{Emitter, State};
 
 use crate::auth::{is_token_expired, load_cached_user, load_token, AuthState};
 use crate::database::DatabaseStore;
-use crate::settings_sync::{self, UserSettings};
+use crate::settings_sync::{self, SettingsPersistence, UserSettings};
 
 enum SettingsSession {
     Verified { token: String, user_id: String },
@@ -25,7 +25,10 @@ fn get_settings_session(db: &DatabaseStore, auth_state: &AuthState) -> (u64, Set
     })
 }
 
-fn emit_settings_synced<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &UserSettings) {
+fn emit_settings_synced<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    settings: &SettingsPersistence,
+) {
     let _ = app.emit("settings-synced", settings);
 }
 
@@ -34,7 +37,7 @@ pub async fn get_synced_settings<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
-) -> Result<UserSettings, String> {
+) -> Result<SettingsPersistence, String> {
     let (session_generation, session) = get_settings_session(&db, &auth_state);
     let (token, user_id) = match session {
         SettingsSession::Verified { token, user_id } => (token, user_id),
@@ -47,7 +50,9 @@ pub async fn get_synced_settings<R: tauri::Runtime>(
         // Returning bare defaults here would let a refresh silently revert
         // edits the user just made in the UI.
         SettingsSession::PendingIdentity | SettingsSession::SignedOut => {
-            return Ok(settings_sync::load_cache().unwrap_or_default())
+            return Ok(SettingsPersistence::queued(
+                settings_sync::load_cache().unwrap_or_default(),
+            ))
         }
     };
 
@@ -56,8 +61,9 @@ pub async fn get_synced_settings<R: tauri::Runtime>(
     match settings_sync::sync_settings_for_owner(&token, &user_id).await {
         Ok(s) => auth_state
             .commit_if_session_current(session_generation, || {
-                emit_settings_synced(&app, &s);
-                s
+                let result = SettingsPersistence::synced(s);
+                emit_settings_synced(&app, &result);
+                result
             })
             .ok_or_else(|| "Authentication changed while settings were loading".into()),
         Err(_) => {
@@ -67,7 +73,9 @@ pub async fn get_synced_settings<R: tauri::Runtime>(
             {
                 return Err("Authentication changed while settings were loading".into());
             }
-            Ok(settings_sync::load_cache().unwrap_or_default())
+            Ok(SettingsPersistence::queued(
+                settings_sync::load_cache().unwrap_or_default(),
+            ))
         }
     }
 }
@@ -78,7 +86,7 @@ pub async fn update_synced_settings<R: tauri::Runtime>(
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
     settings: UserSettings,
-) -> Result<UserSettings, String> {
+) -> Result<SettingsPersistence, String> {
     let (session_generation, session) = get_settings_session(&db, &auth_state);
     let (token, user_id) = match session {
         SettingsSession::Verified { token, user_id } => (token, user_id),
@@ -94,8 +102,9 @@ pub async fn update_synced_settings<R: tauri::Runtime>(
             return auth_state
                 .commit_if_session_current(session_generation, || {
                     settings_sync::save_cache_dirty(&settings)?;
-                    emit_settings_synced(&app, &settings);
-                    Ok(settings)
+                    let result = SettingsPersistence::queued(settings);
+                    emit_settings_synced(&app, &result);
+                    Ok(result)
                 })
                 .unwrap_or_else(|| {
                     Err("Authentication changed while settings were updating".into())
@@ -120,7 +129,7 @@ pub async fn update_setting<R: tauri::Runtime>(
     section: String,
     key: String,
     value: serde_json::Value,
-) -> Result<UserSettings, String> {
+) -> Result<SettingsPersistence, String> {
     let mut partial_section = serde_json::Map::new();
     partial_section.insert(key.clone(), value.clone());
     let mut partial_root = serde_json::Map::new();
@@ -150,8 +159,9 @@ pub async fn update_setting<R: tauri::Runtime>(
                     let merged: UserSettings =
                         serde_json::from_value(current_val).unwrap_or_default();
                     settings_sync::save_cache_dirty(&merged)?;
-                    emit_settings_synced(&app, &merged);
-                    Ok(merged)
+                    let result = SettingsPersistence::queued(merged);
+                    emit_settings_synced(&app, &result);
+                    Ok(result)
                 })
                 .unwrap_or_else(|| {
                     Err("Authentication changed while settings were updating".into())
@@ -159,7 +169,9 @@ pub async fn update_setting<R: tauri::Runtime>(
         }
     };
 
-    let result = settings_sync::patch_settings_for_owner(&token, &user_id, partial).await?;
+    let result = SettingsPersistence::synced(
+        settings_sync::patch_settings_for_owner(&token, &user_id, partial).await?,
+    );
     auth_state
         .commit_if_session_current(session_generation, || {
             emit_settings_synced(&app, &result);
@@ -173,7 +185,7 @@ pub async fn reset_synced_settings<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
-) -> Result<UserSettings, String> {
+) -> Result<SettingsPersistence, String> {
     let defaults = UserSettings::default();
 
     let (session_generation, session) = get_settings_session(&db, &auth_state);
@@ -188,8 +200,9 @@ pub async fn reset_synced_settings<R: tauri::Runtime>(
             return auth_state
                 .commit_if_session_current(session_generation, || {
                     settings_sync::save_cache_dirty(&defaults)?;
-                    emit_settings_synced(&app, &defaults);
-                    Ok(defaults)
+                    let result = SettingsPersistence::queued(defaults);
+                    emit_settings_synced(&app, &result);
+                    Ok(result)
                 })
                 .unwrap_or_else(|| {
                     Err("Authentication changed while settings were resetting".into())
@@ -199,14 +212,17 @@ pub async fn reset_synced_settings<R: tauri::Runtime>(
             return auth_state
                 .commit_if_session_current(session_generation, || {
                     settings_sync::clear_cache();
-                    emit_settings_synced(&app, &defaults);
-                    defaults
+                    let result = SettingsPersistence::synced(defaults);
+                    emit_settings_synced(&app, &result);
+                    result
                 })
                 .ok_or_else(|| "Authentication changed while settings were resetting".into());
         }
     };
 
-    let result = settings_sync::delete_settings_for_owner(&token, &user_id).await?;
+    let result = SettingsPersistence::synced(
+        settings_sync::delete_settings_for_owner(&token, &user_id).await?,
+    );
     auth_state
         .commit_if_session_current(session_generation, || {
             emit_settings_synced(&app, &result);
@@ -287,7 +303,8 @@ mod tests {
         .await
         .expect("pending-identity edits must save locally, not error");
 
-        assert_eq!(result, settings);
+        assert_eq!(result.settings, settings);
+        assert!(!result.synced);
         assert_eq!(settings_sync::load_cache(), Some(settings));
         assert!(
             settings_sync::is_dirty(),
@@ -315,7 +332,8 @@ mod tests {
         .await
         .expect("pending-identity edits must save locally, not error");
 
-        assert_eq!(result.appearance.theme, "dark");
+        assert_eq!(result.settings.appearance.theme, "dark");
+        assert!(!result.synced);
         assert_eq!(
             settings_sync::load_cache().map(|s| s.appearance.theme),
             Some("dark".into())
@@ -340,7 +358,8 @@ mod tests {
         let result = get_synced_settings(handle.clone(), handle.state(), handle.state())
             .await
             .expect("pending-identity read must answer from the local cache");
-        assert_eq!(result, local);
+        assert_eq!(result.settings, local);
+        assert!(!result.synced);
         settings_sync::clear_cache();
     }
 
@@ -359,7 +378,8 @@ mod tests {
             .await
             .expect("pending-identity reset must land locally, not error");
 
-        assert_eq!(result, UserSettings::default());
+        assert_eq!(result.settings, UserSettings::default());
+        assert!(!result.synced);
         assert_eq!(settings_sync::load_cache(), Some(UserSettings::default()));
         assert!(
             settings_sync::is_dirty(),

@@ -254,6 +254,12 @@ export interface BrowserSyncSettings {
   default_viewport: string | null;
 }
 
+/** The backend reports whether this snapshot reached the account. */
+export interface SettingsPersistence {
+  settings: UserSettings;
+  synced: boolean;
+}
+
 export interface UserSettings {
   appearance: AppearanceSettings;
   editor: EditorSettings;

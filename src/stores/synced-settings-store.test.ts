@@ -7,12 +7,18 @@ const mockUpdateSyncedSettings = vi.fn();
 const mockUpdateSetting = vi.fn();
 const mockResetSyncedSettings = vi.fn();
 
-vi.mock("@/tauri/commands", () => ({
-  getSyncedSettings: (...args: unknown[]) => mockGetSyncedSettings(...args),
-  updateSyncedSettings: (...args: unknown[]) => mockUpdateSyncedSettings(...args),
-  updateSetting: (...args: unknown[]) => mockUpdateSetting(...args),
-  resetSyncedSettings: (...args: unknown[]) => mockResetSyncedSettings(...args),
-}));
+vi.mock("@/tauri/commands", () => {
+  const result = async (request: Promise<UserSettings | SettingsPersistence>) => {
+    const value = await request;
+    return "settings" in value ? value : { settings: value, synced: true };
+  };
+  return {
+    getSyncedSettings: (...args: unknown[]) => result(mockGetSyncedSettings(...args)),
+    updateSyncedSettings: (...args: unknown[]) => result(mockUpdateSyncedSettings(...args)),
+    updateSetting: (...args: unknown[]) => result(mockUpdateSetting(...args)),
+    resetSyncedSettings: (...args: unknown[]) => result(mockResetSyncedSettings(...args)),
+  };
+});
 
 import {
   useSyncedSettingsStore,
@@ -26,7 +32,7 @@ import {
   selectBrowserDefaultViewport,
   parseViewportString,
 } from "./synced-settings-store";
-import type { UserSettings } from "@/tauri/types";
+import type { UserSettings, SettingsPersistence } from "@/tauri/types";
 
 const DARK_SETTINGS: UserSettings = {
   appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 16, show_resource_monitor: true },
@@ -42,8 +48,16 @@ const DARK_SETTINGS: UserSettings = {
   browser: { default_viewport: "2560x1440" },
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 describe("synced-settings-store", () => {
   beforeEach(() => {
+    useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
     useSyncedSettingsStore.setState({
       settings: DEFAULT_SETTINGS,
       isLoading: true,
@@ -111,6 +125,29 @@ describe("synced-settings-store", () => {
   });
 
   describe("updateSettings", () => {
+    it("reports an offline full write and clears the queue only after confirmed reconciliation", async () => {
+      mockUpdateSyncedSettings.mockResolvedValue({ settings: DARK_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+
+      mockGetSyncedSettings.mockResolvedValue({ settings: DARK_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().loadSettings();
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      mockGetSyncedSettings.mockResolvedValue({ settings: DARK_SETTINGS, synced: true });
+      await useSyncedSettingsStore.getState().loadSettings();
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("does not let an older full write clear a newer failed reset", async () => {
+      const old = deferred<UserSettings>();
+      mockUpdateSyncedSettings.mockReturnValue(old.promise);
+      const write = useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+      mockResetSyncedSettings.mockRejectedValue(new Error("reset failed"));
+      await useSyncedSettingsStore.getState().resetSettings();
+      old.resolve(DARK_SETTINGS);
+      await write;
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+    });
     it("optimistically updates and syncs", async () => {
       mockUpdateSyncedSettings.mockResolvedValue(DARK_SETTINGS);
 
@@ -138,6 +175,65 @@ describe("synced-settings-store", () => {
   });
 
   describe("updateSetting", () => {
+    it("does not dispatch a fallback after the request's account was replaced", async () => {
+      const old = deferred<UserSettings>();
+      mockUpdateSetting.mockReturnValue(old.promise);
+      const write = useSyncedSettingsStore.getState().updateSetting("appearance", "theme", "old-account");
+      useSyncedSettingsStore.getState().replaceSessionSettings(DARK_SETTINGS);
+      old.reject(new Error("account changed"));
+      await write;
+      expect(mockUpdateSyncedSettings).not.toHaveBeenCalled();
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("reports an online full fallback as synced", async () => {
+      mockUpdateSetting.mockRejectedValue(new Error("PATCH rejected"));
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => ({ settings, synced: true }));
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("does not let an older PATCH success hide a newer failed edit", async () => {
+      const old = deferred<UserSettings>();
+      mockUpdateSetting.mockReturnValueOnce(old.promise).mockRejectedValueOnce(new Error("PATCH failed"));
+      mockUpdateSyncedSettings.mockRejectedValue(new Error("PUT failed"));
+      const write = useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      await useSyncedSettingsStore.getState().updateSetting("terminal", "cursor_style", "block");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+      old.resolve({ ...DEFAULT_SETTINGS, git: { default_base_branch: "dev" } });
+      await write;
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+
+      // Even a newer unrelated PATCH cannot confirm the failed cursor edit.
+      mockUpdateSetting.mockResolvedValue({ ...DEFAULT_SETTINGS, git: { default_base_branch: "other" } });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "other");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+    });
+
+    it("keeps a fallback scoped to its account until it completes", async () => {
+      const fallback = deferred<SettingsPersistence>();
+      mockUpdateSetting.mockRejectedValue(new Error("PATCH failed"));
+      mockUpdateSyncedSettings.mockReturnValue(fallback.promise);
+      const write = useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      await vi.waitFor(() => expect(mockUpdateSyncedSettings).toHaveBeenCalled());
+      useSyncedSettingsStore.getState().replaceSessionSettings(DARK_SETTINGS);
+      fallback.resolve({ settings: DEFAULT_SETTINGS, synced: false });
+      await write;
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+    });
+
+    it("reports a signed-out PATCH as locally queued", async () => {
+      mockUpdateSetting.mockResolvedValue({ settings: DARK_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().updateSetting("appearance", "theme", "dark");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DARK_SETTINGS, false);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DARK_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
     it("updates a single field", async () => {
       const returned = {
         ...DEFAULT_SETTINGS,
@@ -156,7 +252,7 @@ describe("synced-settings-store", () => {
 
     it("falls back to a full write that keeps the edit locally when the single-field write fails", async () => {
       mockUpdateSetting.mockRejectedValue("Network error: offline");
-      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => settings);
+      mockUpdateSyncedSettings.mockImplementation(async (settings: UserSettings) => ({ settings, synced: false }));
 
       await useSyncedSettingsStore.getState().updateSetting("terminal", "cursor_style", "block");
 

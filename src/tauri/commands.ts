@@ -22,6 +22,7 @@ import type {
 import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
+  SettingsPersistence,
   PresetLaunchConfig,
   AppStateSnapshot,
   AuthResponse,
@@ -254,16 +255,16 @@ export const importSkillsFromFile = (filePath: string) =>
 // ── Settings Sync ──
 
 export const getSyncedSettings = () =>
-  invoke<UserSettings>("get_synced_settings");
+  invoke<SettingsPersistence>("get_synced_settings");
 
 export const updateSyncedSettings = (settings: UserSettings) =>
-  invoke<UserSettings>("update_synced_settings", { settings });
+  invoke<SettingsPersistence>("update_synced_settings", { settings });
 
 export const updateSetting = (section: string, key: string, value: unknown) =>
-  invoke<UserSettings>("update_setting", { section, key, value });
+  invoke<SettingsPersistence>("update_setting", { section, key, value });
 
 export const resetSyncedSettings = () =>
-  invoke<UserSettings>("reset_synced_settings");
+  invoke<SettingsPersistence>("reset_synced_settings");
 
 // ── Resource Monitor ──
 

@@ -327,7 +327,10 @@ pub async fn refresh_session<R: tauri::Runtime>(
             Ok(auth_state
                 .commit_if_session_current(session_generation, || {
                     if settings_synced {
-                        let _ = app.emit("settings-synced", &settings);
+                        let _ = app.emit(
+                            "settings-synced",
+                            &crate::settings_sync::SettingsPersistence::synced(settings.clone()),
+                        );
                     }
                     let _ = app.emit(
                         "sync-state-changed",
@@ -541,7 +544,9 @@ pub fn sign_out<R: tauri::Runtime>(
     // Reset frontend settings store to defaults before auth-state-changed
     let _ = app.emit(
         "settings-synced",
-        &crate::settings_sync::UserSettings::default(),
+        &crate::settings_sync::SettingsPersistence::synced(
+            crate::settings_sync::UserSettings::default(),
+        ),
     );
 
     let payload = AuthStatePayload {

@@ -35,9 +35,9 @@ const DEFAULT_SETTINGS: UserSettings = {
   browser: { default_viewport: null },
 };
 
-/** How the last write went when it did not reach your account:
+/** Outstanding writes that did not reach your account:
  *  `saved-locally` is on this machine and syncs on the next refresh;
- *  `failed` was not saved anywhere. `null` once a write succeeds. */
+ *  `failed` was not saved anywhere. `null` once all edits have synced. */
 export type SyncIssue = "saved-locally" | "failed";
 
 export interface SyncedSettingsState {
@@ -52,7 +52,7 @@ interface SyncedSettingsActions {
   updateSettings: (settings: UserSettings) => Promise<void>;
   updateSetting: (section: string, key: string, value: unknown) => Promise<void>;
   resetSettings: () => Promise<void>;
-  applySettingsFromEvent: (settings: UserSettings) => void;
+  applySettingsFromEvent: (settings: UserSettings, synced?: boolean) => void;
   /** Capture before a remote account refresh; its result only applies while
    * no newer local write or session replacement has happened. */
   remoteReconcileToken: () => SettingsOperationToken;
@@ -60,6 +60,7 @@ interface SyncedSettingsActions {
   reconcileRemoteSettings: (
     settings: UserSettings,
     token: SettingsOperationToken,
+    synced?: boolean,
   ) => boolean;
   replaceSessionSettings: (settings: UserSettings) => void;
 }
@@ -88,6 +89,43 @@ interface SettingsOperationToken {
 
 const _inflightWrites = new Map<number, number>();
 const _inflightRemoteReconciles = new Map<number, number>();
+// A PATCH only confirms its own field. A full snapshot covers all edits up
+// to its captured generation, including edits whose PATCH is still pending.
+const _writeIssues = new Map<string, { generation: number; issue: SyncIssue }>();
+const _writeStatusGenerations = new Map<string, number>();
+const FULL_WRITE = "*";
+
+function writeOutcome(
+  token: SettingsOperationToken,
+  scope: string,
+  issue: SyncIssue | null,
+  set: (partial: Partial<SyncedSettingsState>) => void,
+) {
+  if (!sameSession(token)) return;
+  const generation = token.settingsGeneration;
+  if (generation < Math.max(
+    _writeStatusGenerations.get(scope) ?? 0,
+    _writeStatusGenerations.get(FULL_WRITE) ?? 0,
+  )) return;
+  _writeStatusGenerations.set(scope, generation);
+  if (scope === FULL_WRITE && issue !== "failed") {
+    for (const [field, status] of _writeIssues) {
+      if (status.generation <= generation) _writeIssues.delete(field);
+    }
+  } else {
+    _writeIssues.delete(scope);
+  }
+  if (issue) _writeIssues.set(scope, { generation, issue });
+  set({ syncIssue: [..._writeIssues.values()].some((s) => s.issue === "failed")
+    ? "failed" : _writeIssues.size > 0 ? "saved-locally" : null });
+}
+
+function clearQueuedIssues(set: (partial: Partial<SyncedSettingsState>) => void) {
+  for (const [field, status] of _writeIssues) {
+    if (status.issue === "saved-locally") _writeIssues.delete(field);
+  }
+  set({ syncIssue: _writeIssues.size > 0 ? "failed" : null });
+}
 
 function incrementInflight(map: Map<number, number>, sessionGeneration: number) {
   map.set(sessionGeneration, (map.get(sessionGeneration) ?? 0) + 1);
@@ -143,15 +181,16 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
   syncIssue: null,
 
   loadSettings: async () => {
-    const sessionGeneration = _sessionGen;
+    const token = { sessionGeneration: _sessionGen, settingsGeneration: _settingsGen };
     set({ isLoading: true });
     try {
-      const settings = await getSyncedSettings();
-      if (sessionGeneration === _sessionGen) {
-        set({ settings, isLoading: false });
+      const result = await getSyncedSettings();
+      if (isCurrent(token) && currentInflight(_inflightWrites) === 0) {
+        set({ settings: result.settings, isLoading: false });
+        if (result.synced) clearQueuedIssues(set);
       }
     } catch {
-      if (sessionGeneration === _sessionGen) set({ isLoading: false });
+      if (sameSession(token)) set({ isLoading: false });
     }
   },
 
@@ -159,13 +198,13 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     const token = beginWrite();
     set({ settings, isSyncing: true });
     try {
-      const saved = await updateSyncedSettings(settings);
-      if (isCurrent(token)) set({ settings: saved });
-      if (sameSession(token)) set({ syncIssue: null });
+      const result = await updateSyncedSettings(settings);
+      if (isCurrent(token)) set({ settings: result.settings });
+      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set);
     } catch {
       // Keep the optimistic value. A full write already saves locally when
       // the server is unreachable, so an error here was not saved at all.
-      if (sameSession(token)) set({ syncIssue: "failed" });
+      writeOutcome(token, FULL_WRITE, "failed", set);
     } finally {
       finishWrite(token, set);
     }
@@ -173,6 +212,7 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
 
   updateSetting: async (section, key, value) => {
     const token = beginWrite();
+    const scope = `${section}.${key}`;
     // Optimistic update — apply locally first
     set((s) => {
       const json = JSON.parse(JSON.stringify(s.settings)) as Record<string, Record<string, unknown>>;
@@ -182,7 +222,9 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
       return { settings: json as unknown as UserSettings, isSyncing: true };
     });
     try {
-      const saved = await updateSettingCmd(section, key, value);
+      const result = await updateSettingCmd(section, key, value);
+      const saved = result.settings;
+      writeOutcome(token, scope, result.synced ? null : "saved-locally", set);
       if (isCurrent(token)) {
         // Re-apply our intended value on top of the server response.
         // The server PATCH deep-merges nested objects, so sending
@@ -198,20 +240,24 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
         const serverVal = JSON.stringify((saved as unknown as Record<string, Record<string, unknown>>)[section]?.[key]);
         const intendedVal = JSON.stringify(value);
         if (serverVal !== intendedVal) {
-          updateSyncedSettings(corrected).catch(() => {});
+          // Keep the correction in this write's lifetime so persistence
+          // failures and offline saves remain visible to the user.
+          const correctedResult = await updateSyncedSettings(corrected);
+          writeOutcome(token, FULL_WRITE, correctedResult.synced ? null : "saved-locally", set);
         }
       }
-      if (sameSession(token)) set({ syncIssue: null });
     } catch {
       // A single-field write has no offline path in the backend: it fails
       // without touching the local cache, so the edit would vanish on the
       // next refresh. A full write does save locally and syncs later, so
       // fall back to it with everything the user currently sees.
+      if (!sameSession(token)) return;
+      const fallbackToken = { ...token, settingsGeneration: _settingsGen };
       try {
-        await updateSyncedSettings(get().settings);
-        if (sameSession(token)) set({ syncIssue: "saved-locally" });
+        const result = await updateSyncedSettings(get().settings);
+        writeOutcome(fallbackToken, FULL_WRITE, result.synced ? null : "saved-locally", set);
       } catch {
-        if (sameSession(token)) set({ syncIssue: "failed" });
+        writeOutcome(token, scope, "failed", set);
       }
     } finally {
       finishWrite(token, set);
@@ -222,19 +268,19 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     const token = beginWrite();
     set({ settings: DEFAULT_SETTINGS, isSyncing: true });
     try {
-      const saved = await resetSyncedSettings();
-      if (isCurrent(token)) set({ settings: saved });
-      if (sameSession(token)) set({ syncIssue: null });
+      const result = await resetSyncedSettings();
+      if (isCurrent(token)) set({ settings: result.settings });
+      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set);
     } catch {
       // Keep the optimistic defaults. The backend owns offline persistence and
       // the next explicit refresh will reconcile them.
-      if (sameSession(token)) set({ syncIssue: "failed" });
+      writeOutcome(token, FULL_WRITE, "failed", set);
     } finally {
       finishWrite(token, set);
     }
   },
 
-  applySettingsFromEvent: (settings) => {
+  applySettingsFromEvent: (settings, synced) => {
     // Skip events while local writes are in flight — the async response
     // path handles those with gen-checks. Only apply events from
     // external sources (other devices, server push).
@@ -245,6 +291,10 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
       return;
     }
     set({ settings });
+    if (synced) clearQueuedIssues(set);
+    else if (synced === false) {
+      writeOutcome({ sessionGeneration: _sessionGen, settingsGeneration: _settingsGen }, FULL_WRITE, "saved-locally", set);
+    }
   },
 
   remoteReconcileToken: () => {
@@ -266,11 +316,12 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     );
   },
 
-  reconcileRemoteSettings: (settings, token) => {
+  reconcileRemoteSettings: (settings, token, synced = false) => {
     if (!isCurrent(token) || currentInflight(_inflightWrites) > 0) {
       return false;
     }
     set({ settings, isLoading: false });
+    if (synced) clearQueuedIssues(set);
     return true;
   },
 
@@ -281,6 +332,8 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
     _settingsGen += 1;
     _inflightWrites.clear();
     _inflightRemoteReconciles.clear();
+    _writeIssues.clear();
+    _writeStatusGenerations.clear();
     set({ settings, isLoading: false, isSyncing: false, syncIssue: null });
   },
 }));

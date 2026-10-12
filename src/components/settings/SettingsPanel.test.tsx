@@ -679,6 +679,12 @@ describe("Settings destructive actions", () => {
 });
 
 describe("Settings → Projects", () => {
+  const chooseOtherProject = async () => {
+    Element.prototype.hasPointerCapture ??= () => false;
+    Element.prototype.scrollIntoView ??= () => {};
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Project" }), { key: "Enter" });
+    fireEvent.keyDown(await screen.findByRole("option", { name: "other" }), { key: "Enter" });
+  };
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -742,6 +748,64 @@ describe("Settings → Projects", () => {
       screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"));
     await waitFor(() => expect(visibleNotes()).toHaveLength(1));
     expect(visibleNotes()[0].closest(".space-y-2")).toContainElement(setup);
+  });
+
+  it("cannot save the previous project's values while the new project is loading", async () => {
+    mockWorkspaces = [
+      { workspace_id: "ws-1", project_root: "/tmp/proj" },
+      { workspace_id: "ws-2", project_root: "/tmp/other" },
+    ];
+    let resolveOther!: (scripts: Awaited<ReturnType<typeof commands.getProjectScripts>>) => void;
+    vi.mocked(commands.getProjectScripts)
+      .mockResolvedValueOnce({ setup: ["setup-for-a"], teardown: [], run: null, worktree_includes: [] })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOther = resolve; }));
+    render(<SettingsView />);
+    await waitFor(() => expect(screen.getByPlaceholderText("e.g. npm install")).toHaveValue("setup-for-a"));
+    await chooseOtherProject();
+
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toBeDisabled();
+    expect(setup).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading project scripts");
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+
+    resolveOther({ setup: ["setup-for-b"], teardown: [], run: null, worktree_includes: [] });
+    await waitFor(() => expect(setup).toBeEnabled());
+    expect(setup).toHaveValue("setup-for-b");
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+  });
+
+  it("keeps fields disabled and shows a project load error", async () => {
+    vi.mocked(commands.getProjectScripts).mockRejectedValueOnce(new Error("permission denied"));
+    render(<SettingsView />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load proj's scripts: Error: permission denied");
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    expect(setup).toBeDisabled();
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).not.toHaveBeenCalled();
+  });
+
+  it("ignores a previous project's late save completion", async () => {
+    mockWorkspaces = [
+      { workspace_id: "ws-1", project_root: "/tmp/proj" },
+      { workspace_id: "ws-2", project_root: "/tmp/other" },
+    ];
+    let resolveSave!: () => void;
+    vi.mocked(commands.setProjectScripts).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve; }));
+    render(<SettingsView />);
+    const setup = screen.getByPlaceholderText("e.g. npm install");
+    await waitFor(() => expect(setup).toBeEnabled());
+    fireEvent.change(setup, { target: { value: "setup-for-a" } });
+    fireEvent.blur(setup);
+    await chooseOtherProject();
+    await waitFor(() => expect(setup).toBeEnabled());
+    resolveSave();
+    await waitFor(() => expect(screen.getAllByText("Saved").filter((el) => !el.closest("[aria-hidden='true']"))).toHaveLength(0));
+
+    fireEvent.blur(setup);
+    expect(commands.setProjectScripts).toHaveBeenCalledTimes(1);
   });
 
   it("reports a failed save and keeps the edit dirty", async () => {

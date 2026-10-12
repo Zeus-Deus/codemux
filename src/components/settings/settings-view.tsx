@@ -1438,7 +1438,14 @@ export function SettingsView() {
 
   // What the backend last confirmed for `scriptsRoot`, so a blur with no
   // edits does not write, and a failed save stays dirty for the next blur.
-  const savedScripts = useRef<string | null>(null);
+  const savedScripts = useRef<{ root: string; generation: number; snapshot: string } | null>(null);
+  const scriptsGeneration = useRef(0);
+  const scriptSaveGeneration = useRef(0);
+  const currentScriptsRoot = useRef(scriptsRoot);
+  currentScriptsRoot.current = scriptsRoot;
+  const [loadedScriptsRoot, setLoadedScriptsRoot] = useState<string | null>(null);
+  const [scriptsLoadError, setScriptsLoadError] = useState<string | null>(null);
+  const scriptsReady = loadedScriptsRoot === scriptsRoot && savedScripts.current?.root === scriptsRoot;
   const [savedField, setSavedField] = useState<ProjectField | null>(null);
   const [savedVisible, setSavedVisible] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1448,12 +1455,23 @@ export function SettingsView() {
 
   // Load project scripts when switching to the projects section
   useEffect(() => {
+    const generation = ++scriptsGeneration.current;
+    ++scriptSaveGeneration.current;
+    savedScripts.current = null;
+    setLoadedScriptsRoot(null);
+    setScriptsLoadError(null);
+    setSetupScripts("");
+    setTeardownScripts("");
+    setRunCommand("");
+    setWorktreeIncludes("");
+    setHasConfigFile(false);
+    setHasIncludeFile(false);
+    setSavedVisible(false);
+    if (savedTimer.current) clearTimeout(savedTimer.current);
     if (activeSection !== "projects" || !scriptsRoot) return;
     // A slow answer for the previously chosen project must not land in
     // the form after the user picked another one.
     let stale = false;
-    savedScripts.current = null;
-    setSavedVisible(false);
     getProjectScripts(scriptsRoot).then((scripts) => {
       if (stale) return;
       const setup = scripts?.setup.join("\n") ?? "";
@@ -1464,21 +1482,33 @@ export function SettingsView() {
       setTeardownScripts(teardown);
       setRunCommand(run);
       setWorktreeIncludes(includes);
-      savedScripts.current = JSON.stringify(
-        projectScriptsFrom(setup, teardown, run, includes),
-      );
-    }).catch(console.error);
+      savedScripts.current = {
+        root: scriptsRoot,
+        generation,
+        snapshot: JSON.stringify(projectScriptsFrom(setup, teardown, run, includes)),
+      };
+      setLoadedScriptsRoot(scriptsRoot);
+    }).catch((error) => {
+      if (!stale) setScriptsLoadError(String(error));
+    });
     getWorkspaceConfig(scriptsRoot).then((config) => {
       if (!stale) setHasConfigFile(config !== null);
     }).catch(console.error);
     hasCodemuxinclude(scriptsRoot)
       .then((has) => { if (!stale) setHasIncludeFile(has); })
       .catch(() => { if (!stale) setHasIncludeFile(false); });
-    return () => { stale = true; };
+    return () => {
+      stale = true;
+      ++scriptsGeneration.current;
+      ++scriptSaveGeneration.current;
+    };
   }, [activeSection, scriptsRoot]);
 
   const saveProjectSettings = (field: ProjectField) => {
-    if (!scriptsRoot) return;
+    const owner = savedScripts.current;
+    if (!scriptsRoot || !scriptsReady || owner?.root !== scriptsRoot) return;
+    const root = scriptsRoot;
+    const generation = owner.generation;
     const scripts = projectScriptsFrom(
       setupScripts,
       teardownScripts,
@@ -1486,16 +1516,22 @@ export function SettingsView() {
       worktreeIncludes,
     );
     const snapshot = JSON.stringify(scripts);
-    if (snapshot === savedScripts.current) return;
-    setProjectScripts(scriptsRoot, scripts)
+    if (snapshot === owner.snapshot) return;
+    const saveGeneration = ++scriptSaveGeneration.current;
+    const stillCurrent = () => currentScriptsRoot.current === root &&
+      scriptsGeneration.current === generation && scriptSaveGeneration.current === saveGeneration;
+    setProjectScripts(root, scripts)
       .then(() => {
-        savedScripts.current = snapshot;
+        if (!stillCurrent()) return;
+        savedScripts.current = { root, generation, snapshot };
         setSavedField(field);
         setSavedVisible(true);
         if (savedTimer.current) clearTimeout(savedTimer.current);
         savedTimer.current = setTimeout(() => setSavedVisible(false), 1500);
       })
-      .catch(reportFailure(`Couldn't save ${basename(scriptsRoot)}'s scripts`));
+      .catch((error) => {
+        if (stillCurrent()) reportFailure(`Couldn't save ${basename(root)}'s scripts`)(error);
+      });
   };
 
   useEffect(() => {
@@ -2328,7 +2364,7 @@ export function SettingsView() {
           );
         }
         const savedNote = (field: ProjectField) => (
-          <SavedNote visible={savedVisible && savedField === field} />
+          <SavedNote visible={scriptsReady && savedVisible && savedField === field} />
         );
         return (
           <div>
@@ -2355,6 +2391,13 @@ export function SettingsView() {
                 </Select>
               }
             />
+            {!scriptsReady && (
+              <SettingsCard className="mb-6">
+                <p role={scriptsLoadError ? "alert" : "status"} className="text-body text-muted-foreground">
+                  {scriptsLoadError ? `Couldn't load ${basename(scriptsRoot)}'s scripts: ${scriptsLoadError}` : "Loading project scripts…"}
+                </p>
+              </SettingsCard>
+            )}
             {hasConfigFile && (
               <SettingsCard className="mb-6 flex items-start gap-3">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
@@ -2391,6 +2434,7 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
+                  disabled={!scriptsReady}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
                   onBlur={() => saveProjectSettings("includes")}
                 />
@@ -2405,6 +2449,7 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
+                  disabled={!scriptsReady}
                   onChange={(e) => setSetupScripts(e.target.value)}
                   onBlur={() => saveProjectSettings("setup")}
                 />
@@ -2419,6 +2464,7 @@ export function SettingsView() {
                   className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
+                  disabled={!scriptsReady}
                   onChange={(e) => setTeardownScripts(e.target.value)}
                   onBlur={() => saveProjectSettings("teardown")}
                 />
@@ -2438,6 +2484,7 @@ export function SettingsView() {
                   className="font-mono text-body h-9"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
+                  disabled={!scriptsReady}
                   onChange={(e) => setRunCommand(e.target.value)}
                   onBlur={() => saveProjectSettings("run")}
                 />
