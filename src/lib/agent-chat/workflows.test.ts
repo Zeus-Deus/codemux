@@ -228,7 +228,44 @@ describe("workflowPhaseStatus", () => {
 
   it("resolves an empty planned phase alongside a terminal run", () => {
     expect(workflowPhaseStatus(phase({ agents: [] }), "completed")).toBe("done");
-    expect(workflowPhaseStatus(phase({ agents: [] }), "failed")).toBe("failed");
+  });
+
+  it("marks a phase the stopped or failed run never reached as skipped, not done", () => {
+    expect(workflowPhaseStatus(phase({ agents: [] }), "stopped")).toBe("skipped");
+    expect(workflowPhaseStatus(phase({ agents: [] }), "failed")).toBe("skipped");
+  });
+
+  it("marks a phase cut short by a stop as stopped, even with some agents done", () => {
+    expect(
+      workflowPhaseStatus(
+        phase({
+          agents: [agent({ status: "interrupted" }), agent({ status: "stopped" })],
+        }),
+        "stopped",
+      ),
+    ).toBe("stopped");
+    expect(
+      workflowPhaseStatus(
+        phase({
+          agents: [agent({ status: "completed" }), agent({ status: "interrupted" })],
+        }),
+        "stopped",
+      ),
+    ).toBe("stopped");
+  });
+});
+
+describe("workflowRunStats — stopped run", () => {
+  it("does not count stopped or skipped phases as done", () => {
+    const stopped = run({
+      status: "stopped",
+      phases: [
+        phase({ title: "Discover", agents: [agent({ status: "completed" })] }),
+        phase({ title: "Audit", agents: [agent({ status: "interrupted" })] }),
+        phase({ title: "Verify", agents: [] }),
+      ],
+    });
+    expect(workflowRunStats(stopped).phasesDone).toBe(1);
   });
 });
 

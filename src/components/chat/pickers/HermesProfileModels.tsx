@@ -1,6 +1,25 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { CheckIcon, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Eyebrow } from "@/components/ui/eyebrow";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import { useHermes, hermesProfileKey, hermesModelUnavailable, pickHermesProfile, type HermesProfile } from "@/stores/hermes-store";
+
+/** One selectable model row, on the same row recipe as the provider picker's model list. */
+function HermesModelRow({ title, subtitle, selected, disabled, tooltip, onClick }: {
+  title: string; subtitle: string; selected: boolean; disabled?: boolean; tooltip?: string; onClick: () => void;
+}) {
+  return <button type="button" title={tooltip} disabled={disabled} aria-current={selected || undefined} onClick={onClick}
+    className={cn("flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors duration-100 hover:bg-surface-2 disabled:opacity-40", selected && "bg-surface-3")}>
+    <span className="min-w-0 flex-1">
+      <span className="block truncate font-medium">{title}</span>
+      <span className="mt-0.5 block truncate text-muted-foreground/70">{subtitle}</span>
+    </span>
+    {selected && <CheckIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />}
+  </button>;
+}
 
 /** Lives inside the existing provider picker; only native layout metadata is displayed. */
 export function HermesProfileModels({ threadId, projectPath, model, onSelect, onProfileChange }: {
@@ -44,23 +63,33 @@ export function HermesProfileModels({ threadId, projectPath, model, onSelect, on
     groups.set(service, [...(groups.get(service) ?? []), entry]);
   }
   const unavailable = missing || slot?.value?.state === "unsupported";
+  const modes = slot?.value?.session.modes;
+  // `model` is null unless Hermes is the active provider, so no row checks then.
+  const usingDefault = model === "profile_default";
   return <div className="flex min-h-0 flex-1 flex-col p-3 text-label" data-testid="hermes-profile-models">
     <div className="mb-3 flex items-center justify-between"><strong className="text-body">Hermes</strong><span className="text-muted-foreground">Experimental</span></div>
     <label className="mb-1 text-muted-foreground" htmlFor="hermes-profile">Profile {fixed ? "· fixed for this chat" : ""}</label>
-    <select id="hermes-profile" aria-label="Hermes profile" className="mb-2 w-full rounded-md border border-border bg-background p-2" disabled={fixed || loading || !threadId} value={selection ? hermesProfileKey(selection) : ""} onChange={e => {
-      const p = profiles.find(p => hermesProfileKey(p) === e.target.value);
+    <Select disabled={fixed || loading || !threadId} value={selection ? hermesProfileKey(selection) : ""} onValueChange={value => {
+      const p = profiles.find(p => hermesProfileKey(p) === value);
       if (p && threadId) { useHermes.getState().select(threadId, projectPath ?? "home", p); onProfileChange?.(); }
     }}>
-      <option value="">{loading ? "Finding profiles…" : "Choose a profile"}</option>
-      {missing && selection && <option value={hermesProfileKey(selection)}>{selection.id} · repair required</option>}
-      {profiles.map(p => <option key={hermesProfileKey(p)} value={hermesProfileKey(p)}>{p.id}</option>)}
-    </select>
-    <p className="mb-2 text-[11px] text-muted-foreground">Reasoning control unavailable. Configure identity, credentials and skills in Hermes.</p>
+      <SelectTrigger id="hermes-profile" aria-label="Hermes profile" size="sm" className="mb-2 w-full text-label">
+        <SelectValue placeholder={loading ? "Finding profiles…" : "Choose a profile"} />
+      </SelectTrigger>
+      <SelectContent position="popper">
+        {missing && selection && <SelectItem value={hermesProfileKey(selection)}>{selection.id} · repair required</SelectItem>}
+        {profiles.map(p => <SelectItem key={hermesProfileKey(p)} value={hermesProfileKey(p)}>{p.id}</SelectItem>)}
+      </SelectContent>
+    </Select>
+    <p className="mb-2 text-caption text-muted-foreground">Reasoning control unavailable. Configure identity, credentials and skills in Hermes.</p>
     {(error || slot?.error || missing || unavailable) && <p role="alert" className="mb-2 rounded-md border border-destructive/30 p-2 text-destructive">{error ?? slot?.error ?? (missing ? "Profile missing or replaced. Restore it in Hermes; this chat will not switch profiles." : slot?.value?.message ?? "This profile cannot resume durable chats on the installed adapter.")}</p>}
-    {selection && <button type="button" className="mb-2 self-end text-muted-foreground hover:text-foreground" disabled={slot?.loading} onClick={() => void refresh(selection)}>{slot?.loading ? "Loading models…" : "Refresh models"}</button>}
-    {slot?.value?.session.modes && <label className="mb-2 block text-[11px] text-muted-foreground">File edit policy · not a terminal sandbox
-      <select aria-label="Hermes file edit policy" className="mt-1 block w-full rounded-md border border-border bg-background p-1 text-label text-foreground" value={mode ?? slot.value.session.modes.currentModeId} onChange={e => {
-        const value = e.target.value;
+    {selection && <Button type="button" variant="ghost" size="xs" className="mb-2 self-end text-muted-foreground" disabled={slot?.loading} onClick={() => void refresh(selection)}>
+      <RefreshCw aria-hidden className={cn(slot?.loading && "motion-safe:animate-spin")} />
+      {slot?.loading ? "Loading models…" : "Refresh models"}
+    </Button>}
+    {modes && <div className="mb-2">
+      <label className="mb-1 block text-caption text-muted-foreground" htmlFor="hermes-edit-policy">File edit policy · not a terminal sandbox</label>
+      <Select value={mode ?? modes.currentModeId} onValueChange={value => {
         if (!threadId) return;
         void (async () => {
           try {
@@ -68,11 +97,23 @@ export function HermesProfileModels({ threadId, projectPath, model, onSelect, on
             useHermes.setState(s => ({modes:{...s.modes,[threadId]:value}}));
           } catch (e) {setError(String(e));}
         })();
-      }}>{slot.value.session.modes.availableModes.map(m => <option key={m.id} value={m.id}>{m.name} — {m.description}</option>)}</select>
-    </label>}
+      }}>
+        <SelectTrigger id="hermes-edit-policy" aria-label="Hermes file edit policy" size="sm" className="w-full text-label">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent position="popper">
+          {modes.availableModes.map(m => <SelectItem key={m.id} value={m.id}>{m.description ? `${m.name} — ${m.description}` : m.name}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>}
     <div className="min-h-0 flex-1 overflow-y-auto">
-      {models && !unavailable && <button type="button" disabled={slot?.loading || fixed} className="mb-1 w-full rounded-md p-2 text-left hover:bg-muted disabled:opacity-40" onClick={() => onSelect("profile_default")}><span className="font-medium">Use profile default</span><span className="block truncate text-muted-foreground">{models.currentModelId}</span></button>}
-      {Array.from(groups, ([service, entries]) => <section key={service}><h3 className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{service}</h3>{entries.map(m => <button type="button" key={m.modelId} title={hermesModelUnavailable(m.modelId) ? "Unsupported native restart route" : m.description} disabled={unavailable || slot?.loading || hermesModelUnavailable(m.modelId)} className="w-full rounded-md p-2 text-left hover:bg-muted disabled:opacity-40" onClick={() => onSelect(m.modelId)}><span className="block truncate">{m.name}</span><span className="block truncate text-[10px] text-muted-foreground">{m.description ?? m.modelId}</span></button>)}</section>)}
+      {models && !unavailable && <HermesModelRow title="Use profile default" subtitle={models.currentModelId} selected={usingDefault} disabled={slot?.loading || fixed} onClick={() => onSelect("profile_default")} />}
+      {Array.from(groups, ([service, entries]) => <section key={service}>
+        <Eyebrow asChild><h3 className="block px-2 pb-1 pt-3">{service}</h3></Eyebrow>
+        {entries.map(m => <HermesModelRow key={m.modelId} title={m.name} subtitle={m.description ?? m.modelId} selected={model === m.modelId}
+          tooltip={hermesModelUnavailable(m.modelId) ? "Unsupported native restart route" : m.description}
+          disabled={unavailable || slot?.loading || hermesModelUnavailable(m.modelId)} onClick={() => onSelect(m.modelId)} />)}
+      </section>)}
       {models?.availableModels.length === 0 && <p className="p-2 text-muted-foreground">No models advertised. Configure this profile in Hermes and refresh.</p>}
       {model && model !== "profile_default" && models && !models.availableModels.some(m => m.modelId === model) && <p role="status" className="p-2 text-muted-foreground">Selected model unavailable: {model}</p>}
     </div>

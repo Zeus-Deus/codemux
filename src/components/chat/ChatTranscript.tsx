@@ -13,7 +13,9 @@ import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store
 import { TranscriptCacheMount } from "./transcript-cache";
 import { TranscriptBindingContext } from "./transcript-cache-binding";
 import { MessageList } from "./MessageList";
+import { AsyncQuestionThreadContext } from "./AsyncQuestionPanel";
 import { ChatMarkdownPassiveContext } from "./chat-markdown-passive";
+import { ChatProviderContext } from "./chat-provider-context";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
@@ -25,6 +27,8 @@ interface Props {
   streaming: boolean;
   /** Stall-watchdog state — drives the amber "no activity" tail notice. */
   stalled?: { silentForSecs: number } | null;
+  /** Stops the running turn from the stall notice. Must be stable. */
+  onStop?: () => void;
   /** True when the last run never cleanly settled — drives the
    *  "Run interrupted" tail divider. */
   interrupted?: boolean;
@@ -107,6 +111,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   compacting = false,
   streaming,
   stalled,
+  onStop,
   interrupted,
   sendAnchor,
   positionedNonceRef,
@@ -152,12 +157,15 @@ export const ChatTranscript = memo(function ChatTranscript({
 
   const list = (
     <ChatMarkdownPassiveContext.Provider value={passive}>
+      <AsyncQuestionThreadContext.Provider value={passive ? null : (threadKey ?? null)}>
+      <ChatProviderContext.Provider value={provider ?? null}>
       <MessageList
         messages={messages}
         showThinking={showThinking}
         streaming={streaming}
         compacting={compacting}
         stalled={stalled}
+        onStop={onStop}
         interrupted={interrupted}
         sendAnchor={sendAnchor}
         positionedNonceRef={positionedNonceRef}
@@ -182,6 +190,8 @@ export const ChatTranscript = memo(function ChatTranscript({
         cwd={cwd}
         onReadingBackChange={onReadingBackChange}
       />
+      </ChatProviderContext.Provider>
+      </AsyncQuestionThreadContext.Provider>
     </ChatMarkdownPassiveContext.Provider>
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The

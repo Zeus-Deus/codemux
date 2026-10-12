@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
@@ -39,9 +39,30 @@ describe("BashToolBody", () => {
     );
     expect(screen.getByText(/ls -la/)).toBeInTheDocument();
     expect(screen.getByText(/line 15/)).toBeInTheDocument();
-    expect(screen.getByText(/\+ 5 earlier lines hidden/)).toBeInTheDocument();
     // Lines outside the tail should not be rendered.
-    expect(screen.queryByText("line 1")).not.toBeInTheDocument();
+    const output = () => document.querySelector("pre")?.textContent ?? "";
+    expect(output().startsWith("line 6\n")).toBe(true);
+
+    // The footer opens the whole output in place, and closes it again.
+    fireEvent.click(screen.getByRole("button", { name: "Show all 15 lines" }));
+    expect(output()).toBe(lines);
+    expect(document.querySelector("pre")?.className).toContain("max-h-[60vh]");
+    fireEvent.click(screen.getByRole("button", { name: "Show last 10 lines" }));
+    expect(output().startsWith("line 6\n")).toBe(true);
+  });
+
+  it("offers copy for the command and the output", () => {
+    render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "Bash",
+          input: { command: "ls -la" },
+          result_content: "a\nb",
+        })}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Copy command" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy output" })).toBeInTheDocument();
   });
 
   it("shows a non-zero exit code badge", () => {
@@ -87,10 +108,11 @@ describe("ReadToolBody", () => {
     );
     expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
     expect(screen.getByText(/L1-50/)).toBeInTheDocument();
-    expect(screen.getByText(/Read 50 lines/)).toBeInTheDocument();
     // Only the first 5 lines should be visible.
     expect(screen.getByText(/row1/)).toBeInTheDocument();
     expect(screen.queryByText(/row50/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all 50 lines" }));
+    expect(screen.getByText(/row50/)).toBeInTheDocument();
   });
 
   it("renders only the path when there is no result yet", () => {
@@ -132,10 +154,11 @@ describe("GrepToolBody", () => {
     expect(screen.getByText("foo")).toBeInTheDocument();
     expect(screen.getByText(/in src/)).toBeInTheDocument();
     expect(screen.getByText(/7 matches/)).toBeInTheDocument();
-    expect(screen.getByText(/\+ 2 more/)).toBeInTheDocument();
     // 5th match should be visible, 6th should not.
     expect(screen.getByText("src/c.ts:1")).toBeInTheDocument();
     expect(screen.queryByText("src/d.ts:3")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show 2 more matches" }));
+    expect(screen.getByText("src/d.ts:3")).toBeInTheDocument();
   });
 });
 
@@ -231,7 +254,7 @@ describe("BashToolBody edge cases", () => {
     );
     expect(screen.getByText(/sleep 1/)).toBeInTheDocument();
     expect(screen.queryByText(/exit/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/earlier line/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Show all/)).not.toBeInTheDocument();
   });
 
   it("with very large output (1000+ lines) renders only the last 10 + the hidden-count footer", () => {
@@ -253,7 +276,7 @@ describe("BashToolBody edge cases", () => {
     expect(screen.queryByText(/^row1$/)).not.toBeInTheDocument();
     // Hidden count = total - tail (10).
     expect(
-      screen.getByText(new RegExp(`\\+ ${total - 10} earlier line`)),
+      screen.getByRole("button", { name: `Show all ${total} lines` }),
     ).toBeInTheDocument();
   });
 });

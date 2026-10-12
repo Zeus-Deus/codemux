@@ -60,6 +60,7 @@ vi.mock("@/hooks/use-project-actions", () => ({
 
 import { SidebarActionRow, SidebarHeaderActions } from "./sidebar-action-row";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 
 function renderRow() {
   const utils = render(
@@ -205,6 +206,25 @@ describe("SidebarActionRow — New agent button", () => {
       expect(
         Object.keys(useChatDraftStore.getState().draftsById),
       ).toHaveLength(1);
+    });
+
+    // A repeat press lands on the draft already on screen, so the only
+    // visible response is the caret moving into its composer.
+    it("asks for composer focus on every press, including a repeat", () => {
+      enableAgentChatFlag = true;
+      enableLazyFlag = true;
+      useDraftComposerFocusStore.setState({ request: null });
+      const { newAgent } = renderRow();
+      fireEvent.click(newAgent);
+      const draftId = useChatDraftStore.getState().activeDraftId;
+      const first = useDraftComposerFocusStore.getState().request;
+      expect(first?.draftId).toBe(draftId);
+
+      useDraftComposerFocusStore.getState().clear();
+      fireEvent.click(newAgent);
+      const second = useDraftComposerFocusStore.getState().request;
+      expect(second?.draftId).toBe(draftId);
+      expect(second?.nonce).not.toBe(first?.nonce);
     });
   });
 });

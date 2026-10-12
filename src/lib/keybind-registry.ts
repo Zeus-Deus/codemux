@@ -45,7 +45,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "toggleRightPanel", label: "Toggle right panel", category: "general", defaultKeys: "Ctrl+Shift+B", description: "Show/hide the right panel (Files, Changes, Review, Orchestration)" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
   { id: "openProject", label: "Open project", category: "general", defaultKeys: "Ctrl+O", description: "Open an existing folder as a project" },
-  { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Open Settings to the keyboard-shortcuts page" },
+  { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Show every shortcut over the current view. Rebind them in Settings ▸ Shortcuts" },
   { id: "zoomIn", label: "Increase interface size", category: "general", defaultKeys: "Ctrl+=", description: "Make all interface text and chrome bigger" },
   { id: "zoomOut", label: "Decrease interface size", category: "general", defaultKeys: "Ctrl+-", description: "Make all interface text and chrome smaller" },
   { id: "zoomReset", label: "Reset interface size", category: "general", defaultKeys: "Ctrl+0" },
@@ -62,6 +62,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
 
   // ── Workspaces ──
   { id: "newAgent", label: "New agent", category: "workspaces", defaultKeys: "Ctrl+N", description: "New chat in home directory, or the New Workspace dialog (same as the sidebar's New agent button)" },
+  { id: "openLauncher", label: "Launch an agent", category: "workspaces", defaultKeys: "Ctrl+Shift+A", description: "Open the title bar's + launcher (agents, terminal, browser)" },
   { id: "newWorkspaceInProject", label: "New workspace in current project", category: "workspaces", defaultKeys: "Ctrl+Shift+N", description: "Quick-create a workspace/agent in the active workspace's project" },
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },
@@ -116,6 +117,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "copySelection", label: "Copy selection", category: "terminal", defaultKeys: "Ctrl+Shift+C", when: "terminal" },
   { id: "pasteTerminal", label: "Paste", category: "terminal", defaultKeys: "Ctrl+Shift+V", when: "terminal" },
   { id: "backwardKillWord", label: "Backward kill word", category: "terminal", defaultKeys: "Ctrl+Backspace", when: "terminal" },
+  { id: "terminalFind", label: "Find in terminal", category: "terminal", defaultKeys: "Ctrl+F", when: "terminal", description: "Search the scrollback. Full-screen apps such as vim and less keep the key" },
 ] as const;
 
 const registryById = new Map(KEYBIND_REGISTRY.map((e) => [e.id, e]));

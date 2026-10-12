@@ -2,13 +2,16 @@ import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
+  Network,
   Check,
+  CornerDownRight,
+  ListEnd,
   ListTodo,
   LoaderCircle,
   Plus,
   Square,
 } from "lucide-react";
-import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactNode, Ref } from "react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -21,10 +24,23 @@ import type {
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
 import { useStopTooltip } from "./composer-interrupt";
+import { FOOTER_SEPARATOR } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
+
+const DELIVERY_SEND_LABEL: Record<MessageDelivery, string> = {
+  queue: "Queue message",
+  steer: "Steer",
+  interrupt: "Interrupt and send",
+};
+
+const DELIVERY_SEND_TITLE: Record<MessageDelivery, string> = {
+  queue: "Send after this turn finishes",
+  steer: "Guide the current task without stopping tools",
+  interrupt: "Stop current work and send",
+};
 
 /** 34px circle shared by attach / send / stop so the row's two ends sit on
  *  one optical baseline, concentric with the 44px pill (5px inset). */
@@ -34,18 +50,23 @@ const ROUND_CONTROL =
 interface Props {
   hermesThreadId?: string | null;
   hermesProjectPath?: string | null;
+  customAgentsAllowed?: boolean;
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
   ultrathinkInBodyText: boolean;
   streaming: boolean;
   canSubmit: boolean;
+  /** The draft holds text to send. While a turn runs this swaps the Stop
+   *  button for the queue/steer/interrupt send button — one slot, never
+   *  both. Defaults to `canSubmit`. */
+  hasDraft?: boolean;
   delivery?: MessageDelivery;
   supportsSteering?: boolean;
   onDeliveryChange?: (value: MessageDelivery) => void;
@@ -59,13 +80,13 @@ interface Props {
   mode: ChatMode;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
-    model: string,
+    model: string | null,
   ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onSubmit: () => void;
   onBackgroundSubmit?: () => void;
   onStop: () => void;
@@ -89,19 +110,25 @@ interface Props {
   tasks?: { completed: number; total: number; running?: boolean } | null;
   tasksOpen?: boolean;
   onTasksClick?: () => void;
+  onWorkflowsClick?: () => void;
+  workflowsOpen?: boolean;
   /** Content for the flexible gap between the attach button and the
    *  right-pinned controls: the placeholder while the pill is collapsed,
    *  "Enter to queue" while expanded. */
   gap?: ReactNode;
   /** Pointer-down on the gap — the composer focuses its textarea. */
   onGapPointerDown?: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  /** The gap element, measured by the composer to fit the row. */
+  gapRef?: Ref<HTMLDivElement>;
   /** The context ring lives in the expanded card only. Defaults to true. */
   showContextMeter?: boolean;
   /** Width ladder: model label shortens to its leaf name. */
   modelLeafLabel?: boolean;
+  /** Width ladder: provider/model control keeps only its provider mark. */
+  modelIconOnly?: boolean;
   /** Width ladder: effort drops its text label. */
   effortIconOnly?: boolean;
-  /** Width ladder: access drops its text label. */
+  /** Width ladder: access, tasks and delivery drop their text labels. */
   accessIconOnly?: boolean;
   /** Width ladder: effort + access leave the row for the `+` menu. */
   configInMenu?: boolean;
@@ -114,19 +141,20 @@ interface Props {
  * send pinned right, a flexible gap in between.
  */
 export function ComposerFooter({
-  hermesThreadId, hermesProjectPath,
+  hermesThreadId, hermesProjectPath, customAgentsAllowed = true,
   provider,
   model,
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
   ultrathinkInBodyText,
   streaming,
   canSubmit,
+  hasDraft = canSubmit,
   delivery = "queue",
   supportsSteering = false,
   onDeliveryChange,
@@ -138,7 +166,7 @@ export function ComposerFooter({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onSubmit,
   onBackgroundSubmit,
   onStop,
@@ -154,10 +182,14 @@ export function ComposerFooter({
   tasks = null,
   tasksOpen = false,
   onTasksClick,
+  onWorkflowsClick,
+  workflowsOpen = false,
   gap = null,
   onGapPointerDown,
+  gapRef,
   showContextMeter = true,
   modelLeafLabel = false,
+  modelIconOnly = false,
   effortIconOnly = false,
   accessIconOnly = false,
   configInMenu = false,
@@ -195,6 +227,7 @@ export function ComposerFooter({
       )}
 
       <div
+        ref={gapRef}
         data-testid="composer-gap"
         onPointerDown={onGapPointerDown}
         // Reserve the meter's space even while collapsed, so it cannot
@@ -221,6 +254,9 @@ export function ComposerFooter({
       </div>
 
       <div className="flex min-w-0 items-center gap-1">
+        {onWorkflowsClick && (
+          <button type="button" data-testid="composer-workflows-toggle" aria-label="Open dynamic workflows" aria-pressed={workflowsOpen} title="Dynamic workflows" onClick={onWorkflowsClick} className={cn("inline-flex size-[28px] shrink-0 items-center justify-center rounded-lg transition-colors duration-100", workflowsOpen ? "bg-surface-3 text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground")}><Network className="size-3.5" aria-hidden /></button>
+        )}
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
             {/* Reports run state rather than reading as a setting: amber +
@@ -232,13 +268,13 @@ export function ComposerFooter({
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               aria-label={
-                modelLeafLabel
+                accessIconOnly
                   ? `Tasks: ${tasks.completed} of ${tasks.total} complete`
                   : undefined
               }
               className={cn(
-                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors duration-150",
-                modelLeafLabel && "w-[34px] justify-center px-0",
+                "inline-flex h-[30px] shrink-0 items-center gap-1.5 rounded-md border-0 px-2 text-body-sm font-medium leading-none transition-colors duration-150",
+                accessIconOnly && "w-[30px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -256,7 +292,7 @@ export function ComposerFooter({
               ) : (
                 <ListTodo className="size-3.5" aria-hidden />
               )}
-              {!modelLeafLabel && (
+              {!accessIconOnly && (
                 <>
                   <span>Tasks</span>
                   <span className="text-label tabular-nums opacity-70">
@@ -265,20 +301,22 @@ export function ComposerFooter({
                 </>
               )}
             </button>
-            <span className="mx-0.5 h-4 w-px shrink-0 bg-border/50" aria-hidden />
+            <span className={FOOTER_SEPARATOR} aria-hidden />
           </>
         )}
 
-        {showProviderPicker || provider === "hermes" ? (
+        {showProviderPicker || provider === "hermes" || provider === "acp" ? (
           <MultiProviderModelPicker
             hermesThreadId={hermesThreadId}
             hermesProjectPath={hermesProjectPath}
+            customAgentsAllowed={customAgentsAllowed}
             provider={provider}
             model={model}
             onProviderModelChange={onProviderModelChange}
             disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
             leafLabel={modelLeafLabel}
+            iconOnly={modelIconOnly}
           />
         ) : (
           <ModelPicker
@@ -288,9 +326,10 @@ export function ComposerFooter({
             disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
             leafLabel={modelLeafLabel}
+            iconOnly={modelIconOnly}
           />
         )}
-        {!configInMenu && (
+        {!configInMenu && provider !== "acp" && (
           <>
             <ReasoningPicker
               model={activeModel}
@@ -298,10 +337,10 @@ export function ComposerFooter({
               contextWindowValue={contextWindow}
               labelMap={effortLabelMap}
               ultrathinkInBodyText={ultrathinkInBodyText}
-              fastMode={fastMode}
+              serviceTier={serviceTier}
               onEffortChange={onEffortChange}
               onContextWindowChange={onContextWindowChange}
-              onFastModeChange={onFastModeChange}
+              onServiceTierChange={onServiceTierChange}
               disabled={configurationDisabled}
               withSeparator
               iconOnly={effortIconOnly}
@@ -320,13 +359,26 @@ export function ComposerFooter({
           </>
         )}
 
-        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} />}
-        {streaming && showStopButton ? (
-          <>
-          {onDeliveryChange && <button type="button" onClick={onSubmit} disabled={!canSubmit} aria-label={delivery === "interrupt" ? "Interrupt and send" : delivery === "steer" ? "Steer" : "Queue message"}
-            title={delivery === "interrupt" ? "Stop current work and send" : delivery === "steer" ? "Guide the current task without stopping tools" : "Send after this turn finishes"}
-            className={cn(ROUND_CONTROL, "bg-primary/90 text-primary-foreground disabled:opacity-30 disabled:cursor-not-allowed")}><ArrowUp className="size-4" /></button>}
-
+        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} iconOnly={accessIconOnly} />}
+        {streaming && onDeliveryChange && hasDraft ? (
+          // One action slot, as in t3code: with a draft, the slot sends it
+          // (queue / steer / interrupt); otherwise it's Stop.
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            aria-label={DELIVERY_SEND_LABEL[delivery]}
+            title={DELIVERY_SEND_TITLE[delivery]}
+            className={cn(
+              ROUND_CONTROL,
+              "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
+              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-primary active:scale-100",
+              "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
+            )}
+          >
+            {delivery === "queue" ? <ListEnd className="size-4" /> : delivery === "steer" ? <CornerDownRight className="size-4" /> : <ArrowUp className="size-4" />}
+          </button>
+        ) : streaming && showStopButton ? (
           <button
             type="button"
             onClick={onStop}
@@ -340,7 +392,6 @@ export function ComposerFooter({
           >
             <Square className="size-3" fill="currentColor" />
           </button>
-          </>
         ) : (
           <button
             type="button"

@@ -3,6 +3,7 @@ import { memo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { PaneNodeSnapshot, WorkspaceSnapshot } from "@/tauri/types";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // xterm cannot mount in jsdom; the stub reports the `visible` prop it gets so
 // the test can see which panes a zoom hides.
@@ -67,7 +68,7 @@ afterEach(() => cleanup());
 
 describe("PaneContainer zoom", () => {
   it("renders every pane of the split when nothing is zoomed", async () => {
-    render(<PaneContainer workspace={workspace("top")} />);
+    render(<PaneContainer workspace={workspace("top")} />, { wrapper: TooltipProvider });
     await screen.findByTestId("term-s-left");
     expect(visibility()).toEqual({ left: "true", top: "true", bottom: "true" });
     expect(document.querySelector("[data-pane-zoom-chip]")).toBeNull();
@@ -75,7 +76,7 @@ describe("PaneContainer zoom", () => {
 
   it("fills the surface with the zoomed pane and keeps the rest mounted but hidden", async () => {
     usePaneZoomStore.setState({ zoomedPaneBySurface: { "sf-1": "top" } });
-    render(<PaneContainer workspace={workspace("top")} />);
+    render(<PaneContainer workspace={workspace("top")} />, { wrapper: TooltipProvider });
     await screen.findByTestId("term-s-left");
 
     expect(visibility()).toEqual({ left: "false", top: "true", bottom: "false" });
@@ -86,7 +87,7 @@ describe("PaneContainer zoom", () => {
 
   it("restores the split from the Zoomed chip", async () => {
     usePaneZoomStore.setState({ zoomedPaneBySurface: { "sf-1": "top" } });
-    render(<PaneContainer workspace={workspace("top")} />);
+    render(<PaneContainer workspace={workspace("top")} />, { wrapper: TooltipProvider });
     await screen.findByTestId("term-s-left");
 
     fireEvent.click(document.querySelector("[data-pane-zoom-chip]")!);
@@ -95,7 +96,7 @@ describe("PaneContainer zoom", () => {
 
   it("ends the zoom once focus moves to another pane", async () => {
     usePaneZoomStore.setState({ zoomedPaneBySurface: { "sf-1": "top" } });
-    const { rerender } = render(<PaneContainer workspace={workspace("top")} />);
+    const { rerender } = render(<PaneContainer workspace={workspace("top")} />, { wrapper: TooltipProvider });
     await screen.findByTestId("term-s-left");
 
     act(() => rerender(<PaneContainer workspace={workspace("left")} />));

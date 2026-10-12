@@ -1,0 +1,370 @@
+{
+  "accounting": {
+    "cost_unknown": true,
+    "cost_usd": 0.00230806,
+    "estimated_tokens": 0,
+    "input_tokens": 32062,
+    "output_tokens": 151,
+    "reserved_tokens": 0,
+    "tokens_unknown": false,
+    "total_tokens": 32213
+  },
+  "attempts": [
+    {
+      "error": null,
+      "generation": 1,
+      "status": "waiting",
+      "task_id": "coordinator",
+      "usage": {
+        "cost_unknown": true,
+        "cost_usd": null,
+        "estimated_tokens": 0,
+        "input_tokens": 3586,
+        "output_tokens": 8,
+        "reserved_tokens": 0,
+        "tokens_unknown": false,
+        "total_tokens": 3594
+      }
+    },
+    {
+      "error": null,
+      "generation": 1,
+      "status": "succeeded",
+      "task_id": "coordinator",
+      "usage": {
+        "cost_unknown": false,
+        "cost_usd": 0.0006755299999999999,
+        "estimated_tokens": 0,
+        "input_tokens": 7558,
+        "output_tokens": 8,
+        "reserved_tokens": 0,
+        "tokens_unknown": false,
+        "total_tokens": 7566
+      }
+    },
+    {
+      "error": null,
+      "generation": 1,
+      "status": "succeeded",
+      "task_id": "reader_one",
+      "usage": {
+        "cost_unknown": false,
+        "cost_usd": 0.0010379500000000002,
+        "estimated_tokens": 0,
+        "input_tokens": 10459,
+        "output_tokens": 69,
+        "reserved_tokens": 0,
+        "tokens_unknown": false,
+        "total_tokens": 10528
+      }
+    },
+    {
+      "error": null,
+      "generation": 1,
+      "status": "succeeded",
+      "task_id": "reader_two",
+      "usage": {
+        "cost_unknown": false,
+        "cost_usd": 0.00059458,
+        "estimated_tokens": 0,
+        "input_tokens": 10459,
+        "output_tokens": 66,
+        "reserved_tokens": 0,
+        "tokens_unknown": false,
+        "total_tokens": 10525
+      }
+    }
+  ],
+  "budget_controls": {
+    "authorized_total_usd": 2.0,
+    "concurrency": 1,
+    "max_output_tokens_per_request": 1024,
+    "native_session_limit": 4,
+    "sdk_max_budget_usd_per_session": 0.2,
+    "sdk_max_turns_per_session": 6,
+    "thinking": "native default; no override",
+    "wall_time_ms": 90000,
+    "token_admission_budget": 250000
+  },
+  "case": "native_claude_dynamic_children_capacity_one",
+  "host_capability_declarations": {
+    "enforced_read_only": true,
+    "isolated_writes": true,
+    "native_fanout_disabled": true,
+    "scoped_tools": true,
+    "verified_stop": true
+  },
+  "host_catalog_file": "native-host-catalog.json",
+  "mode": "paid_native_canary",
+  "model": "claude-haiku-5-5",
+  "native_start_requests": 4,
+  "native_starts": 4,
+  "native_trace": [
+    {
+      "kind": "native_tool_catalog",
+      "mcp_servers": [
+        {
+          "name": "codemux",
+          "status": "connected"
+        }
+      ],
+      "tools": [
+        "mcp__codemux__workflow_add_tasks",
+        "mcp__codemux__workflow_cancel",
+        "mcp__codemux__workflow_list",
+        "mcp__codemux__workflow_list_files",
+        "mcp__codemux__workflow_message",
+        "mcp__codemux__workflow_read_dependency_file",
+        "mcp__codemux__workflow_read_file",
+        "mcp__codemux__workflow_replace",
+        "mcp__codemux__workflow_retire",
+        "mcp__codemux__workflow_submit_result",
+        "mcp__codemux__workflow_wait"
+      ]
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_add_tasks"
+    },
+    {
+      "is_error": false,
+      "kind": "tool_result"
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_wait"
+    },
+    {
+      "kind": "native_tool_catalog",
+      "mcp_servers": [
+        {
+          "name": "codemux",
+          "status": "connected"
+        }
+      ],
+      "tools": [
+        "mcp__codemux__workflow_add_tasks",
+        "mcp__codemux__workflow_cancel",
+        "mcp__codemux__workflow_list",
+        "mcp__codemux__workflow_list_files",
+        "mcp__codemux__workflow_message",
+        "mcp__codemux__workflow_read_dependency_file",
+        "mcp__codemux__workflow_read_file",
+        "mcp__codemux__workflow_replace",
+        "mcp__codemux__workflow_retire",
+        "mcp__codemux__workflow_submit_result",
+        "mcp__codemux__workflow_wait"
+      ]
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_read_file"
+    },
+    {
+      "is_error": false,
+      "kind": "tool_result"
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_submit_result"
+    },
+    {
+      "is_error": false,
+      "kind": "tool_result"
+    },
+    {
+      "kind": "assistant_text",
+      "text": "Submitted `{\"value\": 17}`, read from first.txt. The result was accepted."
+    },
+    {
+      "kind": "native_tool_catalog",
+      "mcp_servers": [
+        {
+          "name": "codemux",
+          "status": "connected"
+        }
+      ],
+      "tools": [
+        "mcp__codemux__workflow_add_tasks",
+        "mcp__codemux__workflow_cancel",
+        "mcp__codemux__workflow_list",
+        "mcp__codemux__workflow_list_files",
+        "mcp__codemux__workflow_message",
+        "mcp__codemux__workflow_read_dependency_file",
+        "mcp__codemux__workflow_read_file",
+        "mcp__codemux__workflow_replace",
+        "mcp__codemux__workflow_retire",
+        "mcp__codemux__workflow_submit_result",
+        "mcp__codemux__workflow_wait"
+      ]
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_read_file"
+    },
+    {
+      "is_error": false,
+      "kind": "tool_result"
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_submit_result"
+    },
+    {
+      "is_error": false,
+      "kind": "tool_result"
+    },
+    {
+      "kind": "assistant_text",
+      "text": "Submitted `{\"value\": 25}` for Reader two. The result was accepted."
+    },
+    {
+      "kind": "native_tool_catalog",
+      "mcp_servers": [
+        {
+          "name": "codemux",
+          "status": "connected"
+        }
+      ],
+      "tools": [
+        "mcp__codemux__workflow_add_tasks",
+        "mcp__codemux__workflow_cancel",
+        "mcp__codemux__workflow_list",
+        "mcp__codemux__workflow_list_files",
+        "mcp__codemux__workflow_message",
+        "mcp__codemux__workflow_read_dependency_file",
+        "mcp__codemux__workflow_read_file",
+        "mcp__codemux__workflow_replace",
+        "mcp__codemux__workflow_retire",
+        "mcp__codemux__workflow_submit_result",
+        "mcp__codemux__workflow_wait"
+      ]
+    },
+    {
+      "kind": "tool_use",
+      "name": "mcp__codemux__workflow_submit_result"
+    },
+    {
+      "is_error": false,
+      "kind": "tool_result"
+    },
+    {
+      "kind": "assistant_text",
+      "text": "The coordinator result is submitted and accepted: `{\"sum\": 42, \"child_count\": 2}`. Both dependencies had already succeeded, with `reader_one` returning 17 and `reader_two` returning 25, so their sum is 42. I did not read the files or create any other tasks."
+    }
+  ],
+  "notes": [
+    "Cost is the sum of observed SDK counters; interrupted yield may remain explicitly unknown. SDK budget can overshoot by a final API call; session, turn, output and wall caps provide conservative margin.",
+    "Configured host tool schemas and capability declarations do not prove the native model's effective tool catalog. Only the separately captured SDK diagnostic records its reported catalog.",
+    "Paid mode exercises native Claude coordination only. Mixed Claude/Codex coordination is separately verified with deterministic providers. Metadata-only mode rejects before any native startup."
+  ],
+  "provider": "claude",
+  "quiescence": {
+    "all_attempts_terminal": true,
+    "cleanup_errors": 0,
+    "driver_stopped": true,
+    "extra_cleanup_sessions": 0,
+    "live_provider_sessions": 0
+  },
+  "run_status": "completed",
+  "source_unchanged": true,
+  "spending_envelope": {
+    "incomplete_session_count": 1,
+    "observed_plus_incomplete_reserve_usd": 0.20230806,
+    "observed_sdk_cost_usd": 0.00230806,
+    "reserved_usd_per_incomplete_session": 0.2
+  },
+  "typed_results": [
+    {
+      "generation": 1,
+      "status": "succeeded",
+      "task_id": "coordinator",
+      "observer": {
+        "matches_expected": true
+      },
+      "observed_output_fields": {
+        "child_count": 2,
+        "sum": 42
+      }
+    },
+    {
+      "generation": 1,
+      "status": "succeeded",
+      "task_id": "reader_one",
+      "observer": {
+        "matches_expected": true
+      },
+      "observed_output_fields": {
+        "value": 17
+      }
+    },
+    {
+      "generation": 1,
+      "status": "succeeded",
+      "task_id": "reader_two",
+      "observer": {
+        "matches_expected": true
+      },
+      "observed_output_fields": {
+        "value": 25
+      }
+    }
+  ],
+  "cumulative_functional_spending": {
+    "authorized_total_usd": 2.0,
+    "attempts": [
+      {
+        "report": "live-validation-attempt-1.json",
+        "run_status": "failed",
+        "observed_sdk_cost_usd": 0.0,
+        "native_starts": 1,
+        "cost_unknown": true
+      },
+      {
+        "report": "live-validation-attempt-2.json",
+        "run_status": "failed",
+        "observed_sdk_cost_usd": 0.0,
+        "native_starts": 1,
+        "cost_unknown": true
+      },
+      {
+        "report": "live-validation-attempt-3.json",
+        "run_status": "failed",
+        "observed_sdk_cost_usd": 0.0029268600000000003,
+        "native_starts": 1,
+        "cost_unknown": false
+      },
+      {
+        "report": "live-validation-attempt-4.json",
+        "run_status": "failed",
+        "observed_sdk_cost_usd": 0.0023764800000000003,
+        "native_starts": 1,
+        "cost_unknown": false
+      },
+      {
+        "report": "live-validation-attempt-5.json",
+        "run_status": "failed",
+        "observed_sdk_cost_usd": 0.0024459800000000004,
+        "native_starts": 1,
+        "cost_unknown": false
+      },
+      {
+        "report": "live-validation-attempt-6.json",
+        "run_status": "completed",
+        "observed_sdk_cost_usd": 0.00230806,
+        "native_starts": 4,
+        "cost_unknown": true
+      }
+    ],
+    "observed_sdk_cost_usd": 0.010057380000000001,
+    "incomplete_session_count": 3,
+    "reserved_usd_per_incomplete_session": 0.2,
+    "conservative_observed_plus_incomplete_reserve_usd": 0.61005738,
+    "remaining_authorized_margin_usd": 1.3899426200000002,
+    "notes": [
+      "This is a conservative test spending envelope, not an invoice. Two network-blocked sessions and the deliberately yielded coordinator have no final SDK dollar counter and each retain a $0.20 reserve. SDK client-side caps may overshoot by a final API call; fixed turns, output, sessions and observed remaining margin supplement those caps.",
+      "The native coordination test is complete. No further functional inference is planned. The separately authorized design-model call is outside this functional-test ledger."
+    ]
+  },
+  "sanitization_note": "Sanitized observed_output_fields contain only fixture numeric fields. observer.matches_expected is a host-generated exact comparison, not a model-submitted field. Recorded run outcomes and accounting are unchanged."
+}

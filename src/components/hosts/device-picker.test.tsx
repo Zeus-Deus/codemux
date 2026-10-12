@@ -1,139 +1,152 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-vi.mock("@/tauri/commands", () => ({
-  hostsList: vi.fn(),
+import { host, status } from "@/components/devices/host-fixtures.test-utils";
+import type { HostStatusView, HostView } from "@/tauri/commands";
+
+let hosts: HostView[] = [];
+let statuses: Record<number, HostStatusView> = {};
+let localName: string | null = "ai-node";
+const setShowSettingsMock = vi.fn();
+
+vi.mock("@/stores/hosts-store", () => ({ useHosts: () => hosts }));
+vi.mock("@/stores/host-status-store", () => ({
+  useHostStatuses: () => statuses,
+}));
+vi.mock("@/stores/local-device-store", () => ({
+  useLocalDeviceName: () => localName,
+}));
+vi.mock("@/stores/ui-store", () => ({
+  useUIStore: vi.fn((selector: (s: unknown) => unknown) =>
+    selector({ setShowSettings: setShowSettingsMock }),
+  ),
 }));
 
-import { hostsList, type HostView } from "@/tauri/commands";
 import { DevicePicker } from "./device-picker";
-import { __resetHostsStoreForTests } from "@/stores/hosts-store";
+import { useAddDeviceDialogStore } from "@/stores/add-device-dialog-store";
 
 afterEach(() => cleanup());
 
-// The hosts store is module-level (singleton) so previous tests'
-// mock returns linger across cases. Reset before each so every
-// test starts from "unloaded, empty list" — same precondition the
-// production app sees on first launch.
 beforeEach(() => {
-  __resetHostsStoreForTests();
+  hosts = [];
+  statuses = {};
+  localName = "ai-node";
+  setShowSettingsMock.mockClear();
+  useAddDeviceDialogStore.setState({ open: false });
 });
 
-function host(over: Partial<HostView>): HostView {
-  return {
-    id: 1,
-    server_id: null,
-    name: "homelab",
-    ssh_target: "u@h",
-    created_at: "2026-05-16",
-    updated_at: "2026-05-16",
-    dirty: false,
-    ...over,
-  };
+function trigger() {
+  return screen.getByRole("button", { name: /^Device:/ });
 }
 
 describe("DevicePicker", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("shows 'Local Device' label when hostId is null", async () => {
-    vi.mocked(hostsList).mockResolvedValue([]);
+  it("labels the trigger with this machine's hostname when local", () => {
     render(<DevicePicker hostId={null} onSelectHostId={() => {}} />);
-    await waitFor(() => {
-      expect(screen.getByRole("button")).toHaveAttribute(
-        "aria-label",
-        "Device: Local Device",
-      );
-    });
+    expect(trigger()).toHaveAccessibleName("Device: ai-node");
   });
 
-  it("respects the localLabel override", async () => {
-    vi.mocked(hostsList).mockResolvedValue([]);
-    render(
-      <DevicePicker
-        hostId={null}
-        onSelectHostId={() => {}}
-        localLabel="This device"
-      />,
-    );
-    await waitFor(() => {
-      expect(screen.getByRole("button")).toHaveAttribute(
-        "aria-label",
-        "Device: This device",
-      );
-    });
+  it("falls back to 'This device' until the hostname loads", () => {
+    localName = null;
+    render(<DevicePicker hostId={null} onSelectHostId={() => {}} />);
+    expect(trigger()).toHaveAccessibleName("Device: This device");
   });
 
-  it("shows the host name when a remote host is selected", async () => {
-    vi.mocked(hostsList).mockResolvedValue([
-      host({ id: 7, name: "homelab", ssh_target: "u@h" }),
-      host({ id: 8, name: "vps-fra", ssh_target: "u@v" }),
-    ]);
+  it("shows the device name when a device is selected", () => {
+    hosts = [host(7, "homelab"), host(8, "vps-fra")];
     render(<DevicePicker hostId={7} onSelectHostId={() => {}} />);
-    await waitFor(() => {
-      expect(screen.getByRole("button")).toHaveAttribute(
-        "aria-label",
-        "Device: homelab",
-      );
-    });
+    expect(trigger()).toHaveAccessibleName("Device: homelab");
   });
 
-  it("falls back to local label if the configured hostId no longer exists", async () => {
-    // Realistic scenario: workspace was assigned to a host that's
-    // since been deleted on another device. We must not crash; we
-    // also must not pretend it's still selected. Showing "Local
-    // Device" is the safest default.
-    vi.mocked(hostsList).mockResolvedValue([]);
+  it("shows a neutral label, with no row checked, for a device the list doesn't know", async () => {
+    // The send still goes to that device (e.g. the list failed to load),
+    // so the picker must not claim this machine.
+    const user = userEvent.setup();
+    hosts = [host(7, "homelab")];
     render(<DevicePicker hostId={999} onSelectHostId={() => {}} />);
-    await waitFor(() => {
-      expect(screen.getByRole("button")).toHaveAttribute(
-        "aria-label",
-        "Device: Local Device",
-      );
-    });
+    expect(trigger()).toHaveAccessibleName("Device: Device unavailable");
+    expect(trigger()).toHaveAttribute("title", "Runs on a device that isn't available");
+
+    await user.click(trigger());
+    await screen.findByText("this device");
+    expect(screen.queryByLabelText("Selected")).toBeNull();
   });
 
-  it("opens the dropdown and exposes the Local Device entry", async () => {
+  it("checks this device's row when local", async () => {
     const user = userEvent.setup();
-    vi.mocked(hostsList).mockResolvedValue([]);
+    hosts = [host(7, "homelab")];
     render(<DevicePicker hostId={null} onSelectHostId={() => {}} />);
-    await waitFor(() => screen.getByRole("button"));
-    await user.click(screen.getByRole("button"));
-    // The trigger label and the menu item both contain "Local Device"
-    // — assert at-least-one match (we don't care which one). findAll
-    // is the right primitive for "render eventually showed this."
-    await waitFor(() =>
-      expect(screen.getAllByText("Local Device").length).toBeGreaterThanOrEqual(1),
-    );
+    await user.click(trigger());
+    const local = (await screen.findByText("this device")).closest("[cmdk-item]");
+    expect(screen.getAllByLabelText("Selected")).toHaveLength(1);
+    expect(local).toContainElement(screen.getByLabelText("Selected"));
+    expect(local).toHaveTextContent("ai-node");
   });
 
-  it("renders the 'Other Hosts' submenu only when remote hosts exist", async () => {
+  it("lists this device and every device with its live status", async () => {
     const user = userEvent.setup();
-    vi.mocked(hostsList).mockResolvedValue([
-      host({ id: 7, name: "homelab" }),
-    ]);
+    hosts = [host(1, "homelab"), host(2, "zeus"), host(3, "nas"), host(4, "pi")];
+    statuses = {
+      1: status(1, { reachable: true }),
+      2: status(2, { reachable: true, last_error: "codemux-remote is not installed" }),
+      3: status(3),
+      4: status(4, { probed: false }),
+    };
     render(<DevicePicker hostId={null} onSelectHostId={() => {}} />);
-    await waitFor(() => screen.getByRole("button"));
-    await user.click(screen.getByRole("button"));
-    await waitFor(() =>
-      expect(screen.getAllByText("Other Hosts").length).toBeGreaterThanOrEqual(1),
-    );
+    await user.click(trigger());
+
+    expect(await screen.findByText("this device")).toBeInTheDocument();
+    const row = (id: number) =>
+      document.querySelector<HTMLElement>(`[data-host-id="${id}"]`)!;
+    // One line each: name and status; the SSH address is the tooltip.
+    expect(row(1)).toHaveTextContent(/homelab.*online/);
+    expect(row(1)).toHaveAttribute("title", "SSH deus@homelab · Online");
+    expect(row(2)).toHaveTextContent(/zeus.*needs setup/);
+    expect(row(3)).toHaveTextContent(/nas.*offline/);
+    expect(row(4)).toHaveTextContent(/pi.*checking…/);
   });
 
-  it("does not throw when hostsList rejects (falls back to local-only)", async () => {
-    // Defensive: a broken DB or auth state shouldn't crash the
-    // surrounding new-workspace dialog. The picker must render the
-    // local option even if the listing failed.
-    vi.mocked(hostsList).mockRejectedValue(new Error("db down"));
+  it("reports the picked device, and null for this device", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    hosts = [host(7, "homelab")];
+    render(<DevicePicker hostId={7} onSelectHostId={onSelect} />);
+
+    await user.click(trigger());
+    await user.click(await screen.findByText("this device"));
+    expect(onSelect).toHaveBeenLastCalledWith(null);
+
+    await user.click(trigger());
+    const row = document.querySelector<HTMLElement>('[data-host-id="7"]');
+    expect(row).not.toBeNull();
+    await user.click(row!);
+    expect(onSelect).toHaveBeenLastCalledWith(7);
+  });
+
+  it("offers Add a device… with no devices and opens the add dialog in Settings", async () => {
+    const user = userEvent.setup();
     render(<DevicePicker hostId={null} onSelectHostId={() => {}} />);
-    await waitFor(() => {
-      expect(screen.getByRole("button")).toHaveAttribute(
-        "aria-label",
-        "Device: Local Device",
-      );
-    });
+    await user.click(trigger());
+    await user.click(await screen.findByRole("button", { name: "Add a device…" }));
+    expect(setShowSettingsMock).toHaveBeenCalledWith(true, "hosts");
+    expect(useAddDeviceDialogStore.getState().open).toBe(true);
+  });
+
+  it("offers Manage devices… once a device exists, without opening the add dialog", async () => {
+    const user = userEvent.setup();
+    hosts = [host(7, "homelab")];
+    render(<DevicePicker hostId={null} onSelectHostId={() => {}} />);
+    await user.click(trigger());
+    await user.click(await screen.findByRole("button", { name: "Manage devices…" }));
+    expect(setShowSettingsMock).toHaveBeenCalledWith(true, "hosts");
+    expect(useAddDeviceDialogStore.getState().open).toBe(false);
+  });
+
+  it("does not open while disabled", async () => {
+    const user = userEvent.setup();
+    render(<DevicePicker hostId={null} onSelectHostId={() => {}} disabled />);
+    await user.click(trigger());
+    expect(screen.queryByText("this device")).toBeNull();
   });
 });

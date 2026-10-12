@@ -12,6 +12,8 @@ import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 interface RevertTurnDialogProps {
   checkpoint: AgentChatTurnCheckpointRecord | null;
+  /** This turn plus every later one the revert removes. */
+  turnCount: number;
   reverting: boolean;
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
@@ -19,10 +21,12 @@ interface RevertTurnDialogProps {
 
 export function RevertTurnDialog({
   checkpoint,
+  turnCount,
   reverting,
   onOpenChange,
   onConfirm,
 }: RevertTurnDialogProps) {
+  const later = Math.max(0, turnCount - 1);
   return (
     <AlertDialog
       open={checkpoint !== null}
@@ -32,11 +36,18 @@ export function RevertTurnDialog({
     >
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Revert this turn and everything after it?</AlertDialogTitle>
+          <AlertDialogTitle>
+            {later === 0
+              ? "Revert this turn?"
+              : `Revert this turn and ${later} later ${later === 1 ? "turn" : "turns"}?`}
+          </AlertDialogTitle>
           <AlertDialogDescription>
-            Codemux will restore the workspace, rewind the Codex conversation,
-            and remove this turn and later turns from the transcript. Your
-            current workspace state is kept in a hidden Git safety snapshot.
+            Codemux puts the workspace files back to how they were before this
+            turn, rewinds the agent&apos;s conversation, and removes{" "}
+            {turnCount > 1 ? `these ${turnCount} turns` : "the turn"} from the
+            transcript. Your prompt goes back into the composer. Right after
+            reverting you can restore the current files; the conversation
+            cannot be brought back.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
@@ -50,7 +61,11 @@ export function RevertTurnDialog({
             }}
             data-testid="revert-turn-confirm"
           >
-            {reverting ? "Reverting…" : "Revert turns"}
+            {reverting
+              ? "Reverting…"
+              : turnCount > 1
+                ? `Revert ${turnCount} turns`
+                : "Revert turn"}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

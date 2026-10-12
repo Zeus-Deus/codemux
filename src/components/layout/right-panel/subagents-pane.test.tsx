@@ -14,6 +14,10 @@ import { useUIStore } from "@/stores/ui-store";
 
 import { COMPLETION_LINGER_MS, SubagentsPane } from "./subagents-pane";
 
+const { openDelegatedChat } = vi.hoisted(() => ({ openDelegatedChat: vi.fn() }));
+vi.mock("@/components/chat/delegation-actions", () => ({ openDelegatedChat }));
+vi.mock("@/assets/preset-icons/codex.svg", () => ({ default: "/mock/codex.svg" }));
+
 function subagent(overrides: Partial<SubagentView>): SubagentView {
   return {
     id: "sub-1",
@@ -499,5 +503,37 @@ describe("SubagentsPane — history", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Back to Subagents" }));
     expect(useUIStore.getState().subagentsHistoryOpen).toBe(false);
+  });
+});
+
+describe("SubagentsPane — delegated tasks", () => {
+  const delegated = subagent({
+    id: "delegate:child-1",
+    name: "Codex",
+    agentType: "codex",
+    description: "Add slugify helper",
+    model: "gpt-6.1-codex",
+    effort: "high",
+    activity: "Working in its tab",
+  });
+
+  it("marks a delegated row with its provider and model · effort", () => {
+    const { container } = render(
+      <SubagentsPane threadId="thread-1" messages={messages([delegated])} />,
+    );
+    const row = screen.getByTestId("live-row");
+    expect(row.querySelector("img[data-provider='codex']")).not.toBeNull();
+    expect(container.querySelector("[data-subagent-model]")).toHaveAttribute(
+      "data-subagent-model",
+      "gpt-6.1-codex · high",
+    );
+  });
+
+  it("opens the child's own chat instead of the read-only drill-in", () => {
+    openDelegatedChat.mockClear();
+    render(<SubagentsPane threadId="thread-1" messages={messages([delegated])} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open Add slugify helper thread" }));
+    expect(openDelegatedChat).toHaveBeenCalledWith("child-1");
+    expect(useUIStore.getState().subagentEnterRequest).toBeNull();
   });
 });
