@@ -28,6 +28,7 @@ import {
   HEALTH_REPROBE_MS,
   healthBannerKey,
   providerReadiness,
+  healthBlocksSend,
   selectVisibleHealthReport,
   useProbedProviderHealth,
   useProviderHealth,
@@ -417,5 +418,106 @@ describe("provider-health-store", () => {
     expect(result.current.claude?.pending).toBe(false);
     expect(result.current.claude?.report?.status).toBe("ready");
     warn.mockRestore();
+  });
+
+  it("blocks a send only for a missing or signed-out CLI", () => {
+    expect(healthBlocksSend(null)).toBe(false);
+    expect(healthBlocksSend(report("ready"))).toBe(false);
+    expect(healthBlocksSend(report("warning", "Version check timed out."))).toBe(false);
+    // Installed but failing to run: the session gets to explain itself.
+    expect(
+      healthBlocksSend({ ...report("error", "failed to run"), installed: true }),
+    ).toBe(false);
+    expect(healthBlocksSend(report("error", "not installed"))).toBe(true);
+    expect(
+      healthBlocksSend({
+        ...report("error", "Claude Code isn't signed in."),
+        installed: true,
+        login_command: "claude auth login",
+      }),
+    ).toBe(true);
+  });
+
+  it("ensureReady re-probes a cached block and passes once signed in", async () => {
+    const signedOut: ProviderHealthReport = {
+      ...report("error", "Claude Code isn't signed in."),
+      installed: true,
+      login_command: "claude auth login",
+    };
+    seed(signedOut);
+    useProviderHealth.getState().dismiss("claude");
+    mockProbe.mockResolvedValueOnce(signedOut);
+
+    // Still signed out: the report comes back and the banner is shown
+    // again even though the user had dismissed it.
+    expect(await useProviderHealth.getState().ensureReady("claude")).toEqual(
+      signedOut,
+    );
+    expect(
+      selectVisibleHealthReport(useProviderHealth.getState(), "claude"),
+    ).toEqual(signedOut);
+
+    // A fresh cached block is still re-probed, so a sign-in finished a
+    // moment ago is never refused on stale facts.
+    mockProbe.mockResolvedValueOnce(report("ready"));
+    expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
+    expect(mockProbe).toHaveBeenCalledTimes(2);
+  });
+
+  it("ensureReady reuses a fresh healthy answer without probing", async () => {
+    seed(report("ready"));
+    expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
+    expect(mockProbe).not.toHaveBeenCalled();
+  });
+
+  it("lets a send proceed when re-probing a cached block fails, without renewing that block", async () => {
+    vi.useFakeTimers();
+    const signedOut: ProviderHealthReport = {
+      ...report("error", "Claude Code isn't signed in."),
+      installed: true,
+      login_command: "claude auth login",
+    };
+    seed(signedOut);
+    const fetchedAt = useProviderHealth.getState().slots.claude.fetchedAt;
+    vi.advanceTimersByTime(1000);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockProbe.mockRejectedValueOnce(new Error("IPC down"));
+    try {
+      expect(await useProviderHealth.getState().ensureReady("claude")).toBeNull();
+      expect(mockProbe).toHaveBeenCalledOnce();
+      expect(useProviderHealth.getState().slots.claude).toMatchObject({
+        report: signedOut,
+        fetchedAt,
+        inFlight: null,
+      });
+      expect(selectVisibleHealthReport(useProviderHealth.getState(), "claude")).toEqual(signedOut);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("returns the failed queued re-probe result instead of an older blocking report", async () => {
+    const running = deferred();
+    const signedOut = { ...report("error", "Signed out."), installed: true, login_command: "claude auth login" };
+    seed(signedOut);
+    mockProbe.mockReturnValueOnce(running.promise);
+    mockProbe.mockRejectedValueOnce(new Error("IPC down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const refresh = useProviderHealth.getState().refresh("claude", { force: true });
+      const gate = useProviderHealth.getState().ensureReady("claude");
+      running.resolve(signedOut);
+      expect(await refresh).toEqual(signedOut);
+      expect(await gate).toBeNull();
+      expect(mockProbe).toHaveBeenCalledTimes(2);
+      expect(useProviderHealth.getState().slots.claude.report).toEqual(signedOut);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("leaves ACP readiness to the instance without starting a generic probe", async () => {
+    expect(await useProviderHealth.getState().ensureReady("acp")).toBeNull();
+    expect(mockProbe).not.toHaveBeenCalled();
   });
 });

@@ -63,6 +63,8 @@ export function useHorizontalWheelScroll<T extends HTMLElement>(): (
     detachRef.current?.();
     detachRef.current = null;
     if (!node) return;
+    const previousOwnership = node.getAttribute("data-native-wheel");
+    node.setAttribute("data-native-wheel", "");
 
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY === 0) return;
@@ -78,6 +80,10 @@ export function useHorizontalWheelScroll<T extends HTMLElement>(): (
     };
 
     node.addEventListener("wheel", onWheel, { passive: false });
-    detachRef.current = () => node.removeEventListener("wheel", onWheel);
+    detachRef.current = () => {
+      node.removeEventListener("wheel", onWheel);
+      if (previousOwnership === null) node.removeAttribute("data-native-wheel");
+      else node.setAttribute("data-native-wheel", previousOwnership);
+    };
   }, []);
 }

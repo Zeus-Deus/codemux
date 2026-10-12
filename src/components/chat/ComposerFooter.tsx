@@ -23,6 +23,7 @@ import type {
 } from "@/tauri/types";
 
 import { ContextUsageMeter } from "./ContextUsageMeter";
+import { useStopTooltip } from "./composer-interrupt";
 import { FOOTER_SEPARATOR } from "./pickers/footer-trigger";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
@@ -194,6 +195,7 @@ export function ComposerFooter({
   configInMenu = false,
 }: Props) {
   const modeIsActive = mode !== "default";
+  const stopTooltip = useStopTooltip();
 
   return (
     <div
@@ -386,7 +388,7 @@ export function ComposerFooter({
               "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
             )}
             aria-label="Stop"
-            title="Stop"
+            title={stopTooltip}
           >
             <Square className="size-3" fill="currentColor" />
           </button>

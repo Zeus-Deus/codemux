@@ -4,7 +4,7 @@ import type {
   HostView,
   LocalChatSession,
 } from "@/tauri/commands";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import type { AgentChatProviderKind, ProjectScripts } from "@/tauri/types";
 /**
  * Dev-only Tauri runtime shim.
  *
@@ -700,6 +700,21 @@ function emitAppStateDelta(delta: AppStateDelta): void {
   emitEvent("app-state-delta", payload);
 }
 
+/** Replace a workspace with an updated copy. The renderer shares structure
+ *  with the snapshot it already holds, so mutating that object in place would
+ *  leave the next emit looking unchanged. */
+function replaceWorkspace(
+  workspaceId: string,
+  update: (ws: WorkspaceSnapshot) => Partial<WorkspaceSnapshot>,
+): void {
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((w) =>
+      w.workspace_id === workspaceId ? { ...w, ...update(w) } : w,
+    ),
+  };
+}
+
 /** Every leaf pane id under `node`, in tree order. */
 function leafPaneIds(node: PaneNodeSnapshot): string[] {
   if (node.kind !== "split") return [node.pane_id];
@@ -1182,6 +1197,13 @@ let floodCounter = 0;
  *
  *   window.__codemuxTerminalMock.emitOsc7("/home/zeus/proj/src-tauri")
  */
+/** Per-session overrides for `terminal_foreground_jobs` (null = idle). */
+const mockForegroundJobs = new Map<string, string | null>();
+
+function setForegroundJob(sessionId: string, job: string | null): void {
+  mockForegroundJobs.set(sessionId, job);
+}
+
 function emitOsc7(cwd: string, sessionId?: string): void {
   // `ESC ] 7 ; file://<host>/<path> BEL` — the form vte, fish, and
   // kitty's shell integration all emit.
@@ -3271,6 +3293,31 @@ function sessionErrorMockRun(
   });
 }
 
+/** Signed-out QA: the turn a signed-out Claude CLI produces. The SDK
+ *  reports `authentication_failed` on the assistant message, which the
+ *  transcript renders as the "isn't signed in" card with its actions. */
+function signedOutMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
+  const turnId = `signed-out-turn-${Date.now()}`;
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: turnId },
+  });
+  emitChatEvent(threadId, {
+    type: "runtime_warning",
+    thread_id: threadId,
+    message: "assistant error: authentication_failed",
+    original_payload: null,
+  });
+  emitChatEvent(threadId, {
+    type: "turn_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    status: { kind: "success" },
+    usage: null,
+  });
+}
+
 /** Dead-run detection QA (issue #154): settle a live turn with a synthetic
  *  `child_exited` error — exactly what the provider watchdogs emit when a
  *  sidecar/server dies mid-turn. Drives the "Run interrupted" divider and
@@ -3397,6 +3444,7 @@ function streamMockDelegatedTask(
       streamRunStalled: typeof streamMockRunStalled;
       interruptRun: typeof interruptMockRun;
       sessionError: typeof sessionErrorMockRun;
+      signedOut: typeof signedOutMockRun;
       setProviderHealth: typeof setMockProviderHealth;
     };
   }
@@ -3410,6 +3458,7 @@ function streamMockDelegatedTask(
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
   sessionError: sessionErrorMockRun,
+  signedOut: signedOutMockRun,
   setProviderHealth: setMockProviderHealth,
 };
 
@@ -3421,12 +3470,14 @@ function streamMockDelegatedTask(
       flood: typeof floodTerminals;
       emitSerializeBuffers: typeof emitSerializeBuffers;
       emitOsc7: typeof emitOsc7;
+      setForegroundJob: typeof setForegroundJob;
     };
   }
 ).__codemuxTerminalMock = {
   flood: floodTerminals,
   emitSerializeBuffers,
   emitOsc7,
+  setForegroundJob,
 };
 
 // ── Editor disk overlay ──────────────────────────────────────────────
@@ -3875,6 +3926,9 @@ function emitWebRemoteState(): void {
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
 
+/** Per-project scripts saved through `set_project_scripts`, keyed by path. */
+const mockProjectScripts = new Map<string, ProjectScripts>();
+
 /** In-memory staging store for `agent_chat_stage_image` (keyed by the
  *  fake absolute path returned to the frontend). Serves `agent_chat_read_image`
  *  so the IPC-read image fallback works end-to-end in `npm run dev`. */
@@ -4295,7 +4349,10 @@ const handlers: Record<string, Handler> = {
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
   ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
-  get_package_format: () => "AppImage",
+  get_package_format: () =>
+    updateMockScenario === "pacman" || updateMockScenario === "other"
+      ? updateMockScenario
+      : "appimage",
 
   // ── Settings ──
   get_synced_settings: () => structuredClone(SYNCED_SETTINGS),
@@ -5147,6 +5204,18 @@ const handlers: Record<string, Handler> = {
     await new Promise(resolve => setTimeout(resolve, 1800));
     if (new URLSearchParams(location.search).get("providerUpdate") === "error") throw new Error("Update failed: the package registry could not be reached. Check your connection and try again.");
     return { provider: a.provider, installed_version: "0.158.0", latest_version: "0.158.0", available: false, manager: "Omarchy · mise", can_update: true, message: null };
+  },
+  // Opens the sign-in terminal tab like the backend, then treats the
+  // sign-in as done: the next probe (Re-check, window focus, or a send)
+  // reports ready, which is the recovery path QA needs to see.
+  open_provider_login_terminal: (a) => {
+    const tabId = handlers.create_tab({ workspaceId: a.workspaceId, kind: "terminal" });
+    const ws = findWorkspace(a.workspaceId);
+    const tab = ws?.tabs.find((t) => t.tab_id === tabId);
+    if (tab) tab.title = "Sign in";
+    delete mockProviderHealth[String(a.provider) as MockProviderKind];
+    emitAppState();
+    return undefined;
   },
   agent_chat_provider_health: (a) => {
     const provider = String(a.provider) as MockProviderKind;
@@ -6726,19 +6795,28 @@ const handlers: Record<string, Handler> = {
   // ── Workspace config / scripts (sidebar setup banner, default-branch
   //    cache) ──
   get_default_branch: () => "main",
-  get_workspace_config: () => ({
-    setup: [],
-    teardown: [],
-    run: null,
-    worktree_includes: [],
-  }),
-  get_project_scripts: () => ({
-    setup: [],
-    teardown: [],
-    run: null,
-    worktree_includes: [],
-  }),
-
+  // No mock project has a `.codemux/config.json`; like the backend, that
+  // reads as null, so the DB scripts below are the effective config.
+  get_workspace_config: () => null,
+  get_project_scripts: (a) =>
+    mockProjectScripts.get(a.path as string) ?? {
+      setup: [],
+      teardown: [],
+      run: null,
+      worktree_includes: [],
+    },
+  // Kept in memory so the titlebar Run button flips from "Set Run" to
+  // "Run" after a command is picked in its popover.
+  set_project_scripts: (a) => {
+    mockProjectScripts.set(a.path as string, a.scripts as ProjectScripts);
+    return null;
+  },
+  detect_run_candidates: () => [
+    { command: "npm run dev", source: "package.json" },
+    { command: "npm run start", source: "package.json" },
+    { command: "npm run tauri:dev", source: "package.json" },
+    { command: "cargo run", source: "Cargo.toml" },
+  ],
   // ── Terminal (the body is out of scope per issue #40, but the mount
   //    MUST NOT crash). `get_terminal_status` is the load-bearing one:
   //    TerminalPane writes whatever it returns into a ref that the next
@@ -6815,6 +6893,30 @@ const handlers: Record<string, Handler> = {
       if (ids.has(session.session_id) && session.cwd) {
         out[session.session_id] = session.cwd;
       }
+    }
+    return out;
+  },
+  // Twin of `terminal_foreground_jobs`. There is no shell here, so the
+  // port-detection workspace's terminal plays a running dev server and every
+  // other session sits at its prompt. Override per session with
+  // `window.__codemuxTerminalMock.setForegroundJob(sessionId, "cargo" | null)`.
+  terminal_foreground_jobs: (a) => {
+    const out: Record<string, string> = {};
+    const ports = findWorkspace("ws-codemux-ports");
+    const portsSessions = new Set(
+      (ports?.surfaces ?? []).flatMap((surface) =>
+        leafPaneNodes(surface.root).flatMap((node) =>
+          node.kind === "terminal" ? [node.session_id] : [],
+        ),
+      ),
+    );
+    for (const id of (a.sessionIds as string[]) ?? []) {
+      const job = mockForegroundJobs.has(id)
+        ? mockForegroundJobs.get(id)
+        : portsSessions.has(id)
+          ? "node"
+          : null;
+      if (job) out[id] = job;
     }
     return out;
   },
@@ -7070,6 +7172,25 @@ const handlers: Record<string, Handler> = {
     setTimeout(() => emitAppState(), 0);
     return ws.workspace_id;
   },
+  // Reuses the Home workspace or adds one rooted at the mock home dir, so
+  // flows that open something "in Home" (the provider sign-in terminal)
+  // work in `npm run dev`.
+  get_or_create_home_workspace: () => {
+    const existing = appState.workspaces.find((w) => w.workspace_type === "home");
+    if (existing) return existing.workspace_id;
+    const ws: WorkspaceSnapshot = {
+      ...buildWorktreeWorkspace(MOCK_HOME_DIR, "main"),
+      title: "Home",
+      workspace_type: "home",
+      cwd: MOCK_HOME_DIR,
+      worktree_path: null,
+      project_root: MOCK_HOME_DIR,
+      workspace_kind: null,
+    };
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    setTimeout(() => emitAppState(), 0);
+    return ws.workspace_id;
+  },
   activate_tab: (a) => {
     const ws = findWorkspace(a.workspaceId);
     const tab = ws?.tabs.find((candidate) => candidate.tab_id === a.tabId);
@@ -7080,6 +7201,16 @@ const handlers: Record<string, Handler> = {
         ? { ...candidate, active_tab_id: tab.tab_id, active_surface_id: tab.surface_id ?? candidate.active_surface_id }
         : candidate),
     };
+    emitAppState();
+    return undefined;
+  },
+  reorder_tabs: (a) => {
+    const order = (a.tabIds as string[]) ?? [];
+    replaceWorkspace(a.workspaceId as string, (ws) => ({
+      tabs: [...ws.tabs].sort(
+        (x, y) => order.indexOf(x.tab_id) - order.indexOf(y.tab_id),
+      ),
+    }));
     emitAppState();
     return undefined;
   },
@@ -7111,9 +7242,11 @@ const handlers: Record<string, Handler> = {
     // Like the backend, drop the terminal and browser sessions the tab owned.
     const removedSessions = new Set<string>();
     const removedBrowsers = new Set<string>(closed.browser_id ? [closed.browser_id] : []);
+    const removedPaneIds = new Set<string>();
     for (const surface of ws.surfaces) {
       if (surface.surface_id !== closed.surface_id) continue;
       for (const node of leafPaneNodes(surface.root)) {
+        removedPaneIds.add(node.pane_id);
         if (node.kind === "terminal") removedSessions.add(node.session_id);
         if (node.kind === "browser") removedBrowsers.add(node.browser_id);
       }
@@ -7139,6 +7272,9 @@ const handlers: Record<string, Handler> = {
       ),
       browser_sessions: appState.browser_sessions.filter(
         (b) => !removedBrowsers.has(b.browser_id),
+      ),
+      pane_statuses: Object.fromEntries(
+        Object.entries(appState.pane_statuses).filter(([id]) => !removedPaneIds.has(id)),
       ),
     };
     emitAppState();
@@ -7280,6 +7416,50 @@ const handlers: Record<string, Handler> = {
           }
         }
       }
+    }
+    // `NewTab` gets its own tab, as in the backend (reopening a closed chat
+    // lands here with the chat's old thread id).
+    if (ws && a.launchMode === "new_tab") {
+      const n = ++mockTabSeq;
+      const paneId = `pane-mock-chat-${n}`;
+      const surfaceId = `surface-mock-chat-${n}`;
+      const tabId = `tab-mock-chat-${n}`;
+      replaceWorkspace(ws.workspace_id, () => ({
+        surfaces: [
+          ...ws.surfaces,
+          {
+            surface_id: surfaceId,
+            title: "Agent Chat",
+            active_pane_id: paneId,
+            root: {
+              kind: "agent_chat",
+              pane_id: paneId,
+              title: "Agent Chat",
+              thread_id: threadId,
+              provider: (a.provider as AgentChatProviderKind | null) ?? null,
+              cwd: (a.cwd as string | null) ?? null,
+            },
+          },
+        ],
+        tabs: [
+          ...ws.tabs,
+          {
+            tab_id: tabId,
+            kind: "terminal",
+            title: "Agent Chat",
+            surface_id: surfaceId,
+            browser_id: null,
+            icon: null,
+          },
+        ],
+        active_tab_id: tabId,
+        active_surface_id: surfaceId,
+      }));
+      if (a.select !== false) {
+        appState = { ...appState, active_workspace_id: ws.workspace_id };
+      }
+      emitAppState();
+      return paneId;
     }
     // The deferred worktree workspace already carries a fresh
     // agent_chat pane (empty thread); bind the session to it. Falls
@@ -7729,6 +7909,58 @@ async function showOpenerToast(url: unknown): Promise<void> {
   }
 }
 
+// ── Updater scenarios ──────────────────────────────────────────────
+//
+// Dev builds never run the update check. `?updateMock=` opts in so the toast
+// and app-menu footer states can be exercised (screenshots, manual QA):
+//   appimage — in-app install; the download streams progress and succeeds
+//   fail     — in-app install; the download stops at ~60% with a 404
+//   pacman   — AUR install; the toast shows the yay command
+//   other    — deb/rpm install; the toast points at the release page
+// The check runs after the checker's usual 5s initial delay.
+const updateMockScenario = new URLSearchParams(location.search).get("updateMock");
+if (updateMockScenario) {
+  (window as { __CODEMUX_MOCK_UPDATER__?: boolean }).__CODEMUX_MOCK_UPDATER__ = true;
+}
+
+async function mockUpdaterDownload(channel: unknown): Promise<void> {
+  const id = (channel as { id?: number } | undefined)?.id;
+  let index = 0;
+  const send = (message: unknown) => {
+    const cb = typeof id === "number" ? callbacks.get(id) : undefined;
+    cb?.fn({ index: index++, message } as unknown as never);
+  };
+  const total = 48_000_000;
+  const chunk = total / 20;
+  send({ event: "Started", data: { contentLength: total } });
+  for (let i = 0; i < 20; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (updateMockScenario === "fail" && i === 12) {
+      throw "Download request failed with status: 404 Not Found";
+    }
+    send({ event: "Progress", data: { chunkLength: chunk } });
+  }
+  send({ event: "Finished" });
+}
+
+function routeUpdater(cmd: string, args: Args): unknown {
+  if (!updateMockScenario) return null;
+  if (cmd === "plugin:updater|check") {
+    return {
+      rid: 1,
+      currentVersion: "0.23.1",
+      version: "0.24.0",
+      date: null,
+      body: "Mock release",
+      rawJson: {},
+    };
+  }
+  if (cmd === "plugin:updater|download_and_install") {
+    return mockUpdaterDownload(args.onEvent);
+  }
+  return null;
+}
+
 function routePlugin(cmd: string, args: Args): unknown {
   // Event system — the backbone of listen()/emit()/once().
   if (cmd === "plugin:event|listen") {
@@ -7769,14 +8001,20 @@ function routePlugin(cmd: string, args: Args): unknown {
   if (cmd === "plugin:app|identifier") return "dev.codemux.mock";
   if (cmd.startsWith("plugin:app|")) return undefined;
 
+  // Path resolution — a fixed fake tree, enough for "Show log file".
+  if (cmd === "plugin:path|resolve_directory") {
+    return "/home/mock/.local/share/dev.codemux.mock/logs";
+  }
+  if (cmd === "plugin:path|join") return (args.paths as string[]).join("/");
+
   // Process control — log the intent, do nothing.
   if (cmd.startsWith("plugin:process|")) {
     console.log(`[dev mock] ${cmd} (no-op in browser)`);
     return undefined;
   }
 
-  // Updater — always "no update available".
-  if (cmd.startsWith("plugin:updater|")) return null;
+  // Updater — "no update available" unless `?updateMock=` picks a scenario.
+  if (cmd.startsWith("plugin:updater|")) return routeUpdater(cmd, args);
 
   // Dialogs — cancelled (null) so file pickers resolve cleanly.
   if (cmd.startsWith("plugin:dialog|")) return null;

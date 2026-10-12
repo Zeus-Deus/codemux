@@ -1039,6 +1039,9 @@ export interface ProviderHealthReport {
   installed: boolean;
   message: string | null;
   version: string | null;
+  /** Set only when the CLI is installed but signed out: the command that
+   *  signs it in. Optional because older backends omit it. */
+  login_command?: string | null;
 }
 
 // ── Chat-side provider capabilities ───────────────────────────────────
@@ -1538,6 +1541,12 @@ export interface DetectedSetup {
   label: string;
   command: string;
   enabled: boolean;
+}
+
+/** A suggested run command and the file it was detected from. */
+export interface RunCandidate {
+  command: string;
+  source: string;
 }
 
 // ── Theme ──

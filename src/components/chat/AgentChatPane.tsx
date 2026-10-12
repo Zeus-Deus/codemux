@@ -794,6 +794,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
+        // Claims the key, so the composer's Escape-to-stop leaves the run be.
+        e.preventDefault();
         setEnteredSubagentId(null);
       }
     };
@@ -4191,7 +4193,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       {/* Provider runtime health (probe-backed, TTL-cached): a dead CLI
           used to fail silently into a perpetual "Working…" spinner.
           Renders as a floating top overlay; needs `relative` above. */}
-      {conversationWritable && <ProviderStatusNotice provider={provider} />}
+      {conversationWritable && (
+        <ProviderStatusNotice provider={provider} workspaceId={paneWorkspaceId} />
+      )}
       {conversationWritable && <ProviderUpdateNotice provider={provider} threadId={threadId} remote={providerUpdatesRemote} />}
       {messages.length === 0 && !hydrating ? (
         <ChatHomeLanding composer={composerEl} />

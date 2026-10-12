@@ -165,6 +165,47 @@ describe("synced-settings-store", () => {
       expect(state.settings).toEqual(DEFAULT_SETTINGS);
       expect(state.isSyncing).toBe(false);
     });
+
+    it("keeps current settings until reset persistence is confirmed", async () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      let resolveReset!: (settings: UserSettings) => void;
+      mockResetSyncedSettings.mockReturnValue(new Promise<UserSettings>((resolve) => {
+        resolveReset = resolve;
+      }));
+      const reset = useSyncedSettingsStore.getState().resetSettings();
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(true);
+
+      resolveReset(DEFAULT_SETTINGS);
+      await reset;
+      expect(useSyncedSettingsStore.getState().settings).toBe(DEFAULT_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
+
+    it("rejects a failed backend reset without changing settings", async () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      const error = new Error("Network error");
+      mockResetSyncedSettings.mockRejectedValue(error);
+
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toBe(error);
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
+
+    it("does not let a completed reset replace a newer local edit", async () => {
+      let resolveReset!: (settings: UserSettings) => void;
+      mockResetSyncedSettings.mockReturnValue(new Promise<UserSettings>((resolve) => {
+        resolveReset = resolve;
+      }));
+      const reset = useSyncedSettingsStore.getState().resetSettings();
+      mockUpdateSyncedSettings.mockResolvedValue(DARK_SETTINGS);
+      await useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+
+      resolveReset(DEFAULT_SETTINGS);
+      await reset;
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
   });
 
   describe("applySettingsFromEvent", () => {
