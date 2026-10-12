@@ -120,8 +120,8 @@ const proseClasses = [
   "prose-pre:m-0 prose-pre:p-0 prose-pre:bg-transparent prose-pre:text-inherit prose-pre:rounded-none prose-pre:border-0 prose-pre:leading-snug",
   // Tables — plugin-default spacing is loose; pull in for chat.
   "prose-table:my-3 prose-table:text-[0.9em]",
-  "prose-th:px-3 prose-th:py-1.5 prose-th:bg-muted/60 prose-th:font-semibold prose-th:text-foreground prose-th:border prose-th:border-border/70",
-  "prose-td:px-3 prose-td:py-1.5 prose-td:align-top prose-td:text-foreground prose-td:border prose-td:border-border/60",
+  "prose-th:px-3 prose-th:py-1.5 prose-th:bg-surface-2 prose-th:font-semibold prose-th:text-foreground prose-th:border prose-th:border-hairline-strong",
+  "prose-td:px-3 prose-td:py-1.5 prose-td:align-top prose-td:text-foreground prose-td:border prose-td:border-hairline",
   // Blockquote — neutral left rule, no italic accent.
   "prose-blockquote:not-italic prose-blockquote:font-normal prose-blockquote:border-l-2 prose-blockquote:pl-3 prose-blockquote:my-2",
   // Break long tokens (URLs, identifiers) rather than overflowing.

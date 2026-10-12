@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     setShowAutomations: vi.fn(),
     setShowSettings: vi.fn(),
     setRightPanelTab: vi.fn(),
+    setShowLocalSessionImport: vi.fn(),
   },
   synced: {
     settings: {
@@ -119,6 +120,7 @@ import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import { BUILT_IN_THEMES, applyTheme } from "@/lib/themes";
 import { useOmarchyStore } from "@/stores/omarchy-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { omarchyToTheme } from "@/lib/omarchy-theme";
 import { fallbackTheme } from "@/hooks/use-theme-colors";
 
@@ -993,5 +995,26 @@ describe("command palette — pull-request mode", () => {
     mocks.ui.takeCommandPaletteQuery.mockReturnValue("pr 123");
     renderPalette();
     expect(screen.getByText("Couldn't reach your pull requests")).toBeInTheDocument();
+  });
+});
+
+describe("command palette — import recent chats", () => {
+  afterEach(() => useFeatureFlags.setState({ enableAgentChat: false }));
+
+  it("opens the recent chat import from anywhere", async () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    await user.click(screen.getByText("Import recent chats…"));
+    expect(mocks.ui.setShowLocalSessionImport).toHaveBeenCalledWith(true);
+  });
+
+  it("is hidden when agent chat is off", async () => {
+    useFeatureFlags.setState({ enableAgentChat: false });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    expect(screen.queryByText("Import recent chats…")).toBeNull();
   });
 });

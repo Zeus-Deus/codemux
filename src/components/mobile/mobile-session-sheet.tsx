@@ -205,7 +205,7 @@ export function MobileSessionSheet({
                   {row()}
                   <button
                     type="button"
-                    className="flex size-11 shrink-0 items-center justify-center rounded-xl text-muted-foreground hover:bg-muted"
+                    className="flex size-11 shrink-0 items-center justify-center rounded-xl text-muted-foreground hover:bg-surface-2"
                     aria-label={`Close ${tab.title}`}
                     disabled={busy}
                     onClick={() => void close(tab.tab_id)}

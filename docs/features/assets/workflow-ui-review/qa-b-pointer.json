@@ -1,0 +1,93 @@
+{
+  "before": {
+    "button": {
+      "x": 1024,
+      "y": 927.609375,
+      "width": 123.640625,
+      "height": 28
+    },
+    "toast": {
+      "x": 1074,
+      "y": 902.3125,
+      "width": 420,
+      "height": 57.6875,
+      "class": "toast on",
+      "pointerEvents": "none"
+    },
+    "atCenter": [
+      {
+        "tag": "BUTTON",
+        "id": "",
+        "class": "btn solid",
+        "text": "Apply changes"
+      },
+      {
+        "tag": "DIV",
+        "id": "",
+        "class": "row-acts",
+        "text": "Apply changesMOCK"
+      },
+      {
+        "tag": "DIV",
+        "id": "",
+        "class": "apply",
+        "text": "Apply rechecks the task generation, accepted digest, scope and each so"
+      },
+      {
+        "tag": "DIV",
+        "id": "",
+        "class": "fr",
+        "text": "Back to attempt\n      Review file changes\n        storage · gen 2 · 4 "
+      },
+      {
+        "tag": "DIV",
+        "id": "",
+        "class": "",
+        "text": "Back to attempt\n      Review file changes\n        storage · gen 2 · 4 "
+      }
+    ],
+    "enabled": true
+  },
+  "after": {
+    "applied": {
+      "ok": true,
+      "text": "Mock only — no files were written. In the app, CodeMux would recheck generation, digest, scope and source content, then write 4 paths."
+    }
+  },
+  "keyboard": {
+    "applied": {
+      "ok": true,
+      "text": "Mock only — no files were written. In the app, CodeMux would recheck generation, digest, scope and source content, then write 4 paths."
+    }
+  },
+  "events": [
+    {
+      "type": "pointerdown",
+      "target": "BUTTON",
+      "id": "",
+      "class": "btn solid",
+      "act": "apply",
+      "x": 1085.8203125,
+      "y": 941.609375
+    },
+    {
+      "type": "pointerup",
+      "target": "BUTTON",
+      "id": "",
+      "class": "btn solid",
+      "act": "apply",
+      "x": 1085.8203125,
+      "y": 941.609375
+    },
+    {
+      "type": "click",
+      "target": "BUTTON",
+      "id": "",
+      "class": "btn solid",
+      "act": "apply",
+      "x": 1085,
+      "y": 941
+    }
+  ],
+  "external": []
+}
