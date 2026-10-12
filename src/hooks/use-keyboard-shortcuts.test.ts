@@ -17,8 +17,15 @@ vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn(), dismiss: vi.fn() },
 }));
 
+vi.mock("@/components/overlays/interface-size-hud", () => ({
+  announceInterfaceSize: vi.fn(),
+}));
+
 import { toast } from "sonner";
 import { dispatch } from "./use-keyboard-shortcuts";
+import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { TYPOGRAPHY_RANGES } from "@/lib/typography";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -285,6 +292,32 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(useUIStore.getState().showSettings).toBe(false);
     });
 
+    it("leaves settings open when a layer inside it already took the Escape", () => {
+      useUIStore.setState({ showSettings: true });
+      const claimed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      claimed.preventDefault();
+
+      expect(dispatch("closeOverlay", claimed)).toBe(false);
+      expect(useUIStore.getState().showSettings).toBe(true);
+    });
+
+    it("leaves settings open while a sheet inside it is open", () => {
+      useUIStore.setState({ showSettings: true });
+      const sheet = document.createElement("div");
+      sheet.setAttribute("role", "dialog");
+      sheet.setAttribute("data-state", "open");
+      document.body.appendChild(sheet);
+      try {
+        expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(false);
+        expect(useUIStore.getState().showSettings).toBe(true);
+      } finally {
+        sheet.remove();
+      }
+      // The next press, with nothing left on top, leaves Settings.
+      expect(dispatch("closeOverlay", FAKE_EVENT)).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(false);
+    });
+
     it("closes fileSearch before contentSearch", () => {
       useUIStore.setState({ showFileSearch: true, showContentSearch: true });
       dispatch("closeOverlay", FAKE_EVENT);
@@ -395,6 +428,22 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       const before = useUIStore.getState().launcherOpenRequest;
       expect(dispatch("openLauncher", FAKE_EVENT)).toBe(true);
       expect(useUIStore.getState().launcherOpenRequest).toBe(before + 1);
+    });
+
+    it("announces an interface-size press even when it is already at the limit", () => {
+      const { max } = TYPOGRAPHY_RANGES.interface;
+      const updateSetting = vi.fn().mockResolvedValue(undefined);
+      const state = useSyncedSettingsStore.getState();
+      useSyncedSettingsStore.setState({
+        settings: { ...state.settings, appearance: { ...state.settings.appearance, interface_font_size: max } },
+        updateSetting,
+      });
+      expect(dispatch("zoomIn", FAKE_EVENT)).toBe(true);
+      expect(updateSetting).not.toHaveBeenCalled();
+      expect(announceInterfaceSize).toHaveBeenLastCalledWith(max, "in", false);
+      expect(dispatch("zoomOut", FAKE_EVENT)).toBe(true);
+      expect(updateSetting).toHaveBeenCalledWith("appearance", "interface_font_size", max - 1);
+      expect(announceInterfaceSize).toHaveBeenLastCalledWith(max - 1, "out", true);
     });
   });
 

@@ -13,7 +13,7 @@ vi.mock("@/stores/synced-settings-store", () => {
     (selector: (state: typeof mocks) => unknown) => selector(mocks),
     { getState: () => mocks },
   );
-  return { useSyncedSettingsStore };
+  return { useSyncedSettingsStore, selectKeyboardShortcuts: () => ({}) };
 });
 
 import { ThemeSettings } from "./theme-settings";
@@ -72,6 +72,14 @@ describe("Appearance theme row", () => {
     mocks.settings.appearance.theme = "ember";
     render(<ThemeSettings />);
     expect(screen.getByText("dark")).toBeInTheDocument();
+  });
+
+  it("shows the palette shortcut as bound, not a hardcoded Mac glyph", () => {
+    render(<ThemeSettings />);
+    const change = screen.getByRole("button", { name: /Change/ });
+    // jsdom is not a Mac, so the registry binding reads verbatim.
+    expect(change).toHaveTextContent("Ctrl+K");
+    expect(change).not.toHaveTextContent("⌘");
   });
 
   it("hands Change to the palette, seeded with the theme query", () => {

@@ -274,3 +274,63 @@ export function groupCountLabel(shown: number, total: number): string {
 export function resultCountLabel(count: number): string {
   return count === 1 ? "1 result" : `${count} results`;
 }
+
+/**
+ * Resting order with the workspace you are already in moved to the end of the
+ * active rows (still ahead of parked work). ⌘K then Enter is a switch, and a
+ * switch to where you already are does nothing — so the preselected first row
+ * has to be somewhere else. Searching ranks by match and never calls this.
+ *
+ * `visible` is the resting cap: the row is kept on screen as its last entry,
+ * so the list still shows where you are.
+ */
+export function demoteCurrentWorkspace<T extends { key: string; parked: boolean }>(
+  rows: readonly T[],
+  currentKey: string | null,
+  visible = Infinity,
+): T[] {
+  const index = currentKey === null ? -1 : rows.findIndex((row) => row.key === currentKey);
+  if (index === -1 || rows[index]!.parked) return [...rows];
+  const rest = rows.filter((_, i) => i !== index);
+  const firstParked = rest.findIndex((row) => row.parked);
+  const at = Math.min(firstParked === -1 ? rest.length : firstParked, Math.max(0, visible - 1));
+  return [...rest.slice(0, at), rows[index]!, ...rest.slice(at)];
+}
+
+// ── Recent commands ──────────────────────────────────────────────────────
+
+export const RECENT_COMMAND_LIMIT = 5;
+
+/** Most recent first, no duplicates, capped. */
+export function pushRecentCommand(recent: readonly string[], id: string): string[] {
+  return [id, ...recent.filter((entry) => entry !== id)].slice(0, RECENT_COMMAND_LIMIT);
+}
+
+// ── Pull-request mode ────────────────────────────────────────────────────
+
+export type PrModeEmptyState =
+  | { kind: "loading" }
+  | { kind: "rate-limited"; until: number }
+  | { kind: "unreachable" }
+  | { kind: "none" }
+  | { kind: "no-match" };
+
+/**
+ * What an empty `pr ` result list means. "No matches" while the first fetch
+ * is still out, or after every repository refused, reads as "that pull
+ * request does not exist" — the one conclusion the data can't support.
+ */
+export function prModeEmptyState(input: {
+  needle: string;
+  rowCount: number;
+  isLoading: boolean;
+  allRootsFailed: boolean;
+  rateLimitedUntil: number;
+}): PrModeEmptyState {
+  if (input.rowCount === 0) {
+    if (input.isLoading) return { kind: "loading" };
+    if (input.rateLimitedUntil > 0) return { kind: "rate-limited", until: input.rateLimitedUntil };
+    if (input.allRootsFailed) return { kind: "unreachable" };
+  }
+  return input.needle === "" ? { kind: "none" } : { kind: "no-match" };
+}
