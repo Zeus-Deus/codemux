@@ -366,26 +366,16 @@ pub fn question_answer(form: &Value, input: &Value) -> Result<Value, String> {
             .cloned()
             .unwrap_or_default();
         let values: Vec<String> = if field["type"] == "multiselect" {
-            if let Some(array) = value.as_array() {
-                array
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| "expected string selection".into())
-                    })
-                    .collect::<Result<_, String>>()?
-            } else {
-                let text = value.as_str().ok_or("expected multiselect answer")?;
-                if options.iter().any(|o| o["value"] == text) {
-                    vec![text.into()]
-                } else {
-                    text.split(", ")
-                        .filter(|s| !s.is_empty())
+            value
+                .as_array()
+                .ok_or("expected multiselect selections")?
+                .iter()
+                .map(|v| {
+                    v.as_str()
                         .map(str::to_string)
-                        .collect()
-                }
-            }
+                        .ok_or_else(|| "expected string selection".into())
+                })
+                .collect::<Result<_, String>>()?
         } else {
             vec![value.as_str().ok_or("expected string answer")?.into()]
         };
@@ -520,7 +510,7 @@ mod tests {
         assert_eq!(
             question_answer(
                 &form,
-                &json!({"answers":{"Which storage?":"custom","Features?":"with, comma"}})
+                &json!({"answers":{"Which storage?":"custom","Features?":["with, comma"]}})
             )
             .unwrap(),
             json!({"q0":"custom","q1":["with, comma"]})
@@ -529,6 +519,23 @@ mod tests {
             question_payload(&json!({"metadata":{"kind":"mcp-elicitation"},"fields":[]})).is_err()
         );
         assert!(question_answer(&form, &json!({"answers":{}})).is_err());
+    }
+
+    #[test]
+    fn question_multiselect_preserves_comma_labels_and_combined_option_identities() {
+        let form = json!({"metadata":{"kind":"question"},"fields":[{
+            "key":"q0", "type":"multiselect", "description":"Pick", "custom":true,
+            "options":[{"value":"with, comma"},{"value":"A"},{"value":"B"},{"value":"A, B"}]
+        }]});
+        for selections in [json!(["with, comma", "B"]), json!(["A", "B"]), json!(["A, B"])] {
+            assert_eq!(
+                question_answer(&form, &json!({"answers":{"Pick":selections}})).unwrap(),
+                json!({"q0":selections})
+            );
+        }
+        for ambiguous in [json!("A, B"), json!([]), json!(["A", 1])] {
+            assert!(question_answer(&form, &json!({"answers":{"Pick":ambiguous}})).is_err());
+        }
     }
 
     #[test]
