@@ -84,6 +84,7 @@ pub struct OpenCodeSession {
     /// `has_session` treats the corpse as absent and the next send rebuilds
     /// a fresh session via `ensure_live_session`.
     dead: Arc<AtomicBool>,
+    closing: tokio::sync::watch::Sender<bool>,
     ready: tokio::sync::watch::Receiver<bool>,
     outbound: Mutex<()>,
     queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
@@ -385,6 +386,7 @@ impl OpenCodeSession {
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
             dead,
+            closing: tokio::sync::watch::channel(false).0,
             ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
@@ -683,7 +685,7 @@ impl OpenCodeSession {
             // Keep the queue unchanged if the abort fails. The outbound lock
             // prevents the completion worker from draining before promotion.
             if self.turn_active().await {
-                self.interrupt().await?;
+                self.until_closed(self.interrupt()).await?;
             }
             let mut queue = self.queued.lock().await;
             if let Some(index) = queue.iter().position(|(key, _)| key == id) {
@@ -818,6 +820,26 @@ impl OpenCodeSession {
     }
 
     async fn post_turn(
+        &self,
+        text: String,
+        images: Vec<ImageInput>,
+        model_override: Option<String>,
+        effort_override: Option<String>,
+        steer: bool,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
+    ) -> Result<Option<TurnId>, ProviderError> {
+        self.until_closed(self.post_turn_open(
+            text,
+            images,
+            model_override,
+            effort_override,
+            steer,
+            checkpoint,
+        ))
+        .await
+    }
+
+    async fn post_turn_open(
         &self,
         text: String,
         images: Vec<ImageInput>,
@@ -1058,7 +1080,16 @@ impl OpenCodeSession {
             requests.push(handle);
             return Ok(Some(turn_id));
         }
-        let response = request.send().await;
+        let response = request
+            .timeout(std::time::Duration::from_secs(
+                if native_v2 && endpoint == "compact" {
+                    600
+                } else {
+                    15
+                },
+            ))
+            .send()
+            .await;
         let response = match response {
             Ok(r) => r,
             Err(err) => {
@@ -1112,7 +1143,7 @@ impl OpenCodeSession {
                 });
             }
         }
-        self.interrupt().await
+        self.until_closed(self.interrupt()).await
     }
 
     /// Abort the active turn. OpenCode's `/abort` endpoint is
@@ -1142,6 +1173,7 @@ impl OpenCodeSession {
         let response = self
             .http
             .post(&url)
+            .timeout(std::time::Duration::from_secs(15))
             .basic_auth("opencode", Some(&self.server_handle.server_password))
             .send()
             .await
@@ -1305,6 +1337,10 @@ impl OpenCodeSession {
     /// applied at the next `prompt_async` body.
     pub async fn set_model(&self, model: String) -> Result<(), ProviderError> {
         let _outbound = self.outbound.lock().await;
+        self.until_closed(self.set_model_open(model)).await
+    }
+
+    async fn set_model_open(&self, model: String) -> Result<(), ProviderError> {
         if self.is_dead() {
             return Err(ProviderError::SessionClosed {
                 thread_id: self.thread_id.clone(),
@@ -1359,12 +1395,17 @@ impl OpenCodeSession {
     /// OpenCode-side execution, and emits the closed state.
     pub async fn shutdown(&self) {
         self.dead.store(true, Ordering::Relaxed);
-        // Dispatch holds outbound through prompt admission. Mark closure first
-        // so asynchronous preparation rejects, then wait for any admitted
-        // request before the final interrupt and Closed event.
+        self.closing.send_replace(true);
+        // Cancel preparation/header waits before awaiting outbound. Dispatch
+        // keeps the fence until its request future is dropped, so the final
+        // interrupt cannot race a later prompt write.
         let _outbound = self.outbound.lock().await;
-        for request in self.native_requests.lock().await.drain(..) {
+        let requests: Vec<_> = self.native_requests.lock().await.drain(..).collect();
+        for request in &requests {
             request.abort();
+        }
+        for request in requests {
+            let _ = request.await;
         }
         if let Some(worker) = self.queue_worker.lock().await.take() {
             worker.abort();
@@ -1398,6 +1439,23 @@ impl OpenCodeSession {
                 thread_id: self.thread_id.clone(),
                 status: SessionStatus::Closed,
             });
+    }
+
+    async fn until_closed<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, ProviderError>>,
+    ) -> Result<T, ProviderError> {
+        // Subscribe before checking closure so a close between the check and
+        // the first poll is retained, even if no response headers ever arrive.
+        let mut closing = self.closing.subscribe();
+        self.ensure_open()?;
+        tokio::select! {
+            biased;
+            _ = closing.changed() => Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            }),
+            result = operation => result,
+        }
     }
 
     fn ensure_open(&self) -> Result<(), ProviderError> {
@@ -1989,6 +2047,7 @@ pub(crate) mod tests {
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
             dead: Arc::new(AtomicBool::new(false)),
+            closing: tokio::sync::watch::channel(false).0,
             ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
@@ -2027,18 +2086,30 @@ pub(crate) mod tests {
         (session, tx)
     }
 
-    pub(crate) async fn mock_native_peer(base_url: String) -> (
-        Arc<OpenCodeSession>, SsePeer, broadcast::Sender<ProviderRuntimeEvent>,
+    pub(crate) async fn mock_native_peer(
+        base_url: String,
+    ) -> (
+        Arc<OpenCodeSession>,
+        SsePeer,
+        broadcast::Sender<ProviderRuntimeEvent>,
         broadcast::Receiver<ProviderRuntimeEvent>,
     ) {
-        let (session, tx, rx) = mock_session_api(base_url, "fixture".into(), "root",
-            super::super::api::OpenCodeApi::V2).await;
+        let (session, tx, rx) = mock_session_api(
+            base_url,
+            "fixture".into(),
+            "root",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
         let peer = SsePeer {
             api: super::super::api::OpenCodeApi::V2,
             ready: tokio::sync::watch::channel(true).0,
-            directory: None, session_id: "root".into(),
-            event_ctx: session.event_ctx.clone(), router: session.router.clone(),
-            dead: session.dead.clone(), usage: session.usage.clone(),
+            directory: None,
+            session_id: "root".into(),
+            event_ctx: session.event_ctx.clone(),
+            router: session.router.clone(),
+            dead: session.dead.clone(),
+            usage: session.usage.clone(),
         };
         (session, peer, tx, rx)
     }
@@ -2175,6 +2246,199 @@ pub(crate) mod tests {
         assert!(session.set_model("p/bad".into()).await.is_err());
         reject.assert_async().await;
         assert_eq!(session.current_model.lock().await.as_deref(), Some("p/m"));
+    }
+
+    /// Hold the first matching response headers while serving teardown on a
+    /// separate connection; this models an unresponsive admission endpoint.
+    async fn stalled_first_response(
+        path: &'static str,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen, received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let held = Arc::new(AtomicBool::new(false));
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        let seen = seen.clone();
+                        let held = held.clone();
+                        let mut released = released.clone();
+                        connections.spawn(async move {
+                            let mut request = Vec::new();
+                            let mut chunk = [0_u8; 2048];
+                            loop {
+                                let read = socket.read(&mut chunk).await.unwrap();
+                                if read == 0 { return; }
+                                request.extend_from_slice(&chunk[..read]);
+                                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                                    let headers = String::from_utf8_lossy(&request[..end]);
+                                    let length = headers.lines().filter_map(|line| line.split_once(':'))
+                                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                        .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
+                                    if request.len() >= end + 4 + length { break; }
+                                }
+                            }
+                            let target = String::from_utf8_lossy(&request).split_whitespace().nth(1).unwrap().to_string();
+                            let _ = seen.send(target.clone());
+                            if target == path && !held.swap(true, Ordering::Relaxed) {
+                                while !*released.borrow_and_update() {
+                                    if released.changed().await.is_err() { return; }
+                                }
+                            }
+                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        (format!("http://{address}"), received, release, server)
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_native_and_legacy_prompt_admission_without_response_headers() {
+        for (api, path) in [
+            (super::super::api::OpenCodeApi::V2, "/api/session/s/prompt"),
+            (
+                super::super::api::OpenCodeApi::Legacy,
+                "/session/s/prompt_async",
+            ),
+        ] {
+            let (base, mut requests, release, server) = stalled_first_response(path).await;
+            let (session, _, mut events) = mock_session_api(base, "pw".into(), "s", api).await;
+            let sending = tokio::spawn({
+                let session = session.clone();
+                async move { session.enqueue_or_send(delivery_input("held prompt")).await }
+            });
+            assert_eq!(requests.recv().await.unwrap(), path);
+            tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
+                .await
+                .unwrap();
+            assert!(matches!(
+                sending.await.unwrap(),
+                Err(ProviderError::SessionClosed { .. })
+            ));
+            let interrupt = if api == super::super::api::OpenCodeApi::V2 {
+                "/api/session/s/interrupt?resume=false"
+            } else {
+                "/session/s/abort"
+            };
+            assert_eq!(requests.recv().await.unwrap(), interrupt);
+            assert!(!session.turn_active().await);
+            let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            assert!(matches!(
+                emitted.last(),
+                Some(ProviderRuntimeEvent::SessionStateChanged {
+                    status: SessionStatus::Closed,
+                    ..
+                })
+            ));
+            release.send_replace(true);
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                session.enqueue_or_send(delivery_input("late prompt")).await,
+                Err(ProviderError::SessionClosed { .. })
+            ));
+            assert!(requests.try_recv().is_err());
+            assert!(
+                events.try_recv().is_err(),
+                "the late ACK cannot publish Running after Closed"
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_model_selection_before_its_ack() {
+        let (base, mut requests, release, server) =
+            stalled_first_response("/api/session/s/model").await;
+        let (session, _, _) =
+            mock_session_api(base, "pw".into(), "s", super::super::api::OpenCodeApi::V2).await;
+        let selecting = tokio::spawn({
+            let session = session.clone();
+            async move { session.set_model("p/m".into()).await }
+        });
+        assert_eq!(requests.recv().await.unwrap(), "/api/session/s/model");
+        tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
+            .await
+            .unwrap();
+        assert!(matches!(
+            selecting.await.unwrap(),
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            "/api/session/s/interrupt?resume=false"
+        );
+        release.send_replace(true);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            session.current_model.lock().await.as_deref(),
+            Some("openai/gpt-5")
+        );
+        assert!(requests.try_recv().is_err());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_queued_promotion_waiting_on_interrupt_headers() {
+        let (base, mut requests, release, server) =
+            stalled_first_response("/api/session/s/interrupt?resume=false").await;
+        let (session, _, mut events) =
+            mock_session_api(base, "pw".into(), "s", super::super::api::OpenCodeApi::V2).await;
+        session.event_ctx.lock().await.turn_active = true;
+        let queued = session
+            .enqueue_or_send(delivery_input("queued prompt"))
+            .await
+            .unwrap()
+            .queued_id
+            .unwrap();
+        let promoting = tokio::spawn({
+            let session = session.clone();
+            let queued = queued.clone();
+            async move { session.send_queued_now(&queued, false).await }
+        });
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            "/api/session/s/interrupt?resume=false"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
+            .await
+            .unwrap();
+        assert!(matches!(
+            promoting.await.unwrap(),
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            "/api/session/s/interrupt?resume=false"
+        );
+        release.send_replace(true);
+        tokio::task::yield_now().await;
+        assert!(session.queued.lock().await.is_empty());
+        assert!(
+            requests.try_recv().is_err(),
+            "promotion cannot dispatch the prompt after closure"
+        );
+        let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(!emitted
+            .iter()
+            .any(|event| matches!(event, ProviderRuntimeEvent::QueuedTurnDispatched { .. })));
+        assert!(emitted.iter().any(|event| matches!(event, ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } if queued_id == &queued)));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
