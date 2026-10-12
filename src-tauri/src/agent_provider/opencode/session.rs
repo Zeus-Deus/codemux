@@ -4043,7 +4043,6 @@ pub(crate) mod tests {
             &tx,
         )
         .await;
-        let callback_turn = session.event_ctx.lock().await.turn_id.clone();
         super::super::sse::handle_native(
             serde_json::from_value(serde_json::json!({
                 "id":"callback-content","type":"session.text.ended",
@@ -4051,6 +4050,7 @@ pub(crate) mod tests {
             })).unwrap(),
             &peer, &tx,
         ).await;
+        let callback_turn = session.event_ctx.lock().await.turn_id.clone();
         release.send(()).unwrap();
         draining.await.unwrap();
         assert_eq!(session.event_ctx.lock().await.turn_id, callback_turn);

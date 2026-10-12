@@ -970,7 +970,7 @@ pub struct Durable {
 }
 
 impl Event {
-    fn sequence(&self, session: &str) -> Option<u64> {
+    pub(super) fn sequence(&self, session: &str) -> Option<u64> {
         self.durable
             .as_ref()
             .filter(|d| d.aggregate_id == session)

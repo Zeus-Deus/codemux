@@ -233,7 +233,6 @@ async fn run_sse_listener(
             return;
         }
     };
-
     let mut attempt: u32 = 0;
     loop {
         let connect = client
@@ -619,6 +618,9 @@ pub(super) async fn handle_native(
             return;
         }
     };
+    let accepted_success = updates.iter().any(
+        |update| matches!(update, super::v2::Update::Terminal { outcome, .. } if outcome == "succeeded"),
+    );
     let parked_user = router.native.has_pending_user_admission(&session);
     if subagent.is_none()
         && !live.turn_active
@@ -667,16 +669,15 @@ pub(super) async fn handle_native(
                     // genuine callback evidence owns the turn identity.
                     continue;
                 }
-                if (awaiting_execution || parked_user)
-                    && (matches!(
+                let callback_evidence = matches!(
                     &update,
                     super::v2::Update::Content { .. }
                         | super::v2::Update::ToolUse { .. }
                         | super::v2::Update::ToolResult { .. }
                         | super::v2::Update::Permission(_)
                         | super::v2::Update::Form(_)
-                ) || matches!(&update, super::v2::Update::Terminal { outcome, .. } if outcome != "succeeded"))
-                {
+                ) || matches!(&update, super::v2::Update::Terminal { outcome, .. } if outcome != "succeeded");
+                if (awaiting_execution || parked_user) && callback_evidence {
                     admit_native_root(&mut live);
                     events.push(ProviderRuntimeEvent::SessionStateChanged {
                         thread_id: live.thread_id.clone(),
@@ -717,6 +718,7 @@ pub(super) async fn handle_native(
         && !live.turn_active
         && !parked_user
         && awaiting_execution
+        && accepted_success
         && event.kind == "session.execution.succeeded"
         && events.is_empty()
     {
@@ -2541,6 +2543,21 @@ mod tests {
                     _ => unreachable!(),
                 };
                 handle_record(&native_record("evt_d_activity", kind, data, seq), &p, &tx).await;
+                if activity == "start" {
+                    assert_eq!(p.event_ctx.lock().await.turn_id, completed_turn);
+                    assert!(!p.event_ctx.lock().await.turn_active);
+                    assert!(p.router.lock().await.native.awaiting_execution("root"));
+                    handle_record(
+                        &native_record(
+                            "evt_d_content",
+                            "session.text.ended",
+                            serde_json::json!({"sessionID":"root","assistantMessageID":"m_d","ordinal":0,"text":"D"}),
+                            None,
+                        ),
+                        &p,
+                        &tx,
+                    ).await;
+                }
                 let d_turn = p.event_ctx.lock().await.turn_id.clone();
                 assert_ne!(d_turn, completed_turn);
                 assert!(p.event_ctx.lock().await.turn_active);
@@ -2849,6 +2866,19 @@ mod tests {
             &tx,
         )
         .await;
+        assert_eq!(p.event_ctx.lock().await.turn_id, previous_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert!(p.router.lock().await.native.awaiting_execution("root"));
+        handle_record(
+            &native_record(
+                "evt_callback_text",
+                "session.text.ended",
+                serde_json::json!({"sessionID":"root","assistantMessageID":"m_callback","ordinal":0,"text":"callback"}),
+                None,
+            ),
+            &p,
+            &tx,
+        ).await;
         let resumed_turn = p.event_ctx.lock().await.turn_id.clone();
         assert_ne!(resumed_turn, previous_turn);
         assert!(p.event_ctx.lock().await.turn_active);
