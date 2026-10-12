@@ -245,7 +245,38 @@ async fn real_opencode_models_approvals_tools_interrupt_and_resume() {
     )));
     assert_single_completion(&mut stream, &continued.turn_id).await;
     provider.stop_session(thread).await.unwrap();
-    manager.stop().await;
+    manager.shutdown().await.unwrap();
+    assert_eq!(
+        manager.ensure_running().await.unwrap_err(),
+        "opencode_manager_shutdown"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the runner's prepared executable; never uses account credentials"]
+async fn real_opencode_owned_server_is_reaped_on_shutdown() {
+    let binary = PathBuf::from(
+        std::env::var_os("CODEMUX_TEST_OPENCODE_BINARY").expect("prepared native executable"),
+    );
+    let mut server = OpenCodeServer::spawn(&binary).await.unwrap();
+    let pid = sysinfo::Pid::from_u32(server.pid().unwrap());
+    server.shutdown().await.unwrap();
+    assert_eq!(
+        server.pid(),
+        None,
+        "Shutdown must await the native direct child"
+    );
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    assert!(
+        system.process(pid).is_none(),
+        "Owned native child must be gone when shutdown returns"
+    );
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
