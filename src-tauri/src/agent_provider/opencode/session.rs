@@ -2544,8 +2544,24 @@ pub(crate) mod tests {
         broadcast::Sender<ProviderRuntimeEvent>,
         broadcast::Receiver<ProviderRuntimeEvent>,
     ) {
+        let (session, tx, rx, _) =
+            mock_session_api_with_readiness(base_url, password, session_id, api).await;
+        (session, tx, rx)
+    }
+
+    async fn mock_session_api_with_readiness(
+        base_url: String,
+        password: String,
+        session_id: &str,
+        api: super::super::api::OpenCodeApi,
+    ) -> (
+        Arc<OpenCodeSession>,
+        broadcast::Sender<ProviderRuntimeEvent>,
+        broadcast::Receiver<ProviderRuntimeEvent>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
         let (tx, rx) = broadcast::channel(64);
-        let (_, ready) = tokio::sync::watch::channel(true);
+        let (ready_sender, ready) = tokio::sync::watch::channel(true);
         let handle = OpenCodeServerHandle {
             base_url,
             server_password: password,
@@ -2591,7 +2607,7 @@ pub(crate) mod tests {
             handed_off: AtomicBool::new(false),
         });
         session.start_queue_worker(tx.subscribe()).await;
-        (session, tx, rx)
+        (session, tx, rx, ready_sender)
     }
 
     /// Recovery tests use the real HTTP prompt, SSE listener and queue worker,
@@ -2630,7 +2646,7 @@ pub(crate) mod tests {
         broadcast::Sender<ProviderRuntimeEvent>,
         broadcast::Receiver<ProviderRuntimeEvent>,
     ) {
-        let (session, tx, rx) = mock_session_api(
+        let (session, tx, rx, ready) = mock_session_api_with_readiness(
             base_url,
             "fixture".into(),
             "root",
@@ -2639,7 +2655,7 @@ pub(crate) mod tests {
         .await;
         let peer = SsePeer {
             api: super::super::api::OpenCodeApi::V2,
-            ready: tokio::sync::watch::channel(true).0,
+            ready,
             directory: None,
             session_id: "root".into(),
             event_ctx: session.event_ctx.clone(),

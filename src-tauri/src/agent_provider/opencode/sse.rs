@@ -946,6 +946,21 @@ async fn reconcile_native_history(
         .native
         .observed_execution_sequence(session);
     let observed_idle = peer.router.lock().await.native.observed_idle_id(session);
+    let submitted_input = if session == peer.session_id {
+        let ctx = peer.event_ctx.lock().await;
+        let router = peer.router.lock().await;
+        router
+            .native
+            .pending_user_admission(session)
+            .map(|(input, _)| input)
+            .or_else(|| {
+                ctx.turn_active
+                    .then(|| router.native.user_admission_for(session, &ctx.turn_id.0))
+                    .flatten()
+            })
+    } else {
+        None
+    };
     let mut snapshot = None;
     for attempt in 0..3 {
         let previous = peer.router.lock().await.native.recovered_sequence(session);
@@ -963,6 +978,8 @@ async fn reconcile_native_history(
         let mut idle_message = None;
         let recover_completed_root = session == peer.session_id && observed_idle.is_some();
         let mut found_observed_idle = false;
+        let mut observed_position = None;
+        let mut found_submitted_input = false;
         'history: loop {
             let path = match &cursor {
                 Some(cursor) => format!(
@@ -978,15 +995,28 @@ async fn reconcile_native_history(
                     if boundaries == 1 {
                         idle_message = Some(message.clone());
                     }
-                    if recover_completed_root {
-                        if message["id"].as_str() == observed_idle.as_deref() {
-                            found_observed_idle = true;
+                    if recover_completed_root && message["id"].as_str() == observed_idle.as_deref()
+                    {
+                        found_observed_idle = true;
+                        observed_position = Some(messages.len());
+                        if submitted_input.is_none() || found_submitted_input {
                             break 'history;
                         }
-                    } else if boundaries > if running { 0 } else { 1 } {
+                    }
+                    if submitted_input.is_some() {
+                        // The exact delivered User can lie below newer callbacks
+                        // or even an Idle baselined before delivery was claimed.
+                        // Read through its busy period, not merely the latest one.
+                        if found_submitted_input {
+                            break 'history;
+                        }
+                    } else if !recover_completed_root && boundaries > if running { 0 } else { 1 } {
                         break 'history;
                     }
                 }
+                found_submitted_input |= submitted_input.is_some()
+                    && message["type"] == "user"
+                    && message["id"].as_str() == submitted_input.as_deref();
                 messages.push(message.clone());
             }
             let next = page["cursor"]["next"].as_str().map(str::to_string);
@@ -997,6 +1027,13 @@ async fn reconcile_native_history(
                 return Err("history cursor did not advance".into());
             }
             cursor = next;
+        }
+        if submitted_input.is_some() && !found_submitted_input {
+            if let Some(position) = observed_position {
+                // An undelivered input must not expand ordinary attachment
+                // recovery into older, already-observed history.
+                messages.truncate(position);
+            }
         }
         let final_active = native_get(client, base, password, "/api/session/active").await?;
         if !final_active["data"].is_object() {
@@ -1013,27 +1050,33 @@ async fn reconcile_native_history(
             running,
             if stable { after } else { None },
             found_observed_idle,
+            found_submitted_input,
         ));
         if stable || attempt == 2 {
             break;
         }
     }
-    let (mut messages, idle_message, running, sequence, found_observed_idle) = snapshot.unwrap();
-    if found_observed_idle && sequence.is_some() {
-        let (reserved_turn, admitted_input, mut active_background_turn) = {
-            let ctx = peer.event_ctx.lock().await;
-            let router = peer.router.lock().await;
-            let pending = router.native.pending_user_admission(session);
-            let turn = pending
-                .as_ref()
-                .map(|(_, turn)| crate::agent_provider::TurnId(turn.clone()))
-                .or_else(|| ctx.turn_active.then(|| ctx.turn_id.clone()));
-            let active_input = router.native.user_admission_for(session, &ctx.turn_id.0);
-            let background =
-                (ctx.turn_active && active_input.is_none()).then(|| ctx.turn_id.clone());
-            let input = pending.map(|(input, _)| input).or(active_input);
-            (turn, input, background)
-        };
+    let (mut messages, idle_message, running, sequence, found_observed_idle, found_submitted_input) =
+        snapshot.unwrap();
+    let (reserved_turn, admitted_input, mut active_background_turn) = {
+        let ctx = peer.event_ctx.lock().await;
+        let router = peer.router.lock().await;
+        let pending = router.native.pending_user_admission(session);
+        let turn = pending
+            .as_ref()
+            .map(|(_, turn)| crate::agent_provider::TurnId(turn.clone()))
+            .or_else(|| ctx.turn_active.then(|| ctx.turn_id.clone()));
+        let active_input = ctx.turn_active
+            .then(|| router.native.user_admission_for(session, &ctx.turn_id.0))
+            .flatten();
+        let background = (ctx.turn_active && active_input.is_none()).then(|| ctx.turn_id.clone());
+        let input = pending.map(|(input, _)| input).or(active_input);
+        (turn, input, background)
+    };
+    let exact_user_found = submitted_input.is_some()
+        && found_submitted_input
+        && submitted_input == admitted_input;
+    if (found_observed_idle || exact_user_found) && sequence.is_some() {
         let mut executions = Vec::new();
         let mut current = Vec::new();
         for message in messages.into_iter().rev() {
@@ -1060,17 +1103,20 @@ async fn reconcile_native_history(
         for (execution, terminal) in executions {
             let mut ctx = peer.event_ctx.lock().await;
             let mut router = peer.router.lock().await;
-            if !router
-                .native
-                .recover_terminal(session, terminal["id"].clone())
-            {
-                continue;
-            }
             let user_index = admitted_input.as_ref().and_then(|input| {
                 execution.iter().position(|message| {
                     message["type"] == "user" && message["id"].as_str() == Some(input)
                 })
             });
+            let unseen = router
+                .native
+                .recover_terminal(session, terminal["id"].clone());
+            // A previous attachment baseline may have retired this Idle without
+            // claiming its parked User. Exact input ownership repairs that gap
+            // before a floor can suppress either its answer or live delivery.
+            if !unseen && user_index.is_none() {
+                continue;
+            }
             if let Some((user_index, turn)) = user_index.zip(reserved_turn.as_ref()) {
                 drop(router);
                 drop(ctx);
@@ -1204,6 +1250,46 @@ async fn reconcile_native_history(
                 .native
                 .recover_through(session, sequence.unwrap());
         }
+        return Ok(());
+    }
+    if exact_user_found {
+        // Even an advancing window proves the exact User was delivered. Claim
+        // its original turn and replay only its busy period; a coherent Idle or
+        // the live terminal must still establish completion and a replay floor.
+        let user_index = messages
+            .iter()
+            .position(|message| {
+                message["type"] == "user" && message["id"].as_str() == admitted_input.as_deref()
+            })
+            .unwrap();
+        let newer_boundary = messages[..user_index]
+            .iter()
+            .rposition(|message| message["type"] == "idle")
+            .map_or(0, |index| index + 1);
+        let older_boundary = messages[user_index + 1..]
+            .iter()
+            .position(|message| message["type"] == "idle")
+            .map_or(messages.len(), |index| user_index + 1 + index);
+        let execution: Vec<_> = messages[newer_boundary..older_boundary]
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        let user_index = execution
+            .iter()
+            .position(|message| {
+                message["type"] == "user" && message["id"].as_str() == admitted_input.as_deref()
+            })
+            .unwrap();
+        replay_native_user_history(
+            &execution,
+            user_index,
+            session,
+            reserved_turn.as_ref().unwrap(),
+            peer,
+            event_tx,
+        )
+        .await?;
         return Ok(());
     }
     // A moving checkpoint cannot settle executions. If the known boundary
@@ -3443,6 +3529,281 @@ mod tests {
             .await;
         session.shutdown().await.unwrap();
         interrupt.assert_async().await;
+    }
+
+    async fn first_user_recovery(running: bool, buried: bool, retired: bool, moving: bool) {
+        let mut server = mockito::Server::new_async().await;
+        let sequence = Arc::new(std::sync::atomic::AtomicU64::new(20));
+        let changing = Arc::new(std::sync::atomic::AtomicBool::new(moving));
+        let log_sequence = sequence.clone();
+        let log_changing = changing.clone();
+        let _log = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    "^/api/experimental/session/root/log\\?follow=false(?:&after=[0-9]+)?$".into(),
+                ),
+            )
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let seq = if log_changing.load(std::sync::atomic::Ordering::Relaxed) {
+                    log_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    log_sequence.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                watermark_record("root", seq).into_bytes()
+            })
+            .create_async()
+            .await;
+        let _active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body(if running {
+                r#"{"data":{"root":{}}}"#
+            } else {
+                r#"{"data":{}}"#
+            })
+            .create_async()
+            .await;
+        let prompts = server
+            .mock("POST", "/api/session/root/prompt")
+            .with_status(200)
+            .expect(4)
+            .create_async()
+            .await;
+        let _interrupt = server
+            .mock("POST", "/api/session/root/interrupt?resume=false")
+            .with_status(200)
+            .create_async()
+            .await;
+        let _inbox = server
+            .mock("GET", "/api/session/root/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let _wait = server
+            .mock("POST", "/api/experimental/session/root/wait")
+            .with_status(204)
+            .create_async()
+            .await;
+        let (session, p, tx, mut rx) =
+            super::super::session::tests::mock_native_peer(server.url()).await;
+        let input = |text: &str| {
+            serde_json::from_value(
+                serde_json::json!({"thread_id":"t1","text":text,"model_override":null}),
+            )
+            .unwrap()
+        };
+        let a = session.enqueue_or_send(input("first input")).await.unwrap();
+        let (a_input, _) = p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .unwrap();
+        let b = session
+            .enqueue_or_send(input("queued input"))
+            .await
+            .unwrap();
+        assert!(b.queued_id.is_some());
+        // A reconnect must hold the actual dispatch readiness until recovery
+        // has assigned all missed responses and coherent terminal boundaries.
+        p.ready.send_replace(false);
+        if retired {
+            let mut router = p.router.lock().await;
+            assert!(router
+                .native
+                .recover_terminal("root", serde_json::json!("msg_first_done")));
+            router.native.recover_through("root", 10);
+        }
+        let mut first = Vec::new();
+        if !running {
+            first.push(
+                serde_json::json!({"id":"msg_first_done","type":"idle","outcome":"succeeded"}),
+            );
+        }
+        first.extend([
+            serde_json::json!({"id":"m_first_answer","type":"assistant","time":{"completed":3},
+                "content":[{"type":"text","text":"first answer"}]}),
+            serde_json::json!({"id":a_input,"type":"user","content":[]}),
+            serde_json::json!({"id":"msg_older_done","type":"idle","outcome":"succeeded"}),
+        ]);
+        let (first_page, older_page) = if buried {
+            (
+                serde_json::json!({"data":[
+                {"id":"msg_callback_done","type":"idle","outcome":"succeeded"},
+                {"id":"m_callback_answer","type":"assistant","time":{"completed":4},
+                    "content":[{"type":"text","text":"callback answer"}]}
+            ],"cursor":{"next":"older"}}),
+                Some(serde_json::json!({"data":first})),
+            )
+        } else {
+            (serde_json::json!({"data":first}), None)
+        };
+        let _history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body(first_page.to_string())
+            .create_async()
+            .await;
+        let _older = if let Some(page) = older_page {
+            Some(
+                server
+                    .mock("GET", "/api/session/root/message?limit=200&cursor=older")
+                    .with_status(200)
+                    .with_body(page.to_string())
+                    .create_async()
+                    .await,
+            )
+        } else {
+            None
+        };
+        let client = reqwest::Client::new();
+        let url = server.url();
+        reconcile_native_history(&client, &url, "fixture", &p, &tx, "root", running)
+            .await
+            .unwrap();
+        assert!(!p
+            .router
+            .lock()
+            .await
+            .native
+            .has_pending_user_admission("root"));
+        let mut observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(observed.iter().filter(|e| matches!(e,
+            ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if turn_id == &a.turn_id && text == "first answer")).count(), 1);
+        if running || moving {
+            assert_eq!(p.event_ctx.lock().await.turn_id, a.turn_id);
+            assert!(p.event_ctx.lock().await.turn_active);
+            assert!(!observed
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })));
+            assert!(p
+                .router
+                .lock()
+                .await
+                .native
+                .recovered_sequence("root")
+                .is_none());
+        }
+        if moving {
+            // The exact User claim survives an advancing window, but only a
+            // later coherent Idle can complete it or retire buffered records.
+            changing.store(false, std::sync::atomic::Ordering::Relaxed);
+            reconcile_native_history(&client, &url, "fixture", &p, &tx, "root", running)
+                .await
+                .unwrap();
+        }
+        p.ready.send_replace(true);
+        if running {
+            handle_record(
+                &native_record(
+                    "evt_first_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(30),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
+        }
+        let b_turn = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                let dispatch = match &event {
+                    ProviderRuntimeEvent::QueuedTurnDispatched {
+                        queued_id, turn_id, ..
+                    } => {
+                        assert_eq!(Some(queued_id), b.queued_id.as_ref());
+                        Some(turn_id.clone())
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(turn) = dispatch {
+                    break turn;
+                }
+            }
+        })
+        .await
+        .expect("recovered first input must release its original queued successor");
+        assert_ne!(b_turn, a.turn_id);
+        handle_record(
+            &native_record(
+                "evt_first_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert_eq!(p.event_ctx.lock().await.turn_id, b_turn);
+        let (b_input, _) = p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .unwrap();
+        handle_record(
+            &native_record(
+                "evt_second_delivered",
+                "session.inbox.delivered",
+                serde_json::json!({"sessionID":"root","inboxID":b_input}),
+                Some(31),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_second_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(32),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        observed.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        for turn in [&a.turn_id, &b_turn] {
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|e| matches!(e,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn))
+                    .count(),
+                1
+            );
+        }
+        if buried {
+            assert_eq!(observed.iter().filter(|e| matches!(e,
+                ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                    if turn_id != &a.turn_id && text == "callback answer")).count(), 1);
+        }
+        prompts.assert_async().await;
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_recovery_claims_first_pending_user_without_an_observed_idle() {
+        first_user_recovery(false, false, false, false).await;
+        first_user_recovery(true, false, false, false).await;
+        first_user_recovery(false, true, false, false).await;
+        first_user_recovery(false, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn native_recovery_claims_first_pending_user_without_settling_a_moving_snapshot() {
+        first_user_recovery(false, false, false, true).await;
     }
 
     #[tokio::test]
