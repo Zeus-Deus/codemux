@@ -926,10 +926,6 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     const keyId = e.code || e.key.toLowerCase();
-    if (isAppShortcut(e.nativeEvent)) {
-      appShortcutKeysRef.current.add(keyId);
-      return;
-    }
     appShortcutKeysRef.current.delete(keyId);
     // Ctrl+Shift+I toggles element inspector
     if (e.ctrlKey && e.shiftKey && e.key === "I") {
@@ -957,6 +953,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       e.preventDefault();
       e.stopPropagation();
       runBrowserNav(effectiveSessionId, shortcut).catch(console.error);
+      return;
+    }
+
+    // Browser chrome keeps its own controls, including page reload, ahead
+    // of app bindings such as the guard against reloading the interface.
+    if (isAppShortcut(e.nativeEvent)) {
+      appShortcutKeysRef.current.add(keyId);
       return;
     }
 

@@ -7,7 +7,7 @@ import { useAppStore } from "@/stores/app-store";
 import { usePaneZoomStore } from "@/stores/pane-zoom-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useUIStore } from "@/stores/ui-store";
-import { activatePane, activateTab, activateWorkspace } from "@/tauri/commands";
+import { activatePane, activateTab, activateWorkspace, agentBrowserRun } from "@/tauri/commands";
 import { BrowserPane } from "./BrowserPane";
 
 vi.mock("@/tauri/commands", () => ({
@@ -100,6 +100,14 @@ afterEach(() => {
 });
 
 describe("BrowserPane app shortcut propagation", () => {
+  it("reloads the browser page before the window's interface reload guard can claim Ctrl+R", async () => {
+    const { canvas, socket } = await renderBrowser();
+    fireEvent.keyDown(canvas, { key: "r", code: "KeyR", ctrlKey: true });
+    fireEvent.keyUp(canvas, { key: "r", code: "KeyR", ctrlKey: true });
+    expect(agentBrowserRun).toHaveBeenCalledWith("browser-test", "reload", {});
+    expect(socket.send).not.toHaveBeenCalled();
+  });
+
   it("moves from the focused browser canvas into the adjacent composer", async () => {
     const { canvas, socket, chat } = await renderBrowser();
     fireEvent.keyDown(canvas, { key: "ArrowRight", code: "ArrowRight", altKey: true, shiftKey: true });
