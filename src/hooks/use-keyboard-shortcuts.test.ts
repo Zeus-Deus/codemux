@@ -243,6 +243,15 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(s.showSettings).toBe(true);
     });
 
+    it("closes a lone shortcuts sheet even when its dialog has prevented Escape", () => {
+      useUIStore.setState({ showShortcutsSheet: true });
+      const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+      event.preventDefault();
+      expect(dispatch("closeOverlay", event)).toBe(true);
+      expect(useUIStore.getState().showShortcutsSheet).toBe(false);
+      expect(useUIStore.getState().showSettings).toBe(false);
+    });
+
     it("closes the rename dialog before settings", () => {
       // The rename dialog opts out of Radix's own Escape dismissal so this
       // ladder is the single closer: one press must take exactly one layer.

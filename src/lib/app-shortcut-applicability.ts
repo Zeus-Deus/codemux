@@ -8,7 +8,7 @@ import { useUIStore } from "@/stores/ui-store";
 export function isAppShortcutApplicable(actionId: string): boolean {
   if (actionId === "closeOverlay") {
     const ui = useUIStore.getState();
-    return !!(ui.onboardingProjectDir || ui.themeStudio || ui.renameWorkspaceId ||
+    return !!(ui.showShortcutsSheet || ui.onboardingProjectDir || ui.themeStudio || ui.renameWorkspaceId ||
       ui.showSettings || ui.showFileSearch || ui.showContentSearch || ui.showCommandPalette);
   }
 
