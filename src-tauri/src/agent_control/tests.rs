@@ -440,7 +440,7 @@ impl crate::agent_provider::AgentProvider for RecoveryOpenCode {
     async fn respond_to_request(&self, _: crate::agent_provider::ThreadId, r: crate::agent_provider::RequestId, d: crate::agent_provider::ApprovalDecision) -> Result<(), crate::agent_provider::ProviderError> { self.session.respond_to_request(r,d).await }
     async fn set_model(&self, _: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.session.set_model(m).await }
     async fn set_permission_mode(&self, t: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.metadata.set_permission_mode(t,m).await }
-    async fn stop_session(&self, _: crate::agent_provider::ThreadId) -> Result<(), crate::agent_provider::ProviderError> { self.session.shutdown().await; Ok(()) }
+    async fn stop_session(&self, _: crate::agent_provider::ThreadId) -> Result<(), crate::agent_provider::ProviderError> { self.session.shutdown().await }
     async fn list_sessions(&self) -> Result<Vec<crate::agent_provider::ProviderSession>, crate::agent_provider::ProviderError> { Ok(vec![]) }
     async fn has_session(&self, _: &crate::agent_provider::ThreadId) -> bool { !self.session.is_dead() }
     async fn turn_active(&self, _: &crate::agent_provider::ThreadId) -> bool { self.session.turn_active().await }

@@ -1099,9 +1099,9 @@ async fn reconcile_native_history(
             if let Some((user_index, turn)) =
                 user_index.zip(reserved_turn.as_ref().filter(|_| !reserved_completed))
             {
+                let _ = active_background_turn.take();
                 replay_native_user_history(&current, user_index, session, turn, peer, event_tx)
                     .await?;
-                active_background_turn = None;
             } else {
                 let mut ctx = peer.event_ctx.lock().await;
                 let mut router = peer.router.lock().await;
@@ -1833,7 +1833,7 @@ mod tests {
                 .await;
             }
             handle_record(&native_record("evt_b_text", "session.text.delta",
-                serde_json::json!({"sessionID":"root","assistantMessageID":"m_b","ordinal":0,"text":"live "}),
+                serde_json::json!({"sessionID":"root","assistantMessageID":"m_b","ordinal":0,"delta":"live "}),
                 None), &p, &tx).await;
             let background_turn = p.event_ctx.lock().await.turn_id.clone();
             let parked_turn = TurnId("parked_x".into());
@@ -3182,12 +3182,13 @@ mod tests {
         let prompts = server
             .mock("POST", "/api/session/root/prompt")
             .with_status(200)
-            .expect(2)
+            .expect(4)
             .create_async()
             .await;
         let interrupt = server
             .mock("POST", "/api/session/root/interrupt?resume=false")
             .with_status(200)
+            .expect(2)
             .create_async()
             .await;
         let history = server.mock("GET", "/api/session/root/message?limit=200&order=desc")
@@ -3204,6 +3205,35 @@ mod tests {
             .unwrap()
         };
         let a = session.enqueue_or_send(input("A")).await.unwrap();
+        let (a_input, _) = p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .unwrap();
+        handle_record(
+            &native_record(
+                "evt_a_admit_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(1),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_a_delivered",
+                "session.inbox.delivered",
+                serde_json::json!({"sessionID":"root","inboxID":a_input}),
+                Some(2),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
         let b = session.enqueue_or_send(input("B")).await.unwrap();
         assert!(b.queued_id.is_some());
         reconcile_native_history(
@@ -3282,6 +3312,25 @@ mod tests {
         .await;
         assert!(session.turn_active().await);
         assert_eq!(p.event_ctx.lock().await.turn_id, b_turn);
+        let (b_input, _) = p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .unwrap();
+        handle_record(
+            &native_record(
+                "evt_b_delivered",
+                "session.inbox.delivered",
+                serde_json::json!({"sessionID":"root","inboxID":b_input}),
+                Some(12),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(p.event_ctx.lock().await.turn_active);
         handle_record(
             &native_record(
                 "evt_b_done",
@@ -3303,7 +3352,18 @@ mod tests {
         for checkpoint in checkpoints {
             checkpoint.assert_async().await;
         }
-        session.shutdown().await;
+        let _inbox = server
+            .mock("GET", "/api/session/root/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let _wait = server
+            .mock("POST", "/api/experimental/session/root/wait")
+            .with_status(204)
+            .create_async()
+            .await;
+        session.shutdown().await.unwrap();
         interrupt.assert_async().await;
     }
 

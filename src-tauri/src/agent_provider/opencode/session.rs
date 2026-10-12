@@ -1890,10 +1890,10 @@ impl OpenCodeSession {
             for request in requests {
                 let _ = request.await;
             }
-            tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, self.interrupt())
-                .await
-                .map_err(|_| "legacy_shutdown_interrupt_timeout".into())
-                .and_then(|result| result.map_err(|error| error.to_string()))
+            // V1 retains its established best-effort detach behavior; it has
+            // no staged native admission contract to acknowledge here.
+            let _ = tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, self.interrupt()).await;
+            Ok(())
         };
         if let Err(message) = result {
             let _ = self
@@ -3461,6 +3461,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_detach_remains_best_effort_when_abort_is_unavailable() {
+        let mut server = Server::new_async().await;
+        let abort = server
+            .mock("POST", "/session/s/abort")
+            .with_status(503)
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/session/s")
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _, mut events) = mock_session(server.url(), "pw".into(), "s").await;
+        session.shutdown().await.unwrap();
+        assert!(session.is_dead());
+        assert!(matches!(
+            std::iter::from_fn(|| events.try_recv().ok()).last(),
+            Some(ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            })
+        ));
+        abort.assert_async().await;
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn shutdown_cancels_legacy_prompt_admission_without_response_headers() {
         for (api, path) in [(
             super::super::api::OpenCodeApi::Legacy,
@@ -3475,6 +3502,7 @@ pub(crate) mod tests {
             assert_eq!(requests.recv().await.unwrap(), path);
             tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
                 .await
+                .unwrap()
                 .unwrap();
             assert!(matches!(
                 sending.await.unwrap(),
