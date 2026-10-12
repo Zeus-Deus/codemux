@@ -32,8 +32,20 @@ interface UpdateStatusStore {
   published: boolean;
   /** True on the web (remote) client, where `startDownload` cannot work. */
   isRemote: boolean;
+  /**
+   * False for package-manager installs (deb/rpm/pacman), where the in-app
+   * updater cannot replace the binary and the only route is the release page
+   * or the package manager.
+   */
+  canAutoUpdate: boolean;
+  /** `get_package_format`'s answer, or null until it resolves. */
+  packageFormat: string | null;
+  /** Why the last download or restart failed, while `state` is `error`. */
+  errorMessage: string | null;
   startDownload: (() => void) | null;
   installAndRestart: (() => void) | null;
+  /** Re-run whichever step failed: the download, or the restart after it. */
+  retry: (() => void) | null;
   /** Web only: ask the desktop to run its update + restart flow. */
   requestDesktopUpdate: (() => void) | null;
   /** Desktop only: run a check now instead of waiting for the next poll. */
@@ -48,8 +60,12 @@ interface UpdateStatusStore {
       | "updateVersion"
       | "downloadProgress"
       | "isRemote"
+      | "canAutoUpdate"
+      | "packageFormat"
+      | "errorMessage"
       | "startDownload"
       | "installAndRestart"
+      | "retry"
       | "requestDesktopUpdate"
       | "checkNow"
       | "lastCheck"
@@ -63,8 +79,12 @@ const INITIAL = {
   downloadProgress: 0,
   published: false,
   isRemote: false,
+  canAutoUpdate: false,
+  packageFormat: null,
+  errorMessage: null,
   startDownload: null,
   installAndRestart: null,
+  retry: null,
   requestDesktopUpdate: null,
   checkNow: null,
   lastCheck: null,
