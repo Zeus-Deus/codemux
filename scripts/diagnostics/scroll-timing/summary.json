@@ -1,0 +1,306 @@
+{
+  "app-wheel-oldclock-2ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 590,
+    "raf_median_ms": 16,
+    "raf_active_p95_ms": 17,
+    "raf_active_max_ms": 17,
+    "distance_at_input_end_lower_pct": 95.4,
+    "distance_at_input_end_upper_pct": 98.2,
+    "final_distance_pixels": 6349,
+    "last_moving_frame_after_input_ms": 74,
+    "active_moving_frame_median_step_px": 174.5,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "equal-app-electron": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2015.3,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 10.0,
+    "raf_active_max_ms": 20.1,
+    "distance_at_input_end_lower_pct": 95.7,
+    "distance_at_input_end_upper_pct": 95.9,
+    "final_distance_pixels": 6352,
+    "last_moving_frame_after_input_ms": 153.9,
+    "active_moving_frame_median_step_px": 16.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.216 Electron/41.5.0 Safari/537.36"
+  },
+  "equal-electron-2ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 513.1,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 5.1,
+    "raf_active_max_ms": 5.1,
+    "distance_at_input_end_lower_pct": 89.7,
+    "distance_at_input_end_upper_pct": 90.7,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 92.1,
+    "active_moving_frame_median_step_px": 60.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.216 Electron/41.5.0 Safari/537.36"
+  },
+  "equal-electron-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2011.6,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 5.1,
+    "raf_active_max_ms": 5.1,
+    "distance_at_input_end_lower_pct": 95.8,
+    "distance_at_input_end_upper_pct": 96.0,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 142.5,
+    "active_moving_frame_median_step_px": 16.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.216 Electron/41.5.0 Safari/537.36"
+  },
+  "full-app-webkit-clock": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2144,
+    "raf_median_ms": 5,
+    "raf_active_p95_ms": 39,
+    "raf_active_max_ms": 90,
+    "distance_at_input_end_lower_pct": 99.6,
+    "distance_at_input_end_upper_pct": 100.0,
+    "final_distance_pixels": 6351,
+    "last_moving_frame_after_input_ms": 12,
+    "active_moving_frame_median_step_px": 26.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "full-app-webkit-off": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2178,
+    "raf_median_ms": 16,
+    "raf_active_p95_ms": 49,
+    "raf_active_max_ms": 107,
+    "distance_at_input_end_lower_pct": 99.6,
+    "distance_at_input_end_upper_pct": 100.0,
+    "final_distance_pixels": 6351,
+    "last_moving_frame_after_input_ms": 10,
+    "active_moving_frame_median_step_px": 51,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "full-webkit-clock-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2194,
+    "raf_median_ms": 5,
+    "raf_active_p95_ms": 6,
+    "raf_active_max_ms": 39,
+    "distance_at_input_end_lower_pct": 99.6,
+    "distance_at_input_end_upper_pct": 100.0,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 2,
+    "active_moving_frame_median_step_px": 25.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "full-webkit-clock-on-2ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 675,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 6,
+    "raf_active_max_ms": 37,
+    "distance_at_input_end_lower_pct": 51.6,
+    "distance_at_input_end_upper_pct": 51.7,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 202,
+    "active_moving_frame_median_step_px": 19.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "full-webkit-off-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2013,
+    "raf_median_ms": 16,
+    "raf_active_p95_ms": 17,
+    "raf_active_max_ms": 17,
+    "distance_at_input_end_lower_pct": 99.6,
+    "distance_at_input_end_upper_pct": 100.0,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 14,
+    "active_moving_frame_median_step_px": 51.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "full-webkit-on-2ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 577,
+    "raf_median_ms": 16.0,
+    "raf_active_p95_ms": 17,
+    "raf_active_max_ms": 17,
+    "distance_at_input_end_lower_pct": 11.2,
+    "distance_at_input_end_upper_pct": 12.4,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 211,
+    "active_moving_frame_median_step_px": 10,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "full-webkit-on-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2024.0,
+    "raf_median_ms": 16.0,
+    "raf_active_p95_ms": 17,
+    "raf_active_max_ms": 18,
+    "distance_at_input_end_lower_pct": 80.6,
+    "distance_at_input_end_upper_pct": 81.6,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 199,
+    "active_moving_frame_median_step_px": 18.5,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "mode-clock-app-transcript": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2185,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 44,
+    "raf_active_max_ms": 98,
+    "distance_at_input_end_lower_pct": 97.0,
+    "distance_at_input_end_upper_pct": 99.5,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 57,
+    "active_moving_frame_median_step_px": 22,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "mode-clock-app-wheel-2ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 724.0,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 8,
+    "raf_active_max_ms": 44,
+    "distance_at_input_end_lower_pct": 97.8,
+    "distance_at_input_end_upper_pct": 97.8,
+    "final_distance_pixels": 6349,
+    "last_moving_frame_after_input_ms": 86,
+    "active_moving_frame_median_step_px": 49,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "mode-clock-app-wheel-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2173.0,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 7,
+    "raf_active_max_ms": 41,
+    "distance_at_input_end_lower_pct": 98.8,
+    "distance_at_input_end_upper_pct": 99.1,
+    "final_distance_pixels": 6349,
+    "last_moving_frame_after_input_ms": 88,
+    "active_moving_frame_median_step_px": 18,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "mode-clock-off-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2214.0,
+    "raf_median_ms": 5.0,
+    "raf_active_p95_ms": 6,
+    "raf_active_max_ms": 39,
+    "distance_at_input_end_lower_pct": 99.6,
+    "distance_at_input_end_upper_pct": 100.0,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 2.0,
+    "active_moving_frame_median_step_px": 25.0,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  },
+  "repeat-webkit-off-8ms": {
+    "viewport": [
+      2560,
+      1440
+    ],
+    "wheel_count": 250,
+    "trusted_wheel_count": 250,
+    "observed_input_pixels": 6350.0,
+    "input_delivery_duration_ms": 2014.0,
+    "raf_median_ms": 16.0,
+    "raf_active_p95_ms": 17,
+    "raf_active_max_ms": 17,
+    "distance_at_input_end_lower_pct": 99.2,
+    "distance_at_input_end_upper_pct": 100.0,
+    "final_distance_pixels": 6350,
+    "last_moving_frame_after_input_ms": 5.0,
+    "active_moving_frame_median_step_px": 51,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15"
+  }
+}

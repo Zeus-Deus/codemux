@@ -198,13 +198,13 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
 
   resetSettings: async () => {
     const token = beginWrite();
-    set({ settings: DEFAULT_SETTINGS, isSyncing: true });
+    // A verified-account reset must reach the server before it is persisted.
+    // Keep the current settings until that succeeds, and let callers report
+    // a rejected reset instead of presenting defaults that disappear later.
+    set({ isSyncing: true });
     try {
       const saved = await resetSyncedSettings();
       if (isCurrent(token)) set({ settings: saved });
-    } catch {
-      // Keep the optimistic defaults. The backend owns offline persistence and
-      // the next explicit refresh will reconcile them.
     } finally {
       finishWrite(token, set);
     }

@@ -1,3 +1,4 @@
+import { requestCloseTab } from "@/lib/close-guard";
 import { useRef, useState } from "react";
 import { flushSync } from "react-dom";
 
@@ -10,7 +11,7 @@ import {
 } from "@/components/ui/context-menu";
 import { cn } from "@/lib/utils";
 import { useEditorStore } from "@/stores/editor-store";
-import { closeTab, renameTab, splitPane } from "@/tauri/commands";
+import { renameTab, splitPane } from "@/tauri/commands";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 /**
@@ -41,7 +42,7 @@ export function TabContextMenu({
   // and firing them concurrently races those mutations.
   const closeAll = async (ids: string[]) => {
     for (const id of ids) {
-      await closeTab(workspaceId, id).catch(console.error);
+      await requestCloseTab(workspaceId, id).catch(console.error);
     }
   };
 

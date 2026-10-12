@@ -1,0 +1,39 @@
+{
+  "commit": "f74bcb2f",
+  "monitor": {
+    "name": "DP-1",
+    "width": 2560,
+    "height": 1440,
+    "refresh_hz": 200
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "nvidia_driver": "615.71.09",
+  "nvidia_drm_vblank": "N",
+  "webkitgtk": "2.52.6",
+  "gtk": "3.24.52",
+  "comparison_electron": "41.5.0",
+  "linux_renderer_env": {
+    "WEBKIT_DMABUF_RENDERER_FORCE_SHM": "1"
+  },
+  "drmWaitVBlank": {
+    "nvidia_card1_errno": 95,
+    "nvidia_card1_error": "Operation not supported",
+    "amdgpu_card0_errno": 22
+  },
+  "input": "250 native injected mouse wheel events; nominal scheduling 8 ms or 2 ms; not a physical HID recording",
+  "content": "Plain HTML for engine isolation; identical CodeMux development mock transcript in WebKit/Electron shells for rendering comparison",
+  "limitations": [
+    "rAF callback timing is not physical presentation timing",
+    "Electron shell uses available local 41.5.0 dependency, not currently running t3code",
+    "GLib and Electron timers deliver native input differently; raw delivered wheel events preserved",
+    "Diagnostic vblank shim is fixed 200 Hz and not phase locked to physical scanout",
+    "Mock frontend development mode is not a production performance profile"
+  ],
+  "sources": [
+    "https://github.com/WebKit/WebKit/blob/webkitgtk-2.52.6/Source/WebKit/UIProcess/glib/DisplayVBlankMonitor.cpp",
+    "https://github.com/WebKit/WebKit/blob/webkitgtk-2.52.6/Source/WebKit/UIProcess/glib/DisplayVBlankMonitorDRM.cpp",
+    "https://github.com/WebKit/WebKit/blob/webkitgtk-2.52.6/Source/WebKit/UIProcess/glib/DisplayVBlankMonitorTimer.cpp",
+    "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.09/kernel-open/nvidia-drm/nvidia-drm-linux.c",
+    "https://github.com/WebKit/WebKit/blob/webkitgtk-2.52.6/Source/WebCore/platform/ScrollAnimationSmooth.cpp"
+  ]
+}

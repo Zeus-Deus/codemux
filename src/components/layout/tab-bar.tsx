@@ -1,3 +1,4 @@
+import { requestCloseTab } from "@/lib/close-guard";
 import { useState, useRef, useCallback, memo } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -13,7 +14,6 @@ import { Plus, X, Terminal, Globe, GitCompare, PanelRight, FileCode } from "luci
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   activateTab,
-  closeTab,
   createTab,
   createBrowserPane,
   reorderTabs,
@@ -102,7 +102,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
 
   const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
-    closeTab(workspace.workspace_id, tabId).catch(console.error);
+    requestCloseTab(workspace.workspace_id, tabId).catch(console.error);
   };
 
   const handleCreateTab = () => {
@@ -266,7 +266,7 @@ function TabBarImpl({ workspace, hideActions = false }: Props) {
                   draggable={renamingTabId !== tab.tab_id}
                   onDragStart={handleDragStart(tab.tab_id)}
                   {...middleClickCloseProps(() => {
-                    closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+                    requestCloseTab(workspace.workspace_id, tab.tab_id).catch(console.error);
                   })}
                   className={cn("group relative h-full", dragTabId === tab.tab_id && "opacity-40")}
                 >

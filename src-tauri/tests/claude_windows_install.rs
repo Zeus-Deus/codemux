@@ -83,6 +83,7 @@ fn windows_native_install_worker() {
             "GUI health must distinguish missing CLI from missing login"
         );
         assert_eq!(report.version.as_deref(), Some("9.9.9"));
-        assert!(report.message.unwrap().contains("not authenticated"));
+        assert_eq!(report.status, health::ProviderHealthStatus::Error);
+        assert_eq!(report.login_command.as_deref(), Some("claude auth login"));
     });
 }

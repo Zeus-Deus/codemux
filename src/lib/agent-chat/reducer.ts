@@ -9,7 +9,10 @@ import type {
 } from "@/tauri/events";
 
 import { isDelegatedId, isDelegatedRow } from "./delegation";
-import { runtimeNoticeFromWarning } from "./runtime-notice";
+import {
+  runtimeNoticeFromWarning,
+  signedOutProviderFromWarning,
+} from "./runtime-notice";
 import {
   appendTranscriptItem,
   hasRunningSubagents,
@@ -2123,11 +2126,13 @@ function applyEventInner(
       // before it lands.
       const sealed = sealTrailingReasoning(state, now);
       const { seq, next } = takeSeq(sealed);
+      const signIn = signedOutProviderFromWarning(event.message);
       const item: RuntimeNoticeItem = {
         kind: "runtime_notice",
         id: nextId("notice"),
         seq,
         message: notice,
+        ...(signIn ? { signIn } : {}),
       };
       return { ...next, messages: appendItem(next.messages, item) };
     }

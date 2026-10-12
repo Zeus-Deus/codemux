@@ -1,4 +1,10 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        // WebKitGTK falls back to a fixed 60 Hz timer when DRM vblank waits
+        // are unavailable. Export our narrow, mode-paced fallback from the
+        // GUI executable; do not interpose libdrm in its child processes.
+        println!("cargo:rustc-link-arg-bin=codemux=-Wl,--export-dynamic-symbol=drmWaitVBlank");
+    }
     // Generate the app context here, in the build script, rather than via the
     // `tauri::generate_context!()` proc macro. The macro writes cached files
     // (the decoded window icon) into OUT_DIR *while* the lib is compiling, and
