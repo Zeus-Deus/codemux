@@ -785,13 +785,23 @@ export function reseedBootstrapDrafts(): void {
       if (!isBootstrapModelId(draft.provider, draft.model)) continue;
       const roster = selectCapabilities(capabilities, draft.provider)?.models;
       if (!roster?.length || roster.some((m) => m.id === draft.model)) continue;
-      const defaults = capabilityDefaults(draft.provider, roster[0].id);
+      const model = roster[0];
+      const defaults = capabilityDefaults(draft.provider, model.id);
+      // New-chat settings can seed an effort before capabilities arrive.
+      // Keep supported choices while filling the missing bootstrap values.
+      const effort = draft.effort && (
+        model.effort_levels.includes(draft.effort) ||
+        model.prompt_injected_effort_levels.includes(draft.effort)
+      ) ? draft.effort : defaults.effort;
+      const contextWindow = model.context_window_options.some(
+        (option) => option.value === draft.contextWindow,
+      ) ? draft.contextWindow : defaults.contextWindow;
       draftsById ??= { ...state.draftsById };
       draftsById[draft.draftId] = {
         ...draft,
         model: defaults.model,
-        effort: defaults.effort,
-        contextWindow: defaults.contextWindow,
+        effort,
+        contextWindow,
       };
     }
     return draftsById ? { draftsById } : state;

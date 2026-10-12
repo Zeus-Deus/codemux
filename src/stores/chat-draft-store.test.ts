@@ -490,6 +490,37 @@ describe("chat-draft-store", () => {
       expect(after.contextWindow).toBe("1m");
     });
 
+    it("keeps a supported effort saved before capabilities load", () => {
+      useSettingsStore.setState({
+        settings: {
+          ...useSettingsStore.getState().settings,
+          "chat.default_provider": "claude",
+          "chat.default_model": "default",
+          "chat.default_effort": "low",
+        },
+      });
+      try {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        expect(draft.effort).toBe("low");
+
+        useProviderCapabilities.setState({ claude: roster });
+
+        const after = useChatDraftStore.getState().draftsById[draft.draftId];
+        expect(after.model).toBe("opus");
+        expect(after.effort).toBe("low");
+        expect(after.contextWindow).toBe("1m");
+      } finally {
+        useSettingsStore.setState({
+          settings: {
+            ...useSettingsStore.getState().settings,
+            "chat.default_provider": "",
+            "chat.default_model": "",
+            "chat.default_effort": "",
+          },
+        });
+      }
+    });
+
     it("reseeds against a roster that was already restored from storage", () => {
       unsubscribe();
       useProviderCapabilities.setState({
