@@ -22,7 +22,9 @@ import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
+import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { stepInterfaceSize } from "@/lib/typography";
+import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { isAppShortcutApplicable } from "@/lib/app-shortcut-applicability";
@@ -99,7 +101,7 @@ export function useKeyboardShortcuts() {
  * event; the command palette calls it without one, so a palette row and its
  * shortcut always execute the exact same code path.
  */
-export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
+export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
   if (!isAppShortcutApplicable(actionId)) return false;
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
@@ -117,7 +119,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     // A dialog or popover open on top of an overlay (Radix marks the Escape
     // it dismissed on) owns this press; closing the overlay beneath it too
     // would throw away the page the user was returning to.
-    if (_e?.defaultPrevented) return false;
+    if (event?.defaultPrevented) return false;
     // Onboarding is a full-view replacement, not a modal — prioritize it over
     // dismissible overlays so Escape always provides an escape hatch.
     if (ui.onboardingProjectDir) {
@@ -133,6 +135,9 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       return true;
     }
     if (ui.showSettings) {
+      // Settings hosts sheets, selects, dialogs and its own command palette.
+      // Escape belongs to the innermost of those; a second press leaves.
+      if (event && escapeClaimedElsewhere(event)) return false;
       ui.setShowSettings(false);
       return true;
     }
@@ -178,9 +183,11 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     const current = settings.settings.appearance.interface_font_size;
     const step = actionId === "zoomIn" ? "in" : actionId === "zoomOut" ? "out" : "reset";
     const next = stepInterfaceSize(current, step);
-    if (next !== current) {
+    const changed = next !== current;
+    if (changed) {
       void settings.updateSetting("appearance", "interface_font_size", next).catch(console.error);
     }
+    announceInterfaceSize(next, step, changed);
     return true;
   }
 
