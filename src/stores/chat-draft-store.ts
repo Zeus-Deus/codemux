@@ -1,13 +1,25 @@
+import { useEffect } from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
-import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
-import { resolveNewChatModelDefaults } from "@/lib/agent-chat/new-chat-defaults";
-import { getNewChatCheckout } from "@/stores/settings-store";
+import {
+  capabilityDefaults,
+  defaultModelId,
+} from "@/lib/agent-chat/capability-defaults";
+import {
+  NEW_CHAT_SETTING_KEYS,
+  resolveNewChatModelDefaults,
+} from "@/lib/agent-chat/new-chat-defaults";
+import { getNewChatCheckout, useSettingsStore } from "@/stores/settings-store";
+import { useAppStore } from "@/stores/app-store";
 import { discardStagedImage } from "@/lib/agent-chat/image-staging";
 import {
   useAgentChatStore,
   type ChatMode,
 } from "@/stores/agent-chat-store";
+import {
+  selectCapabilities,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
 
@@ -27,6 +39,10 @@ export interface ChatDraft {
   target: DraftTarget;
   provider: AgentChatProviderKind;
   model: string | null;
+  /** True only for an automatic model seeded before capabilities loaded.
+   *  Explicit picks clear this persisted marker. Missing means a legacy
+   *  draft of unknown provenance, whose model must be preserved. */
+  bootstrapModel?: boolean;
   effort: string | null;
   contextWindow: string | null;
   serviceTier?: string;
@@ -277,6 +293,7 @@ type NewChatConfig = Pick<
   ChatDraft,
   | "provider"
   | "model"
+  | "bootstrapModel"
   | "effort"
   | "contextWindow"
   | "serviceTier"
@@ -295,9 +312,19 @@ function newChatConfig(): NewChatConfig {
   // stay visible post-first-send too (Stage C Effort-lock fix).
   const choice = resolveNewChatModelDefaults();
   const defaults = capabilityDefaults(choice.provider, choice.model);
+  const settings = useSettingsStore.getState().settings;
+  const savedModel =
+    settings[NEW_CHAT_SETTING_KEYS.provider] === choice.provider
+      ? settings[NEW_CHAT_SETTING_KEYS.model]
+      : null;
+  const roster = selectCapabilities(
+    useProviderCapabilities.getState(),
+    choice.provider,
+  )?.models;
   return {
     provider: choice.provider,
     model: defaults.model,
+    bootstrapModel: !savedModel && !roster?.length,
     effort: choice.effort ?? defaults.effort,
     contextWindow: defaults.contextWindow,
     serviceTier: "default",
@@ -519,10 +546,31 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         set((s) => {
           const existing = s.draftsById[draftId];
           if (!existing) return s;
+          // A provider-only switch chooses its automatic default. A model
+          // field is an explicit pick, even if its id equals the fallback.
+          const automaticProvider =
+            config.provider && config.provider !== existing.provider &&
+            !("model" in config) ? config.provider : null;
+          const automaticConfig = automaticProvider
+            ? {
+                ...capabilityDefaults(automaticProvider, defaultModelId(automaticProvider)),
+                bootstrapModel: !selectCapabilities(
+                  useProviderCapabilities.getState(),
+                  automaticProvider,
+                )?.models.length,
+              }
+            : {};
           return {
             draftsById: {
               ...s.draftsById,
-              [draftId]: { ...existing, ...config },
+              [draftId]: {
+                ...existing,
+                ...automaticConfig,
+                ...config,
+                ...("model" in config
+                  ? { bootstrapModel: false }
+                  : {}),
+              },
             },
           };
         }),
@@ -762,6 +810,73 @@ export const useChatDraftStore = create<ChatDraftStore>()(
     },
   ),
 );
+
+/** Hydrate confirmed automatic local drafts once a roster becomes available.
+ *  A model id cannot tell a bootstrap seed from an explicit or legacy pick.
+ *  Device drafts keep their native defaults because this catalog describes
+ *  only this computer's CLI, not the device that will launch the thread. */
+export function reseedBootstrapDrafts(): void {
+  const capabilities = useProviderCapabilities.getState();
+  const appState = useAppStore.getState().appState;
+  useChatDraftStore.setState((state) => {
+    let draftsById: Record<DraftId, ChatDraft> | null = null;
+    for (const draft of Object.values(state.draftsById)) {
+      if (draft.promoting || draft.promotedTo || draft.materializedTo) continue;
+      if (draft.bootstrapModel !== true) continue;
+      if (draft.target.kind === "existing_workspace") {
+        const workspaceId = draft.target.workspaceId;
+        const workspace = appState?.workspaces.find(
+          (w) => w.workspace_id === workspaceId,
+        );
+        // Until the workspace hydrates, its execution device is unknown.
+        if (!workspace || workspace.host_id != null) continue;
+      } else if (draft.hostId != null) {
+        continue;
+      }
+      const roster = selectCapabilities(capabilities, draft.provider)?.models;
+      if (!roster?.length) continue;
+      const model = roster.find((m) => m.id === draft.model) ?? roster[0];
+      const defaults = capabilityDefaults(draft.provider, model.id);
+      // New-chat settings can seed an effort before capabilities arrive.
+      // Keep supported choices while filling the missing bootstrap values.
+      const effort = draft.effort && (
+        model.effort_levels.includes(draft.effort) ||
+        model.prompt_injected_effort_levels.includes(draft.effort)
+      ) ? draft.effort : defaults.effort;
+      const contextWindow = model.context_window_options.some(
+        (option) => option.value === draft.contextWindow,
+      ) ? draft.contextWindow : defaults.contextWindow;
+      draftsById ??= { ...state.draftsById };
+      draftsById[draft.draftId] = {
+        ...draft,
+        model: defaults.model,
+        bootstrapModel: false,
+        effort,
+        contextWindow,
+      };
+    }
+    return draftsById ? { draftsById } : state;
+  });
+}
+
+/** Keep placeholder drafts in step with the capability roster for the
+ *  lifetime of the app shell: once for a roster already restored from
+ *  storage, then on every harvest. */
+export function useReseedBootstrapDrafts(): void {
+  useEffect(() => {
+    reseedBootstrapDrafts();
+    const unsubscribeCapabilities = useProviderCapabilities.subscribe(
+      reseedBootstrapDrafts,
+    );
+    const unsubscribeApp = useAppStore.subscribe((state, previous) => {
+      if (state.appState !== previous.appState) reseedBootstrapDrafts();
+    });
+    return () => {
+      unsubscribeCapabilities();
+      unsubscribeApp();
+    };
+  }, []);
+}
 
 export type PersistedChatDraftStoreState = Pick<
   ChatDraftStore,
