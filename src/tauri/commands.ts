@@ -471,6 +471,10 @@ export const cyclePane = (step: number) =>
 export const closePane = (paneId: string) =>
   invoke<string | null>("close_pane", { paneId });
 
+/** Capture and shut down the provider session before removing its pane. */
+export const agentChatClosePane = (paneId: string) =>
+  invoke<void>("agent_chat_close_pane", { paneId });
+
 export const swapPanes = (sourcePaneId: string, targetPaneId: string) =>
   invoke("swap_panes", { sourcePaneId, targetPaneId });
 

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   closeTab: vi.fn(),
   closePane: vi.fn(),
+  agentChatClosePane: vi.fn(),
   reorderTabs: vi.fn(),
   terminalForegroundJobs: vi.fn(),
   launchAgentChatPane: vi.fn(),
@@ -14,6 +15,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/tauri/commands", () => ({
   closeTab: mocks.closeTab,
   closePane: mocks.closePane,
+  agentChatClosePane: mocks.agentChatClosePane,
   reorderTabs: mocks.reorderTabs,
   terminalForegroundJobs: mocks.terminalForegroundJobs,
 }));
@@ -87,6 +89,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.closeTab.mockResolvedValue(undefined);
   mocks.closePane.mockResolvedValue(null);
+  mocks.agentChatClosePane.mockResolvedValue(undefined);
   mocks.reorderTabs.mockResolvedValue(undefined);
   mocks.terminalForegroundJobs.mockResolvedValue({});
   mocks.undoable.mockReturnValue("toast-1");
@@ -282,8 +285,33 @@ describe("requestClosePane", () => {
     );
     prompt()!.confirm();
     await done;
-    expect(mocks.closePane).toHaveBeenCalledWith("pane-chat");
+    expect(mocks.agentChatClosePane).toHaveBeenCalledWith("pane-chat");
+    expect(mocks.closePane).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(mocks.undoable).toHaveBeenCalled());
+  });
+
+  it("does not shut down the agent when closing is cancelled", async () => {
+    seed({ "pane-chat": "working" });
+    const done = requestClosePane("pane-chat");
+    await vi.waitFor(() => expect(prompt()).not.toBeNull());
+    prompt()!.cancel();
+    await done;
+    expect(mocks.agentChatClosePane).not.toHaveBeenCalled();
+    expect(mocks.closePane).not.toHaveBeenCalled();
+    expect(mocks.undoable).not.toHaveBeenCalled();
+  });
+
+  it("shuts down an idle chat session without prompting", async () => {
+    await requestClosePane("pane-chat");
+    expect(prompt()).toBeNull();
+    expect(mocks.agentChatClosePane).toHaveBeenCalledWith("pane-chat");
+    expect(mocks.closePane).not.toHaveBeenCalled();
+  });
+
+  it("uses the generic close for a terminal pane", async () => {
+    await requestClosePane("pane-term");
+    expect(mocks.closePane).toHaveBeenCalledWith("pane-term");
+    expect(mocks.agentChatClosePane).not.toHaveBeenCalled();
   });
 
   it("closes a pane it cannot find without asking", async () => {

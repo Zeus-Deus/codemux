@@ -5,6 +5,7 @@ import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { toast } from "@/lib/toast";
 import { useAppStore } from "@/stores/app-store";
 import {
+  agentChatClosePane,
   closePane,
   closeTab,
   reorderTabs,
@@ -255,7 +256,7 @@ export function requestClosePane(paneId: string): Promise<void> {
       return guardedClose(
         title,
         [pane],
-        () => closePane(paneId),
+        () => pane.kind === "agent_chat" ? agentChatClosePane(paneId) : closePane(paneId),
         () => rememberChats(ws.workspace_id, null, [pane], title),
       );
     }
