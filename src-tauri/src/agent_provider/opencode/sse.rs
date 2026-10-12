@@ -557,7 +557,7 @@ async fn handle_record(
     }
 }
 
-async fn handle_native(
+pub(super) async fn handle_native(
     event: super::v2::Event,
     peer: &SsePeer,
     event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
@@ -569,6 +569,9 @@ async fn handle_native(
     let Some(session) = event.session_id().map(str::to_string) else {
         return;
     };
+    // Root lifecycle reduction and turn admission share this lock, so a
+    // queue drain cannot enter between an accepted start and its Running state.
+    let mut live = peer.event_ctx.lock().await;
     let mut router = peer.router.lock().await;
     if event.kind == "session.created" {
         if let Some(parent) = event.data["parentID"].as_str() {
@@ -607,7 +610,6 @@ async fn handle_native(
         }
     };
     drop(router);
-    let mut live = peer.event_ctx.lock().await;
     let mut usage = peer.usage.lock().await;
     let mut events = Vec::new();
     for update in updates {

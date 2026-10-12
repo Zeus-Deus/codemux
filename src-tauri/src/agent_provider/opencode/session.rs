@@ -479,26 +479,41 @@ impl OpenCodeSession {
             });
         }
         if self.turn_active().await || !self.queued.lock().await.is_empty() {
-            let id = format!("opencode-queued-{}", Uuid::new_v4());
-            let text = input
-                .display_text
-                .clone()
-                .unwrap_or_else(|| input.text.clone());
-            let client_nonce = input.client_nonce.clone();
-            self.queued.lock().await.push_back((id.clone(), input));
+            return Ok(self.queue_input(input, None).await);
+        }
+        self.dispatch_input(input, false, None).await
+    }
+
+    async fn queue_input(
+        &self,
+        input: crate::agent_provider::SendTurnInput,
+        existing_id: Option<String>,
+    ) -> crate::agent_provider::TurnStartResult {
+        let is_existing = existing_id.is_some();
+        let id = existing_id.unwrap_or_else(|| format!("opencode-queued-{}", Uuid::new_v4()));
+        let text = input
+            .display_text
+            .clone()
+            .unwrap_or_else(|| input.text.clone());
+        let client_nonce = input.client_nonce.clone();
+        let mut queue = self.queued.lock().await;
+        if is_existing {
+            queue.retain(|(key, _)| key != &id);
+            queue.push_front((id.clone(), input));
+        } else {
+            queue.push_back((id.clone(), input));
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
                 thread_id: self.thread_id.clone(),
                 queued_id: id.clone(),
                 client_nonce,
                 text,
             });
-            return Ok(crate::agent_provider::TurnStartResult {
-                turn_id: TurnId(String::new()),
-                queued_id: Some(id),
-                steered: false,
-            });
         }
-        self.dispatch_input(input, false).await
+        crate::agent_provider::TurnStartResult {
+            turn_id: TurnId(String::new()),
+            queued_id: Some(id),
+            steered: false,
+        }
     }
 
     pub async fn steer_turn(
@@ -506,13 +521,14 @@ impl OpenCodeSession {
         input: crate::agent_provider::SendTurnInput,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         let _outbound = self.outbound.lock().await;
-        self.dispatch_input(input, true).await
+        self.dispatch_input(input, true, None).await
     }
 
     async fn dispatch_input(
         &self,
         input: crate::agent_provider::SendTurnInput,
         steer: bool,
+        queued_id: Option<String>,
     ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
         if self.is_dead() {
             return Err(ProviderError::SessionClosed {
@@ -526,16 +542,16 @@ impl OpenCodeSession {
         }
         let result = self
             .post_turn(
-                input.text,
-                input.images,
-                input.model_override,
-                input.effort_override,
+                input.text.clone(),
+                input.images.clone(),
+                input.model_override.clone(),
+                input.effort_override.clone(),
                 steered,
                 input.turn_checkpoint.clone(),
             )
             .await;
         match result {
-            Ok(turn_id) => {
+            Ok(Some(turn_id)) => {
                 if let Some(checkpoint) = checkpoint {
                     checkpoint.commit().await;
                 }
@@ -544,6 +560,14 @@ impl OpenCodeSession {
                     queued_id: None,
                     steered,
                 })
+            }
+            Ok(None) => {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.abort().await;
+                }
+                // A background execution can resume while model preparation
+                // awaits its ACK. Preserve this input for the next idle turn.
+                Ok(self.queue_input(input, queued_id).await)
             }
             Err(error) => {
                 if let Some(checkpoint) = checkpoint {
@@ -568,7 +592,8 @@ impl OpenCodeSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
-            match self.dispatch_input(input, false).await {
+            match self.dispatch_input(input, false, Some(id.clone())).await {
+                Ok(result) if result.queued_id.is_some() => return,
                 Ok(result) => {
                     let _ = self
                         .event_tx
@@ -640,7 +665,10 @@ impl OpenCodeSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| input.text.clone());
-            let result = self.dispatch_input(input, true).await?;
+            let result = self.dispatch_input(input, true, Some(id.into())).await?;
+            if result.queued_id.is_some() {
+                return Ok(());
+            }
             self.queued.lock().await.retain(|(key, _)| key != id);
             let _ = self
                 .event_tx
@@ -783,7 +811,10 @@ impl OpenCodeSession {
     ) -> Result<TurnId, ProviderError> {
         let _outbound = self.outbound.lock().await;
         self.post_turn(text, images, model_override, effort_override, false, None)
-            .await
+            .await?
+            .ok_or_else(|| ProviderError::ValidationError {
+                message: "OpenCode execution resumed before this turn could be admitted. Queue the prompt or steer the active turn.".into(),
+            })
     }
 
     async fn post_turn(
@@ -794,7 +825,7 @@ impl OpenCodeSession {
         effort_override: Option<String>,
         steer: bool,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
-    ) -> Result<TurnId, ProviderError> {
+    ) -> Result<Option<TurnId>, ProviderError> {
         self.ensure_open()?;
         self.wait_ready().await?;
         self.ensure_open()?;
@@ -931,6 +962,9 @@ impl OpenCodeSession {
         let turn_id = {
             let mut ctx = self.event_ctx.lock().await;
             self.ensure_open()?;
+            if native_v2 && !steer && ctx.turn_active {
+                return Ok(None);
+            }
             if let Some(checkpoint) = &checkpoint {
                 checkpoint.authorize_dispatch()?;
             }
@@ -1022,7 +1056,7 @@ impl OpenCodeSession {
             let mut requests = self.native_requests.lock().await;
             requests.retain(|request| !request.is_finished());
             requests.push(handle);
-            return Ok(turn_id);
+            return Ok(Some(turn_id));
         }
         let response = request.send().await;
         let response = match response {
@@ -1062,7 +1096,7 @@ impl OpenCodeSession {
         }
         // SSE may already have completed the turn before this HTTP response.
         // Never re-arm it here. A steer retains the active turn's identity.
-        Ok(turn_id)
+        Ok(Some(turn_id))
     }
 
     pub async fn interrupt_selected(&self, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
@@ -2204,6 +2238,124 @@ pub(crate) mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn native_background_resume_keeps_prompt_queued_after_pending_model_ack() {
+        let mut server = Server::new_async().await;
+        let (seen, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(gate);
+        let model = server
+            .mock("POST", "/api/session/s/model")
+            .match_request(move |_| {
+                seen.send(()).unwrap();
+                gate.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                true
+            })
+            .with_status(204)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"text":"waiting input","delivery":"queue","resume":true}),
+            ))
+            .with_status(200)
+            .create_async()
+            .await;
+        let interrupt = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .create_async()
+            .await;
+        let (session, tx, mut events) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        session.event_ctx.lock().await.turn_active = true;
+        let mut input = delivery_input("waiting input");
+        input.model_override = Some("p/m".into());
+        let queued = session
+            .enqueue_or_send(input)
+            .await
+            .unwrap()
+            .queued_id
+            .unwrap();
+        session.event_ctx.lock().await.turn_active = false;
+        let draining = tokio::spawn({
+            let session = session.clone();
+            async move { session.drain_queue().await }
+        });
+        received.recv().await.unwrap();
+        let peer = SsePeer {
+            api: super::super::api::OpenCodeApi::V2,
+            ready: tokio::sync::watch::channel(true).0,
+            directory: None,
+            session_id: "s".into(),
+            event_ctx: session.event_ctx.clone(),
+            router: session.router.clone(),
+            dead: session.dead.clone(),
+            usage: session.usage.clone(),
+        };
+        let event = |id: &str, kind: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id":id,"type":kind,"data":{"sessionID":"s"}
+            }))
+            .unwrap()
+        };
+        super::super::sse::handle_native(
+            event("callback-start", "session.execution.started"),
+            &peer,
+            &tx,
+        )
+        .await;
+        let callback_turn = session.event_ctx.lock().await.turn_id.clone();
+        release.send(()).unwrap();
+        draining.await.unwrap();
+        assert_eq!(session.event_ctx.lock().await.turn_id, callback_turn);
+        assert!(session.turn_active().await);
+        assert_eq!(session.queued.lock().await.front().unwrap().0, queued);
+        assert_eq!(session.queued.lock().await.len(), 1);
+        assert!(
+            !prompt.matched_async().await,
+            "the waiting prompt cannot join the callback execution"
+        );
+        let before: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(!before
+            .iter()
+            .any(|event| matches!(event, ProviderRuntimeEvent::QueuedTurnDispatched { .. })));
+        super::super::sse::handle_native(
+            event("callback-end", "session.execution.succeeded"),
+            &peer,
+            &tx,
+        )
+        .await;
+        let next_turn = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let ProviderRuntimeEvent::QueuedTurnDispatched {
+                    queued_id, turn_id, ..
+                } = events.recv().await.unwrap()
+                {
+                    assert_eq!(queued_id, queued);
+                    break turn_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(next_turn, callback_turn);
+        assert!(session.queued.lock().await.is_empty());
+        model.assert_async().await;
+        prompt.assert_async().await;
+        session.shutdown().await;
+        interrupt.assert_async().await;
     }
 
     #[tokio::test]
