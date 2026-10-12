@@ -348,6 +348,7 @@ pub fn v2_update_to_runtime(
         item,
     };
     match update {
+        U::UserDelivered(_) => vec![],
         U::Content {
             thinking,
             complete,

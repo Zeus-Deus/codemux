@@ -3134,9 +3134,9 @@ pub(crate) mod tests {
             &tx,
         )
         .await;
-        let callback_turn = session.event_ctx.lock().await.turn_id.clone();
         super::super::sse::handle_native(event("evt_b_text", "session.text.ended",
             serde_json::json!({"sessionID":"s","assistantMessageID":"msg_b_assistant","ordinal":0,"text":"background B"}), 11), &peer, &tx).await;
+        let callback_turn = session.event_ctx.lock().await.turn_id.clone();
         super::super::sse::handle_native(
             event(
                 "evt_b_done",
@@ -3149,7 +3149,13 @@ pub(crate) mod tests {
         )
         .await;
         server.state.lock().await.active = false;
-        assert!(!session.turn_active().await);
+        assert!(!session.event_ctx.lock().await.turn_active);
+        assert!(session
+            .router
+            .lock()
+            .await
+            .native
+            .has_pending_user_admission("s"));
         assert!(
             !sending.is_finished(),
             "the stage ACK must still be withheld"

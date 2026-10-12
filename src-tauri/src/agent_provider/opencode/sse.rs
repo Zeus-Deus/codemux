@@ -618,10 +618,58 @@ pub(super) async fn handle_native(
             return;
         }
     };
+    let parked_user = router.native.has_pending_user_admission(&session);
     drop(router);
     let mut usage = peer.usage.lock().await;
     let mut events = Vec::new();
     for update in updates {
+        if subagent.is_none() {
+            if let super::v2::Update::UserDelivered(turn) = &update {
+                let turn = crate::agent_provider::TurnId(turn.clone());
+                if live.turn_active && live.turn_id != turn {
+                    // The native busy period delivered the queued user after
+                    // background output. Handoff once without waking the queue.
+                    events.push(ProviderRuntimeEvent::TurnCompleted {
+                        thread_id: live.thread_id.clone(),
+                        turn_id: live.turn_id.clone(),
+                        status: crate::agent_provider::TurnStatus::Success,
+                        usage: None,
+                    });
+                }
+                live.turn_id = turn;
+                live.turn_active = true;
+                events.push(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: live.thread_id.clone(),
+                    status: crate::agent_provider::SessionStatus::Running {
+                        active_turn: live.turn_id.clone(),
+                    },
+                });
+                continue;
+            }
+            if parked_user && !live.turn_active {
+                if matches!(&update, super::v2::Update::Started) {
+                    // Started precedes inbox drain and cannot identify the
+                    // parked user. Its delivery event owns that local turn.
+                    continue;
+                }
+                if matches!(
+                    &update,
+                    super::v2::Update::Content { .. }
+                        | super::v2::Update::ToolUse { .. }
+                        | super::v2::Update::ToolResult { .. }
+                        | super::v2::Update::Permission(_)
+                        | super::v2::Update::Form(_)
+                ) {
+                    admit_native_root(&mut live);
+                    events.push(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: live.thread_id.clone(),
+                        status: crate::agent_provider::SessionStatus::Running {
+                            active_turn: live.turn_id.clone(),
+                        },
+                    });
+                }
+            }
+        }
         // A background child's callback can admit a new root execution after
         // the user turn settled. Only a live start accepted by the reducer
         // may reactivate it; recovery and replay filtering happen above.
@@ -650,7 +698,7 @@ pub(super) async fn handle_native(
     }
     if events
         .iter()
-        .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+        .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &live.turn_id))
     {
         live.turn_active = false;
     }
@@ -866,7 +914,12 @@ async fn reconcile_native_history(
     // their last observed Idle identity, across cursor pages. Other snapshots
     // retain the current execution's live-lifecycle recovery behavior.
     let encoded = urlencoding::encode(session);
-    let observed_sequence = peer.router.lock().await.native.observed_execution_sequence(session);
+    let observed_sequence = peer
+        .router
+        .lock()
+        .await
+        .native
+        .observed_execution_sequence(session);
     let observed_idle = peer.router.lock().await.native.observed_idle_id(session);
     let mut snapshot = None;
     for attempt in 0..3 {
@@ -945,8 +998,14 @@ async fn reconcile_native_history(
         let (reserved_turn, admitted_input) = {
             let ctx = peer.event_ctx.lock().await;
             let router = peer.router.lock().await;
-            let turn = ctx.turn_active.then(|| ctx.turn_id.clone());
-            let input = router.native.user_admission_for(session, &ctx.turn_id.0);
+            let pending = router.native.pending_user_admission(session);
+            let turn = pending
+                .as_ref()
+                .map(|(_, turn)| crate::agent_provider::TurnId(turn.clone()))
+                .or_else(|| ctx.turn_active.then(|| ctx.turn_id.clone()));
+            let input = pending
+                .map(|(input, _)| input)
+                .or_else(|| router.native.user_admission_for(session, &ctx.turn_id.0));
             (turn, input)
         };
         let mut executions = Vec::new();
@@ -959,7 +1018,14 @@ async fn reconcile_native_history(
             }
         }
         let execution_count = executions.len();
-        if !running && peer.router.lock().await.native.clear_deferred_execution(session) {
+        if !running
+            && peer
+                .router
+                .lock()
+                .await
+                .native
+                .clear_deferred_execution(session)
+        {
             let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
                 thread_id: peer.event_ctx.lock().await.thread_id.clone(),
                 status: crate::agent_provider::SessionStatus::Ready,
@@ -969,14 +1035,37 @@ async fn reconcile_native_history(
         for (index, (execution, terminal)) in executions.into_iter().enumerate() {
             let mut ctx = peer.event_ctx.lock().await;
             let mut router = peer.router.lock().await;
-            if !router.native.recover_terminal(session, terminal["id"].clone()) {
+            if !router
+                .native
+                .recover_terminal(session, terminal["id"].clone())
+            {
                 continue;
             }
-            let belongs_to_admission = admitted_input.as_ref().is_some_and(|input| execution.iter()
-                .any(|message| message["type"] == "user" && message["id"].as_str() == Some(input)));
-            let preserve_latest = admitted_input.is_none() && (!running || current.is_empty())
+            let belongs_to_admission = admitted_input.as_ref().is_some_and(|input| {
+                execution.iter().any(|message| {
+                    message["type"] == "user" && message["id"].as_str() == Some(input)
+                })
+            });
+            if belongs_to_admission {
+                router
+                    .native
+                    .claim_pending_user_admission(session, admitted_input.as_deref().unwrap());
+            }
+            let preserve_latest = admitted_input.is_none()
+                && (!running || current.is_empty())
                 && index + 1 == execution_count;
-            if let Some(turn) = reserved_turn.as_ref().filter(|_| belongs_to_admission || preserve_latest) {
+            if let Some(turn) = reserved_turn
+                .as_ref()
+                .filter(|_| belongs_to_admission || preserve_latest)
+            {
+                if belongs_to_admission && ctx.turn_active && ctx.turn_id != *turn {
+                    let _ = event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                        thread_id: ctx.thread_id.clone(),
+                        turn_id: ctx.turn_id.clone(),
+                        status: crate::agent_provider::TurnStatus::Success,
+                        usage: None,
+                    });
+                }
                 ctx.turn_id = turn.clone();
                 ctx.turn_active = true;
                 reserved_completed = true;
@@ -1000,40 +1089,75 @@ async fn reconcile_native_history(
             // This can be the recovered terminal's coordinator cleanup or a
             // newer execution before its first projected message. Keep claimed
             // terminals retired; only genuine new output/lifecycle admits a turn.
-            peer.router.lock().await.native.defer_execution(session, sequence.unwrap());
+            peer.router
+                .lock()
+                .await
+                .native
+                .defer_execution(session, sequence.unwrap());
             return Ok(());
         }
         if running || (reserved_turn.is_some() && !reserved_completed) {
             let mut ctx = peer.event_ctx.lock().await;
             let mut router = peer.router.lock().await;
             if let Some(turn) = reserved_turn.filter(|_| !reserved_completed) {
-                ctx.turn_id = turn;
-                ctx.turn_active = true;
+                let delivered = admitted_input.as_ref().is_some_and(|input| {
+                    current.iter().any(|message| {
+                        message["type"] == "user" && message["id"].as_str() == Some(input)
+                    })
+                });
+                if delivered {
+                    router
+                        .native
+                        .claim_pending_user_admission(session, admitted_input.as_deref().unwrap());
+                }
+                if !router.native.has_pending_user_admission(session) {
+                    if delivered && ctx.turn_active && ctx.turn_id != turn {
+                        let _ = event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                            thread_id: ctx.thread_id.clone(),
+                            turn_id: ctx.turn_id.clone(),
+                            status: crate::agent_provider::TurnStatus::Success,
+                            usage: None,
+                        });
+                    }
+                    ctx.turn_id = turn;
+                    ctx.turn_active = true;
+                }
             } else {
                 // Coordinator ownership can trail an already observed Idle.
-                let completed = idle_message.as_ref().and_then(|m| m["id"].as_str())
+                let completed = idle_message
+                    .as_ref()
+                    .and_then(|m| m["id"].as_str())
                     .and_then(|id| router.native.completed_idle_sequence(session, id));
-                if current.is_empty() && sequence.zip(completed)
-                    .is_some_and(|(seq, completed)| seq <= completed) {
+                if current.is_empty()
+                    && sequence
+                        .zip(completed)
+                        .is_some_and(|(seq, completed)| seq <= completed)
+                {
                     return Ok(());
                 }
                 admit_native_root(&mut ctx);
             }
             router.native.mark_running(session);
             drop(router);
-            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: ctx.thread_id.clone(),
-                status: crate::agent_provider::SessionStatus::Running {
-                    active_turn: ctx.turn_id.clone(),
-                },
-            });
+            if ctx.turn_active {
+                let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: ctx.thread_id.clone(),
+                    status: crate::agent_provider::SessionStatus::Running {
+                        active_turn: ctx.turn_id.clone(),
+                    },
+                });
+            }
             drop(ctx);
             replay_native_messages(&current, session, peer, event_tx).await?;
         }
         if !running {
             // Retire buffered durable records only after every recovered answer
             // has its own execution/terminal identity. Active tails remain live.
-            peer.router.lock().await.native.recover_through(session, sequence.unwrap());
+            peer.router
+                .lock()
+                .await
+                .native
+                .recover_through(session, sequence.unwrap());
         }
         return Ok(());
     }
@@ -1041,7 +1165,9 @@ async fn reconcile_native_history(
     // disappeared, retain the conservative latest-execution snapshot too.
     let mut boundaries = 0;
     messages.retain(|message| {
-        if message["type"] == "idle" { boundaries += 1; }
+        if message["type"] == "idle" {
+            boundaries += 1;
+        }
         boundaries <= if running { 0 } else { 1 }
     });
     let mut terminal_claimed = false;
@@ -1092,13 +1218,19 @@ async fn reconcile_native_history(
             let Some(message) = idle_message.as_ref().filter(|_| sequence.is_some()) else {
                 return Ok(());
             };
-            if !message["id"].as_str().is_some_and(|id| id.starts_with("msg_")) {
+            if !message["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_"))
+            {
                 return Err("missing native idle message identity".into());
             }
             let mut router = peer.router.lock().await;
-            let advanced = sequence.zip(observed_sequence)
+            let advanced = sequence
+                .zip(observed_sequence)
                 .is_some_and(|(current, observed)| current > observed);
-            let unseen = router.native.recover_terminal(session, message["id"].clone());
+            let unseen = router
+                .native
+                .recover_terminal(session, message["id"].clone());
             if !advanced || !unseen {
                 // Initial attachment records its baseline silently. An unchanged
                 // Idle remains retired even if unrelated durable state advances.
@@ -1148,16 +1280,24 @@ async fn replay_native_terminal(
     peer: &SsePeer,
     event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
 ) -> Result<(), String> {
-    let boundary = message["id"].as_str()
+    let boundary = message["id"]
+        .as_str()
         .filter(|id| id.starts_with("msg_"))
         .ok_or("missing native idle message identity")?;
-    let outcome = message["outcome"].as_str().ok_or("missing native idle outcome")?;
-    handle_native(super::v2::Event {
-        durable: None,
-        id: format!("snapshot:terminal:{boundary}"),
-        kind: format!("session.execution.{outcome}"),
-        data: serde_json::json!({"sessionID":session,"error":message.get("error")}),
-    }, peer, event_tx).await;
+    let outcome = message["outcome"]
+        .as_str()
+        .ok_or("missing native idle outcome")?;
+    handle_native(
+        super::v2::Event {
+            durable: None,
+            id: format!("snapshot:terminal:{boundary}"),
+            kind: format!("session.execution.{outcome}"),
+            data: serde_json::json!({"sessionID":session,"error":message.get("error")}),
+        },
+        peer,
+        event_tx,
+    )
+    .await;
     Ok(())
 }
 
@@ -1464,24 +1604,46 @@ mod tests {
         mocks
     }
 
-    async fn mock_completed_root_callback(server: &mut mockito::ServerGuard, running: bool) -> Vec<mockito::Mock> {
+    async fn mock_completed_root_callback(
+        server: &mut mockito::ServerGuard,
+        running: bool,
+    ) -> Vec<mockito::Mock> {
         let mut mocks = Vec::new();
         for (path, body) in [
-            ("/api/session/active", serde_json::json!({"data":if running { serde_json::json!({"root":{}}) } else { serde_json::json!({}) }})),
-            ("/api/session?parentID=root&limit=200&order=asc", serde_json::json!({"data":[]})),
-            ("/api/session/root/permission", serde_json::json!({"data":[]})),
+            (
+                "/api/session/active",
+                serde_json::json!({"data":if running { serde_json::json!({"root":{}}) } else { serde_json::json!({}) }}),
+            ),
+            (
+                "/api/session?parentID=root&limit=200&order=asc",
+                serde_json::json!({"data":[]}),
+            ),
+            (
+                "/api/session/root/permission",
+                serde_json::json!({"data":[]}),
+            ),
             ("/api/session/root/form", serde_json::json!({"data":[]})),
-            ("/api/session/root/message?limit=200&order=desc", serde_json::json!({"data":[
-                {"id":"msg_callback_done","type":"idle","outcome":"succeeded"},
-                {"id":"callback_message","type":"assistant","time":{"completed":3},
-                    "content":[{"type":"text","text":"background follow-up"}]},
-                {"id":"msg_a_done","type":"idle","outcome":"succeeded"},
-                {"id":"old_message","type":"assistant","time":{"completed":2},
-                    "content":[{"type":"text","text":"old response"}]}
-            ]})),
+            (
+                "/api/session/root/message?limit=200&order=desc",
+                serde_json::json!({"data":[
+                    {"id":"msg_callback_done","type":"idle","outcome":"succeeded"},
+                    {"id":"callback_message","type":"assistant","time":{"completed":3},
+                        "content":[{"type":"text","text":"background follow-up"}]},
+                    {"id":"msg_a_done","type":"idle","outcome":"succeeded"},
+                    {"id":"old_message","type":"assistant","time":{"completed":2},
+                        "content":[{"type":"text","text":"old response"}]}
+                ]}),
+            ),
         ] {
-            mocks.push(server.mock("GET", path).with_status(200).with_body(body.to_string())
-                .expect_at_least(1).create_async().await);
+            mocks.push(
+                server
+                    .mock("GET", path)
+                    .with_status(200)
+                    .with_body(body.to_string())
+                    .expect_at_least(1)
+                    .create_async()
+                    .await,
+            );
         }
         mocks.extend(mock_watermarks(server, "root", 20).await);
         mocks
@@ -1498,45 +1660,87 @@ mod tests {
             ("evt_a_start", "session.execution.started", 1),
             ("evt_a_done", "session.execution.succeeded", 10),
         ] {
-            handle_record(&native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)), &p, &tx).await;
+            handle_record(
+                &native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)),
+                &p,
+                &tx,
+            )
+            .await;
         }
         let original_turn = p.event_ctx.lock().await.turn_id.clone();
         assert!(!p.event_ctx.lock().await.turn_active);
         while rx.try_recv().is_ok() {}
         // Both start and completion happened before resubscribing, so the
         // volatile feed contributes no callback event to this recovery.
-        reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
         let callback_turn = p.event_ctx.lock().await.turn_id.clone();
         assert_ne!(callback_turn, original_turn);
         assert!(!p.event_ctx.lock().await.turn_active);
         let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(observed.iter().filter(|event| matches!(event,
-            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &callback_turn)).count(), 1);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &callback_turn))
+                .count(),
+            1
+        );
         assert_eq!(observed.iter().filter(|event| matches!(event,
             ProviderRuntimeEvent::ItemCompleted { item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
                 if text == "background follow-up")).count(), 1);
         assert!(!observed.iter().any(|event| matches!(event,
             ProviderRuntimeEvent::ItemCompleted { item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
                 if text == "old response")));
-        reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
         assert_eq!(p.event_ctx.lock().await.turn_id, callback_turn);
-        assert!(rx.try_recv().is_err(), "unchanged idle callback must not replay");
-        for mock in mocks { mock.assert_async().await; }
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged idle callback must not replay"
+        );
+        for mock in mocks {
+            mock.assert_async().await;
+        }
     }
 
     #[tokio::test]
-    async fn native_recovery_recovers_two_completed_root_callbacks_across_pages_on_distinct_turns() {
-        for (admitted_first, running_tail, absent_input) in [(false, false, false), (true, false, false), (true, true, false), (true, false, true)] {
+    async fn native_recovery_recovers_two_completed_root_callbacks_across_pages_on_distinct_turns()
+    {
+        for (admitted_first, running_tail, absent_input) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
             let mut server = mockito::Server::new_async().await;
             let mut mocks = mock_watermarks(&mut server, "root", 30).await;
             for (path, body) in [
-                ("/api/session/active", serde_json::json!({"data":if running_tail { serde_json::json!({"root":{}}) } else { serde_json::json!({}) }})),
-                ("/api/session?parentID=root&limit=200&order=asc", serde_json::json!({"data":[]})),
-                ("/api/session/root/permission", serde_json::json!({"data":[]})),
+                (
+                    "/api/session/active",
+                    serde_json::json!({"data":if running_tail { serde_json::json!({"root":{}}) } else { serde_json::json!({}) }}),
+                ),
+                (
+                    "/api/session?parentID=root&limit=200&order=asc",
+                    serde_json::json!({"data":[]}),
+                ),
+                (
+                    "/api/session/root/permission",
+                    serde_json::json!({"data":[]}),
+                ),
                 ("/api/session/root/form", serde_json::json!({"data":[]})),
             ] {
-                mocks.push(server.mock("GET", path).with_status(200).with_body(body.to_string())
-                    .expect_at_least(1).create_async().await);
+                mocks.push(
+                    server
+                        .mock("GET", path)
+                        .with_status(200)
+                        .with_body(body.to_string())
+                        .expect_at_least(1)
+                        .create_async()
+                        .await,
+                );
             }
             let mut newest = Vec::new();
             if running_tail {
@@ -1550,8 +1754,13 @@ mod tests {
                 serde_json::json!({"id":"m_c","type":"assistant","time":{"completed":5},"content":[{"type":"text","text":"C"}]}),
                 serde_json::json!({"id":"msg_b_done","type":"idle","outcome":"succeeded"}),
             ]);
-            let first_page = server.mock("GET", "/api/session/root/message?limit=200&order=desc")
-                .with_status(200).with_body(serde_json::json!({"data":newest,"cursor":{"next":"older"}}).to_string()).expect(2).create_async().await;
+            let first_page = server
+                .mock("GET", "/api/session/root/message?limit=200&order=desc")
+                .with_status(200)
+                .with_body(serde_json::json!({"data":newest,"cursor":{"next":"older"}}).to_string())
+                .expect(2)
+                .create_async()
+                .await;
             let older_page = server.mock("GET", "/api/session/root/message?limit=200&cursor=older")
                 .with_status(200).with_body(serde_json::json!({"data":[
                     {"id":"m_b","type":"assistant","time":{"completed":3},"content":[{"type":"text","text":"B"}]},
@@ -1566,7 +1775,12 @@ mod tests {
                 ("evt_a_start", "session.execution.started", 1),
                 ("evt_a_done", "session.execution.succeeded", 10),
             ] {
-                handle_record(&native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)), &p, &tx).await;
+                handle_record(
+                    &native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)),
+                    &p,
+                    &tx,
+                )
+                .await;
             }
             let original_turn = p.event_ctx.lock().await.turn_id.clone();
             let admitted_turn = TurnId("admitted_b".into());
@@ -1574,56 +1788,136 @@ mod tests {
                 let mut ctx = p.event_ctx.lock().await;
                 ctx.turn_id = admitted_turn.clone();
                 ctx.turn_active = true;
-                p.router.lock().await.native.remember_user_admission("root",
-                    if absent_input { "input_pending" } else if running_tail { "input_d" } else { "input_b" }, &admitted_turn.0);
+                p.router.lock().await.native.remember_user_admission(
+                    "root",
+                    if absent_input {
+                        "input_pending"
+                    } else if running_tail {
+                        "input_d"
+                    } else {
+                        "input_b"
+                    },
+                    &admitted_turn.0,
+                );
             }
             while rx.try_recv().is_ok() {}
-            reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
             let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-            let responses: Vec<_> = observed.iter().filter_map(|event| match event {
-                ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
-                    => Some((turn_id.clone(), text.as_str())),
-                _ => None,
-            }).collect();
-            assert_eq!(responses.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
-                if running_tail { vec!["B", "C", "D"] } else { vec!["B", "C"] });
+            let responses: Vec<_> = observed
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderRuntimeEvent::ItemCompleted {
+                        turn_id,
+                        item: crate::agent_provider::CompletedItem::AssistantText { text },
+                        ..
+                    } => Some((turn_id.clone(), text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                responses.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                if running_tail {
+                    vec!["B", "C", "D"]
+                } else {
+                    vec!["B", "C"]
+                }
+            );
             assert_ne!(responses[0].0, responses[1].0);
             assert_ne!(responses[0].0, original_turn);
-            assert_eq!(responses[0].0 == admitted_turn, admitted_first && !running_tail && !absent_input);
+            assert_eq!(
+                responses[0].0 == admitted_turn,
+                admitted_first && !running_tail && !absent_input
+            );
             assert_ne!(responses[1].0, original_turn);
             for (turn, _) in responses.iter().take(2) {
-                assert_eq!(observed.iter().filter(|event| matches!(event,
-                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn)).count(), 1);
+                assert_eq!(
+                    observed
+                        .iter()
+                        .filter(|event| matches!(event,
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn))
+                        .count(),
+                    1
+                );
             }
-            assert_eq!(p.router.lock().await.native.recovered_sequence("root"), if running_tail { None } else { Some(30) });
-            assert_eq!(p.event_ctx.lock().await.turn_active, running_tail || absent_input);
-            if running_tail { assert_eq!(responses[2].0, admitted_turn); }
-            if absent_input { assert_eq!(p.event_ctx.lock().await.turn_id, admitted_turn); }
-            reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+            assert_eq!(
+                p.router.lock().await.native.recovered_sequence("root"),
+                if running_tail { None } else { Some(30) }
+            );
+            assert_eq!(p.event_ctx.lock().await.turn_active, running_tail);
+            if running_tail {
+                assert_eq!(responses[2].0, admitted_turn);
+            }
+            if absent_input {
+                assert!(p
+                    .router
+                    .lock()
+                    .await
+                    .native
+                    .has_pending_user_admission("root"));
+            }
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
             for (id, kind, seq) in [
                 ("evt_b_start", "session.execution.started", 11),
                 ("evt_b_done", "session.execution.succeeded", 20),
                 ("evt_c_start", "session.execution.started", 21),
                 ("evt_c_done", "session.execution.succeeded", 30),
             ] {
-                handle_record(&native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)), &p, &tx).await;
+                handle_record(
+                    &native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)),
+                    &p,
+                    &tx,
+                )
+                .await;
             }
             let replayed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-            assert!(!replayed.iter().any(|event| matches!(event,
-                ProviderRuntimeEvent::TurnCompleted { .. } | ProviderRuntimeEvent::ItemCompleted { .. })),
-                "checkpoint and buffered lifecycle replay must not repeat B or C");
-            assert_eq!(p.event_ctx.lock().await.turn_active, running_tail || absent_input);
+            assert!(
+                !replayed.iter().any(|event| matches!(
+                    event,
+                    ProviderRuntimeEvent::TurnCompleted { .. }
+                        | ProviderRuntimeEvent::ItemCompleted { .. }
+                )),
+                "checkpoint and buffered lifecycle replay must not repeat B or C"
+            );
+            assert_eq!(p.event_ctx.lock().await.turn_active, running_tail);
             if running_tail || absent_input {
+                if absent_input {
+                    handle_record(
+                        &native_record(
+                            "evt_pending_delivered",
+                            "session.inbox.delivered",
+                            serde_json::json!({"sessionID":"root","inboxID":"input_pending"}),
+                            Some(35),
+                        ),
+                        &p,
+                        &tx,
+                    )
+                    .await;
+                }
                 assert_eq!(p.event_ctx.lock().await.turn_id, admitted_turn);
-                handle_record(&native_record("evt_d_done", "session.execution.succeeded",
-                    serde_json::json!({"sessionID":"root"}), Some(40)), &p, &tx).await;
+                handle_record(
+                    &native_record(
+                        "evt_d_done",
+                        "session.execution.succeeded",
+                        serde_json::json!({"sessionID":"root"}),
+                        Some(40),
+                    ),
+                    &p,
+                    &tx,
+                )
+                .await;
                 assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|event| matches!(event,
                     ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &admitted_turn)).count(), 1);
                 assert!(!p.event_ctx.lock().await.turn_active);
             }
             first_page.assert_async().await;
             older_page.assert_async().await;
-            for mock in mocks { mock.assert_async().await; }
+            for mock in mocks {
+                mock.assert_async().await;
+            }
         }
     }
 
@@ -1636,46 +1930,125 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let original_turn = p.event_ctx.lock().await.turn_id.clone();
         for _ in 0..2 {
-            reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
             assert_eq!(p.event_ctx.lock().await.turn_id, original_turn);
             assert!(!p.event_ctx.lock().await.turn_active);
             assert!(rx.try_recv().is_err());
         }
-        assert_eq!(p.router.lock().await.native.observed_execution_sequence("root"), Some(20));
-        for mock in mocks { mock.assert_async().await; }
+        assert_eq!(
+            p.router
+                .lock()
+                .await
+                .native
+                .observed_execution_sequence("root"),
+            Some(20)
+        );
+        for mock in mocks {
+            mock.assert_async().await;
+        }
     }
 
     #[tokio::test]
-    async fn native_recovery_active_without_new_history_defers_identity_until_real_execution_or_idle() {
+    async fn native_recovery_active_without_new_history_defers_identity_until_real_execution_or_idle(
+    ) {
         for activity in ["idle", "start", "content", "permission", "form"] {
             let mut server = mockito::Server::new_async().await;
             let mocks = mock_completed_root_callback(&mut server, true).await;
             let mut p = peer("root");
             p.api = super::super::api::OpenCodeApi::V2;
             let (tx, mut rx) = broadcast::channel(64);
-            handle_record(&native_record("evt_a_start", "session.execution.started",
-                serde_json::json!({"sessionID":"root"}), Some(1)), &p, &tx).await;
-            handle_record(&native_record("evt_a_done", "session.execution.succeeded",
-                serde_json::json!({"sessionID":"root"}), Some(10)), &p, &tx).await;
+            handle_record(
+                &native_record(
+                    "evt_a_start",
+                    "session.execution.started",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(1),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
+            handle_record(
+                &native_record(
+                    "evt_a_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(10),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
             while rx.try_recv().is_ok() {}
-            reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
             let completed_turn = p.event_ctx.lock().await.turn_id.clone();
             assert!(!p.event_ctx.lock().await.turn_active);
             assert!(p.router.lock().await.native.awaiting_execution("root"));
-            assert!(p.router.lock().await.native.recovered_sequence("root").is_none());
-            assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|event|
-                matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })).count(), 1);
-            handle_record(&native_record("evt_buffered_callback_start", "session.execution.started",
-                serde_json::json!({"sessionID":"root"}), Some(11)), &p, &tx).await;
-            handle_record(&native_record("evt_callback_done", "session.execution.succeeded",
-                serde_json::json!({"sessionID":"root"}), Some(20)), &p, &tx).await;
-            assert!(rx.try_recv().is_err(), "the recovered callback terminal must not admit or settle a phantom turn");
+            assert!(p
+                .router
+                .lock()
+                .await
+                .native
+                .recovered_sequence("root")
+                .is_none());
+            assert_eq!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }))
+                    .count(),
+                1
+            );
+            handle_record(
+                &native_record(
+                    "evt_buffered_callback_start",
+                    "session.execution.started",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(11),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
+            handle_record(
+                &native_record(
+                    "evt_callback_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(20),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
+            assert!(
+                rx.try_recv().is_err(),
+                "the recovered callback terminal must not admit or settle a phantom turn"
+            );
             if activity != "idle" {
                 let (kind, data, seq) = match activity {
-                    "start" => ("session.execution.started", serde_json::json!({"sessionID":"root"}), Some(21)),
-                    "content" => ("session.text.ended", serde_json::json!({"sessionID":"root","assistantMessageID":"m_d","ordinal":0,"text":"D"}), Some(21)),
-                    "permission" => ("permission.asked", serde_json::json!({"sessionID":"root","id":"per_d","action":"read","resources":["x"]}), None),
-                    "form" => ("form.created", serde_json::json!({"form":{"sessionID":"root","id":"f_d","metadata":{"kind":"question"},"fields":[{"key":"q0","type":"string","description":"D?","custom":true,"options":[]}]}}), None),
+                    "start" => (
+                        "session.execution.started",
+                        serde_json::json!({"sessionID":"root"}),
+                        Some(21),
+                    ),
+                    "content" => (
+                        "session.text.ended",
+                        serde_json::json!({"sessionID":"root","assistantMessageID":"m_d","ordinal":0,"text":"D"}),
+                        Some(21),
+                    ),
+                    "permission" => (
+                        "permission.asked",
+                        serde_json::json!({"sessionID":"root","id":"per_d","action":"read","resources":["x"]}),
+                        None,
+                    ),
+                    "form" => (
+                        "form.created",
+                        serde_json::json!({"form":{"sessionID":"root","id":"f_d","metadata":{"kind":"question"},"fields":[{"key":"q0","type":"string","description":"D?","custom":true,"options":[]}]}}),
+                        None,
+                    ),
                     _ => unreachable!(),
                 };
                 handle_record(&native_record("evt_d_activity", kind, data, seq), &p, &tx).await;
@@ -1683,65 +2056,150 @@ mod tests {
                 assert_ne!(d_turn, completed_turn);
                 assert!(p.event_ctx.lock().await.turn_active);
                 assert!(!p.router.lock().await.native.awaiting_execution("root"));
-                handle_record(&native_record("evt_d_done", "session.execution.succeeded",
-                    serde_json::json!({"sessionID":"root"}), Some(25)), &p, &tx).await;
-                assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|event| matches!(event,
-                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &d_turn)).count(), 1);
+                handle_record(
+                    &native_record(
+                        "evt_d_done",
+                        "session.execution.succeeded",
+                        serde_json::json!({"sessionID":"root"}),
+                        Some(25),
+                    ),
+                    &p,
+                    &tx,
+                )
+                .await;
+                assert_eq!(
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .filter(|event| matches!(event,
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &d_turn))
+                        .count(),
+                    1
+                );
             } else {
                 mocks[0].remove_async().await;
-                server.mock("GET", "/api/session/active").with_status(200).with_body("{\"data\":{}}")
-                    .expect_at_least(1).create_async().await;
-                reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+                server
+                    .mock("GET", "/api/session/active")
+                    .with_status(200)
+                    .with_body("{\"data\":{}}")
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+                reconcile_native(&server.url(), "fixture", &p, &tx)
+                    .await
+                    .unwrap();
                 assert!(!p.router.lock().await.native.awaiting_execution("root"));
                 assert_eq!(p.event_ctx.lock().await.turn_id, completed_turn);
-                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|event|
-                    matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })));
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|event| matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })));
             }
             assert!(!p.event_ctx.lock().await.turn_active);
         }
     }
 
     #[tokio::test]
-    async fn native_recovery_pending_root_request_admits_current_execution_after_completed_callbacks() {
+    async fn native_recovery_pending_root_request_admits_current_execution_after_completed_callbacks(
+    ) {
         for form in [false, true] {
             let mut server = mockito::Server::new_async().await;
             let mocks = mock_completed_root_callback(&mut server, true).await;
             let (index, suffix, request) = if form {
-                (3, "form", serde_json::json!({"sessionID":"root","id":"f_d","metadata":{"kind":"question"},
-                    "fields":[{"key":"q0","type":"string","description":"D?","custom":true,"options":[]}]}))
+                (
+                    3,
+                    "form",
+                    serde_json::json!({"sessionID":"root","id":"f_d","metadata":{"kind":"question"},
+                    "fields":[{"key":"q0","type":"string","description":"D?","custom":true,"options":[]}]}),
+                )
             } else {
-                (2, "permission", serde_json::json!({"sessionID":"root","id":"per_d","action":"read","resources":["x"]}))
+                (
+                    2,
+                    "permission",
+                    serde_json::json!({"sessionID":"root","id":"per_d","action":"read","resources":["x"]}),
+                )
             };
             mocks[index].remove_async().await;
-            server.mock("GET", format!("/api/session/root/{suffix}").as_str()).with_status(200)
-                .with_body(serde_json::json!({"data":[request]}).to_string()).create_async().await;
+            server
+                .mock("GET", format!("/api/session/root/{suffix}").as_str())
+                .with_status(200)
+                .with_body(serde_json::json!({"data":[request]}).to_string())
+                .create_async()
+                .await;
             let mut p = peer("root");
             p.api = super::super::api::OpenCodeApi::V2;
             let (tx, mut rx) = broadcast::channel(64);
-            handle_record(&native_record("evt_a_start", "session.execution.started",
-                serde_json::json!({"sessionID":"root"}), Some(1)), &p, &tx).await;
-            handle_record(&native_record("evt_a_done", "session.execution.succeeded",
-                serde_json::json!({"sessionID":"root"}), Some(10)), &p, &tx).await;
+            handle_record(
+                &native_record(
+                    "evt_a_start",
+                    "session.execution.started",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(1),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
+            handle_record(
+                &native_record(
+                    "evt_a_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(10),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
             while rx.try_recv().is_ok() {}
-            reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
             let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-            let completed_turn = observed.iter().find_map(|event| match event {
-                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } => Some(turn_id.clone()), _ => None,
-            }).expect("completed callback must be recovered");
-            let request_turn = observed.iter().find_map(|event| match event {
-                ProviderRuntimeEvent::RequestOpened { turn_id, .. } => Some(turn_id.clone()), _ => None,
-            }).expect("pending D request must be recovered");
+            let completed_turn = observed
+                .iter()
+                .find_map(|event| match event {
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } => Some(turn_id.clone()),
+                    _ => None,
+                })
+                .expect("completed callback must be recovered");
+            let request_turn = observed
+                .iter()
+                .find_map(|event| match event {
+                    ProviderRuntimeEvent::RequestOpened { turn_id, .. } => Some(turn_id.clone()),
+                    _ => None,
+                })
+                .expect("pending D request must be recovered");
             assert_ne!(request_turn, completed_turn);
             assert_eq!(p.event_ctx.lock().await.turn_id, request_turn);
             assert!(p.event_ctx.lock().await.turn_active);
             assert!(!p.router.lock().await.native.awaiting_execution("root"));
-            handle_record(&native_record("evt_callback_done", "session.execution.succeeded",
-                serde_json::json!({"sessionID":"root"}), Some(20)), &p, &tx).await;
+            handle_record(
+                &native_record(
+                    "evt_callback_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(20),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
             assert!(rx.try_recv().is_err());
-            handle_record(&native_record("evt_d_done", "session.execution.succeeded",
-                serde_json::json!({"sessionID":"root"}), Some(25)), &p, &tx).await;
-            assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|event| matches!(event,
-                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &request_turn)).count(), 1);
+            handle_record(
+                &native_record(
+                    "evt_d_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}),
+                    Some(25),
+                ),
+                &p,
+                &tx,
+            )
+            .await;
+            assert_eq!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| matches!(event,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &request_turn))
+                    .count(),
+                1
+            );
         }
     }
 

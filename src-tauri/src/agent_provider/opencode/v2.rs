@@ -39,6 +39,7 @@ pub enum Update {
         answer: Option<Value>,
     },
     Compacted,
+    UserDelivered(String),
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +56,7 @@ pub struct State {
     terminal_sequences: HashMap<String, (String, u64)>,
     recovered_terminals: HashSet<(String, String)>,
     user_admissions: HashMap<String, (String, String)>,
+    pending_user_admissions: HashMap<String, (String, String)>,
     awaiting_execution: HashMap<String, u64>,
 }
 
@@ -84,19 +86,52 @@ impl State {
     pub fn observed_idle_id(&self, session: &str) -> Option<String> {
         let recovered = self.recovered_idle.get(session).and_then(Value::as_str);
         let terminal = self.terminal_sequences.get(session);
-        if recovered.is_some() && self.recovered_sequence(session)
-            .is_some_and(|seq| terminal.is_none_or(|(_, live)| seq >= *live)) {
+        if recovered.is_some()
+            && self
+                .recovered_sequence(session)
+                .is_some_and(|seq| terminal.is_none_or(|(_, live)| seq >= *live))
+        {
             return recovered.map(str::to_string);
         }
-        terminal.and_then(|(id, _)| id.strip_prefix("evt_"))
+        terminal
+            .and_then(|(id, _)| id.strip_prefix("evt_"))
             .map(|suffix| format!("msg_{suffix}"))
     }
     pub fn remember_user_admission(&mut self, session: &str, input_id: &str, turn_id: &str) {
-        self.user_admissions.insert(session.into(), (input_id.into(), turn_id.into()));
+        self.user_admissions
+            .insert(session.into(), (input_id.into(), turn_id.into()));
+        self.pending_user_admissions
+            .insert(session.into(), (input_id.into(), turn_id.into()));
+    }
+    pub fn has_pending_user_admission(&self, session: &str) -> bool {
+        self.pending_user_admissions.contains_key(session)
+    }
+    pub fn pending_user_admission(&self, session: &str) -> Option<(String, String)> {
+        self.pending_user_admissions.get(session).cloned()
+    }
+    pub fn claim_pending_user_admission(
+        &mut self,
+        session: &str,
+        input_id: &str,
+    ) -> Option<String> {
+        if self
+            .pending_user_admissions
+            .get(session)
+            .is_some_and(|(input, _)| input == input_id)
+        {
+            self.awaiting_execution.remove(session);
+            return self
+                .pending_user_admissions
+                .remove(session)
+                .map(|(_, turn)| turn);
+        }
+        None
     }
     pub fn user_admission_for(&self, session: &str, turn_id: &str) -> Option<String> {
-        self.user_admissions.get(session)
-            .filter(|(_, admitted)| admitted == turn_id).map(|(input, _)| input.clone())
+        self.user_admissions
+            .get(session)
+            .filter(|(_, admitted)| admitted == turn_id)
+            .map(|(input, _)| input.clone())
     }
     pub fn awaiting_execution(&self, session: &str) -> bool {
         self.awaiting_execution.contains_key(session)
@@ -114,8 +149,13 @@ impl State {
     }
     fn observe_terminal(&mut self, session: &str, event: &Event) {
         if let Some(seq) = event.sequence(session) {
-            if self.terminal_sequences.get(session).is_none_or(|(_, observed)| seq > *observed) {
-                self.terminal_sequences.insert(session.into(), (event.id.clone(), seq));
+            if self
+                .terminal_sequences
+                .get(session)
+                .is_none_or(|(_, observed)| seq > *observed)
+            {
+                self.terminal_sequences
+                    .insert(session.into(), (event.id.clone(), seq));
             }
         }
     }
@@ -160,13 +200,22 @@ impl State {
             // current history to distinguish it from completed callbacks.
             // Only newer starts or genuine new content/requests admit a turn.
             if event.kind == "session.execution.started"
-                && event.sequence(session).zip(self.awaiting_execution.get(session))
-                    .is_some_and(|(seq, checkpoint)| seq <= *checkpoint) {
+                && event
+                    .sequence(session)
+                    .zip(self.awaiting_execution.get(session))
+                    .is_some_and(|(seq, checkpoint)| seq <= *checkpoint)
+            {
                 return Ok(vec![]);
             }
-            if matches!(event.kind.as_str(), "session.execution.succeeded"
-                | "session.execution.failed" | "session.execution.interrupted")
-                && self.recovered_terminals.contains(&(session.into(), event.id.clone())) {
+            if matches!(
+                event.kind.as_str(),
+                "session.execution.succeeded"
+                    | "session.execution.failed"
+                    | "session.execution.interrupted"
+            ) && self
+                .recovered_terminals
+                .contains(&(session.into(), event.id.clone()))
+            {
                 self.observe_terminal(session, event);
                 return Ok(vec![]);
             }
@@ -212,6 +261,13 @@ impl State {
         };
         let mut out = Vec::new();
         match event.kind.as_str() {
+            "session.inbox.delivered" if event.sequence(session).is_some() => {
+                let input = required_str(d, "inboxID")?;
+                if let Some(turn) = self.claim_pending_user_admission(session, input) {
+                    self.running.insert(session.into());
+                    out.push(Update::UserDelivered(turn));
+                }
+            }
             "session.execution.started" => {
                 // Message/tool identities span executions. Reconnect snapshots
                 // can complete them before their buffered live start arrives.
@@ -376,10 +432,20 @@ impl State {
             // settle the user turn. Execution terminals are authoritative.
             _ => {}
         }
-        if self.awaiting_execution.contains_key(session) && out.iter().any(|update|
-            matches!(update, Update::Started | Update::Terminal { .. }
-                | Update::Content { .. } | Update::ToolUse { .. } | Update::ToolResult { .. }
-                | Update::Permission(_) | Update::Form(_))) {
+        if self.awaiting_execution.contains_key(session)
+            && out.iter().any(|update| {
+                matches!(
+                    update,
+                    Update::Started
+                        | Update::Terminal { .. }
+                        | Update::Content { .. }
+                        | Update::ToolUse { .. }
+                        | Update::ToolResult { .. }
+                        | Update::Permission(_)
+                        | Update::Form(_)
+                )
+            })
+        {
             self.awaiting_execution.remove(session);
             if !out.iter().any(|update| matches!(update, Update::Started)) {
                 out.insert(0, Update::Started);
