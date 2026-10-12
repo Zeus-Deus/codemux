@@ -925,6 +925,29 @@ async fn reconcile_native(
     Ok(())
 }
 
+/// Include the local turn as well as native input identity, even for commands
+/// and background work without a User row. Claiming a User preserves this pair.
+async fn native_recovery_ownership(
+    peer: &SsePeer,
+    session: &str,
+) -> (Option<String>, Option<crate::agent_provider::TurnId>) {
+    if session != peer.session_id {
+        return (None, None);
+    }
+    let ctx = peer.event_ctx.lock().await;
+    let router = peer.router.lock().await;
+    if let Some((input, turn)) = router.native.pending_user_admission(session) {
+        return (Some(input), Some(crate::agent_provider::TurnId(turn)));
+    }
+    if ctx.turn_active {
+        return (
+            router.native.user_admission_for(session, &ctx.turn_id.0),
+            Some(ctx.turn_id.clone()),
+        );
+    }
+    (None, None)
+}
+
 /// Replay the same durable content boundary for root and descendant sessions.
 async fn reconcile_native_history(
     client: &reqwest::Client,
@@ -946,23 +969,10 @@ async fn reconcile_native_history(
         .native
         .observed_execution_sequence(session);
     let observed_idle = peer.router.lock().await.native.observed_idle_id(session);
-    let submitted_input = if session == peer.session_id {
-        let ctx = peer.event_ctx.lock().await;
-        let router = peer.router.lock().await;
-        router
-            .native
-            .pending_user_admission(session)
-            .map(|(input, _)| input)
-            .or_else(|| {
-                ctx.turn_active
-                    .then(|| router.native.user_admission_for(session, &ctx.turn_id.0))
-                    .flatten()
-            })
-    } else {
-        None
-    };
     let mut snapshot = None;
     for attempt in 0..3 {
+        let submitted_user = native_recovery_ownership(peer, session).await;
+        let submitted_input = &submitted_user.0;
         let previous = peer.router.lock().await.native.recovered_sequence(session);
         let before = native_watermark(client, base, password, session, previous).await?;
         // Coordinator ownership is process-local and includes pre-start/settlement
@@ -1054,6 +1064,15 @@ async fn reconcile_native_history(
         }
         let final_running = final_active["data"].get(session).is_some();
         let after = native_watermark(client, base, password, session, before).await?;
+        if native_recovery_ownership(peer, session).await != submitted_user {
+            // A prepared send can finish admission as the reconnect begins.
+            // Discard this history selection before claiming output or retiring
+            // delivery records; the next attempt searches its exact ownership.
+            if attempt == 2 {
+                return Err("native_user_ownership_changed_during_recovery".into());
+            }
+            continue;
+        }
         // Coordinator removal trails durable terminal publication, so equal
         // sequence checkpoints alone cannot prove its running flag stayed put.
         let stable = before == after && running == final_running;
@@ -1064,13 +1083,21 @@ async fn reconcile_native_history(
             if stable { after } else { None },
             found_observed_idle,
             found_submitted_input,
+            submitted_user,
         ));
         if stable || attempt == 2 {
             break;
         }
     }
-    let (mut messages, idle_message, running, sequence, found_observed_idle, found_submitted_input) =
-        snapshot.unwrap();
+    let (
+        mut messages,
+        idle_message,
+        running,
+        sequence,
+        found_observed_idle,
+        found_submitted_input,
+        submitted_user,
+    ) = snapshot.unwrap();
     let (reserved_turn, admitted_input, mut active_background_turn) = {
         let ctx = peer.event_ctx.lock().await;
         let router = peer.router.lock().await;
@@ -1087,6 +1114,15 @@ async fn reconcile_native_history(
         let input = pending.map(|(input, _)| input).or(active_input);
         (turn, input, background)
     };
+    // Recheck the full input/turn pair at the commit boundary too. Dispatch
+    // rechecks the closed readiness gate while holding this same context lock,
+    // so a new prepared admission cannot enter during recovery publication.
+    if session == peer.session_id
+        && (admitted_input.clone(), reserved_turn.clone()) != submitted_user
+    {
+        return Err("native_user_ownership_changed_during_recovery".into());
+    }
+    let submitted_input = submitted_user.0;
     let exact_user_found = reserved_turn.is_some()
         && submitted_input.is_some()
         && found_submitted_input
@@ -3614,6 +3650,253 @@ mod tests {
             .await;
         session.shutdown().await.unwrap();
         interrupt.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_recovery_retries_user_registered_after_held_model_ack() {
+        let (native_base, mut requests, release_model, native_server) =
+            super::super::session::tests::stalled_first_response("/api/session/root/model").await;
+        let (session, p, tx, mut rx) =
+            super::super::session::tests::mock_native_peer(native_base).await;
+        let input = |text: &str, model: Option<&str>| {
+            serde_json::from_value(
+                serde_json::json!({"thread_id":"t1","text":text,"model_override":model}),
+            )
+            .unwrap()
+        };
+        let sending = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .enqueue_or_send(input("held model input", Some("openai/new")))
+                    .await
+            }
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "/api/session/root/model"
+        );
+        assert!(p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .is_none());
+
+        // This independent checkpoint peer holds the first read, while the
+        // already-permitted model/admission HTTP peer can still acknowledge.
+        let mut history_server = mockito::Server::new_async().await;
+        let reading = Arc::new(tokio::sync::Notify::new());
+        let checkpoint_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release_read, read_released) = std::sync::mpsc::channel();
+        let read_released = std::sync::Mutex::new(read_released);
+        let _logs = history_server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    "^/api/experimental/session/root/log\\?follow=false(?:&after=[0-9]+)?$".into(),
+                ),
+            )
+            .with_status(200)
+            .with_body_from_request({
+                let reading = reading.clone();
+                let checkpoint_reads = checkpoint_reads.clone();
+                move |_| {
+                    if checkpoint_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        reading.notify_one();
+                        read_released
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    watermark_record("root", 10).into_bytes()
+                }
+            })
+            .expect(4)
+            .create_async()
+            .await;
+        let _active = history_server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body(r#"{"data":{}}"#)
+            .create_async()
+            .await;
+        let history_input = Arc::new(std::sync::Mutex::new(String::new()));
+        let history = history_server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body_from_request({
+                let history_input = history_input.clone();
+                move |_| {
+                    serde_json::json!({"data":[
+                        {"id":"msg_held_done","type":"idle","outcome":"succeeded"},
+                        {"id":"m_held_answer","type":"assistant","time":{"completed":3},
+                            "content":[{"type":"text","text":"held model answer"}]},
+                        {"id":*history_input.lock().unwrap(),"type":"user","content":[]},
+                        {"id":"msg_older_done","type":"idle","outcome":"succeeded"}
+                    ]})
+                    .to_string()
+                    .into_bytes()
+                }
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let recovering = tokio::spawn({
+            let p = p.clone();
+            let tx = tx.clone();
+            let base = history_server.url();
+            async move {
+                reconcile_native_history(
+                    &reqwest::Client::new(),
+                    &base,
+                    "fixture",
+                    &p,
+                    &tx,
+                    "root",
+                    false,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), reading.notified())
+            .await
+            .unwrap();
+        release_model.send_replace(true);
+        let a = tokio::time::timeout(Duration::from_secs(5), sending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (a_input, a_reserved) = p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .unwrap();
+        assert_eq!(a_reserved, a.turn_id.0);
+        // Close the gate after this already-permitted admission, before its
+        // snapshot commits. The queued successor uses the real shared gate.
+        p.ready.send_replace(false);
+        let b = session
+            .enqueue_or_send(input("queued successor", None))
+            .await
+            .unwrap();
+        assert!(b.queued_id.is_some());
+        *history_input.lock().unwrap() = a_input;
+        release_read.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), recovering)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!p
+            .router
+            .lock()
+            .await
+            .native
+            .has_pending_user_admission("root"));
+        let mut observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(observed.iter().filter(|event| matches!(event,
+            ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if turn_id == &a.turn_id && text == "held model answer")).count(), 1);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &a.turn_id))
+                .count(),
+            1
+        );
+        assert!(!observed
+            .iter()
+            .any(|event| matches!(event, ProviderRuntimeEvent::QueuedTurnDispatched { .. })));
+        p.ready.send_replace(true);
+        let b_turn = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                let dispatched = match &event {
+                    ProviderRuntimeEvent::QueuedTurnDispatched {
+                        queued_id, turn_id, ..
+                    } => {
+                        assert_eq!(Some(queued_id), b.queued_id.as_ref());
+                        Some(turn_id.clone())
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(turn) = dispatched {
+                    break turn;
+                }
+            }
+        })
+        .await
+        .expect("changed-ownership recovery must release the original queued successor");
+        let (b_input, _) = p
+            .router
+            .lock()
+            .await
+            .native
+            .pending_user_admission("root")
+            .unwrap();
+        handle_record(
+            &native_record(
+                "evt_old_held_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert_eq!(p.event_ctx.lock().await.turn_id, b_turn);
+        handle_record(
+            &native_record(
+                "evt_b_delivered",
+                "session.inbox.delivered",
+                serde_json::json!({"sessionID":"root","inboxID":b_input}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_b_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(20),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        observed.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        for turn in [&a.turn_id, &b_turn] {
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| matches!(event,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(observed.iter().filter(|event| matches!(event,
+            ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, .. } if Some(queued_id) == b.queued_id.as_ref())).count(), 1);
+        assert!(checkpoint_reads.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+        history.assert_async().await;
+        session.shutdown().await.unwrap();
+        native_server.abort();
+        let _ = native_server.await;
     }
 
     async fn first_user_recovery(running: bool, buried: bool, retired: bool, moving: bool) {

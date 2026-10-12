@@ -3441,7 +3441,7 @@ pub(crate) mod tests {
 
     /// Hold the first matching response headers while serving teardown on a
     /// separate connection; this models an unresponsive admission endpoint.
-    async fn stalled_first_response(
+    pub(crate) async fn stalled_first_response(
         path: &'static str,
     ) -> (
         String,
