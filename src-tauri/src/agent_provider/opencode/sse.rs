@@ -995,7 +995,7 @@ async fn reconcile_native_history(
     }
     let (mut messages, idle_message, running, sequence, found_observed_idle) = snapshot.unwrap();
     if found_observed_idle && sequence.is_some() {
-        let (reserved_turn, admitted_input) = {
+        let (reserved_turn, admitted_input, mut active_background_turn) = {
             let ctx = peer.event_ctx.lock().await;
             let router = peer.router.lock().await;
             let pending = router.native.pending_user_admission(session);
@@ -1003,10 +1003,11 @@ async fn reconcile_native_history(
                 .as_ref()
                 .map(|(_, turn)| crate::agent_provider::TurnId(turn.clone()))
                 .or_else(|| ctx.turn_active.then(|| ctx.turn_id.clone()));
-            let input = pending
-                .map(|(input, _)| input)
-                .or_else(|| router.native.user_admission_for(session, &ctx.turn_id.0));
-            (turn, input)
+            let active_input = router.native.user_admission_for(session, &ctx.turn_id.0);
+            let background =
+                (ctx.turn_active && active_input.is_none()).then(|| ctx.turn_id.clone());
+            let input = pending.map(|(input, _)| input).or(active_input);
+            (turn, input, background)
         };
         let mut executions = Vec::new();
         let mut current = Vec::new();
@@ -1017,7 +1018,6 @@ async fn reconcile_native_history(
                 current.push(message);
             }
         }
-        let execution_count = executions.len();
         if !running
             && peer
                 .router
@@ -1032,7 +1032,7 @@ async fn reconcile_native_history(
             });
         }
         let mut reserved_completed = false;
-        for (index, (execution, terminal)) in executions.into_iter().enumerate() {
+        for (execution, terminal) in executions {
             let mut ctx = peer.event_ctx.lock().await;
             let mut router = peer.router.lock().await;
             if !router
@@ -1052,16 +1052,17 @@ async fn reconcile_native_history(
                 replay_native_user_history(&execution, user_index, session, turn, peer, event_tx)
                     .await?;
                 reserved_completed = true;
+                active_background_turn = None;
                 replay_native_terminal(&terminal, session, peer, event_tx).await?;
                 continue;
             }
-            let preserve_latest = admitted_input.is_none()
-                && (!running || current.is_empty())
-                && index + 1 == execution_count;
-            if let Some(turn) = reserved_turn.as_ref().filter(|_| preserve_latest) {
+            // The first unseen execution completes the already-active
+            // background turn; later callbacks receive independent identities.
+            let recovered_turn = active_background_turn.take();
+            if let Some(turn) = recovered_turn.as_ref() {
                 ctx.turn_id = turn.clone();
                 ctx.turn_active = true;
-                reserved_completed = true;
+                reserved_completed |= reserved_turn.as_ref() == Some(turn);
             } else {
                 ctx.turn_active = false;
                 admit_native_root(&mut ctx);
@@ -1100,10 +1101,14 @@ async fn reconcile_native_history(
             {
                 replay_native_user_history(&current, user_index, session, turn, peer, event_tx)
                     .await?;
+                active_background_turn = None;
             } else {
                 let mut ctx = peer.event_ctx.lock().await;
                 let mut router = peer.router.lock().await;
-                if let Some(turn) = reserved_turn.filter(|_| !reserved_completed) {
+                if let Some(background) = active_background_turn.take() {
+                    ctx.turn_id = background;
+                    ctx.turn_active = true;
+                } else if let Some(turn) = reserved_turn.filter(|_| !reserved_completed) {
                     let delivered = admitted_input.as_ref().is_some_and(|input| {
                         current.iter().any(|message| {
                             message["type"] == "user" && message["id"].as_str() == Some(input)
@@ -1772,6 +1777,151 @@ mod tests {
         );
         for mock in mocks {
             mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_recovery_preserves_live_background_turn_before_offline_callbacks() {
+        for parked_user in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let mut mocks = mock_watermarks(&mut server, "root", 30).await;
+            for (path, body) in [
+                ("/api/session/active", serde_json::json!({"data":{}})),
+                (
+                    "/api/session?parentID=root&limit=200&order=asc",
+                    serde_json::json!({"data":[]}),
+                ),
+                (
+                    "/api/session/root/permission",
+                    serde_json::json!({"data":[]}),
+                ),
+                ("/api/session/root/form", serde_json::json!({"data":[]})),
+                (
+                    "/api/session/root/message?limit=200&order=desc",
+                    serde_json::json!({"data":[
+                        {"id":"msg_c_done","type":"idle","outcome":"succeeded"},
+                        {"id":"m_c","type":"assistant","time":{"completed":5},"content":[{"type":"text","text":"C"}]},
+                        {"id":"msg_b_done","type":"idle","outcome":"succeeded"},
+                        {"id":"m_b","type":"assistant","time":{"completed":3},"content":[{"type":"text","text":"live B"}]},
+                        {"id":"msg_a_done","type":"idle","outcome":"succeeded"}
+                    ]}),
+                ),
+            ] {
+                mocks.push(
+                    server
+                        .mock("GET", path)
+                        .with_status(200)
+                        .with_body(body.to_string())
+                        .expect_at_least(1)
+                        .create_async()
+                        .await,
+                );
+            }
+            let mut p = peer("root");
+            p.api = super::super::api::OpenCodeApi::V2;
+            let (tx, mut rx) = broadcast::channel(64);
+            for (id, kind, seq) in [
+                ("evt_a_start", "session.execution.started", 1),
+                ("evt_a_done", "session.execution.succeeded", 10),
+                ("evt_b_start", "session.execution.started", 11),
+            ] {
+                handle_record(
+                    &native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)),
+                    &p,
+                    &tx,
+                )
+                .await;
+            }
+            handle_record(&native_record("evt_b_text", "session.text.delta",
+                serde_json::json!({"sessionID":"root","assistantMessageID":"m_b","ordinal":0,"text":"live "}),
+                None), &p, &tx).await;
+            let background_turn = p.event_ctx.lock().await.turn_id.clone();
+            let parked_turn = TurnId("parked_x".into());
+            if parked_user {
+                p.router.lock().await.native.remember_user_admission(
+                    "root",
+                    "input_x",
+                    &parked_turn.0,
+                );
+            }
+            // B already has live output. Both its terminal and C's entire
+            // execution are missed; X has not been delivered by the server.
+            let before: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert!(
+                before.iter().any(|event| matches!(event,
+                ProviderRuntimeEvent::ContentDelta { turn_id, .. } if turn_id == &background_turn))
+            );
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
+            let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let responses: Vec<_> = observed
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderRuntimeEvent::ItemCompleted {
+                        turn_id,
+                        item: crate::agent_provider::CompletedItem::AssistantText { text },
+                        ..
+                    } => Some((turn_id.clone(), text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(responses.len(), 2);
+            assert_eq!(responses[0], (background_turn.clone(), "live B"));
+            assert_eq!(responses[1].1, "C");
+            assert_ne!(responses[1].0, background_turn);
+            assert_ne!(responses[1].0, parked_turn);
+            for (turn, _) in &responses {
+                assert_eq!(
+                    observed
+                        .iter()
+                        .filter(|event| matches!(event,
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == turn))
+                        .count(),
+                    1
+                );
+            }
+            assert!(!observed.iter().any(|event| matches!(event,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &parked_turn)));
+            assert_eq!(
+                p.router
+                    .lock()
+                    .await
+                    .native
+                    .has_pending_user_admission("root"),
+                parked_user
+            );
+            assert!(!p.event_ctx.lock().await.turn_active);
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
+            for (id, kind, seq) in [
+                ("evt_b_done", "session.execution.succeeded", 20),
+                ("evt_c_start", "session.execution.started", 21),
+                ("evt_c_done", "session.execution.succeeded", 30),
+            ] {
+                handle_record(
+                    &native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)),
+                    &p,
+                    &tx,
+                )
+                .await;
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "recovery and buffered records must settle B and C only once"
+            );
+            assert_eq!(
+                p.router
+                    .lock()
+                    .await
+                    .native
+                    .has_pending_user_admission("root"),
+                parked_user
+            );
+            for mock in mocks {
+                mock.assert_async().await;
+            }
         }
     }
 
