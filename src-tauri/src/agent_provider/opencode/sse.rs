@@ -4220,6 +4220,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_recovery_retires_idle_only_success_after_a_completed_user() {
+        let (p, tx, mut rx, user_turn) = native_completed_user_fixture().await;
+        let mut server = mockito::Server::new_async().await;
+        let mut mocks = mock_watermarks(&mut server, "root", 20).await;
+        for (path, body) in [
+            ("/api/session/active", serde_json::json!({"data":{}})),
+            (
+                "/api/session?parentID=root&limit=200&order=asc",
+                serde_json::json!({"data":[]}),
+            ),
+            (
+                "/api/session/root/permission",
+                serde_json::json!({"data":[]}),
+            ),
+            ("/api/session/root/form", serde_json::json!({"data":[]})),
+            (
+                "/api/session/root/message?limit=200&order=desc",
+                serde_json::json!({"data":[
+                    {"id":"msg_empty_done","type":"idle","outcome":"succeeded"},
+                    {"id":"msg_user_done","type":"idle","outcome":"succeeded"}
+                ]}),
+            ),
+        ] {
+            mocks.push(
+                server
+                    .mock("GET", path)
+                    .with_status(200)
+                    .with_body(body.to_string())
+                    .expect_at_least(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        // The same empty wake can finish wholly in the outage. Its durable
+        // projection contains only an Idle, with no new input or answer.
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(
+            p.router.lock().await.native.recovered_sequence("root"),
+            Some(20)
+        );
+        assert_eq!(
+            p.router
+                .lock()
+                .await
+                .native
+                .observed_idle_id("root")
+                .as_deref(),
+            Some("msg_empty_done")
+        );
+        assert!(
+            !p.router
+                .lock()
+                .await
+                .native
+                .recover_terminal("root", serde_json::json!("msg_empty_done")),
+            "the empty native terminal must still be claimed exactly once"
+        );
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!observed.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::TurnCompleted { .. }
+                | ProviderRuntimeEvent::ItemCompleted { .. }
+                | ProviderRuntimeEvent::SessionStateChanged {
+                    status: crate::agent_provider::SessionStatus::Running { .. },
+                    ..
+                }
+        )));
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        for (id, kind, seq) in [
+            ("evt_empty_start", "session.execution.started", 11),
+            ("evt_empty_done", "session.execution.succeeded", 20),
+        ] {
+            handle_record(
+                &native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)),
+                &p,
+                &tx,
+            )
+            .await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "repeated recovery and buffered empty lifecycle must stay silent"
+        );
+        assert_eq!(p.event_ctx.lock().await.turn_id, user_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        for mock in mocks {
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
     async fn native_callback_content_claims_a_fresh_turn_after_unidentified_start() {
         let (p, tx, mut rx, user_turn) = native_completed_user_fixture().await;
         handle_record(
