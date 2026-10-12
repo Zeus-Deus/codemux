@@ -42,6 +42,28 @@ export function SubsectionHeader({
   );
 }
 
+/** Calm grouped surface for things like environment-variable lists,
+ *  test-connection panels, info banners. Subtle border, very soft
+ *  bg — should never compete with content inside it. */
+export function SettingsCard({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "rounded-lg border border-border/60 bg-muted/30 p-4",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
 /** Segmented control — a bordered pill of mutually-exclusive options
  *  with a neutral foreground-filled active segment (the design system's
  *  "white is the baseline" rule for toggles/selection).
@@ -56,11 +78,15 @@ export function SegmentedControl<T extends string>({
   options,
   ariaLabel,
   size = "md",
+  disabled = false,
 }: {
   value: T;
   onChange: (value: T) => void;
   options: { value: T; label: string }[];
   ariaLabel?: string;
+  /** Keeps the control in place but inert, for a choice that does not
+   *  apply to the current view. */
+  disabled?: boolean;
   /** `sm` is the in-card variant (the Cost/Tokens metric toggle), which
    *  sits beside content rather than titling it. */
   size?: "sm" | "md";
@@ -69,7 +95,11 @@ export function SegmentedControl<T extends string>({
     <div
       role="radiogroup"
       aria-label={ariaLabel}
-      className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5"
+      aria-disabled={disabled || undefined}
+      className={cn(
+        "inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5",
+        disabled && "opacity-50",
+      )}
     >
       {options.map((opt) => {
         const active = opt.value === value;
@@ -79,6 +109,7 @@ export function SegmentedControl<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
+            disabled={disabled}
             onClick={() => onChange(opt.value)}
             className={cn(
               "rounded-md font-medium transition-colors duration-150",
@@ -87,7 +118,8 @@ export function SegmentedControl<T extends string>({
                 : "px-3 py-1 text-body-sm",
               active
                 ? "bg-foreground text-background"
-                : "text-muted-foreground hover:text-foreground",
+                : "text-muted-foreground enabled:hover:text-foreground",
+              disabled && "cursor-not-allowed",
             )}
           >
             {opt.label}

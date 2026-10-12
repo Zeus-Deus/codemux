@@ -167,18 +167,23 @@ fn handle_lifecycle_event<R: Runtime>(app: &AppHandle<R>, session_id: &str, stat
     // status pill update is not perception-sensitive at that scale.
     state::schedule_emit_app_state(app);
 
-    // Fire desktop notification on agent completion when the user can't already
-    // see the pane. Mirrors the "suppress if visible" behavior. A workspace
-    // can also be explicitly muted (right-click → Mute notifications) — useful
-    // when a pane runs a process that spawns agent subprocesses of its own,
-    // whose lifecycle hooks would otherwise pop notifications for this pane.
-    if status == PaneStatus::Review
-        && !crate::notifications::should_suppress(app, is_active)
-        && !state.is_session_workspace_muted(session_id)
-    {
-        let workspace_title = workspace_title_for_session(&snapshot, session_id)
-            .unwrap_or_else(|| "Workspace".to_string());
-        crate::notifications::dispatch_agent_complete(app, &workspace_title);
+    // Notify on agent completion. `notify_agent` skips it when the user can
+    // already see the pane, or when the workspace is muted (right-click → Mute
+    // notifications) — useful when a pane runs a process that spawns agent
+    // subprocesses of its own, whose lifecycle hooks would otherwise pop
+    // notifications for this pane. Terminal agents notify only on Review: in
+    // an approve-each-tool session their hooks alternate Permission
+    // (`PermissionRequest` / `Notification`) with Working (`PostToolUse`), so
+    // a transition-based rule would notify once per approved tool call. Chat
+    // agents report approvals precisely and notify then.
+    if status == PaneStatus::Review {
+        if let Some(target) = state.notification_target_for_session(session_id) {
+            crate::notifications::notify_agent(
+                app,
+                crate::notifications::AgentNotice::Finished,
+                &target,
+            );
+        }
     }
 
     // When status becomes Working/Permission, start monitoring for agent exit.
@@ -190,21 +195,6 @@ fn handle_lifecycle_event<R: Runtime>(app: &AppHandle<R>, session_id: &str, stat
             start_agent_exit_monitor(app.clone(), session_id.to_string(), shell_pid);
         }
     }
-}
-
-/// Return the title of the workspace containing the given session, if any.
-fn workspace_title_for_session(
-    snapshot: &state::AppStateSnapshot,
-    session_id: &str,
-) -> Option<String> {
-    for ws in &snapshot.workspaces {
-        for surface in &ws.surfaces {
-            if find_session_in_node(&surface.root, session_id) {
-                return Some(ws.title.clone());
-            }
-        }
-    }
-    None
 }
 
 /// Check if the pane for a session is in the currently active workspace.

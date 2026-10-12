@@ -359,13 +359,23 @@ describe("ComposerFooter — context-window meter", () => {
 });
 
 describe("message delivery while working", () => {
-  it("keeps both Queue and Stop discoverable", () => {
+  it("swaps Stop for the Queue button once there is a draft — never both", () => {
     const onSubmit = vi.fn();
     renderFooter({ streaming: true, onDeliveryChange: vi.fn(), onSubmit });
     expect(screen.getByRole("button", { name: "Message delivery: Queue" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Queue message" }));
     expect(onSubmit).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: /Stop/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+  it("shows only Stop while working with an empty draft", () => {
+    renderFooter({ streaming: true, canSubmit: false, hasDraft: false, onDeliveryChange: vi.fn() });
+    expect(screen.queryByRole("button", { name: "Queue message" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument();
+  });
+  it("keeps the send slot (disabled) when a draft exists but can't be sent yet", () => {
+    renderFooter({ streaming: true, canSubmit: false, hasDraft: true, onDeliveryChange: vi.fn() });
+    expect(screen.getByRole("button", { name: "Queue message" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
   });
   it("offers an explicit interruption separately from safe steering", () => {
     renderFooter({ streaming: true, delivery: "interrupt", onDeliveryChange: vi.fn() });
@@ -380,5 +390,17 @@ describe("provider steering capability", () => {
     expect(screen.getByRole("option", { name: /Steer \/steer/ })).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByText(/Safe steering is unavailable for this provider/)).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /^Interrupt and send/ })).not.toHaveAttribute("aria-disabled", "true");
+  });
+});
+
+
+describe("dynamic workflow entry", () => {
+  it("opens workflows from a non-Claude composer and exposes pane state", () => {
+    const onWorkflowsClick = vi.fn();
+    renderFooter({ provider: "codex", onWorkflowsClick, workflowsOpen: true });
+    const button = screen.getByRole("button", { name: "Open dynamic workflows" });
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(button);
+    expect(onWorkflowsClick).toHaveBeenCalledOnce();
   });
 });

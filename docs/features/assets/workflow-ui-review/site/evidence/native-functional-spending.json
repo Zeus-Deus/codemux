@@ -1,0 +1,56 @@
+{
+  "authorized_total_usd": 2.0,
+  "attempts": [
+    {
+      "report": "live-validation-attempt-1.json",
+      "run_status": "failed",
+      "observed_sdk_cost_usd": 0.0,
+      "native_starts": 1,
+      "cost_unknown": true
+    },
+    {
+      "report": "live-validation-attempt-2.json",
+      "run_status": "failed",
+      "observed_sdk_cost_usd": 0.0,
+      "native_starts": 1,
+      "cost_unknown": true
+    },
+    {
+      "report": "live-validation-attempt-3.json",
+      "run_status": "failed",
+      "observed_sdk_cost_usd": 0.0029268600000000003,
+      "native_starts": 1,
+      "cost_unknown": false
+    },
+    {
+      "report": "live-validation-attempt-4.json",
+      "run_status": "failed",
+      "observed_sdk_cost_usd": 0.0023764800000000003,
+      "native_starts": 1,
+      "cost_unknown": false
+    },
+    {
+      "report": "live-validation-attempt-5.json",
+      "run_status": "failed",
+      "observed_sdk_cost_usd": 0.0024459800000000004,
+      "native_starts": 1,
+      "cost_unknown": false
+    },
+    {
+      "report": "live-validation-attempt-6.json",
+      "run_status": "completed",
+      "observed_sdk_cost_usd": 0.00230806,
+      "native_starts": 4,
+      "cost_unknown": true
+    }
+  ],
+  "observed_sdk_cost_usd": 0.010057380000000001,
+  "incomplete_session_count": 3,
+  "reserved_usd_per_incomplete_session": 0.2,
+  "conservative_observed_plus_incomplete_reserve_usd": 0.61005738,
+  "remaining_authorized_margin_usd": 1.3899426200000002,
+  "notes": [
+    "This is a conservative test spending envelope, not an invoice. Two network-blocked sessions and the deliberately yielded coordinator have no final SDK dollar counter and each retain a $0.20 reserve. SDK client-side caps may overshoot by a final API call; fixed turns, output, sessions and observed remaining margin supplement those caps.",
+    "The native coordination test is complete. No further functional inference is planned. The separately authorized design-model call is outside this functional-test ledger."
+  ]
+}

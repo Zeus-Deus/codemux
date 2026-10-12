@@ -1,6 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
+// Tooltips need the provider `main.tsx` mounts around the whole app.
+const render = (ui: Parameters<typeof rtlRender>[0]) =>
+  rtlRender(ui, { wrapper: TooltipProvider });
 
 import type {
   PresetStoreSnapshot,
@@ -16,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   createTab: vi.fn().mockResolvedValue("tab-new"),
   createBrowserPane: vi.fn().mockResolvedValue("pane-b"),
   setShowSettings: vi.fn(),
+  launcherOpenRequest: 0,
   launchDraftWithPreset: vi.fn().mockResolvedValue({
     success: true,
     workspaceId: "ws-new",
@@ -41,12 +47,15 @@ vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
+  reportFailure: () => vi.fn(),
 }));
 
 vi.mock("@/stores/ui-store", () => ({
-  useUIStore: Object.assign(vi.fn(), {
-    getState: () => ({ setShowSettings: mocks.setShowSettings }),
-  }),
+  useUIStore: Object.assign(
+    (select: (s: { launcherOpenRequest: number }) => unknown) =>
+      select({ launcherOpenRequest: mocks.launcherOpenRequest }),
+    { getState: () => ({ setShowSettings: mocks.setShowSettings }) },
+  ),
 }));
 
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
@@ -169,6 +178,7 @@ beforeEach(() => {
   mocks.createBrowserPane.mockClear();
   mocks.launchDraftWithPreset.mockClear();
   mocks.setShowSettings.mockClear();
+  mocks.launcherOpenRequest = 0;
   localStorage.clear();
   useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
@@ -180,6 +190,23 @@ afterEach(() => {
 });
 
 describe("AgentLauncher", () => {
+  it("opens for a launcher shortcut pressed after mount, not for an older one", () => {
+    mocks.launcherOpenRequest = 3;
+    const view = render(<AgentLauncher workspace={makeWorkspace()} />);
+    expect(screen.queryByTestId("agent-launcher-popover")).not.toBeInTheDocument();
+
+    mocks.launcherOpenRequest = 4;
+    view.rerender(<AgentLauncher workspace={makeWorkspace()} />);
+    expect(screen.getByTestId("agent-launcher-popover")).toBeInTheDocument();
+  });
+
+  it("ignores the launcher shortcut in the mobile sheet", () => {
+    const view = render(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    mocks.launcherOpenRequest = 1;
+    view.rerender(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    expect(screen.queryByTestId("agent-launcher-popover")).not.toBeInTheDocument();
+  });
+
   it("offers chat and utility panes on mobile without CLI presets or titlebar controls", async () => {
     render(<AgentLauncher workspace={makeWorkspace()} mobile />);
     openLauncher();
@@ -486,6 +513,27 @@ describe("DraftAgentLauncher", () => {
   it("disables the trigger while the draft is promoting", () => {
     render(<DraftAgentLauncher draft={makeDraft({ promoting: true })} />);
     expect(screen.getByTestId("draft-agent-launcher-trigger")).toBeDisabled();
+  });
+
+  it("keeps chat presets but disables CLI presets for a draft on a device", () => {
+    render(<DraftAgentLauncher draft={makeDraft({ hostId: 2 })} />);
+    openDraftLauncher();
+    const cli = screen.getByTestId("draft-launcher-cli-builtin-claude");
+    expect(cli).toHaveAttribute("data-disabled", "true");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-claude"),
+    ).toHaveTextContent("local only");
+    act(() => {
+      fireEvent.click(cli);
+    });
+    expect(mocks.launchDraftWithPreset).not.toHaveBeenCalled();
+
+    act(() => {
+      fireEvent.click(
+        screen.getByTestId("draft-launcher-gui-builtin-chat-agent"),
+      );
+    });
+    expect(mocks.launchDraftWithPreset).toHaveBeenCalledTimes(1);
   });
 });
 

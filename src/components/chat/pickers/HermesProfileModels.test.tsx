@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
 import { HermesProfileModels } from "./HermesProfileModels";
@@ -17,7 +18,7 @@ afterEach(cleanup);
 it("starts with the only installed profile without remembering it for the project", async () => {
   render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={vi.fn()}/>);
   await screen.findByRole("heading",{name:"Native service"});
-  expect((screen.getByLabelText("Hermes profile") as HTMLSelectElement).value).toBe(JSON.stringify([profile.host,profile.installation,profile.root,profile.home,profile.identity]));
+  expect(screen.getByRole("combobox",{name:"Hermes profile"}).textContent).toBe("coder");
   expect(useHermes.getState().selections.draft).toEqual(profile);
   expect(useHermes.getState().preferred["/project"]).toBeUndefined();
 });
@@ -31,15 +32,21 @@ it("starts with the Settings default when several profiles exist", async () => {
 it("asks for a profile when several exist and no default is set", async () => {
   vi.mocked(invoke).mockImplementation(async command => command === "hermes_binding" ? null : command === "hermes_profiles" ? [profile, {...profile, id:"research", home:"/hermes/profiles/research", identity:"2"}] : catalog);
   render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={vi.fn()}/>);
+  const trigger = screen.getByRole("combobox",{name:"Hermes profile"});
+  await waitFor(() => expect(trigger.textContent).toBe("Choose a profile"));
+  await userEvent.click(trigger);
   await screen.findByRole("option",{name:"research"});
-  expect((screen.getByLabelText("Hermes profile") as HTMLSelectElement).value).toBe("");
   expect(useHermes.getState().selections.draft).toBeUndefined();
 });
 it("selects an existing profile, groups its native catalog and gates the known resume route", async () => {
   const onSelect=vi.fn(), onProfileChange=vi.fn();
+  // Two profiles and no default, so nothing is picked until the user chooses.
+  vi.mocked(invoke).mockImplementation(async command => command === "hermes_binding" ? null : command === "hermes_profiles" ? [profile, {...profile, id:"research", home:"/hermes/profiles/research", identity:"2"}] : catalog);
   render(<HermesProfileModels threadId="draft" projectPath="/project" model={null} onSelect={onSelect} onProfileChange={onProfileChange}/>);
-  await screen.findByRole("option",{name:"coder"});
-  fireEvent.change(screen.getByLabelText("Hermes profile"), {target:{value:JSON.stringify([profile.host,profile.installation,profile.root,profile.home,profile.identity])}});
+  const trigger = screen.getByRole("combobox",{name:"Hermes profile"});
+  await waitFor(() => expect((trigger as HTMLButtonElement).disabled).toBe(false));
+  await userEvent.click(trigger);
+  await userEvent.click(await screen.findByRole("option",{name:"coder"}));
   await screen.findByRole("heading",{name:"Native service"});
   expect((screen.getByRole("button",{name:/Unsupported named custom/}) as HTMLButtonElement).disabled).toBe(true);
   fireEvent.click(screen.getByRole("button",{name:/Use profile default/}));
@@ -51,7 +58,7 @@ it("locks restored profiles and reports replacement instead of selecting a diffe
   vi.mocked(invoke).mockImplementation(async command => command === "hermes_binding" ? {profile} : command === "hermes_profiles" ? [{...profile,identity:"replacement"}] : catalog);
   render(<HermesProfileModels threadId="existing" model="service:missing" onSelect={vi.fn()}/>);
   await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Profile missing or replaced"));
-  expect((screen.getByLabelText("Hermes profile") as HTMLSelectElement).disabled).toBe(true);
+  expect((screen.getByRole("combobox",{name:"Hermes profile"}) as HTMLButtonElement).disabled).toBe(true);
   expect(screen.getByRole("status").textContent).toContain("service:missing");
 });
 it("surfaces catalog failures without erasing the profile selection", async () => {
@@ -64,4 +71,10 @@ it("surfaces catalog failures without erasing the profile selection", async () =
   await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("credentials revoked"));
   expect(useHermes.getState().selections.draft).toEqual(profile);
   expect(screen.queryByRole("button",{name:/Use profile default/})).toBeNull();
+});
+it("marks the current model so the selection is visible in the list", async () => {
+  render(<HermesProfileModels threadId="draft" projectPath="/project" model="service:current" onSelect={vi.fn()}/>);
+  const current = await screen.findByRole("button",{name:/Native model label/});
+  expect(current.getAttribute("aria-current")).toBe("true");
+  expect(screen.getByRole("button",{name:/Use profile default/}).getAttribute("aria-current")).toBeNull();
 });

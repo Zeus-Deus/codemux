@@ -1,6 +1,7 @@
 import React from "react";
 import { DisabledFeaturePlaceholder } from "@/components/layout/disabled-feature-placeholder";
 import { Button } from "@/components/ui/button";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
 import { splitPane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
@@ -14,11 +15,13 @@ import {
 } from "@/stores/app-store";
 import { useTerminalCwd } from "@/stores/terminal-cwd-store";
 import { formatCwdHint } from "@/lib/terminal-cwd";
+import { resizeKeyAction } from "@/lib/resize-keys";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { PanelHeader } from "@/components/ui/panel-header";
+import { reportFailure } from "@/lib/toast";
 
 const TerminalPane = React.lazy(() =>
   import("@/components/terminal/TerminalPane").then((module) => ({
@@ -144,6 +147,118 @@ function startResize(
 
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
+}
+
+/** Smallest share either side of a split seam may shrink to. */
+const MIN_SPLIT_FRACTION = 0.05;
+
+/**
+ * Keyboard and double-click control for a split seam. Arrows move the seam
+ * by a pixel step converted to the split's ratio; Home/End push it to either
+ * end; double-click evens out every child of the split.
+ */
+function SplitResizeHandle({
+  node,
+  index,
+}: {
+  node: PaneNodeSnapshot & { kind: "split" };
+  index: number;
+}) {
+  const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
+  const columns = node.direction === "horizontal";
+  // A seam between columns is a vertical line.
+  const orientation = columns ? "vertical" : "horizontal";
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const action = resizeKeyAction(e, orientation);
+    if (!action) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const container = e.currentTarget.closest<HTMLElement>(
+      "[data-split-container]",
+    );
+    if (!container) return;
+    // Read the layout from the grid itself, as a drag leaves it: repeated
+    // presses land before the backend echoes the previous step back.
+    const template = columns
+      ? container.style.gridTemplateColumns
+      : container.style.gridTemplateRows;
+    const parsed = template.split(" ").map((v) => Number.parseFloat(v));
+    const current =
+      parsed.length === sizes.length && parsed.every(Number.isFinite)
+        ? normalizeChildSizes(parsed, parsed.length)
+        : sizes;
+    const pair = current[index] + current[index + 1];
+    const rect = container.getBoundingClientRect();
+    const axisSize = columns ? rect.width : rect.height;
+    const target =
+      action.kind === "min"
+        ? 0
+        : action.kind === "max"
+          ? pair
+          : axisSize > 0
+            ? current[index] + action.px / axisSize
+            : current[index];
+    const first = Math.max(
+      MIN_SPLIT_FRACTION,
+      Math.min(pair - MIN_SPLIT_FRACTION, target),
+    );
+    const next = [...current];
+    next[index] = first;
+    next[index + 1] = pair - first;
+    const nextTemplate = next.map((s) => `${s}fr`).join(" ");
+    if (columns) container.style.gridTemplateColumns = nextTemplate;
+    else container.style.gridTemplateRows = nextTemplate;
+    resizeSplit(node.pane_id, next).catch(console.error);
+  };
+
+  let before = 0;
+  for (let i = 0; i <= index; i++) before += sizes[i];
+
+  return (
+    <div
+      role="separator"
+      tabIndex={0}
+      aria-orientation={orientation}
+      aria-label="Resize split"
+      aria-valuenow={Math.round(before * 100)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      data-testid="split-resize-handle"
+      className={cn(
+        "group/split absolute z-20 outline-none",
+        columns
+          ? "top-1 bottom-1 -right-[6.5px] w-3 cursor-col-resize"
+          : "left-1 right-1 -bottom-[6.5px] h-3 cursor-row-resize",
+      )}
+      onPointerDown={(e) => startResize(e, node, index)}
+      onKeyDown={handleKeyDown}
+      onDoubleClick={() =>
+        resizeSplit(
+          node.pane_id,
+          node.children.map(() => 1 / node.children.length),
+        ).catch(console.error)
+      }
+    >
+      {/* The pane borders already draw the seam at rest; this 3px line is
+          the hover, drag and focus state, centred on the 1px grid gap. The
+          keyboard-focus line is ember, the same "your keys drive this" cue
+          as the active pane's border, so where the two meet it continues
+          that border instead of greying it out. The handle is inset 4px at
+          each end; the line overhangs by the same 4px so it runs the full
+          seam and meets the pane borders without a notch. */}
+      <span
+        aria-hidden
+        className={cn(
+          "pointer-events-none absolute rounded-full bg-transparent transition-colors duration-100",
+          "group-hover/split:bg-foreground/30 group-focus-visible/split:bg-accent-ember/60 group-data-[dragging=true]/split:bg-foreground/40",
+          columns
+            ? "-inset-y-1 left-1/2 w-[3px] -translate-x-1/2"
+            : "-inset-x-1 top-1/2 h-[3px] -translate-y-1/2",
+        )}
+      />
+    </div>
+  );
 }
 
 // ── Drag-to-swap logic (ported from old PaneNode.svelte) ──
@@ -274,22 +389,21 @@ function PaneNodeImpl({
     return (
       <div style={gridStyle} data-split-container data-split-pane-id={node.pane_id}>
         {node.children.map((child, i) => (
-          <div key={child.pane_id} className="relative min-w-0 min-h-0 overflow-hidden">
-            <PaneNode
-              node={child}
-              activePaneId={activePaneId}
-              visible={visible}
-              workspaceId={workspaceId}
-            />
-            {i < node.children.length - 1 && (
-              <div
-                className={`absolute z-20 opacity-0 hover:opacity-100 data-[dragging=true]:opacity-100 transition-opacity duration-100 ${
-                  node.direction === "horizontal"
-                    ? "top-1 bottom-1 -right-[6px] w-3 cursor-col-resize"
-                    : "left-1 right-1 -bottom-[6px] h-3 cursor-row-resize"
-                } bg-foreground/20 hover:bg-foreground/30 data-[dragging=true]:bg-foreground/30 rounded-full`}
-                onPointerDown={(e) => startResize(e, node as PaneNodeSnapshot & { kind: "split" }, i)}
+          // The cell itself is not clipped, so the seam handle can reach past
+          // its edge and its centre, not just its near half, is hit-testable.
+          // The pane is clipped by its own wrapper instead: a terminal sized
+          // wider than its cell would otherwise paint over the neighbour.
+          <div key={child.pane_id} className="relative min-w-0 min-h-0">
+            <div data-split-cell-clip className="size-full min-w-0 min-h-0 overflow-hidden">
+              <PaneNode
+                node={child}
+                activePaneId={activePaneId}
+                visible={visible}
+                workspaceId={workspaceId}
               />
+            </div>
+            {i < node.children.length - 1 && (
+              <SplitResizeHandle node={node} index={i} />
             )}
           </div>
         ))}
@@ -298,13 +412,26 @@ function PaneNodeImpl({
   }
 
   const isActive = node.pane_id === activePaneId;
+  // In a split, near-identical panes make it easy to type into the wrong
+  // one, so the pane that takes keystrokes carries an accent border. A sole
+  // pane has nothing to be confused with and stays chrome-free.
+  const paneShell = cn(
+    "group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border transition-[border-color] duration-150",
+    isSurfaceRoot
+      ? "border-border/30"
+      : isActive
+        ? "border-accent-ember/45"
+        : // The other panes still need an edge, or the seam between two
+          // dark panes disappears into the background.
+          "border-hairline-strong",
+  );
 
   const handleActivate = () => {
     if (!isActive) activatePane(node.pane_id).catch(console.error);
   };
 
   const handleSplit = (direction: "horizontal" | "vertical") => {
-    splitPane(node.pane_id, direction).catch(console.error);
+    splitPane(node.pane_id, direction).catch(reportFailure("Couldn't split the pane"));
   };
 
   const handleClose = () => {
@@ -318,7 +445,7 @@ function PaneNodeImpl({
 
     return (
       <div
-        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className={paneShell}
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
         onPointerDown={handleActivate}
@@ -377,15 +504,21 @@ function PaneNodeImpl({
             data-terminal-pane-actions
           >
             <TerminalBackgroundBrowserIndicator active={isActive} />
-            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal />
-            </Button>
-            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical />
-            </Button>
-            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X />
-            </Button>
+            <ShortcutTooltip label="Split right" shortcut="splitPaneRight">
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right">
+                <SplitSquareHorizontal />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Split down" shortcut="splitPaneDown">
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down">
+                <SplitSquareVertical />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Close pane" shortcut="closePane">
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane">
+                <X />
+              </Button>
+            </ShortcutTooltip>
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
@@ -412,7 +545,7 @@ function PaneNodeImpl({
     if (!enableAgentChat) {
       return (
         <div
-          className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+          className={paneShell}
           data-pane-drop-id={node.pane_id}
           onPointerDown={handleActivate}
         >
@@ -428,7 +561,7 @@ function PaneNodeImpl({
     const hideChatHeader = enableAgentChat && isSurfaceRoot;
     return (
       <div
-        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className={paneShell}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
@@ -466,7 +599,7 @@ function PaneNodeImpl({
   if (node.kind === "browser") {
     return (
       <div
-        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className={paneShell}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
@@ -478,15 +611,21 @@ function PaneNodeImpl({
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal className="size-3.5" />
-            </Button>
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical className="size-3.5" />
-            </Button>
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X className="size-3.5" />
-            </Button>
+            <ShortcutTooltip label="Split right" shortcut="splitPaneRight">
+              <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right">
+                <SplitSquareHorizontal className="size-3.5" />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Split down" shortcut="splitPaneDown">
+              <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down">
+                <SplitSquareVertical className="size-3.5" />
+              </Button>
+            </ShortcutTooltip>
+            <ShortcutTooltip label="Close pane" shortcut="closePane">
+              <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane">
+                <X className="size-3.5" />
+              </Button>
+            </ShortcutTooltip>
           </div>
         </PanelHeader>
         <div className="flex-1 min-h-0 overflow-hidden">

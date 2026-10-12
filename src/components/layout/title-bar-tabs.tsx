@@ -1,4 +1,5 @@
-import { useCallback, useState } from "react";
+import { requestCloseTab } from "@/lib/close-guard";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   FileCode,
@@ -30,7 +31,6 @@ import { cn } from "@/lib/utils";
 import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { useAppStore } from "@/stores/app-store";
-import { requestCloseTab } from "@/lib/close-guard";
 import { activateTab, reorderTabs } from "@/tauri/commands";
 import type {
   ActivePaneStatus,
@@ -42,6 +42,14 @@ import type {
 } from "@/tauri/types";
 
 import { TabDropIndicator } from "./tab-drop-indicator";
+import {
+  EditorDirtyDot,
+  TabContextMenu,
+  TabTitleInput,
+  middleClickCloseProps,
+  useTabRename,
+} from "./tab-strip-actions";
+import { reportFailure } from "@/lib/toast";
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -87,13 +95,77 @@ interface TitleBarTabsProps {
   workspace: WorkspaceSnapshot;
 }
 
+/** Width of the edge fade that marks tabs scrolled out of view. */
+const EDGE_FADE_PX = 16;
+
+/** Which ends of a horizontal scroller have content hidden past them. */
+function useOverflowEdges(scroller: HTMLElement | null, contentKey: string) {
+  const [edges, setEdges] = useState({ start: false, end: false });
+  useEffect(() => {
+    if (!scroller) return;
+    const update = () => {
+      const start = scroller.scrollLeft > 0;
+      const end =
+        scroller.scrollLeft + scroller.clientWidth < scroller.scrollWidth - 1;
+      setEdges((prev) =>
+        prev.start === start && prev.end === end ? prev : { start, end },
+      );
+    };
+    update();
+    scroller.addEventListener("scroll", update, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(scroller);
+    // Once the island hits its width cap the scroller's own box stops
+    // changing, so a pill growing or shrinking (a rename, the active chat
+    // tab gaining its chevron) is only seen through the pills themselves.
+    for (const pill of Array.from(scroller.children)) observer?.observe(pill);
+    return () => {
+      scroller.removeEventListener("scroll", update);
+      observer?.disconnect();
+    };
+  }, [scroller, contentKey]);
+  return edges;
+}
+
+/** Re-reveals the active pill whenever the strip changes width. Activation
+ *  alone is not enough: a panel or sidebar growing, or the window shrinking,
+ *  narrows the strip after the fact and can push the selected tab out. */
+function useKeepActiveTabInView(
+  scroller: HTMLElement | null,
+  activeTabId: string | null,
+) {
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  useEffect(() => {
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      const id = activeTabIdRef.current;
+      if (!id) return;
+      Array.from(scroller.querySelectorAll<HTMLElement>("[data-tab-id]"))
+        .find((el) => el.dataset.tabId === id)
+        ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [scroller]);
+}
+
+function edgeFadeMask(start: boolean, end: boolean): string | undefined {
+  if (!start && !end) return undefined;
+  const from = start ? `transparent, black ${EDGE_FADE_PX}px` : "black";
+  const to = end ? `black calc(100% - ${EDGE_FADE_PX}px), transparent` : "black";
+  return `linear-gradient(to right, ${from}, ${to})`;
+}
+
 /**
  * Workspace tabs merged into the title bar for GUI chrome. Each tab is a
  * compact pill; the active chat tab grows a chevron that opens the shared
  * session-history dropdown. Live subagent status no longer rides an
  * inline pill here — it lives in the `ComposerStrip` docked above
- * the composer. Tabs stay backend-owned — activation/close/reorder go through
- * the existing commands. Reorder is a pointer-driven drag (see
+ * the composer. Tabs stay backend-owned — activation/close/reorder/rename go
+ * through the existing commands, and the right-click menu, middle-click close
+ * and inline rename are shared with the legacy `TabBar`. Reorder is a pointer-driven drag (see
  * `@/lib/tab-reorder`) rather than the legacy TabBar's HTML5 DnD.
  */
 export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
@@ -139,19 +211,31 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   const attachWheelScroll = useHorizontalWheelScroll<HTMLDivElement>();
   // The scroller is also the reorder hook's measurement container, so both
   // consumers are fed from one ref callback.
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const setScrollerNode = useCallback(
     (node: HTMLDivElement | null) => {
       containerRef.current = node;
       attachWheelScroll(node);
+      setScroller(node);
     },
     [attachWheelScroll, containerRef],
   );
+  // The strip hides its scrollbar, so a fade on whichever edge has tabs
+  // past it is the only hint that more tabs exist.
+  const edges = useOverflowEdges(scroller, tabIds.join("\n"));
+  const mask = edgeFadeMask(edges.start, edges.end);
+  useKeepActiveTabInView(scroller, workspace.active_tab_id);
 
   return (
     <div
       ref={setScrollerNode}
-      className="no-scrollbar relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
+      // `scroll-px-4` matches EDGE_FADE_PX so a pill scrolled into view
+      // stops clear of the fade instead of losing its close button to it.
+      className="no-scrollbar relative flex min-w-0 scroll-px-4 items-center gap-[2px] overflow-x-auto"
       data-testid="titlebar-tabs-scroll"
+      data-overflow-start={edges.start ? "" : undefined}
+      data-overflow-end={edges.end ? "" : undefined}
+      style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
     >
       {dragTabId && dropIndicatorLeft !== null && (
         <TabDropIndicator left={dropIndicatorLeft} />
@@ -200,6 +284,17 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   );
 }
 
+/** Keeps the selected pill visible when it is activated from outside the
+ *  strip (Ctrl+1..9, the palette) while it sits past the clipped edge. */
+function useScrollIntoViewWhenActive(isActive: boolean) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isActive) return;
+    ref.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [isActive]);
+  return ref;
+}
+
 interface TitleBarTabProps {
   workspace: WorkspaceSnapshot;
   tab: TabSnapshot;
@@ -219,51 +314,82 @@ function TitleBarTab({
   reorderProps,
   isDragging,
 }: TitleBarTabProps) {
+  const ref = useScrollIntoViewWhenActive(isActive);
   const handleActivate = () => {
     if (!isActive) {
-      activateTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+      activateTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't switch tabs"));
     }
+  };
+  const rename = useTabRename();
+  const close = () => {
+    requestCloseTab(workspace.workspace_id, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
   };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    void requestCloseTab(workspace.workspace_id, tab.tab_id);
+    close();
   };
+  const icon = (
+    <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
+  );
 
   return (
-    <div
-      {...reorderProps}
-      className={cn(
-        PILL_BASE,
-        isActive ? PILL_ACTIVE : PILL_INACTIVE,
-        isDragging && "opacity-40",
-      )}
+    <TabContextMenu
+      workspace={workspace}
+      tabId={tab.tab_id}
+      onRename={rename.start}
     >
-      <button
-        type="button"
-        className="flex min-w-0 items-center gap-1.5"
-        onClick={handleActivate}
-        title={tab.title}
-      >
-        <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
-        <span className="max-w-[130px] truncate">{tab.title}</span>
-        {status && <StatusIndicator status={status} />}
-      </button>
-      <button
-        type="button"
-        data-no-drag
-        onClick={handleClose}
-        aria-label="Close tab"
-        title="Close tab"
+      <div
+        {...reorderProps}
+        {...middleClickCloseProps(close)}
+        ref={ref}
         className={cn(
-          CLOSE_BTN,
-          isActive
-            ? "opacity-70"
-            : "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100",
+          PILL_BASE,
+          isActive ? PILL_ACTIVE : PILL_INACTIVE,
+          isDragging && "opacity-40",
         )}
       >
-        <X className="size-3" />
-      </button>
-    </div>
+        {rename.renaming ? (
+          <div className="flex min-w-0 items-center gap-1.5">
+            {icon}
+            <TabTitleInput
+              workspaceId={workspace.workspace_id}
+              tabId={tab.tab_id}
+              title={tab.title}
+              onDone={rename.stop}
+            />
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="flex min-w-0 items-center gap-1.5"
+            onClick={handleActivate}
+            onDoubleClick={rename.start}
+            aria-current={isActive ? "page" : undefined}
+            title={tab.title}
+          >
+            {icon}
+            <span className="max-w-[130px] truncate">{tab.title}</span>
+            {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
+            {status && <StatusIndicator status={status} />}
+          </button>
+        )}
+        <button
+          type="button"
+          data-no-drag
+          onClick={handleClose}
+          aria-label="Close tab"
+          title="Close tab"
+          className={cn(
+            CLOSE_BTN,
+            isActive
+              ? "opacity-70"
+              : "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100",
+          )}
+        >
+          <X className="size-3" />
+        </button>
+      </div>
+    </TabContextMenu>
   );
 }
 
@@ -285,6 +411,7 @@ function ActiveChatTab({
   isDragging,
 }: ActiveChatTabProps) {
   const [open, setOpen] = useState(false);
+  const ref = useScrollIntoViewWhenActive(true);
   const workspaceId = workspace.workspace_id;
 
   const { cwd, handleSelect, handleNewChat } = useAgentChatSessionActions(pane);
@@ -293,54 +420,82 @@ function ActiveChatTab({
     workspaceId,
     cwd,
   });
+  const rename = useTabRename();
+  const close = () => {
+    requestCloseTab(workspaceId, tab.tab_id).catch(reportFailure("Couldn't close the tab"));
+  };
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    void requestCloseTab(workspaceId, tab.tab_id);
+    close();
   };
+  const icon = (
+    <span className="shrink-0 opacity-90">
+      <MessageSquare className="size-3" />
+    </span>
+  );
 
+  // Rename is reached from the context menu only: a click on the label
+  // already opens the session-history dropdown.
   return (
-    <>
+    <TabContextMenu
+      workspace={workspace}
+      tabId={tab.tab_id}
+      onRename={rename.start}
+    >
       <div
         {...reorderProps}
+        {...middleClickCloseProps(close)}
+        ref={ref}
         className={cn(PILL_BASE, PILL_ACTIVE, isDragging && "opacity-40")}
       >
-        <DropdownMenu open={open} onOpenChange={setOpen}>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              className="flex min-w-0 items-center gap-1.5"
+        {rename.renaming ? (
+          <div className="flex min-w-0 items-center gap-1.5">
+            {icon}
+            <TabTitleInput
+              workspaceId={workspaceId}
+              tabId={tab.tab_id}
               title={tab.title}
-              data-testid="titlebar-chat-tab-trigger"
-            >
-              <span className="shrink-0 opacity-90">
-                <MessageSquare className="size-3" />
-              </span>
-              <span className="max-w-[130px] truncate">{tab.title}</span>
-              {status && <StatusIndicator status={status} />}
-              <ChevronDown
-                className={cn(
-                  "size-3 shrink-0 opacity-60 transition-transform duration-150",
-                  open && "rotate-180",
-                )}
-              />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align="start"
-            className="max-h-[400px] w-72 overflow-y-auto"
-            data-testid="titlebar-chat-history"
-          >
-            <SessionHistoryList
-              sessions={sessions}
-              loading={loading}
-              activeThreadId={pane.thread_id}
-              onSelect={handleSelect}
-              onNewChat={handleNewChat}
-              onDelete={handleDelete}
-              closeMenu={() => setOpen(false)}
+              onDone={rename.stop}
             />
-          </DropdownMenuContent>
-        </DropdownMenu>
+          </div>
+        ) : (
+          <DropdownMenu open={open} onOpenChange={setOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="flex min-w-0 items-center gap-1.5"
+                aria-current="page"
+                title={tab.title}
+                data-testid="titlebar-chat-tab-trigger"
+              >
+                {icon}
+                <span className="max-w-[130px] truncate">{tab.title}</span>
+                {status && <StatusIndicator status={status} />}
+                <ChevronDown
+                  className={cn(
+                    "size-3 shrink-0 opacity-60 transition-transform duration-150",
+                    open && "rotate-180",
+                  )}
+                />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="max-h-[400px] w-72 overflow-y-auto"
+              data-testid="titlebar-chat-history"
+            >
+              <SessionHistoryList
+                sessions={sessions}
+                loading={loading}
+                activeThreadId={pane.thread_id}
+                onSelect={handleSelect}
+                onNewChat={handleNewChat}
+                onDelete={handleDelete}
+                closeMenu={() => setOpen(false)}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         <button
           type="button"
           data-no-drag
@@ -352,6 +507,6 @@ function ActiveChatTab({
           <X className="size-3" />
         </button>
       </div>
-    </>
+    </TabContextMenu>
   );
 }

@@ -1,0 +1,30 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 114565,
+  "num_turns": 19,
+  "total_cost_usd": 0.6489998,
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 18,
+      "outputTokens": 10417,
+      "cacheReadInputTokens": 290259,
+      "cacheCreationInputTokens": 47817,
+      "webSearchRequests": 0,
+      "costUSD": 0.6489998,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 6392,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "model": "claude-opus-5-5",
+  "effort": "high",
+  "cliVersion": "2.1.295",
+  "requestedReview": "Read-only integrated UI review using Read/Glob/Grep; safe mode; no model work delegated",
+  "evidenceTiming": "Reviewed the 19-flow and 17-layout evidence before provider setup guards and subsequent focus fixes. Findings require final regression verification.",
+  "functionalTestBudget": "Separate from authorized $2 functional live-test cap"
+}
