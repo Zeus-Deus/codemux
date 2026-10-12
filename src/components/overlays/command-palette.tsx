@@ -108,6 +108,7 @@ import {
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { useAuthStore } from "@/stores/auth-store";
 import { buildNavGroups } from "@/lib/settings-sections";
 import { settingsPagesForQuery } from "@/lib/settings-search";
 
@@ -614,10 +615,11 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // Settings pages are search-only: "settings" lists them all, and a query
   // that names a page or one of its rows ("scrollback") jumps straight there.
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const signedIn = useAuthStore((s) => s.user !== null);
   const settingsRows = useMemo<CommandRow[]>(() => {
     if (prsOnly || query.pathMode) return [];
     const pages = buildNavGroups(enableAgentChat).flatMap((group) => group.items);
-    return settingsPagesForQuery(query.needle, enableAgentChat).flatMap((id) => {
+    return settingsPagesForQuery(query.needle, enableAgentChat, signedIn).flatMap((id) => {
       const page = pages.find((item) => item.id === id);
       if (!page) return [];
       return [{
@@ -632,7 +634,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         keys: "",
       }];
     });
-  }, [prsOnly, query.pathMode, query.needle, enableAgentChat]);
+  }, [prsOnly, query.pathMode, query.needle, enableAgentChat, signedIn]);
 
   const searching = query.needle !== "";
   const conversationsEligible =

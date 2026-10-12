@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { Profiler } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import type { AuthUser } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   ui: {
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   app: {
     appState: null as unknown,
   },
+  auth: { user: null as AuthUser | null },
   backend: {
     dbGetUiState: vi.fn(),
     prOverview: vi.fn(() => ({ rows: [] })),
@@ -55,6 +57,9 @@ vi.mock("@/stores/app-store", async (importOriginal) => ({
 }));
 
 vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
+vi.mock("@/stores/auth-store", () => ({
+  useAuthStore: (selector: (state: typeof mocks.auth) => unknown) => selector(mocks.auth),
+}));
 
 // Use the real inbox subscriptions to cover its asynchronous first read.
 
@@ -105,6 +110,7 @@ import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
 import { BUILT_IN_THEMES, applyTheme } from "@/lib/themes";
 import { useOmarchyStore } from "@/stores/omarchy-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { omarchyToTheme } from "@/lib/omarchy-theme";
 import { fallbackTheme } from "@/hooks/use-theme-colors";
 
@@ -136,6 +142,8 @@ Element.prototype.scrollTo ??= () => {};
 Element.prototype.scrollIntoView ??= () => {};
 
 beforeEach(() => {
+  useFeatureFlags.setState({ enableAgentChat: true });
+  mocks.auth.user = { id: "u1", email: "test@codemux.org", name: "Test User", image: null };
   useSettingsStore.setState({ settings: { "appearance.theme_source": "manual" }, loaded: true });
   useOmarchyStore.setState({ theme: null, loaded: true });
   vi.clearAllMocks();
@@ -776,6 +784,25 @@ describe("command palette — reload interface", () => {
 });
 
 describe("command palette — settings pages", () => {
+  it("updates row-based page matches when Agent Chat or sign-in state changes", () => {
+    const view = renderPalette();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "checkpoint" } });
+    expect(screen.getByText("Settings · Agent")).toBeInTheDocument();
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: false }));
+    expect(screen.queryByText("Settings · Agent")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "skills sync" } });
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: true }));
+    expect(screen.getByText("Settings · Account")).toBeInTheDocument();
+    mocks.auth.user = null;
+    view.rerender(withClient(<CommandPalette open onOpenChange={vi.fn()} />));
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "email" } });
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+  });
+
   it("keeps settings pages out of the resting list", () => {
     renderPalette();
     expect(screen.queryByText("Settings pages")).not.toBeInTheDocument();

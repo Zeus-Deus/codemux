@@ -19,6 +19,10 @@ export interface SettingsSearchEntry {
   keywords?: string;
   /** The page hides this row on the web remote client. */
   desktopOnly?: boolean;
+  /** The row is rendered only while Agent Chat is enabled. */
+  agentChatOnly?: boolean;
+  /** Account details and session controls require a signed-in user. */
+  signedInOnly?: boolean;
 }
 
 /** Synonyms for whole pages, matched alongside the page name. */
@@ -50,9 +54,9 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
 
 export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   // Account
-  { section: "account", label: "Email" },
-  { section: "account", label: "Skills sync", keywords: "devices sync" },
-  { section: "account", label: "Session", keywords: "sign out log out logout" },
+  { section: "account", label: "Email", signedInOnly: true },
+  { section: "account", label: "Skills sync", keywords: "devices sync", agentChatOnly: true, signedInOnly: true },
+  { section: "account", label: "Session", keywords: "sign out log out logout", signedInOnly: true },
 
   // Appearance
   { section: "appearance", label: "Typography", keywords: "font size interface zoom text" },
@@ -74,9 +78,9 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   { section: "agent", label: "Utility agent", keywords: "handoff model haiku luna cheap" },
   { section: "agent", label: "Default Hermes profile", keywords: "hermes acp" },
   { section: "agent", label: "Auto-configure MCP for workspaces", keywords: ".mcp.json mcp config" },
-  { section: "agent", label: "Per-turn revert checkpoints", keywords: "checkpoints undo rewind snapshot" },
-  { section: "agent", label: "Resume automatically after usage limits reset", keywords: "auto resume rate limit" },
-  { section: "agent", label: "Desktop-size background browser", keywords: "viewport peek screenshot" },
+  { section: "agent", label: "Per-turn revert checkpoints", keywords: "checkpoints undo rewind snapshot", agentChatOnly: true },
+  { section: "agent", label: "Resume automatically after usage limits reset", keywords: "auto resume rate limit", agentChatOnly: true },
+  { section: "agent", label: "Desktop-size background browser", keywords: "viewport peek screenshot", agentChatOnly: true },
 
   // Interface
   { section: "interface", label: "Agent Chat GUI", keywords: "classic cli terminal mode" },
@@ -178,12 +182,14 @@ function escapeRegExp(text: string): string {
  * A result matches when every word of the query appears in its label, its
  * keywords, or its page's name and keywords — so "git stats" and "appearance
  * orb" both narrow the way they read. Pages hidden by the current flags never
- * appear, and neither do rows the web remote client does not render. Pages are ordered by their strongest result, then nav order, so the
+ * appear, and row visibility follows the same feature, account and remote
+ * conditions as the rendered controls. Pages are ordered by their strongest result, then nav order, so the
  * first result is the one the query most plausibly names.
  */
 export function searchSettings(
   query: string,
   agentChatEnabled: boolean,
+  signedIn: boolean,
 ): SettingsSearchGroup[] {
   const needles = tokens(query);
   if (needles.length === 0) return [];
@@ -210,6 +216,8 @@ export function searchSettings(
     for (const entry of SETTINGS_SEARCH_ENTRIES) {
       if (entry.section !== item.id) continue;
       if (remote && entry.desktopOnly) continue;
+      if (!agentChatEnabled && entry.agentChatOnly) continue;
+      if (!signedIn && entry.signedInOnly) continue;
       const rowText = `${entry.label} ${entry.keywords ?? ""}`.toLowerCase();
       if (!needles.every((n) => rowText.includes(n) || sectionText.includes(n))) continue;
       // When the query names the page, list only the rows it also says
@@ -243,6 +251,7 @@ export function searchSettings(
 export function settingsPagesForQuery(
   needle: string,
   agentChatEnabled: boolean,
+  signedIn: boolean,
   cap = 5,
 ): Section[] {
   const typed = needle.trim().toLowerCase();
@@ -250,10 +259,10 @@ export function settingsPagesForQuery(
   if (rest !== typed) {
     return rest === ""
       ? buildNavGroups(agentChatEnabled).flatMap((g) => g.items.map((i) => i.id))
-      : searchSettings(rest, agentChatEnabled).map((g) => g.section);
+      : searchSettings(rest, agentChatEnabled, signedIn).map((g) => g.section);
   }
   if (typed.length < 2) return [];
-  return searchSettings(typed, agentChatEnabled)
+  return searchSettings(typed, agentChatEnabled, signedIn)
     .slice(0, cap)
     .map((g) => g.section);
 }

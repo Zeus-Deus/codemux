@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -19,6 +19,7 @@ let requestedSection: string | null = null;
 let navigationVersion = 0;
 const mockSignOut = vi.fn();
 const mockSettingsSet = vi.fn();
+let mockSignedIn = true;
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -93,8 +94,8 @@ vi.mock("@/stores/settings-store", () => {
 vi.mock("@/stores/auth-store", () => ({
   useAuthStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
-      user: { id: "u1", email: "test@codemux.org", name: "Test User", image: null },
-      isAuthenticated: true,
+      user: mockSignedIn ? { id: "u1", email: "test@codemux.org", name: "Test User", image: null } : null,
+      isAuthenticated: mockSignedIn,
       signOut: mockSignOut,
     }),
 }));
@@ -210,7 +211,7 @@ vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
 import { SettingsView } from "./settings-view";
 import { revealSettingsAnchor } from "./settings-search";
 import * as commands from "@/tauri/commands";
-import { SETTINGS_SEARCH_ENTRIES } from "@/lib/settings-search";
+import { SETTINGS_SEARCH_ENTRIES, searchSettings } from "@/lib/settings-search";
 
 describe("SettingsPanel", () => {
   beforeEach(() => {
@@ -584,14 +585,41 @@ describe("Settings footer navigation", () => {
 // ── Settings search ──
 
 describe("Settings search", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     cleanup();
     requestedSection = null;
     navigationVersion = 0;
+    mockSignedIn = true;
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: true });
   });
 
   const searchField = (view: ReturnType<typeof render>) =>
     view.getByRole("combobox", { name: "Search settings" });
+
+  it("updates search results when Agent Chat or sign-in state changes", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    const view = render(<SettingsView />);
+    const hasResult = (label: string) => view.queryAllByRole("option").some((option) => option.textContent?.includes(label));
+    fireEvent.change(searchField(view), { target: { value: "checkpoint" } });
+    expect(hasResult("Per-turn revert checkpoints")).toBe(true);
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: false }));
+    view.rerender(<SettingsView />);
+    expect(hasResult("Per-turn revert checkpoints")).toBe(false);
+    fireEvent.change(searchField(view), { target: { value: "skills sync" } });
+    expect(hasResult("Skills sync")).toBe(false);
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: true }));
+    view.rerender(<SettingsView />);
+    expect(hasResult("Skills sync")).toBe(true);
+    mockSignedIn = false;
+    view.rerender(<SettingsView />);
+    expect(hasResult("Skills sync")).toBe(false);
+    fireEvent.change(searchField(view), { target: { value: "email" } });
+    expect(hasResult("Email")).toBe(false);
+    view.unmount();
+  });
 
   it("lists matching rows by page and opens the page on Enter", async () => {
     const view = render(<SettingsView />);
@@ -695,17 +723,29 @@ describe("Settings search", () => {
     view.unmount();
   });
 
-  it("finds every indexed row on the page it points at", async () => {
+  it.each([
+    { agentChat: true, signedIn: true },
+    { agentChat: false, signedIn: true },
+    { agentChat: true, signedIn: false },
+    { agentChat: false, signedIn: false },
+  ])("finds every searchable row on its rendered page (Agent Chat: $agentChat, signed in: $signedIn)", async ({ agentChat, signedIn }) => {
     // The index stands in for pages that are not rendered, so a renamed row
     // must be renamed here too or search lands on the top of the page. The
     // check uses the same lookup navigation does, not just any text match.
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: agentChat });
+    mockSignedIn = signedIn;
     const view = render(<SettingsView />);
-    const sections = new Set(SETTINGS_SEARCH_ENTRIES.map((entry) => entry.section));
+    const searchable = SETTINGS_SEARCH_ENTRIES.flatMap((entry) =>
+      searchSettings(entry.label, agentChat, signedIn).flatMap((group) => group.results)
+        .filter((result) => result.section === entry.section && result.anchor === entry.label),
+    );
+    const sections = new Set(searchable.map((result) => result.section));
     for (const section of sections) {
       requestedSection = section;
       navigationVersion++;
       view.rerender(<SettingsView />);
-      for (const entry of SETTINGS_SEARCH_ENTRIES.filter((e) => e.section === section)) {
+      for (const entry of searchable.filter((result) => result.section === section)) {
         // Some pages fill in after an async load (Presets).
         await waitFor(() =>
           expect(

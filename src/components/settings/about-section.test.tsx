@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 }));
 vi.mock("@/tauri/commands", () => ({
   getPackageFormat: vi.fn().mockResolvedValue("other"),
+  resetSyncedSettings: vi.fn(),
 }));
 vi.mock("@/lib/toast", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
@@ -21,13 +22,10 @@ vi.mock("@/components/remote/is-remote-client", () => ({
   isRemoteClient: () => remoteClient,
 }));
 
-const resetSettings = vi.fn().mockResolvedValue(undefined);
-vi.mock("@/stores/synced-settings-store", () => ({
-  useSyncedSettingsStore: (sel: (s: { resetSettings: typeof resetSettings }) => unknown) =>
-    sel({ resetSettings }),
-}));
-
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { resetSyncedSettings } from "@/tauri/commands";
+import { DEFAULT_SETTINGS, useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { toast } from "@/lib/toast";
 import {
   __resetUpdateStatusStoreForTests,
   useUpdateStatusStore,
@@ -51,7 +49,11 @@ function publish(overrides: Partial<Snapshot>) {
 }
 
 describe("AboutSection", () => {
-  beforeEach(() => __resetUpdateStatusStoreForTests());
+  beforeEach(() => {
+    __resetUpdateStatusStoreForTests();
+    useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
+    vi.mocked(resetSyncedSettings).mockResolvedValue(DEFAULT_SETTINGS);
+  });
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -124,12 +126,36 @@ describe("AboutSection", () => {
   it("resets synced settings only after confirming", async () => {
     render(<AboutSection />);
     fireEvent.click(screen.getByRole("button", { name: "Reset…" }));
-    expect(resetSettings).not.toHaveBeenCalled();
+    expect(resetSyncedSettings).not.toHaveBeenCalled();
     expect(
       await screen.findByText(/Custom themes and custom source-control hosts are deleted/),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Reset settings" }));
-    expect(resetSettings).toHaveBeenCalledTimes(1);
+    expect(resetSyncedSettings).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Settings reset to defaults"));
+  });
+
+  it("reports a rejected backend reset and preserves settings through the real store", async () => {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      appearance: {
+        ...DEFAULT_SETTINGS.appearance,
+        theme: "custom-theme",
+        custom_themes: [{ id: "custom-theme", name: "Custom theme" }],
+      },
+      source_control: { custom_hosts: { "git.example.com": "gitlab" } },
+    };
+    useSyncedSettingsStore.getState().replaceSessionSettings(settings);
+    vi.mocked(resetSyncedSettings).mockRejectedValue(new Error("Network error"));
+    render(<AboutSection />);
+    fireEvent.click(screen.getByRole("button", { name: "Reset…" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reset settings" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn't reset settings: Error: Network error"));
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(useSyncedSettingsStore.getState().settings).toBe(settings);
+    expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    expect(screen.getByRole("button", { name: "Reset…" })).toBeEnabled();
   });
 
   it("hides host-only actions on the web remote", async () => {

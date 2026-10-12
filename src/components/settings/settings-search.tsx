@@ -35,12 +35,14 @@ function keepInView(scroller: HTMLElement, row: HTMLElement) {
  */
 export function SettingsNavSearch({
   agentChatEnabled,
+  signedIn,
   activeSection,
   inputRef,
   onNavigate,
   children,
 }: {
   agentChatEnabled: boolean;
+  signedIn: boolean;
   /** The open page; its nav row is kept in view when it changes. */
   activeSection: string;
   inputRef: React.RefObject<HTMLInputElement | null>;
@@ -53,8 +55,8 @@ export function SettingsNavSearch({
   const scrollerRef = useRef<HTMLDivElement>(null);
 
   const groups = useMemo(
-    () => searchSettings(query, agentChatEnabled),
-    [query, agentChatEnabled],
+    () => searchSettings(query, agentChatEnabled, signedIn),
+    [query, agentChatEnabled, signedIn],
   );
   const results = useMemo(() => groups.flatMap((g) => g.results), [groups]);
   const searching = query.trim() !== "";

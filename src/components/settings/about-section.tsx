@@ -240,11 +240,21 @@ function DiagnosticsRow() {
 
 function ResetSettingsRow() {
   const [confirming, setConfirming] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const resetSettings = useSyncedSettingsStore((s) => s.resetSettings);
 
-  const reset = () => {
+  const reset = async () => {
+    if (resetting) return;
     setConfirming(false);
-    void resetSettings().then(() => toast.success("Settings reset to defaults"));
+    setResetting(true);
+    try {
+      await resetSettings();
+      toast.success("Settings reset to defaults");
+    } catch (error) {
+      toast.error(`Couldn't reset settings: ${String(error)}`);
+    } finally {
+      setResetting(false);
+    }
   };
 
   return (
@@ -253,8 +263,8 @@ function ResetSettingsRow() {
         label="Reset settings"
         description="Return every synced setting (appearance, editor, terminal, Git, shortcuts, notifications, browser, agent chat and session restore) to its default, and delete your custom themes and custom source-control hosts. Signed in, this applies on every device. Preferences kept only on this device, such as density and sidebar options, stay as they are."
       >
-        <Button variant="destructive" size="sm" onClick={() => setConfirming(true)}>
-          Reset…
+        <Button variant="destructive" size="sm" disabled={resetting} onClick={() => setConfirming(true)}>
+          {resetting ? "Resetting…" : "Reset…"}
         </Button>
       </SettingRow>
       <AlertDialog open={confirming} onOpenChange={setConfirming}>
@@ -270,7 +280,7 @@ function ResetSettingsRow() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={reset}>
+            <AlertDialogAction variant="destructive" onClick={() => void reset()}>
               Reset settings
             </AlertDialogAction>
           </AlertDialogFooter>
