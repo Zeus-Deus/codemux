@@ -526,9 +526,14 @@ pub fn v2_update_to_runtime(
         U::Resolved { id, answer } => vec![ProviderRuntimeEvent::RequestResolved {
             thread_id: ctx.thread_id.clone(),
             request_id: RequestId(id),
-            decision: match answer.as_ref().and_then(serde_json::Value::as_str) {
-                Some("always") => ApprovalDecision::AllowForSession,
-                Some("reject") | None => ApprovalDecision::Cancel,
+            decision: match answer.as_ref() {
+                Some(serde_json::Value::String(reply)) if reply == "always" => {
+                    ApprovalDecision::AllowForSession
+                }
+                Some(serde_json::Value::String(reply)) if reply == "reject" => {
+                    ApprovalDecision::Cancel
+                }
+                None | Some(serde_json::Value::Null) => ApprovalDecision::Cancel,
                 _ => ApprovalDecision::Allow {
                     updated_input: answer,
                     updated_permissions: None,
@@ -1331,6 +1336,79 @@ mod tests {
             context_window_tokens: Some(window),
             ..ctx()
         }
+    }
+
+    #[test]
+    fn native_form_reply_preserves_structured_answer_as_allow() {
+        let answer = json!({"q0": "A", "q1": ["with, comma", "B"]});
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "id": "reply_form", "type": "form.replied",
+            "data": {"sessionID": "sess_1", "id": "form_1", "answer": answer}
+        }))
+        .unwrap();
+        let events = opencode_event_to_runtime(event, &ctx(), None);
+        assert!(matches!(events.as_slice(),
+            [ProviderRuntimeEvent::RequestResolved {
+                request_id,
+                decision: ApprovalDecision::Allow { updated_input: Some(input), updated_permissions: None },
+                ..
+            }] if request_id.0 == "form_1" && *input == answer));
+    }
+
+    #[test]
+    fn native_request_resolution_retains_permission_and_cancel_decisions() {
+        for (reply, expected) in [
+            ("always", "allow_for_session"),
+            ("reject", "cancel"),
+            ("once", "allow"),
+        ] {
+            let event: OpenCodeEvent = serde_json::from_value(json!({
+                "id": format!("permission_{reply}"), "type": "permission.replied",
+                "data": {"sessionID": "sess_1", "requestID": "permission_1", "reply": reply}
+            }))
+            .unwrap();
+            let events = opencode_event_to_runtime(event, &ctx(), None);
+            let [ProviderRuntimeEvent::RequestResolved { decision, .. }] = events.as_slice() else {
+                panic!("expected a permission resolution");
+            };
+            assert_eq!(
+                serde_json::to_value(decision).unwrap()["decision"],
+                expected
+            );
+        }
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "id": "cancel_form", "type": "form.cancelled",
+            "data": {"sessionID": "sess_1", "id": "form_1"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            opencode_event_to_runtime(event, &ctx(), None).as_slice(),
+            [ProviderRuntimeEvent::RequestResolved {
+                decision: ApprovalDecision::Cancel,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn native_image_tool_result_preserves_renderer_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../src/lib/agent-chat/__fixtures__/opencode-native-image-tool-result.json"
+        ))
+        .unwrap();
+        let event: OpenCodeEvent = serde_json::from_value(fixture.clone()).unwrap();
+        let events = opencode_event_to_runtime(event, &ctx(), None);
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderRuntimeEvent::ItemCompleted {
+                    item: CompletedItem::ToolResult { content, .. },
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .expect("native tool completion must reach the renderer");
+        assert_eq!(*result, fixture["data"]["content"]);
     }
 
     #[test]
