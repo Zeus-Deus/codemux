@@ -525,7 +525,8 @@ mod tests {
     fn question_multiselect_preserves_comma_labels_and_combined_option_identities() {
         let form = json!({"metadata":{"kind":"question"},"fields":[{
             "key":"q0", "type":"multiselect", "description":"Pick", "custom":true,
-            "options":[{"value":"with, comma"},{"value":"A"},{"value":"B"},{"value":"A, B"}]
+            "options":[{"value":"with, comma","label":"with, comma"},{"value":"A","label":"A"},
+                {"value":"B","label":"B"},{"value":"A, B","label":"A, B"}]
         }]});
         for selections in [json!(["with, comma", "B"]), json!(["A", "B"]), json!(["A, B"])] {
             assert_eq!(
