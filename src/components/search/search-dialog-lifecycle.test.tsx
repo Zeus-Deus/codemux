@@ -23,6 +23,8 @@ import type { SearchResult } from "@/tauri/types";
 vi.mock("@/tauri/commands", () => ({
   searchFileNames: vi.fn(),
   searchInFiles: vi.fn(),
+  // File search offers changed files before a query is typed.
+  getGitStatus: vi.fn(() => Promise.resolve([])),
 }));
 vi.mock("@/stores/app-store", () => ({
   selectActiveWorkspaceId: () => null,
@@ -77,6 +79,11 @@ function searchInput(): HTMLInputElement {
   return screen.getByRole("textbox") as HTMLInputElement;
 }
 
+/** A result's file name, which the row splits around the highlighted match. */
+function fileName(name: string) {
+  return (_: string, element: Element | null) => element?.textContent === name;
+}
+
 describe("file search across opens", () => {
   it("keeps results through the exit and reopens empty", async () => {
     vi.mocked(searchFileNames).mockResolvedValue(["src/app.tsx", "src/main.tsx"]);
@@ -85,17 +92,17 @@ describe("file search across opens", () => {
 
     fireEvent.change(searchInput(), { target: { value: "app" } });
     await flushSearch(250);
-    expect(screen.getByText("app.tsx")).toBeInTheDocument();
+    expect(screen.getByText(fileName("app.tsx"))).toBeInTheDocument();
 
     act(() => useUIStore.setState({ showFileSearch: false }));
     // Still mounted for the exit animation, with the list intact.
     expect(screen.getByRole("dialog", { hidden: true })).toHaveAttribute("data-state", "closed");
-    expect(screen.getByText("app.tsx")).toBeInTheDocument();
+    expect(screen.getByText(fileName("app.tsx"))).toBeInTheDocument();
     expect(screen.queryByText("No matching files")).toBeNull();
 
     act(() => useUIStore.setState({ showFileSearch: true }));
     expect(searchInput().value).toBe("");
-    expect(screen.queryByText("app.tsx")).toBeNull();
+    expect(screen.queryByText(fileName("app.tsx"))).toBeNull();
     expect(screen.getByText("Type a file name to search")).toBeInTheDocument();
   });
 
