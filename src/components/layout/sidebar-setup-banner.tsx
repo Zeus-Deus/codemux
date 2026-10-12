@@ -115,6 +115,7 @@ export function SidebarSetupBanner() {
               size="icon-xs"
               className="shrink-0 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
               onClick={handleDismiss}
+              aria-label="Dismiss setup tip"
             >
               <X className="size-3" />
             </Button>

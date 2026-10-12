@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -6,8 +6,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { toast } from "@/lib/toast";
+import { modEnterLabel } from "@/lib/keybind-utils";
 import {
   btnCard,
   btnCardStrong,
@@ -16,10 +16,11 @@ import {
   btnGreenSolid,
   btnGreenTint,
   btnQuiet,
+  kbdChip,
   reviewBodyRequirement,
+  spinnerRing,
   tzBody,
   tzEyebrow,
-  tzMeta,
   tzMetaNum,
 } from "./review-ui";
 import { MERGE_STRATEGIES } from "./merge-sheet";
@@ -30,9 +31,6 @@ import {
   setReviewDraft,
   type DraftKey,
 } from "./pr-drafts";
-
-// The handler accepts Ctrl or Cmd; show whichever this platform calls it.
-const SUBMIT_HINT = formatKeyCombo("Ctrl+Enter");
 
 /**
  * Which bar the PR earns. Reviewer is the fallback: if we can't tell
@@ -45,6 +43,11 @@ export type ActionBarState =
   | "author-draft"
   | "author-green"
   | "author-blocked";
+
+export type PendingStateChange = "ready" | "close" | "reopen";
+
+/** One-shot requests from the bar and the notice slot, one at a time. */
+export type PendingWork = PendingStateChange | "pull" | "stash-pull";
 
 export interface ActionBarProps {
   state: ActionBarState;
@@ -65,11 +68,17 @@ export interface ActionBarProps {
   canComment: boolean;
   canMerge: boolean;
   canChangeState: boolean;
+  /** A request in flight. A state change's own button shows progress;
+   *  every state button waits while anything is in flight (a pull from
+   *  the notice included), since the click would be dropped anyway. */
+  pending?: PendingWork | null;
   onSubmitReview: (event: string, body: string) => void;
   onOpenMergeSheet: () => void;
   onPickStrategy: (strategy: string) => void;
   onReadyForReview: () => void;
   onClose: () => void;
+  /** Record bar only: offered when a closed PR may be reopened here. */
+  onReopen?: () => void;
   onRebase?: () => void;
   /** Conflicts only: hands the merge to an agent in a worktree thread. */
   onResolveConflicts?: () => Promise<unknown>;
@@ -88,6 +97,9 @@ export interface ActionBarProps {
  */
 export function ReviewActionBar(props: ActionBarProps) {
   const { state, sentence, merging } = props;
+  const pending = props.pending ?? null;
+  // Per instance: the page can show two detail columns at once.
+  const sentenceId = useId();
 
   return (
     <div
@@ -100,6 +112,24 @@ export function ReviewActionBar(props: ActionBarProps) {
       ) : state === "record" ? (
         <div className="flex items-center gap-2">
           <span className={cn("flex-1 text-muted-foreground", tzBody)}>{sentence}</span>
+          {props.onReopen && (
+            <button
+              type="button"
+              className={btnCard}
+              data-testid="review-reopen"
+              disabled={pending != null}
+              onClick={props.onReopen}
+            >
+              {pending === "reopen" ? (
+                <>
+                  <span aria-hidden className={spinnerRing} />
+                  Reopening
+                </>
+              ) : (
+                "Reopen"
+              )}
+            </button>
+          )}
         </div>
       ) : state === "author-draft" ? (
         <div className="flex items-center gap-2">
@@ -117,16 +147,26 @@ export function ReviewActionBar(props: ActionBarProps) {
           </span>
           {props.canChangeState && (
             <>
-              <button type="button" className={btnCard} onClick={props.onClose}>
-                Close
-              </button>
+              <ConfirmCloseButton
+                onClose={props.onClose}
+                closing={pending === "close"}
+                disabled={pending != null}
+              />
               <button
                 type="button"
                 className={btnCardStrong}
                 data-testid="review-primary-action"
+                disabled={pending != null}
                 onClick={props.onReadyForReview}
               >
-                Ready for review
+                {pending === "ready" ? (
+                  <>
+                    <span aria-hidden className={spinnerRing} />
+                    Marking ready
+                  </>
+                ) : (
+                  "Ready for review"
+                )}
               </button>
             </>
           )}
@@ -146,7 +186,7 @@ export function ReviewActionBar(props: ActionBarProps) {
                 state === "author-green" ? "bg-status-open" : "bg-status-working",
               )}
             />
-            <span className="truncate" data-testid="bar-sentence">
+            <span id={sentenceId} className="truncate" data-testid="bar-sentence">
               {sentence}
             </span>
           </span>
@@ -179,14 +219,11 @@ export function ReviewActionBar(props: ActionBarProps) {
             // Blocked Merge is still a real control: it opens the sheet,
             // where the host has the final say. What it never does is
             // pretend the block isn't there — that's the sentence's job.
-            aria-describedby="review-bar-sentence"
+            aria-describedby={sentenceId}
           >
             {merging ? (
               <>
-                <span
-                  aria-hidden
-                  className="size-2.5 animate-spin rounded-full border-[1.6px] border-current border-r-transparent"
-                />
+                <span aria-hidden className={spinnerRing} />
                 Merging
               </>
             ) : (
@@ -197,6 +234,63 @@ export function ReviewActionBar(props: ActionBarProps) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Close takes two taps.
+ *
+ * Closing notifies everyone watching the PR, and Close sits right beside
+ * the primary, so one stray click must not do it. The first tap arms the
+ * button in place ("Confirm close"); it disarms by itself after a few
+ * seconds, so an armed button is never left waiting for a later click.
+ */
+export const CLOSE_CONFIRM_MS = 3000;
+
+function ConfirmCloseButton({
+  onClose,
+  closing,
+  disabled,
+}: {
+  onClose: () => void;
+  closing: boolean;
+  disabled: boolean;
+}) {
+  const [armed, setArmed] = useState(false);
+
+  useEffect(() => {
+    if (!armed) return;
+    const timer = setTimeout(() => setArmed(false), CLOSE_CONFIRM_MS);
+    return () => clearTimeout(timer);
+  }, [armed]);
+
+  return (
+    <button
+      type="button"
+      className={cn(btnCard, armed && !closing && "text-destructive")}
+      data-testid="review-close"
+      data-armed={armed}
+      disabled={disabled}
+      onClick={() => {
+        if (!armed) {
+          setArmed(true);
+          return;
+        }
+        setArmed(false);
+        onClose();
+      }}
+    >
+      {closing ? (
+        <>
+          <span aria-hidden className={spinnerRing} />
+          Closing
+        </>
+      ) : armed ? (
+        "Confirm close"
+      ) : (
+        "Close"
+      )}
+    </button>
   );
 }
 
@@ -219,7 +313,7 @@ function ResolveWithAgentButton({ onResolve }: { onResolve: () => Promise<unknow
         if (starting) return;
         setStarting(true);
         onResolve()
-          .catch((err) => toast.error(String(err)))
+          .catch((err) => toast.failure("Couldn't hand the conflicts to an agent", err))
           .finally(() => setStarting(false));
       }}
     >
@@ -355,7 +449,7 @@ function ReviewerBar({
             tzBody,
           )}
         >
-          Leave a review… <span className={cn("font-mono", tzMeta)}>{SUBMIT_HINT}</span>
+          Leave a review… <kbd className={kbdChip}>{modEnterLabel()}</kbd>
         </button>
       )}
       <div className="flex items-center gap-2">

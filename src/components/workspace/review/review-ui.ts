@@ -42,6 +42,15 @@ export const tzPageTitle = "text-[1.0625rem]";
 /** Check-log excerpts — mono, quieter than the diff it explains. */
 export const tzLog = "text-body-sm";
 
+/**
+ * The side margins of a card drawn under a diff row (a thread, a pending
+ * note, the composer). It starts at the code column, past the 72px
+ * gutter; in a narrow Code tab that indent would leave a suggestion diff
+ * a sliver of width, so below `@md` the card takes it back. Needs the
+ * `@container` the Code tab root sets.
+ */
+export const underRowInset = "ml-3 mr-3 @md:ml-[72px]";
+
 /*
  * Deliberately no token for the diff body.
  *
@@ -101,6 +110,18 @@ export const btnGreenMuted = `${BASE} bg-card text-muted-foreground`;
 
 /** Bare text action (the strategy dropdown trigger). */
 export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text-foreground`;
+
+/**
+ * The in-slot progress ring for a button whose request is in flight.
+ * It sits beside the changed label inside the same box, so the button
+ * never resizes; under reduced motion it stays a still ring.
+ */
+export const spinnerRing =
+  "size-2.5 shrink-0 rounded-full border-[1.6px] border-current border-r-transparent motion-safe:animate-spin";
+
+/** Keycap chip for a shortcut hint ("Ctrl+↵"). */
+export const kbdChip =
+  "rounded-sm bg-muted/60 px-1 py-px font-mono text-caption text-muted-foreground";
 
 /**
  * Comment-sized ember tint, for actions that sit inside a quoted thread.

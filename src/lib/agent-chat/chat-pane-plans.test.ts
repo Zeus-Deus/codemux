@@ -254,7 +254,7 @@ describe("planModelChange", () => {
     expect(plan).toEqual({
       resetEffort: undefined,
       resetContextWindow: undefined,
-      resetFastMode: undefined,
+      resetServiceTier: undefined,
     });
   });
 
@@ -311,9 +311,9 @@ describe("planModelChange", () => {
       newModel: HAIKU,
       currentEffort: null,
       currentContextWindow: null,
-      currentFastMode: true,
+      currentServiceTier: "fast",
     });
-    expect(plan.resetFastMode).toBe(false);
+    expect(plan.resetServiceTier).toBe("default");
   });
 });
 

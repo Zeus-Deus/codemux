@@ -66,6 +66,7 @@ import {
 } from "@/stores/agent-chat-store";
 import { toast } from "@/lib/toast";
 import { useHermes } from "@/stores/hermes-store";
+import { useCustomAcp } from "@/stores/custom-acp-store";
 import { invoke } from "@tauri-apps/api/core";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
@@ -130,6 +131,28 @@ afterEach(() => {
 });
 
 describe("useAgentChatSessionActions — handleNewChat", () => {
+  it("carries a restored custom instance into a new thread with a null model default", async () => {
+    useCustomAcp.setState({ selections: { "thread-old": "stable/instance" }, bindings: {} });
+    vi.mocked(invoke).mockResolvedValue(null);
+    const { result } = renderHook(() => useAgentChatSessionActions(makePane({ provider: "acp" })));
+    await result.current.handleNewChat();
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("acp");
+    expect(input.thread_id).not.toBe("thread-old");
+    expect(input.model).toBeNull();
+    expect(input.permission_mode).toBeNull();
+    expect(useCustomAcp.getState().selections[input.thread_id]).toBe("stable/instance");
+  });
+  it("reopens custom history on its durable backend-bound thread ID, not a fresh local ID", async () => {
+    const record = makeRecord({ provider: "acp", thread_id: "durable-acp", model: '{"provider":"Case","model":"Opaque/ID"}', sdk_session_id: '["acp","agent","r","native"]' });
+    const { result } = renderHook(() => useAgentChatSessionActions(makePane({ provider: "acp" })));
+    await result.current.handleSelect(record);
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("acp");
+    expect(input.thread_id).toBe(record.thread_id);
+    expect(input.model).toBe(record.model);
+    expect(input.resume_cursor).toEqual({ resume: record.sdk_session_id });
+  });
   it("carries the restored Hermes profile into an explicitly new conversation", async () => {
     const profile = {schema_version:1,host:"local",installation:"/official/hermes",root:"/test",id:"coder",home:"/test/profiles/coder",identity:"synthetic"};
     const restore = vi.spyOn(useHermes.getState(), "restore").mockImplementation(async () => {

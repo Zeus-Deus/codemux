@@ -85,7 +85,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
         />
       </button>
       {open && item.text.length > 0 && (
-        <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
+        <div className="ml-[10px] mt-0.5 border-l border-hairline py-1.5 pl-3">
           <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
             {item.text}
           </p>

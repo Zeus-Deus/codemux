@@ -266,6 +266,7 @@ fn model_from_options(id: String, label: String, options: &[Value]) -> ChatModel
         supports_adaptive_thinking: false,
         supports_thinking_toggle,
         supports_fast_mode,
+        service_tiers: vec![],
         // Cursor's ACP initialize response advertises image prompts globally.
         // The extension does not currently narrow this per model.
         supports_images: true,
