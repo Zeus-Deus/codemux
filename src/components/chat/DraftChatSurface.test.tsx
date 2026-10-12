@@ -271,6 +271,13 @@ function resetStores() {
       opencode: emptyHealthSlot(),
     },
   });
+  vi.mocked(agentChatProviderHealth).mockReset().mockResolvedValue({
+    provider: "claude",
+    status: "ready",
+    installed: true,
+    message: null,
+    version: "test",
+  });
   vi.mocked(listSkills).mockReset().mockResolvedValue({ skills: [], errors: [] });
   vi.mocked(listChatSlashCommands).mockClear();
   // homeDir is normally hydrated at App mount; seed it here so the
@@ -1674,8 +1681,11 @@ describe("DraftChatSurface", () => {
       });
     });
 
-    it("the current checkout of a device workspace sends into that workspace", async () => {
-      seedActiveProjectWorkspace({ host_id: 3, cwd: "/home/deus/work/active" });
+    it.each([
+      { location: "device", hostId: 3 },
+      { location: "local", hostId: null },
+    ])("applies local readiness only to the $location current checkout", async ({ hostId }) => {
+      seedActiveProjectWorkspace({ host_id: hostId, cwd: "/home/deus/work/active" });
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
@@ -1690,9 +1700,33 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       vi.mocked(materializeAndSend).mockImplementationOnce(() => new Promise(() => {}));
       const { container } = renderSurface();
+      const signedOut = {
+        provider: "claude" as const,
+        status: "error" as const,
+        installed: true,
+        message: "Claude Code isn't signed in.",
+        version: "2.1.0",
+        login_command: "claude auth login",
+      };
+      // Mount recovery must not consume the submit-time health probe.
+      act(() => useProviderHealth.setState((state) => ({ slots: {
+        ...state.slots,
+        claude: { ...emptyHealthSlot(), report: signedOut, fetchedAt: Date.now() },
+      } })));
+      vi.mocked(agentChatProviderHealth).mockReset().mockResolvedValue(signedOut);
 
       fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      if (hostId === null) {
+        await vi.waitFor(() => expect(container).toHaveTextContent(
+          "Send failed: Claude Code isn't signed in. Press Enter to retry.",
+        ));
+        expect(agentChatProviderHealth).toHaveBeenCalledExactlyOnceWith("claude");
+        expect(materializeAndSend).not.toHaveBeenCalled();
+        expect(container.querySelector("textarea")).toHaveValue("fix it");
+        return;
+      }
       await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      expect(agentChatProviderHealth).not.toHaveBeenCalled();
       const call = vi.mocked(materializeAndSend).mock.calls[0];
       expect(call[0].target).toEqual({ kind: "existing_workspace", workspaceId: "ws-active" });
       expect(call[2]).toBe("/home/deus/work/active");

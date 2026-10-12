@@ -584,6 +584,13 @@ function DraftChatSurfaceInner({
     // work begins. The status line advances through the real phases via
     // `materializeAndSend`'s `onPhase` hook.
     const finalDraft = currentDraft;
+    const sendTarget = sendDraft.target;
+    const executionHostId =
+      sendTarget.kind === "existing_workspace"
+        ? (useAppStore.getState().appState?.workspaces.find(
+            (workspace) => workspace.workspace_id === sendTarget.workspaceId,
+          )?.host_id ?? null)
+        : (sendDraft.hostId ?? null);
     const sendHostId =
       sendDraft.target.kind !== "existing_workspace"
         ? (sendDraft.hostId ?? null)
@@ -635,7 +642,7 @@ function DraftChatSurfaceInner({
       // creating a worktree and workspace for it only leaves debris behind.
       // The draft keeps its text and attachments; the banner carries the fix.
       // Local health cannot establish readiness on another device.
-      const blocked = sendHostId === null
+      const blocked = executionHostId === null
         ? await useProviderHealth.getState().ensureReady(finalDraft.provider)
         : null;
       if (blocked) {
