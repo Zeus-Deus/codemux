@@ -110,7 +110,7 @@ function AuthorChip({ author }: { author: string }) {
     <span className="flex min-w-0 items-center gap-1">
       <span
         aria-hidden
-        className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] font-semibold uppercase leading-none text-foreground/80"
+        className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-muted text-micro font-semibold uppercase leading-none text-foreground/80"
       >
         {author.charAt(0)}
       </span>
