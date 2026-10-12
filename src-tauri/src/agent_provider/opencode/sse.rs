@@ -1073,7 +1073,8 @@ async fn reconcile_native_history(
         let input = pending.map(|(input, _)| input).or(active_input);
         (turn, input, background)
     };
-    let exact_user_found = submitted_input.is_some()
+    let exact_user_found = reserved_turn.is_some()
+        && submitted_input.is_some()
         && found_submitted_input
         && submitted_input == admitted_input;
     if (found_observed_idle || exact_user_found) && sequence.is_some() {
