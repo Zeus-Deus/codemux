@@ -54,6 +54,10 @@ pub struct StartSessionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_dangerously_skip_permissions: Option<bool>,
@@ -402,9 +406,7 @@ impl SidecarNotification {
                 .unwrap_or_default()
         }
         fn field_opt_string(v: &Value, name: &str) -> Option<String> {
-            v.get(name)
-                .and_then(|x| x.as_str())
-                .map(String::from)
+            v.get(name).and_then(|x| x.as_str()).map(String::from)
         }
         fn field_value(v: &Value, name: &str) -> Value {
             v.get(name).cloned().unwrap_or(Value::Null)
@@ -412,11 +414,8 @@ impl SidecarNotification {
         match method {
             "session-configured" => Self::SessionConfigured {
                 thread_id: field_string(&params, "threadId"),
-                path_to_claude_code_executable: field_string(
-                    &params,
-                    "pathToClaudeCodeExecutable",
-                )
-                .into(),
+                path_to_claude_code_executable: field_string(&params, "pathToClaudeCodeExecutable")
+                    .into(),
             },
             "sdk-message" => Self::SdkMessage {
                 thread_id: field_string(&params, "threadId"),
@@ -454,8 +453,7 @@ impl SidecarNotification {
             },
             "session-error" => Self::SessionError {
                 thread_id: field_string(&params, "threadId"),
-                error: serde_json::from_value(field_value(&params, "error"))
-                    .unwrap_or_default(),
+                error: serde_json::from_value(field_value(&params, "error")).unwrap_or_default(),
             },
             "sdk-session-id" => Self::SdkSessionId {
                 thread_id: field_string(&params, "threadId"),
@@ -539,6 +537,8 @@ mod tests {
             model: Some("claude-opus-4-7".into()),
             effort: None,
             fast_mode: Some(true),
+            max_budget_usd: None,
+            max_turns: None,
             permission_mode: None,
             allow_dangerously_skip_permissions: None,
             additional_directories: None,
@@ -732,7 +732,9 @@ mod tests {
             }),
         );
         match n {
-            SidecarNotification::RequestOpened { kind, request_id, .. } => {
+            SidecarNotification::RequestOpened {
+                kind, request_id, ..
+            } => {
                 assert_eq!(kind, "command");
                 assert_eq!(request_id, "r");
             }
@@ -773,10 +775,8 @@ mod tests {
     fn notification_resume_fallback_allows_null_stale_session_id() {
         // The sidecar may not know the stale id (e.g. it was never
         // observed). `staleSessionId` absent / null → `None`.
-        let n = SidecarNotification::from_method_params(
-            "resume-fallback",
-            json!({"threadId": "t"}),
-        );
+        let n =
+            SidecarNotification::from_method_params("resume-fallback", json!({"threadId": "t"}));
         match n {
             SidecarNotification::ResumeFallback {
                 thread_id,

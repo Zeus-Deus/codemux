@@ -52,6 +52,7 @@ import {
   Loader2,
   PanelRight as PanelRightIcon,
   RefreshCw,
+  Search,
   Terminal,
   WrapText,
   X,
@@ -67,6 +68,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { WorkflowPanel, WorkflowsPaneActions } from "@/components/workflows/workflow-panel";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import {
@@ -82,7 +85,11 @@ import { isMarkdownFile } from "@/components/editor/EditorPane";
 import { subagentDeckSummary } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
-import { maxRightPanelWidth } from "@/lib/right-panel-width";
+import {
+  maxRightPanelWidth,
+  resolveRightPanelWidth,
+  RIGHT_PANEL_WIDTH_UI_KEY,
+} from "@/lib/right-panel-width";
 import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
@@ -130,7 +137,6 @@ import {
   docPanePath,
   isCorePane,
   paneMeta,
-  relativeToRoot,
 } from "./right-panel/pane-registry";
 import { PaneTabStrip, type DeckTab } from "./right-panel/pane-tab-strip";
 import { SubagentsPane } from "./right-panel/subagents-pane";
@@ -140,10 +146,6 @@ interface Props {
   workspace: WorkspaceSnapshot;
   activeTab: RightPanelTab;
 }
-
-/** The width the expand toggle returns to. Its other endpoint is whatever
- *  the current layout allows — see `@/lib/right-panel-width`. */
-const PANEL_DEFAULT_WIDTH = 320;
 
 const EMPTY_MESSAGES: ChatViewItem[] = [];
 
@@ -232,7 +234,6 @@ export const RightPanel = memo(function RightPanel({
 }: Props) {
   const mobile = useMobileLayout();
   const workspaceId = workspace.workspace_id;
-  const cwd = workspace.worktree_path ?? workspace.cwd;
 
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
@@ -241,7 +242,9 @@ export const RightPanel = memo(function RightPanel({
   const reorderRightPanelPanes = useUIStore((s) => s.reorderRightPanelPanes);
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
-  const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
+  const rightPanelWidth = useUIStore((s) =>
+    resolveRightPanelWidth(s.rightPanelWidth, s.rightPanelRowWidth),
+  );
   const rightPanelRowWidth = useUIStore((s) => s.rightPanelRowWidth);
   const storedPanes = useUIStore((s) => s.rightPanelPanes[workspaceId]);
   const storedDismissed = useUIStore(
@@ -262,6 +265,7 @@ export const RightPanel = memo(function RightPanel({
   const titlebarOverlay = useTitlebarOverlay();
 
   const workspaceWorkflow = useWorkspaceWorkflow(workspace);
+  const enableAgentChat = useFeatureFlags((state) => state.enableAgentChat);
   const {
     threadId,
     tasks: activeChatTasks,
@@ -346,6 +350,8 @@ export const RightPanel = memo(function RightPanel({
       if (isAddonPane(id)) return addonPanels.some(panel => panel.pane === id);
       if (!isCorePane(id)) return id.startsWith("doc:");
       switch (id) {
+        case "workflows":
+          return enableAgentChat && !isRemoteClient() && !workspace.host_id && !workspace.attach_only;
         case "tasks":
           return tasksSnapshot != null;
         case "orchestration":
@@ -356,7 +362,7 @@ export const RightPanel = memo(function RightPanel({
           return true;
       }
     },
-    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels],
+    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels, enableAgentChat, workspace.host_id, workspace.attach_only],
   );
 
   // Availability-gated panes join the strip on their own when their data
@@ -513,6 +519,11 @@ export const RightPanel = memo(function RightPanel({
   const diffSetFile = useDiffStore((s) => s.setFile);
   const diffSetLayout = useDiffStore((s) => s.setLayout);
   const diffTab = useDiffStore((s) => s.tabs[diffTabId]);
+  // A side panel is narrow, so a long line wraps by default; the pane
+  // bar turns it off when sideways scrolling reads better.
+  const [diffWrap, setDiffWrap] = useState(true);
+  // Escape from the diff hands focus back to the Changes row it came from.
+  const [changesFocusPath, setChangesFocusPath] = useState<string | null>(null);
 
   /** Hand the panel's diff to a full main-area tab, which has the room
    *  for hunk/file navigation and focus mode. */
@@ -545,7 +556,7 @@ export const RightPanel = memo(function RightPanel({
   // is made from the *rendered* active pane, which can differ from the
   // persisted one (workspace-main coerces a stale tab without writing to
   // the store).
-  const handleClose = useCallback(
+  const dropPane = useCallback(
     (id: RightPanelTab) => {
       closeRightPanelPane(workspaceId, id);
       if (id === "browser") {
@@ -555,6 +566,13 @@ export const RightPanel = memo(function RightPanel({
         // same as closing a browser pane in the main area.
         undockBrowserFromRightPanel(workspaceId, true).catch(console.error);
       }
+    },
+    [closeRightPanelPane, workspaceId],
+  );
+
+  const handleClose = useCallback(
+    (id: RightPanelTab) => {
+      dropPane(id);
       if (id !== activePane) return;
       const index = visiblePanes.indexOf(id);
       const remaining = visiblePanes.filter((pane) => pane !== id);
@@ -563,13 +581,20 @@ export const RightPanel = memo(function RightPanel({
         remaining[Math.min(index, remaining.length - 1)] ?? RIGHT_PANEL_EMPTY,
       );
     },
-    [
-      closeRightPanelPane,
-      setRightPanelTab,
-      workspaceId,
-      activePane,
-      visiblePanes,
-    ],
+    [dropPane, setRightPanelTab, workspaceId, activePane, visiblePanes],
+  );
+
+  // The tab context menu's bulk closes. One focus decision for the batch:
+  // looping `handleClose` would re-pick a neighbour per tab from a stale
+  // pane list.
+  const handleCloseMany = useCallback(
+    (ids: RightPanelTab[], focus: RightPanelTab | null) => {
+      ids.forEach(dropPane);
+      if (activePane !== null && ids.includes(activePane)) {
+        setRightPanelTab(workspaceId, focus ?? RIGHT_PANEL_EMPTY);
+      }
+    },
+    [dropPane, setRightPanelTab, workspaceId, activePane],
   );
 
   const handleOpenTerminal = useCallback(() => {
@@ -597,9 +622,14 @@ export const RightPanel = memo(function RightPanel({
       : rightPanelWidth;
   const expanded = rightPanelWidth >= panelMaxWidth;
   const handleToggleExpand = useCallback(() => {
-    const next = expanded ? PANEL_DEFAULT_WIDTH : Math.round(panelMaxWidth);
+    // Restores to the window-relative default (`null`, persisted as "");
+    // the other endpoint is whatever the current layout allows — see
+    // `@/lib/right-panel-width`.
+    const next = expanded ? null : Math.round(panelMaxWidth);
     setRightPanelWidth(next);
-    dbSetUiState("right_panel_width", String(next)).catch(console.error);
+    dbSetUiState(RIGHT_PANEL_WIDTH_UI_KEY, next === null ? "" : String(next)).catch(
+      console.error,
+    );
   }, [expanded, panelMaxWidth, setRightPanelWidth]);
 
   // The store owns collapsing (it undocks a docked agent browser — a
@@ -687,6 +717,9 @@ export const RightPanel = memo(function RightPanel({
         } else if (subagentSummary.running > 0) {
           tab.badge = subagentSummary.running;
         }
+        break;
+      case "workflows":
+        tab.testId = "workflows-tab";
         break;
       case "orchestration":
         tab.testId = "orchestration-tab";
@@ -862,6 +895,14 @@ export const RightPanel = memo(function RightPanel({
                 )
               }
             />
+            {diffTab?.layout !== "split" && (
+              <PaneActionButton
+                label={diffWrap ? "Disable soft wrap" : "Soft wrap"}
+                icon={WrapText}
+                active={diffWrap}
+                onClick={() => setDiffWrap((w) => !w)}
+              />
+            )}
             <PaneActionButton
               label="Open in a tab"
               icon={ExternalLink}
@@ -879,6 +920,9 @@ export const RightPanel = memo(function RightPanel({
         actions = browserSessionName ? (
           <BrowserPaneActions sessionName={browserSessionName} />
         ) : null;
+        break;
+      case "workflows":
+        actions = <WorkflowsPaneActions workspaceId={workspaceId} />;
         break;
       case "tasks":
         actions = tasksSnapshot ? (
@@ -907,11 +951,6 @@ export const RightPanel = memo(function RightPanel({
       deletions: workspace.git_deletions,
     },
     review: { prNumber: workspace.pr_number, state: workspace.pr_state },
-    diff: {
-      filePath: diffTab?.filePath
-        ? relativeToRoot(diffTab.filePath, cwd)
-        : null,
-    },
     browser: browserOpen
       ? {
           docked: browserDocked,
@@ -929,20 +968,19 @@ export const RightPanel = memo(function RightPanel({
     // No left border: the resize handle in `workspace-main.tsx` is the seam.
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
       {mobile ? <div className="mobile-panel-header">
-        <div className="flex min-w-0 items-center gap-1">
-          <select aria-label="Open tool or file" className="mobile-pane-picker min-w-0 flex-1" value={activePane ?? "empty"} onChange={e => setRightPanelTab(workspaceId, e.target.value as RightPanelTab)}>
-            <option value="empty">All tools</option>{tabs.map(tab => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
-          </select>
-          <button aria-label="Find a file" onClick={handleOpenFile}>Find file</button>
-          <button aria-label="Back to conversation" onClick={handleCollapsePanel}>Back</button>
-        </div>
-        <div className="mobile-panel-actions">{actions}{activePane && <button onClick={() => handleClose(activePane)}>Close this view</button>}</div>
+        <select aria-label="Open tool or file" className="mobile-pane-picker" value={activePane ?? "empty"} onChange={e => setRightPanelTab(workspaceId, e.target.value as RightPanelTab)}>
+          <option value="empty">All tools</option>{tabs.map(tab => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
+        </select>
+        <div className="mobile-panel-actions">{actions}</div>
+        <button aria-label="Find a file" title="Find a file" onClick={handleOpenFile}><Search className="size-4" aria-hidden /></button>
+        {activePane && <button aria-label="Close this view" title="Close this view" onClick={() => handleClose(activePane)}><X className="size-4" aria-hidden /></button>}
       </div> : <PaneTabStrip
         inTitlebar={titlebarOverlay}
         tabs={tabs}
         activeTab={activePane}
         onSelect={(id) => setRightPanelTab(workspaceId, id)}
         onClose={handleClose}
+        onCloseMany={handleCloseMany}
         onReorder={(ids) => reorderRightPanelPanes(workspaceId, ids)}
         actions={actions}
         surfaces={surfaces}
@@ -987,9 +1025,19 @@ export const RightPanel = memo(function RightPanel({
             refreshKey={changesRefreshKey}
             sectionFilter={changesFilter}
             onOpenDiff={openDiffPane}
+            returnFocusPath={changesFocusPath}
           />
         ) : activePane === "diff" ? (
-          <DiffPane tabId={diffTabId} workspace={workspace} embedded />
+          <DiffPane
+            tabId={diffTabId}
+            workspace={workspace}
+            embedded
+            wrap={diffWrap}
+            onBack={() => {
+              setChangesFocusPath(diffTab?.filePath ?? null);
+              setRightPanelTab(workspaceId, "changes");
+            }}
+          />
         ) : activePane === "review" ? (
           <ReviewPanel workspace={workspace} />
         ) : activePane === "browser" ? (
@@ -997,6 +1045,8 @@ export const RightPanel = memo(function RightPanel({
             session={browserDocked ? browserSession : null}
             workspaceId={workspaceId}
           />
+        ) : activePane === "workflows" ? (
+          <WorkflowPanel key={workspaceId} workspaceId={workspaceId} />
         ) : activePane === "tasks" && tasksSnapshot ? (
           <TasksPanel snapshot={tasksSnapshot} updatedAt={tasksUpdatedAt} />
         ) : activePane === "orchestration" && workflowRun ? (

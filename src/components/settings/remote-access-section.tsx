@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -82,7 +82,6 @@ import {
   lanEnabledOf,
   lanExposurePhrase,
   msUntil,
-  newlyPendingSessionIds,
   originHostSurvivesScope,
   pendingSessions,
   pickPrimaryEndpoint,
@@ -837,31 +836,7 @@ export function RemoteAccessSection() {
   const [pairingPending, setPairingPending] = useState(false);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
   const [revokingAll, setRevokingAll] = useState(false);
-
-  // Latest known sessions, used to detect *new* pending devices on each
-  // live event so we can toast exactly once per arrival.
-  const prevSessionsRef = useRef<WebRemoteSessionView[]>([]);
-
-  const applyStatus = useCallback(
-    (next: WebRemoteStatus, { detectPending }: { detectPending: boolean }) => {
-      if (detectPending) {
-        const fresh = newlyPendingSessionIds(
-          prevSessionsRef.current,
-          next.sessions,
-        );
-        for (const id of fresh) {
-          const s = next.sessions.find((x) => x.id === id);
-          const d = describeDevice(s?.name ?? null, s?.user_agent ?? null);
-          toast.info(`${d.title} wants to connect`, {
-            description: "Approve it under Devices to grant access.",
-          });
-        }
-      }
-      prevSessionsRef.current = next.sessions;
-      setStatus(next);
-    },
-    [],
-  );
+  const [confirmRevokeAll, setConfirmRevokeAll] = useState(false);
 
   const refreshEndpoints = useCallback(async () => {
     try {
@@ -877,7 +852,7 @@ export function RemoteAccessSection() {
    *  socket reconnects. Silent by design — the reflected value is the feedback. */
   const reconcileAfterRebind = useCallback(
     (fresh: WebRemoteStatus) => {
-      applyStatus(fresh, { detectPending: false });
+      setStatus(fresh);
       setPortDraft(String(fresh.port));
       setScopeOverride(null);
       setRebindPhase(null);
@@ -885,7 +860,7 @@ export function RemoteAccessSection() {
       setPairing(null);
       if (fresh.running) void refreshEndpoints();
     },
-    [applyStatus, refreshEndpoints],
+    [refreshEndpoints],
   );
 
   /** Enter the terminal cutoff state: this device can't reconnect. Annotate
@@ -904,7 +879,6 @@ export function RemoteAccessSection() {
       try {
         const s = await webRemoteStatus();
         if (disposed) return;
-        prevSessionsRef.current = s.sessions;
         setStatus(s);
         setPortDraft(String(s.port));
         if (s.running) void refreshEndpoints();
@@ -913,7 +887,7 @@ export function RemoteAccessSection() {
       }
     })();
     onWebRemoteStateChanged((next) => {
-      applyStatus(next, { detectPending: true });
+      setStatus(next);
       if (next.running) void refreshEndpoints();
       else setEndpoints([]);
     }).then((fn) => {
@@ -924,7 +898,7 @@ export function RemoteAccessSection() {
       disposed = true;
       unlisten?.();
     };
-  }, [applyStatus, refreshEndpoints]);
+  }, [refreshEndpoints]);
 
   // After a rebind-induced disconnect, the shim's reconnect loop re-establishes
   // the socket and the store flips back to "connected". Refetch the authoritative
@@ -1061,7 +1035,7 @@ export function RemoteAccessSection() {
       setTogglePending(true);
       try {
         const result = next ? await webRemoteEnable() : await webRemoteDisable();
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         if (result.running) void refreshEndpoints();
         else {
           setEndpoints([]);
@@ -1074,12 +1048,12 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] toggle failed:", err);
-        toast.error(`Couldn't ${next ? "enable" : "disable"} remote access: ${String(err)}`);
+        toast.failure(`Couldn't ${next ? "enable" : "disable"} remote access`, err);
       } finally {
         setTogglePending(false);
       }
     },
-    [applyStatus, refreshEndpoints],
+    [refreshEndpoints],
   );
 
   const handleToggle = useCallback(
@@ -1102,25 +1076,25 @@ export function RemoteAccessSection() {
       setRetryPending(true);
       try {
         const result = await webRemoteRetry();
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         if (result.running) void refreshEndpoints();
         if (what === "server") toast.success("Listening on your network again.");
       } catch (err) {
         console.error("[remote-access] retry failed:", err);
         if (what === "server") {
-          toast.error(`Still couldn't start the server: ${String(err)}`);
+          toast.failure("Still couldn't start the server", err);
         } else {
           // The rejection is about the listener; registration was retried
           // regardless and reports back through the live status.
           void webRemoteStatus()
-            .then((fresh) => applyStatus(fresh, { detectPending: false }))
+            .then((fresh) => setStatus(fresh))
             .catch(() => undefined);
         }
       } finally {
         setRetryPending(false);
       }
     },
-    [applyStatus, refreshEndpoints],
+    [refreshEndpoints],
   );
 
   const handleApplyPort = useCallback(async () => {
@@ -1149,7 +1123,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set port failed:", err);
           setPortDraft(String(status?.port ?? nextPort));
           setRebindPhase(null);
-          toast.error(`Couldn't change the port: ${String(err)}`);
+          toast.failure("Couldn't change the port", err);
         }
       } finally {
         setPortPending(false);
@@ -1160,7 +1134,7 @@ export function RemoteAccessSection() {
     // Desktop (native IPC) or relay: this UI's own transport is unaffected.
     try {
       const result = await webRemoteSetConfig({ port: nextPort });
-      applyStatus(result, { detectPending: false });
+      setStatus(result);
       setPortDraft(String(result.port));
       if (result.running) void refreshEndpoints();
       // A port change invalidates any composed pairing URL.
@@ -1168,12 +1142,11 @@ export function RemoteAccessSection() {
       reportLanOutcome(result, `Port set to ${result.port}.`);
     } catch (err) {
       console.error("[remote-access] set port failed:", err);
-      toast.error(`Couldn't change the port: ${String(err)}`);
+      toast.failure("Couldn't change the port", err);
     } finally {
       setPortPending(false);
     }
   }, [
-    applyStatus,
     portValidation,
     reconcileAfterRebind,
     refreshEndpoints,
@@ -1206,7 +1179,7 @@ export function RemoteAccessSection() {
           console.error("[remote-access] set scope failed:", err);
           setScopeOverride(null);
           setRebindPhase(null);
-          toast.error(`Couldn't change where the server is visible: ${String(err)}`);
+          toast.failure("Couldn't change where the server is visible", err);
         }
       } finally {
         setScopePending(false);
@@ -1235,7 +1208,7 @@ export function RemoteAccessSection() {
       setScopePending(true);
       try {
         const result = await webRemoteSetConfig({ bindScope: next });
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         // A scope change rebinds, so the reachable-endpoint set changes too.
         if (result.running) void refreshEndpoints();
         // A rebind drops any composed pairing URL (the old address may be gone).
@@ -1248,12 +1221,12 @@ export function RemoteAccessSection() {
         console.error("[remote-access] set scope failed:", err);
         // The backend keeps the previous, working scope on failure and the
         // status it broadcasts reflects that, so the control snaps back.
-        toast.error(`Couldn't change where the server is visible: ${String(err)}`);
+        toast.failure("Couldn't change where the server is visible", err);
       } finally {
         setScopePending(false);
       }
     },
-    [applyScopeRemote, applyStatus, bindScope, refreshEndpoints, reportLanOutcome, transport],
+    [applyScopeRemote, bindScope, refreshEndpoints, reportLanOutcome, transport],
   );
 
   const applyLan = useCallback(
@@ -1261,7 +1234,7 @@ export function RemoteAccessSection() {
       setLanPending(true);
       try {
         const result = await webRemoteSetConfig({ lanEnabled: next });
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         if (result.running) void refreshEndpoints();
         else {
           setEndpoints([]);
@@ -1271,12 +1244,12 @@ export function RemoteAccessSection() {
         else toast.success("Stopped listening on your network.");
       } catch (err) {
         console.error("[remote-access] set LAN listener failed:", err);
-        toast.error(`Couldn't change network access: ${String(err)}`);
+        toast.failure("Couldn't change network access", err);
       } finally {
         setLanPending(false);
       }
     },
-    [applyStatus, refreshEndpoints, reportLanOutcome],
+    [refreshEndpoints, reportLanOutcome],
   );
 
   const handleToggleLan = useCallback(
@@ -1295,7 +1268,7 @@ export function RemoteAccessSection() {
       setApprovalPending(true);
       try {
         const result = await webRemoteSetConfig({ requireApproval: next });
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         toast.success(
           next
             ? "Pairing links now wait for your approval."
@@ -1303,12 +1276,12 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set approval failed:", err);
-        toast.error(`Couldn't change approval mode: ${String(err)}`);
+        toast.failure("Couldn't change approval mode", err);
       } finally {
         setApprovalPending(false);
       }
     },
-    [applyStatus],
+    [],
   );
 
   const handleToggleAccountMode = useCallback(
@@ -1316,7 +1289,7 @@ export function RemoteAccessSection() {
       setAccountModePending(true);
       try {
         const result = await webRemoteSetConfig({ accountModeEnabled: next });
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         toast.success(
           next
             ? "Browsers on your network can now sign in with your Codemux account."
@@ -1324,12 +1297,12 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set account mode failed:", err);
-        toast.error(`Couldn't change account sign-in: ${String(err)}`);
+        toast.failure("Couldn't change account sign-in", err);
       } finally {
         setAccountModePending(false);
       }
     },
-    [applyStatus],
+    [],
   );
 
   /** "Approve browsers on my account" is the inverse of the stored
@@ -1341,7 +1314,7 @@ export function RemoteAccessSection() {
         const result = await webRemoteSetConfig({
           trustAccountBrowsers: !requireApprovalNext,
         });
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         toast.success(
           requireApprovalNext
             ? "Browsers on your account now wait for your approval."
@@ -1349,12 +1322,12 @@ export function RemoteAccessSection() {
         );
       } catch (err) {
         console.error("[remote-access] set trust-account failed:", err);
-        toast.error(`Couldn't change account approval: ${String(err)}`);
+        toast.failure("Couldn't change account approval", err);
       } finally {
         setTrustAccountPending(false);
       }
     },
-    [applyStatus],
+    [],
   );
 
   const applyRelay = useCallback(
@@ -1362,7 +1335,7 @@ export function RemoteAccessSection() {
       setRelayModePending(true);
       try {
         const result = await webRemoteSetConfig({ relayModeEnabled: next });
-        applyStatus(result, { detectPending: false });
+        setStatus(result);
         if (next && !result.relay_running && result.registration_error) {
           toast.error(`Saved, but ${result.registration_error}`);
         } else {
@@ -1374,12 +1347,12 @@ export function RemoteAccessSection() {
         }
       } catch (err) {
         console.error("[remote-access] set relay mode failed:", err);
-        toast.error(`Couldn't change from-anywhere access: ${String(err)}`);
+        toast.failure("Couldn't change from-anywhere access", err);
       } finally {
         setRelayModePending(false);
       }
     },
-    [applyStatus],
+    [],
   );
 
   const handleToggleRelayMode = useCallback(
@@ -1409,7 +1382,7 @@ export function RemoteAccessSection() {
       setPairing(await webRemoteCreatePairing());
     } catch (err) {
       console.error("[remote-access] create pairing failed:", err);
-      toast.error(`Couldn't create a pairing link: ${String(err)}`);
+      toast.failure("Couldn't create a pairing link", err);
     } finally {
       setPairingPending(false);
     }
@@ -1419,45 +1392,45 @@ export function RemoteAccessSection() {
     async (id: string) => {
       setSessionBusy(id);
       try {
-        applyStatus(await webRemoteApproveSession(id), { detectPending: false });
-        toast.success("Device approved.");
+        setStatus(await webRemoteApproveSession(id));
+        toast.success("Browser approved.");
       } catch (err) {
-        toast.error(`Couldn't approve the device: ${String(err)}`);
+        toast.failure("Couldn't approve the browser", err);
       } finally {
         setSessionBusy(null);
       }
     },
-    [applyStatus],
+    [],
   );
 
   const handleReject = useCallback(
     async (id: string) => {
       setSessionBusy(id);
       try {
-        applyStatus(await webRemoteRejectSession(id), { detectPending: false });
+        setStatus(await webRemoteRejectSession(id));
         toast.success("Request rejected.");
       } catch (err) {
-        toast.error(`Couldn't reject the device: ${String(err)}`);
+        toast.failure("Couldn't reject the browser", err);
       } finally {
         setSessionBusy(null);
       }
     },
-    [applyStatus],
+    [],
   );
 
   const handleRevoke = useCallback(
     async (id: string) => {
       setSessionBusy(id);
       try {
-        applyStatus(await webRemoteRevokeSession(id), { detectPending: false });
-        toast.success("Device revoked — its access is now blocked.");
+        setStatus(await webRemoteRevokeSession(id));
+        toast.success("Browser revoked. Its access is now blocked.");
       } catch (err) {
-        toast.error(`Couldn't revoke the device: ${String(err)}`);
+        toast.failure("Couldn't revoke the browser", err);
       } finally {
         setSessionBusy(null);
       }
     },
-    [applyStatus],
+    [],
   );
 
   const handleRevokeAll = useCallback(async () => {
@@ -1467,21 +1440,21 @@ export function RemoteAccessSection() {
       for (const s of approved) {
         last = await webRemoteRevokeSession(s.id);
       }
-      if (last) applyStatus(last, { detectPending: false });
-      toast.success("Revoked every device.");
+      if (last) setStatus(last);
+      toast.success("Revoked every browser.");
     } catch (err) {
-      toast.error(`Couldn't revoke every device: ${String(err)}`);
+      toast.failure("Couldn't revoke every browser", err);
     } finally {
       setRevokingAll(false);
     }
-  }, [applyStatus, approved]);
+  }, [approved]);
 
   // Shared by both cards: the one setting that governs every browser signing
   // in with the account, whichever way in it used.
   const accountApprovalRow = (
     <SettingRow
       title="Approve browsers that sign in with your account"
-      detail="A new browser on your account waits under Devices until you approve it. Applies to both ways in."
+      detail="A new browser on your account waits under Paired browsers until you approve it. Applies to both ways in."
       checked={!trustAccountBrowsers}
       onCheckedChange={handleToggleAccountApproval}
       disabled={trustAccountPending}
@@ -1863,8 +1836,8 @@ export function RemoteAccessSection() {
 
               <div className="border-t border-border/60 pt-4">
                 <SettingRow
-                  title="Approve devices that use a pairing link"
-                  detail="A device that opens a valid pairing link waits under Devices until you approve it. When off, the link connects right away."
+                  title="Approve browsers that use a pairing link"
+                  detail="A browser that opens a valid pairing link waits under Paired browsers until you approve it. When off, the link connects right away."
                   checked={requireApproval}
                   onCheckedChange={handleToggleApproval}
                   disabled={approvalPending}
@@ -1902,12 +1875,13 @@ export function RemoteAccessSection() {
             </WayCard>
           </div>
 
-          {/* Devices — one answer to "what can reach this machine": paired
-              devices and account browsers, from either way in. */}
+          {/* Paired browsers — one answer to "what can reach this machine":
+              paired devices and account browsers, from either way in. Not
+              called "Devices": that name belongs to the SSH hosts page. */}
           <section className="space-y-2">
             <div className="flex items-center justify-between gap-4">
               <div className="flex items-center gap-2">
-                <SubHeading>Devices</SubHeading>
+                <SubHeading>Paired browsers</SubHeading>
                 {connectedCount > 0 && (
                   <span className="text-label font-medium text-status-open tabular-nums">
                     {connectedCount} connected
@@ -1921,7 +1895,7 @@ export function RemoteAccessSection() {
                   size="sm"
                   className="text-muted-foreground hover:text-status-attention"
                   disabled={revokingAll}
-                  onClick={handleRevokeAll}
+                  onClick={() => setConfirmRevokeAll(true)}
                 >
                   <Trash2 className="size-3.5" />
                   Revoke all
@@ -1958,7 +1932,7 @@ export function RemoteAccessSection() {
               pending.length === 0 && (
                 <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-muted-foreground/70">
                   <Server className="size-4" />
-                  No devices yet. Connect one from app.codemux.org or with a
+                  No browsers yet. Connect one from app.codemux.org or with a
                   pairing link.
                 </div>
               )
@@ -2018,6 +1992,27 @@ export function RemoteAccessSection() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={confirmCutoff}>Continue</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmRevokeAll} onOpenChange={setConfirmRevokeAll}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Revoke {approved.length === 1 ? "1 browser" : `all ${approved.length} browsers`}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {isRemoteClient()
+                ? "Every paired browser loses access at once, including this one. Each will need a new pairing link or approval to reconnect."
+                : "Every paired browser loses access at once. Each will need a new pairing link or approval to reconnect."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={handleRevokeAll}>
+              Revoke all
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

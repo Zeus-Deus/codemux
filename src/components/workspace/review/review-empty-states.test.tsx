@@ -16,6 +16,7 @@ import {
   BranchLocalOnlyState,
   CliMissingState,
   NoPullRequestState,
+  NoRemoteState,
   RepoUnreachableState,
   SignedOutState,
   UnsupportedHostState,
@@ -116,6 +117,20 @@ describe("branch is local only", () => {
       "uncommitted changes",
     );
   });
+
+  it("says Pushing, and takes no second click, while the push runs", () => {
+    render(
+      <BranchLocalOnlyState
+        changedFiles={0}
+        pushOnly
+        pushing
+        onCommitAndPush={vi.fn()}
+        onOpenChanges={vi.fn()}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Pushing" });
+    expect(button).toBeDisabled();
+  });
 });
 
 describe("host not authenticated", () => {
@@ -145,6 +160,30 @@ describe("host not authenticated", () => {
     render(<SignedOutState provider={gitlab} />);
     expect(screen.getByText("Sign in to GitLab")).toBeInTheDocument();
     expect(screen.getByText("glab auth login")).toBeInTheDocument();
+  });
+
+  it("offers to check again after signing in elsewhere", async () => {
+    const user = userEvent.setup();
+    const onRecheck = vi.fn();
+    render(<SignedOutState provider={github} onRecheck={onRecheck} />);
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    expect(onRecheck).toHaveBeenCalled();
+  });
+});
+
+describe("no remote", () => {
+  it("keeps local review one click away and names the fix", async () => {
+    const user = userEvent.setup();
+    const onOpenChanges = vi.fn();
+    const onRecheck = vi.fn();
+    render(<NoRemoteState onOpenChanges={onOpenChanges} onRecheck={onRecheck} />);
+
+    expect(screen.getByText("This repository has no remote yet")).toBeInTheDocument();
+    expect(screen.getByText("git remote add origin <url>")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Review changes" }));
+    expect(onOpenChanges).toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    expect(onRecheck).toHaveBeenCalled();
   });
 });
 

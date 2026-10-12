@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from "vitest";
 import { render, screen, fireEvent, within, cleanup, waitFor } from "@testing-library/react";
+afterEach(cleanup);
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -27,6 +28,10 @@ let mockActiveWorkspaceId: string | null = "ws-1";
 
 vi.mock("@/lib/toast", () => ({
   toast: { error: (...args: unknown[]) => mockToastError(...args) },
+}));
+
+vi.mock("@/components/settings/custom-acp-settings", () => ({
+  CustomAcpSettings: () => null,
 }));
 
 vi.mock("@/stores/ui-store", () => ({
@@ -71,7 +76,13 @@ vi.mock("@/stores/settings-store", () => {
     "sidebar.auto_settle_days": "3",
     "agents.orb_match_activity": "true",
     "agents.auto_resume_usage_limit": "true",
+    "agents.cross_provider_delegation": "true",
     "chat.code_wrap": "false",
+    "chat.default_checkout": "worktree",
+    "diff.layout": "unified",
+    "diff.hide_whitespace": "false",
+    "diff.file_state": "expanded",
+    "appearance.time_format": "system",
   };
   // Built lazily: `mockSettingsSet` is hoisted below this factory.
   const state = () => ({
@@ -96,6 +107,14 @@ vi.mock("@/stores/settings-store", () => {
     selectSidebarAutoSettleDays: () => 3,
     selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
+    selectCrossProviderDelegation: () => false,
+    selectNewChatCheckout: () => "worktree",
+    selectDiffLayoutPreference: () => "unified",
+    selectHideWhitespacePreference: () => false,
+    selectDiffFileState: () => "expanded",
+    selectTimeFormat: () => "system",
+    getNewChatCheckout: () => "worktree",
+    getTimeFormat: () => "system",
   };
 });
 
@@ -108,6 +127,11 @@ vi.mock("@/stores/auth-store", () => ({
     }),
 }));
 
+const mockUpdateSyncedSetting = vi.fn().mockResolvedValue(undefined);
+// The synced sound flag differs from `config.notification_sound_enabled`
+// above on purpose: the switches must follow the synced values.
+const syncedNotifications = { sound_enabled: false, desktop_enabled: true };
+
 vi.mock("@/stores/synced-settings-store", () => ({
   useSyncedSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
@@ -117,9 +141,9 @@ vi.mock("@/stores/synced-settings-store", () => ({
         terminal: { scrollback_limit: 10000, cursor_style: "bar" },
         git: { default_base_branch: "main" },
         keyboard: { shortcuts: {} },
-        notifications: { sound_enabled: true, desktop_enabled: true },
+        notifications: syncedNotifications,
       },
-      updateSetting: vi.fn(),
+      updateSetting: mockUpdateSyncedSetting,
       isSyncing: false,
       syncIssue: null,
     }),
@@ -127,13 +151,13 @@ vi.mock("@/stores/synced-settings-store", () => ({
   selectDefaultEditor: () => "",
   selectDefaultBaseBranch: () => "main",
   selectBrowserDefaultViewport: () => null,
+  selectKeyboardShortcuts: () => ({}),
   selectNotificationSoundEnabled: () => true,
   selectDesktopNotificationsEnabled: () => true,
 }));
 
 vi.mock("@/tauri/commands", () => ({
   detectEditors: vi.fn().mockResolvedValue([]),
-  setNotificationSoundEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageCli: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageModel: vi.fn().mockResolvedValue(undefined),
@@ -157,10 +181,21 @@ vi.mock("@/tauri/commands", () => ({
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
   usageExportCsv: vi.fn().mockResolvedValue(""),
+  agentConnectorStatus: vi.fn().mockResolvedValue({ enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null, localCommand: "codemux mcp", pending: [], clients: [] }),
+  agentConnectorRevoke: vi.fn().mockResolvedValue(undefined),
+  listMcpServers: vi.fn().mockResolvedValue([]),
+  getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
+  setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
+  primeMcpRuntime: vi.fn().mockResolvedValue([]),
+  usageRefreshQuota: vi.fn().mockResolvedValue({ quota: {}, statuses: [], refreshed_at_ms: 0 }),
+  usagePriceOverrides: vi.fn().mockResolvedValue({}),
 }));
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
 vi.mock("@/tauri/events", () => ({
   onPresetsChanged: vi.fn().mockReturnValue(Promise.resolve(() => {})),
+  onAgentConnectorChanged: vi.fn().mockResolvedValue(() => {}),
 }));
 
 // ── Model picker mock ──
@@ -441,6 +476,68 @@ describe("SettingsPanel — Git section model pickers", () => {
 // picker and the indicator-color swatches were deleted outright when the
 // orb replaced them — there is nothing left to pick.
 
+describe("SettingsPanel — Git section diff defaults", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openGitSection() {
+    render(<SettingsView />);
+    fireEvent.click(screen.getAllByRole("button", { name: /Git/i })[0]);
+  }
+
+  it("writes the diff layout and file state defaults", () => {
+    openGitSection();
+    fireEvent.click(screen.getAllByRole("radio", { name: /^Split$/i })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.layout", "split");
+    fireEvent.click(screen.getAllByRole("radio", { name: /^Collapsed$/i })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.file_state", "collapsed");
+  });
+
+  it("toggling Hide whitespace changes writes diff.hide_whitespace", () => {
+    openGitSection();
+    fireEvent.click(screen.getByRole("switch", { name: "Hide whitespace changes" }));
+    expect(mockSettingsSet).toHaveBeenCalledWith("diff.hide_whitespace", "true");
+  });
+});
+
+describe("SettingsPanel — Notifications section", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openNotifications() {
+    render(<SettingsView />);
+    fireEvent.click(screen.getAllByRole("button", { name: /Notifications/i })[0]);
+  }
+
+  it("shows the synced sound and desktop preferences", () => {
+    openNotifications();
+    expect(
+      screen.getAllByRole("switch", { name: "Notification sounds" })[0],
+    ).toHaveAttribute("aria-checked", "false");
+    expect(
+      screen.getAllByRole("switch", { name: "Desktop notifications" })[0],
+    ).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("writes each toggle to the synced notification settings", () => {
+    openNotifications();
+    fireEvent.click(screen.getAllByRole("switch", { name: "Notification sounds" })[0]);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith(
+      "notifications",
+      "sound_enabled",
+      true,
+    );
+    fireEvent.click(screen.getAllByRole("switch", { name: "Desktop notifications" })[0]);
+    expect(mockUpdateSyncedSetting).toHaveBeenCalledWith(
+      "notifications",
+      "desktop_enabled",
+      false,
+    );
+  });
+});
+
 describe("SettingsPanel — Appearance Agents section", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -494,6 +591,13 @@ describe("SettingsPanel — Appearance Agents section", () => {
       "sidebar.auto_settle_days",
       "7",
     );
+  });
+
+  it("choosing a time format writes appearance.time_format", () => {
+    openAppearance();
+    const [twentyFour] = screen.getAllByRole("radio", { name: /^24-hour$/i });
+    fireEvent.click(twentyFour);
+    expect(mockSettingsSet).toHaveBeenCalledWith("appearance.time_format", "24h");
   });
 
   it("toggling Match the orb to the activity writes agents.orb_match_activity", () => {
@@ -555,6 +659,30 @@ describe("Settings footer navigation", () => {
     expect(view.getByRole("status")).toHaveTextContent("Settings section unavailable");
     expect(view.queryByRole("button", { name: "Pin to footer" })).toBeNull();
     view.unmount();
+  });
+
+  it("keeps inbound administration on the shared MCP route in classic CLI mode without mounting outbound runtime", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    vi.clearAllMocks();
+    const status = { enabled: true, publicOrigin: null, listenerRunning: false, mcpUrl: null,
+      localCommand: "codemux mcp", pending: [], clients: [{ id: "synthetic-granted", clientName: "Synthetic read-only assistant", callbackOrigin: "https://client.example",
+        access: "read_only" as const, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString() }] };
+    vi.mocked(commands.agentConnectorStatus).mockResolvedValue(status);
+    requestedSection = "mcp";
+    const view = render(<SettingsView />);
+    try {
+      expect(view.getByRole("button", { name: "MCP Servers" })).toHaveAttribute("aria-current", "page");
+      fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
+      vi.mocked(commands.agentConnectorStatus).mockResolvedValue({ ...status, clients: [] });
+      fireEvent.click(view.getByRole("button", { name: "Revoke access" }));
+      await waitFor(() => expect(commands.agentConnectorRevoke).toHaveBeenCalledWith("synthetic-granted"));
+      await waitFor(() => expect(view.queryByText("Synthetic read-only assistant")).not.toBeInTheDocument());
+      expect(commands.agentConnectorStatus).toHaveBeenCalledTimes(2);
+      for (const fn of [commands.listMcpServers, commands.getMcpRuntimeStatus, commands.setMcpDisabledIds, commands.primeMcpRuntime]) expect(fn).not.toHaveBeenCalled();
+      expect(view.queryByLabelText("Refresh MCP servers")).not.toBeInTheDocument();
+      expect(useFeatureFlags.getState().enableAgentChat).toBe(false);
+    } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); requestedSection = null; }
   });
 
   it("does not render a chat-only Settings section when the feature is disabled", async () => {

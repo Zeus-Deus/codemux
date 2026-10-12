@@ -34,6 +34,20 @@ pub trait AgentProvider: Send + Sync {
     /// Static declaration of what mid-session operations are supported.
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Workflow execution requires guarantees beyond the chat UI controls.
+    /// Adapters opt in individually; ignored input fields are not support.
+    fn managed_capabilities(&self) -> super::managed::ManagedCapabilities {
+        super::managed::ManagedCapabilities::default()
+    }
+
+    /// Close an attempt and prove that its owned execution is no longer live.
+    /// A normal stop acknowledgement alone must never release a write lease.
+    async fn stop_managed_session(&self, _thread_id: ThreadId) -> Result<(), ProviderError> {
+        Err(ProviderError::ValidationError {
+            message: "provider cannot verify managed execution quiescence".into(),
+        })
+    }
+
     /// Bring up a new session (or resume a previous one via `resume_cursor`).
     ///
     /// Returns the canonical snapshot once the session has advanced to at
@@ -43,6 +57,16 @@ pub trait AgentProvider: Send + Sync {
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError>;
+
+    /// Only cancellation-safe pre-dispatch waits may observe this token.
+    /// Default adapters keep their existing startup/cleanup ownership; do not
+    /// drop an in-flight startup RPC as a generic cancellation fallback.
+    async fn start_session_with_cancellation(
+        &self, input: StartSessionInput,
+        _cancellation: Option<std::sync::Arc<dyn super::types::SessionStartCancellation>>,
+    ) -> Result<ProviderSession, ProviderError> {
+        self.start_session(input).await
+    }
 
     /// Queue a user turn on an existing session. Returns the newly minted
     /// turn identifier; actual turn output streams through
@@ -175,6 +199,25 @@ pub trait AgentProvider: Send + Sync {
         })
     }
 
+    /// Service tiers are provider-native identifiers. Boolean adapters accept
+    /// only Standard/Fast; they must never silently treat Ultrafast as Fast.
+    async fn set_service_tier(
+        &self,
+        thread_id: ThreadId,
+        tier: String,
+    ) -> Result<(), ProviderError> {
+        let fast = match tier.as_str() {
+            "default" => false,
+            "fast" => true,
+            _ => {
+                return Err(ProviderError::ValidationError {
+                    message: "provider does not support this service tier".into(),
+                })
+            }
+        };
+        self.set_fast_mode(thread_id, fast).await
+    }
+
     /// Swap the session's permission mode at runtime.
     async fn set_permission_mode(
         &self,
@@ -251,4 +294,10 @@ pub trait AgentProvider: Send + Sync {
     /// Each call typically returns a fresh subscription; implementations are
     /// free to multiplex a single underlying broadcaster to many consumers.
     fn event_stream(&self) -> ProviderEventStream;
+
+    /// Managed subscribers must surface event loss instead of silently
+    /// treating a truncated stream as a successful execution.
+    fn managed_event_stream(&self, _thread_id: &ThreadId) -> ProviderEventStream {
+        self.event_stream()
+    }
 }

@@ -13,6 +13,217 @@ use std::time::Duration;
 use codemux_lib::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 use serde_json::{json, Value};
 
+#[cfg(target_os = "linux")]
+struct OwnedPeer(i32);
+#[cfg(target_os = "linux")]
+impl Drop for OwnedPeer {
+    fn drop(&mut self) {
+        // Failure-safe cleanup of this fixture's exact subprocess only.
+        if PathBuf::from(format!("/proc/{}", self.0)).exists() {
+            unsafe { libc::kill(self.0, libc::SIGKILL); }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn nonreading_peer() -> (std::sync::Arc<JsonRpcChild>, OwnedPeer, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let child = std::sync::Arc::new(JsonRpcChild::spawn(SpawnConfig {
+        program: "/usr/bin/python3".into(),
+        args: vec!["-I".into(), "-u".into(), "-c".into(),
+            "import json,os,time; print(json.dumps({'jsonrpc':'2.0','method':'ready','params':{'pid':os.getpid()}}),flush=True); time.sleep(60)".into()],
+        env: std::collections::HashMap::from([
+            ("HOME".into(), dir.path().to_string_lossy().into_owned()),
+            ("TMPDIR".into(), dir.path().to_string_lossy().into_owned()),
+        ]),
+        cwd: Some(dir.path().to_owned()),
+        ..config()
+    }).await.unwrap());
+    let mut notes = child.notifications();
+    let ready = tokio::time::timeout(Duration::from_secs(2), notes.recv()).await.unwrap().unwrap();
+    let peer = OwnedPeer(ready.params["pid"].as_i64().unwrap() as i32);
+    (child, peer, dir)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn transport_shutdown_reaps_with_nonreading_stdin() {
+    let (child, peer, _dir) = nonreading_peer().await;
+    let write = child.notify("fill", json!({"text":"x".repeat(4 * 1024 * 1024)}));
+    tokio::pin!(write);
+    assert!(futures_util::poll!(&mut write).is_pending(), "large actual stdin write must block");
+    let outcome = tokio::time::timeout(Duration::from_secs(4), child.shutdown()).await;
+    let reaped = !PathBuf::from(format!("/proc/{}", peer.0)).exists();
+    drop(write);
+    drop(peer);
+    assert!(matches!(outcome, Ok(Ok(()))), "shutdown must reap despite a held writer: {outcome:?}");
+    assert!(reaped, "successful shutdown must have actually reaped the peer");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn transport_concurrent_shutdown_joins_owned_reap() {
+    let (child, peer, _dir) = nonreading_peer().await;
+    let write = child.notify("fill", json!({"text":"x".repeat(4 * 1024 * 1024)}));
+    tokio::pin!(write);
+    assert!(futures_util::poll!(&mut write).is_pending());
+    let result = tokio::time::timeout(Duration::from_secs(6), async {
+        tokio::join!(child.shutdown(), child.shutdown())
+    }).await;
+    let reaped = !PathBuf::from(format!("/proc/{}", peer.0)).exists();
+    drop(write);
+    drop(peer);
+    assert!(matches!(result, Ok((Ok(()), Ok(())))), "both callers must join cleanup, not wedge/time out: {result:?}");
+    assert!(reaped);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn transport_cancelled_shutdown_initiator_does_not_strand_cleanup() {
+    let (child, peer, _dir) = nonreading_peer().await;
+    {
+        let write = child.notify("fill", json!({"text":"x".repeat(4 * 1024 * 1024)}));
+        tokio::pin!(write);
+        assert!(futures_util::poll!(&mut write).is_pending());
+        {
+            let first = child.shutdown();
+            tokio::pin!(first);
+            assert!(futures_util::poll!(&mut first).is_pending());
+        } // Cancel the actual sole initiator while the writer is still held.
+    } // Cancel the blocked write and release its writer guard.
+    let outcome = child.shutdown().await;
+    let reaped = !PathBuf::from(format!("/proc/{}", peer.0)).exists();
+    drop(peer);
+    assert!(outcome.is_ok(), "another caller must join initiated cleanup after cancellation: {outcome:?}");
+    assert!(reaped);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn transport_inherited_pipes_are_closed_at_owned_drain_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
+    let done = dir.path().join("done");
+    let script = r#"import json,os,sys,time
+q=json.loads(sys.stdin.readline())
+pid=os.fork()
+if pid == 0:
+    deadline=time.monotonic()+10
+    while not os.path.exists(sys.argv[1]) and time.monotonic()<deadline: time.sleep(.005)
+    try:
+        print(json.dumps({'jsonrpc':'2.0','method':'late','params':{}}),flush=True)
+        print('late stderr',file=sys.stderr,flush=True)
+    except BrokenPipeError: pass
+    open(sys.argv[2],'w').write('done')
+    os._exit(0)
+print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':{'pid':os.getpid(),'descendant':pid}}),flush=True)
+os._exit(0)
+"#;
+    let child = JsonRpcChild::spawn(SpawnConfig {
+        program: "/usr/bin/python3".into(),
+        args: vec!["-I".into(),"-u".into(),"-c".into(),script.into(),release.to_string_lossy().into_owned(),done.to_string_lossy().into_owned()],
+        cwd: Some(dir.path().to_owned()),
+        env: std::collections::HashMap::from([("HOME".into(),dir.path().to_string_lossy().into_owned()),("TMPDIR".into(),dir.path().to_string_lossy().into_owned())]),
+        ..config()
+    }).await.unwrap();
+    let mut notes = child.notifications();
+    let mut incoming = child.incoming_requests().unwrap();
+    let response = child.request("fork",json!({})).await.unwrap();
+    let parent = OwnedPeer(response["pid"].as_i64().unwrap() as i32);
+    let descendant = OwnedPeer(response["descendant"].as_i64().unwrap() as i32);
+    let result = child.shutdown().await;
+    let closed = tokio::time::timeout(Duration::from_millis(150), incoming.recv()).await;
+    let reaped = !PathBuf::from(format!("/proc/{}",parent.0)).exists();
+    std::fs::write(&release,"release").unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(2), async {
+        while !done.exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+    }).await;
+    let late = notes.try_recv();
+    drop(descendant);
+    drop(parent);
+    assert!(result.is_ok(),"owned shutdown must complete: {result:?}");
+    assert!(reaped);
+    assert!(finished.is_ok());
+    assert!(matches!(closed,Ok(None)),"shutdown must join/abort retained reader, not detach it: {closed:?}");
+    assert!(late.is_err(),"post-boundary descendant bytes must never be routed: {late:?}");
+}
+
+#[cfg(target_os = "linux")]
+async fn asymmetric_pipe_drain(retained_fd: u8, strict: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"import json,os,sys,time
+q=json.loads(sys.stdin.readline())
+pid=os.fork()
+if pid == 0:
+    os.close(0)
+    os.close(2 if sys.argv[1]=='1' else 1)
+    open('fd-closed','w').write('closed')
+    deadline=time.monotonic()+30
+    while not os.path.exists('release') and time.monotonic()<deadline: time.sleep(.005)
+    try: os.write(int(sys.argv[1]),b'{"jsonrpc":"2.0","method":"late","params":{}}\n')
+    except BrokenPipeError: pass
+    open('done','w').write('done')
+    os._exit(0)
+while not os.path.exists('fd-closed'): time.sleep(.005)
+print(json.dumps({'jsonrpc':'2.0','method':'ready','params':{'pid':os.getpid(),'descendant':pid}}),flush=True)
+while not os.path.exists('exit'): time.sleep(.005)
+os._exit(0)
+"#;
+    let config = SpawnConfig {
+        program: "/usr/bin/python3".into(),
+        args: vec!["-I".into(), "-u".into(), "-c".into(), script.into(), retained_fd.to_string()],
+        cwd: Some(dir.path().to_owned()),
+        env: std::collections::HashMap::from([("HOME".into(), dir.path().to_string_lossy().into_owned()), ("TMPDIR".into(), dir.path().to_string_lossy().into_owned())]),
+        default_timeout: Duration::from_secs(30),
+    };
+    let child = if strict { JsonRpcChild::spawn_strict(config).await } else { JsonRpcChild::spawn(config).await }.unwrap();
+    let mut notes = child.notifications();
+    let mut incoming = child.incoming_requests().unwrap();
+    // The actual pending request is written before the peer forks; never answered.
+    let pending = child.request("unanswered", json!({}));
+    tokio::pin!(pending);
+    let ready = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            ready = notes.recv() => ready.unwrap(),
+            result = &mut pending => panic!("peer must leave the request pending: {result:?}"),
+        }
+    }).await.unwrap();
+    let parent = OwnedPeer(ready.params["pid"].as_i64().unwrap() as i32);
+    let descendant = OwnedPeer(ready.params["descendant"].as_i64().unwrap() as i32);
+    std::fs::write(dir.path().join("exit"), "exit").unwrap();
+    let shutdowns = tokio::time::timeout(Duration::from_secs(6), async {
+        tokio::join!(child.shutdown(), child.shutdown(), child.shutdown())
+    }).await;
+    let settled = tokio::time::timeout(Duration::from_millis(150), &mut pending).await;
+    let closed = tokio::time::timeout(Duration::from_millis(150), incoming.recv()).await;
+    let reaped = !PathBuf::from(format!("/proc/{}", parent.0)).exists();
+    std::fs::write(dir.path().join("release"), "release").unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(2), async {
+        while !dir.path().join("done").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await;
+    let late = notes.try_recv();
+    drop(descendant);
+    drop(parent);
+    assert!(matches!(shutdowns, Ok((Ok(()), Ok(()), Ok(())))), "asymmetric fd={retained_fd} strict={strict}: watchdog must complete without double-poll panic: {shutdowns:?}");
+    assert!(reaped, "owned parent must actually be reaped");
+    assert!(matches!(settled, Ok(Err(RpcChildError::RpcError(_)))), "unanswered pending request must fail at the owned drain boundary: {settled:?}");
+    assert!(matches!(closed, Ok(None)), "callback channel must be closed: {closed:?}");
+    assert!(done.is_ok());
+    assert!(late.is_err(), "no descendant bytes may route after the drain boundary: {late:?}");
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn final_asymmetric_stdout_eof_stderr_inherited_tolerant() { asymmetric_pipe_drain(2, false).await; }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn final_asymmetric_stderr_eof_stdout_inherited_tolerant() { asymmetric_pipe_drain(1, false).await; }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn final_asymmetric_stdout_eof_stderr_inherited_strict() { asymmetric_pipe_drain(2, true).await; }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn final_asymmetric_stderr_eof_stdout_inherited_strict() { asymmetric_pipe_drain(1, true).await; }
+
 fn helper_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_rpc_child"))
 }
@@ -342,4 +553,36 @@ async fn incoming_requests_can_only_be_claimed_once() {
     assert!(first.is_some(), "first claim should return Some");
     assert!(second.is_none(), "second claim must be None");
     let _ = child.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_reap_even_when_stdout_closes_first() {
+    let child = JsonRpcChild::spawn(SpawnConfig {
+        program: "python3".into(),
+        args: vec![
+            "-u".into(),
+            "-c".into(),
+            "import json,os,sys,time; q=json.loads(sys.stdin.readline()); print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':os.getpid()}),flush=True); os.close(1); time.sleep(60)".into(),
+        ],
+        ..config()
+    })
+    .await
+    .expect("spawn owned peer");
+    let pid = child.request("pid", json!({})).await.unwrap().as_u64().unwrap();
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while child.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("stdout EOF should be observed");
+    child.shutdown().await.expect("shutdown");
+    let reaped_before_return = !proc.exists();
+    // Keep the original failure deterministic without abandoning the owned peer.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while proc.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("watchdog must ultimately reap its peer");
+    assert!(reaped_before_return, "stdout EOF is not proof that the owned process exited and was reaped before shutdown returned");
 }

@@ -12,8 +12,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useMcpStore } from "@/stores/mcp-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   listMcpServers,
   MCP_CODEMUX_SELF_ID,
@@ -26,6 +28,7 @@ import {
   type McpServerRuntime,
 } from "@/tauri/commands";
 
+import { OutsideAssistantsSection } from "./outside-assistants-section";
 import { McpToolModal } from "./mcp-tool-modal";
 import { SectionHeader } from "./settings-primitives";
 import { eyebrowVariants } from "@/components/ui/eyebrow";
@@ -64,6 +67,14 @@ interface Props {
  * updates so the UI never polls.
  */
 export function McpSection({ projectRoot }: Props) {
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  return <div>
+    {enableAgentChat && <OutboundMcpSection projectRoot={projectRoot} />}
+    <OutsideAssistantsSection />
+  </div>;
+}
+
+function OutboundMcpSection({ projectRoot }: Props) {
   const [servers, setServers] = useState<McpServerConfig[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -281,19 +292,24 @@ function ServerRow({
   const additionalSources = server.sources.slice(1);
   const isCodemuxSelf = server.id === MCP_CODEMUX_SELF_ID;
 
+  const reportFailure = (verb: "start" | "stop" | "restart") => (err: unknown) => {
+    console.warn(`[mcp] ${verb} ${server.id} failed:`, err);
+    toast.error(`Couldn't ${verb} ${server.name}`, {
+      description: err instanceof Error ? err.message : String(err),
+    });
+  };
+
   const handleToggle = (next: boolean) => {
     onToggle();
     // The store-level toggle persists + syncs to the backend; here we
     // just trigger the runtime spawn/stop so the row's status updates
     // immediately without waiting for the next prime.
     if (next) {
-      void startMcpServerCmd(server.id, projectRoot).catch((err) =>
-        console.warn(`[mcp] start ${server.id} failed:`, err),
+      void startMcpServerCmd(server.id, projectRoot).catch(
+        reportFailure("start"),
       );
     } else {
-      void stopMcpServerCmd(server.id).catch((err) =>
-        console.warn(`[mcp] stop ${server.id} failed:`, err),
-      );
+      void stopMcpServerCmd(server.id).catch(reportFailure("stop"));
     }
   };
 
@@ -359,11 +375,11 @@ function ServerRow({
           {commandPreview(server)}
         </p>
       </div>
-      {/* Hover-reveal "View tools" button — opens the modal. */}
+      {/* Revealed on row hover or keyboard focus, always shown on touch. */}
       <Button
         variant="ghost"
         size="sm"
-        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100"
+        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
         onClick={onView}
         data-testid={`mcp-row-${server.id}-view`}
       >
@@ -375,9 +391,7 @@ function ServerRow({
           variant="ghost"
           size="sm"
           onClick={() =>
-            void restartMcpServerCmd(server.id).catch((err) =>
-              console.warn(`[mcp] restart ${server.id} failed:`, err),
-            )
+            void restartMcpServerCmd(server.id).catch(reportFailure("restart"))
           }
           data-testid={`mcp-row-${server.id}-restart`}
         >

@@ -18,6 +18,9 @@ interface Props {
    *  what a per-file review section needs, since a PR is one scroll
    *  through many files rather than one scrollbar per file. */
   flow?: boolean;
+  /** Soft-wrap long lines instead of scrolling sideways. The gutter
+   *  stays pinned to the first visual line of its row. */
+  wrap?: boolean;
 }
 
 export interface DiffViewHandle {
@@ -25,7 +28,7 @@ export interface DiffViewHandle {
 }
 
 export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
-  function DiffUnifiedView({ lines, selection, flow = false }, ref) {
+  function DiffUnifiedView({ lines, selection, flow = false, wrap = false }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const scrollToHunk = useCallback(
       (direction: 1 | -1) => {
@@ -76,12 +79,21 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                   key={i}
                   data-diff-hunk
                   className={cn(
-                    "flex bg-muted/30 whitespace-pre mt-1 first:mt-0",
+                    "flex bg-muted/30 mt-1 first:mt-0",
+                    // Wrapped like the code rows, so the function context
+                    // after the range stays readable in a narrow pane.
+                    wrap ? "whitespace-pre-wrap" : "whitespace-pre",
                     rowHeight,
                   )}
                 >
                   <span className="w-[72px] shrink-0" />
-                  <span className={cn("text-muted-foreground/60 px-3", gutterSize)}>
+                  <span
+                    className={cn(
+                      "text-muted-foreground/60 px-3",
+                      gutterSize,
+                      wrap && "min-w-0 break-words",
+                    )}
+                  >
                     {line.content}
                   </span>
                 </div>
@@ -107,7 +119,8 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                   data-diff-row={selectable ? `${side}:${lineNo}` : undefined}
                   data-selected={selected ? "true" : undefined}
                   className={cn(
-                    "flex whitespace-pre",
+                    "flex",
+                    wrap ? "whitespace-pre-wrap" : "whitespace-pre",
                     rowHeight,
                     selected ? SELECTED_ROW_CLASS : style.bgClass,
                   )}
@@ -143,7 +156,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                   >
                     {style.prefixChar}
                   </span>
-                  <span className="flex-1 min-w-0 pr-4">
+                  <span className={cn("flex-1 min-w-0 pr-4", wrap && "break-words")}>
                     {style.isOursMarker && (
                       <span className="text-micro font-bold text-primary mr-2">OURS</span>
                     )}

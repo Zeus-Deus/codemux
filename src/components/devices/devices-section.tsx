@@ -11,6 +11,7 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { cn } from "@/lib/utils";
+import { Empty, EmptyDescription, EmptyTitle } from "@/components/ui/empty";
 import { toast } from "@/lib/toast";
 import { formatBytes } from "@/lib/format-bytes";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-seconds";
@@ -191,6 +192,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
 
 const TONE_DOT: Record<DeviceTone, string> = {
   online: "bg-status-open ring-[3px] ring-status-open/15",
+  updating: "bg-status-remote motion-safe:animate-pulse",
   attention: "bg-status-working ring-[3px] ring-status-working/15",
   offline: "bg-muted-foreground/60",
   checking: "bg-muted-foreground/40",
@@ -198,6 +200,7 @@ const TONE_DOT: Record<DeviceTone, string> = {
 
 const TONE_TEXT: Record<DeviceTone, string> = {
   online: "text-status-open",
+  updating: "text-status-remote",
   attention: "text-status-working",
   offline: "text-muted-foreground/70",
   checking: "text-muted-foreground/60",
@@ -249,7 +252,7 @@ function DeviceCardView({
           : "bg-surface-1 opacity-80",
       )}
     >
-      <div className="flex items-center gap-2.5 px-[13px] py-3">
+      <div className="flex items-center gap-2.5 px-[13px] py-3" data-device-card-header={card.remoteControlServing ? "serving" : "idle"}>
         <button
           type="button"
           onClick={toggle}
@@ -487,7 +490,7 @@ function WorkspaceRow({
         : null;
 
   return (
-    <li className="grid h-8 grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg px-2 hover:bg-surface-2">
+    <li className="grid h-8 grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg px-2 hover:bg-surface-2" data-device-sync-row>
       <span
         aria-hidden
         className="size-1.5 justify-self-center rounded-full bg-status-remote/70"
@@ -579,13 +582,13 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
 
 function EmptyDevices() {
   return (
-    <div className="px-6 py-8 text-center">
-      <p className="text-body font-semibold text-foreground">No devices yet</p>
-      <p className="mx-auto mt-1.5 max-w-[420px] text-body-sm leading-relaxed text-muted-foreground/80">
+    <Empty className="px-6">
+      <EmptyTitle>No devices yet</EmptyTitle>
+      <EmptyDescription>
         Add a device — your home desktop, an always-on box, or a cloud server
         — then push work to it from any workspace's menu.
-      </p>
-    </div>
+      </EmptyDescription>
+    </Empty>
   );
 }
 

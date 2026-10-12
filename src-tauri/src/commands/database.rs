@@ -8,8 +8,19 @@ pub fn db_get_setting(db: State<'_, DatabaseStore>, key: String) -> Option<Strin
 }
 
 #[tauri::command]
-pub fn db_set_setting(db: State<'_, DatabaseStore>, key: String, value: String) -> Result<(), String> {
-    db.set_setting(&key, &value)
+pub fn db_set_setting(
+    db: State<'_, DatabaseStore>,
+    mcp: State<'_, crate::mcp::registry::McpRegistry>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    db.set_setting(&key, &value)?;
+    // Live Claude chats re-list their tools, so the delegation toggle
+    // reaches them without a restart.
+    if key == crate::commands::delegation::DELEGATION_SETTING_KEY {
+        mcp.notify_host_tools_changed();
+    }
+    Ok(())
 }
 
 #[tauri::command]
