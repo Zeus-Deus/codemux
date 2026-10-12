@@ -894,10 +894,12 @@ async fn reconcile_native_history(
             for message in page["data"].as_array().ok_or("missing history snapshot")? {
                 if message["type"] == "idle" {
                     boundaries += 1;
+                    if boundaries == 1 {
+                        idle_message = Some(message.clone());
+                    }
                     if boundaries > if running { 0 } else { 1 } {
                         break 'history;
                     }
-                    idle_message = Some(message.clone());
                 }
                 messages.push(message.clone());
             }
@@ -910,8 +912,15 @@ async fn reconcile_native_history(
             }
             cursor = next;
         }
+        let final_active = native_get(client, base, password, "/api/session/active").await?;
+        if !final_active["data"].is_object() {
+            return Err("missing active-session snapshot".into());
+        }
+        let final_running = final_active["data"].get(session).is_some();
         let after = native_watermark(client, base, password, session, before).await?;
-        let stable = before == after;
+        // Coordinator removal trails durable terminal publication, so equal
+        // sequence checkpoints alone cannot prove its running flag stayed put.
+        let stable = before == after && running == final_running;
         snapshot = Some((
             messages,
             idle_message,
@@ -937,8 +946,24 @@ async fn reconcile_native_history(
     if running {
         if session == peer.session_id {
             let mut ctx = peer.event_ctx.lock().await;
+            let mut router = peer.router.lock().await;
+            let completed = idle_message
+                .as_ref()
+                .and_then(|message| message["id"].as_str())
+                .and_then(|id| router.native.completed_idle_sequence(session, id));
+            if !ctx.turn_active
+                && messages.is_empty()
+                && sequence
+                    .zip(completed)
+                    .is_some_and(|(current, completed)| current <= completed)
+            {
+                // Ownership can trail the completed Idle. With no newer
+                // durable event/content, it cannot admit another root turn.
+                return Ok(());
+            }
             admit_native_root(&mut ctx);
-            peer.router.lock().await.native.mark_running(session);
+            router.native.mark_running(session);
+            drop(router);
             let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
                 thread_id: ctx.thread_id.clone(),
                 status: crate::agent_provider::SessionStatus::Running {
@@ -1294,6 +1319,7 @@ mod tests {
         let _checkpoints = mock_watermarks(&mut server, "root", 10).await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body(r#"{"data":{"root":{}}}"#)
             .create_async()
@@ -1371,12 +1397,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_reconnect_cached_idle_ownership_does_not_mint_a_phantom_root() {
+        let mut server = mockito::Server::new_async().await;
+        let _checkpoints = mock_watermarks(&mut server, "root", 10).await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body(r#"{"data":{"root":{}}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        for path in [
+            "/api/session?parentID=root&limit=200&order=asc",
+            "/api/session/root/permission",
+            "/api/session/root/form",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(200)
+                .with_body(r#"{"data":[]}"#)
+                .create_async()
+                .await;
+        }
+        let history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"msg_previous","type":"idle","outcome":"succeeded"}]}"#)
+            .create_async()
+            .await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        p.event_ctx.lock().await.turn_active = true;
+        let previous_turn = p.event_ctx.lock().await.turn_id.clone();
+        let (tx, mut rx) = broadcast::channel(32);
+        handle_record(
+            &native_record(
+                "evt_previous_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(5),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &native_record(
+                "evt_previous",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(10),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        while rx.try_recv().is_ok() {}
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        assert_eq!(p.event_ctx.lock().await.turn_id, previous_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert!(rx.try_recv().is_err());
+        handle_record(
+            &native_record(
+                "evt_callback_start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+                Some(11),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        let resumed_turn = p.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(resumed_turn, previous_turn);
+        assert!(p.event_ctx.lock().await.turn_active);
+        handle_record(
+            &native_record(
+                "evt_callback_done",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+                Some(15),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|event| matches!(event,
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &resumed_turn
+                ))
+                .count(),
+            1
+        );
+        active.assert_async().await;
+        history.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_reconnect_settlement_during_checkpoint_does_not_arm_idle_root() {
+        let mut server = mockito::Server::new_async().await;
+        let _checkpoints = mock_watermarks(&mut server, "root", 10).await;
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                    r#"{"data":{"root":{}}}"#.into()
+                } else {
+                    r#"{"data":{}}"#.into()
+                }
+            })
+            .expect(5)
+            .create_async()
+            .await;
+        for path in [
+            "/api/session?parentID=root&limit=200&order=asc",
+            "/api/session/root/permission",
+            "/api/session/root/form",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(200)
+                .with_body(r#"{"data":[]}"#)
+                .create_async()
+                .await;
+        }
+        let history = server
+            .mock("GET", "/api/session/root/message?limit=200&order=desc")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"msg_previous","type":"idle","outcome":"succeeded"}]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let previous_turn = p.event_ctx.lock().await.turn_id.clone();
+        let (tx, mut rx) = broadcast::channel(16);
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        assert_eq!(p.event_ctx.lock().await.turn_id, previous_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert_eq!(
+            p.router.lock().await.native.recovered_sequence("root"),
+            Some(10)
+        );
+        assert!(rx.try_recv().is_err());
+        active.assert_async().await;
+        history.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn native_reconnect_stale_active_scan_does_not_arm_an_idle_root() {
         let mut server = mockito::Server::new_async().await;
         let _checkpoints = mock_watermarks(&mut server, "root", 10).await;
         let reads = std::sync::atomic::AtomicUsize::new(0);
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body_from_request(move |_| {
                 if reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -1385,7 +1568,7 @@ mod tests {
                     r#"{"data":{}}"#.into()
                 }
             })
-            .expect(2)
+            .expect(3)
             .create_async()
             .await;
         for path in [
@@ -1453,6 +1636,7 @@ mod tests {
         let checkpoints = mock_watermarks(&mut server, "root", 10).await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body("{\"data\":{\"root\":{}}}")
             .create_async()
@@ -1531,6 +1715,7 @@ mod tests {
         let checkpoints = mock_watermarks(&mut server, "child", 10).await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body("{\"data\":{}}")
             .create_async()
@@ -1657,9 +1842,10 @@ mod tests {
         let checkpoints = mock_watermarks(&mut server, "root", 10).await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body("{\"data\":{}}")
-            .expect(2)
+            .expect(4)
             .create_async()
             .await;
         let prompts = server
@@ -1807,6 +1993,7 @@ mod tests {
             .await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body("{\"data\":{}}")
             .create_async()
@@ -1862,9 +2049,10 @@ mod tests {
             .await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body("{\"data\":{}}")
-            .expect(3)
+            .expect(6)
             .create_async()
             .await;
         let history = server.mock("GET", "/api/session/child/message?limit=200&order=desc")
@@ -1943,6 +2131,7 @@ mod tests {
         let checkpoints = mock_watermarks(&mut server, "root", 10).await;
         let active = server
             .mock("GET", "/api/session/active")
+            .expect_at_least(1)
             .with_status(200)
             .with_body("{\"data\":{\"root\":{}}}")
             .create_async()

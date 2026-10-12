@@ -72,6 +72,20 @@ impl State {
     pub fn recovered_sequence(&self, session: &str) -> Option<u64> {
         self.recovered_sequences.get(session).copied()
     }
+    pub fn completed_idle_sequence(&self, session: &str, idle_id: &str) -> Option<u64> {
+        let event_id = idle_id
+            .strip_prefix("msg_")
+            .map(|suffix| format!("evt_{suffix}"))?;
+        if let Some((observed, sequence)) = self.terminal_sequences.get(session) {
+            if observed == &event_id {
+                return Some(*sequence);
+            }
+        }
+        if self.recovered_idle.get(session).and_then(Value::as_str) == Some(idle_id) {
+            return self.recovered_sequence(session);
+        }
+        None
+    }
     pub fn recover_through(&mut self, session: &str, seq: u64) {
         let boundary = self.recovered_sequences.entry(session.into()).or_default();
         *boundary = (*boundary).max(seq);
@@ -82,7 +96,9 @@ impl State {
         let previous = self.recovered_idle.insert(session.into(), boundary.clone());
         if let Some(suffix) = boundary.as_str().and_then(|id| id.strip_prefix("msg_")) {
             let event_id = format!("evt_{suffix}");
-            let observed = self.terminal_sequences.get(session)
+            let observed = self
+                .terminal_sequences
+                .get(session)
                 .is_some_and(|(id, _)| id == &event_id);
             return !observed && previous.as_ref().is_none_or(|old| old != &boundary);
         }
@@ -92,17 +108,26 @@ impl State {
     }
     pub fn reduce(&mut self, event: &Event) -> Result<Vec<Update>, String> {
         if let Some(session) = event.session_id() {
-            if event.sequence(session).zip(self.recovered_sequence(session))
-                .is_some_and(|(seq, boundary)| seq <= boundary) {
+            if event
+                .sequence(session)
+                .zip(self.recovered_sequence(session))
+                .is_some_and(|(seq, boundary)| seq <= boundary)
+            {
                 return Ok(vec![]);
             }
             // A moving snapshot cannot cover content, but an observed durable
             // terminal still proves older lifecycle records have settled.
-            if matches!(event.kind.as_str(), "session.execution.started"
-                | "session.execution.succeeded" | "session.execution.failed"
-                | "session.execution.interrupted")
-                && event.sequence(session).zip(self.terminal_sequences.get(session))
-                    .is_some_and(|(seq, (_, boundary))| seq <= *boundary) {
+            if matches!(
+                event.kind.as_str(),
+                "session.execution.started"
+                    | "session.execution.succeeded"
+                    | "session.execution.failed"
+                    | "session.execution.interrupted"
+            ) && event
+                .sequence(session)
+                .zip(self.terminal_sequences.get(session))
+                .is_some_and(|(seq, (_, boundary))| seq <= *boundary)
+            {
                 return Ok(vec![]);
             }
         }
@@ -135,7 +160,8 @@ impl State {
             | "session.execution.failed"
             | "session.execution.interrupted" => {
                 if let Some(seq) = event.sequence(session) {
-                    self.terminal_sequences.insert(session.into(), (event.id.clone(), seq));
+                    self.terminal_sequences
+                        .insert(session.into(), (event.id.clone(), seq));
                 }
                 if self.running.remove(session) {
                     self.settled.insert(session.into());
@@ -269,7 +295,11 @@ impl State {
                 }
                 if tool.ended {
                     // Keep a completion tombstone, not the finished payload.
-                    *tool = Tool { called: true, ended: true, ..Tool::default() };
+                    *tool = Tool {
+                        called: true,
+                        ended: true,
+                        ..Tool::default()
+                    };
                 }
             }
             "permission.asked" => out.push(Update::Permission(d.clone())),
@@ -515,40 +545,92 @@ mod tests {
     fn native_event_fixtures_without_a_durable_envelope_still_decode() {
         let decoded: Event = serde_json::from_value(json!({
             "id":"evt_fixture", "type":"session.execution.started", "data":{"sessionID":"root"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(decoded.durable.is_none());
-        assert!(matches!(State::default().reduce(&decoded).unwrap().as_slice(), [Update::Started]));
+        assert!(matches!(
+            State::default().reduce(&decoded).unwrap().as_slice(),
+            [Update::Started]
+        ));
     }
 
     #[test]
     fn observed_terminal_fences_old_lifecycle_but_preserves_late_content_and_new_execution() {
         let durable = |id: &str, kind: &str, data: Value, seq: u64| {
             let mut event = event(id, kind, data);
-            event.durable = Some(Durable { aggregate_id: "s".into(), seq });
+            event.durable = Some(Durable {
+                aggregate_id: "s".into(),
+                seq,
+            });
             event
         };
-        let lifecycle = |id: &str, kind: &str, seq| durable(id, kind,
-            json!({"sessionID":"s"}), seq);
+        let lifecycle =
+            |id: &str, kind: &str, seq| durable(id, kind, json!({"sessionID":"s"}), seq);
         let mut state = State::default();
         state.mark_running("s");
         let terminal = lifecycle("evt_a_done", "session.execution.succeeded", 10);
-        assert!(matches!(state.reduce(&terminal).unwrap().as_slice(), [Update::Terminal { .. }]));
+        assert!(matches!(
+            state.reduce(&terminal).unwrap().as_slice(),
+            [Update::Terminal { .. }]
+        ));
         assert!(state.recovered_sequence("s").is_none());
-        assert!(state.reduce(&lifecycle("evt_a_start", "session.execution.started", 5)).unwrap().is_empty());
+        assert!(state
+            .reduce(&lifecycle("evt_a_start", "session.execution.started", 5))
+            .unwrap()
+            .is_empty());
         for i in 0..2100 {
-            state.reduce(&event(&format!("evict_{i}"), "ignored", json!({"sessionID":"s"}))).unwrap();
+            state
+                .reduce(&event(
+                    &format!("evict_{i}"),
+                    "ignored",
+                    json!({"sessionID":"s"}),
+                ))
+                .unwrap();
         }
         assert!(!state.seen.contains("evt_a_done"));
-        let late = durable("late_content", "session.text.ended",
-            json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"late"}), 9);
-        assert!(matches!(state.reduce(&late).unwrap().as_slice(), [Update::Content { complete:true, .. }]));
-        assert!(matches!(state.reduce(&lifecycle("evt_b_start", "session.execution.started", 11)).unwrap().as_slice(), [Update::Started]));
+        let late = durable(
+            "late_content",
+            "session.text.ended",
+            json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"late"}),
+            9,
+        );
+        assert!(matches!(
+            state.reduce(&late).unwrap().as_slice(),
+            [Update::Content { complete: true, .. }]
+        ));
+        assert!(matches!(
+            state
+                .reduce(&lifecycle("evt_b_start", "session.execution.started", 11))
+                .unwrap()
+                .as_slice(),
+            [Update::Started]
+        ));
         assert!(state.reduce(&terminal).unwrap().is_empty());
-        assert!(state.reduce(&lifecycle("evt_older_terminal", "session.execution.failed", 7)).unwrap().is_empty());
+        assert!(state
+            .reduce(&lifecycle(
+                "evt_older_terminal",
+                "session.execution.failed",
+                7
+            ))
+            .unwrap()
+            .is_empty());
         assert_eq!(state.terminal_sequences["s"].1, 10);
         assert!(state.running.contains("s"));
-        assert!(state.reduce(&lifecycle("evt_old_start_again", "session.execution.started", 8)).unwrap().is_empty());
-        assert!(matches!(state.reduce(&lifecycle("evt_b_done", "session.execution.succeeded", 15)).unwrap().as_slice(), [Update::Terminal { .. }]));
+        assert!(state
+            .reduce(&lifecycle(
+                "evt_old_start_again",
+                "session.execution.started",
+                8
+            ))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            state
+                .reduce(&lifecycle("evt_b_done", "session.execution.succeeded", 15))
+                .unwrap()
+                .as_slice(),
+            [Update::Terminal { .. }]
+        ));
         assert_eq!(state.terminal_sequences["s"].1, 15);
     }
     #[test]
@@ -605,7 +687,11 @@ mod tests {
             "options":[{"value":"with, comma","label":"with, comma"},{"value":"A","label":"A"},
                 {"value":"B","label":"B"},{"value":"A, B","label":"A, B"}]
         }]});
-        for selections in [json!(["with, comma", "B"]), json!(["A", "B"]), json!(["A, B"])] {
+        for selections in [
+            json!(["with, comma", "B"]),
+            json!(["A", "B"]),
+            json!(["A, B"]),
+        ] {
             assert_eq!(
                 question_answer(&form, &json!({"answers":{"Pick":selections}})).unwrap(),
                 json!({"q0":selections})
@@ -742,7 +828,10 @@ pub struct Durable {
 
 impl Event {
     fn sequence(&self, session: &str) -> Option<u64> {
-        self.durable.as_ref().filter(|d| d.aggregate_id == session).map(|d| d.seq)
+        self.durable
+            .as_ref()
+            .filter(|d| d.aggregate_id == session)
+            .map(|d| d.seq)
     }
     pub fn session_id(&self) -> Option<&str> {
         if self.kind.starts_with("form.") && self.kind == "form.created" {
