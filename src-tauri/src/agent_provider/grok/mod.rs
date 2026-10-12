@@ -108,6 +108,7 @@ impl AgentProvider for GrokAgentProvider {
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
+        let fast_mode = input.boolean_fast_mode()?;
         let thread_id = input.thread_id.clone();
         // Keep the provider boundary safe for callers other than the Tauri
         // command layer. An explicit fresh start must never attempt to load
@@ -141,7 +142,7 @@ impl AgentProvider for GrokAgentProvider {
             input.permission_mode,
             input.effort,
             input.context_window,
-            input.fast_mode,
+            fast_mode,
             resume_cursor,
             input.env,
             AcpSpawnConfig {

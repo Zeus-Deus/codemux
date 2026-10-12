@@ -61,7 +61,10 @@ function mountApp() {
     <React.StrictMode>
       <QueryClientProvider client={queryClient}>
         <ReducedMotionProvider>
-          <TooltipProvider>
+          {/* A short wait before the first tooltip keeps a pointer sweeping the
+              dense title bar from flashing a chain of them; once one is open,
+              its neighbours show immediately for the skip window. */}
+          <TooltipProvider delayDuration={300} skipDelayDuration={300}>
             <App />
           </TooltipProvider>
         </ReducedMotionProvider>

@@ -1,3 +1,4 @@
+import { resolveServiceTier } from "@/lib/agent-chat/model-resolution";
 import { selectProviderCommands, useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { parseMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
@@ -81,6 +82,8 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { FullAccessNotice } from "./FullAccessNotice";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { ProviderUpdateNotice } from "./ProviderUpdateNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
@@ -133,6 +136,24 @@ export function DraftChatSurface() {
   );
 }
 
+/**
+ * A single 300ms ring around the composer card, for a "New agent" press that
+ * lands on the draft already on screen. Run through the Web Animations API so
+ * it never fights the classes the Composer owns, and skipped under reduced
+ * motion (the caret moving into the composer is feedback enough there).
+ */
+function pulseComposerCard(card: HTMLElement): void {
+  if (typeof card.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  card.animate(
+    [
+      { outline: "2px solid color-mix(in oklab, var(--ring) 60%, transparent)", outlineOffset: "2px" },
+      { outline: "2px solid transparent", outlineOffset: "2px" },
+    ],
+    { duration: 300, easing: "ease-out" },
+  );
+}
+
 function DraftChatSurfaceInner({
   draft,
   focusOnMount,
@@ -153,6 +174,14 @@ function DraftChatSurfaceInner({
 
   const updateDraftInput = useChatDraftStore((s) => s.updateDraftInput);
   const updateDraftConfig = useChatDraftStore((s) => s.updateDraftConfig);
+  useEffect(() => {
+    if (!activeModel || draft.promoting) return;
+    const resolved = resolveServiceTier(activeModel, draft.serviceTier);
+    if (resolved !== (draft.serviceTier ?? "default")) {
+      updateDraftConfig(draft.draftId, { serviceTier: resolved });
+    }
+  }, [activeModel, draft.draftId, draft.serviceTier, draft.promoting, updateDraftConfig]);
+
   const updateDraftTarget = useChatDraftStore((s) => s.updateDraftTarget);
   const setActiveDraft = useChatDraftStore((s) => s.setActiveDraft);
   const clearDraft = useChatDraftStore((s) => s.clearDraft);
@@ -686,7 +715,7 @@ function DraftChatSurfaceInner({
           setSessionLaunchMode: chat.setSessionLaunchMode,
           setEffort: chat.setEffort,
           setContextWindow: chat.setContextWindow,
-          setFastMode: chat.setFastMode,
+          setServiceTier: chat.setServiceTier,
           setMode: chat.setMode,
           refreshSkillSelection: (selection, effectiveCwd) =>
             refreshSkillSelectionForCwd(
@@ -1122,7 +1151,7 @@ function DraftChatSurfaceInner({
         contextWindow: defaults.contextWindow,
         // Speed tiers are provider/model-scoped: never carry a Fast
         // selection across a provider switch.
-        fastMode: false,
+        serviceTier: "default",
       });
     },
     [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
@@ -1133,12 +1162,10 @@ function DraftChatSurfaceInner({
       const nextModel = capabilities?.models.find((item) => item.id === next);
       updateDraftConfig(draft.draftId, {
         model: next,
-        ...(draft.fastMode && nextModel && !nextModel.supports_fast_mode
-          ? { fastMode: false }
-          : {}),
+        ...(nextModel ? { serviceTier: resolveServiceTier(nextModel, draft.serviceTier) } : {}),
       });
     },
-    [draft.draftId, draft.fastMode, capabilities, updateDraftConfig],
+    [draft.draftId, draft.serviceTier, capabilities, updateDraftConfig],
   );
   const handlePermissionModeChange = useCallback(
     (next: string) =>
@@ -1153,8 +1180,8 @@ function DraftChatSurfaceInner({
     (next: string) => updateDraftConfig(draft.draftId, { contextWindow: next }),
     [draft.draftId, updateDraftConfig],
   );
-  const handleFastModeChange = useCallback(
-    (next: boolean) => updateDraftConfig(draft.draftId, { fastMode: next }),
+  const handleServiceTierChange = useCallback(
+    (next: string) => updateDraftConfig(draft.draftId, { serviceTier: next }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -1302,7 +1329,7 @@ function DraftChatSurfaceInner({
       permissionMode={draft.permissionMode}
       effort={draft.effort}
       contextWindow={draft.contextWindow}
-      fastMode={draft.fastMode ?? false}
+      serviceTier={draft.serviceTier ?? "default"}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -1363,7 +1390,7 @@ function DraftChatSurfaceInner({
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
-      onFastModeChange={handleFastModeChange}
+      onServiceTierChange={handleServiceTierChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />
@@ -1376,8 +1403,37 @@ function DraftChatSurfaceInner({
   // h-7 band so the draft doesn't look "naked" next to a real pane.
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
+  // "New agent" asked for this draft's composer. Consumed once, after the
+  // composer has mounted (child effects run first), so a repeat press on the
+  // draft already on screen still moves the caret into it, and the card
+  // pulses once so the press is visible even though the page is unchanged.
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const composerFocusRequest = useDraftComposerFocusStore((s) => s.request);
+  useEffect(() => {
+    if (composerFocusRequest?.draftId !== draft.draftId) return;
+    useDraftComposerFocusStore.getState().clear();
+    const card = surfaceRef.current?.querySelector<HTMLElement>(
+      '[data-testid="composer-wrapper"]',
+    );
+    card
+      ?.querySelector<HTMLTextAreaElement>("textarea")
+      ?.focus({ preventScroll: true });
+    if (card) pulseComposerCard(card);
+  }, [composerFocusRequest, draft.draftId]);
+
+  // Opening a project from the empty home points this draft at it, the same
+  // as picking it in the location control below the composer.
+  const handleProjectOpened = useCallback(
+    (projectPath: string) =>
+      updateDraftTarget(draft.draftId, { kind: "project", projectPath }),
+    [draft.draftId, updateDraftTarget],
+  );
+
   return (
-    <div className="relative flex h-full w-full flex-col bg-background">
+    <div
+      ref={surfaceRef}
+      className="relative flex h-full w-full flex-col bg-background"
+    >
       {!enableAgentChat && <DraftSurfaceHeader />}
       {/* Provider runtime health (probe-backed, TTL-cached): tell the
           user the selected provider can't run BEFORE they compose and
@@ -1394,6 +1450,13 @@ function DraftChatSurfaceInner({
           // and a failed send brings the landing back.
           <ChatHomeLanding
             composer={composerEl}
+            notice={
+              <FullAccessNotice
+                permissionMode={draft.permissionMode}
+                permissionModes={permissionModes}
+              />
+            }
+            onProjectOpened={handleProjectOpened}
             projectName={scopeProjectPath ? basename(scopeProjectPath) : null}
             projectPicker={(trigger) => (
               <ProjectScopePopover

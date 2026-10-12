@@ -59,6 +59,12 @@ describe("runtimeNoticeFromWarning", () => {
     );
   });
 
+  it("shows a saved service-tier downgrade inline", () => {
+    const text = "Saved service tier could not be verified; using Standard.";
+    expect(runtimeNoticeFromWarning("service-tier-fallback: " + text, null)).toBe(text);
+    expect(runtimeNoticeFromWarning("model/list decode failed: invalid data", null)).toBeNull();
+  });
+
   it("keeps SDK debug chatter console-only", () => {
     expect(
       runtimeNoticeFromWarning("stream_event message_start", {

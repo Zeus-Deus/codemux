@@ -24,6 +24,8 @@ import {
   ComposerStrip,
   STRIP_ROW_HEIGHT,
   type StripGoal,
+  type StripOccupant,
+  type StripRow,
 } from "./ComposerStrip";
 import {
   approvalOccupant,
@@ -241,6 +243,21 @@ describe("ComposerStrip — list", () => {
     fireEvent.click(screen.getByTestId("composer-strip-toggle"));
     fireEvent.click(screen.getByTestId("composer-strip-toggle"));
     expect(screen.getByTestId("composer-strip")).not.toHaveAttribute("data-open");
+  });
+
+  it("leaves Escape to the page above it while its workspace is inert", () => {
+    // A utility page (Pull requests, Usage, …) covers the workspace and
+    // marks it `inert`. Claiming Escape there would leave the page open.
+    const { container } = render(
+      <div inert>
+        <Harness messages={busy} />
+      </div>,
+    );
+    fireEvent.click(screen.getByTestId("composer-strip-toggle"));
+    const event = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(within(container).getByTestId("composer-strip")).toHaveAttribute("data-open");
   });
 
   it("closes when the list empties, and stays closed when work returns", () => {
@@ -511,6 +528,18 @@ describe("ComposerStrip — goal", () => {
     expect(others).toHaveTextContent("2 messages queued");
     fireEvent.click(others);
     expect(rows()).toHaveLength(2);
+  });
+
+  it("never counts a heading row (delegation's Stop all) into +n", () => {
+    const item = (id: string): StripRow => ({ id, mark: { kind: "queued" }, label: id });
+    const header: StripRow = { ...item("delegation:all"), countsAsItem: false };
+    const delegation: StripOccupant = {
+      kind: "delegation",
+      summary: header,
+      rows: [header, item("delegation:a"), item("delegation:b")],
+    };
+    render(<ComposerStrip goal={stripGoal()} occupants={[delegation]} />);
+    expect(screen.getByTestId("composer-strip-goal-more")).toHaveTextContent("+2");
   });
 
   it("interrupted: amber edge, Resume and the overflow; never folded under another occupant", () => {

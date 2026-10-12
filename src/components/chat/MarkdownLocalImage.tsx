@@ -128,7 +128,7 @@ export function MarkdownLocalImage({
 
   return (
     <span
-      className="not-prose my-3 block max-w-2xl overflow-hidden rounded-lg border border-border/70 bg-card shadow-sm"
+      className="not-prose my-3 block max-w-2xl overflow-hidden rounded-lg border border-hairline-strong bg-card shadow-sm"
       data-chat-local-image
     >
       <button
@@ -137,7 +137,7 @@ export function MarkdownLocalImage({
         aria-label={`Open ${caption}`}
         onClick={() => setOpen(true)}
       >
-        <span className="flex min-h-28 max-h-72 w-full items-center justify-center overflow-hidden bg-muted/35">
+        <span className="flex min-h-28 max-h-72 w-full items-center justify-center overflow-hidden bg-surface-1">
           {thumbnail.failed || !thumbnail.src ? (
             <span className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
               <ImageOff className="size-6 opacity-50" aria-hidden />
@@ -153,7 +153,7 @@ export function MarkdownLocalImage({
             />
           )}
         </span>
-        <span className="flex min-w-0 items-center gap-2 border-t border-border/60 px-3 py-2 text-label">
+        <span className="flex min-w-0 items-center gap-2 border-t border-hairline px-3 py-2 text-label">
           <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <span className="min-w-0 flex-1 truncate font-medium text-foreground">
             {children ?? caption}

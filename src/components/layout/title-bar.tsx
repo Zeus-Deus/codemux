@@ -59,6 +59,7 @@ import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
+import { selectUtilityPage } from "@/lib/utility-pages";
 import { toast, reportFailure } from "@/lib/toast";
 import { applyPreset, openInEditor } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
@@ -256,8 +257,8 @@ function SidebarToggleButton({
           <PanelLeft className="size-3.5" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
-        Toggle sidebar (Ctrl+B)
+      <TooltipContent side="bottom" sideOffset={4} shortcut="toggleSidebar">
+        Toggle sidebar
       </TooltipContent>
     </Tooltip>
   );
@@ -317,6 +318,7 @@ function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
         active={open}
         testId="right-panel-toggle"
         size="titlebar"
+        shortcut="toggleRightPanel"
         onClick={togglePanel}
       />
     </div>
@@ -491,7 +493,7 @@ function TitleBarDraftSlots() {
       <div
         data-testid="titlebar-draft-tab"
         // The draft's stand-in for the active tab, so it wears exactly the
-        // active pill: same radius token, same 6% selected fill.
+        // active pill: same radius token, same selected fill.
         className={cn(
           "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-label font-semibold text-foreground",
           BAND_CONTROL_RADIUS,
@@ -547,6 +549,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       : false,
   );
   const rightPanelMaximized = useUIStore((s) => s.rightPanelMaximized);
+  // A utility page (Pull requests, Devices, …) covers the workspace and
+  // draws its own header in this band, so the workspace's tabs, actions
+  // and panel controls step aside while it is open.
+  const pageOpen = useUIStore((s) => selectUtilityPage(s) !== null);
   // The measured content row — the only honest width for "the panel covers
   // everything" while full-expand is on, since the panel then has no inline
   // width of its own.
@@ -651,9 +657,11 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           className="pointer-events-auto absolute inset-y-0 left-0"
           // Maximized, the panel owns everything right of the sidebar, so
           // the layer is sized from the left instead of trusting a row
-          // measurement that may not have landed yet.
+          // measurement that may not have landed yet. An open utility page
+          // gets the same: its header is its own drag surface, and a layer
+          // over it would swallow clicks on its controls.
           style={
-            panelMaximized
+            panelMaximized || pageOpen
               ? { width: `${sidebarGapWidth}px` }
               : {
                   right: rightPanelOpen
@@ -701,7 +709,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         data-testid="titlebar-floating-band"
         className={cn(
           "absolute top-1 z-10 flex h-8 min-w-0 items-center gap-2",
-          panelMaximized && "hidden",
+          (panelMaximized || pageOpen) && "hidden",
         )}
         style={{
           left: `${sidebarGapWidth + 6}px`,
@@ -772,7 +780,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           the native buttons — the one cluster in this band whose position
           never depends on the panel. Workspace-only: a draft renders no
           right panel, so there is nothing for it to control. */}
-      {guiChrome && activeWorkspaceId && (
+      {guiChrome && activeWorkspaceId && !pageOpen && (
         <RightPanelChromeCluster workspaceId={activeWorkspaceId} />
       )}
 

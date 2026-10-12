@@ -1146,6 +1146,7 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         // demux re-stamps it onto every subsequent snapshot for this id.
         task_kind: None,
         model: get("model"),
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -1355,6 +1356,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         description: None,
         task_kind: None,
         model: None,
+        effort: None,
         status: SubagentStatus::Running,
         activity: None,
         result_text: None,
@@ -2458,6 +2460,30 @@ mod tests {
             }
         } else {
             panic!("expected TurnCompleted");
+        }
+    }
+
+    #[test]
+    fn result_success_subtype_with_error_flag_preserves_failure_and_usage() {
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "turn_id": "t",
+            "result": "API Error: response exceeded the output token maximum",
+            "total_cost_usd": 0.002,
+            "usage": {},
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted { turn_id, status, usage, .. } => {
+                assert_eq!(turn_id.0, "t");
+                assert!(matches!(status, TurnStatus::Error { subtype, message }
+                    if subtype == "api_error"
+                        && message == "API Error: response exceeded the output token maximum"));
+                assert_eq!(usage.as_ref().unwrap().total_cost_usd, Some(0.002));
+            }
+            _ => panic!("expected failed TurnCompleted"),
         }
     }
 

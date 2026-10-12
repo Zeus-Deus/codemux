@@ -14,6 +14,7 @@ import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { startNewHomeAgent } from "@/lib/agent-chat/new-home-agent";
 import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
@@ -89,6 +90,14 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   // ── Close overlay (Escape) — conditional ──
   if (actionId === "closeOverlay") {
+    // The shortcuts sheet layers over everything, Settings and onboarding
+    // included, so it is the first layer to go. It runs before the
+    // defaultPrevented guard below because the sheet's own dialog prevents
+    // Escape so that this ladder, not Radix, closes it.
+    if (ui.showShortcutsSheet) {
+      ui.setShowShortcutsSheet(false);
+      return true;
+    }
     // A dialog or popover open on top of an overlay (Radix marks the Escape
     // it dismissed on) owns this press; closing the overlay beneath it too
     // would throw away the page the user was returning to.
@@ -178,11 +187,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       return true;
     }
     if (flags.enableLazyWorkspaceCreation) {
-      const store = useChatDraftStore.getState();
-      // `lockedToHome` mirrors the sidebar button: a home-directory chat that
-      // won't be redirected to whatever project is active in the sidebar.
-      const draft = store.getOrCreateHomeDraft({ lockedToHome: true });
-      store.setActiveDraft(draft.draftId);
+      startNewHomeAgent();
       return true;
     }
     ui.setShowNewWorkspaceDialog(true);
@@ -196,8 +201,18 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   // ── Show keyboard shortcuts ──
+  // A cheat sheet over the current view, so checking a binding never means
+  // leaving the work. Pressing it again closes it.
   if (actionId === "showShortcuts") {
-    ui.setShowSettings(true, "shortcuts");
+    ui.setShowShortcutsSheet(!ui.showShortcutsSheet);
+    return true;
+  }
+
+  // ── Open the `+` launcher ──
+  // Works on a draft too (its launcher has no workspace yet), so it sits
+  // before the appState guard. Without a mounted launcher it does nothing.
+  if (actionId === "openLauncher") {
+    ui.requestOpenLauncher();
     return true;
   }
 

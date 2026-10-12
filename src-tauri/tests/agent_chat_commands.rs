@@ -69,6 +69,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         effort: None,
         context_window: None,
         fast_mode: false,
+        service_tier: None,
         additional_directories: vec![],
         recorded_usage_baseline: None,
         env: None,
@@ -1580,6 +1581,7 @@ mod auto_resume {
                 effort: None,
                 context_window: None,
                 fast_mode: false,
+                service_tier: None,
                 additional_directories: vec![],
                 recorded_usage_baseline: None,
                 env: None,
@@ -2057,6 +2059,111 @@ async fn turn_revert_restores_workspace_provider_and_transcript_together() {
         !first_ref_status.success(),
         "oldest checkpoint ref is deleted"
     );
+}
+
+/// The undo's whole safety rule: once a newer turn has checkpointed, restoring
+/// the pre-revert files would clobber that turn's work, so the undo refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_turn_revert_refuses_after_a_newer_turn() {
+    use codemux_lib::agent_provider::AgentProvider;
+    use codemux_lib::commands::agent_chat::{
+        agent_chat_revert_turn_checkpoint, agent_chat_undo_turn_revert,
+    };
+    use codemux_lib::database::AgentChatTurnCheckpointRecord;
+
+    const THREAD: &str = "thread-undo-refused";
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("code.txt"), "v1").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(THREAD, "ws-1", Some(&repo.to_string_lossy()), "codex")
+        .unwrap();
+    let capture = |db: &DatabaseStore, index: i64, nonce: &str| {
+        let ref_name = codemux_lib::git::turn_checkpoint_ref_name(THREAD, index);
+        let snapshot = codemux_lib::git::git_checkpoint_create(
+            &repo,
+            &ref_name,
+            &format!("before turn {index}"),
+        )
+        .unwrap()
+        .unwrap();
+        db.upsert_agent_chat_turn_checkpoint(&AgentChatTurnCheckpointRecord {
+            thread_id: THREAD.into(),
+            workspace_id: "ws-1".into(),
+            repo_path: repo.to_string_lossy().to_string(),
+            turn_index: index,
+            client_nonce: Some(nonce.into()),
+            transcript_cutoff_id: db.agent_chat_transcript_cutoff(THREAD).unwrap(),
+            ref_name: snapshot.ref_name,
+            snapshot_commit: snapshot.snapshot_commit,
+            head_commit: snapshot.head_commit,
+            branch: snapshot.branch,
+            created_at: String::new(),
+        })
+        .unwrap()
+    };
+
+    capture(&db, 1, "nonce-1");
+    db.append_agent_chat_message(THREAD, r#"{"type":"user_message","text":"first"}"#)
+        .unwrap();
+    db.append_agent_chat_message(THREAD, r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v2").unwrap();
+    capture(&db, 2, "nonce-2");
+    db.append_agent_chat_message(THREAD, r#"{"type":"user_message","text":"second"}"#)
+        .unwrap();
+    db.append_agent_chat_message(THREAD, r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v3").unwrap();
+
+    let mock = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+    mock.start_session(start_input(THREAD)).await.unwrap();
+    let registry = ProviderRegistry::new();
+    registry.set_codex(mock.clone()).await;
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    app.manage(test_observability(true));
+    app.manage(AppStateStore::default());
+    app.manage(registry);
+    let handle = app.handle().clone();
+
+    agent_chat_revert_turn_checkpoint(handle.clone(), THREAD.into(), 2)
+        .await
+        .expect("revert succeeds");
+    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "v2");
+
+    // A newer turn starts from the reverted state and writes its own work.
+    let db = handle.state::<DatabaseStore>();
+    capture(&db, 2, "nonce-newer");
+    std::fs::write(repo.join("code.txt"), "newer turn's work").unwrap();
+
+    let error = agent_chat_undo_turn_revert(handle.clone(), THREAD.into())
+        .await
+        .expect_err("undo after a newer turn is refused");
+    assert!(error.contains("newer turn"), "unexpected error: {error}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+        "newer turn's work"
+    );
+    // The refusal is final: the stale undo entry is dropped.
+    let error = agent_chat_undo_turn_revert(handle.clone(), THREAD.into())
+        .await
+        .expect_err("no undo remains");
+    assert!(error.contains("no revert to undo"), "unexpected error: {error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2601,6 +2708,77 @@ fn usage_limit_notice_is_deduped_per_turn_and_respects_the_setting() {
         .filter(|r| r["type"] == "usage_limit_reached")
         .count();
     assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn service_tier_persists_only_accepted_changes_and_survives_cold_resume() {
+    use codemux_lib::commands::agent_chat::{agent_chat_set_service_tier, ensure_live_session};
+    use codemux_lib::database::AgentChatSessionConfig;
+
+    for outcome in ["accepted", "rejected", "missing"] {
+        let app = mock_app_with_chat_state();
+        app.manage(test_observability(true));
+        let provider = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+        let registry = ProviderRegistry::new();
+        registry.set_codex(provider.clone()).await;
+        app.manage(registry);
+        let handle = app.handle().clone();
+        let thread = ThreadId("service-tier-test".into());
+        let db: State<'_, DatabaseStore> = handle.state();
+        db.upsert_agent_chat_session(&thread.0, "ws", None, "codex")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            &thread.0,
+            &AgentChatSessionConfig {
+                service_tier: Some("priority".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match outcome {
+            "rejected" => {
+                provider.fail_next_fast_mode(codemux_lib::agent_provider::ProviderError::RpcError {
+                    message: "tier unavailable".into(),
+                })
+            }
+            "missing" => provider.fail_next_fast_mode(
+                codemux_lib::agent_provider::ProviderError::SessionNotFound {
+                    thread_id: thread.clone(),
+                },
+            ),
+            _ => {}
+        }
+        let result = agent_chat_set_service_tier(
+            handle.clone(),
+            ProviderKind::Codex,
+            thread.clone(),
+            "ultrafast".into(),
+        )
+        .await;
+        assert_eq!(result.is_err(), outcome == "rejected");
+        assert_eq!(
+            db.get_agent_chat_session(&thread.0).unwrap().service_tier,
+            if outcome == "rejected" {
+                "priority"
+            } else {
+                "ultrafast"
+            }
+        );
+        if outcome == "missing" {
+            ensure_live_session(&handle, ProviderKind::Codex, &thread)
+                .await
+                .unwrap();
+            assert_eq!(
+                provider
+                    .start_inputs()
+                    .last()
+                    .unwrap()
+                    .service_tier
+                    .as_deref(),
+                Some("ultrafast")
+            );
+        }
+    }
 }
 
 #[test]

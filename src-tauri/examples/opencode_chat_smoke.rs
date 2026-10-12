@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             effort: None,
             context_window: None,
             fast_mode: false,
+            service_tier: None,
             additional_directories: vec![],
             recorded_usage_baseline: None,
             env: None,

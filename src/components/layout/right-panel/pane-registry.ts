@@ -24,6 +24,7 @@
  */
 import {
   Bot,
+  Network,
   Folder,
   GitCompare,
   GitPullRequest,
@@ -78,6 +79,12 @@ export const PANE_REGISTRY: readonly PaneMeta[] = [
     label: "Browser",
     icon: Globe,
     description: "Open a local app or URL beside the chat.",
+  },
+  {
+    id: "workflows",
+    label: "Workflows",
+    icon: Network,
+    description: "Run dynamic tasks across your providers.",
   },
   {
     id: "tasks",

@@ -2,6 +2,7 @@ import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
+  Network,
   Check,
   CornerDownRight,
   ListEnd,
@@ -54,7 +55,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -84,7 +85,7 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onSubmit: () => void;
   onBackgroundSubmit?: () => void;
   onStop: () => void;
@@ -108,6 +109,8 @@ interface Props {
   tasks?: { completed: number; total: number; running?: boolean } | null;
   tasksOpen?: boolean;
   onTasksClick?: () => void;
+  onWorkflowsClick?: () => void;
+  workflowsOpen?: boolean;
   /** Content for the flexible gap between the attach button and the
    *  right-pinned controls: the placeholder while the pill is collapsed,
    *  "Enter to queue" while expanded. */
@@ -143,7 +146,7 @@ export function ComposerFooter({
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -162,7 +165,7 @@ export function ComposerFooter({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onSubmit,
   onBackgroundSubmit,
   onStop,
@@ -178,6 +181,8 @@ export function ComposerFooter({
   tasks = null,
   tasksOpen = false,
   onTasksClick,
+  onWorkflowsClick,
+  workflowsOpen = false,
   gap = null,
   onGapPointerDown,
   gapRef,
@@ -247,6 +252,9 @@ export function ComposerFooter({
       </div>
 
       <div className="flex min-w-0 items-center gap-1">
+        {onWorkflowsClick && (
+          <button type="button" data-testid="composer-workflows-toggle" aria-label="Open dynamic workflows" aria-pressed={workflowsOpen} title="Dynamic workflows" onClick={onWorkflowsClick} className={cn("inline-flex size-[28px] shrink-0 items-center justify-center rounded-lg transition-colors duration-100", workflowsOpen ? "bg-surface-3 text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground")}><Network className="size-3.5" aria-hidden /></button>
+        )}
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
             {/* Reports run state rather than reading as a setting: amber +
@@ -327,10 +335,10 @@ export function ComposerFooter({
               contextWindowValue={contextWindow}
               labelMap={effortLabelMap}
               ultrathinkInBodyText={ultrathinkInBodyText}
-              fastMode={fastMode}
+              serviceTier={serviceTier}
               onEffortChange={onEffortChange}
               onContextWindowChange={onContextWindowChange}
-              onFastModeChange={onFastModeChange}
+              onServiceTierChange={onServiceTierChange}
               disabled={configurationDisabled}
               withSeparator
               iconOnly={effortIconOnly}

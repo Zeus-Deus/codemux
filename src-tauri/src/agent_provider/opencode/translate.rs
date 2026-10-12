@@ -764,6 +764,7 @@ fn empty_snapshot(id: &str) -> SubagentSnapshot {
         // `None` reads as ordinary agent work everywhere downstream.
         task_kind: None,
         model: None,
+        effort: None,
         status: SubagentStatus::Pending,
         activity: None,
         result_text: None,

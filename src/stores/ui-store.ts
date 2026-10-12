@@ -6,7 +6,12 @@ import {
 } from "@/lib/right-panel-width";
 import { useAppStore } from "@/stores/app-store";
 import { undockBrowserFromRightPanel } from "@/tauri/commands";
-import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
+import type {
+  ModelSelection,
+  NewWorkspaceDraft,
+  PendingWorkspace,
+} from "@/tauri/types";
+import { selectUtilityPage } from "@/lib/utility-pages";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
 export type RightPanelCorePane =
@@ -14,6 +19,7 @@ export type RightPanelCorePane =
   | "files"
   | "review"
   | "orchestration"
+  | "workflows"
   | "tasks"
   | "subagents"
   | "diff"
@@ -124,6 +130,9 @@ interface UIStore {
   fileSearchTarget: "editor" | "right-panel";
   showNewWorkspaceDialog: boolean;
   newWorkspaceProjectDir: string | null;
+  /** Form contents the dialog restores on open, set only when reopening a
+   *  failed create. Any other open or close clears it. Not persisted. */
+  newWorkspaceDraft: NewWorkspaceDraft | null;
   showSettings: boolean;
   settingsSection: string | null;
   settingsNavigationVersion: number;
@@ -133,6 +142,7 @@ interface UIStore {
   showAutomations: boolean;
   showDevices: boolean;
   showPullRequests: boolean;
+  showUsage: boolean;
   /** A pull request the page should select as it opens — set by the
    *  palette or a link, consumed and cleared by the page. `url` is where
    *  a link came from, so the page can hand it to the browser if the
@@ -165,6 +175,15 @@ interface UIStore {
    * list. Transient; never persisted.
    */
   commandPaletteQuery: string | null;
+  /** The read-only shortcuts cheat sheet that layers over whatever is open.
+   *  Rebinding stays on Settings ▸ Shortcuts. Not persisted. */
+  showShortcutsSheet: boolean;
+  /** Bumped by the `openLauncher` keybind; the mounted `+` launcher opens
+   *  when it changes. A counter rather than a flag, so the launcher never
+   *  has to clear it and a remount never replays an old request. */
+  launcherOpenRequest: number;
+  setShowShortcutsSheet: (show: boolean) => void;
+  requestOpenLauncher: () => void;
   /**
    * Theme Studio request, or null while it is closed. `"generate"` and
    * `"import"` open the two tabs the palette's last two rows point at; a
@@ -257,6 +276,10 @@ interface UIStore {
   clearPendingPresetCreate: () => void;
   setShowAutomations: (show: boolean) => void;
   setShowDevices: (show: boolean) => void;
+  setShowUsage: (show: boolean) => void;
+  /** Leave whichever utility page is open (Automations, Devices, Pull
+   *  requests, Usage) and return to the workspace underneath it. */
+  closeUtilityPages: () => void;
   /** Open the Pull Requests page, optionally on a given pull request. */
   setShowPullRequests: (
     show: boolean,
@@ -273,6 +296,9 @@ interface UIStore {
   addPendingWorkspace: (pw: PendingWorkspace) => void;
   removePendingWorkspace: (id: string) => void;
   failPendingWorkspace: (id: string, error: string) => void;
+  /** Drop a pending row and, when it carries a draft, reopen the New
+   *  Workspace dialog with that draft so the user can fix and retry. */
+  reopenPendingWorkspace: (id: string) => void;
   setLastSelectedAgentId: (id: string | null) => void;
   setLastModelSelection: (family: string, selection: ModelSelection) => void;
   setShowCommandPalette: (show: boolean) => void;
@@ -300,6 +326,14 @@ interface UIStore {
   dismissSubagentAttention: (id: string) => void;
 }
 
+const NO_UTILITY_PAGE = {
+  showAutomations: false,
+  showDevices: false,
+  showPullRequests: false,
+  showUsage: false,
+  pendingPrSelection: null,
+} as const;
+
 /** Only the latest wave's failures can raise a card, so a short memory of
  *  dismissals is enough and keeps the persisted list from growing forever. */
 const MAX_DISMISSED_SUBAGENTS = 200;
@@ -319,6 +353,7 @@ export const useUIStore = create<UIStore>()(
       fileSearchTarget: "editor",
       showNewWorkspaceDialog: false,
       newWorkspaceProjectDir: null,
+      newWorkspaceDraft: null,
       showSettings: false,
       settingsSection: null,
       settingsNavigationVersion: 0,
@@ -326,6 +361,7 @@ export const useUIStore = create<UIStore>()(
       showAutomations: false,
       showDevices: false,
       showPullRequests: false,
+      showUsage: false,
       pendingPrSelection: null,
       prBadgeSeen: [],
       renameWorkspaceId: null,
@@ -336,6 +372,8 @@ export const useUIStore = create<UIStore>()(
       lastModelSelections: {},
       showCommandPalette: false,
       commandPaletteQuery: null,
+      showShortcutsSheet: false,
+      launcherOpenRequest: 0,
       themeStudio: null,
       showLocalSessionImport: false,
       localSessionImportOfferDismissed: false,
@@ -583,6 +621,7 @@ export const useUIStore = create<UIStore>()(
         set({
           showNewWorkspaceDialog: show,
           newWorkspaceProjectDir: show ? (projectDir ?? null) : null,
+          newWorkspaceDraft: null,
         }),
 
       setShowSettings: (show, section = null) =>
@@ -598,14 +637,24 @@ export const useUIStore = create<UIStore>()(
           pendingPresetCreate: true,
         }),
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
-      setShowAutomations: (show) => set({ showAutomations: show }),
+      // Utility pages share the main area beside the sidebar, so opening
+      // one replaces whichever other one was showing.
+      setShowAutomations: (show) =>
+        set(show ? { ...NO_UTILITY_PAGE, showAutomations: true } : { showAutomations: false }),
       setShowDevices: (show) =>
-        set({ showDevices: show }),
+        set(show ? { ...NO_UTILITY_PAGE, showDevices: true } : { showDevices: false }),
+      setShowUsage: (show) =>
+        set(show ? { ...NO_UTILITY_PAGE, showUsage: true } : { showUsage: false }),
       setShowPullRequests: (show, select = null) =>
         set({
+          ...(show ? NO_UTILITY_PAGE : {}),
           showPullRequests: show,
           pendingPrSelection: show ? select : null,
         }),
+      closeUtilityPages: () =>
+        set((state) =>
+          selectUtilityPage(state) === null ? state : NO_UTILITY_PAGE,
+        ),
       clearPendingPrSelection: () => set({ pendingPrSelection: null }),
       markPrBadgeSeen: (keys) =>
         set((state) => ({
@@ -638,6 +687,24 @@ export const useUIStore = create<UIStore>()(
           ),
         })),
 
+      // The failed row stays until a retry from the dialog replaces it (see
+      // `runCreate`), so closing the reopened dialog never loses the draft.
+      reopenPendingWorkspace: (id) =>
+        set((s) => {
+          const pw = s.pendingWorkspaces.find((p) => p.id === id);
+          if (!pw) return s;
+          if (!pw.draft) {
+            return {
+              pendingWorkspaces: s.pendingWorkspaces.filter((p) => p.id !== id),
+            };
+          }
+          return {
+            showNewWorkspaceDialog: true,
+            newWorkspaceProjectDir: pw.draft.projectDir,
+            newWorkspaceDraft: pw.draft,
+          };
+        }),
+
       setLastSelectedAgentId: (id) => set({ lastSelectedAgentId: id }),
 
       setLastModelSelection: (family, selection) =>
@@ -651,6 +718,9 @@ export const useUIStore = create<UIStore>()(
       setShowCommandPalette: (show) => set({ showCommandPalette: show }),
       toggleCommandPalette: () =>
         set((s) => ({ showCommandPalette: !s.showCommandPalette })),
+      setShowShortcutsSheet: (show) => set({ showShortcutsSheet: show }),
+      requestOpenLauncher: () =>
+        set((s) => ({ launcherOpenRequest: s.launcherOpenRequest + 1 })),
 
       // Deliberately does NOT close Settings. Settings is a full-screen
       // destination, so this used to have to leave it for the palette to

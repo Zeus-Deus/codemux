@@ -39,7 +39,7 @@ type Cache = HashMap<(ProviderKind, Option<String>), (Instant, ProviderUpdate)>;
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 const CHECK_TTL: Duration = Duration::from_secs(3600);
 
-fn binary_name(provider: ProviderKind) -> &'static str {
+pub(crate) fn binary_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "claude",
         ProviderKind::Codex => "codex",

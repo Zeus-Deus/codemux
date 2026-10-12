@@ -58,6 +58,7 @@ import {
   SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
   selectAutoResumeUsageLimit,
+  selectCrossProviderDelegation,
   selectOrbMatchActivity,
   selectNewChatCheckout,
   selectDiffLayoutPreference,
@@ -182,6 +183,7 @@ import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useShortcutLabel } from "@/components/ui/menu-chrome";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -1236,6 +1238,7 @@ export function SettingsView() {
   );
   const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
+  const crossProviderDelegation = useSettingsStore(selectCrossProviderDelegation);
   const newChatCheckout = useSettingsStore(selectNewChatCheckout);
   const diffLayout = useSettingsStore(selectDiffLayoutPreference);
   const hideWhitespace = useSettingsStore(selectHideWhitespacePreference);
@@ -2177,6 +2180,21 @@ export function SettingsView() {
                       />
                     </SettingRow>
                     <Separator />
+                    <SettingRow
+                      label="Delegate to other agents"
+                      description="When you ask for it, a Full-access Claude or Codex chat can hand a task to another installed agent, e.g. “have Codex implement X, then review it”. Each task opens as a tab next to the chat and shares its folder. Turning this off hides the tool from Claude chats right away and from new Codex chats."
+                    >
+                      <Switch
+                        checked={crossProviderDelegation}
+                        onCheckedChange={(checked) =>
+                          storeSet(
+                            "agents.cross_provider_delegation",
+                            checked ? "true" : "false",
+                          )
+                        }
+                      />
+                    </SettingRow>
+                    <Separator />
                     {/* GUI-mode background browser viewport pin. Like the
                         checkpoint toggle, only meaningful with the Agent
                         Chat GUI on — the peek popover it affects is a
@@ -2227,11 +2245,7 @@ export function SettingsView() {
         );
 
       case "mcp":
-        return enableAgentChat ? (
-          <McpSection projectRoot={projectRoot} />
-        ) : (
-          <InterfaceSection />
-        );
+        return <McpSection projectRoot={projectRoot} />;
 
       case "archive":
         return (
@@ -2357,8 +2371,7 @@ export function SettingsView() {
                 label="Run"
                 helper={
                   <>
-                    A command to start your dev server, triggered via{" "}
-                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">Ctrl+Shift+G</kbd>.
+                    A command to start your dev server<RunShortcutHint />.
                   </>
                 }
               >
@@ -2599,6 +2612,19 @@ interface SortablePresetRowProps {
   onSelect: () => void;
   onTogglePin: () => void;
   onDelete: () => void;
+}
+
+/** The Run field's ", triggered via <keys>" tail, following the user's rebind
+ *  and dropped when the action is unbound. */
+function RunShortcutHint() {
+  const keys = useShortcutLabel("runDevCommand");
+  if (!keys) return null;
+  return (
+    <>
+      , triggered via{" "}
+      <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">{keys}</kbd>
+    </>
+  );
 }
 
 function SortablePresetRow({

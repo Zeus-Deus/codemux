@@ -72,7 +72,7 @@ export async function launchDraftWithPreset(
       setSessionLaunchMode: chat.setSessionLaunchMode,
       setEffort: chat.setEffort,
       setContextWindow: chat.setContextWindow,
-      setFastMode: chat.setFastMode,
+      setServiceTier: chat.setServiceTier,
       setMode: chat.setMode,
       refreshSkillSelection: (selection, effectiveCwd) =>
         refreshSkillSelectionForCwd(

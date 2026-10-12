@@ -125,7 +125,7 @@ export function ReviewSubmitSheet({
           <DialogTitle className={cn("flex-1 font-semibold", tzPanelHeader)}>
             Submit review on #{prNumber}
           </DialogTitle>
-          <div className="flex gap-px rounded-lg bg-muted/60 p-0.5" role="radiogroup" aria-label="Verdict">
+          <div className="flex gap-px rounded-lg bg-surface-2 p-0.5" role="radiogroup" aria-label="Verdict">
             {options.map((option) => (
               <button
                 key={option.id}

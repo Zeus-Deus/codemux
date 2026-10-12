@@ -22,6 +22,7 @@ import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import {
   activateWorkspace,
   runProjectDevCommand,
@@ -49,6 +50,7 @@ beforeEach(() => {
     showNewWorkspaceDialog: false,
     renameWorkspaceId: null,
     themeStudio: null,
+    showShortcutsSheet: false,
   });
   // Restore the store's boot state (GUI on) so a case that opts out
   // doesn't leak into the next one.
@@ -225,6 +227,17 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(s.showSettings).toBe(true);
     });
 
+    it("closes the shortcuts sheet before the settings page under it", () => {
+      useUIStore.setState({ showShortcutsSheet: true, showSettings: true });
+
+      const handled = dispatch("closeOverlay", FAKE_EVENT);
+
+      expect(handled).toBe(true);
+      const s = useUIStore.getState();
+      expect(s.showShortcutsSheet).toBe(false);
+      expect(s.showSettings).toBe(true);
+    });
+
     it("closes the rename dialog before settings", () => {
       // The rename dialog opts out of Radix's own Escape dismissal so this
       // ladder is the single closer: one press must take exactly one layer.
@@ -306,6 +319,22 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(handled).toBe(true);
     });
 
+    it("newAgent shows the home draft and asks for its composer focus", () => {
+      // A repeat Ctrl+N lands on the empty home draft already on screen, so
+      // the focus request is the only visible effect; it must name that draft.
+      const handled = dispatch("newAgent", FAKE_EVENT);
+      expect(handled).toBe(true);
+      const { activeDraftId, draftsById } = useChatDraftStore.getState();
+      expect(activeDraftId).not.toBeNull();
+      expect(draftsById[activeDraftId!]?.lockedToHome).toBe(true);
+      expect(useDraftComposerFocusStore.getState().request?.draftId).toBe(activeDraftId);
+
+      useDraftComposerFocusStore.getState().clear();
+      dispatch("newAgent", FAKE_EVENT);
+      expect(useChatDraftStore.getState().activeDraftId).toBe(activeDraftId);
+      expect(useDraftComposerFocusStore.getState().request?.draftId).toBe(activeDraftId);
+    });
+
     it("renameWorkspace targets the active workspace", () => {
       useAppStore.setState({
         appState: {
@@ -325,10 +354,20 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(useUIStore.getState().renameWorkspaceId).toBe("ws-2");
     });
 
-    it("showShortcuts opens settings", () => {
-      const handled = dispatch("showShortcuts", FAKE_EVENT);
-      expect(handled).toBe(true);
-      expect(useUIStore.getState().showSettings).toBe(true);
+    it("showShortcuts toggles the cheat sheet without leaving the current view", () => {
+      expect(dispatch("showShortcuts", FAKE_EVENT)).toBe(true);
+      expect(useUIStore.getState().showShortcutsSheet).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(false);
+
+      dispatch("showShortcuts", FAKE_EVENT);
+      expect(useUIStore.getState().showShortcutsSheet).toBe(false);
+    });
+
+    it("openLauncher asks the launcher to open, even with no workspace", () => {
+      useAppStore.setState({ appState: null });
+      const before = useUIStore.getState().launcherOpenRequest;
+      expect(dispatch("openLauncher", FAKE_EVENT)).toBe(true);
+      expect(useUIStore.getState().launcherOpenRequest).toBe(before + 1);
     });
   });
 

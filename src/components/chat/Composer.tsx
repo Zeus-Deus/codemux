@@ -1,3 +1,5 @@
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { usePopupArrowNavigation } from "./use-popup-arrow-navigation";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
@@ -176,7 +178,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
-  fastMode?: boolean;
+  serviceTier?: string;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -365,7 +367,7 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
-  onFastModeChange?: (fastMode: boolean) => void;
+  onServiceTierChange?: (serviceTier: string) => void;
   onModeActivate: (mode: ActivePillMode) => void;
   onModeRemove: () => void;
 }
@@ -468,7 +470,7 @@ export function Composer({
   permissionMode,
   effort,
   contextWindow,
-  fastMode = false,
+  serviceTier = "default",
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -525,12 +527,16 @@ export function Composer({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
-  onFastModeChange = () => {},
+  onServiceTierChange = () => {},
   onModeActivate,
   onModeRemove,
 }: Props) {
   const connectionStatus = useRemoteConnectionStore(s => s.status);
   const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
+  const workflowsEnabled = useFeatureFlags((state) => state.enableAgentChat);
+  const workflowWorkspace = useAppStore((state) => workspaceId ? state.appState?.workspaces.find((workspace) => workspace.workspace_id === workspaceId) : undefined);
+  const workflowsAvailable = workflowsEnabled && !!workflowWorkspace && !workflowWorkspace.host_id && !workflowWorkspace.attach_only && !isRemoteClient();
+  const workflowsOpen = useUIStore((state) => workspaceId ? state.rightPanelTabs[workspaceId] === "workflows" : false);
   const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
   const addonActions = useAddonComposerActions(addonComposer);
   const customAgentsAllowed = useAppStore(s => {
@@ -938,7 +944,11 @@ export function Composer({
         { name: "settings", label: "Agent settings", section: "agent", description: "Open Codemux agent settings" },
         { name: "usage", label: "Usage", section: "usage", description: "View provider usage and limits" }].map((action): SlashCommandItem => ({
           id: `composer:${action.name}`, label: action.label, command: `/${action.name}`, icon: Settings,
-          description: action.description, disabled: provider === "acp" && action.name !== "settings", group: "CHAT", onSelect: () => useUIStore.getState().setShowSettings(true, action.section),
+          description: action.description, disabled: provider === "acp" && action.name !== "settings", group: "CHAT",
+          // Usage opens beside the sidebar; the others are Settings sections.
+          onSelect: () => action.section === "usage"
+            ? useUIStore.getState().setShowUsage(true)
+            : useUIStore.getState().setShowSettings(true, action.section),
         })),
       ...(provider === "codex" ? [{
         id: "composer:hooks", label: "Hooks", command: "/hooks", icon: Settings,
@@ -2793,7 +2803,7 @@ export function Composer({
     model,
     effort,
     contextWindow,
-    fastMode,
+    serviceTier,
     permissionMode,
     busy,
     delivery.delivery,
@@ -3200,10 +3210,10 @@ export function Composer({
                       contextWindowValue={contextWindow}
                       labelMap={effortLabelMap}
                       ultrathinkInBodyText={ultrathinkInBodyText}
-                      fastMode={fastMode}
+                      serviceTier={serviceTier}
                       onEffortChange={onEffortChange}
                       onContextWindowChange={onContextWindowChange}
-                      onFastModeChange={onFastModeChange}
+                      onServiceTierChange={onServiceTierChange}
                       disabled={!configurationEnabled}
                     />
                     <PermissionModePicker
@@ -3675,7 +3685,7 @@ export function Composer({
             permissionMode={permissionMode}
             effort={effort}
             contextWindow={contextWindow}
-            fastMode={fastMode}
+            serviceTier={serviceTier}
             activeModel={activeModel}
             effortLabelMap={effortLabelMap}
             permissionModes={permissionModes}
@@ -3697,7 +3707,7 @@ export function Composer({
             onPermissionModeChange={onPermissionModeChange}
             onEffortChange={onEffortChange}
             onContextWindowChange={onContextWindowChange}
-            onFastModeChange={onFastModeChange}
+            onServiceTierChange={onServiceTierChange}
             onSubmit={() => submit()}
             onBackgroundSubmit={onBackgroundSubmit ? () => submit(true) : undefined}
             onStop={onStop}
@@ -3713,6 +3723,8 @@ export function Composer({
             tasks={tasks}
             tasksOpen={tasksOpen}
             onTasksClick={onTasksClick}
+            workflowsOpen={workflowsOpen}
+            onWorkflowsClick={workspaceId && workflowsAvailable ? () => useUIStore.getState().setRightPanelTab(workspaceId, "workflows") : undefined}
             gap={
               !expanded ? (
                 <span

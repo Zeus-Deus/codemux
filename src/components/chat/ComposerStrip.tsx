@@ -1,4 +1,5 @@
 import {
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -8,7 +9,7 @@ import {
   EllipsisVertical,
   Hourglass,
 } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import {
@@ -25,19 +26,24 @@ import {
 } from "@/lib/agent-chat/goal";
 import type { OrbActivity } from "@/lib/orb-state";
 import { cn } from "@/lib/utils";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
+import { ProviderLogo } from "./provider-logo";
 import { TickingText } from "./TickingText";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
-/** Which occupant leads the collapsed strip. Lower wins. */
+/** Which occupant leads the collapsed strip. Lower wins. Delegations sit
+ *  just ahead of running subagents: both are background work, and a
+ *  delegation is the one the parent will continue from. */
 export const STRIP_PRIORITY = {
   approval: 0,
   error: 1,
   usage: 2,
   monitoring: 3,
-  running: 4,
-  finished: 5,
-  queued: 6,
+  delegation: 4,
+  running: 5,
+  finished: 6,
+  queued: 7,
 } as const;
 
 export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
@@ -45,6 +51,8 @@ export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
 /** The only coloured thing in a row. The surface itself stays neutral. */
 export type StripMark =
   | { kind: "orb"; activity?: OrbActivity }
+  /** Who is doing the work: one provider mark, or up to two overlapping. */
+  | { kind: "providers"; providers: AgentChatProviderKind[] }
   | { kind: "monitoring" }
   | { kind: "finished" }
   | { kind: "queued" }
@@ -85,6 +93,9 @@ export interface StripRow {
   /** Sits before `action` (e.g. a quiet Cancel beside Try now). */
   secondaryAction?: StripAction | null;
   action?: StripAction | null;
+  /** False for a row that only heads the items below it (delegation's
+   *  "Stop all"), so the `+n` counts never include it. */
+  countsAsItem?: boolean;
 }
 
 export interface StripOccupant {
@@ -220,7 +231,7 @@ export function ComposerStrip({
   const rows = present.flatMap((occupant) =>
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
-  const total = rows.length;
+  const total = rows.filter(({ row }) => row.countsAsItem !== false).length;
   const hasGoal = goal !== null;
 
   const listId = useId();
@@ -236,12 +247,16 @@ export function ComposerStrip({
   }, [hasGoal]);
 
   const anyOpen = open || goalOpen;
+  const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!anyOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       // Anything that already consumed Escape (a composer popup closing)
       // keeps it.
       if (e.key !== "Escape" || e.defaultPrevented) return;
+      // Under a utility page the workspace is `inert`; the page owns
+      // Escape, and claiming it here would leave the page open.
+      if (rootRef.current?.closest("[inert]")) return;
       e.preventDefault();
       setOpen(false);
       setGoalOpen(false);
@@ -288,6 +303,7 @@ export function ComposerStrip({
 
   return (
     <div
+      ref={rootRef}
       data-testid="composer-strip"
       data-open={open || undefined}
       data-lead={goal ? "goal" : lead.kind}
@@ -386,8 +402,10 @@ export function ComposerStrip({
 /** "2 subagents running · 1 message queued", in strip priority order. */
 function occupantSummary(present: StripOccupant[]): string | null {
   const parts = present.map((o) => {
-    const n = o.rows.length;
+    const n = o.rows.filter((row) => row.countsAsItem !== false).length;
     switch (o.kind) {
+      case "delegation":
+        return `${n} delegated task${n === 1 ? "" : "s"} running`;
       case "running":
         return `${n} subagent${n === 1 ? "" : "s"} running`;
       case "queued":
@@ -855,6 +873,26 @@ function StripMarkView({ mark }: { mark: StripMark }) {
   switch (mark.kind) {
     case "orb":
       return <AgentOrb size={20} {...mark.activity} aria-hidden />;
+    case "providers": {
+      const [first, second] = mark.providers;
+      if (!first) {
+        return <Bot className="size-3.5 text-muted-foreground" aria-hidden />;
+      }
+      if (!second) return <ProviderLogo provider={first} className="size-3.5" />;
+      // Two marks share the 20px slot, overlapped like an avatar stack.
+      return (
+        <span className="flex items-center -space-x-1" aria-hidden>
+          {[first, second].map((provider) => (
+            <span
+              key={provider}
+              className="flex size-3.5 items-center justify-center rounded-full bg-background ring-1 ring-background"
+            >
+              <ProviderLogo provider={provider} className="size-3" />
+            </span>
+          ))}
+        </span>
+      );
+    }
     case "monitoring":
       // Calm background presence: a still dot, never a pulse.
       return (

@@ -45,6 +45,7 @@ import type {
   GitLogEntry,
   CommitFileEntry,
   CommitSummary,
+  PrDescriptionDraft,
   HandoffPacket,
   LaunchMode,
   ProviderDiagnostic,
@@ -84,6 +85,31 @@ import type {
   WebRemoteRegistrationStatus,
   NativePerformanceDiagnostics,
 } from "./types";
+
+// ── Outside-assistant MCP connector ──
+
+async function invokeAgentConnector<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (isRemoteClient()) throw new Error("Manage connections from the desktop.");
+  return args ? invoke<T>(command, args) : invoke<T>(command);
+}
+
+export const agentConnectorStatus = () =>
+  invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_status");
+
+export const agentConnectorSetConfig = (config: { enabled: boolean; publicOrigin: string | null }) =>
+  invokeAgentConnector<import("./types").AgentConnectorStatus>("agent_connector_set_config", {
+    enabled: config.enabled,
+    publicOrigin: config.publicOrigin,
+  });
+
+export const agentConnectorApprove = (requestId: string, access: import("./types").AgentConnectorAccess) =>
+  invokeAgentConnector<void>("agent_connector_approve", { requestId, access });
+
+export const agentConnectorDeny = (requestId: string) =>
+  invokeAgentConnector<void>("agent_connector_deny", { requestId });
+
+export const agentConnectorRevoke = (clientId: string) =>
+  invokeAgentConnector<void>("agent_connector_revoke", { clientId });
 
 /** Bounded, identifier-free native latency summaries for support reports. */
 export const getPerformanceDiagnostics = () =>
@@ -371,9 +397,11 @@ export const getOrCreateHomeWorkspace = () =>
 
 export const listChatProviderCapabilities = (
   provider: AgentChatProviderKind,
+  force?: boolean,
 ) =>
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
+    force,
   });
 
 /** Probe the health of a chat provider's local runtime (installed /
@@ -1162,6 +1190,23 @@ export const generateAiCommitMessage = (
   model: string | null = null,
 ) => invoke<string>("generate_ai_commit_message", { path, cli, model });
 
+/** Drafts a pull request title and description from the branch's
+ *  commits and diff against `base`, through the utility CLI. */
+export const generateAiPrDescription = (
+  path: string,
+  base: string,
+  template: string | null,
+  cli: string | null = null,
+  model: string | null = null,
+) =>
+  invoke<PrDescriptionDraft>("generate_ai_pr_description", {
+    path,
+    base,
+    template,
+    cli,
+    model,
+  });
+
 export const setAiCommitMessageEnabled = (enabled: boolean) =>
   invoke("set_ai_commit_message_enabled", { enabled });
 
@@ -1600,7 +1645,7 @@ export interface AgentChatStartSessionInput {
   /** Claude only — context-window selector (e.g. "1m" adds [1m] bracket). */
   context_window?: string | null;
   /** Premium provider speed tier. Capability-gated by the active model. */
-  fast_mode?: boolean;
+  service_tier?: string;
   additional_directories: string[];
   env: Record<string, string> | null;
   extra?: unknown;
@@ -1944,11 +1989,11 @@ export const agentChatSetModel = (
   model: string | null,
 ) => invoke<void>("agent_chat_set_model", { provider, threadId, model });
 
-export const agentChatSetFastMode = (
+export const agentChatSetServiceTier = (
   provider: AgentChatProviderKind,
   threadId: string,
-  fastMode: boolean,
-) => invoke<void>("agent_chat_set_fast_mode", { provider, threadId, fastMode });
+  serviceTier: string,
+) => invoke<void>("agent_chat_set_service_tier", { provider, threadId, serviceTier });
 
 export const agentChatSetPermissionMode = (
   provider: AgentChatProviderKind,
@@ -1994,7 +2039,7 @@ export interface AgentChatSessionRecord {
   effort: string | null;
   context_window: string | null;
   permission_mode: string | null;
-  fast_mode?: boolean;
+  service_tier?: string;
 }
 
 /** Provider-neutral conversation row for the composer's `@session:` picker.
@@ -2069,7 +2114,7 @@ export interface AgentChatSessionConfigUpdate {
   effort?: string | null;
   context_window?: string | null;
   permission_mode?: string | null;
-  fast_mode?: boolean;
+  service_tier?: string;
 }
 
 export const agentChatListSessions = (
@@ -2303,6 +2348,12 @@ export const agentChatRevertTurnCheckpoint = (
     "agent_chat_revert_turn_checkpoint",
     { threadId, turnIndex },
   );
+
+/** Bring back the workspace files the last turn revert replaced, from its
+ *  safety snapshot. The conversation stays rewound. Refused once a newer turn
+ *  has started. */
+export const agentChatUndoTurnRevert = (threadId: string) =>
+  invoke<void>("agent_chat_undo_turn_revert", { threadId });
 
 /**
  * Register a per-thread `Channel` that receives every live

@@ -3,6 +3,7 @@ import { Eye, EyeOff, Github, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { WindowChrome } from "@/components/layout/window-chrome";
+import { BootSplash } from "@/components/layout/boot-splash";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/auth-store";
 import { forgotPassword, resendVerificationEmail } from "@/tauri/commands";
@@ -42,15 +43,9 @@ export function LoginScreen() {
   const [resetLoading, setResetLoading] = useState(false);
   const resend = useResendVerification(email);
 
-  // Startup loading state — pulsing logo
-  if (isLoading) {
-    return (
-      <div className="relative flex h-screen w-screen items-center justify-center bg-background">
-        <WindowChrome />
-        <Wordmark className="opacity-80 motion-safe:animate-pulse" />
-      </div>
-    );
-  }
+  // Startup: the same splash AppShell shows while it loads, so the
+  // auth-check → shell hand-off does not change what is on screen.
+  if (isLoading) return <BootSplash />;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

@@ -40,8 +40,21 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { createAgentConnectorMock } from "./agent-connector-mock";
+import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
+import {
+  delegationScenarioFromSearch,
+  mockDelegatedChild,
+  mockDelegatedChildParent,
+  mockDelegatedChildTranscript,
+  stopMockDelegatedChild,
+  stopMockDelegationParent,
+  streamDelegatedTask,
+  type DelegatedTaskOptions,
+  type MockDelegatedChild,
+} from "./delegation-mock";
 import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
@@ -152,9 +165,37 @@ console.log(
 
 let appState: AppStateSnapshot = createSeedAppState();
 // Synthetic, browser-only histories: never reads native provider files.
+const serviceTierFixture = new URLSearchParams(window.location.search).get("fixture") === "service-tiers";
 const sessionImportFixture = new URLSearchParams(window.location.search).get("fixture") === "session-import";
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
+}
+const MOCK_RECENT_PROJECTS = [
+  { path: `${MOCK_HOME_DIR}/code/parser`, name: "parser", last_opened_at: "2026-10-05T09:12:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/api-gateway`, name: "api-gateway", last_opened_at: "2026-09-29T11:05:00Z" },
+];
+// `?mockScenario=delegation…`: the seeded chat starts empty, as a Claude chat
+// in Full access, and plays the delegation flow once its channel attaches.
+const delegationScenario = delegationScenarioFromSearch(window.location.search);
+let delegationScenarioStarted = false;
+if (delegationScenario) {
+  const asClaude = (node: PaneNodeSnapshot): PaneNodeSnapshot =>
+    node.kind === "split"
+      ? { ...node, children: node.children.map(asClaude) }
+      : node.kind === "agent_chat" && node.thread_id === MOCK_CHAT_THREAD_ID
+        ? { ...node, provider: "claude" }
+        : node;
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((workspace) => ({
+      ...workspace,
+      surfaces: workspace.surfaces.map((surface) => ({
+        ...surface,
+        root: asClaude(surface.root),
+      })),
+    })),
+  };
 }
 const mockLocalSessions: LocalChatSession[] = [
   { source_id: "claude:synthetic-parser", provider: "claude", title: "Fix the parser edge case", cwd: "/demo/parser", last_active_at: "2026-09-29T10:00:00Z", message_count: 2, already_imported: false },
@@ -1239,13 +1280,16 @@ const FEATURE_FLAGS: FeatureFlags = {
   // Scope row below the composer) is a primary dev-iteration surface —
   // "New thread"/"New agent" render the draft composer with the
   // location · checkout · from-branch controls instead of eagerly
-  // creating a workspace.
-  enable_lazy_workspace_creation: true,
+  // creating a workspace. `?lazy=0` turns it off to reach the legacy
+  // full-screen Open Project page (with `?fixture=session-import`).
+  enable_lazy_workspace_creation:
+    new URLSearchParams(location.search).get("lazy") !== "0",
 };
 
 const SYNCED_SETTINGS: UserSettings = {
   appearance: {
-    theme: "system",
+    // `?mockTheme=graphite-light` (any theme id) for light-scheme screenshots.
+    theme: new URLSearchParams(location.search).get("mockTheme") ?? "system",
     shell_font: null,
     typography_mode: "simple",
     interface_font_family: null,
@@ -1643,6 +1687,33 @@ const CODEX_UTILITY_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_session",
 };
 
+/** Synthetic entitlement fixture for service-tier UI verification. */
+const CODEX_SERVICE_TIER_CAPABILITIES: ProviderChatCapabilities = {
+  ...CODEX_UTILITY_CAPABILITIES,
+  models: [
+    {
+      ...CODEX_UTILITY_CAPABILITIES.models[0],
+      id: "gpt-6-astra",
+      label: "GPT-6 Astra",
+      description: "Synthetic model with Ultrafast access",
+      default_effort: "medium",
+      supports_fast_mode: true,
+      service_tiers: [
+        { value: "priority", label: "Fast", description: "Faster output at a premium usage rate" },
+        { value: "ultrafast", label: "Ultrafast", description: "Even faster output at a higher usage rate" },
+      ],
+    },
+    {
+      ...CODEX_UTILITY_CAPABILITIES.models[0],
+      id: "gpt-6-sol",
+      label: "GPT-6 Sol",
+      description: "Synthetic model with Fast access",
+      supports_fast_mode: true,
+      service_tiers: [{ value: "priority", label: "Fast", description: "Faster output at a premium usage rate" }],
+    },
+  ],
+};
+
 /** Mirrors Cursor's ACP `cursor/list_available_models` extension: options
  * are per model, not provider-wide. This keeps browser-dev useful for
  * verifying that controls appear and disappear as the selected row changes. */
@@ -1779,6 +1850,9 @@ const mockThreadRowCache = new Map<string, MockMessageRow[]>();
 function mockThreadPayloads(threadId: string): string[] {
   const imported = mockImportedPayloads.get(threadId);
   if (imported) return imported;
+  const delegated = mockDelegatedChildTranscript(threadId);
+  if (delegated) return delegated;
+  if (delegationScenario && threadId === MOCK_CHAT_THREAD_ID) return [];
   // Under a stress fixture the generated threads AND the seeded thread serve
   // the synthetic transcript — hydration cost is one of the things being
   // measured, and the curated 520-turn showcase is not that profile.
@@ -3211,6 +3285,95 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   });
 }
 
+/** The chat in the active workspace's focused pane, else the seeded one. */
+function activeMockChatThreadId(): string {
+  const workspace = findWorkspace(appState.active_workspace_id);
+  const surface = workspace?.surfaces.find(
+    (candidate) => candidate.surface_id === workspace.active_surface_id,
+  );
+  const pane = surface
+    ? leafPaneNodes(surface.root).find((node) => node.pane_id === surface.active_pane_id)
+    : undefined;
+  return (pane?.kind === "agent_chat" && pane.thread_id) || MOCK_CHAT_THREAD_ID;
+}
+
+let mockDelegatedTabSeq = 0;
+
+/** Mirror of the backend's `create_background_chat_tab`: the child's chat
+ *  tab lands after the parent's tab and its earlier delegated children,
+ *  and focus stays where it was. */
+function openMockDelegatedTab(parentThreadId: string, child: MockDelegatedChild): void {
+  if (findChatPaneLocation(child.threadId)) return;
+  const location = findChatPaneLocation(parentThreadId);
+  if (!location) return;
+  const { workspace, surface: parentSurface } = location;
+  const n = ++mockDelegatedTabSeq;
+  const title = `${child.label} · ${child.title}`;
+  const parentRoot = parentSurface.root;
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: `pane-delegated-${n}`,
+    title,
+    thread_id: child.threadId,
+    provider: child.provider,
+    cwd: parentRoot.kind === "agent_chat" ? parentRoot.cwd : null,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: `surface-delegated-${n}`,
+    title,
+    root: pane,
+    active_pane_id: pane.pane_id,
+  };
+  const tab: TabSnapshot = {
+    tab_id: `tab-delegated-${n}`,
+    kind: "terminal",
+    title,
+    surface_id: surface.surface_id,
+    browser_id: null,
+    icon: null,
+  };
+  const tabs = [...workspace.tabs];
+  const parentIndex = tabs.findIndex(
+    (candidate) => candidate.surface_id === parentSurface.surface_id,
+  );
+  // After the parent's earlier children too, so tabs read in the order the
+  // tasks were handed off, like the card.
+  const isSiblingTab = (candidate: TabSnapshot) => {
+    const root = workspace.surfaces.find(
+      (s) => s.surface_id === candidate.surface_id,
+    )?.root;
+    return (
+      root?.kind === "agent_chat" &&
+      root.thread_id != null &&
+      mockDelegatedChildParent(root.thread_id) === parentThreadId
+    );
+  };
+  let at = parentIndex + 1;
+  while (at < tabs.length && isSiblingTab(tabs[at])) at += 1;
+  tabs.splice(at, 0, tab);
+  const next = { ...workspace, tabs, surfaces: [...workspace.surfaces, surface] };
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((candidate) =>
+      candidate === workspace ? next : candidate,
+    ),
+  };
+  emitAppState();
+}
+
+/** Script the cross-provider delegation flow (see `delegation-mock.ts`) on
+ *  the active chat, or on `threadId` when given. */
+function streamMockDelegatedTask(
+  opts: DelegatedTaskOptions = {},
+  threadId: string = activeMockChatThreadId(),
+) {
+  return streamDelegatedTask(
+    { emit: emitChatEvent, openChildTab: openMockDelegatedTab },
+    threadId,
+    opts,
+  );
+}
+
 // Expose the stream triggers for browser-console / automation use.
 (
   window as unknown as {
@@ -3218,6 +3381,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       threadId: string;
       streamReply: typeof streamMockChatReply;
       streamSubagents: typeof streamMockSubagents;
+      streamDelegatedTask: typeof streamMockDelegatedTask;
       streamBackgroundWait: typeof streamMockBackgroundWait;
       streamWorkLog: typeof streamMockWorkLog;
       streamRunStalled: typeof streamMockRunStalled;
@@ -3230,6 +3394,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   threadId: MOCK_CHAT_THREAD_ID,
   streamReply: streamMockChatReply,
   streamSubagents: streamMockSubagents,
+  streamDelegatedTask: streamMockDelegatedTask,
   streamBackgroundWait: streamMockBackgroundWait,
   streamWorkLog: streamMockWorkLog,
   streamRunStalled: streamMockRunStalled,
@@ -3598,6 +3763,7 @@ function buildWebRemoteStatus(): WebRemoteStatus {
 
 function emitWebRemoteState(): void {
   emitEvent("web-remote-state-changed", buildWebRemoteStatus());
+  emitEvent("agent-connector-changed", null);
 }
 
 // Console/automation hooks: inject devices so the live "device wants to
@@ -3830,6 +3996,22 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+/** The repo-shaped file list behind both search dialogs in browser dev. */
+const MOCK_SEARCH_PATHS = [
+  "AGENTS.md",
+  "README.md",
+  "CLAUDE.md",
+  "package.json",
+  "CONTRIBUTING.md",
+  "src/components/layout/right-panel.tsx",
+  "src/stores/ui-store.ts",
+  "src-tauri/Cargo.toml",
+  // No real filesystem backs browser dev, so an opened image always
+  // 404s — which is exactly what makes the ImageViewer failure card
+  // reachable here.
+  "docs/screenshots/dashboard.png",
+];
+
 // ── Devices (SSH hosts) ─────────────────────────────────────────────
 //
 // Mutable so Settings → Devices can add, rename, set up and remove devices
@@ -3922,8 +4104,18 @@ function markMockHostInstalled(id: number): void {
 }
 
 const customAcpMock = createCustomAcpMock(emitEvent);
+
+const agentConnectorMock = createAgentConnectorMock(
+  () => ({ running: webRemoteLanRunning(), port: webRemotePort }),
+  () => emitEvent("agent-connector-changed", null),
+);
+
+// Dev-only console hook for the outside-assistant approval screenshots.
+(window as unknown as { __codemuxAgentConnectorMock: typeof agentConnectorMock }).__codemuxAgentConnectorMock = agentConnectorMock;
+
 const handlers: Record<string, Handler> = {
   ...customAcpMock.handlers,
+  ...agentConnectorMock.handlers,
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
     if (update) {
@@ -4092,6 +4284,7 @@ const handlers: Record<string, Handler> = {
   // Empty by default: plugins never alter a clean core-only UI. Synthetic
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
+  ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () => "AppImage",
 
   // ── Settings ──
@@ -4128,8 +4321,36 @@ const handlers: Record<string, Handler> = {
   db_set_setting: () => undefined,
   db_get_setting: () => null,
   db_delete_setting: () => undefined,
-  db_get_recent_projects: () => [],
+  // A few folders "opened before", so the zero-project landings (try
+  // `?fixture=session-import`) and the project picker have recents to show.
+  db_get_recent_projects: (a) =>
+    MOCK_RECENT_PROJECTS.slice(0, typeof a.limit === "number" ? a.limit : undefined),
   db_add_recent_project: () => undefined,
+  // Opening a project (folder picker or a recent row) adds a main-checkout
+  // workspace for that folder and returns its id, like the backend.
+  create_empty_workspace: (a) => {
+    const cwd = String(a.cwd ?? "");
+    const existing = appState.workspaces.find((w) => w.cwd === cwd);
+    if (existing) return existing.workspace_id;
+    const id = `ws-opened-${appState.workspaces.length + 1}`;
+    const workspace = buildRestoredWorkspace({
+      archive_id: id,
+      workspace_id: id,
+      title: cwd.split("/").pop() || cwd,
+      cwd,
+      project_root: cwd,
+      project_uid: null,
+      workspace_kind: "main",
+      worktree_path: null,
+      git_branch: "main",
+      is_git: true,
+      protected: true,
+      archived_at: 0,
+    });
+    appState = { ...appState, workspaces: [...appState.workspaces, workspace] };
+    emitAppState();
+    return id;
+  },
 
   // ── File dialogs ──
   // Default: resolve as a cancel (null / empty) like the previous
@@ -4166,6 +4387,8 @@ const handlers: Record<string, Handler> = {
     // and the generic listing would hand the form a stack of unrelated
     // `.md` files to mistake for one.
     if (path.includes("merge_request_templates")) return [];
+    // The seeded recent projects must probe as folders so a recent row opens.
+    if (MOCK_RECENT_PROJECTS.some((p) => p.path === path)) return [];
     return mockListDirectory(path, Boolean(a.showHidden));
   },
 
@@ -4175,21 +4398,44 @@ const handlers: Record<string, Handler> = {
   // in browser dev.
   search_file_names: (a) => {
     const query = String(a.query ?? "").toLowerCase();
-    const paths = [
-      "AGENTS.md",
-      "README.md",
-      "CLAUDE.md",
-      "package.json",
-      "CONTRIBUTING.md",
-      "src/components/layout/right-panel.tsx",
-      "src/stores/ui-store.ts",
-      "src-tauri/Cargo.toml",
-      // No real filesystem backs browser dev, so an opened image always
-      // 404s — which is exactly what makes the ImageViewer failure card
-      // reachable here.
-      "docs/screenshots/dashboard.png",
-    ];
+    const paths = MOCK_SEARCH_PATHS;
     return query ? paths.filter((p) => p.toLowerCase().includes(query)) : paths;
+  },
+
+  // Searches the same synthetic contents `read_file` serves, so opening a
+  // hit lands on a line that really holds the match in the mock editor.
+  // Mirrors the real command: literal unless `regex`, case-insensitive
+  // unless `caseSensitive`, absolute paths, UTF-16 offsets, and a rejected
+  // promise for an invalid pattern.
+  search_in_files: (a) => {
+    const root = String(a.path ?? "");
+    const query = String(a.query ?? "");
+    if (!query) return [];
+    const source = a.regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(source, a.caseSensitive ? "" : "i");
+    } catch (err) {
+      return Promise.reject(err instanceof Error ? err.message : String(err));
+    }
+    const limit = Number(a.maxResults ?? 100);
+    const results: Array<Record<string, unknown>> = [];
+    for (const rel of MOCK_SEARCH_PATHS) {
+      if (rel.endsWith(".png")) continue;
+      const lines = mockReadFile(`${root}/${rel}`).split("\n");
+      lines.forEach((line, i) => {
+        const hit = pattern.exec(line);
+        if (!hit || hit[0].length === 0 || results.length >= limit) return;
+        results.push({
+          file_path: `${root}/${rel}`,
+          line_number: i + 1,
+          line_content: line,
+          match_start: hit.index,
+          match_end: hit.index + hit[0].length,
+        });
+      });
+    }
+    return results;
   },
 
   // Enough content for the editor surfaces (main-area tab and the right
@@ -4267,7 +4513,8 @@ const handlers: Record<string, Handler> = {
     ({ ... (a.provider === "claude"
       ? CLAUDE_CAPABILITIES
       : a.provider === "codex"
-        ? CODEX_UTILITY_CAPABILITIES
+        ? (serviceTierFixture
+          ? CODEX_SERVICE_TIER_CAPABILITIES : CODEX_UTILITY_CAPABILITIES)
         : a.provider === "cursor"
           ? CURSOR_CAPABILITIES
           : a.provider === "grok"
@@ -4797,6 +5044,26 @@ const handlers: Record<string, Handler> = {
   agent_chat_get_session: (a) => {
     const threadId = a.threadId as string;
     if (mockImportedRecords.has(threadId)) return mockImportedRecords.get(threadId);
+    // A delegated child's row holds what the backend wrote at hand-off:
+    // the requested model and effort, the task title, full access.
+    const delegated = mockDelegatedChild(threadId);
+    if (delegated || (delegationScenario && threadId === MOCK_CHAT_THREAD_ID)) {
+      const provider = delegated?.provider ?? "claude";
+      return {
+        thread_id: threadId,
+        sdk_session_id: `sdk-${threadId}`,
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider,
+        title: delegated?.title ?? "agent-chat-demo",
+        created_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        model: delegated ? delegated.model : "claude-opus-4-8",
+        effort: delegated?.effort ?? null,
+        context_window: null,
+        permission_mode: provider === "codex" ? "danger-full-access" : "bypassPermissions",
+      };
+    }
     if (threadId === MOCK_CHAT_THREAD_ID) {
       return {
         thread_id: MOCK_CHAT_THREAD_ID,
@@ -5040,6 +5307,11 @@ const handlers: Record<string, Handler> = {
   },
   agent_chat_interrupt_turn: (a) => {
     const { threadId } = a as { threadId: string };
+    // Before touching the provider, the backend reads the interrupt as
+    // "stop this task quietly" on a delegated child, and as "stop every
+    // running task, report nothing" on its parent.
+    if (stopMockDelegatedChild(threadId)) return true;
+    stopMockDelegationParent(threadId);
     return interruptMockChatTurn(threadId);
   },
   // The composer strip's monitoring Stop. Mirrors the real backend closely
@@ -5143,7 +5415,7 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   agent_chat_set_model: (a) => { if (a.provider === "acp") customAcpMock.setModel(String(a.threadId), String(a.model)); },
-  agent_chat_set_fast_mode: () => undefined,
+  agent_chat_set_service_tier: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
   agent_chat_stop_session: (a) => customAcpMock.handlers.agent_chat_stop_session(a),
   agent_chat_rename_session: () => undefined,
@@ -5170,6 +5442,14 @@ const handlers: Record<string, Handler> = {
       remaining_checkpoints: [],
     });
     return [];
+  },
+  // The mock has no workspace files; restoring them leaves the rewound
+  // transcript as it is, like the real command.
+  agent_chat_undo_turn_revert: (a) => {
+    if (a.threadId !== MOCK_CHAT_THREAD_ID || mockChatRevertCutoff === null) {
+      throw new Error("There is no revert to undo for this chat.");
+    }
+    return undefined;
   },
   grep_count_pattern: () => 0,
 
@@ -5198,6 +5478,18 @@ const handlers: Record<string, Handler> = {
     seedPendingAskQuestion(threadId);
     seedPendingApproval(threadId);
     seedAsyncQuestion(threadId);
+    if (
+      delegationScenario &&
+      !delegationScenarioStarted &&
+      threadId === MOCK_CHAT_THREAD_ID
+    ) {
+      delegationScenarioStarted = true;
+      // Past the empty hydrate, so the first event lands on a mounted pane.
+      window.setTimeout(
+        () => streamMockDelegatedTask(delegationScenario, threadId),
+        400,
+      );
+    }
     return generation;
   },
   detach_agent_chat_output: (a) => {
@@ -5570,6 +5862,21 @@ const handlers: Record<string, Handler> = {
 
   /** The commits the form drafts a title and a description from. */
   git_commits_ahead: (a) => MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [],
+  // A beat of latency so the form's "writing" state is visible.
+  generate_ai_pr_description: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const commits = MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [];
+    return {
+      title: "feat(chat): stream replies through one channel",
+      body: [
+        "Replies arrived only once the whole turn had finished, so long answers sat blank for seconds.",
+        "",
+        "This streams each reply through a single channel as it is produced.",
+        "",
+        ...commits.map((c) => `- ${c.subject}`),
+      ].join("\n"),
+    };
+  },
 
   /**
    * Create, for real as far as the rest of the mock is concerned.
@@ -6703,6 +7010,19 @@ const handlers: Record<string, Handler> = {
     return { workspace_id: ws.workspace_id, cwd, adopted: false };
   },
   create_worktree_workspace: (a) => {
+    // Mirror the backend's rejections so the New Workspace dialog's
+    // failure recovery can be exercised: a non-git folder always fails,
+    // and `?worktreeFail=1` makes every worktree create fail like git does
+    // when the target path is already taken.
+    const repoPath = String(a.repoPath ?? "");
+    if (repoPath.endsWith("/scratchpad")) {
+      throw new Error(`Not a git repository: ${repoPath}`);
+    }
+    if (new URLSearchParams(location.search).get("worktreeFail") === "1") {
+      throw new Error(
+        `fatal: '${MOCK_HOME_DIR}/.codemux/worktrees/codemux/${String(a.branch ?? "")}' already exists`,
+      );
+    }
     const ws = buildWorktreeWorkspace(
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),

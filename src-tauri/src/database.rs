@@ -1,4 +1,7 @@
 pub mod async_questions;
+pub mod agent_control;
+pub mod mcp_connector;
+pub mod delegated_tasks;
 pub mod hermes;
 pub mod custom_acp;
 pub(crate) mod local_sessions;
@@ -9,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 20;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -62,6 +65,12 @@ pub struct AgentChatSessionRecord {
     /// `false` for rows created before this column existed.
     #[serde(default)]
     pub fast_mode: bool,
+    #[serde(default = "standard_service_tier")]
+    pub service_tier: String,
+}
+
+fn standard_service_tier() -> String {
+    "default".into()
 }
 
 /// Lightweight provider-neutral conversation row used by the composer's
@@ -220,6 +229,8 @@ pub struct AgentChatSessionConfig {
     /// state, so a plain optional boolean can express leave/set-false/set-true.
     #[serde(default)]
     pub fast_mode: Option<bool>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 /// Deserialize a present field (whether `null` or a value) into the
@@ -356,6 +367,8 @@ fn database_path() -> Option<PathBuf> {
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(agent_control::SCHEMA).map_err(|e| e.to_string())?;
+    mcp_connector::migrate(conn)?;
     conn.execute_batch(local_sessions::SCHEMA).map_err(|e|e.to_string())?;
     hermes::migrate(conn).map_err(|e| e.to_string())?;
     custom_acp::migrate(conn).map_err(|e| e.to_string())?;
@@ -437,7 +450,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             effort TEXT,
             context_window TEXT,
             permission_mode TEXT,
-            fast_mode INTEGER
+            fast_mode INTEGER,
+            service_tier TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_workspace
@@ -457,6 +471,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Numeric affinity matches the row-id comparison, including legacy
+        -- numeric JSON strings. Accept JSON5 TEXT like json_extract while
+        -- excluding malformed input from this derived index.
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_user_control
+            ON agent_chat_messages(thread_id, CAST(json_extract(payload, '$.user_message_id') AS NUMERIC))
+            WHERE json_valid(payload, 2) AND json_extract(payload, '$.type') = 'native_user_control';
 
         -- Lazy, model-written conversation handoffs (schema v16). One cache
         -- row per source conversation is sufficient: changing utility model,
@@ -990,6 +1011,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE agent_chat_sessions ADD COLUMN context_window TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN fast_mode INTEGER",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN service_tier TEXT",
         // Web-remote account mode (Stage A): how a session was admitted and,
         // for account-minted sessions, the verified Codemux account user id.
         // `source` defaults to 'pair' so every pre-existing (pairing-token) row
@@ -1110,6 +1132,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     }
 
     async_questions::create_schema(conn)?;
+    delegated_tasks::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -3618,6 +3641,13 @@ impl DatabaseStore {
                      (SELECT permission_mode FROM agent_chat_sessions WHERE thread_id = ?1),
                      permission_mode
                  ),
+                 service_tier = COALESCE(
+                     (SELECT COALESCE(service_tier,
+                         CASE WHEN fast_mode IS NOT NULL
+                              THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END)
+                      FROM agent_chat_sessions WHERE thread_id = ?1),
+                     service_tier
+                 ),
                  fast_mode = COALESCE(
                      (SELECT fast_mode FROM agent_chat_sessions WHERE thread_id = ?1),
                      fast_mode
@@ -3719,12 +3749,27 @@ impl DatabaseStore {
         fn bind_bool(field: Option<bool>) -> Option<Value> {
             field.map(|value| Value::Integer(i64::from(value)))
         }
+        // Legacy clients still write the boolean. Convert it unless a native
+        // tier was supplied, and keep the old column coherent for those clients.
+        let tier = config.service_tier.clone().or_else(|| {
+            config
+                .fast_mode
+                .map(|fast| if fast { "fast" } else { "default" }.into())
+        });
         let columns = [
+            ("service_tier", tier.clone().map(Value::Text)),
             ("model", bind(&config.model)),
             ("effort", bind(&config.effort)),
             ("context_window", bind(&config.context_window)),
             ("permission_mode", bind(&config.permission_mode)),
-            ("fast_mode", bind_bool(config.fast_mode)),
+            (
+                "fast_mode",
+                // Other native tiers (for example Flex) must not look like
+                // premium Fast to a legacy client that cannot represent them.
+                bind_bool(tier.as_ref().map(|tier| {
+                    matches!(tier.as_str(), "fast" | "priority" | "ultrafast")
+                })),
+            ),
         ];
         let mut set_clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
@@ -3820,6 +3865,7 @@ impl DatabaseStore {
                 context_window: row.get(10)?,
                 permission_mode: row.get(11)?,
                 fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                service_tier: row.get(14)?,
             })
         };
         // Only surface rows that actually have an sdk_session_id —
@@ -3831,7 +3877,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -3844,7 +3890,7 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND (sdk_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id))
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -4422,6 +4468,16 @@ impl DatabaseStore {
                       WHERE sdk_session_id = ?1 AND permission_mode IS NOT NULL
                       ORDER BY last_active_at DESC LIMIT 1)
                  ),
+                 service_tier = COALESCE(
+                     service_tier,
+                     CASE WHEN fast_mode IS NOT NULL
+                          THEN CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END END,
+                     (SELECT COALESCE(service_tier,
+                         CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
+                      FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND (service_tier IS NOT NULL OR fast_mode IS NOT NULL)
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 ),
                  fast_mode = COALESCE(
                      fast_mode,
                      (SELECT fast_mode FROM agent_chat_sessions
@@ -4475,7 +4531,7 @@ impl DatabaseStore {
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id)
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, (SELECT i.provider FROM agent_chat_local_imports i WHERE i.thread_id=agent_chat_sessions.thread_id), COALESCE(service_tier, CASE WHEN fast_mode = 1 THEN 'fast' ELSE 'default' END)
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -4494,6 +4550,7 @@ impl DatabaseStore {
                     context_window: row.get(10)?,
                     permission_mode: row.get(11)?,
                     fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                    service_tier: row.get(14)?,
                 })
             },
         )
@@ -6479,6 +6536,183 @@ mod tests {
     }
 
     #[test]
+    fn mario_r2_migration_preserves_known_legacy_receipts_without_inventing_owners() {
+        use mcp_connector::{NewMcpClient, NewMcpGrant};
+        let db = init_test_database();
+        db.mcp_register_client(
+            NewMcpClient {
+                id: "legacy-client".into(),
+                name: "Untrusted name".into(),
+                redirects: vec!["https://client.example/cb".into()],
+                created_at: 0,
+            },
+            0,
+        )
+        .unwrap();
+        let grant = |id: &str| NewMcpGrant {
+            id: id.into(),
+            client_id: "legacy-client".into(),
+            token_hash: id.into(),
+            redirect_uri: "https://client.example/cb".into(),
+            resource: "https://mcp.example/mcp".into(),
+            access: "full_access".into(),
+            created_at: 1,
+            expires_at: 3_600_001,
+        };
+        db.mcp_mint_grant(grant("legacy-active")).unwrap();
+        let admit = |principal: &str, key: &str| {
+            let a = db
+                .admit_control_operation(
+                    principal,
+                    key,
+                    "thread_interrupt",
+                    "unchanged-payload-hash",
+                    "original-epoch",
+                    Some("synthetic-workspace"),
+                    Some("synthetic-thread"),
+                )
+                .unwrap();
+            db.update_control_operation(
+                principal,
+                &a.receipt.operation_id,
+                "original-epoch",
+                "succeeded",
+                None,
+                None,
+                Some(&serde_json::json!({"reached_provider":true})),
+                None,
+            )
+            .unwrap();
+            db.control_operation(principal, &a.receipt.operation_id, "original-epoch")
+                .unwrap()
+                .unwrap()
+        };
+        let known = admit("mcp:legacy-active", "known-key");
+        let lost = admit("mcp:lost-deleted-grant", "lost-key");
+        create_schema(&db.conn.lock().unwrap()).unwrap();
+        let recovered=db.control_operation_by_key("mcp-client:legacy-client","known-key","thread_interrupt","unchanged-payload-hash","later-epoch").unwrap()
+            .expect("A retained grant's authenticated client mapping must preserve the exact existing receipt on upgrade");
+        assert_eq!(
+            serde_json::to_value(&recovered).unwrap(),
+            serde_json::to_value(&known).unwrap()
+        );
+        assert!(db
+            .control_operation(
+                "mcp-client:legacy-client",
+                &lost.operation_id,
+                "later-epoch"
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(
+                db.control_operation("mcp:lost-deleted-grant", &lost.operation_id, "later-epoch")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&lost).unwrap()
+        );
+        db.mcp_mint_grant(grant("replacement")).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                db.control_operation(
+                    "mcp-client:legacy-client",
+                    &known.operation_id,
+                    "later-epoch"
+                )
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&known).unwrap()
+        );
+        // Never select one of two historical receipts with the same stable key.
+        let stable = admit("mcp-client:legacy-client", "colliding-key");
+        let collision = admit("mcp:replacement", "colliding-key");
+        create_schema(&db.conn.lock().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                db.control_operation(
+                    "mcp-client:legacy-client",
+                    &stable.operation_id,
+                    "later-epoch"
+                )
+                .unwrap()
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(stable).unwrap()
+        );
+        assert!(db
+            .control_operation(
+                "mcp-client:legacy-client",
+                &collision.operation_id,
+                "later-epoch"
+            )
+            .unwrap()
+            .is_none());
+        assert!(db
+            .control_operation("mcp:replacement", &collision.operation_id, "later-epoch")
+            .unwrap()
+            .is_some());
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_control_operations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 4,
+            "Migration must not drop or merge frozen historical receipts"
+        );
+    }
+
+    #[test]
+    fn mario_r5_v19_migration_preserves_approved_registration_metadata() {
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE agent_mcp_grants; DROP TABLE agent_mcp_clients;
+                CREATE TABLE agent_mcp_clients(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,redirects_json TEXT NOT NULL,created_at INTEGER NOT NULL);
+                CREATE TABLE agent_mcp_grants(id TEXT PRIMARY KEY NOT NULL,client_id TEXT NOT NULL REFERENCES agent_mcp_clients(id) ON DELETE CASCADE,token_hash TEXT UNIQUE NOT NULL,redirect_uri TEXT NOT NULL,resource TEXT NOT NULL,access TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
+                UPDATE schema_version SET version=19;
+                INSERT INTO agent_mcp_clients VALUES('cached-v19','Original untrusted name','[\"https://client.example/cb\"]',0);
+                INSERT INTO agent_mcp_clients VALUES('anonymous-v19','Unapproved','[\"https://client.example/cb\"]',0);
+                INSERT INTO agent_mcp_grants VALUES('expired-v19','cached-v19','synthetic-hash','https://client.example/cb','https://mcp.example/mcp','read_only',1,3600001,0);").unwrap();
+            create_schema(&conn).unwrap();
+            create_schema(&conn).unwrap();
+        }
+        db.mcp_prune_clients(3_600_002, &[]).unwrap();
+        let cached = db.mcp_client("cached-v19").unwrap().expect("Upgrading v19 must preserve approved cached registrations before pruning expired grants");
+        assert_eq!(cached.name, "Original untrusted name");
+        assert_eq!(cached.redirects, vec!["https://client.example/cb"]);
+        assert!(db.mcp_client("anonymous-v19").unwrap().is_none());
+        assert!(db.mcp_list_grants(3_600_002).unwrap().is_empty());
+        db.mcp_prune_clients(1 + 7 * 86_400_000, &[]).unwrap();
+        assert!(db.mcp_client("cached-v19").unwrap().is_none(),"Migration must use the historical approval timestamp, not extend retention on every restart");
+    }
+
+    #[test]
+    fn mario_r5_fresh_v18_initialization_and_restart_do_not_duplicate_columns() {
+        let db = init_test_database();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch("DROP TABLE agent_mcp_grants; DROP TABLE agent_mcp_clients; DROP TABLE agent_mcp_config; UPDATE schema_version SET version=18;").unwrap();
+        create_schema(&conn).unwrap();
+        create_schema(&conn).unwrap();
+        let columns:i64=conn.query_row("SELECT COUNT(*) FROM pragma_table_info('agent_mcp_clients') WHERE name='approved_at'",[],|r|r.get(0)).unwrap();
+        assert_eq!(
+            columns, 1,
+            "Fresh schema creation and upgrade must share one approved registration marker"
+        );
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+    #[test]
     fn schema_version_set() {
         let db = init_test_database();
         let conn = db.conn.lock().unwrap();
@@ -7685,6 +7919,7 @@ mod tests {
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("acceptEdits"),
                 fast_mode: Some(true),
+                service_tier: None,
             },
         )
         .unwrap();
@@ -7713,6 +7948,7 @@ mod tests {
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("default"),
                 fast_mode: Some(true),
+                service_tier: None,
             },
         )
         .unwrap();
@@ -7776,6 +8012,7 @@ mod tests {
                 context_window: Some(None),
                 permission_mode: None,
                 fast_mode: None,
+                service_tier: None,
             },
         )
         .unwrap();
@@ -7843,6 +8080,7 @@ mod tests {
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
                 fast_mode: Some(true),
+                service_tier: None,
             },
         )
         .unwrap();
@@ -9340,4 +9578,147 @@ mod tests {
         );
         assert_eq!(db.list_automation_runs(a.id, 10)[0].status, "running");
     }
+
+    #[test]
+    fn service_tier_legacy_read_roundtrip_and_thread_migration() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("old", "ws", None, "codex")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("old", "sdk-tier").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_chat_sessions SET fast_mode = 1 WHERE thread_id = 'old'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("old").unwrap().service_tier,
+            "fast"
+        );
+        db.update_agent_chat_session_config(
+            "old",
+            &AgentChatSessionConfig {
+                service_tier: Some("ultrafast".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_agent_chat_sessions("ws", None, 10)[0].service_tier,
+            "ultrafast"
+        );
+        db.upsert_agent_chat_session("new", "ws", None, "codex")
+            .unwrap();
+        db.migrate_agent_chat_session("old", "new").unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("new").unwrap().service_tier,
+            "ultrafast"
+        );
+        db.update_agent_chat_session_config(
+            "new",
+            &AgentChatSessionConfig {
+                service_tier: Some("flex".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let flexible = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(flexible.service_tier, "flex");
+        assert!(!flexible.fast_mode);
+        db.update_agent_chat_session_config(
+            "new",
+            &AgentChatSessionConfig {
+                service_tier: Some("default".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let record = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(record.service_tier, "default");
+        assert!(!record.fast_mode);
+    }
+
+    #[test]
+    fn service_tier_survives_duplicate_session_collapse() {
+        let db = init_test_database();
+        for thread in ["old", "new"] {
+            db.upsert_agent_chat_session(thread, "ws", None, "codex")
+                .unwrap();
+            db.set_agent_chat_sdk_session_id(thread, "sdk-tier")
+                .unwrap();
+        }
+        db.update_agent_chat_session_config(
+            "old",
+            &AgentChatSessionConfig {
+                service_tier: Some("ultrafast".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute("UPDATE agent_chat_sessions SET last_active_at = '2099-01-01' WHERE thread_id = 'new'", []).unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-tier")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("new").unwrap().service_tier,
+            "ultrafast"
+        );
+    }
+
+    #[test]
+    fn service_tier_legacy_choices_remain_authoritative_when_aliases_merge() {
+        for (fast, expected) in [(false, "default"), (true, "fast")] {
+            let db = init_test_database();
+            for thread in ["legacy", "target", "old-duplicate", "new-duplicate"] {
+                db.upsert_agent_chat_session(thread, "ws", None, "codex")
+                    .unwrap();
+            }
+            for thread in ["target", "old-duplicate"] {
+                db.update_agent_chat_session_config(
+                    thread,
+                    &AgentChatSessionConfig {
+                        service_tier: Some("ultrafast".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            // Reproduce rows saved by the boolean-only client: the new
+            // column is absent, but Standard/Fast was explicitly selected.
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET fast_mode = ?1, service_tier = NULL
+                 WHERE thread_id IN ('legacy', 'new-duplicate')",
+                    params![i64::from(fast)],
+                )
+                .unwrap();
+            db.migrate_agent_chat_session("legacy", "target").unwrap();
+            assert_eq!(
+                db.get_agent_chat_session("target").unwrap().service_tier,
+                expected
+            );
+            for thread in ["old-duplicate", "new-duplicate"] {
+                db.set_agent_chat_sdk_session_id(thread, "shared-tier-sdk")
+                    .unwrap();
+            }
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_chat_sessions SET last_active_at = '2099-01-01'
+                 WHERE thread_id = 'new-duplicate'",
+                    [],
+                )
+                .unwrap();
+            db.collapse_duplicate_agent_chat_sessions("shared-tier-sdk")
+                .unwrap();
+            let record = db.get_agent_chat_session("new-duplicate").unwrap();
+            assert_eq!(record.service_tier, expected);
+            assert_eq!(record.fast_mode, fast);
+        }
+    }
+
 }

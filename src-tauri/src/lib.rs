@@ -1,4 +1,6 @@
 use tauri::{Emitter, Listener, Manager};
+#[cfg(test)]
+extern crate self as codemux_lib;
 
 /// Subdirectory name used under XDG config/data dirs for all Codemux state
 /// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
@@ -13,6 +15,7 @@ pub mod addons;
 pub mod agent_capability;
 pub mod active_workspace_persistence;
 pub mod agent_context;
+pub mod agent_control;
 pub mod agent_provider;
 pub mod ai;
 pub mod auth;
@@ -22,6 +25,7 @@ pub mod branch_name;
 pub mod json_rpc_child;
 pub mod local_session_import;
 pub mod mcp_server;
+pub mod mcp_connector;
 pub mod agent_browser;
 pub mod browser_viewport;
 pub mod cli;
@@ -79,6 +83,7 @@ pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod project_identity;
 pub mod workspaces_sync;
+pub mod workflows;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -510,6 +515,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<commands::workflows::WorkflowState>().shutdown(),
+                ) {
+                    eprintln!("[codemux::workflows] shutdown incomplete: {error}");
+                }
                 if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
                     tauri::async_runtime::block_on(manager.shutdown());
                 }
@@ -591,6 +601,8 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(auth::AuthState::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        .manage(agent_control::NativeControlState::default())
+        .manage(commands::workflows::WorkflowState::open_default())
         // Per-thread live event channels for the chat pane: each
         // mounted pane attaches a tauri::ipc::Channel keyed by
         // thread_id; forward_event routes that thread's runtime
@@ -607,6 +619,10 @@ fn build_core_app<R: tauri::Runtime>(
         // forward_event → publish_pane_status. See agent_chat.rs.
         .manage(commands::agent_chat::SubagentTracker::default())
         .manage(commands::agent_chat::RunActivityTracker::default())
+        // Cross-provider delegation's in-memory task map. Managed here, not
+        // in the gated setup task, so its forward_event / stop hooks can
+        // always `try_state` it and return at once.
+        .manage(commands::delegation::DelegationState::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -671,6 +687,7 @@ fn build_core_app<R: tauri::Runtime>(
             database::DatabaseStore::new_in_memory()
         }))
         .manage(web_remote_state)
+        .manage(mcp_connector::McpConnectorState::default())
         // Reroute channel frames opened by a web-remote invoke to the
         // browser that opened them. Returns true only for server-allocated
         // channel ids (the router owns them); genuine desktop-webview
@@ -1300,6 +1317,9 @@ fn build_core_app<R: tauri::Runtime>(
                     sidecar,
                 );
             }
+            if let Some(sidecar) = agent_provider::managed_bridge::resolve_sidecar(resource_dir.as_deref()) {
+                std::env::set_var(agent_provider::managed_bridge::SIDECAR_PATH_ENV, sidecar);
+            }
 
             // Agent-chat provider registry initialisation.
             //
@@ -1333,6 +1353,15 @@ fn build_core_app<R: tauri::Runtime>(
                         let mcp_registry: tauri::State<'_, mcp::registry::McpRegistry> =
                             registry_handle.state();
                         let mcp_registry = mcp_registry.inner().clone();
+
+                        // Delegated tasks the last run left open become
+                        // Stopped, and their children's usage resumes are
+                        // cancelled — before the resume scheduler's first
+                        // tick below can restart any of them.
+                        commands::delegation::drain_journal(&registry_handle);
+                        mcp_registry.set_host_tools(std::sync::Arc::new(
+                            commands::delegation::DelegationHost::new(registry_handle.clone()),
+                        ));
 
                         let mut claude_config =
                             agent_provider::claude::ClaudeProviderConfig::default();
@@ -1451,6 +1480,9 @@ fn build_core_app<R: tauri::Runtime>(
                             registry_handle.clone(),
                         )
                         .await;
+                        // Delegation backstop: finalizes children whose turn
+                        // end was lost and retries due result deliveries.
+                        commands::delegation::spawn_sweep(registry_handle.clone());
                     });
                 }
             }
@@ -2555,6 +2587,24 @@ fn build_core_app<R: tauri::Runtime>(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::workflows::workflow_capabilities,
+            commands::workflows::workflow_list,
+            commands::workflows::workflow_get,
+            commands::workflows::workflow_create,
+            commands::workflows::workflow_script_execute,
+            commands::workflows::workflow_pause,
+            commands::workflows::workflow_resume,
+            commands::workflows::workflow_cancel,
+            commands::workflows::workflow_cancel_task,
+            commands::workflows::workflow_retry,
+            commands::workflows::workflow_reconcile,
+            commands::workflows::workflow_replace,
+            commands::workflows::workflow_retire,
+            commands::workflows::workflow_message,
+            commands::workflows::workflow_script_save,
+            commands::workflows::workflow_script_list,
+            commands::workflows::workflow_integrate_artifact,
+            commands::workflows::workflow_artifact_preview,
             commands::addons::addon_inventory,
             commands::addons::addon_import_review,
             commands::addons::addon_accept_review,
@@ -2709,6 +2759,11 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_close_pane,
             commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
+            mcp_connector::agent_connector_status,
+            mcp_connector::agent_connector_set_config,
+            mcp_connector::agent_connector_approve,
+            mcp_connector::agent_connector_deny,
+            mcp_connector::agent_connector_revoke,
             commands::agent_chat_send_turn,
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,
@@ -2727,6 +2782,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
+            commands::agent_chat_set_service_tier,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
             commands::hermes::hermes_profiles,
@@ -2767,6 +2823,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_restore_checkpoint,
             commands::agent_chat_list_turn_checkpoints,
             commands::agent_chat_revert_turn_checkpoint,
+            commands::agent_chat_undo_turn_revert,
             commands::attach_agent_chat_output,
             commands::detach_agent_chat_output,
             commands::opencode_check_availability,
@@ -2849,6 +2906,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::git_clone_repo,
             commands::check_claude_available,
             commands::generate_ai_commit_message,
+            commands::generate_ai_pr_description,
             commands::check_gh_available,
             commands::check_gh_status,
             commands::check_github_repo,
