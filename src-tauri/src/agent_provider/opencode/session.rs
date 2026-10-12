@@ -197,6 +197,9 @@ pub struct OpenCodeSession {
     native_requests: Mutex<Vec<JoinHandle<()>>>,
     native_admissions: Mutex<Vec<NativeAdmission>>,
     native_inputs: Arc<Mutex<HashSet<String>>>,
+    teardown_requested: AtomicBool,
+    teardown_complete: AtomicBool,
+    handed_off: AtomicBool,
 }
 
 impl OpenCodeSession {
@@ -501,6 +504,9 @@ impl OpenCodeSession {
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),
             native_inputs: Arc::new(Mutex::new(HashSet::new())),
+            teardown_requested: AtomicBool::new(false),
+            teardown_complete: AtomicBool::new(false),
+            handed_off: AtomicBool::new(false),
         });
         if native_v2 {
             if let Err(error) = session.wait_ready().await {
@@ -1254,11 +1260,27 @@ impl OpenCodeSession {
     }
 
     pub(crate) async fn has_unconfirmed_native_admissions(&self) -> bool {
-        self.native_admissions
-            .lock()
-            .await
-            .iter()
-            .any(|request| !matches!(request.borrow().as_ref(), Some(Ok(()))))
+        (self.teardown_requested.load(Ordering::Relaxed)
+            && !self.teardown_complete.load(Ordering::Relaxed))
+            || self
+                .native_admissions
+                .lock()
+                .await
+                .iter()
+                .any(|request| !matches!(request.borrow().as_ref(), Some(Ok(()))))
+    }
+
+    pub(crate) async fn handoff_dead_attachment(&self) -> Result<(), ProviderError> {
+        let _outbound = self.outbound.lock().await;
+        if !self.is_dead() || self.has_unconfirmed_native_admissions().await {
+            return Err(ProviderError::RpcError {
+                message: "native_attachment_handoff_requires_completed_fence".into(),
+            });
+        }
+        // A rebuilt attachment readopts this same durable session. Its old
+        // object's Drop must not later interrupt the newly resumed execution.
+        self.handed_off.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn native_peer(&self) -> NativeAdmissionPeer {
@@ -1645,6 +1667,7 @@ impl OpenCodeSession {
     /// Close this attachment only after all native admission/wake requests
     /// are acknowledged, its pending input is cancelled and execution is idle.
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
+        self.teardown_requested.store(true, Ordering::Relaxed);
         self.dead.store(true, Ordering::Relaxed);
         self.closing.send_replace(true);
         let _outbound = self.outbound.lock().await;
@@ -1715,6 +1738,7 @@ impl OpenCodeSession {
                 });
             }
         }
+        self.teardown_complete.store(true, Ordering::Relaxed);
         let _ = self
             .event_tx
             .send(ProviderRuntimeEvent::SessionStateChanged {
@@ -1756,7 +1780,10 @@ impl Drop for OpenCodeSession {
     fn drop(&mut self) {
         self.dead.store(true, Ordering::Relaxed);
         self.closing.send_replace(true);
-        if self.server_handle.api == super::api::OpenCodeApi::V2 {
+        if self.server_handle.api == super::api::OpenCodeApi::V2
+            && !self.handed_off.load(Ordering::Relaxed)
+            && !self.teardown_complete.load(Ordering::Relaxed)
+        {
             let peer = self.native_peer();
             let admissions = self.native_admissions.get_mut().clone();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -2350,6 +2377,9 @@ pub(crate) mod tests {
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),
             native_inputs: Arc::new(Mutex::new(HashSet::new())),
+            teardown_requested: AtomicBool::new(false),
+            teardown_complete: AtomicBool::new(false),
+            handed_off: AtomicBool::new(false),
         });
         session.start_queue_worker(tx.subscribe()).await;
         (session, tx, rx)
@@ -2457,7 +2487,7 @@ pub(crate) mod tests {
         let mut server = Server::new_async().await;
         let compact = server
             .mock("POST", "/api/session/s/compact")
-            .match_body(mockito::Matcher::Json(
+            .match_body(mockito::Matcher::PartialJson(
                 serde_json::json!({"delivery":"queue"}),
             ))
             .with_status(200)
@@ -2510,9 +2540,10 @@ pub(crate) mod tests {
             .await;
         let prompt = server
             .mock("POST", "/api/session/s/prompt")
-            .match_body(mockito::Matcher::Json(
-                serde_json::json!({"text":"hi","delivery":"queue","resume":true}),
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"text":"hi","delivery":"queue"}),
             ))
+            .expect(2)
             .with_status(200)
             .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
             .create_async()
@@ -2936,7 +2967,9 @@ pub(crate) mod tests {
                                     if released.changed().await.is_err() { return; }
                                 }
                             }
-                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            let body = if target.ends_with("/inbox") { r#"{"data":[]}"# } else { "" };
+                            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                            let _ = socket.write_all(response.as_bytes()).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -2947,14 +2980,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_cancels_native_and_legacy_prompt_admission_without_response_headers() {
-        for (api, path) in [
-            (super::super::api::OpenCodeApi::V2, "/api/session/s/prompt"),
-            (
-                super::super::api::OpenCodeApi::Legacy,
-                "/session/s/prompt_async",
-            ),
-        ] {
+    async fn shutdown_cancels_legacy_prompt_admission_without_response_headers() {
+        for (api, path) in [(
+            super::super::api::OpenCodeApi::Legacy,
+            "/session/s/prompt_async",
+        )] {
             let (base, mut requests, release, server) = stalled_first_response(path).await;
             let (session, _, mut events) = mock_session_api(base, "pw".into(), "s", api).await;
             let sending = tokio::spawn({
@@ -3013,6 +3043,7 @@ pub(crate) mod tests {
         assert_eq!(requests.recv().await.unwrap(), "/api/session/s/model");
         tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
             .await
+            .unwrap()
             .unwrap();
         assert!(matches!(
             selecting.await.unwrap(),
@@ -3028,7 +3059,8 @@ pub(crate) mod tests {
             session.current_model.lock().await.as_deref(),
             Some("openai/gpt-5")
         );
-        assert!(requests.try_recv().is_err());
+        assert!(std::iter::from_fn(|| requests.try_recv().ok())
+            .all(|path| path != "/api/session/s/model"));
         server.abort();
         let _ = server.await;
     }
@@ -3057,6 +3089,7 @@ pub(crate) mod tests {
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
             .await
+            .unwrap()
             .unwrap();
         assert!(matches!(
             promoting.await.unwrap(),
@@ -3070,7 +3103,8 @@ pub(crate) mod tests {
         tokio::task::yield_now().await;
         assert!(session.queued.lock().await.is_empty());
         assert!(
-            requests.try_recv().is_err(),
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .all(|path| path != "/api/session/s/prompt"),
             "promotion cannot dispatch the prompt after closure"
         );
         let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
@@ -3083,8 +3117,132 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn native_dead_attachment_handoff_does_not_interrupt_resumed_turn() {
+        let mut server = Server::new_async().await;
+        let interrupt = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let old_inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .with_status(200)
+            .with_body("{}")
+            .expect(2)
+            .create_async()
+            .await;
+        let (old, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        old.dead.store(true, Ordering::Relaxed);
+        assert!(!old.has_unconfirmed_native_admissions().await);
+        old.handoff_dead_attachment().await.unwrap();
+        drop(old);
+        let (resumed, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        resumed
+            .send_turn("resumed prompt".into(), vec![], None, None)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(resumed.turn_active().await);
+        prompt.assert_async().await;
+        interrupt.assert_async().await;
+        old_inbox.assert_async().await;
+        resumed.dead.store(true, Ordering::Relaxed);
+        resumed.handoff_dead_attachment().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_failed_idle_confirmation_keeps_teardown_owned_until_retry() {
+        let mut server = Server::new_async().await;
+        let _inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+        let _interrupt = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .create_async()
+            .await;
+        let failed_wait = server
+            .mock("POST", "/api/experimental/session/s/wait")
+            .with_status(500)
+            .create_async()
+            .await;
+        let (session, _, mut events) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        assert!(session.shutdown().await.is_err());
+        assert!(session.has_unconfirmed_native_admissions().await);
+        assert!(session.handoff_dead_attachment().await.is_err());
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                event,
+                ProviderRuntimeEvent::SessionStateChanged {
+                    status: SessionStatus::Closed,
+                    ..
+                }
+            ))
+        );
+        failed_wait.remove_async().await;
+        let successful_wait = server
+            .mock("POST", "/api/experimental/session/s/wait")
+            .with_status(204)
+            .create_async()
+            .await;
+        session.shutdown().await.unwrap();
+        assert!(!session.has_unconfirmed_native_admissions().await);
+        session.handoff_dead_attachment().await.unwrap();
+        successful_wait.assert_async().await;
+    }
+
+    async fn native_idle_responses(server: &mut Server, session: &str) -> Vec<mockito::Mock> {
+        vec![
+            server
+                .mock("GET", format!("/api/session/{session}/inbox").as_str())
+                .with_status(200)
+                .with_body(r#"{"data":[]}"#)
+                .create_async()
+                .await,
+            server
+                .mock(
+                    "POST",
+                    format!("/api/experimental/session/{session}/wait").as_str(),
+                )
+                .with_status(204)
+                .create_async()
+                .await,
+        ]
+    }
+
+    #[tokio::test]
     async fn native_shutdown_rejects_prompt_after_pending_model_ack() {
         let mut server = Server::new_async().await;
+        let _teardown = native_idle_responses(&mut server, "s").await;
         let (seen, mut received) = tokio::sync::mpsc::unbounded_channel();
         let (release, gate) = std::sync::mpsc::channel();
         let gate = std::sync::Mutex::new(gate);
@@ -3109,6 +3267,7 @@ pub(crate) mod tests {
             .await;
         let interrupt = server
             .mock("POST", "/api/session/s/interrupt?resume=false")
+            .expect_at_least(2)
             .with_status(200)
             .create_async()
             .await;
@@ -3140,7 +3299,7 @@ pub(crate) mod tests {
             sending.await.unwrap(),
             Err(ProviderError::SessionClosed { .. })
         ));
-        closing.await.unwrap();
+        closing.await.unwrap().unwrap();
         model.assert_async().await;
         prompt.assert_async().await;
         interrupt.assert_async().await;
@@ -3164,6 +3323,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn native_background_resume_keeps_prompt_queued_after_pending_model_ack() {
         let mut server = Server::new_async().await;
+        let _teardown = native_idle_responses(&mut server, "s").await;
         let (seen, mut received) = tokio::sync::mpsc::unbounded_channel();
         let (release, gate) = std::sync::mpsc::channel();
         let gate = std::sync::Mutex::new(gate);
@@ -3182,14 +3342,16 @@ pub(crate) mod tests {
             .await;
         let prompt = server
             .mock("POST", "/api/session/s/prompt")
-            .match_body(mockito::Matcher::Json(
-                serde_json::json!({"text":"waiting input","delivery":"queue","resume":true}),
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"text":"waiting input","delivery":"queue"}),
             ))
+            .expect(2)
             .with_status(200)
             .create_async()
             .await;
         let interrupt = server
             .mock("POST", "/api/session/s/interrupt?resume=false")
+            .expect_at_least(2)
             .with_status(200)
             .create_async()
             .await;
@@ -3301,11 +3463,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn native_interrupt_and_child_question_use_exact_owner_and_detach_does_not_delete() {
         let mut server = Server::new_async().await;
+        let _teardown = native_idle_responses(&mut server, "s").await;
         let abort = server
             .mock("POST", "/api/session/s/interrupt?resume=false")
+            .expect_at_least(2)
             .with_status(200)
             .with_body(r#"{"interrupted":true}"#)
-            .expect(2)
+            .expect_at_least(3)
             .create_async()
             .await;
         let delete = server
@@ -3824,12 +3988,13 @@ pub(crate) mod tests {
     }
     async fn await_native_http(session: &OpenCodeSession) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while session
-                .native_requests
-                .lock()
-                .await
-                .iter()
-                .any(|request| !request.is_finished())
+            while session.has_unconfirmed_native_admissions().await
+                || session
+                    .native_requests
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|request| !request.is_finished())
             {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }

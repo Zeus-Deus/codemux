@@ -231,6 +231,7 @@ impl AgentProvider for OpenCodeAgentProvider {
             if existing.has_unconfirmed_native_admissions().await {
                 existing.shutdown().await?;
             }
+            existing.handoff_dead_attachment().await?;
             let mut sessions = self.sessions.write().await;
             if sessions
                 .get(&thread_id)
