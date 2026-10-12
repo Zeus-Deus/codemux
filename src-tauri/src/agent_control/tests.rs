@@ -438,7 +438,7 @@ impl crate::agent_provider::AgentProvider for RecoveryOpenCode {
     async fn cancel_queued_turn(&self, _: crate::agent_provider::ThreadId, id: String) -> Result<bool, crate::agent_provider::ProviderError> { Ok(self.session.cancel_queued(&id).await) }
     async fn send_queued_turn_now(&self, _: crate::agent_provider::ThreadId, id: String) -> Result<(), crate::agent_provider::ProviderError> { self.session.send_queued_now(&id, false).await }
     async fn respond_to_request(&self, _: crate::agent_provider::ThreadId, r: crate::agent_provider::RequestId, d: crate::agent_provider::ApprovalDecision) -> Result<(), crate::agent_provider::ProviderError> { self.session.respond_to_request(r,d).await }
-    async fn set_model(&self, _: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.session.set_model(m).await; Ok(()) }
+    async fn set_model(&self, _: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.session.set_model(m).await }
     async fn set_permission_mode(&self, t: crate::agent_provider::ThreadId, m: String) -> Result<(), crate::agent_provider::ProviderError> { self.metadata.set_permission_mode(t,m).await }
     async fn stop_session(&self, _: crate::agent_provider::ThreadId) -> Result<(), crate::agent_provider::ProviderError> { self.session.shutdown().await; Ok(()) }
     async fn list_sessions(&self) -> Result<Vec<crate::agent_provider::ProviderSession>, crate::agent_provider::ProviderError> { Ok(vec![]) }

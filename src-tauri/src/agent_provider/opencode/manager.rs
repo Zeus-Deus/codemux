@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::discovery::check_opencode_availability;
+use super::discovery::prepared_binary;
 use super::server::OpenCodeServer;
 
 /// Per-attempt budget for the cached-server liveness probe in
@@ -77,6 +77,7 @@ const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct OpenCodeServerHandle {
     pub base_url: String,
     pub server_password: String,
+    pub api: super::api::OpenCodeApi,
 }
 
 /// Singleton supervisor for the OpenCode HTTP server child.
@@ -113,10 +114,9 @@ impl OpenCodeServerManager {
     /// Failure modes (returned as a stable `Err(String)` so the
     /// Tauri command surface can forward verbatim):
     ///
-    /// * `"opencode_not_installed"` — the `opencode` binary was not
-    ///   found on PATH. Triggered by the discovery layer rather
-    ///   than the spawn layer so the message is uniform across the
-    ///   ping / list_models / future session-start commands.
+    /// * Prepared-executable resolution errors (missing install, invalid
+    ///   authoritative override, or unsupported npm layout) are forwarded
+    ///   verbatim, without a best-effort `--version` probe.
     /// * `"spawn_failed: …"` / `"ready_banner_missing"` /
     ///   `"ready_timeout_after_…"` — passthrough from
     ///   [`OpenCodeServer::spawn`](super::server::OpenCodeServer::spawn).
@@ -177,6 +177,7 @@ impl Default for OpenCodeServerManager {
 fn handle_from(server: &Arc<OpenCodeServer>) -> OpenCodeServerHandle {
     OpenCodeServerHandle {
         base_url: server.base_url().to_string(),
+        api: server.api(),
         server_password: server.server_password().to_string(),
     }
 }
@@ -241,17 +242,9 @@ async fn probe_server_alive(handle: &OpenCodeServerHandle) -> bool {
 }
 
 async fn resolve_binary() -> Result<PathBuf, String> {
-    // Reuse the Stage 1 discovery primitive so any future
-    // refinement (e.g. honouring a `binary_path_override` setting)
-    // lands in one place rather than duplicated across the spawn
-    // path and the diagnostics path.
-    let availability = check_opencode_availability(None).await;
-    if !availability.installed {
-        return Err("opencode_not_installed".into());
-    }
-    availability
-        .binary_path
-        .ok_or_else(|| "opencode_not_installed".into())
+    // Spawn admission needs the selected prepared path, not a best-effort
+    // availability/version probe. Preserve authoritative resolver diagnostics.
+    prepared_binary().await
 }
 
 /// Test-only fixture: write a fake `opencode` binary into `dir` that
@@ -346,32 +339,124 @@ mod tests {
     /// runs.
     use serial_test::serial;
 
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn new(values: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
+            let guard = Self(
+                values
+                    .iter()
+                    .map(|(key, _)| (*key, std::env::var_os(key)))
+                    .collect(),
+            );
+            for (key, value) in values {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            guard
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial(opencode_path)]
-    async fn ensure_running_when_binary_missing_returns_not_installed() {
-        // Force PATH to a guaranteed-empty location so discovery
-        // returns `installed: false`. Mirror the Stage 1
-        // `check_when_binary_missing_returns_not_installed`
-        // pattern so the env mutation is bracketed by a restore
-        // even on panic.
-        let original = std::env::var("PATH").unwrap_or_default();
+    async fn resolve_binary_preserves_authoritative_override_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.exe");
+        let launcher = tmp.path().join("opencode.cmd");
+        std::fs::write(&launcher, "@echo off\ninvalid selected legacy install\n").unwrap();
+        let legacy_root = tmp.path().join("legacy");
+        let package = legacy_root.join("node_modules/opencode-ai");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(
+            package.join("bin/opencode"),
+            "inert Node launcher; never executed",
+        )
+        .unwrap();
+        std::fs::write(package.join("package.json"), r#"{"name":"opencode-ai","version":"1.14.31","bin":{"opencode":"./bin/opencode"},"optionalDependencies":{"opencode-windows-x64":"1.14.31","opencode-windows-x64-baseline":"1.14.31","opencode-windows-arm64":"1.14.31"}}"#).unwrap();
+        let legacy = legacy_root.join("opencode.cmd");
+        std::fs::write(
+            &legacy,
+            "@echo off\n\"%dp0%/node_modules/opencode-ai/bin/opencode\" %*\n",
+        )
+        .unwrap();
+        let _path = EnvGuard::new(&[("PATH", Some(tmp.path().as_os_str()))]);
+        for (path, expected) in [
+            (PathBuf::from("relative/opencode.exe"), "OpenCode requires an absolute prepared executable path"),
+            (missing, "The prepared OpenCode executable is unavailable"),
+            (launcher, "Cannot resolve this OpenCode npm launcher to an adjacent prepared native executable"),
+            (legacy, "Cannot resolve this legacy OpenCode npm launcher to a same-version prepared Windows optional dependency; check its node_modules or set CODEMUX_OPENCODE_BINARY to the prepared native executable"),
+        ] {
+            let _override = EnvGuard::new(&[("CODEMUX_OPENCODE_BINARY", Some(path.as_os_str()))]);
+            let manager = OpenCodeServerManager::new();
+            assert_eq!(manager.ensure_running().await.unwrap_err(), expected);
+            assert!(!manager.is_running_for_tests().await);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn resolve_binary_never_probes_version_or_falls_back_to_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("opencode");
+        let marker = tmp.path().join("executed");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf touched > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = EnvGuard::new(&[
+            ("PATH", Some(tmp.path().as_os_str())),
+            ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
+        ]);
+        assert_eq!(
+            resolve_binary().await.unwrap(),
+            binary.canonicalize().unwrap()
+        );
+        assert!(
+            !marker.exists(),
+            "ordinary spawn resolution must not run --version"
+        );
+        let missing = tmp.path().join("missing.exe");
+        let _bad = EnvGuard::new(&[("CODEMUX_OPENCODE_BINARY", Some(missing.as_os_str()))]);
+        assert_eq!(
+            resolve_binary().await.unwrap_err(),
+            "The prepared OpenCode executable is unavailable"
+        );
+        assert!(
+            !marker.exists(),
+            "bad override must not run the valid PATH binary"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn ensure_running_when_binary_missing_preserves_resolver_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serial_test serialises this against any other
-        // opencode test that touches PATH, so the env mutation is
-        // exclusive while it's in effect.
-        unsafe {
-            std::env::set_var("PATH", tmp.path());
-        }
-
+        let _env = EnvGuard::new(&[
+            ("PATH", Some(tmp.path().as_os_str())),
+            ("CODEMUX_OPENCODE_BINARY", None),
+        ]);
         let manager = OpenCodeServerManager::new();
-        let result = manager.ensure_running().await;
-
-        unsafe {
-            std::env::set_var("PATH", original);
-        }
-
-        let err = result.expect_err("must fail");
-        assert_eq!(err, "opencode_not_installed");
+        let err = manager.ensure_running().await.expect_err("must fail");
+        assert_eq!(err, "Install a supported OpenCode CLI or set CODEMUX_OPENCODE_BINARY to its prepared executable");
         assert!(
             !manager.is_running_for_tests().await,
             "manager should not have populated the server slot on failure"

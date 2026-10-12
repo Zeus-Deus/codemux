@@ -5388,7 +5388,8 @@ pub async fn list_chat_slash_commands(
         ProviderKind::OpenCode => {
             let handle = opencode_manager.ensure_running().await?;
             let mut config = crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
-            config.server_password = Some(handle.server_password);
+            config.api = handle.api;
+    config.server_password = Some(handle.server_password);
             let client = crate::agent_provider::opencode::OpenCodeClient::new(config)?;
             let mut commands = vec![
                 crate::agent_provider::claude::slash_commands::ProviderSlashCommand {

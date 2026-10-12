@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::agent_provider::events::ProviderRuntimeEvent;
@@ -68,6 +68,14 @@ pub struct SseRouter {
     root_session_id: String,
     watched: HashSet<String>,
     permission_sessions: HashMap<String, String>,
+    interrupted_turn: Option<crate::agent_provider::TurnId>,
+    legacy_message_turns: HashMap<String, crate::agent_provider::TurnId>,
+    legacy_terminal: Option<(
+        crate::agent_provider::TurnId,
+        crate::agent_provider::TurnStatus,
+    )>,
+    forms: HashMap<String, serde_json::Value>,
+    pub native: super::v2::State,
 }
 
 impl SseRouter {
@@ -81,6 +89,11 @@ impl SseRouter {
             root_session_id: root,
             watched,
             permission_sessions: HashMap::new(),
+            interrupted_turn: None,
+            legacy_message_turns: HashMap::new(),
+            legacy_terminal: None,
+            forms: HashMap::new(),
+            native: super::v2::State::default(),
         }
     }
 
@@ -113,6 +126,34 @@ impl SseRouter {
         self.permission_sessions.insert(permission_id, session_id);
     }
 
+    pub fn record_form(&mut self, form: serde_json::Value) {
+        if let (Some(id), Some(session)) = (form["id"].as_str(), form["sessionID"].as_str()) {
+            self.permission_sessions.insert(id.into(), session.into());
+            self.forms.insert(id.into(), form);
+        }
+    }
+    pub fn form(&self, id: &str) -> Option<serde_json::Value> {
+        self.forms.get(id).cloned()
+    }
+    pub fn forget_request(&mut self, id: &str) {
+        self.permission_sessions.remove(id);
+        self.forms.remove(id);
+    }
+    pub fn mark_interrupted(&mut self, turn: Option<crate::agent_provider::TurnId>) {
+        self.interrupted_turn = turn;
+    }
+    fn take_interrupted(&mut self, turn: &crate::agent_provider::TurnId) -> bool {
+        if self.interrupted_turn.as_ref() == Some(turn) {
+            self.interrupted_turn = None;
+            true
+        } else {
+            false
+        }
+    }
+    pub fn watched_sessions(&self) -> Vec<String> {
+        self.watched.iter().cloned().collect()
+    }
+
     /// The session a permission reply must target, if known.
     pub fn session_for_permission(&self, permission_id: &str) -> Option<String> {
         self.permission_sessions.get(permission_id).cloned()
@@ -129,6 +170,8 @@ impl SseRouter {
 /// mutable watched-session + permission-routing state.
 #[derive(Debug, Clone)]
 pub struct SsePeer {
+    pub api: super::api::OpenCodeApi,
+    pub ready: watch::Sender<bool>,
     pub directory: Option<std::path::PathBuf>,
     pub session_id: String,
     pub event_ctx: Arc<Mutex<EventContext>>,
@@ -164,10 +207,15 @@ async fn run_sse_listener(
     peer: SsePeer,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 ) {
-    let mut url = format!("{}/event", base_url.trim_end_matches('/'));
+    let mut url = format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        peer.api.route("/event", "/api/event")
+    );
     if let Some(directory) = peer.directory.as_ref() {
         url.push_str(&format!(
-            "?directory={}",
+            "?{}={}",
+            peer.api.route("directory", "location%5Bdirectory%5D"),
             urlencoding::encode(&directory.to_string_lossy())
         ));
     }
@@ -211,10 +259,7 @@ async fn run_sse_listener(
                 continue;
             }
             Err(err) => {
-                let _ = event_tx.send(warn(
-                    &peer,
-                    format!("opencode_sse_connect_error: {err}"),
-                ));
+                let _ = event_tx.send(warn(&peer, format!("opencode_sse_connect_error: {err}")));
                 if !backoff_or_quit(&mut attempt, &peer, &event_tx).await {
                     return;
                 }
@@ -222,7 +267,13 @@ async fn run_sse_listener(
             }
         };
 
-        consume_stream(response, &peer, &event_tx).await;
+        if peer.api == super::api::OpenCodeApi::Legacy {
+            peer.ready.send_replace(true);
+        }
+        consume_stream(response, &peer, &event_tx, &base_url, &server_password).await;
+        if peer.api == super::api::OpenCodeApi::V2 {
+            peer.ready.send_replace(false);
+        }
 
         // The server closed the stream (or it ended cleanly). Try to
         // reconnect — the OpenCode server may still be live and a new
@@ -237,6 +288,8 @@ async fn consume_stream(
     response: reqwest::Response,
     peer: &SsePeer,
     event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+    base_url: &str,
+    server_password: &str,
 ) {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::<u8>::new();
@@ -245,10 +298,7 @@ async fn consume_stream(
         let bytes = match chunk {
             Ok(b) => b,
             Err(err) => {
-                let _ = event_tx.send(warn(
-                    peer,
-                    format!("opencode_sse_chunk_error: {err}"),
-                ));
+                let _ = event_tx.send(warn(peer, format!("opencode_sse_chunk_error: {err}")));
                 return;
             }
         };
@@ -259,6 +309,21 @@ async fn consume_stream(
         while let Some(end) = find_record_end(&buffer) {
             let record_bytes = buffer.drain(..end).collect::<Vec<u8>>();
             let record = String::from_utf8_lossy(&record_bytes).into_owned();
+            if peer.api == super::api::OpenCodeApi::V2
+                && parse_sse_record(&record)
+                    .and_then(|s| serde_json::from_str::<super::v2::Event>(&s).ok())
+                    .is_some_and(|e| e.kind == "server.connected")
+            {
+                if let Err(message) =
+                    reconcile_native(base_url, server_password, peer, event_tx).await
+                {
+                    let _ = event_tx.send(warn(
+                        peer,
+                        format!("opencode_reconnect_snapshot_failed: {message}"),
+                    ));
+                    return;
+                }
+            }
             handle_record(&record, peer, event_tx).await;
         }
     }
@@ -329,13 +394,15 @@ async fn handle_record(
     let event = match serde_json::from_str::<OpenCodeEvent>(&data) {
         Ok(e) => e,
         Err(err) => {
-            let _ = event_tx.send(warn(
-                peer,
-                format!("opencode_sse_decode_error: {err}"),
-            ));
+            let _ = event_tx.send(warn(peer, format!("opencode_sse_decode_error: {err}")));
             return;
         }
     };
+
+    if let OpenCodeEvent::V2(event) = event {
+        handle_native(event, peer, event_tx).await;
+        return;
+    }
 
     // Resolve routing against the watched-session set, growing it for
     // newly-spawned subagents, before deciding whether the event is
@@ -355,9 +422,77 @@ async fn handle_record(
     let mut usage = peer.usage.lock().await;
     let root_idle =
         subagent_id.is_none() && matches!(&event, OpenCodeEvent::Known(KnownEvent::SessionIdle(_)));
+    if root_idle && !ctx.turn_active {
+        return;
+    }
+    let stale_message = if subagent_id.is_none() {
+        let message = match &event {
+            OpenCodeEvent::Known(KnownEvent::MessageUpdated(message))
+                if message.info.role == "assistant" =>
+            {
+                Some(&message.info.id)
+            }
+            OpenCodeEvent::Known(KnownEvent::MessagePartDelta(part)) => Some(&part.message_id),
+            _ => None,
+        };
+        if let Some(message) = message {
+            let mut router = peer.router.lock().await;
+            if ctx.turn_active {
+                router
+                    .legacy_message_turns
+                    .entry(message.clone())
+                    .or_insert_with(|| ctx.turn_id.clone());
+            }
+            router
+                .legacy_message_turns
+                .get(message)
+                .is_some_and(|turn| turn != &ctx.turn_id)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     let mut events =
         opencode_event_to_runtime_with(event, &ctx, subagent_id.as_deref(), &mut usage);
+    if subagent_id.is_none() && !root_idle {
+        // v1 sends session.error, then idle, then often repeats the same
+        // error on message.updated. Idle is the execution boundary; retain
+        // the failure until that boundary instead of emitting three terminals.
+        for event in &events {
+            if let ProviderRuntimeEvent::TurnCompleted { status, .. } = event {
+                if ctx.turn_active && !stale_message {
+                    peer.router.lock().await.legacy_terminal =
+                        Some((ctx.turn_id.clone(), status.clone()));
+                }
+            }
+        }
+        events.retain(|e| !matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }));
+    }
     if root_idle {
+        let pending = peer.router.lock().await.legacy_terminal.take();
+        if let Some((turn, status)) = pending {
+            if turn == ctx.turn_id {
+                for event in &mut events {
+                    if let ProviderRuntimeEvent::TurnCompleted {
+                        status: current, ..
+                    } = event
+                    {
+                        *current = status.clone();
+                    }
+                }
+            }
+        }
+        if peer.router.lock().await.take_interrupted(&ctx.turn_id) {
+            for event in &mut events {
+                if let ProviderRuntimeEvent::TurnCompleted { status, .. } = event {
+                    *status = crate::agent_provider::TurnStatus::Error {
+                        subtype: "interrupted".into(),
+                        message: "OpenCode execution interrupted".into(),
+                    };
+                }
+            }
+        }
         events.push(ProviderRuntimeEvent::SessionStateChanged {
             thread_id: ctx.thread_id.clone(),
             status: crate::agent_provider::SessionStatus::Ready,
@@ -408,6 +543,398 @@ async fn handle_record(
     }
 }
 
+async fn handle_native(
+    event: super::v2::Event,
+    peer: &SsePeer,
+    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+) {
+    if event.kind == "server.connected" {
+        peer.ready.send_replace(true);
+        return;
+    }
+    let Some(session) = event.session_id().map(str::to_string) else {
+        return;
+    };
+    let mut router = peer.router.lock().await;
+    if event.kind == "session.created" {
+        if let Some(parent) = event.data["parentID"].as_str() {
+            if router.is_watched(parent) {
+                router.watched.insert(session.clone());
+            }
+        }
+    }
+    if !router.is_watched(&session) {
+        return;
+    }
+    let subagent = router.subagent_id_for(&session);
+    if event.kind == "permission.asked" {
+        if let Some(id) = event.data["id"].as_str() {
+            if router.session_for_permission(id).is_some() {
+                return;
+            }
+            router.record_permission(id.into(), session.clone());
+        }
+    }
+    if event.kind == "form.created" {
+        if let Some(id) = event.data["form"]["id"].as_str() {
+            if router.session_for_permission(id).is_some() {
+                return;
+            }
+        }
+        router.record_form(event.data["form"].clone());
+    }
+    // Retain routing until a reply has actually succeeded, not merely clicked.
+    let updates = match router.native.reduce(&event) {
+        Ok(updates) => updates,
+        Err(message) => {
+            drop(router);
+            let _ = event_tx.send(warn(peer, message));
+            return;
+        }
+    };
+    drop(router);
+    let mut live = peer.event_ctx.lock().await;
+    let mut usage = peer.usage.lock().await;
+    let mut events = Vec::new();
+    for update in updates {
+        // Root content that precedes attachment is already in durable history.
+        // Child callbacks and lifecycle remain live after the parent settles.
+        if !live.turn_active
+            && subagent.is_none()
+            && matches!(
+                &update,
+                super::v2::Update::Content { .. }
+                    | super::v2::Update::ToolUse { .. }
+                    | super::v2::Update::ToolResult { .. }
+            )
+        {
+            continue;
+        }
+        events.extend(super::translate::v2_update_to_runtime(
+            update,
+            &live,
+            subagent.as_deref(),
+            &mut usage,
+        ));
+    }
+    if events
+        .iter()
+        .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+    {
+        live.turn_active = false;
+    }
+    for event in events {
+        let _ = event_tx.send(event);
+    }
+}
+
+async fn native_get(
+    client: &reqwest::Client,
+    base: &str,
+    password: &str,
+    path: &str,
+) -> Result<serde_json::Value, String> {
+    client
+        .get(format!("{}{path}", base.trim_end_matches('/')))
+        .basic_auth("opencode", Some(password))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The native feed is volatile. Subscribe first, then recover durable state
+/// before releasing the readiness barrier; never recreate/delete on failure.
+async fn reconcile_native(
+    base: &str,
+    password: &str,
+    peer: &SsePeer,
+    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let active = native_get(&client, base, password, "/api/session/active").await?;
+    if !active["data"].is_object() {
+        return Err("missing active-session snapshot".into());
+    }
+    let mut parents = vec![peer.session_id.clone()];
+    let mut visited = HashSet::new();
+    while let Some(parent) = parents.pop() {
+        if !visited.insert(parent.clone()) {
+            continue;
+        }
+        let mut cursor: Option<String> = None;
+        loop {
+            let path = match &cursor {
+                Some(cursor) => format!(
+                    "/api/session?parentID={}&limit=200&cursor={}",
+                    urlencoding::encode(&parent),
+                    urlencoding::encode(cursor)
+                ),
+                None => format!(
+                    "/api/session?parentID={}&limit=200&order=asc",
+                    urlencoding::encode(&parent)
+                ),
+            };
+            let page = native_get(&client, base, password, &path).await?;
+            let children = page["data"]
+                .as_array()
+                .ok_or("missing child-session snapshot")?;
+            for child in children {
+                let id = child["id"].as_str().ok_or("missing child id")?;
+                peer.router.lock().await.watched.insert(id.into());
+                parents.push(id.into());
+                if active["data"].get(id).is_some() {
+                    peer.router.lock().await.native.mark_running(id);
+                }
+            }
+            let next = page["cursor"]["next"].as_str().map(str::to_string);
+            if next.is_none() {
+                break;
+            }
+            if next == cursor {
+                return Err("child cursor did not advance".into());
+            }
+            cursor = next;
+        }
+    }
+    let sessions = peer.router.lock().await.watched_sessions();
+    for session in sessions {
+        let encoded = urlencoding::encode(&session);
+        // Pending asks can be raised by grandchildren and background children.
+        for (suffix, kind, key) in [
+            ("permission", "permission.asked", None),
+            ("form", "form.created", Some("form")),
+        ] {
+            let page = native_get(
+                &client,
+                base,
+                password,
+                &format!("/api/session/{encoded}/{suffix}"),
+            )
+            .await?;
+            for request in page["data"]
+                .as_array()
+                .ok_or("missing pending-request snapshot")?
+            {
+                let id = request["id"].as_str().ok_or("missing pending request id")?;
+                let known = peer
+                    .router
+                    .lock()
+                    .await
+                    .session_for_permission(id)
+                    .is_some();
+                if !known {
+                    let data = if let Some(key) = key {
+                        serde_json::json!({key:request})
+                    } else {
+                        request.clone()
+                    };
+                    handle_native(
+                        super::v2::Event {
+                            id: format!("snapshot:request:{id}"),
+                            kind: kind.into(),
+                            data,
+                        },
+                        peer,
+                        event_tx,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    let root = &peer.session_id;
+    let running = active["data"].get(root).is_some();
+    if running {
+        let mut ctx = peer.event_ctx.lock().await;
+        ctx.turn_active = true;
+        peer.router.lock().await.native.mark_running(root);
+        let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ctx.thread_id.clone(),
+            status: crate::agent_provider::SessionStatus::Running {
+                active_turn: ctx.turn_id.clone(),
+            },
+        });
+    }
+    let sessions = peer.router.lock().await.watched_sessions();
+    for session in sessions {
+        let session_running = active["data"].get(&session).is_some();
+        if session != peer.session_id || peer.event_ctx.lock().await.turn_active {
+            reconcile_native_history(
+                &client,
+                base,
+                password,
+                peer,
+                event_tx,
+                &session,
+                session_running,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Replay the same durable content boundary for root and descendant sessions.
+async fn reconcile_native_history(
+    client: &reqwest::Client,
+    base: &str,
+    password: &str,
+    peer: &SsePeer,
+    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+    session: &str,
+    running: bool,
+) -> Result<(), String> {
+    // Recover completed content from the current/latest execution, stopping
+    // at its preceding durable idle boundary. Pagination follows cursor,
+    // with no order parameter on cursor pages.
+    let encoded = urlencoding::encode(session);
+    let mut messages = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut boundaries = 0;
+    'history: loop {
+        let path = match &cursor {
+            Some(cursor) => format!(
+                "/api/session/{encoded}/message?limit=200&cursor={}",
+                urlencoding::encode(cursor)
+            ),
+            None => format!("/api/session/{encoded}/message?limit=200&order=desc"),
+        };
+        let page = native_get(client, base, password, &path).await?;
+        for message in page["data"].as_array().ok_or("missing history snapshot")? {
+            if message["type"] == "idle" {
+                boundaries += 1;
+                if boundaries > if running { 0 } else { 1 } {
+                    break 'history;
+                }
+            }
+            messages.push(message.clone());
+        }
+        let next = page["cursor"]["next"].as_str().map(str::to_string);
+        if next.is_none() {
+            break;
+        }
+        if next == cursor {
+            return Err("history cursor did not advance".into());
+        }
+        cursor = next;
+    }
+    for message in messages
+        .into_iter()
+        .rev()
+        .filter(|m| m["type"] == "assistant")
+    {
+        let id = message["id"]
+            .as_str()
+            .ok_or("missing assistant message id")?;
+        handle_native(super::v2::Event{id:format!("snapshot:step:{id}"),kind:"session.step.started".into(),data:serde_json::json!({"sessionID":session,"assistantMessageID":id,"model":message["model"]})},peer,event_tx).await;
+        for (ordinal, part) in message["content"]
+            .as_array()
+            .ok_or("missing assistant content")?
+            .iter()
+            .enumerate()
+        {
+            if part["type"] == "tool" {
+                let tool_id = part["id"].as_str().ok_or("missing tool id")?;
+                let base =
+                    serde_json::json!({"sessionID":session,"assistantMessageID":id,"id":tool_id});
+                let mut started = base.clone();
+                started["name"] = part["name"].clone();
+                handle_native(
+                    super::v2::Event {
+                        id: format!("snapshot:tool-start:{id}:{tool_id}"),
+                        kind: "session.tool.input.started".into(),
+                        data: started,
+                    },
+                    peer,
+                    event_tx,
+                )
+                .await;
+                if part["state"]["input"].is_object() {
+                    let mut called = base.clone();
+                    called["input"] = part["state"]["input"].clone();
+                    handle_native(
+                        super::v2::Event {
+                            id: format!("snapshot:tool-call:{id}:{tool_id}"),
+                            kind: "session.tool.called".into(),
+                            data: called,
+                        },
+                        peer,
+                        event_tx,
+                    )
+                    .await;
+                }
+                let status = part["state"]["status"].as_str().unwrap_or("streaming");
+                if matches!(status, "completed" | "error") {
+                    let mut result = base;
+                    result["content"] = part["state"]["content"].clone();
+                    result["error"] = part["state"]["error"].clone();
+                    result["metadata"] = part["state"]["metadata"].clone();
+                    handle_native(
+                        super::v2::Event {
+                            id: format!("snapshot:tool-result:{id}:{tool_id}"),
+                            kind: if status == "completed" {
+                                "session.tool.success"
+                            } else {
+                                "session.tool.failed"
+                            }
+                            .into(),
+                            data: result,
+                        },
+                        peer,
+                        event_tx,
+                    )
+                    .await;
+                }
+                continue;
+            }
+            let prefix = match part["type"].as_str() {
+                Some("text") => "session.text",
+                Some("reasoning") => "session.reasoning",
+                _ => continue,
+            };
+            // A still-streaming message can race buffered live deltas.
+            // Do not append its partial snapshot or prematurely end it;
+            // the authoritative ended event restores the full segment.
+            if !message["time"]["completed"].is_number() {
+                continue;
+            }
+            let suffix = "ended";
+            handle_native(super::v2::Event{id:format!("snapshot:content:{id}:{ordinal}"),kind:format!("{prefix}.{suffix}"),data:serde_json::json!({"sessionID":session,"assistantMessageID":id,"ordinal":ordinal,"text":part["text"]})},peer,event_tx).await;
+        }
+        if message.get("tokens").is_some() {
+            handle_native(super::v2::Event{id:format!("snapshot:usage:{id}"),kind:"session.step.ended".into(),data:serde_json::json!({"sessionID":session,"assistantMessageID":id,"tokens":message["tokens"],"cost":message["cost"]})},peer,event_tx).await;
+        }
+    }
+    if !running {
+        let info = native_get(client, base, password, &format!("/api/session/{encoded}")).await?;
+        let boundary = info["data"]["time"]["idle"].clone();
+        let mut router = peer.router.lock().await;
+        if session != peer.session_id && !router.native.recover_terminal(session, boundary) {
+            return Ok(());
+        }
+        router.native.mark_running(session);
+        drop(router);
+        let outcome = info["data"]["outcome"].as_str().unwrap_or("interrupted");
+        handle_native(
+            super::v2::Event {
+                id: format!("snapshot:terminal:{}", info["data"]["time"]["idle"]),
+                kind: format!("session.execution.{outcome}"),
+                data: serde_json::json!({"sessionID":session}),
+            },
+            peer,
+            event_tx,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Decide whether an event belongs to a watched session and, if so,
 /// return its subagent tag (`None` for the root, `Some(child)` for a
 /// subagent). Returns `None` (the outer `Option`) to signal "drop this
@@ -429,7 +956,7 @@ async fn resolve_routing(
     // translator's `Other` warning arm is reserved for direct callers.
     let known = match event {
         OpenCodeEvent::Known(k) => k,
-        OpenCodeEvent::Other(_) => return None,
+        OpenCodeEvent::V2(_) | OpenCodeEvent::Other(_) => return None,
     };
 
     // Record which session a permission belongs to so the reply can
@@ -508,10 +1035,7 @@ async fn backoff_or_quit(
 /// Marks the session dead so the provider's `has_session` reports it
 /// absent and the next send rebuilds a fresh session via
 /// `ensure_live_session` instead of POSTing to a corpse.
-async fn emit_give_up_terminal(
-    peer: &SsePeer,
-    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
-) {
+async fn emit_give_up_terminal(peer: &SsePeer, event_tx: &broadcast::Sender<ProviderRuntimeEvent>) {
     use std::sync::atomic::Ordering;
     peer.dead.store(true, Ordering::Relaxed);
     let (thread_id, active_turn) = {
@@ -552,6 +1076,8 @@ mod tests {
 
     fn peer(session_id: &str) -> SsePeer {
         SsePeer {
+            api: super::super::api::OpenCodeApi::Legacy,
+            ready: watch::channel(true).0,
             directory: None,
             session_id: session_id.to_string(),
             event_ctx: Arc::new(Mutex::new(EventContext {
@@ -566,6 +1092,439 @@ mod tests {
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage: Arc::new(Mutex::new(OpenCodeUsageState::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_aborted_error_idle_and_late_assistant_error_settle_once() {
+        let p = peer("root");
+        p.event_ctx.lock().await.turn_active = true;
+        let (tx, mut rx) = broadcast::channel(16);
+        let error = r#"data: {"type":"session.error","properties":{"sessionID":"root","error":{"name":"MessageAbortedError","data":{"message":"Aborted"}}}}"#;
+        let idle = r#"data: {"type":"session.idle","properties":{"sessionID":"root"}}"#;
+        let assistant = r#"data: {"type":"message.updated","properties":{"info":{"id":"m","sessionID":"root","role":"assistant","error":{"name":"MessageAbortedError","data":{"message":"Aborted"}}}}}"#;
+        handle_record(error, &p, &tx).await;
+        handle_record(idle, &p, &tx).await;
+        handle_record(assistant, &p, &tx).await;
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "one legacy terminal, not session.error + idle + assistant.error"
+        );
+        assert!(matches!(
+            terminals[0],
+            ProviderRuntimeEvent::TurnCompleted {
+                status: crate::agent_provider::TurnStatus::Error { .. },
+                ..
+            }
+        ));
+        assert!(!p.event_ctx.lock().await.turn_active);
+    }
+
+    #[tokio::test]
+    async fn legacy_repeated_idle_does_not_emit_a_second_turn_terminal() {
+        let p = peer("root");
+        p.event_ctx.lock().await.turn_active = true;
+        let (tx, mut rx) = broadcast::channel(8);
+        let record =
+            "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"root\"}}\n\n";
+        handle_record(record, &p, &tx).await;
+        handle_record(record, &p, &tx).await;
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_abort_idle_is_interrupted_not_success_for_the_selected_turn() {
+        let p = peer("root");
+        let mut ctx = p.event_ctx.lock().await;
+        ctx.turn_active = true;
+        let turn = ctx.turn_id.clone();
+        drop(ctx);
+        p.router.lock().await.mark_interrupted(Some(turn));
+        let (tx, mut rx) = broadcast::channel(8);
+        handle_record(
+            "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"root\"}}\n\n",
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv().unwrap(),ProviderRuntimeEvent::TurnCompleted{status:crate::agent_provider::TurnStatus::Error{subtype,..},..} if subtype=="interrupted")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_reconnect_recovers_completed_output_terminal_and_child_question() {
+        let mut server = mockito::Server::new_async().await;
+        let specs = [
+            ("/api/session/active", serde_json::json!({"data":{}})),
+            (
+                "/api/session?parentID=root&limit=200&order=asc",
+                serde_json::json!({"data":[{"id":"child","parentID":"root"}]}),
+            ),
+            (
+                "/api/session?parentID=child&limit=200&order=asc",
+                serde_json::json!({"data":[]}),
+            ),
+            (
+                "/api/session/root/permission",
+                serde_json::json!({"data":[]}),
+            ),
+            ("/api/session/root/form", serde_json::json!({"data":[]})),
+            (
+                "/api/session/child/permission",
+                serde_json::json!({"data":[]}),
+            ),
+            (
+                "/api/session/child/form",
+                serde_json::json!({"data":[{"id":"f","sessionID":"child","metadata":{"kind":"question"},"fields":[{"key":"q0","type":"string","description":"Pick","custom":true,"options":[]}]}]}),
+            ),
+            (
+                "/api/session/child/message?limit=200&order=desc",
+                serde_json::json!({"data":[]}),
+            ),
+            (
+                "/api/session/child",
+                serde_json::json!({"data":{"id":"child","outcome":"succeeded","time":{"idle":3}}}),
+            ),
+            (
+                "/api/session/root/message?limit=200&order=desc",
+                serde_json::json!({"data":[{"id":"idle","type":"idle","outcome":"succeeded"},{"id":"m","type":"assistant","time":{"completed":3},"model":{"providerID":"p","id":"m"},"content":[{"type":"text","text":"recovered"},{"type":"tool","id":"t","name":"read","state":{"status":"completed","input":{"path":"x"},"content":[{"type":"text","text":"ok"}]}}]}]}),
+            ),
+            (
+                "/api/session/root",
+                serde_json::json!({"data":{"id":"root","outcome":"succeeded","time":{"idle":3}}}),
+            ),
+        ];
+        let mut mocks = Vec::new();
+        for (path, body) in specs {
+            mocks.push(
+                server
+                    .mock("GET", path)
+                    .with_status(200)
+                    .with_body(body.to_string())
+                    .create_async()
+                    .await,
+            );
+        }
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        p.event_ctx.lock().await.turn_active = true;
+        let (tx, mut rx) = broadcast::channel(32);
+        reconcile_native(&server.url(), "fixture", &p, &tx)
+            .await
+            .unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|e|matches!(e,ProviderRuntimeEvent::RequestOpened{subagent_id:Some(s),request_kind,..} if s=="child" && request_kind=="user-input")));
+        assert!(events.iter().any(|e|matches!(e,ProviderRuntimeEvent::ItemCompleted{item:crate::agent_provider::CompletedItem::AssistantText{text},..} if text=="recovered")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(!p.event_ctx.lock().await.turn_active);
+        for mock in mocks {
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_reconnect_recovers_descendants_without_settling_root() {
+        for (root_active, live_terminal_first) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut server = mockito::Server::new_async().await;
+            let mut mocks = Vec::new();
+            let mut specs = vec![
+                (
+                    "/api/session/active".to_string(),
+                    serde_json::json!({"data":if root_active {serde_json::json!({"root":{}})} else {serde_json::json!({})}}),
+                ),
+                (
+                    "/api/session?parentID=root&limit=200&order=asc".into(),
+                    serde_json::json!({"data":[{"id":"child","parentID":"root"}]}),
+                ),
+                (
+                    "/api/session?parentID=child&limit=200&order=asc".into(),
+                    serde_json::json!({"data":[{"id":"grandchild","parentID":"child"}]}),
+                ),
+                (
+                    "/api/session?parentID=grandchild&limit=200&order=asc".into(),
+                    serde_json::json!({"data":[]}),
+                ),
+                (
+                    "/api/session/root/message?limit=200&order=desc".into(),
+                    serde_json::json!({"data":[]}),
+                ),
+            ];
+            for session in ["root", "child", "grandchild"] {
+                specs.push((
+                    format!("/api/session/{session}/permission"),
+                    serde_json::json!({"data":[]}),
+                ));
+                specs.push((format!("/api/session/{session}/form"), serde_json::json!({"data":if session=="grandchild" {serde_json::json!([{"id":"f","sessionID":session,"metadata":{"kind":"question"},"fields":[{"key":"q0","type":"string","description":"Pick","custom":true,"options":[]}]}])} else {serde_json::json!([])}})));
+            }
+            for (session, outcome) in [("child", "succeeded"), ("grandchild", "failed")] {
+                specs.push((format!("/api/session/{session}/message?limit=200&order=desc"), serde_json::json!({"data":[{"type":"idle"},{"id":format!("m-{session}"),"type":"assistant","time":{"completed":3},"content":[{"type":"text","text":session}]}]})));
+                specs.push((
+                    format!("/api/session/{session}"),
+                    serde_json::json!({"data":{"id":session,"outcome":outcome,"time":{"idle":3}}}),
+                ));
+            }
+            for (path, body) in specs {
+                mocks.push(
+                    server
+                        .mock("GET", path.as_str())
+                        .with_status(200)
+                        .with_body(body.to_string())
+                        .expect_at_least(0)
+                        .create_async()
+                        .await,
+                );
+            }
+            let mut p = peer("root");
+            p.api = super::super::api::OpenCodeApi::V2;
+            p.event_ctx.lock().await.turn_active = root_active;
+            // The child started before the outage; the grandchild was created during it.
+            p.router.lock().await.watched.insert("child".into());
+            p.router.lock().await.native.mark_running("child");
+            let (tx, mut rx) = broadcast::channel(64);
+            if live_terminal_first {
+                handle_record("data: {\"id\":\"early-terminal\",\"type\":\"session.execution.succeeded\",\"data\":{\"sessionID\":\"child\"}}\n\n", &p, &tx).await;
+            }
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
+            let mut events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(
+                        e,
+                        ProviderRuntimeEvent::ItemCompleted {
+                            subagent_id: Some(_),
+                            item: crate::agent_provider::CompletedItem::AssistantText { .. },
+                            ..
+                        }
+                    ))
+                    .count(),
+                2,
+                "snapshot must recover descendant output before live replay"
+            );
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
+            for session in ["child", "grandchild"] {
+                handle_record(&format!("data: {}\n\n", serde_json::json!({"id":format!("live-content-{session}"),"type":"session.text.ended","data":{"sessionID":session,"assistantMessageID":format!("m-{session}"),"ordinal":0,"text":session}})), &p, &tx).await;
+                handle_record(&format!("data: {}\n\n", serde_json::json!({"id":format!("live-end-{session}"),"type":if session=="child" {"session.execution.succeeded"} else {"session.execution.failed"},"data":{"sessionID":session}})), &p, &tx).await;
+            }
+            handle_record("data: {\"id\":\"live-form\",\"type\":\"form.created\",\"data\":{\"form\":{\"id\":\"f\",\"sessionID\":\"grandchild\",\"metadata\":{\"kind\":\"question\"},\"fields\":[{\"key\":\"q0\",\"type\":\"string\",\"description\":\"Pick\",\"custom\":true,\"options\":[]}]}}}\n\n", &p, &tx).await;
+            events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+            for session in ["child", "grandchild"] {
+                assert_eq!(events.iter().filter(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { subagent_id:Some(s), item:crate::agent_provider::CompletedItem::AssistantText { text }, .. } if s==session && text==session)).count(), 1, "missed descendant output recovered once");
+                assert_eq!(events.iter().filter(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { subagent, .. } if subagent.subagent_id==session && subagent.status == if session=="child" {crate::agent_provider::SubagentStatus::Completed} else {crate::agent_provider::SubagentStatus::Failed})).count(), 1, "descendant terminal recovered once");
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, ProviderRuntimeEvent::RequestOpened { .. }))
+                    .count(),
+                1
+            );
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })));
+            assert_eq!(p.event_ctx.lock().await.turn_active, root_active);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_reconnect_failed_tools_keep_native_error_without_content() {
+        for content in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!([{"type":"text","text":"explicit result"}])),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let mut state = serde_json::json!({"status":"error","input":{"path":"x"},"error":{"type":"ToolError","message":"native failure"}});
+            if let Some(content) = content.clone() {
+                state["content"] = content;
+            }
+            let specs = [
+                (
+                    "/api/session/active",
+                    serde_json::json!({"data":{"root":{}}}),
+                ),
+                (
+                    "/api/session?parentID=root&limit=200&order=asc",
+                    serde_json::json!({"data":[]}),
+                ),
+                (
+                    "/api/session/root/permission",
+                    serde_json::json!({"data":[]}),
+                ),
+                ("/api/session/root/form", serde_json::json!({"data":[]})),
+                (
+                    "/api/session/root/message?limit=200&order=desc",
+                    serde_json::json!({"data":[{"id":"m","type":"assistant","time":{"completed":3},"content":[{"type":"tool","id":"t","name":"read","state":state}]}]}),
+                ),
+            ];
+            let mut mocks = Vec::new();
+            for (path, body) in specs {
+                mocks.push(
+                    server
+                        .mock("GET", path)
+                        .with_status(200)
+                        .with_body(body.to_string())
+                        .create_async()
+                        .await,
+                );
+            }
+            let mut p = peer("root");
+            p.api = super::super::api::OpenCodeApi::V2;
+            p.event_ctx.lock().await.turn_active = true;
+            let (tx, mut rx) = broadcast::channel(32);
+            reconcile_native(&server.url(), "fixture", &p, &tx)
+                .await
+                .unwrap();
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let results: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ProviderRuntimeEvent::ItemCompleted {
+                        item:
+                            crate::agent_provider::CompletedItem::ToolResult {
+                                content, is_error, ..
+                            },
+                        ..
+                    } => Some((content, is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(results.len(), 1);
+            assert!(*results[0].1);
+            assert_eq!(
+                *results[0].0,
+                content.filter(|v| !v.is_null()).unwrap_or_else(
+                    || serde_json::json!([{"type":"text","text":"native failure"}])
+                )
+            );
+            assert!(p.event_ctx.lock().await.turn_active);
+            for mock in mocks {
+                mock.assert_async().await;
+            }
+        }
+        // Live native failures use the same fallback, not just the snapshot adapter.
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        p.event_ctx.lock().await.turn_active = true;
+        let (tx, mut rx) = broadcast::channel(16);
+        handle_record(&format!("data: {}\n\n", serde_json::json!({"id":"failed","type":"session.tool.failed","data":{"sessionID":"root","assistantMessageID":"m","id":"t","content":null,"error":{"message":"live failure"}}})), &p, &tx).await;
+        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { item:crate::agent_provider::CompletedItem::ToolResult { content, is_error:true, .. }, .. } if content==serde_json::json!([{"type":"text","text":"live failure"}]))));
+    }
+
+    #[tokio::test]
+    async fn native_connected_gates_readiness_and_child_requests_keep_their_owner() {
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let (ready, rx_ready) = watch::channel(false);
+        p.ready = ready;
+        let (tx, mut rx) = broadcast::channel(32);
+        p.event_ctx.lock().await.turn_active = true;
+        let record = |id: &str, kind: &str, data: serde_json::Value| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"id":id,"type":kind,"data":data})
+            )
+        };
+        handle_record(
+            &record("connected", "server.connected", serde_json::json!({})),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(
+            *rx_ready.borrow(),
+            "observed server.connected must unblock dispatch"
+        );
+        handle_record(
+            &record(
+                "child",
+                "session.created",
+                serde_json::json!({"sessionID":"child","parentID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(&record("ask","permission.asked",serde_json::json!({"id":"req","sessionID":"child","action":"edit","resources":["x"]})),&p,&tx).await;
+        assert_eq!(
+            p.router
+                .lock()
+                .await
+                .session_for_permission("req")
+                .as_deref(),
+            Some("child")
+        );
+        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|e|matches!(e,ProviderRuntimeEvent::RequestOpened{subagent_id:Some(id),..} if id=="child")));
+        handle_record(
+            &record(
+                "start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &record(
+                "end",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &record(
+                "idle",
+                "session.idle",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        handle_record(
+            &record(
+                "end2",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(!p.event_ctx.lock().await.turn_active);
     }
 
     #[tokio::test]
@@ -675,13 +1634,15 @@ mod tests {
     }
 
     fn delta_event(session_id: &str) -> OpenCodeEvent {
-        OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
-            session_id: session_id.into(),
-            message_id: "m1".into(),
-            part_id: "p1".into(),
-            field: "text".into(),
-            delta: "x".into(),
-        }))
+        OpenCodeEvent::Known(KnownEvent::MessagePartDelta(
+            super::super::protocol::MessagePartDelta {
+                session_id: session_id.into(),
+                message_id: "m1".into(),
+                part_id: "p1".into(),
+                field: "text".into(),
+                delta: "x".into(),
+            },
+        ))
     }
 
     fn child_created_event(child: &str, parent: &str) -> OpenCodeEvent {
@@ -728,7 +1689,10 @@ mod tests {
         let router = Arc::new(Mutex::new(SseRouter::new("s1")));
         // A session.created whose parent we don't track must NOT be added.
         resolve_routing(&child_created_event("stranger", "someone_else"), &router).await;
-        assert_eq!(resolve_routing(&delta_event("stranger"), &router).await, None);
+        assert_eq!(
+            resolve_routing(&delta_event("stranger"), &router).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -761,7 +1725,11 @@ mod tests {
         );
         // The reply path can now recover the child session id.
         assert_eq!(
-            router.lock().await.session_for_permission("per_1").as_deref(),
+            router
+                .lock()
+                .await
+                .session_for_permission("per_1")
+                .as_deref(),
             Some("child")
         );
     }
@@ -802,7 +1770,9 @@ mod tests {
         handle_record(record, &peer, &tx).await;
         let event = rx.try_recv().expect("event published");
         match event {
-            ProviderRuntimeEvent::ContentDelta { delta, subagent_id, .. } => {
+            ProviderRuntimeEvent::ContentDelta {
+                delta, subagent_id, ..
+            } => {
                 use crate::agent_provider::events::ContentDelta;
                 assert!(subagent_id.is_none(), "root delta carries no subagent id");
                 match delta {

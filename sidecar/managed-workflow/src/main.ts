@@ -1,6 +1,6 @@
 import { Agent, Cursor, JsonlLocalAgentStore } from "@cursor/sdk/bundled";
 import { CursorRuntime, CURSOR_ADAPTER_VERSION } from "./cursor";
-import { OpenCodeRuntime, OPENCODE_ADAPTER_VERSION, OPENCODE_NATIVE_VERSION } from "./opencode";
+import { OpenCodeRuntime, OPENCODE_ADAPTER_VERSION, OPENCODE_NATIVE_VERSION, OPENCODE_NATIVE_VERSIONS } from "./opencode";
 import { object, parseInitialize } from "./contract";
 import type { Json, Runtime } from "./contract";
 import { Rpc, serve } from "./rpc";
@@ -15,7 +15,8 @@ if (process.argv.includes("--check-native")) {
   await probeCursorNatives();
 } else if (process.argv.includes("--check")) {
   process.stdout.write(JSON.stringify({ protocolVersion: 1, cursorAdapterVersion: CURSOR_ADAPTER_VERSION,
-    openCodeAdapterVersion: OPENCODE_ADAPTER_VERSION, openCodeNativeVersion: OPENCODE_NATIVE_VERSION }) + "\n");
+    openCodeAdapterVersion: OPENCODE_ADAPTER_VERSION, openCodeNativeVersion: OPENCODE_NATIVE_VERSION,
+    openCodeNativeVersions: OPENCODE_NATIVE_VERSIONS }) + "\n");
 } else {
   const rpc = new Rpc((line) => process.stdout.write(line));
   let runtime: Runtime | undefined;

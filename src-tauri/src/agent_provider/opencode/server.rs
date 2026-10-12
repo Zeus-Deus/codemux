@@ -49,6 +49,7 @@ use rand::distributions::{Alphanumeric, DistString};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+use super::api::OpenCodeApi;
 use crate::execution::sanitize_gui_env_tokio;
 
 /// Banner prefix OpenCode emits on stdout once the HTTP server is
@@ -85,6 +86,7 @@ pub struct OpenCodeServer {
     /// Stable URL extracted from the ready banner — usable as-is for
     /// `reqwest` requests.
     base_url: String,
+    api: OpenCodeApi,
     /// Password that was set into `OPENCODE_SERVER_PASSWORD` for
     /// this specific child. Bound to the server's lifetime: when the
     /// server dies the password becomes meaningless.
@@ -124,6 +126,9 @@ impl OpenCodeServer {
         let mut cmd = Command::new(binary_path);
         cmd.args(["serve", "--hostname=127.0.0.1", "--port=0"]);
         cmd.env("OPENCODE_SERVER_PASSWORD", &server_password);
+        // v2 prefers OPENCODE_PASSWORD over the legacy alias. Bind both to
+        // this child so an ambient CLI/service password cannot override it.
+        cmd.env("OPENCODE_PASSWORD", &server_password);
         // Echo OpenCode's documented "use upstream defaults, ignore
         // user config" knob — the reference clone does this at line
         // 340. Without it OpenCode honours
@@ -137,24 +142,17 @@ impl OpenCodeServer {
         cmd.kill_on_drop(true);
         sanitize_gui_env_tokio(&mut cmd);
 
-        let mut child = cmd.spawn().map_err(|err| {
-            format!(
-                "spawn_failed: {} ({err})",
-                binary_path.display()
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| format!("spawn_failed: {} ({err})", binary_path.display()))?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "spawn_failed: child stdout pipe missing".to_string())?;
 
-        let url_result = tokio::time::timeout(
-            ready_budget,
-            await_ready_url(stdout),
-        )
-        .await;
+        let url_result = tokio::time::timeout(ready_budget, await_ready_url(stdout)).await;
 
-        let base_url = match url_result {
+        let (base_url, api) = match url_result {
             Ok(Ok(url)) => url,
             Ok(Err(message)) => {
                 // Probe drained stdout before exiting — kill the
@@ -174,6 +172,7 @@ impl OpenCodeServer {
         Ok(Self {
             child,
             base_url,
+            api,
             server_password,
         })
     }
@@ -183,6 +182,10 @@ impl OpenCodeServer {
     /// match [`OpenCodeClientConfig::new`](super::client::OpenCodeClientConfig::new).
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn api(&self) -> OpenCodeApi {
+        self.api
     }
 
     /// Server password used for HTTP Basic auth. Always matches the
@@ -216,7 +219,9 @@ impl Drop for OpenCodeServer {
 /// Read lines from the child's stdout until the ready banner shows
 /// up or the stream closes. Only the *banner* triggers `Ok`; anything
 /// else is forwarded as part of the diagnostic on failure.
-async fn await_ready_url(stdout: tokio::process::ChildStdout) -> Result<String, String> {
+async fn await_ready_url(
+    stdout: tokio::process::ChildStdout,
+) -> Result<(String, OpenCodeApi), String> {
     let mut reader = BufReader::new(stdout).lines();
     let mut buffered = String::new();
     while let Some(line) = reader
@@ -229,7 +234,9 @@ async fn await_ready_url(stdout: tokio::process::ChildStdout) -> Result<String, 
         }
         buffered.push_str(&line);
         if let Some(url) = parse_ready_url(&line) {
-            return Ok(url);
+            if let Some(api) = OpenCodeApi::from_ready_banner(&line) {
+                return Ok((url, api));
+            }
         }
     }
     Err(format!(
@@ -247,14 +254,12 @@ async fn await_ready_url(stdout: tokio::process::ChildStdout) -> Result<String, 
 /// `/tmp/<reference>/apps/server/src/provider/opencodeRuntime.ts:145-154`.
 pub fn parse_ready_url(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
-    if !trimmed.starts_with(READY_PREFIX) {
-        return None;
-    }
-    // After the prefix the banner reads `… on <url>`; we walk to
-    // the first `http` substring rather than fix the regex to a
-    // specific tail format so a future banner like
-    // `"opencode server listening at https://…"` still works.
-    let rest = &trimmed[READY_PREFIX.len()..];
+    let rest = trimmed
+        .strip_prefix(READY_PREFIX)
+        .or_else(|| trimmed.strip_prefix("server listening"))?;
+    // OpenCode 1.x includes the binary name; 2.x prints only
+    // `server listening`. Both then include `on <url>`.
+    // Find the first HTTP substring to preserve the legacy `at` form.
     let http_idx = rest.find("http")?;
     let after_http = &rest[http_idx..];
     let end = after_http
@@ -283,9 +288,14 @@ mod tests {
     #[test]
     fn parse_ready_url_extracts_http_loopback() {
         let line = "opencode server listening on http://127.0.0.1:38871";
+        assert_eq!(parse_ready_url(line), Some("http://127.0.0.1:38871".into()));
+    }
+
+    #[test]
+    fn parse_ready_url_accepts_opencode_v2_banner() {
         assert_eq!(
-            parse_ready_url(line),
-            Some("http://127.0.0.1:38871".into())
+            parse_ready_url("server listening on http://127.0.0.1:60977"),
+            Some("http://127.0.0.1:60977".into())
         );
     }
 
@@ -303,10 +313,7 @@ mod tests {
         // Some logger banners prepend a timestamp pad. Trim leading
         // whitespace so the prefix match still hits.
         let line = "   opencode server listening on http://127.0.0.1:9000";
-        assert_eq!(
-            parse_ready_url(line),
-            Some("http://127.0.0.1:9000".into())
-        );
+        assert_eq!(parse_ready_url(line), Some("http://127.0.0.1:9000".into()));
     }
 
     #[test]
@@ -316,10 +323,7 @@ mod tests {
             parse_ready_url("Warning: OPENCODE_SERVER_PASSWORD is not set"),
             None
         );
-        assert_eq!(
-            parse_ready_url("opencode something different"),
-            None
-        );
+        assert_eq!(parse_ready_url("opencode something different"), None);
         // Prefix matches but no URL anywhere.
         assert_eq!(
             parse_ready_url("opencode server listening on (no url)"),
@@ -337,14 +341,13 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_against_missing_binary_returns_spawn_failed() {
-        let result =
-            OpenCodeServer::spawn_with_timeout(Path::new("/no/such/opencode"), Duration::from_millis(200))
-                .await;
+        let result = OpenCodeServer::spawn_with_timeout(
+            Path::new("/no/such/opencode"),
+            Duration::from_millis(200),
+        )
+        .await;
         let err = result.expect_err("must fail");
-        assert!(
-            err.starts_with("spawn_failed:"),
-            "unexpected error: {err}"
-        );
+        assert!(err.starts_with("spawn_failed:"), "unexpected error: {err}");
     }
 
     // Unix-only: relies on `/bin/true` which doesn't exist on Windows.
@@ -357,15 +360,12 @@ mod tests {
         // either "ready_banner_missing" or "ready_timeout_…",
         // depending on the schedule of the readline-vs-exit race.
         // Both shapes are acceptable Stage 2 errors.
-        let result = OpenCodeServer::spawn_with_timeout(
-            Path::new("/bin/true"),
-            Duration::from_millis(300),
-        )
-        .await;
+        let result =
+            OpenCodeServer::spawn_with_timeout(Path::new("/bin/true"), Duration::from_millis(300))
+                .await;
         let err = result.expect_err("must fail");
         assert!(
-            err.starts_with("ready_banner_missing")
-                || err.starts_with("ready_timeout_after_"),
+            err.starts_with("ready_banner_missing") || err.starts_with("ready_timeout_after_"),
             "unexpected error: {err}"
         );
     }

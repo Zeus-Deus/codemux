@@ -37,12 +37,12 @@ use crate::agent_provider::types::{
 };
 use crate::mcp::registry::McpRegistry;
 
-use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
-use super::protocol::{
-    PermissionRespondRequest, SessionCreateRequest, SessionResponse,
+use super::client::{
+    OpenCodeClient, OpenCodeClientConfig, OpenCodeModelCost, OpenCodeProviderEntry,
 };
+use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
+use super::protocol::{PermissionRespondRequest, SessionCreateRequest, SessionResponse};
 use super::sse::{spawn_sse_listener, SsePeer, SseRouter};
-use super::client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeModelCost, OpenCodeProviderEntry};
 use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
     OpenCodeUsageState,
@@ -84,6 +84,7 @@ pub struct OpenCodeSession {
     /// `has_session` treats the corpse as absent and the next send rebuilds
     /// a fresh session via `ensure_live_session`.
     dead: Arc<AtomicBool>,
+    ready: tokio::sync::watch::Receiver<bool>,
     outbound: Mutex<()>,
     queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
     queue_worker: Mutex<Option<JoinHandle<()>>>,
@@ -112,7 +113,9 @@ impl OpenCodeSession {
             if err == "opencode_not_installed" {
                 ProviderError::NotInstalled {
                     provider: ProviderKind::OpenCode,
-                    hint: "Install OpenCode (https://opencode.ai/) and ensure `opencode` is on PATH.".into(),
+                    hint:
+                        "Install OpenCode (https://opencode.ai/) and ensure `opencode` is on PATH."
+                            .into(),
                 }
             } else {
                 ProviderError::ProcessError {
@@ -147,7 +150,10 @@ impl OpenCodeSession {
         // able to start a session — just without Codemux-configured servers.
         // Failures surface as a RuntimeWarning instead of killing the session.
         if let Some(registry) = mcp_registry.as_ref() {
-            if let Err(error) = attach_mcp_gateway(&http, &server_handle, registry).await {
+            if let Err(error) =
+                attach_mcp_gateway_scoped(&http, &server_handle, registry, directory.as_deref())
+                    .await
+            {
                 eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
@@ -169,8 +175,55 @@ impl OpenCodeSession {
         // to creating a fresh session (the visible transcript still hydrates
         // from the DB, so the user keeps their history either way).
         let base = server_handle.base_url.trim_end_matches('/').to_string();
+        let native_v2 = server_handle.api == super::api::OpenCodeApi::V2;
         let resumed_id = match &resume_session_id {
-            Some(id) if session_is_addressable(&http, &base, &server_handle.server_password, id).await => {
+            Some(id) if native_v2 => {
+                let response = http
+                    .get(format!("{base}/api/session/{}", urlencoding::encode(id)))
+                    .basic_auth("opencode", Some(&server_handle.server_password))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::RpcError {
+                        message: format!("session_resume_send_failed: {e}"),
+                    })?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    None
+                } else {
+                    let response =
+                        response
+                            .error_for_status()
+                            .map_err(|e| ProviderError::RpcError {
+                                message: format!("session_resume_failed: {e}"),
+                            })?;
+                    let value: serde_json::Value =
+                        response.json().await.map_err(|e| ProviderError::RpcError {
+                            message: format!("session_resume_decode_failed: {e}"),
+                        })?;
+                    if value["data"]["id"].as_str() != Some(id) {
+                        return Err(ProviderError::RpcError {
+                            message: "session_resume_identity_mismatch".into(),
+                        });
+                    }
+                    if let (Some(expected), Some(actual)) = (
+                        directory.as_ref(),
+                        value["data"]["location"]["directory"].as_str(),
+                    ) {
+                        if expected.to_string_lossy() != actual {
+                            return Err(ProviderError::ValidationError {
+                                message:
+                                    "OpenCode resume directory differs from the persisted session"
+                                        .into(),
+                            });
+                        }
+                    }
+                    Some(id.clone())
+                }
+            }
+            Some(id)
+                if session_is_addressable(&http, &base, &server_handle.server_password, id)
+                    .await =>
+            {
                 Some(id.clone())
             }
             _ => None,
@@ -182,8 +235,32 @@ impl OpenCodeSession {
         let session_id = match resumed_id {
             Some(id) => id,
             None => {
-                let create_url = format!("{base}/session");
-                let body = SessionCreateRequest::default();
+                let create_url = format!(
+                    "{base}{}",
+                    server_handle.api.route("/session", "/api/session")
+                );
+                let body = if native_v2 {
+                    let cwd = directory
+                        .clone()
+                        .map(Ok)
+                        .unwrap_or_else(std::env::current_dir)
+                        .map_err(|e| ProviderError::ValidationError {
+                            message: e.to_string(),
+                        })?;
+                    if !cwd.is_absolute() {
+                        return Err(ProviderError::ValidationError {
+                            message: "OpenCode session cwd must be absolute".into(),
+                        });
+                    }
+                    super::v2::create_body(
+                        &cwd.to_string_lossy(),
+                        initial_model.as_deref(),
+                        initial_variant.as_deref(),
+                    )
+                    .map_err(|message| ProviderError::ValidationError { message })?
+                } else {
+                    serde_json::to_value(SessionCreateRequest::default()).unwrap()
+                };
                 let response = http
                     .post(&create_url)
                     .basic_auth("opencode", Some(&server_handle.server_password))
@@ -200,10 +277,20 @@ impl OpenCodeSession {
                         message: format!("session_create_http_status_{}", status.as_u16()),
                     });
                 }
-                let session_resp: SessionResponse = response.json().await.map_err(|err| {
-                    ProviderError::RpcError {
-                        message: format!("session_create_decode_failed: {err}"),
-                    }
+                let value: serde_json::Value =
+                    response
+                        .json()
+                        .await
+                        .map_err(|err| ProviderError::RpcError {
+                            message: format!("session_create_decode_failed: {err}"),
+                        })?;
+                let session_resp: SessionResponse = serde_json::from_value(if native_v2 {
+                    value["data"].clone()
+                } else {
+                    value
+                })
+                .map_err(|err| ProviderError::RpcError {
+                    message: format!("session_create_decode_failed: {err}"),
                 })?;
                 session_resp.id
             }
@@ -227,6 +314,7 @@ impl OpenCodeSession {
             server_handle.base_url.clone(),
             server_handle.server_password.clone(),
             initial_model.clone(),
+            server_handle.api,
             event_ctx.clone(),
         );
 
@@ -243,7 +331,11 @@ impl OpenCodeSession {
             _ => Arc::new(Mutex::new(OpenCodeUsageState::default())),
         };
         let queue_events = event_tx.subscribe();
+        let (ready_tx, ready) =
+            tokio::sync::watch::channel(server_handle.api == super::api::OpenCodeApi::Legacy);
         let peer = SsePeer {
+            api: server_handle.api,
+            ready: ready_tx,
             directory: directory.clone(),
             session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
@@ -279,10 +371,6 @@ impl OpenCodeSession {
             thread_id: thread_id.clone(),
             resume_cursor: super::agent::resume_cursor_for(&provider_session_id),
         });
-        let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: thread_id.clone(),
-            status: SessionStatus::Ready,
-        });
 
         let session = Arc::new(Self {
             thread_id,
@@ -297,11 +385,51 @@ impl OpenCodeSession {
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
             dead,
+            ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
         });
+        if native_v2 {
+            if let Err(error) = session.wait_ready().await {
+                session.shutdown().await;
+                return Err(error);
+            }
+            // A resumed conversation keeps its native history, while explicit
+            // picker choices still require a successful native model ACK.
+            let model = session.current_model.lock().await.clone();
+            let variant = session.current_variant.lock().await.clone();
+            if did_resume || (model.is_none() && variant.is_some()) {
+                let selected = match model {
+                    Some(model) => Some(model),
+                    None if variant.is_some() => Some(session.default_native_model().await?),
+                    _ => None,
+                };
+                if let Some(model) = selected {
+                    if let Err(error) = session.apply_native_model(&model, variant.as_deref()).await
+                    {
+                        session.shutdown().await;
+                        return Err(error);
+                    }
+                    *session.current_model.lock().await = Some(model);
+                }
+            }
+        }
+        let active = session.event_ctx.lock().await.turn_active;
+        let status = if active {
+            SessionStatus::Running {
+                active_turn: session.event_ctx.lock().await.turn_id.clone(),
+            }
+        } else {
+            SessionStatus::Ready
+        };
+        let _ = session
+            .event_tx
+            .send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: session.thread_id.clone(),
+                status,
+            });
         session.start_queue_worker(queue_events).await;
         Ok(session)
     }
@@ -540,6 +668,87 @@ impl OpenCodeSession {
         Ok(())
     }
 
+    async fn wait_ready(&self) -> Result<(), ProviderError> {
+        if self.server_handle.api == super::api::OpenCodeApi::Legacy {
+            return Ok(());
+        }
+        let mut ready = self.ready.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !*ready.borrow_and_update() {
+                ready.changed().await.map_err(|_| ProviderError::RpcError {
+                    message: "OpenCode event stream closed before readiness".into(),
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            operation: "OpenCode server.connected handshake".into(),
+            elapsed_ms: 15000,
+        })?
+    }
+
+    async fn default_native_model(&self) -> Result<String, ProviderError> {
+        let response = self
+            .http
+            .get(format!(
+                "{}/api/model/default",
+                self.server_handle.base_url.trim_end_matches('/')
+            ))
+            .basic_auth("opencode", Some(&self.server_handle.server_password))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?
+            .error_for_status()
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?;
+        let value: serde_json::Value =
+            response.json().await.map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?;
+        let data = &value["data"];
+        match (data["providerID"].as_str(), data["id"].as_str()) {
+            (Some(provider), Some(id)) => Ok(format!("{provider}/{id}")),
+            _ => Err(ProviderError::ValidationError {
+                message: "Select a model before choosing an OpenCode effort.".into(),
+            }),
+        }
+    }
+
+    async fn apply_native_model(
+        &self,
+        model: &str,
+        variant: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let model = super::v2::model_ref(model, variant)
+            .map_err(|message| ProviderError::ValidationError { message })?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/api/session/{}/model",
+                self.server_handle.base_url.trim_end_matches('/'),
+                urlencoding::encode(&self.provider_session_id.0)
+            ))
+            .basic_auth("opencode", Some(&self.server_handle.server_password))
+            .json(&serde_json::json!({"model":model}))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: format!("model_send_failed: {e}"),
+            })?;
+        if !response.status().is_success() {
+            return Err(ProviderError::RpcError {
+                message: format!("model_http_status_{}", response.status().as_u16()),
+            });
+        }
+        Ok(())
+    }
+
     /// Whether the SSE listener has declared this session's server
     /// unreachable (reconnect budget exhausted). A dead session is
     /// treated as absent by the provider so the next send auto-resumes.
@@ -572,6 +781,7 @@ impl OpenCodeSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
+        let _outbound = self.outbound.lock().await;
         self.post_turn(text, images, model_override, effort_override, false, None)
             .await
     }
@@ -585,15 +795,22 @@ impl OpenCodeSession {
         steer: bool,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
+        self.wait_ready().await?;
+        let current_model = self.current_model.lock().await.clone();
         let model = match model_override {
             Some(m) => Some(m),
-            None => self.current_model.lock().await.clone(),
+            None => current_model.clone(),
         };
         // Per-turn effort wins; otherwise fall back to the session's
         // variant. OpenCode's `variant` selects the model's reasoning
         // effort on each `prompt_async`.
         let variant = match effort_override {
             Some(v) => Some(v),
+            None if self.server_handle.api == super::api::OpenCodeApi::V2
+                && model != current_model =>
+            {
+                None
+            }
             None => self.current_variant.lock().await.clone(),
         };
         let native = crate::agent_provider::slash_commands::leading_command(&text);
@@ -602,50 +819,117 @@ impl OpenCodeSession {
                 message: "Native commands cannot steer a running turn. Choose Queue or Interrupt and send.".into(),
             });
         }
+        if matches!(native,Some(("compact",arguments)) if !arguments.is_empty() || !images.is_empty())
+        {
+            return Err(ProviderError::ValidationError {
+                message: "OpenCode /compact accepts no arguments or images.".into(),
+            });
+        }
         let prompt =
             build_prompt_async_request(text.clone(), model.as_deref(), variant.as_deref(), &images)
                 .map_err(|err| ProviderError::ValidationError { message: err })?;
-        let (endpoint, body) = match native {
-            Some(("compact", arguments)) => {
-                if !arguments.is_empty() || !images.is_empty() {
-                    return Err(ProviderError::ValidationError {
-                        message: "OpenCode /compact accepts no arguments or images.".into(),
-                    });
+        let native_v2 = self.server_handle.api == super::api::OpenCodeApi::V2;
+        let (endpoint, body) = if native_v2 {
+            if let Some(checkpoint) = &checkpoint {
+                checkpoint.authorize_dispatch()?;
+            }
+            let selected_variant = variant.as_deref().filter(|v| !v.is_empty());
+            if model != *self.current_model.lock().await
+                || selected_variant != self.current_variant.lock().await.as_deref()
+            {
+                let selected_model = match model.clone() {
+                    Some(model) => model,
+                    None => self.default_native_model().await?,
+                };
+                self.apply_native_model(&selected_model, selected_variant)
+                    .await?;
+                *self.current_model.lock().await = Some(selected_model.clone());
+                *self.current_variant.lock().await = selected_variant.map(str::to_string);
+                self.refresh_model_context(selected_model).await;
+            }
+            let files: Vec<_> = prompt
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    super::protocol::PartInput::File { url, filename, .. } => {
+                        let mut file = serde_json::json!({"uri":url});
+                        if let Some(name) = filename {
+                            file["name"] = serde_json::json!(name);
+                        }
+                        Some(file)
+                    }
+                    _ => None,
+                })
+                .collect();
+            match native {
+                Some(("compact", arguments)) => {
+                    if !arguments.is_empty() || !images.is_empty() {
+                        return Err(ProviderError::ValidationError {
+                            message: "OpenCode /compact accepts no arguments or images.".into(),
+                        });
+                    }
+                    ("compact", serde_json::json!({"delivery":"queue"}))
                 }
-                let model =
-                    prompt
-                        .model
-                        .as_ref()
-                        .ok_or_else(|| ProviderError::ValidationError {
-                            message: "Select a model before compacting this OpenCode conversation."
-                                .into(),
-                        })?;
-                (
-                    "summarize",
-                    serde_json::json!({ "providerID": model.provider_id, "modelID": model.model_id }),
-                )
+                Some((name, arguments)) => {
+                    let mut body =
+                        serde_json::json!({"name":name,"text":arguments,"delivery":"queue"});
+                    if !files.is_empty() {
+                        body["files"] = serde_json::json!(files);
+                    }
+                    ("command", body)
+                }
+                None => ("prompt", super::v2::prompt_body(&text, files, steer)),
             }
-            Some((name, arguments)) => {
-                // /command expands native templates and accepts image file parts.
-                // Sending /name through prompt_async would only send literal prose.
-                let files: Vec<_> = prompt
-                    .parts
-                    .iter()
-                    .filter(|part| matches!(part, super::protocol::PartInput::File { .. }))
-                    .collect();
-                let mut body = serde_json::json!({
-                    "command": name, "arguments": arguments, "parts": files,
-                });
-                // Optional Zod fields accept omission, not JSON null.
-                if let Some(model) = model.as_ref() { body["model"] = serde_json::json!(model); }
-                if let Some(variant) = prompt.variant.as_ref() { body["variant"] = serde_json::json!(variant); }
-                ("command", body)
+        } else {
+            match native {
+                Some(("compact", arguments)) => {
+                    if !arguments.is_empty() || !images.is_empty() {
+                        return Err(ProviderError::ValidationError {
+                            message: "OpenCode /compact accepts no arguments or images.".into(),
+                        });
+                    }
+                    let model =
+                        prompt
+                            .model
+                            .as_ref()
+                            .ok_or_else(|| ProviderError::ValidationError {
+                                message:
+                                    "Select a model before compacting this OpenCode conversation."
+                                        .into(),
+                            })?;
+                    (
+                        "summarize",
+                        serde_json::json!({ "providerID": model.provider_id, "modelID": model.model_id }),
+                    )
+                }
+                Some((name, arguments)) => {
+                    // /command expands native templates and accepts image file parts.
+                    // Sending /name through prompt_async would only send literal prose.
+                    let files: Vec<_> = prompt
+                        .parts
+                        .iter()
+                        .filter(|part| matches!(part, super::protocol::PartInput::File { .. }))
+                        .collect();
+                    let mut body = serde_json::json!({
+                        "command": name, "arguments": arguments, "parts": files,
+                    });
+                    // Optional Zod fields accept omission, not JSON null.
+                    if let Some(model) = model.as_ref() {
+                        body["model"] = serde_json::json!(model);
+                    }
+                    if let Some(variant) = prompt.variant.as_ref() {
+                        body["variant"] = serde_json::json!(variant);
+                    }
+                    ("command", body)
+                }
+                None => ("prompt_async", serde_json::to_value(&prompt).unwrap()),
             }
-            None => ("prompt_async", serde_json::to_value(&prompt).unwrap()),
         };
         let turn_id = {
             let mut ctx = self.event_ctx.lock().await;
-            if let Some(checkpoint) = &checkpoint { checkpoint.authorize_dispatch()?; }
+            if let Some(checkpoint) = &checkpoint {
+                checkpoint.authorize_dispatch()?;
+            }
             if !steer {
                 ctx.turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
             }
@@ -663,8 +947,9 @@ impl OpenCodeSession {
                 });
         }
         let url = format!(
-            "{}/session/{}/{}",
+            "{}{}/session/{}/{}",
             self.server_handle.base_url.trim_end_matches('/'),
+            if native_v2 { "/api" } else { "" },
             urlencoding::encode(&self.provider_session_id.0),
             endpoint
         );
@@ -673,7 +958,7 @@ impl OpenCodeSession {
             .post(&url)
             .basic_auth("opencode", Some(&self.server_handle.server_password))
             .json(&body);
-        if endpoint != "prompt_async" {
+        if endpoint != "prompt_async" && !(native_v2 && matches!(endpoint, "prompt" | "compact")) {
             // Native endpoints respond only after generation completes. Keep
             // the composer/queue responsive while SSE streams the actual turn.
             let context = self.event_ctx.clone();
@@ -784,7 +1069,9 @@ impl OpenCodeSession {
         if let Some(turn_id) = turn_id {
             let ctx = self.event_ctx.lock().await;
             if !ctx.turn_active || ctx.turn_id != turn_id {
-                return Err(ProviderError::ValidationError {message:"stale_turn: selected OpenCode turn is no longer active".into()});
+                return Err(ProviderError::ValidationError {
+                    message: "stale_turn: selected OpenCode turn is no longer active".into(),
+                });
             }
         }
         self.interrupt().await
@@ -794,10 +1081,25 @@ impl OpenCodeSession {
     /// idempotent — calling it on an idle session returns 200 with
     /// `false`, which we treat as success.
     pub async fn interrupt(&self) -> Result<(), ProviderError> {
+        if self.server_handle.api == super::api::OpenCodeApi::Legacy {
+            let ctx = self.event_ctx.lock().await;
+            self.router
+                .lock()
+                .await
+                .mark_interrupted(if ctx.turn_active {
+                    Some(ctx.turn_id.clone())
+                } else {
+                    None
+                });
+        }
         let url = format!(
-            "{}/session/{}/abort",
+            "{}{}/session/{}/{}",
             self.server_handle.base_url.trim_end_matches('/'),
-            urlencoding::encode(&self.provider_session_id.0)
+            self.server_handle.api.route("", "/api"),
+            urlencoding::encode(&self.provider_session_id.0),
+            self.server_handle
+                .api
+                .route("abort", "interrupt?resume=false")
         );
         let response = self
             .http
@@ -825,6 +1127,95 @@ impl OpenCodeSession {
         request_id: RequestId,
         decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
+        if self.server_handle.api == super::api::OpenCodeApi::V2 {
+            let router = self.router.lock().await;
+            let target = router
+                .session_for_permission(&request_id.0)
+                .ok_or_else(|| ProviderError::RequestNotPending {
+                    request_id: request_id.clone(),
+                })?;
+            let form = router.form(&request_id.0);
+            drop(router);
+            let base = format!(
+                "{}/api/session/{}",
+                self.server_handle.base_url.trim_end_matches('/'),
+                urlencoding::encode(&target)
+            );
+            let request = if let Some(form) = form {
+                match &decision {
+                    ApprovalDecision::Allow {
+                        updated_input: Some(input),
+                        ..
+                    } => {
+                        let answer = super::v2::question_answer(&form, input)
+                            .map_err(|message| ProviderError::ValidationError { message })?;
+                        self.http
+                            .post(format!(
+                                "{base}/form/{}/reply",
+                                urlencoding::encode(&request_id.0)
+                            ))
+                            .json(&serde_json::json!({"answer":answer}))
+                    }
+                    ApprovalDecision::Cancel => self.http.delete(format!(
+                        "{base}/form/{}",
+                        urlencoding::encode(&request_id.0)
+                    )),
+                    ApprovalDecision::Deny { message } => self
+                        .http
+                        .delete(format!(
+                            "{base}/form/{}",
+                            urlencoding::encode(&request_id.0)
+                        ))
+                        .query(&[("message", message)]),
+                    _ => {
+                        return Err(ProviderError::ValidationError {
+                            message: "OpenCode questions require answers or explicit cancellation"
+                                .into(),
+                        })
+                    }
+                }
+            } else {
+                if matches!(&decision, ApprovalDecision::ProviderOption { .. }) {
+                    return Err(ProviderError::ValidationError {
+                        message: "OpenCode permissions do not advertise provider-option replies"
+                            .into(),
+                    });
+                }
+                let mut body = serde_json::json!({"decision":approval_decision_to_permission_reply(&decision)});
+                if let ApprovalDecision::Deny { message } = &decision {
+                    body["message"] = serde_json::json!(message);
+                }
+                self.http
+                    .post(format!(
+                        "{base}/permission/{}/reply",
+                        urlencoding::encode(&request_id.0)
+                    ))
+                    .json(&body)
+            };
+            let response = request
+                .basic_auth("opencode", Some(&self.server_handle.server_password))
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|e| ProviderError::RpcError {
+                    message: format!("request_reply_failed: {e}"),
+                })?;
+            if !response.status().is_success() {
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::NOT_FOUND
+                        | reqwest::StatusCode::CONFLICT
+                        | reqwest::StatusCode::GONE
+                ) {
+                    return Err(ProviderError::RequestNotPending { request_id });
+                }
+                return Err(ProviderError::RpcError {
+                    message: format!("request_reply_http_status_{}", response.status().as_u16()),
+                });
+            }
+            self.router.lock().await.forget_request(&request_id.0);
+            return Ok(());
+        }
         let body = PermissionRespondRequest {
             response: approval_decision_to_permission_reply(&decision),
         };
@@ -874,11 +1265,27 @@ impl OpenCodeSession {
     /// Update the cached model for subsequent turns. OpenCode does
     /// not have a "session-level model swap" RPC — the change is
     /// applied at the next `prompt_async` body.
-    pub async fn set_model(&self, model: String) {
+    pub async fn set_model(&self, model: String) -> Result<(), ProviderError> {
+        let _outbound = self.outbound.lock().await;
+        if self.is_dead() {
+            return Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            });
+        }
+        if self.server_handle.api == super::api::OpenCodeApi::V2 {
+            self.wait_ready().await?;
+            self.apply_native_model(&model, None).await?;
+            *self.current_variant.lock().await = None;
+        }
         {
             let mut current = self.current_model.lock().await;
             *current = Some(model.clone());
         }
+        self.refresh_model_context(model).await;
+        Ok(())
+    }
+
+    async fn refresh_model_context(&self, model: String) {
         // The window is a property of the model, so a swap invalidates
         // the cached number. Clear it immediately (a stale denominator
         // is worse than none) and re-probe in the background. Both
@@ -905,12 +1312,13 @@ impl OpenCodeSession {
             self.server_handle.base_url.clone(),
             self.server_handle.server_password.clone(),
             Some(model),
+            self.server_handle.api,
             self.event_ctx.clone(),
         );
     }
 
-    /// Tear down the session. Aborts the SSE task, deletes the
-    /// OpenCode-side session, and emits the closed state.
+    /// Tear down the session. Aborts the SSE task, interrupts the
+    /// OpenCode-side execution, and emits the closed state.
     pub async fn shutdown(&self) {
         self.dead.store(true, Ordering::Relaxed);
         for request in self.native_requests.lock().await.drain(..) {
@@ -923,17 +1331,25 @@ impl OpenCodeSession {
         if let Some(handle) = self.sse_handle.lock().await.take() {
             handle.abort();
         }
-        let url = format!(
-            "{}/session/{}",
-            self.server_handle.base_url.trim_end_matches('/'),
-            urlencoding::encode(&self.provider_session_id.0)
-        );
-        let _ = self
-            .http
-            .delete(&url)
-            .basic_auth("opencode", Some(&self.server_handle.server_password))
-            .send()
-            .await;
+        // Closing a live attachment is not deleting its durable transcript.
+        // Interrupt only our root; retained child sessions/history remain
+        // addressable for resume. Explicit destructive APIs belong elsewhere.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), self.interrupt()).await;
+        {
+            let mut ctx = self.event_ctx.lock().await;
+            if ctx.turn_active {
+                ctx.turn_active = false;
+                let _ = self.event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: ctx.turn_id.clone(),
+                    status: crate::agent_provider::TurnStatus::Error {
+                        subtype: "interrupted".into(),
+                        message: "OpenCode attachment closed".into(),
+                    },
+                    usage: None,
+                });
+            }
+        }
         let _ = self
             .event_tx
             .send(ProviderRuntimeEvent::SessionStateChanged {
@@ -945,6 +1361,13 @@ impl OpenCodeSession {
 
 impl Drop for OpenCodeSession {
     fn drop(&mut self) {
+        self.dead.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.sse_handle.get_mut().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.queue_worker.get_mut().take() {
+            handle.abort();
+        }
         for request in self.native_requests.get_mut().drain(..) {
             request.abort();
         }
@@ -954,18 +1377,77 @@ impl Drop for OpenCodeSession {
 /// Register Codemux's process-wide MCP facade with the live OpenCode server.
 /// The remote config is runtime-only: no provider config files are rewritten,
 /// and the bearer credential never leaves this process.
+#[cfg(test)]
 async fn attach_mcp_gateway(
     http: &reqwest::Client,
     server: &OpenCodeServerHandle,
     registry: &McpRegistry,
 ) -> Result<(), ProviderError> {
-    let connection = registry
-        .gateway_connection()
-        .await
-        .map_err(|message| ProviderError::ProcessError {
-            message: "failed to start Codemux MCP gateway".into(),
-            source: Some(message),
-        })?;
+    attach_mcp_gateway_scoped(http, server, registry, None).await
+}
+
+async fn attach_mcp_gateway_scoped(
+    http: &reqwest::Client,
+    server: &OpenCodeServerHandle,
+    registry: &McpRegistry,
+    directory: Option<&std::path::Path>,
+) -> Result<(), ProviderError> {
+    let connection =
+        registry
+            .gateway_connection()
+            .await
+            .map_err(|message| ProviderError::ProcessError {
+                message: "failed to start Codemux MCP gateway".into(),
+                source: Some(message),
+            })?;
+    if server.api == super::api::OpenCodeApi::V2 {
+        let mut request = http.put(format!(
+            "{}/api/experimental/mcp/codemux",
+            server.base_url.trim_end_matches('/')
+        ));
+        if let Some(directory) = directory {
+            request = request.query(&[("location[directory]", directory.to_string_lossy())]);
+        }
+        let response=request.basic_auth("opencode",Some(&server.server_password)).json(&serde_json::json!({"config":{"type":"remote","url":connection.url,"disabled":false,"oauth":false,"headers":{"Authorization":format!("Bearer {}",connection.bearer_token)}}})).send().await.map_err(|e|ProviderError::RpcError{message:format!("opencode_mcp_attach_failed: {e}")})?;
+        if !response.status().is_success() {
+            return Err(ProviderError::RpcError {
+                message: format!(
+                    "opencode_mcp_attach_http_status_{}",
+                    response.status().as_u16()
+                ),
+            });
+        }
+        let mut request = http.get(format!("{}/api/mcp", server.base_url.trim_end_matches('/')));
+        if let Some(directory) = directory {
+            request = request.query(&[("location[directory]", directory.to_string_lossy())]);
+        }
+        let status: serde_json::Value = request
+            .basic_auth("opencode", Some(&server.server_password))
+            .send()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?
+            .error_for_status()
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?
+            .json()
+            .await
+            .map_err(|e| ProviderError::RpcError {
+                message: e.to_string(),
+            })?;
+        if !status["data"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e["name"] == "codemux" && e["status"]["status"] == "connected")
+        }) {
+            return Err(ProviderError::RpcError {
+                message: "Codemux MCP gateway was registered but is not connected".into(),
+            });
+        }
+        return Ok(());
+    }
     let url = format!("{}/mcp", server.base_url.trim_end_matches('/'));
     let response = http
         .post(url)
@@ -1070,6 +1552,7 @@ fn spawn_context_window_probe(
     base_url: String,
     server_password: String,
     model_slug: Option<String>,
+    api: super::api::OpenCodeApi,
     event_ctx: Arc<Mutex<EventContext>>,
 ) {
     let Some(model_slug) = model_slug else {
@@ -1078,6 +1561,7 @@ fn spawn_context_window_probe(
     tokio::spawn(async move {
         let mut config = OpenCodeClientConfig::new(base_url);
         config.server_password = Some(server_password);
+        config.api = api;
         let Ok(client) = OpenCodeClient::new(config) else {
             return;
         };
@@ -1270,14 +1754,11 @@ pub(crate) mod tests {
         let handle = OpenCodeServerHandle {
             base_url: server.url(),
             server_password: "pw".into(),
+            api: super::super::api::OpenCodeApi::Legacy,
         };
-        attach_mcp_gateway(
-            &reqwest::Client::new(),
-            &handle,
-            &McpRegistry::new(),
-        )
-        .await
-        .unwrap();
+        attach_mcp_gateway(&reqwest::Client::new(), &handle, &McpRegistry::new())
+            .await
+            .unwrap();
         attach.assert_async().await;
     }
 
@@ -1404,10 +1885,31 @@ pub(crate) mod tests {
         broadcast::Sender<ProviderRuntimeEvent>,
         broadcast::Receiver<ProviderRuntimeEvent>,
     ) {
+        mock_session_api(
+            base_url,
+            password,
+            session_id,
+            super::super::api::OpenCodeApi::Legacy,
+        )
+        .await
+    }
+
+    async fn mock_session_api(
+        base_url: String,
+        password: String,
+        session_id: &str,
+        api: super::super::api::OpenCodeApi,
+    ) -> (
+        Arc<OpenCodeSession>,
+        broadcast::Sender<ProviderRuntimeEvent>,
+        broadcast::Receiver<ProviderRuntimeEvent>,
+    ) {
         let (tx, rx) = broadcast::channel(64);
+        let (_, ready) = tokio::sync::watch::channel(true);
         let handle = OpenCodeServerHandle {
             base_url,
             server_password: password,
+            api,
         };
         // Build the session directly — bypasses
         // OpenCodeServerManager so we can mock the HTTP layer.
@@ -1435,6 +1937,7 @@ pub(crate) mod tests {
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
             dead: Arc::new(AtomicBool::new(false)),
+            ready,
             outbound: Mutex::new(()),
             queued: Mutex::new(VecDeque::new()),
             queue_worker: Mutex::new(None),
@@ -1446,17 +1949,212 @@ pub(crate) mod tests {
 
     /// Recovery tests use the real HTTP prompt, SSE listener and queue worker,
     /// but never discover/spawn an installed provider or access an account.
-    pub(crate) async fn recovery_session(base_url: String) -> (
-        Arc<OpenCodeSession>, broadcast::Sender<ProviderRuntimeEvent>,
+    pub(crate) async fn recovery_session(
+        base_url: String,
+    ) -> (
+        Arc<OpenCodeSession>,
+        broadcast::Sender<ProviderRuntimeEvent>,
     ) {
         let (session, tx, _) = mock_session(base_url.clone(), "synthetic".into(), "recovery").await;
         let peer = SsePeer {
-            directory: None, session_id: "recovery".into(),
-            event_ctx: session.event_ctx.clone(), router: session.router.clone(),
-            dead: session.dead.clone(), usage: session.usage.clone(),
+            api: super::super::api::OpenCodeApi::Legacy,
+            ready: tokio::sync::watch::channel(true).0,
+            directory: None,
+            session_id: "recovery".into(),
+            event_ctx: session.event_ctx.clone(),
+            router: session.router.clone(),
+            dead: session.dead.clone(),
+            usage: session.usage.clone(),
         };
-        *session.sse_handle.lock().await = Some(spawn_sse_listener(base_url, "synthetic".into(), peer, tx.clone()));
+        *session.sse_handle.lock().await = Some(spawn_sse_listener(
+            base_url,
+            "synthetic".into(),
+            peer,
+            tx.clone(),
+        ));
         (session, tx)
+    }
+
+    #[tokio::test]
+    async fn v2_gateway_registration_is_scoped_and_verified_connected() {
+        let mut server = Server::new_async().await;
+        let directory = tempfile::tempdir().unwrap();
+        let query = mockito::Matcher::UrlEncoded(
+            "location[directory]".into(),
+            directory.path().to_string_lossy().into_owned(),
+        );
+        let put = server
+            .mock("PUT", "/api/experimental/mcp/codemux")
+            .match_query(query.clone())
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"config":{"type":"remote","disabled":false,"oauth":false}}),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        let get = server
+            .mock("GET", "/api/mcp")
+            .match_query(query)
+            .with_status(200)
+            .with_body(r#"{"data":[{"name":"codemux","status":{"status":"connected"}}]}"#)
+            .create_async()
+            .await;
+        let server = OpenCodeServerHandle {
+            base_url: server.url(),
+            server_password: "fixture".into(),
+            api: super::super::api::OpenCodeApi::V2,
+        };
+        attach_mcp_gateway_scoped(
+            &reqwest::Client::new(),
+            &server,
+            &McpRegistry::new(),
+            Some(directory.path()),
+        )
+        .await
+        .unwrap();
+        put.assert_async().await;
+        get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn v2_command_and_compact_keep_native_bodies_and_wait_for_execution_terminal() {
+        let mut server = Server::new_async().await;
+        let compact = server
+            .mock("POST", "/api/session/s/compact")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"delivery":"queue"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"c","sessionID":"s","type":"compaction"}}"#)
+            .create_async()
+            .await;
+        let command = server
+            .mock("POST", "/api/session/s/command")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"name":"review","text":"diff","delivery":"queue"}),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        let (session, _, mut events) = mock_session_api(
+            server.url(),
+            "fixture".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        session
+            .send_turn("/compact".into(), vec![], None, None)
+            .await
+            .unwrap();
+        compact.assert_async().await;
+        assert!(session.turn_active().await);
+        session.event_ctx.lock().await.turn_active = false;
+        session
+            .send_turn("/review diff".into(), vec![], None, None)
+            .await
+            .unwrap();
+        await_native_http(&session).await;
+        command.assert_async().await;
+        assert!(session.turn_active().await);
+        assert!(!std::iter::from_fn(|| events.try_recv().ok())
+            .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })));
+    }
+
+    #[tokio::test]
+    async fn native_model_ack_precedes_prompt_and_failed_ack_keeps_selection() {
+        let mut server = Server::new_async().await;
+        let model = server
+            .mock("POST", "/api/session/s/model")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"model":{"providerID":"p","id":"m","variant":"high"}}),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"text":"hi","delivery":"queue","resume":true}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"data":{"id":"u","sessionID":"s","type":"user"}}"#)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        session
+            .send_turn("hi".into(), vec![], Some("p/m".into()), Some("high".into()))
+            .await
+            .unwrap();
+        model.assert_async().await;
+        prompt.assert_async().await;
+        assert_eq!(session.current_model.lock().await.as_deref(), Some("p/m"));
+        assert_eq!(
+            session.current_variant.lock().await.as_deref(),
+            Some("high")
+        );
+        let reject = server
+            .mock("POST", "/api/session/s/model")
+            .with_status(400)
+            .create_async()
+            .await;
+        assert!(session.set_model("p/bad".into()).await.is_err());
+        reject.assert_async().await;
+        assert_eq!(session.current_model.lock().await.as_deref(), Some("p/m"));
+    }
+
+    #[tokio::test]
+    async fn native_interrupt_and_child_question_use_exact_owner_and_detach_does_not_delete() {
+        let mut server = Server::new_async().await;
+        let abort = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .with_body(r#"{"interrupted":true}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/api/session/s")
+            .expect(0)
+            .create_async()
+            .await;
+        let reply = server
+            .mock("POST", "/api/session/child/form/f/reply")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"answer":{"q0":"A"}}),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        session.router.lock().await.record_form(serde_json::json!({"id":"f","sessionID":"child","metadata":{"kind":"question"},"fields":[{"key":"q0","type":"string","description":"Pick","custom":true,"options":[{"value":"A","label":"A"}]}]}));
+        session
+            .respond_to_request(
+                RequestId("f".into()),
+                ApprovalDecision::Allow {
+                    updated_input: Some(serde_json::json!({"answers":{"Pick":"A"}})),
+                    updated_permissions: None,
+                },
+            )
+            .await
+            .unwrap();
+        reply.assert_async().await;
+        session.interrupt().await.unwrap();
+        session.shutdown().await;
+        abort.assert_async().await;
+        delete.assert_async().await;
     }
 
     #[tokio::test]
@@ -1468,8 +2166,7 @@ pub(crate) mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let (session, _tx, mut rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
 
         let turn_id = session
             .send_turn("hello".into(), Vec::<ImageInput>::new(), None, None)
@@ -1506,8 +2203,7 @@ pub(crate) mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
 
         session
             .send_turn("hi".into(), vec![], None, Some("high".into()))
@@ -1527,8 +2223,7 @@ pub(crate) mod tests {
             .with_body(r#"{"error":"bad model"}"#)
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
 
         let err = session
             .send_turn("hi".into(), vec![], None, None)
@@ -1546,8 +2241,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn send_turn_validation_error_for_invalid_model_id() {
         let server = Server::new_async().await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         // Override with an id missing the `provider/` prefix.
         let err = session
             .send_turn("hi".into(), vec![], Some("invalid".into()), None)
@@ -1570,8 +2264,7 @@ pub(crate) mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session.interrupt().await.expect("abort succeeds");
         mock.assert_async().await;
     }
@@ -1586,8 +2279,7 @@ pub(crate) mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session
             .respond_to_request(
                 RequestId("perm_1".into()),
@@ -1613,8 +2305,7 @@ pub(crate) mod tests {
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         // Simulate the SSE listener having recorded the child permission.
         session
             .router
@@ -1636,16 +2327,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_deletes_session_and_emits_closed_state() {
+    async fn shutdown_detaches_without_deleting_durable_history_and_emits_closed_state() {
         let mut server = Server::new_async().await;
         let mock = server
-            .mock("DELETE", "/session/sess_1")
+            .mock("POST", "/session/sess_1/abort")
             .with_status(200)
             .with_body("true")
             .create_async()
             .await;
-        let (session, _tx, mut rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session.shutdown().await;
         mock.assert_async().await;
         let event = rx.try_recv().expect("closed event published");
@@ -1800,11 +2490,11 @@ pub(crate) mod tests {
             .with_status(204)
             .create_async()
             .await;
-        let (session, _tx, _rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, _rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         session
             .set_model("anthropic/claude-sonnet-4-6".into())
-            .await;
+            .await
+            .unwrap();
         session
             .send_turn("hi".into(), vec![], None, None)
             .await
@@ -1822,8 +2512,7 @@ pub(crate) mod tests {
         let mut server = Server::new_async().await;
         // The background re-probe must not resolve a window during the
         // test; an unmocked /config/providers 501s, leaving it unknown.
-        let (session, _tx, mut rx) =
-            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
         let windowed = EventContext {
             context_window_tokens: Some(1_000_000),
             ..session.event_ctx.lock().await.clone()
@@ -1859,10 +2548,18 @@ pub(crate) mod tests {
         }
         while rx.try_recv().is_ok() {}
 
-        session.set_model("anthropic/claude-sonnet-4-6".into()).await;
+        session
+            .set_model("anthropic/claude-sonnet-4-6".into())
+            .await
+            .unwrap();
 
         assert!(
-            session.event_ctx.lock().await.context_window_tokens.is_none(),
+            session
+                .event_ctx
+                .lock()
+                .await
+                .context_window_tokens
+                .is_none(),
             "the routing-context copy is cleared for the SSE listener"
         );
         match rx.try_recv().expect("a corrected snapshot is published") {
@@ -1938,10 +2635,18 @@ pub(crate) mod tests {
     }
     async fn await_native_http(session: &OpenCodeSession) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while session.native_requests.lock().await.iter().any(|request| !request.is_finished()) {
+            while session
+                .native_requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| !request.is_finished())
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-        }).await.expect("native HTTP must return");
+        })
+        .await
+        .expect("native HTTP must return");
     }
 
     async fn await_native_completion(
@@ -1983,8 +2688,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         await_native_http(&session).await;
-        assert!(session.turn_active().await, "HTTP success must wait for final SSE output and idle");
-        while let Ok(event) = rx.try_recv() { assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })); }
+        assert!(
+            session.turn_active().await,
+            "HTTP success must wait for final SSE output and idle"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }));
+        }
         command.assert_async().await;
     }
 
@@ -2012,7 +2722,9 @@ pub(crate) mod tests {
             .unwrap();
         await_native_http(&session).await;
         assert!(session.turn_active().await);
-        while let Ok(event) = rx.try_recv() { assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. })); }
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }));
+        }
         compact.assert_async().await;
     }
 
@@ -2047,14 +2759,21 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn native_command_omits_unselected_model_and_effort() {
         let mut server = Server::new_async().await;
-        let command = server.mock("POST", "/session/sess_1/command")
+        let command = server
+            .mock("POST", "/session/sess_1/command")
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "command": "init", "arguments": "", "parts": [],
             })))
-            .with_status(200).with_body("{}").create_async().await;
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
         let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
         *session.current_model.lock().await = None;
-        session.send_turn("/init".into(), vec![], None, None).await.unwrap();
+        session
+            .send_turn("/init".into(), vec![], None, None)
+            .await
+            .unwrap();
         await_native_http(&session).await;
         command.assert_async().await;
     }

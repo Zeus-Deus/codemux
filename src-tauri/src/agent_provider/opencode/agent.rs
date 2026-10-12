@@ -127,8 +127,8 @@ impl OpenCodeAgentProvider {
 /// Reaps every live session on drop. Mirrors the Claude/Codex
 /// pattern — sessions own their SSE listener tasks and an HTTP
 /// client; both wind down cleanly when their `Arc` count hits zero,
-/// but we additionally call `shutdown()` to DELETE the OpenCode-side
-/// session and free its server-side memory.
+/// but we additionally interrupt/detach each live attachment. Durable native
+/// sessions remain addressable for resume.
 impl Drop for OpenCodeAgentProvider {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
@@ -387,8 +387,7 @@ impl AgentProvider for OpenCodeAgentProvider {
 
     async fn set_model(&self, thread_id: ThreadId, model: String) -> Result<(), ProviderError> {
         let session = self.lookup(&thread_id).await?;
-        session.set_model(model).await;
-        Ok(())
+        session.set_model(model).await
     }
 
     async fn set_permission_mode(
@@ -542,17 +541,52 @@ mod tests {
     #[tokio::test]
     async fn review_l4_opencode_selected_old_turn_does_not_abort_newer_turn() {
         let mut server = mockito::Server::new_async().await;
-        let prompt = server.mock("POST", "/session/sess_1/prompt_async").with_status(204).create_async().await;
-        let abort = server.mock("POST", "/session/sess_1/abort").with_status(200).with_body("true").expect(2).create_async().await;
-        let (session, _, _) = super::super::session::tests::mock_session(server.url(), "pw".into(), "sess_1").await;
-        let input = serde_json::from_value(serde_json::json!({"thread_id":"thread-1","text":"newer turn B","model_override":null})).unwrap();
+        let prompt = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(204)
+            .create_async()
+            .await;
+        let abort = server
+            .mock("POST", "/session/sess_1/abort")
+            .with_status(200)
+            .with_body("true")
+            .expect(2)
+            .create_async()
+            .await;
+        let (session, _, _) =
+            super::super::session::tests::mock_session(server.url(), "pw".into(), "sess_1").await;
+        let input = serde_json::from_value(
+            serde_json::json!({"thread_id":"thread-1","text":"newer turn B","model_override":null}),
+        )
+        .unwrap();
         let newer = session.enqueue_or_send(input).await.unwrap();
-        let provider = OpenCodeAgentProvider::new(Arc::new(OpenCodeServerManager::new()), OpenCodeProviderConfig::default());
-        provider.sessions.write().await.insert(ThreadId("thread-1".into()), session);
-        let result = provider.interrupt_turn(ThreadId("thread-1".into()), Some(TurnId("retired-a".into()))).await;
-        assert!(result.is_err(), "selected old turn must be checked before session-scoped HTTP abort: {result:?}");
-        provider.interrupt_turn(ThreadId("thread-1".into()), Some(newer.turn_id)).await.unwrap();
-        provider.interrupt_turn(ThreadId("thread-1".into()), None).await.unwrap();
+        let provider = OpenCodeAgentProvider::new(
+            Arc::new(OpenCodeServerManager::new()),
+            OpenCodeProviderConfig::default(),
+        );
+        provider
+            .sessions
+            .write()
+            .await
+            .insert(ThreadId("thread-1".into()), session);
+        let result = provider
+            .interrupt_turn(
+                ThreadId("thread-1".into()),
+                Some(TurnId("retired-a".into())),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "selected old turn must be checked before session-scoped HTTP abort: {result:?}"
+        );
+        provider
+            .interrupt_turn(ThreadId("thread-1".into()), Some(newer.turn_id))
+            .await
+            .unwrap();
+        provider
+            .interrupt_turn(ThreadId("thread-1".into()), None)
+            .await
+            .unwrap();
         prompt.assert_async().await;
         abort.assert_async().await;
     }
