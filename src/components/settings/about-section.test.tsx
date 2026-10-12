@@ -15,7 +15,7 @@ vi.mock("@/tauri/commands", () => ({
   getPackageFormat: vi.fn().mockResolvedValue("other"),
   resetSyncedSettings: vi.fn(),
 }));
-vi.mock("@/lib/toast", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock("@/lib/toast", () => ({ toast: { success: vi.fn(), error: vi.fn(), failure: vi.fn() } }));
 
 let remoteClient = false;
 vi.mock("@/components/remote/is-remote-client", () => ({
@@ -146,12 +146,13 @@ describe("AboutSection", () => {
       source_control: { custom_hosts: { "git.example.com": "gitlab" } },
     };
     useSyncedSettingsStore.getState().replaceSessionSettings(settings);
-    vi.mocked(resetSyncedSettings).mockRejectedValue(new Error("Network error"));
+    const error = new Error("Network error");
+    vi.mocked(resetSyncedSettings).mockRejectedValue(error);
     render(<AboutSection />);
     fireEvent.click(screen.getByRole("button", { name: "Reset…" }));
     fireEvent.click(await screen.findByRole("button", { name: "Reset settings" }));
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn't reset settings: Error: Network error"));
+    await waitFor(() => expect(toast.failure).toHaveBeenCalledWith("Couldn't reset settings", error));
     expect(toast.success).not.toHaveBeenCalled();
     expect(useSyncedSettingsStore.getState().settings).toBe(settings);
     expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);

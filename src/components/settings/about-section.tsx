@@ -114,7 +114,7 @@ async function revealLogFile() {
   try {
     await revealItemInDir(await join(await appLogDir(), LOG_FILE_NAME));
   } catch (error) {
-    toast.error(`Couldn't open the log folder: ${String(error)}`);
+    toast.failure("Couldn't open the log folder", error);
   }
 }
 
@@ -219,7 +219,7 @@ function DiagnosticsRow() {
       window.setTimeout(() => setCopied(false), 1_400);
       toast.success("Performance diagnostics copied");
     } catch (error) {
-      toast.error(`Couldn't collect performance diagnostics: ${String(error)}`);
+      toast.failure("Couldn't collect performance diagnostics", error);
     } finally {
       setCopying(false);
     }
@@ -251,7 +251,7 @@ function ResetSettingsRow() {
       await resetSettings();
       toast.success("Settings reset to defaults");
     } catch (error) {
-      toast.error(`Couldn't reset settings: ${String(error)}`);
+      toast.failure("Couldn't reset settings", error);
     } finally {
       setResetting(false);
     }
