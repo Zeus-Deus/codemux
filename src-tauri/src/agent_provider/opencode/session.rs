@@ -2317,6 +2317,13 @@ pub(crate) mod tests {
         )
         .await;
         let callback_turn = session.event_ctx.lock().await.turn_id.clone();
+        super::super::sse::handle_native(
+            serde_json::from_value(serde_json::json!({
+                "id":"callback-content","type":"session.text.ended",
+                "data":{"sessionID":"s","assistantMessageID":"callback-message","ordinal":0,"text":"child result"}
+            })).unwrap(),
+            &peer, &tx,
+        ).await;
         release.send(()).unwrap();
         draining.await.unwrap();
         assert_eq!(session.event_ctx.lock().await.turn_id, callback_turn);
@@ -2331,6 +2338,10 @@ pub(crate) mod tests {
         assert!(!before
             .iter()
             .any(|event| matches!(event, ProviderRuntimeEvent::QueuedTurnDispatched { .. })));
+        assert!(before.iter().any(|event| matches!(event,
+            ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if turn_id == &callback_turn && text == "child result"
+        )));
         super::super::sse::handle_native(
             event("callback-end", "session.execution.succeeded"),
             &peer,
@@ -2338,13 +2349,21 @@ pub(crate) mod tests {
         )
         .await;
         let next_turn = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut callback_completed = false;
             loop {
-                if let ProviderRuntimeEvent::QueuedTurnDispatched {
-                    queued_id, turn_id, ..
-                } = events.recv().await.unwrap()
-                {
-                    assert_eq!(queued_id, queued);
-                    break turn_id;
+                match events.recv().await.unwrap() {
+                    ProviderRuntimeEvent::TurnCompleted { turn_id, .. } => {
+                        assert_eq!(turn_id, callback_turn);
+                        callback_completed = true;
+                    }
+                    ProviderRuntimeEvent::QueuedTurnDispatched {
+                        queued_id, turn_id, ..
+                    } => {
+                        assert!(callback_completed);
+                        assert_eq!(queued_id, queued);
+                        break turn_id;
+                    }
+                    _ => {}
                 }
             }
         })
