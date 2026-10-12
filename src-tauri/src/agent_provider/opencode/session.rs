@@ -1170,20 +1170,32 @@ impl OpenCodeSession {
                 .native
                 .clear_deferred_execution(&self.provider_session_id.0);
         }
-        let turn_id = {
+        let turn_id = loop {
+            // Model preparation can outlive the reconciled event stream.
+            // Wait outside its locks, then fence the reservation commit too.
+            self.wait_ready().await?;
             let mut ctx = self.event_ctx.lock().await;
+            let mut router = if native_v2 {
+                Some(self.router.lock().await)
+            } else {
+                None
+            };
+            let ready = self.ready.borrow();
             self.ensure_open()?;
+            if native_v2 && !*ready {
+                continue;
+            }
             if native_v2
                 && !steer
-                && (ctx.turn_active || {
-                    let router = self.router.lock().await;
-                    router
-                        .native
-                        .awaiting_execution(&self.provider_session_id.0)
-                        || router
+                && (ctx.turn_active
+                    || router.as_ref().is_some_and(|router| {
+                        router
                             .native
-                            .has_pending_user_admission(&self.provider_session_id.0)
-                })
+                            .awaiting_execution(&self.provider_session_id.0)
+                            || router
+                                .native
+                                .has_pending_user_admission(&self.provider_session_id.0)
+                    }))
             {
                 return Ok(None);
             }
@@ -1197,15 +1209,15 @@ impl OpenCodeSession {
             // identity, rather than an unrelated Started, claims this User turn.
             ctx.turn_active = !(native_v2 && endpoint == "prompt" && !steer);
             if native_v2 && endpoint == "prompt" && !steer {
-                if let Some(id) = body["id"].as_str() {
-                    self.router.lock().await.native.remember_user_admission(
+                if let (Some(router), Some(id)) = (router.as_mut(), body["id"].as_str()) {
+                    router.native.remember_user_admission(
                         &self.provider_session_id.0,
                         id,
                         &ctx.turn_id.0,
                     );
                 }
             }
-            ctx.turn_id.clone()
+            break ctx.turn_id.clone();
         };
         if !steer {
             let _ = self
@@ -2978,6 +2990,7 @@ pub(crate) mod tests {
                                             ("200 OK", serde_json::json!({"interrupted":interrupted}).to_string())
                                         }
                                         ("POST", "/api/session/s/command") => ("204 No Content", String::new()),
+                                        ("POST", "/api/session/s/model") => ("204 No Content", String::new()),
                                         ("GET", "/api/session/s/inbox") => (
                                             "200 OK", serde_json::json!({"data":state.pending.values().collect::<Vec<_>>()} ).to_string()
                                         ),
@@ -3610,6 +3623,213 @@ pub(crate) mod tests {
             .all(|path| path != "/api/session/s/model"));
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_rechecks_readiness_after_model_ack_and_router_wait() {
+        for wait_on_router in [false, true] {
+            let mut peer = DelayedNativeAdmissionPeer::start_for("/api/session/s/model").await;
+            let (session, tx, mut events, ready) = mock_session_api_with_readiness(
+                peer.base_url.clone(),
+                "pw".into(),
+                "s",
+                super::super::api::OpenCodeApi::V2,
+            )
+            .await;
+            let initial_turn = session.event_ctx.lock().await.turn_id.clone();
+            let sending = tokio::spawn({
+                let session = session.clone();
+                async move {
+                    let mut input = delivery_input("first User after reconnect");
+                    input.model_override = Some("p/m".into());
+                    session.enqueue_or_send(input).await
+                }
+            });
+            peer.next_request("POST", "/api/session/s/model").await;
+            let router = if wait_on_router {
+                Some(session.router.lock().await)
+            } else {
+                ready.send_replace(false);
+                None
+            };
+            peer.release.send_replace(true);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while session.current_model.lock().await.as_deref() != Some("p/m") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("model ACK should update the prepared model");
+            if let Some(router) = router {
+                // Join behind the pre-reservation router probe. Its next
+                // acquisition must then wait behind this held FIFO waiter.
+                let next_router = session.router.lock();
+                tokio::pin!(next_router);
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    &mut next_router,
+                )
+                .await
+                .is_err());
+                drop(router);
+                let router = tokio::time::timeout(std::time::Duration::from_secs(2), next_router)
+                    .await
+                    .expect("pre-reservation probe should release the router");
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    // The final context lock is held while router acquisition
+                    // waits. Invalidate readiness after the pre-lock wait.
+                    while session.event_ctx.try_lock().is_ok() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dispatch should reach the final router-lock wait");
+                ready.send_replace(false);
+                drop(router);
+            }
+            tokio::task::yield_now().await;
+            assert!(!sending.is_finished());
+            assert_eq!(session.event_ctx.lock().await.turn_id, initial_turn);
+            assert!(!session.turn_active().await);
+            assert!(session.native_admissions.lock().await.is_empty());
+            assert!(session.native_inputs.lock().await.is_empty());
+            let requests: Vec<_> = std::iter::from_fn(|| peer.requests.try_recv().ok()).collect();
+            assert!(requests
+                .iter()
+                .all(|request| request.path != "/api/session/s/prompt"));
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                    event,
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        status: SessionStatus::Running { .. },
+                        ..
+                    }
+                ))
+            );
+
+            ready.send_replace(true);
+            let started = tokio::time::timeout(std::time::Duration::from_secs(2), sending)
+                .await
+                .expect("dispatch should resume after coherent recovery")
+                .unwrap()
+                .unwrap();
+            assert!(started.queued_id.is_none());
+            assert_ne!(started.turn_id, initial_turn);
+            let requests: Vec<_> = std::iter::from_fn(|| peer.requests.try_recv().ok()).collect();
+            let prompts: Vec<_> = requests
+                .iter()
+                .filter(|request| request.path == "/api/session/s/prompt")
+                .collect();
+            assert_eq!(prompts.len(), 2);
+            assert_eq!(prompts[0].body["resume"], false);
+            assert_eq!(prompts[1].body["resume"], true);
+            assert_eq!(prompts[0].body["id"], prompts[1].body["id"]);
+            assert_eq!(prompts[0].body["text"], "first User after reconnect");
+            assert!(requests
+                .iter()
+                .all(|request| request.path != "/api/session/s/model"));
+            let input_id = prompts[0].body["id"].as_str().unwrap();
+            assert_eq!(
+                session
+                    .router
+                    .lock()
+                    .await
+                    .native
+                    .pending_user_admission("s"),
+                Some((input_id.to_string(), started.turn_id.0.clone()))
+            );
+            let state = peer.state.lock().await;
+            assert_eq!(state.admitted, vec![input_id]);
+            assert_eq!(state.wakes, 1);
+            drop(state);
+            let queued = session
+                .enqueue_or_send(delivery_input("queued successor"))
+                .await
+                .unwrap()
+                .queued_id
+                .unwrap();
+            let sse_peer = SsePeer {
+                api: super::super::api::OpenCodeApi::V2,
+                ready: ready.clone(),
+                directory: None,
+                session_id: "s".into(),
+                event_ctx: session.event_ctx.clone(),
+                router: session.router.clone(),
+                dead: session.dead.clone(),
+                usage: session.usage.clone(),
+            };
+            let event = |id: &str, kind: &str, data: serde_json::Value, seq: u64| {
+                serde_json::from_value(serde_json::json!({
+                    "id":id,"type":kind,"created":0,"data":data,
+                    "durable":{"aggregateID":"s","seq":seq,"version":1}
+                }))
+                .unwrap()
+            };
+            super::super::sse::handle_native(
+                event(
+                    "evt_first_start",
+                    "session.execution.started",
+                    serde_json::json!({"sessionID":"s"}),
+                    10,
+                ),
+                &sse_peer,
+                &tx,
+            )
+            .await;
+            peer.state.lock().await.pending.remove(input_id);
+            super::super::sse::handle_native(
+                event(
+                    "evt_first_delivery",
+                    "session.inbox.delivered",
+                    serde_json::json!({"sessionID":"s","inboxID":input_id}),
+                    11,
+                ),
+                &sse_peer,
+                &tx,
+            )
+            .await;
+            assert_eq!(session.event_ctx.lock().await.turn_id, started.turn_id);
+            super::super::sse::handle_native(
+                event("evt_first_text", "session.text.ended", serde_json::json!({"sessionID":"s","assistantMessageID":"msg_first_answer","ordinal":0,"text":"first answer"}), 12),
+                &sse_peer, &tx,
+            ).await;
+            peer.state.lock().await.active = false;
+            super::super::sse::handle_native(
+                event(
+                    "evt_first_done",
+                    "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"s"}),
+                    13,
+                ),
+                &sse_peer,
+                &tx,
+            )
+            .await;
+            let staged = peer.next_request("POST", "/api/session/s/prompt").await;
+            let woke = peer.next_request("POST", "/api/session/s/prompt").await;
+            assert_eq!(staged.body["text"], "queued successor");
+            assert_eq!(staged.body["resume"], false);
+            assert_eq!(woke.body["resume"], true);
+            assert_eq!(staged.body["id"], woke.body["id"]);
+            assert_ne!(staged.body["id"], input_id);
+            drop(
+                tokio::time::timeout(std::time::Duration::from_secs(2), session.outbound.lock())
+                    .await
+                    .expect("queued successor should finish acknowledged dispatch"),
+            );
+            assert!(session.queued.lock().await.is_empty());
+            let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            assert_eq!(emitted.iter().filter(|event| matches!(
+                event, ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &started.turn_id
+            )).count(), 1);
+            assert!(emitted.iter().any(|event| matches!(
+                event, ProviderRuntimeEvent::QueuedTurnDispatched { queued_id, .. } if queued_id == &queued
+            )));
+            assert_eq!(peer.state.lock().await.wakes, 2);
+            session.shutdown().await.unwrap();
+            session.handoff_dead_attachment().await.unwrap();
+            peer.stop().await;
+        }
     }
 
     #[tokio::test]
