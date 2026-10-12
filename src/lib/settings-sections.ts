@@ -71,7 +71,7 @@ interface NavGroup {
  *  - "Interface" (home of the Agent Chat GUI toggle) stays visible
  *    regardless of the flag so users in either mode can find their way
  *    back.
- *  - The chat-only rows (Usage, Permissions, Skills, MCP Servers) are only
+ *  - The chat-only rows (Usage, Permissions, Skills) are only
  *    surfaced when the GUI is on; they reach into chat-only data. Hiding
  *    them when off matches the "feature absent, no work performed"
  *    promise of the master toggle.
@@ -92,11 +92,12 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
       items: [
         { id: "agent", label: "Agent", icon: Bot },
         { id: "interface", label: "Interface", icon: Sparkles },
+        // Inbound administration stays available in the CLI interface too.
+        { id: "mcp", label: "MCP Servers", icon: Plug },
         ...(agentChatEnabled
           ? ([
               { id: "permissions", label: "Permissions", icon: ShieldCheck },
               { id: "skills", label: "Skills", icon: BookOpen },
-              { id: "mcp", label: "MCP Servers", icon: Plug },
               // Reads the agent-chat usage ledger, which only fills when
               // the GUI is on.
               { id: "usage", label: "Usage", icon: ChartColumn },

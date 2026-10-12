@@ -23,8 +23,9 @@ use crate::json_rpc_child::{
 };
 
 use super::protocol::{
-    config_id_for, config_options, current_model_id, grok_auth_method, grok_model_effort_catalog,
-    initialize_params, looks_unauthenticated, option_by_id, resolve_boolean_value,
+    config_id_for, config_options, current_model_id, grok_auth_method,
+    grok_auth_reads_ambient_api_key, grok_model_effort_catalog, initialize_params,
+    local_xai_api_key_set, looks_unauthenticated, option_by_id, resolve_boolean_value,
     resolve_effort_value, resolve_select_value, session_id, set_config_params, set_model_params,
     ConfigKind, GrokModelEffortCatalog,
 };
@@ -103,6 +104,8 @@ pub struct AcpSpawnConfig {
     /// Shared with the command IPC so the composer reads the same catalogue
     /// the live session last observed.
     pub slash_command_cache: Arc<AcpSlashCommandCache>,
+    /// Device to run the agent on over SSH; `None` runs it here.
+    pub remote: Option<crate::agent_provider::types::RemoteSpawnTarget>,
 }
 
 #[derive(Debug)]
@@ -116,6 +119,52 @@ struct XAiPromptCompletion {
 struct QueuedTurn {
     id: String,
     input: SendTurnInput,
+    dispatch: Option<Arc<QueuedDispatch>>,
+}
+
+/// Retain the selected input across preparation awaits and worker abort.
+/// Dispatch/cancellation share one disposition; checkpoint cleanup remains
+/// owned until preparation has either committed or been aborted.
+#[derive(Debug)]
+struct QueuedDispatch {
+    id: String,
+    thread_id: ThreadId,
+    event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    disposed: AtomicBool,
+    checkpoint: std::sync::Mutex<Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>>,
+    cleanup_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+}
+impl QueuedDispatch {
+    fn cancel(&self) {
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: self.thread_id.clone(), queued_id: self.id.clone(),
+            });
+        }
+    }
+
+    async fn abort_checkpoint(&self) {
+        let checkpoint = self.checkpoint.lock().unwrap().take();
+        if let Some(checkpoint) = checkpoint {
+            // The cleanup future must not belong to the abortable prompt
+            // worker. Stop joins these owned tasks before returning.
+            let (done_tx, done_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                checkpoint.abort().await;
+                let _ = done_tx.send(());
+            });
+            {
+                let mut tasks = self.cleanup_tasks.lock().unwrap();
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
+            }
+            let _ = done_rx.await;
+        }
+    }
+
+    fn committed(&self) {
+        self.checkpoint.lock().unwrap().take();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +242,7 @@ pub(crate) struct AcpSessionState {
     config_options: Vec<Value>,
     pending: HashMap<RequestId, PendingRequest>,
     queued: VecDeque<QueuedTurn>,
+    selected_queued: Option<Arc<QueuedDispatch>>,
     assistant_text: String,
     thinking_text: String,
     /// Monotonic id of the current claim on the session's single prompt
@@ -223,6 +273,17 @@ pub(crate) struct AcpSessionState {
     /// update. This can differ from the requested value after defaults or
     /// provider policy are applied.
     grok_effort: Option<String>,
+}
+
+// Authority rejection is local to an undispatched input, not a provider failure.
+enum PrepareTurnError {
+    Rejected(ProviderError),
+    Failed(ProviderError),
+}
+impl PrepareTurnError {
+    fn into_provider_error(self) -> ProviderError {
+        match self { Self::Rejected(error) | Self::Failed(error) => error }
+    }
 }
 
 impl AcpSessionState {
@@ -269,17 +330,32 @@ impl AcpSessionState {
 /// [`AcpSession::await_child_messages_drained`].
 type NotificationBarrier = oneshot::Sender<()>;
 
+/// Whether the composer's `cwd` names this session's folder for command
+/// discovery. A device session's folder is a path on the device, which the
+/// composer may know only by the workspace's local path; the thread already
+/// identifies the session there, so any folder will do.
+fn command_discovery_cwd_matches(
+    on_device: bool,
+    session_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+) -> bool {
+    on_device || cwd == session_cwd
+}
+
 pub(crate) struct AcpSession {
     pub thread_id: ThreadId,
     pub provider_session_id: ProviderSessionId,
     pub state: Mutex<AcpSessionState>,
     cwd: PathBuf,
+    /// Runs on a device over SSH; `cwd` is a path there, not on this computer.
+    on_device: bool,
     child: Arc<JsonRpcChild>,
     dialect: AcpDialect,
     slash_command_cache: Arc<AcpSlashCommandCache>,
     commands: Mutex<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    queue_cleanup_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Ordering barriers into the two tasks that consume child messages.
     /// See [`AcpSession::await_child_messages_drained`].
     notification_barrier_tx: mpsc::UnboundedSender<NotificationBarrier>,
@@ -300,7 +376,7 @@ impl AcpSession {
     }
 
     pub async fn slash_commands(&self, cwd: &std::path::Path) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, ProviderError> {
-        if cwd != self.cwd {
+        if !command_discovery_cwd_matches(self.on_device, &self.cwd, cwd) {
             return Err(ProviderError::ValidationError { message: "Command discovery must use this conversation's directory.".into() });
         }
         Ok(self.commands.lock().await.clone())
@@ -323,15 +399,40 @@ impl AcpSession {
         let dialect = spawn.dialect;
         let slash_command_cache = Arc::clone(&spawn.slash_command_cache);
         let child_env = env.unwrap_or_default();
-        let child = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.binary,
-            args: dialect.spawn_args(),
-            env: child_env.clone(),
-            cwd: Some(cwd.clone()),
-            default_timeout: RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|error| map_spawn_error(error, dialect))?;
+        let remote = spawn.remote.clone();
+        let device = remote.as_ref().map(|remote| remote.host_name.as_str());
+        let child = match remote.as_ref() {
+            #[cfg(unix)]
+            Some(remote) => {
+                let program = crate::ssh::sidecar::device_program(remote, &spawn.binary).await?;
+                JsonRpcChild::spawn(crate::ssh::sidecar::device_spawn_config(
+                    remote,
+                    &program,
+                    &dialect.spawn_args(),
+                    &child_env,
+                    &cwd,
+                    RPC_TIMEOUT,
+                )?)
+                .await
+                .map_err(crate::ssh::sidecar::ssh_spawn_error)?
+            }
+            #[cfg(not(unix))]
+            Some(_) => {
+                return Err(ProviderError::ValidationError {
+                    message: "Threads on another device need macOS or Linux on this computer"
+                        .into(),
+                })
+            }
+            None => JsonRpcChild::spawn(SpawnConfig {
+                program: spawn.binary,
+                args: dialect.spawn_args(),
+                env: child_env.clone(),
+                cwd: Some(cwd.clone()),
+                default_timeout: RPC_TIMEOUT,
+            })
+            .await
+            .map_err(|error| map_spawn_error(error, dialect))?,
+        };
         let child = Arc::new(child);
         let notification_rx = child.notifications();
         let request_rx = child
@@ -347,19 +448,60 @@ impl AcpSession {
             let initialized = child
                 .request("initialize", initialize_params("codemux"))
                 .await
-                .map_err(|error| map_rpc_error(error, dialect))?;
+                .map_err(|error| {
+                    // `initialize` is the first thing a device-side agent
+                    // answers, so an install or connection problem there
+                    // surfaces here.
+                    #[cfg(unix)]
+                    if let Some(mapped) = remote.as_ref().and_then(|remote| {
+                        crate::ssh::sidecar::device_start_error(
+                            &error,
+                            dialect.provider(),
+                            remote,
+                            device_install_hint(dialect, &remote.host_name),
+                        )
+                    }) {
+                        return mapped;
+                    }
+                    map_rpc_error(error, dialect)
+                })?;
             slash_command_cache
                 .replace_from_value(dialect, &cwd, &initialized)
                 .await;
             let auth_method = match dialect {
                 AcpDialect::Cursor => "cursor_login".to_string(),
-                AcpDialect::Grok => grok_auth_method(&initialized, &child_env).ok_or_else(|| {
-                    ProviderError::NotAuthenticated {
-                        provider: ProviderKind::Grok,
-                        hint: "Run `grok login --device-auth` (or set `XAI_API_KEY`) and try again."
-                            .into(),
-                    }
-                })?,
+                AcpDialect::Grok => {
+                    // Older CLIs pick API-key auth only when the agent's own
+                    // environment has the key. This computer's says nothing
+                    // about a device, so ask the device (its answer, never
+                    // the value), and only when it can change the method.
+                    let ambient_api_key =
+                        grok_auth_reads_ambient_api_key(&initialized, &child_env)
+                            && match remote.as_ref() {
+                                None => local_xai_api_key_set(),
+                                #[cfg(unix)]
+                                Some(remote) => crate::ssh::exec::remote_env_var_set(
+                                    &remote.ssh_target,
+                                    "XAI_API_KEY",
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                    eprintln!(
+                                        "[codemux::acp] couldn't check {} for XAI_API_KEY: {error}",
+                                        remote.host_name
+                                    );
+                                    false
+                                }),
+                                #[cfg(not(unix))]
+                                Some(_) => false,
+                            };
+                    grok_auth_method(&initialized, &child_env, ambient_api_key).ok_or_else(
+                        || ProviderError::NotAuthenticated {
+                            provider: ProviderKind::Grok,
+                            hint: auth_hint(dialect, device),
+                        },
+                    )?
+                }
             };
             let auth_params = if dialect.is_grok() {
                 json!({ "methodId": auth_method, "_meta": { "headless": true } })
@@ -369,7 +511,7 @@ impl AcpSession {
             child
                 .request("authenticate", auth_params)
                 .await
-                .map_err(|error| map_auth_error(error, dialect))?;
+                .map_err(|error| map_auth_error(error, dialect, device))?;
 
             // `initialize` is Grok's first authoritative model catalogue.
             // Reconcile persisted startup preferences before they reach
@@ -507,6 +649,7 @@ impl AcpSession {
                 config_options: config_options(&setup),
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
+                selected_queued: None,
                 assistant_text: String::new(),
                 thinking_text: String::new(),
                 turn_generation: 0,
@@ -522,6 +665,7 @@ impl AcpSession {
                     .or_else(|| grok_reasoning_effort(&initialized)),
             }),
             cwd,
+            on_device: remote.is_some(),
             child,
             dialect,
             slash_command_cache,
@@ -529,6 +673,7 @@ impl AcpSession {
                 .or_else(|| super::slash_commands::available_commands_from_value(&initialized)).unwrap_or_default()),
             event_tx,
             tasks: Mutex::new(Vec::new()),
+            queue_cleanup_tasks: Default::default(),
             notification_barrier_tx,
             request_barrier_tx,
             interrupt_notify: Notify::new(),
@@ -701,6 +846,7 @@ impl AcpSession {
             state.queued.push_back(QueuedTurn {
                 id: queued_id.clone(),
                 input: input.clone(),
+                dispatch: None,
             });
             drop(state);
             let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
@@ -729,15 +875,19 @@ impl AcpSession {
     async fn dispatch_turn(
         self: &Arc<Self>,
         input: SendTurnInput,
-        queued_id: Option<String>,
+        queued_dispatch: Option<Arc<QueuedDispatch>>,
         generation: u64,
     ) -> Result<TurnId, ProviderError> {
-        let (turn_id, prompt) = self.prepare_turn(input, queued_id).await?;
+        let checkpoint = input.turn_checkpoint.clone();
+        #[cfg(test)]
+        if queued_dispatch.is_some() { selected_prepare_test_schedule(&self.thread_id).await; }
+        let (turn_id, prompt) = self.prepare_turn(input, queued_dispatch).await
+            .map_err(PrepareTurnError::into_provider_error)?;
         let session = Arc::clone(self);
         let worker_turn_id = turn_id.clone();
         let task = tokio::spawn(async move {
             session
-                .run_prompt_worker(worker_turn_id, prompt, generation)
+                .run_prompt_worker(worker_turn_id, prompt, generation, checkpoint)
                 .await;
         });
         {
@@ -782,13 +932,57 @@ impl AcpSession {
         }
     }
 
+    fn claim_queued_turn(&self, state: &mut AcpSessionState, mut queued: QueuedTurn) -> (QueuedTurn, u64) {
+        debug_assert!(state.selected_queued.is_none());
+        let dispatch = Arc::new(QueuedDispatch {
+            id: queued.id.clone(), thread_id: self.thread_id.clone(),
+            event_tx: self.event_tx.clone(), disposed: AtomicBool::new(false),
+            checkpoint: std::sync::Mutex::new(queued.input.turn_checkpoint.clone()),
+            cleanup_tasks: self.queue_cleanup_tasks.clone(),
+        });
+        state.selected_queued = Some(dispatch.clone());
+        queued.dispatch = Some(dispatch);
+        state.active_turn = Some(self.dispatching_turn_id());
+        (queued, state.claim_turn())
+    }
+
+    async fn cancel_selected_queued(&self, id: &str) {
+        let selected = {
+            let state = self.state.lock().await;
+            state.selected_queued.as_ref().filter(|selected| selected.id == id).cloned()
+        };
+        if let Some(selected) = selected {
+            selected.cancel();
+            selected.abort_checkpoint().await;
+            let mut state = self.state.lock().await;
+            if state.selected_queued.as_ref().is_some_and(|selected| selected.id == id) {
+                state.selected_queued.take();
+            }
+        }
+    }
+
+    async fn abort_preparing_checkpoint(
+        checkpoint: &Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>,
+        queued: Option<&Arc<QueuedDispatch>>,
+    ) {
+        if let Some(queued) = queued { queued.abort_checkpoint().await; }
+        else { checkpoint.abort().await; }
+    }
+
     async fn prepare_turn(
         &self,
         mut input: SendTurnInput,
-        queued_id: Option<String>,
-    ) -> Result<(TurnId, Vec<Value>), ProviderError> {
+        queued_dispatch: Option<Arc<QueuedDispatch>>,
+    ) -> Result<(TurnId, Vec<Value>), PrepareTurnError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(PrepareTurnError::Failed(ProviderError::SessionClosed { thread_id: self.thread_id.clone() }));
+        }
         if let Some(checkpoint) = &input.turn_checkpoint {
             checkpoint.prepare().await;
+            if let Err(error) = checkpoint.authorize_dispatch() {
+                Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await;
+                return Err(PrepareTurnError::Rejected(error));
+            }
         }
         let configured = async {
             if self.dialect.is_grok() {
@@ -842,45 +1036,55 @@ impl AcpSession {
         .await;
         if let Err(error) = configured {
             if let Some(checkpoint) = &input.turn_checkpoint {
-                checkpoint.abort().await;
+                Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await;
             }
-            return Err(error);
+            return Err(PrepareTurnError::Failed(error));
         }
 
+        if let Some(checkpoint) = &input.turn_checkpoint {
+            if let Err(error) = checkpoint.authorize_dispatch() { Self::abort_preparing_checkpoint(checkpoint, queued_dispatch.as_ref()).await; return Err(PrepareTurnError::Rejected(error)); }
+        }
         let turn_id = TurnId(self.opaque_id("turn"));
         {
             let mut state = self.state.lock().await;
+            // Stop owns an undispatched selection under this same lock.
+            // Never publish a late dispatch after it has cancelled the ID.
+            if self.is_dead() {
+                return Err(PrepareTurnError::Failed(ProviderError::SessionClosed { thread_id: self.thread_id.clone() }));
+            }
             state.active_turn = Some(turn_id.clone());
             state.status = SessionStatus::Running {
                 active_turn: turn_id.clone(),
             };
             state.assistant_text.clear();
             state.thinking_text.clear();
-        }
-        let _ = self
-            .event_tx
-            .send(ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: self.thread_id.clone(),
-                status: SessionStatus::Running {
-                    active_turn: turn_id.clone(),
-                },
-            });
-        if let Some(id) = queued_id {
             let _ = self
                 .event_tx
-                .send(ProviderRuntimeEvent::QueuedTurnDispatched {
-                    steered: false,
+                .send(ProviderRuntimeEvent::SessionStateChanged {
                     thread_id: self.thread_id.clone(),
-                    queued_id: id,
-                    turn_id: turn_id.clone(),
-                    text: input
-                        .display_text
-                        .clone()
-                        .unwrap_or_else(|| input.text.clone()),
+                    status: SessionStatus::Running {
+                        active_turn: turn_id.clone(),
+                    },
                 });
+            if let Some(queued) = &queued_dispatch {
+                if !queued.disposed.swap(true, Ordering::SeqCst) {
+                    let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                        steered: false, thread_id: self.thread_id.clone(),
+                        queued_id: queued.id.clone(), turn_id: turn_id.clone(),
+                        text: input.display_text.clone().unwrap_or_else(|| input.text.clone()),
+                    });
+                }
+            }
         }
         if let Some(checkpoint) = &input.turn_checkpoint {
             checkpoint.commit().await;
+        }
+        if let Some(queued) = &queued_dispatch {
+            queued.committed();
+            let mut state = self.state.lock().await;
+            if state.selected_queued.as_ref().is_some_and(|selected| selected.id == queued.id) {
+                state.selected_queued.take();
+            }
         }
 
         Ok((turn_id, build_prompt(&input)))
@@ -891,6 +1095,7 @@ impl AcpSession {
         mut turn_id: TurnId,
         mut prompt: Vec<Value>,
         mut generation: u64,
+        mut checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) {
         loop {
             // A Stop that landed while this turn was still being
@@ -901,22 +1106,53 @@ impl AcpSession {
             let response = if interrupted_before_send {
                 Ok(json!({ "stopReason": "cancelled" }))
             } else {
-                self.send_prompt(&prompt, generation).await
+                self.send_prompt(&prompt, generation, checkpoint.as_ref()).await
             };
-            let next = self.finish_turn(turn_id, response, generation).await;
-            let Some((queued, next_generation)) = next else {
-                return;
-            };
+            let mut next = self.finish_turn(turn_id, response, generation).await;
+            loop {
+                let Some((queued, next_generation)) = next else {
+                    return;
+                };
             generation = next_generation;
+            #[cfg(test)]
+            selected_prepare_test_schedule(&self.thread_id).await;
+            checkpoint = queued.input.turn_checkpoint.clone();
             match self
-                .prepare_turn(queued.input, Some(queued.id.clone()))
+                .prepare_turn(queued.input, queued.dispatch.clone())
                 .await
             {
                 Ok((next_turn_id, next_prompt)) => {
                     turn_id = next_turn_id;
                     prompt = next_prompt;
+                    break;
                 }
-                Err(error) => {
+                Err(PrepareTurnError::Rejected(_)) => {
+                    self.cancel_selected_queued(&queued.id).await;
+                    // Keep the single-prompt reservation while selecting the
+                    // next input. Stop still drains the queue and closes us.
+                    let mut state = self.state.lock().await;
+                    state.release_turn();
+                    state.status = SessionStatus::Ready;
+                    let cancelled = if self.is_dead() {
+                        // Unexpected child death has no shutdown owner to
+                        // retire the remaining inputs. This worker must do
+                        // so before abandoning its dispatch reservation.
+                        next = None;
+                        state.queued.drain(..).map(|queued| queued.id).collect::<Vec<_>>()
+                    } else {
+                        next = state.queued.pop_front().map(|queued| {
+                            self.claim_queued_turn(&mut state, queued)
+                        });
+                        Vec::new()
+                    };
+                    drop(state);
+                    for queued_id in cancelled {
+                        let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                            thread_id: self.thread_id.clone(), queued_id,
+                        });
+                    }
+                }
+                Err(PrepareTurnError::Failed(error)) => {
                     let cancelled = {
                         let mut state = self.state.lock().await;
                         // `release_turn` (not a bare `active_turn = None`)
@@ -924,11 +1160,14 @@ impl AcpSession {
                         // outlive it.
                         state.release_turn();
                         state.status = SessionStatus::Ready;
-                        state
+                        let cancelled = state
                             .queued
                             .drain(..)
                             .map(|queued| queued.id)
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        #[cfg(test)]
+                        failed_drain_locked_test_schedule(&self.thread_id, &cancelled).await;
+                        cancelled
                     };
                     self.warn(
                         format!(
@@ -937,12 +1176,8 @@ impl AcpSession {
                         ),
                         None,
                     );
-                    let _ = self
-                        .event_tx
-                        .send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                            thread_id: self.thread_id.clone(),
-                            queued_id: queued.id,
-                        });
+                    // These IDs are now worker-local: publish their terminal
+                    // dispositions before any await that Stop can abort.
                     for queued_id in cancelled {
                         let _ = self
                             .event_tx
@@ -951,8 +1186,10 @@ impl AcpSession {
                                 queued_id,
                             });
                     }
+                    self.cancel_selected_queued(&queued.id).await;
                     return;
                 }
+            }
             }
         }
     }
@@ -971,7 +1208,7 @@ impl AcpSession {
     /// and that mutex is FIFO so the cancel queues behind the prompt and
     /// still reaches the child second. `session/cancel` is a notification
     /// with no reply, so repeating it is harmless.
-    async fn send_prompt(&self, prompt: &[Value], generation: u64) -> Result<Value, RpcChildError> {
+    async fn send_prompt(&self, prompt: &[Value], generation: u64, checkpoint: Option<&Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>) -> Result<Value, RpcChildError> {
         let prompt_id = self.dialect.is_grok().then(|| self.opaque_id("prompt"));
         let fallback_rx = if let Some(prompt_id) = prompt_id.as_ref() {
             let (tx, rx) = oneshot::channel();
@@ -993,6 +1230,9 @@ impl AcpSession {
                 "promptId": prompt_id,
                 "requestId": prompt_id
             });
+        }
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.authorize_dispatch().map_err(|error| RpcChildError::RpcError(RpcError {code:-32001,message:error.to_string(),data:None}))?;
         }
         let request = self
             .child
@@ -1223,10 +1463,23 @@ impl AcpSession {
             duration_ms: usage.api_duration_ms,
             num_turns: usage.num_turns,
         });
-        let status = match response {
-            Ok(result) => turn_status_from_result(&result, self.dialect),
-            Err(error) => turn_status_from_rpc_error(&error, self.dialect),
+        let status = match &response {
+            Ok(result) => turn_status_from_result(result, self.dialect),
+            Err(error) => turn_status_from_rpc_error(error, self.dialect),
         };
+        if let TurnStatus::Error { subtype, message } = &status {
+            if subtype == crate::agent_provider::events::RATE_LIMIT_SUBTYPE {
+                let payload = match &response {
+                    Ok(result) => result,
+                    Err(RpcChildError::RpcError(error)) => error.data.as_ref().unwrap_or(&Value::Null),
+                    Err(_) => &Value::Null,
+                };
+                let notice = crate::agent_provider::usage_limit::usage_limit_notice(
+                    &self.thread_id, self.dialect.provider(), payload, message,
+                );
+                if let Some(notice) = notice { let _ = self.event_tx.send(notice); }
+            }
+        }
         let _ = self.event_tx.send(ProviderRuntimeEvent::TurnCompleted {
             thread_id: self.thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -1249,8 +1502,7 @@ impl AcpSession {
                     // an idle session between popping the queued turn and
                     // preparing it, starting a second prompt worker for
                     // the same ACP session.
-                    state.active_turn = Some(self.dispatching_turn_id());
-                    Some((queued, state.claim_turn()))
+                    Some(self.claim_queued_turn(&mut state, queued))
                 }
                 None => {
                     state.release_turn();
@@ -1323,9 +1575,7 @@ impl AcpSession {
                     (None, true)
                 }
                 Some(queued) => {
-                    state.active_turn = Some(self.dispatching_turn_id());
-                    let generation = state.claim_turn();
-                    (Some((queued, generation)), false)
+                    (Some(self.claim_queued_turn(&mut state, queued)), false)
                 }
                 None => (None, false),
             }
@@ -1333,16 +1583,11 @@ impl AcpSession {
         if let Some((queued, generation)) = ready_to_dispatch {
             let queued_id = queued.id.clone();
             if let Err(error) = self
-                .dispatch_turn(queued.input, Some(queued.id), generation)
+                .dispatch_turn(queued.input, queued.dispatch.clone(), generation)
                 .await
             {
                 self.release_dispatch_reservation().await;
-                let _ = self
-                    .event_tx
-                    .send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                        thread_id: self.thread_id.clone(),
-                        queued_id,
-                    });
+                self.cancel_selected_queued(&queued_id).await;
                 return Err(error);
             }
         } else if should_interrupt {
@@ -1370,16 +1615,31 @@ impl AcpSession {
         request_id: RequestId,
         decision: ApprovalDecision,
     ) -> Result<(), ProviderError> {
-        let pending = self
-            .state
-            .lock()
-            .await
-            .pending
-            .remove(&request_id)
-            .ok_or_else(|| ProviderError::RequestNotPending {
-                request_id: request_id.clone(),
-            })?;
+        let pending = {
+            let mut state = self.state.lock().await;
+            if let ApprovalDecision::ProviderOption { option_id } = &decision {
+                let pending = state.pending.get(&request_id).ok_or_else(|| ProviderError::RequestNotPending {request_id:request_id.clone()})?;
+                if !matches!(pending, PendingRequest::Permission { options, .. } if options.iter().any(|option| option["optionId"].as_str() == Some(option_id))) {
+                    return Err(ProviderError::ValidationError {message:"unsupported_decision: exact option is not advertised for this callback".into()});
+                }
+            }
+            state.pending.remove(&request_id).ok_or_else(|| ProviderError::RequestNotPending {request_id:request_id.clone()})?
+        };
         let response = pending_response(&pending, &decision);
+        // The wire needs the exact opaque option ID. Native transcript/UI
+        // consumers need its logical scope, not Hermes' ProviderOption event.
+        let event_decision = match (&pending, &decision) {
+            (PendingRequest::Permission { options, .. }, ApprovalDecision::ProviderOption { option_id }) => {
+                match options.iter().find(|option| option["optionId"].as_str() == Some(option_id))
+                    .and_then(|option| option["kind"].as_str()) {
+                    Some("allow_once") => ApprovalDecision::Allow { updated_input: None, updated_permissions: None },
+                    Some("allow_always") => ApprovalDecision::AllowForSession,
+                    Some("reject_once" | "reject_always") => ApprovalDecision::Deny { message: String::new() },
+                    _ => decision.clone(),
+                }
+            }
+            _ => decision.clone(),
+        };
         self.child
             .respond(pending_rpc_id(pending), Ok(response))
             .await
@@ -1387,7 +1647,7 @@ impl AcpSession {
         let _ = self.event_tx.send(ProviderRuntimeEvent::RequestResolved {
             thread_id: self.thread_id.clone(),
             request_id,
-            decision,
+            decision: event_decision,
         });
         let status = {
             let mut state = self.state.lock().await;
@@ -2238,14 +2498,12 @@ impl AcpSession {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        let queued = {
+        let (queued, selected) = {
             let mut state = self.state.lock().await;
             state.status = SessionStatus::Closed;
-            state
-                .queued
-                .drain(..)
-                .map(|queued| queued.id)
-                .collect::<Vec<_>>()
+            let selected = state.selected_queued.take();
+            if let Some(selected) = &selected { selected.cancel(); }
+            (state.queued.drain(..).map(|queued| queued.id).collect::<Vec<_>>(), selected)
         };
         for queued_id in queued {
             let _ = self
@@ -2263,9 +2521,14 @@ impl AcpSession {
             )
             .await;
         let _ = self.child.shutdown().await;
-        for task in self.tasks.lock().await.drain(..) {
-            task.abort();
-        }
+        let tasks = self.tasks.lock().await.drain(..).collect::<Vec<_>>();
+        for task in &tasks { task.abort(); }
+        // Observe abort completion before cleaning a retained checkpoint so
+        // the old preparation cannot overwrite the cleanup after Stop.
+        for task in tasks { let _ = task.await; }
+        if let Some(selected) = selected { selected.abort_checkpoint().await; }
+        let cleanup = self.queue_cleanup_tasks.lock().unwrap().drain(..).collect::<Vec<_>>();
+        for task in cleanup { let _ = task.await; }
     }
 }
 
@@ -2470,7 +2733,9 @@ fn context_window_from_value(value: &Value) -> Option<u64> {
 fn turn_status_from_result(result: &Value, dialect: AcpDialect) -> TurnStatus {
     match result.get("stopReason").and_then(Value::as_str) {
         Some("error") => TurnStatus::Error {
-            subtype: format!("{}_acp", dialect.id_prefix()),
+            subtype: if crate::agent_provider::usage_limit::is_usage_limit_error(
+                &agent_result_message(result).unwrap_or_default(), result,
+            ) { "rate_limit".into() } else { format!("{}_acp", dialect.id_prefix()) },
             message: agent_result_message(result)
                 .unwrap_or_else(|| format!("{} turn failed", dialect.label())),
         },
@@ -2490,13 +2755,11 @@ fn turn_status_from_rpc_error(error: &RpcChildError, dialect: AcpDialect) -> Tur
         _ => None,
     };
     let message = detail.unwrap_or_else(|| error.to_string());
-    let lower = message.to_ascii_lowercase();
-    let rate_limited = lower.contains("rate limit")
-        || lower.contains("usage limit")
-        || matches!(error, RpcChildError::RpcError(error) if error.data.as_ref().is_some_and(|data| {
-            data.get("http_status").and_then(Value::as_u64) == Some(429)
-                || data.get("httpStatus").and_then(Value::as_u64) == Some(429)
-        }));
+    let payload = match error {
+        RpcChildError::RpcError(error) => error.data.as_ref().unwrap_or(&Value::Null),
+        _ => &Value::Null,
+    };
+    let rate_limited = crate::agent_provider::usage_limit::is_usage_limit_error(&message, payload);
     TurnStatus::Error {
         subtype: if rate_limited {
             "rate_limit".into()
@@ -3215,6 +3478,11 @@ fn xai_plan_response(decision: &ApprovalDecision) -> Value {
 }
 
 fn permission_outcome(options: &[Value], decision: &ApprovalDecision) -> Value {
+    if let ApprovalDecision::ProviderOption { option_id } = decision {
+        return if options.iter().any(|option| option["optionId"].as_str() == Some(option_id)) {
+            json!({"outcome":"selected","optionId":option_id})
+        } else { json!({"outcome":"cancelled"}) };
+    }
     let kinds: &[&str] = match decision {
         ApprovalDecision::AllowForSession => &["allow_always", "allow_once"],
         ApprovalDecision::Allow { .. } => &["allow_once", "allow_always"],
@@ -3309,17 +3577,43 @@ fn map_spawn_error(error: RpcChildError, dialect: AcpDialect) -> ProviderError {
     }
 }
 
-fn map_auth_error(error: RpcChildError, dialect: AcpDialect) -> ProviderError {
+/// How to sign in, on this computer or on the named device.
+fn auth_hint(dialect: AcpDialect, device: Option<&str>) -> String {
+    match (dialect, device) {
+        (AcpDialect::Cursor, None) => "Run `cursor-agent login` and try again.".into(),
+        (AcpDialect::Cursor, Some(device)) => {
+            format!("Run `cursor-agent login` on {device} and try again.")
+        }
+        (AcpDialect::Grok, None) => {
+            "Run `grok login --device-auth` (or set `XAI_API_KEY`) and try again.".into()
+        }
+        (AcpDialect::Grok, Some(device)) => format!(
+            "Run `grok login --device-auth` on {device} (or set `XAI_API_KEY` there) and try again."
+        ),
+    }
+}
+
+/// How to install the agent CLI on a device.
+#[cfg(unix)]
+fn device_install_hint(dialect: AcpDialect, device: &str) -> String {
+    match dialect {
+        AcpDialect::Cursor => {
+            format!("Install Cursor Agent on {device} and run `cursor-agent login` there")
+        }
+        AcpDialect::Grok => format!("Install the Grok CLI on {device} and sign in there"),
+    }
+}
+
+fn map_auth_error(
+    error: RpcChildError,
+    dialect: AcpDialect,
+    device: Option<&str>,
+) -> ProviderError {
     let message = error.to_string();
     if looks_unauthenticated(&message) {
         ProviderError::NotAuthenticated {
             provider: dialect.provider(),
-            hint: match dialect {
-                AcpDialect::Cursor => "Run `cursor-agent login` and try again.".into(),
-                AcpDialect::Grok => {
-                    "Run `grok login --device-auth` (or set `XAI_API_KEY`) and try again.".into()
-                }
-            },
+            hint: auth_hint(dialect, device),
         }
     } else {
         ProviderError::RpcError { message }
@@ -3381,8 +3675,88 @@ fn value_contains_text(value: &Value, needle: &str) -> bool {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SelectedPrepareTestBarrier {
+    pub entered: Notify,
+    pub release: tokio::sync::Semaphore,
+}
+#[cfg(test)]
+fn selected_prepare_test_barriers() -> &'static std::sync::Mutex<HashMap<ThreadId, Arc<SelectedPrepareTestBarrier>>> {
+    static BARRIERS: std::sync::OnceLock<std::sync::Mutex<HashMap<ThreadId, Arc<SelectedPrepareTestBarrier>>>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn install_selected_prepare_test_barrier(thread: ThreadId) -> Arc<SelectedPrepareTestBarrier> {
+    let barrier = Arc::new(SelectedPrepareTestBarrier { entered: Notify::new(), release: tokio::sync::Semaphore::new(0) });
+    assert!(selected_prepare_test_barriers().lock().unwrap().insert(thread, barrier.clone()).is_none());
+    barrier
+}
+#[cfg(test)]
+async fn selected_prepare_test_schedule(thread: &ThreadId) {
+    let barrier = selected_prepare_test_barriers().lock().unwrap().remove(thread);
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FailedDrainLockedTestBarrier {
+    pub entered: Notify,
+    pub release: tokio::sync::Semaphore,
+    pub drained: std::sync::Mutex<Vec<String>>,
+}
+#[cfg(test)]
+fn failed_drain_locked_test_barriers() -> &'static std::sync::Mutex<HashMap<ThreadId, Arc<FailedDrainLockedTestBarrier>>> {
+    static BARRIERS: std::sync::OnceLock<std::sync::Mutex<HashMap<ThreadId, Arc<FailedDrainLockedTestBarrier>>>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn install_failed_drain_locked_test_barrier(thread: ThreadId) -> Arc<FailedDrainLockedTestBarrier> {
+    let barrier = Arc::new(FailedDrainLockedTestBarrier {
+        entered: Notify::new(), release: tokio::sync::Semaphore::new(0), drained: Default::default(),
+    });
+    assert!(failed_drain_locked_test_barriers().lock().unwrap().insert(thread, barrier.clone()).is_none());
+    barrier
+}
+#[cfg(test)]
+async fn failed_drain_locked_test_schedule(thread: &ThreadId, drained: &[String]) {
+    let barrier = failed_drain_locked_test_barriers().lock().unwrap().remove(thread);
+    if let Some(barrier) = barrier {
+        *barrier.drained.lock().unwrap() = drained.to_vec();
+        barrier.entered.notify_one();
+        // Hold the already-existing state lock, allowing real Stop to queue
+        // its FIFO acquisition. No post-drain cancellation point is added.
+        barrier.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_s3_acp_explicit_advertised_option_selects_exact_scope() {
+        let pending = PendingRequest::Permission {rpc_id:json!(1),options:vec![json!({"kind":"allow_always","optionId":"permit"})]};
+        assert_eq!(pending_response(&pending, &ApprovalDecision::ProviderOption {option_id:"permit".into()}),
+            json!({"outcome":{"outcome":"selected","optionId":"permit"}}), "exact option must be delivered, not cancelled or substituted");
+        // The legacy UI fallback remains its existing separate contract.
+        assert_eq!(pending_response(&pending, &ApprovalDecision::Allow {updated_input:None,updated_permissions:None}),
+            json!({"outcome":{"outcome":"selected","optionId":"permit"}}));
+    }
+
+    #[test]
+    fn device_sessions_list_commands_for_the_workspaces_local_folder() {
+        let device_cwd = std::path::Path::new("/home/u/.codemux/worktrees/uid-app/feat");
+        let local_cwd = std::path::Path::new("/home/me/projects/app");
+        assert!(command_discovery_cwd_matches(false, local_cwd, local_cwd));
+        assert!(!command_discovery_cwd_matches(false, device_cwd, local_cwd));
+        // A workspace moved to a device keeps its local folder in the
+        // composer while the session runs in the device's copy.
+        assert!(command_discovery_cwd_matches(true, device_cwd, local_cwd));
+        assert!(command_discovery_cwd_matches(true, device_cwd, device_cwd));
+    }
 
     #[test]
     fn grok_incompatible_model_marker_is_read_from_structured_error_data() {
@@ -3618,6 +3992,23 @@ mod tests {
             ),
             TurnStatus::Error { ref subtype, .. } if subtype == "rate_limit"
         ));
+    }
+
+    #[test]
+    fn usage_limit_acp_results_preserve_reset_metadata() {
+        for dialect in [AcpDialect::Cursor, AcpDialect::Grok] {
+            let result = json!({"stopReason":"error", "_meta":{"agentResult":"Usage limit reached",
+                "reset_at_ms":1_800_000_000_000_i64}});
+            let status = turn_status_from_result(&result, dialect);
+            let TurnStatus::Error { subtype, message } = status else { panic!("expected limit"); };
+            assert_eq!(subtype, "rate_limit");
+            let notice = crate::agent_provider::usage_limit::usage_limit_notice(
+                &ThreadId("acp-limit".into()), dialect.provider(), &result, &message,
+            ).unwrap();
+            assert!(matches!(notice, ProviderRuntimeEvent::UsageLimitReached {
+                resets_at_ms: Some(1_800_000_000_000), ..
+            }));
+        }
     }
 
     #[test]
@@ -4201,6 +4592,7 @@ mod tests {
             config_options: vec![],
             pending: HashMap::new(),
             queued: VecDeque::new(),
+            selected_queued: None,
             assistant_text: String::new(),
             thinking_text: String::new(),
             turn_generation: 0,

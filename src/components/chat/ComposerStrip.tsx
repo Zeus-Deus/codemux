@@ -1,4 +1,5 @@
 import {
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -8,7 +9,7 @@ import {
   EllipsisVertical,
   Hourglass,
 } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import {
@@ -25,18 +26,24 @@ import {
 } from "@/lib/agent-chat/goal";
 import type { OrbActivity } from "@/lib/orb-state";
 import { cn } from "@/lib/utils";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
+import { ProviderLogo } from "./provider-logo";
 import { TickingText } from "./TickingText";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
-/** Which occupant leads the collapsed strip. Lower wins. */
+/** Which occupant leads the collapsed strip. Lower wins. Delegations sit
+ *  just ahead of running subagents: both are background work, and a
+ *  delegation is the one the parent will continue from. */
 export const STRIP_PRIORITY = {
-  error: 0,
-  usage: 1,
-  monitoring: 2,
-  running: 3,
-  finished: 4,
-  queued: 5,
+  approval: 0,
+  error: 1,
+  usage: 2,
+  monitoring: 3,
+  delegation: 4,
+  running: 5,
+  finished: 6,
+  queued: 7,
 } as const;
 
 export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
@@ -44,6 +51,8 @@ export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
 /** The only coloured thing in a row. The surface itself stays neutral. */
 export type StripMark =
   | { kind: "orb"; activity?: OrbActivity }
+  /** Who is doing the work: one provider mark, or up to two overlapping. */
+  | { kind: "providers"; providers: AgentChatProviderKind[] }
   | { kind: "monitoring" }
   | { kind: "finished" }
   | { kind: "queued" }
@@ -69,6 +78,8 @@ export interface StripRow {
   mark: StripMark;
   label: string;
   detail?: string | null;
+  /** Explanation that must stay readable instead of truncating with detail. */
+  note?: string | null;
   /** A detail that is a pure function of the clock (a countdown), repainted
    *  on its own interval without re-rendering the strip. */
   liveDetail?: {
@@ -82,6 +93,9 @@ export interface StripRow {
   /** Sits before `action` (e.g. a quiet Cancel beside Try now). */
   secondaryAction?: StripAction | null;
   action?: StripAction | null;
+  /** False for a row that only heads the items below it (delegation's
+   *  "Stop all"), so the `+n` counts never include it. */
+  countsAsItem?: boolean;
 }
 
 export interface StripOccupant {
@@ -207,14 +221,17 @@ export function ComposerStrip({
   const all = occupants
     .filter((o): o is StripOccupant => !!o && o.rows.length > 0)
     .sort((a, b) => STRIP_PRIORITY[a.kind] - STRIP_PRIORITY[b.kind]);
-  // A usage-limit stop is a decision, not background activity, so a goal
-  // never folds it into `+n`: it takes its own row above the goal.
-  const pinned = goal ? all.filter((o) => o.kind === "usage") : [];
-  const present = goal ? all.filter((o) => o.kind !== "usage") : all;
+  // A pending approval or a usage-limit stop is a decision, not background
+  // activity, so a goal never folds it into `+n`: it takes its own row
+  // above the goal.
+  const isDecision = (o: StripOccupant) =>
+    o.kind === "approval" || o.kind === "usage";
+  const pinned = goal ? all.filter(isDecision) : [];
+  const present = goal ? all.filter((o) => !isDecision(o)) : all;
   const rows = present.flatMap((occupant) =>
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
-  const total = rows.length;
+  const total = rows.filter(({ row }) => row.countsAsItem !== false).length;
   const hasGoal = goal !== null;
 
   const listId = useId();
@@ -230,12 +247,16 @@ export function ComposerStrip({
   }, [hasGoal]);
 
   const anyOpen = open || goalOpen;
+  const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!anyOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       // Anything that already consumed Escape (a composer popup closing)
       // keeps it.
       if (e.key !== "Escape" || e.defaultPrevented) return;
+      // Under a utility page the workspace is `inert`; the page owns
+      // Escape, and claiming it here would leave the page open.
+      if (rootRef.current?.closest("[inert]")) return;
       e.preventDefault();
       setOpen(false);
       setGoalOpen(false);
@@ -282,6 +303,7 @@ export function ComposerStrip({
 
   return (
     <div
+      ref={rootRef}
       data-testid="composer-strip"
       data-open={open || undefined}
       data-lead={goal ? "goal" : lead.kind}
@@ -380,8 +402,10 @@ export function ComposerStrip({
 /** "2 subagents running · 1 message queued", in strip priority order. */
 function occupantSummary(present: StripOccupant[]): string | null {
   const parts = present.map((o) => {
-    const n = o.rows.length;
+    const n = o.rows.filter((row) => row.countsAsItem !== false).length;
     switch (o.kind) {
+      case "delegation":
+        return `${n} delegated task${n === 1 ? "" : "s"} running`;
       case "running":
         return `${n} subagent${n === 1 ? "" : "s"} running`;
       case "queued":
@@ -394,6 +418,8 @@ function occupantSummary(present: StripOccupant[]): string | null {
         return "session error";
       case "usage":
         return "usage limit";
+      case "approval":
+        return `${n} approval${n === 1 ? "" : "s"} needed`;
     }
   });
   return parts.length > 0 ? parts.join(" · ") : null;
@@ -413,48 +439,60 @@ function StripRowView({
       data-testid="composer-strip-row"
       data-kind={kind}
       data-row-id={row.id}
-      className={cn(
-        "flex shrink-0 items-center gap-2.5 px-2",
-        STRIP_ROW_HEIGHT,
-      )}
+      className="shrink-0"
     >
-      <span className="flex size-5 shrink-0 items-center justify-center">
-        <StripMarkView mark={row.mark} />
-      </span>
-      <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
-        {row.label}
-      </span>
-      {row.liveDetail ? (
-        <TickingText
-          testId={row.liveDetail.testId}
-          className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground tabular-nums"
-          compute={row.liveDetail.compute}
-          intervalMs={row.liveDetail.intervalMs}
-        />
-      ) : (
-        <span
-          className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
-          title={row.detail ?? undefined}
+      <div
+        className={cn(
+          "flex shrink-0 items-center gap-2.5 px-2",
+          STRIP_ROW_HEIGHT,
+        )}
+      >
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          <StripMarkView mark={row.mark} />
+        </span>
+        <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
+          {row.label}
+        </span>
+        {row.liveDetail ? (
+          <TickingText
+            testId={row.liveDetail.testId}
+            className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground tabular-nums"
+            compute={row.liveDetail.compute}
+            intervalMs={row.liveDetail.intervalMs}
+          />
+        ) : (
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
+            title={row.detail ?? undefined}
+          >
+            {row.detail}
+          </span>
+        )}
+        {row.meta && (
+          <span className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground tabular-nums">
+            {row.meta}
+          </span>
+        )}
+        {row.elapsed && (
+          <TickingText
+            className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
+            compute={row.elapsed}
+          />
+        )}
+        {row.secondaryAction && (
+          <StripActionButton action={row.secondaryAction} />
+        )}
+        {row.action && <StripActionButton action={row.action} />}
+        {trailing}
+      </div>
+      {row.note && (
+        <p
+          data-testid="composer-strip-usage-explanation"
+          className="pb-2 pl-[38px] pr-3 text-label leading-relaxed text-muted-foreground"
         >
-          {row.detail}
-        </span>
+          {row.note}
+        </p>
       )}
-      {row.meta && (
-        <span className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground tabular-nums">
-          {row.meta}
-        </span>
-      )}
-      {row.elapsed && (
-        <TickingText
-          className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
-          compute={row.elapsed}
-        />
-      )}
-      {row.secondaryAction && (
-        <StripActionButton action={row.secondaryAction} />
-      )}
-      {row.action && <StripActionButton action={row.action} />}
-      {trailing}
     </li>
   );
 }
@@ -835,6 +873,26 @@ function StripMarkView({ mark }: { mark: StripMark }) {
   switch (mark.kind) {
     case "orb":
       return <AgentOrb size={20} {...mark.activity} aria-hidden />;
+    case "providers": {
+      const [first, second] = mark.providers;
+      if (!first) {
+        return <Bot className="size-3.5 text-muted-foreground" aria-hidden />;
+      }
+      if (!second) return <ProviderLogo provider={first} className="size-3.5" />;
+      // Two marks share the 20px slot, overlapped like an avatar stack.
+      return (
+        <span className="flex items-center -space-x-1" aria-hidden>
+          {[first, second].map((provider) => (
+            <span
+              key={provider}
+              className="flex size-3.5 items-center justify-center rounded-full bg-background ring-1 ring-background"
+            >
+              <ProviderLogo provider={provider} className="size-3" />
+            </span>
+          ))}
+        </span>
+      );
+    }
     case "monitoring":
       // Calm background presence: a still dot, never a pulse.
       return (

@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     takeCommandPaletteQuery: vi.fn<() => string | null>(() => null),
     setShowNewWorkspaceDialog: vi.fn(),
     setShowSettings: vi.fn(),
+    setShowLocalSessionImport: vi.fn(),
   },
   synced: {
     settings: {
@@ -824,5 +825,26 @@ describe("command palette — settings pages", () => {
     await user.type(screen.getByRole("combobox"), "settings");
     expect(screen.getByText("Settings · Account")).toBeInTheDocument();
     expect(screen.getByText("Settings · About")).toBeInTheDocument();
+  });
+});
+
+describe("command palette — import recent chats", () => {
+  afterEach(() => useFeatureFlags.setState({ enableAgentChat: false }));
+
+  it("opens the recent chat import from anywhere", async () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    await user.click(screen.getByText("Import recent chats…"));
+    expect(mocks.ui.setShowLocalSessionImport).toHaveBeenCalledWith(true);
+  });
+
+  it("is hidden when agent chat is off", async () => {
+    useFeatureFlags.setState({ enableAgentChat: false });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "import");
+    expect(screen.queryByText("Import recent chats…")).toBeNull();
   });
 });

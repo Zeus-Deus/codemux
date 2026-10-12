@@ -19,6 +19,7 @@ import {
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
+import { getUsage } from "./get-usage.ts";
 import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
 import { ping } from "./ping.ts";
@@ -119,12 +120,23 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
       cwd,
       pathToClaudeCodeExecutable,
     };
+    const managed = optBoolean(p["managed"], "managed");
+    if (managed !== undefined) input.managed = managed;
     const model = optString(p["model"], "model");
     if (model !== undefined) input.model = model;
     const effort = optString(p["effort"], "effort");
     if (effort !== undefined) input.effort = effort;
     const fastMode = optBoolean(p["fastMode"], "fastMode");
     if (fastMode !== undefined) input.fastMode = fastMode;
+    for (const key of ["maxBudgetUsd", "maxTurns"] as const) {
+      const value = p[key];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 ||
+        (key === "maxTurns" && (!Number.isInteger(value) || value > 0xffff_ffff))) {
+        throw new InvalidParamsError(`${key} must be a finite positive ${key === "maxTurns" ? "32-bit integer" : "number"}`);
+      }
+      input[key] = value;
+    }
     const permissionMode = optString(p["permissionMode"], "permissionMode");
     if (permissionMode !== undefined) {
       input.permissionMode = permissionMode as PermissionMode;
@@ -185,6 +197,12 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
     }
 
     const session = new ClaudeSession(input, emit);
+    try {
+      await session.waitManagedReady();
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
     sessions.set(threadId, session);
     return {
       threadId,
@@ -378,6 +396,17 @@ const listCommandsMethod: MethodHandler = async (params) => {
   });
 };
 
+const getUsageMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "get-usage");
+  return getUsage({
+    cwd: asString(p["cwd"], "cwd"),
+    pathToClaudeCodeExecutable: asString(
+      p["pathToClaudeCodeExecutable"],
+      "pathToClaudeCodeExecutable",
+    ),
+  });
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -402,6 +431,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "probe-authenticated": probeAuthenticatedMethod,
     "list-models": listModelsMethod,
     "list-commands": listCommandsMethod,
+    "get-usage": getUsageMethod,
   };
 }
 

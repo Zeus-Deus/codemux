@@ -140,8 +140,8 @@ export const UserMessage = memo(function UserMessage({
           className={cn(
             "conversation-text flex flex-col gap-2 rounded-[14px_14px_5px_14px] border px-[15px] py-[11px] leading-relaxed",
             queued
-              ? "border-border/35 bg-muted/30 text-muted-foreground/75"
-              : "border-border/60 bg-card text-foreground",
+              ? "border-hairline bg-surface-1 text-muted-foreground/75"
+              : "border-hairline bg-card text-foreground",
           )}
         >
           {images.length > 0 ? (
@@ -169,7 +169,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Interrupt and send queued message"
                   title="Stop current work and send this message"
                   onClick={() => onSendQueuedNow(queued.queuedId)}
-                  className="inline-flex items-center gap-1 rounded-sm px-1 text-caption text-muted-foreground transition-colors duration-150 hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                  className="inline-flex items-center gap-1 rounded-sm px-1 text-caption text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 >
                   <CornerDownLeft className="size-3" aria-hidden />
                   Interrupt
@@ -255,7 +255,7 @@ function ImageThumbnail({
   if (failed || !src) {
     return (
       <div
-        className="flex h-20 w-28 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground"
+        className="flex h-20 w-28 items-center justify-center rounded-lg border border-hairline bg-surface-1 text-muted-foreground"
         aria-label="Image failed to load"
       >
         <ImageOff className="size-5 opacity-40" aria-hidden />
@@ -268,7 +268,7 @@ function ImageThumbnail({
       type="button"
       onClick={onOpen}
       aria-label="Open attached image"
-      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+      className="cursor-pointer overflow-hidden rounded-lg border border-hairline transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
     >
       <img
         src={src}

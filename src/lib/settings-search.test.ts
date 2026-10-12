@@ -72,8 +72,13 @@ describe("searchSettings", () => {
   });
 
   it("hides chat-only pages when Agent Chat is off", () => {
-    expect(labels("mcp servers", true)).toContain("MCP Servers › MCP Servers");
-    expect(labels("mcp servers", false)).not.toContain("MCP Servers › MCP Servers");
+    expect(labels("permissions", true)).toContain("Permissions › Permissions");
+    expect(labels("permissions", false)).not.toContain("Permissions › Permissions");
+  });
+
+  it("keeps inbound MCP administration searchable when Agent Chat is off", () => {
+    expect(labels("mcp servers", false)).toContain("MCP Servers › MCP Servers");
+    expect(settingsPagesForQuery("settings mcp servers", false, true)).toContain("mcp");
   });
 
   it.each([

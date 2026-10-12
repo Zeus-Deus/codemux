@@ -183,7 +183,7 @@ export function CustomizeFooterDialog({
                 key={action.id}
                 type="button"
                 aria-label={`Pin ${action.label}`}
-                className="flex w-full items-center gap-3 rounded-md px-2 py-2 text-left text-body hover:bg-muted focus-visible:outline-ring"
+                className="flex w-full items-center gap-3 rounded-md px-2 py-2 text-left text-body hover:bg-surface-2 focus-visible:outline-ring"
                 onClick={() => togglePin(action.id)}
               >
                 <action.icon className="size-4 text-muted-foreground" />

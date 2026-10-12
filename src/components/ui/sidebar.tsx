@@ -21,9 +21,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { PanelLeftIcon } from "lucide-react"
+import { resizeKeyAction } from "@/lib/resize-keys"
 
-const SIDEBAR_COOKIE_NAME = "sidebar_state"
-const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 const SIDEBAR_WIDTH_MIN = 180
 const SIDEBAR_WIDTH_MAX = 400
 // 288px default (was 256): the inbox card's mono meta line (branch ·
@@ -99,9 +98,6 @@ function SidebarProvider({
       } else {
         _setOpen(openState)
       }
-
-      // This sets the cookie to keep the sidebar state.
-      document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`
     },
     [setOpenProp, open]
   )
@@ -299,7 +295,8 @@ function SidebarTrigger({
 }
 
 function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
-  const { setSidebarWidth } = useSidebar()
+  const { state, sidebarWidth, setSidebarWidth } = useSidebar()
+  const widthPx = Number.parseFloat(sidebarWidth)
   const isDragging = React.useRef(false)
   const rafId = React.useRef(0)
 
@@ -348,17 +345,43 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
     [setSidebarWidth],
   )
 
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    const action = resizeKeyAction(e, "vertical")
+    if (!action) return
+    e.preventDefault()
+    setSidebarWidth(
+      action.kind === "min"
+        ? SIDEBAR_WIDTH_MIN
+        : action.kind === "max"
+          ? SIDEBAR_WIDTH_MAX
+          : widthPx + action.px
+    )
+  }
+
+  // The collapsed rail has no width to resize, so it leaves the tab order.
+  const expanded = state === "expanded"
+
   return (
     <div
       data-sidebar="rail"
       data-slot="sidebar-rail"
       role="separator"
       aria-orientation="vertical"
+      aria-label="Resize sidebar"
+      aria-valuenow={widthPx}
+      aria-valuemin={SIDEBAR_WIDTH_MIN}
+      aria-valuemax={SIDEBAR_WIDTH_MAX}
+      tabIndex={expanded ? 0 : -1}
       onPointerDown={handlePointerDown}
+      onKeyDown={handleKeyDown}
+      onDoubleClick={() => setSidebarWidth(SIDEBAR_WIDTH_DEFAULT)}
       className={cn(
         "absolute inset-y-0 z-20 hidden w-1 cursor-col-resize sm:flex",
         "group-data-[side=left]:right-0 group-data-[side=right]:left-0",
         "bg-transparent hover:bg-foreground/20 data-[dragging=true]:bg-foreground/30 transition-colors duration-100",
+        // The 4px strip is too thin for the base outline; the fill is the
+        // focus cue.
+        "outline-none focus-visible:bg-ring/60",
         className
       )}
       {...props}
