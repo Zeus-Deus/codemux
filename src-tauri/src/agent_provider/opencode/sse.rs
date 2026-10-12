@@ -1041,31 +1041,24 @@ async fn reconcile_native_history(
             {
                 continue;
             }
-            let belongs_to_admission = admitted_input.as_ref().is_some_and(|input| {
-                execution.iter().any(|message| {
+            let user_index = admitted_input.as_ref().and_then(|input| {
+                execution.iter().position(|message| {
                     message["type"] == "user" && message["id"].as_str() == Some(input)
                 })
             });
-            if belongs_to_admission {
-                router
-                    .native
-                    .claim_pending_user_admission(session, admitted_input.as_deref().unwrap());
+            if let Some((user_index, turn)) = user_index.zip(reserved_turn.as_ref()) {
+                drop(router);
+                drop(ctx);
+                replay_native_user_history(&execution, user_index, session, turn, peer, event_tx)
+                    .await?;
+                reserved_completed = true;
+                replay_native_terminal(&terminal, session, peer, event_tx).await?;
+                continue;
             }
             let preserve_latest = admitted_input.is_none()
                 && (!running || current.is_empty())
                 && index + 1 == execution_count;
-            if let Some(turn) = reserved_turn
-                .as_ref()
-                .filter(|_| belongs_to_admission || preserve_latest)
-            {
-                if belongs_to_admission && ctx.turn_active && ctx.turn_id != *turn {
-                    let _ = event_tx.send(ProviderRuntimeEvent::TurnCompleted {
-                        thread_id: ctx.thread_id.clone(),
-                        turn_id: ctx.turn_id.clone(),
-                        status: crate::agent_provider::TurnStatus::Success,
-                        usage: None,
-                    });
-                }
+            if let Some(turn) = reserved_turn.as_ref().filter(|_| preserve_latest) {
                 ctx.turn_id = turn.clone();
                 ctx.turn_active = true;
                 reserved_completed = true;
@@ -1097,58 +1090,71 @@ async fn reconcile_native_history(
             return Ok(());
         }
         if running || (reserved_turn.is_some() && !reserved_completed) {
-            let mut ctx = peer.event_ctx.lock().await;
-            let mut router = peer.router.lock().await;
-            if let Some(turn) = reserved_turn.filter(|_| !reserved_completed) {
-                let delivered = admitted_input.as_ref().is_some_and(|input| {
-                    current.iter().any(|message| {
-                        message["type"] == "user" && message["id"].as_str() == Some(input)
-                    })
-                });
-                if delivered {
-                    router
-                        .native
-                        .claim_pending_user_admission(session, admitted_input.as_deref().unwrap());
-                }
-                if !router.native.has_pending_user_admission(session) {
-                    if delivered && ctx.turn_active && ctx.turn_id != turn {
-                        let _ = event_tx.send(ProviderRuntimeEvent::TurnCompleted {
-                            thread_id: ctx.thread_id.clone(),
-                            turn_id: ctx.turn_id.clone(),
-                            status: crate::agent_provider::TurnStatus::Success,
-                            usage: None,
-                        });
-                    }
-                    ctx.turn_id = turn;
-                    ctx.turn_active = true;
-                }
+            let user_index = admitted_input.as_ref().and_then(|input| {
+                current.iter().position(|message| {
+                    message["type"] == "user" && message["id"].as_str() == Some(input)
+                })
+            });
+            if let Some((user_index, turn)) =
+                user_index.zip(reserved_turn.as_ref().filter(|_| !reserved_completed))
+            {
+                replay_native_user_history(&current, user_index, session, turn, peer, event_tx)
+                    .await?;
             } else {
-                // Coordinator ownership can trail an already observed Idle.
-                let completed = idle_message
-                    .as_ref()
-                    .and_then(|m| m["id"].as_str())
-                    .and_then(|id| router.native.completed_idle_sequence(session, id));
-                if current.is_empty()
-                    && sequence
-                        .zip(completed)
-                        .is_some_and(|(seq, completed)| seq <= completed)
-                {
-                    return Ok(());
+                let mut ctx = peer.event_ctx.lock().await;
+                let mut router = peer.router.lock().await;
+                if let Some(turn) = reserved_turn.filter(|_| !reserved_completed) {
+                    let delivered = admitted_input.as_ref().is_some_and(|input| {
+                        current.iter().any(|message| {
+                            message["type"] == "user" && message["id"].as_str() == Some(input)
+                        })
+                    });
+                    if delivered {
+                        router.native.claim_pending_user_admission(
+                            session,
+                            admitted_input.as_deref().unwrap(),
+                        );
+                    }
+                    if !router.native.has_pending_user_admission(session) {
+                        if delivered && ctx.turn_active && ctx.turn_id != turn {
+                            let _ = event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                                thread_id: ctx.thread_id.clone(),
+                                turn_id: ctx.turn_id.clone(),
+                                status: crate::agent_provider::TurnStatus::Success,
+                                usage: None,
+                            });
+                        }
+                        ctx.turn_id = turn;
+                        ctx.turn_active = true;
+                    }
+                } else {
+                    // Coordinator ownership can trail an already observed Idle.
+                    let completed = idle_message
+                        .as_ref()
+                        .and_then(|m| m["id"].as_str())
+                        .and_then(|id| router.native.completed_idle_sequence(session, id));
+                    if current.is_empty()
+                        && sequence
+                            .zip(completed)
+                            .is_some_and(|(seq, completed)| seq <= completed)
+                    {
+                        return Ok(());
+                    }
+                    admit_native_root(&mut ctx);
                 }
-                admit_native_root(&mut ctx);
+                router.native.mark_running(session);
+                drop(router);
+                if ctx.turn_active {
+                    let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: ctx.thread_id.clone(),
+                        status: crate::agent_provider::SessionStatus::Running {
+                            active_turn: ctx.turn_id.clone(),
+                        },
+                    });
+                }
+                drop(ctx);
+                replay_native_messages(&current, session, peer, event_tx).await?;
             }
-            router.native.mark_running(session);
-            drop(router);
-            if ctx.turn_active {
-                let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: ctx.thread_id.clone(),
-                    status: crate::agent_provider::SessionStatus::Running {
-                        active_turn: ctx.turn_id.clone(),
-                    },
-                });
-            }
-            drop(ctx);
-            replay_native_messages(&current, session, peer, event_tx).await?;
         }
         if !running {
             // Retire buffered durable records only after every recovered answer
@@ -1272,6 +1278,69 @@ async fn reconcile_native_history(
         replay_native_terminal(&message, session, peer, event_tx).await?;
     }
     Ok(())
+}
+
+/// A native busy period can drain background work and then a queued User
+/// without another execution start. The exact User row is the ownership
+/// boundary; assistant messages before it must not borrow the User's turn.
+async fn replay_native_user_history(
+    messages: &[serde_json::Value],
+    user_index: usize,
+    session: &str,
+    user_turn: &crate::agent_provider::TurnId,
+    peer: &SsePeer,
+    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+) -> Result<(), String> {
+    let prefix = &messages[..user_index];
+    let user_already_active = {
+        let ctx = peer.event_ctx.lock().await;
+        ctx.turn_active && ctx.turn_id == *user_turn
+    };
+    // A live exact delivery already handed off this ordered prefix. Keeping
+    // its remembered User mapping must not mint another background turn.
+    if !user_already_active {
+        let mut ctx = peer.event_ctx.lock().await;
+        if ctx.turn_active || prefix.iter().any(|message| message["type"] == "assistant") {
+            admit_native_root(&mut ctx);
+            peer.router.lock().await.native.mark_running(session);
+            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ctx.thread_id.clone(),
+                status: crate::agent_provider::SessionStatus::Running {
+                    active_turn: ctx.turn_id.clone(),
+                },
+            });
+            drop(ctx);
+            replay_native_messages(prefix, session, peer, event_tx).await?;
+            let mut ctx = peer.event_ctx.lock().await;
+            ctx.turn_active = false;
+            // The busy period continues with the User: this handoff has no
+            // Ready state and cannot release another queued input.
+            let _ = event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                thread_id: ctx.thread_id.clone(),
+                turn_id: ctx.turn_id.clone(),
+                status: crate::agent_provider::TurnStatus::Success,
+                usage: None,
+            });
+        }
+    }
+    {
+        let mut ctx = peer.event_ctx.lock().await;
+        let mut router = peer.router.lock().await;
+        let input = messages[user_index]["id"]
+            .as_str()
+            .ok_or("missing native User input identity")?;
+        router.native.claim_pending_user_admission(session, input);
+        router.native.mark_running(session);
+        ctx.turn_id = user_turn.clone();
+        ctx.turn_active = true;
+        let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ctx.thread_id.clone(),
+            status: crate::agent_provider::SessionStatus::Running {
+                active_turn: ctx.turn_id.clone(),
+            },
+        });
+    }
+    replay_native_messages(&messages[user_index + 1..], session, peer, event_tx).await
 }
 
 async fn replay_native_terminal(
@@ -1917,6 +1986,228 @@ mod tests {
             older_page.assert_async().await;
             for mock in mocks {
                 mock.assert_async().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_recovery_splits_background_and_exact_user_within_one_busy_period() {
+        for running_tail in [false, true] {
+            for live_prefix in ["unseen", "partial", "delivered"] {
+                let mut server = mockito::Server::new_async().await;
+                let mut mocks = mock_watermarks(&mut server, "root", 30).await;
+                for (path, body) in [
+                    (
+                        "/api/session/active",
+                        serde_json::json!({"data":if running_tail { serde_json::json!({"root":{}}) } else { serde_json::json!({}) }}),
+                    ),
+                    (
+                        "/api/session?parentID=root&limit=200&order=asc",
+                        serde_json::json!({"data":[]}),
+                    ),
+                    (
+                        "/api/session/root/permission",
+                        serde_json::json!({"data":[]}),
+                    ),
+                    ("/api/session/root/form", serde_json::json!({"data":[]})),
+                ] {
+                    mocks.push(
+                        server
+                            .mock("GET", path)
+                            .with_status(200)
+                            .with_body(body.to_string())
+                            .expect_at_least(1)
+                            .create_async()
+                            .await,
+                    );
+                }
+                let mut history = Vec::new();
+                if !running_tail {
+                    history.push(
+                        serde_json::json!({"id":"msg_x_done","type":"idle","outcome":"succeeded"}),
+                    );
+                }
+                history.extend([
+                    serde_json::json!({"id":"msg_x_assistant","type":"assistant","time":{"completed":5},"content":[{"type":"text","text":"answer X"}]}),
+                    serde_json::json!({"id":"msg_user_x","type":"user","text":"User X"}),
+                    serde_json::json!({"id":"msg_b_assistant","type":"assistant","time":{"completed":3},"content":[{"type":"text","text":"background B"}]}),
+                    serde_json::json!({"id":"msg_a_done","type":"idle","outcome":"succeeded"}),
+                ]);
+                mocks.push(
+                    server
+                        .mock("GET", "/api/session/root/message?limit=200&order=desc")
+                        .with_status(200)
+                        .with_body(serde_json::json!({"data":history}).to_string())
+                        .expect(2)
+                        .create_async()
+                        .await,
+                );
+                let mut p = peer("root");
+                p.api = super::super::api::OpenCodeApi::V2;
+                let (tx, mut rx) = broadcast::channel(64);
+                for (id, kind, seq) in [
+                    ("evt_a_start", "session.execution.started", 1),
+                    ("evt_a_done", "session.execution.succeeded", 10),
+                ] {
+                    handle_record(
+                        &native_record(
+                            id,
+                            kind,
+                            serde_json::json!({"sessionID":"root"}),
+                            Some(seq),
+                        ),
+                        &p,
+                        &tx,
+                    )
+                    .await;
+                }
+                while rx.try_recv().is_ok() {}
+                let user_turn = TurnId("reserved_user_x".into());
+                {
+                    let mut ctx = p.event_ctx.lock().await;
+                    ctx.turn_id = user_turn.clone();
+                    ctx.turn_active = false;
+                    p.router.lock().await.native.remember_user_admission(
+                        "root",
+                        "msg_user_x",
+                        &user_turn.0,
+                    );
+                }
+                let mut original_background = None;
+                if live_prefix != "unseen" {
+                    handle_record(
+                        &native_record(
+                            "evt_b_start",
+                            "session.execution.started",
+                            serde_json::json!({"sessionID":"root"}),
+                            Some(11),
+                        ),
+                        &p,
+                        &tx,
+                    )
+                    .await;
+                    let (kind, data) = if live_prefix == "delivered" {
+                        (
+                            "session.text.ended",
+                            serde_json::json!({"sessionID":"root","assistantMessageID":"msg_b_assistant","ordinal":0,"text":"background B"}),
+                        )
+                    } else {
+                        (
+                            "session.text.delta",
+                            serde_json::json!({"sessionID":"root","assistantMessageID":"msg_b_assistant","ordinal":0,"delta":"background "}),
+                        )
+                    };
+                    handle_record(&native_record("evt_b_text", kind, data, Some(12)), &p, &tx)
+                        .await;
+                    original_background = Some(p.event_ctx.lock().await.turn_id.clone());
+                }
+                if live_prefix == "delivered" {
+                    handle_record(
+                        &native_record(
+                            "evt_x_delivered",
+                            "session.inbox.delivered",
+                            serde_json::json!({"sessionID":"root","inboxID":"msg_user_x"}),
+                            Some(21),
+                        ),
+                        &p,
+                        &tx,
+                    )
+                    .await;
+                    assert!(!p
+                        .router
+                        .lock()
+                        .await
+                        .native
+                        .has_pending_user_admission("root"));
+                }
+                reconcile_native(&server.url(), "fixture", &p, &tx)
+                    .await
+                    .unwrap();
+                let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                let responses: Vec<_> = observed
+                    .iter()
+                    .filter_map(|event| match event {
+                        ProviderRuntimeEvent::ItemCompleted {
+                            turn_id,
+                            item: crate::agent_provider::CompletedItem::AssistantText { text },
+                            ..
+                        } => Some((turn_id.clone(), text.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    responses.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                    vec!["background B", "answer X"],
+                    "{running_tail}/{live_prefix}"
+                );
+                let background_turn = &responses[0].0;
+                assert_ne!(background_turn, &user_turn);
+                assert_eq!(responses[1].0, user_turn);
+                if let Some(original) = original_background {
+                    assert_eq!(
+                        *background_turn, original,
+                        "a live background prefix keeps its turn"
+                    );
+                }
+                let terminals = |turn: &TurnId| {
+                    observed.iter().filter(|event|
+                    matches!(event, ProviderRuntimeEvent::TurnCompleted {turn_id, ..} if turn_id == turn)).count()
+                };
+                assert_eq!(terminals(background_turn), 1);
+                assert_eq!(terminals(&user_turn), if running_tail { 0 } else { 1 });
+                let background_end = observed.iter().position(|event|
+                    matches!(event, ProviderRuntimeEvent::TurnCompleted {turn_id, ..} if turn_id == background_turn)).unwrap();
+                let user_output = observed.iter().position(|event|
+                    matches!(event, ProviderRuntimeEvent::ItemCompleted {turn_id, ..} if turn_id == &user_turn)).unwrap();
+                assert!(
+                    !observed[background_end..=user_output]
+                        .iter()
+                        .any(|event| matches!(
+                            event,
+                            ProviderRuntimeEvent::SessionStateChanged {
+                                status: crate::agent_provider::SessionStatus::Ready,
+                                ..
+                            }
+                        )),
+                    "handoff must not release the queue between background and User"
+                );
+                assert_eq!(p.event_ctx.lock().await.turn_active, running_tail);
+                assert!(!p
+                    .router
+                    .lock()
+                    .await
+                    .native
+                    .has_pending_user_admission("root"));
+                reconcile_native(&server.url(), "fixture", &p, &tx)
+                    .await
+                    .unwrap();
+                let duplicate: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                assert!(
+                    !duplicate.iter().any(|event| matches!(
+                        event,
+                        ProviderRuntimeEvent::ItemCompleted { .. }
+                            | ProviderRuntimeEvent::TurnCompleted { .. }
+                    )),
+                    "a repeated checkpoint must not replay either ownership segment"
+                );
+                if running_tail {
+                    handle_record(
+                        &native_record(
+                            "evt_x_done",
+                            "session.execution.succeeded",
+                            serde_json::json!({"sessionID":"root"}),
+                            Some(40),
+                        ),
+                        &p,
+                        &tx,
+                    )
+                    .await;
+                    assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).filter(|event|
+                        matches!(event, ProviderRuntimeEvent::TurnCompleted {turn_id, ..} if turn_id == &user_turn)).count(), 1);
+                }
+                for mock in mocks {
+                    mock.assert_async().await;
+                }
             }
         }
     }
