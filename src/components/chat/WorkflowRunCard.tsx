@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Ban,
@@ -80,6 +80,23 @@ export function WorkflowRunCard({ item, approval, onDecide, workspaceId }: Props
 // Approval card
 // ---------------------------------------------------------------------------
 
+type WorkflowChoice = "once" | "always" | "deny";
+
+export const WORKFLOW_DENIED_MESSAGE = "User denied the workflow.";
+
+/** The approval's cost warning, from what the script actually declares. The
+ *  agent count is unknown until the run starts, so it is never invented. */
+export function workflowCostLabel(item: WorkflowRunItem): string {
+  const phases = item.plannedPhases.length;
+  const scope =
+    item.agentCount != null
+      ? `Spawns ${item.agentCount} agent${item.agentCount === 1 ? "" : "s"}`
+      : phases > 0
+        ? `Runs agents in parallel across ${phases} phase${phases === 1 ? "" : "s"}`
+        : "Runs agents in parallel";
+  return `${scope} · higher token use than a normal turn.`;
+}
+
 function WorkflowApprovalCard({
   item,
   approval,
@@ -96,26 +113,38 @@ function WorkflowApprovalCard({
   // IPC round-trips, so a double-click in the same tick could otherwise
   // dispatch twice.
   const dispatchedRef = useRef(false);
-  const isResponding = approval?.resolution.state === "responding";
+  const [pressed, setPressed] = useState<WorkflowChoice | null>(null);
+  const resolutionState = approval?.resolution.state;
+  const isResponding = resolutionState === "responding";
 
-  const decide = (decision: ApprovalDecision) => {
+  // A decision that fails to send puts the request back to `pending`; the
+  // buttons must work again then instead of staying silently dead.
+  useEffect(() => {
+    if (resolutionState === "responding") return;
+    dispatchedRef.current = false;
+    setPressed(null);
+  }, [resolutionState]);
+
+  const decide = (choice: WorkflowChoice, decision: ApprovalDecision) => {
     if (dispatchedRef.current) return;
     dispatchedRef.current = true;
+    setPressed(choice);
     onDecide(decision);
   };
 
-  const runOnce = () => decide({ decision: "allow" });
+  const runOnce = () => decide("once", { decision: "allow" });
   const runAlways = () => {
     const updatedPermissions = buildPermissionUpdate("project", {
       toolName: "Workflow",
     });
-    decide({
+    decide("always", {
       decision: "allow",
       ...(updatedPermissions ? { updated_permissions: updatedPermissions } : {}),
     });
   };
   const deny = () =>
-    decide({ decision: "deny", message: "User denied the workflow." });
+    decide("deny", { decision: "deny", message: WORKFLOW_DENIED_MESSAGE });
+  const busy = isResponding || pressed !== null;
 
   return (
     <div
@@ -166,8 +195,7 @@ function WorkflowApprovalCard({
           aria-hidden
         />
         <span className="flex-1 text-label text-muted-foreground">
-          Spawns up to 16 agents in parallel · higher token use than a normal
-          turn.
+          {workflowCostLabel(item)}
         </span>
       </div>
 
@@ -177,18 +205,18 @@ function WorkflowApprovalCard({
           size="sm"
           className="bg-foreground text-background hover:bg-foreground/90"
           onClick={runOnce}
-          disabled={isResponding}
+          disabled={busy}
         >
-          Run once
+          {pressed === "once" ? "Starting…" : "Run once"}
         </Button>
         <Button
           type="button"
           variant="outline"
           size="sm"
           onClick={runAlways}
-          disabled={isResponding}
+          disabled={busy}
         >
-          Always for this project
+          {pressed === "always" ? "Starting…" : "Always for this project"}
         </Button>
         <Button
           type="button"
@@ -205,9 +233,9 @@ function WorkflowApprovalCard({
           size="sm"
           className="ml-auto text-muted-foreground hover:text-foreground"
           onClick={deny}
-          disabled={isResponding}
+          disabled={busy}
         >
-          Deny
+          {pressed === "deny" ? "Denying…" : "Deny"}
         </Button>
       </div>
 

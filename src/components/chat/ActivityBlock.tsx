@@ -1,5 +1,5 @@
 import { Check, ChevronDown, ChevronRight, LoaderCircle, X } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
@@ -8,6 +8,8 @@ import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
 
 import type { ActivityStep, WorkEntry } from "./transcript-slots";
+import { Reveal } from "./Reveal";
+import { StepElapsed } from "./StepElapsed";
 import { TickingText } from "./TickingText";
 import { ToolCallBody } from "./ToolCallBodies";
 import {
@@ -27,6 +29,9 @@ export const WORK_LOG_HISTORY_WINDOW = 10;
 const ROW_CLASS =
   "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 
+const META_CLASS =
+  "shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/55";
+
 type OrbActivity = ReturnType<typeof turnOrbActivity>;
 
 /**
@@ -35,32 +40,42 @@ type OrbActivity = ReturnType<typeof turnOrbActivity>;
  * plus stretch totals; pressing it opens the chronological history. There is
  * deliberately no surrounding card, status banner or settled header—the turn
  * fold owns completion and the final assistant answer owns the hierarchy.
+ *
+ * Every disclosure here is the user's own choice, so the block never closes
+ * itself when the turn ends: someone reading a diff mid-run keeps reading it.
+ * `onKeepOpen` tells the transcript that the user opened this log while the
+ * turn ran, so the turn fold that settles over it stays expanded too. That
+ * holds for every log in the running turn (`turnLive`), not just the one with
+ * the live row: agents often write a message between two stretches of work.
  */
 export const ActivityBlock = memo(function ActivityBlock({
   items,
   working,
+  turnLive = false,
   workspaceId,
+  onKeepOpen,
 }: {
   items: WorkEntry[];
   working: boolean;
+  /** The block belongs to the turn still running (implied by `working`). */
+  turnLive?: boolean;
   workspaceId?: string | null;
+  /** Keyed by the block's first entry id, which is stable for its life. */
+  onKeepOpen?: (entryId: string, keep: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
-  const previousWorking = useRef(working);
-
-  useEffect(() => {
-    if (previousWorking.current && !working) {
-      setOpen(false);
-      setShowAll(false);
-      setExpandedStepId(null);
-    }
-    previousWorking.current = working;
-  }, [working]);
 
   const latest = items[items.length - 1];
   if (!latest) return null;
+  const blockId = items[0].id;
+  // Only a live turn needs the hint. A settled block already sits under an
+  // expanded fold, and dropping the hint there would fold the turn away
+  // under the cursor.
+  const keepOpen = (keep: boolean) => {
+    if (working || turnLive) onKeepOpen?.(blockId, keep);
+  };
 
   const runs = items.filter(isSubagentRun);
   const orbActivity = working ? turnOrbActivity(items) : undefined;
@@ -82,11 +97,15 @@ export const ActivityBlock = memo(function ActivityBlock({
         key={entry.id}
         step={entry}
         live={live}
+        ticking={working || turnLive}
         orbActivity={live ? orbActivity : undefined}
         expanded={expandedStepId === entry.id}
-        onToggle={() =>
-          setExpandedStepId((current) => (current === entry.id ? null : entry.id))
-        }
+        onToggle={() => {
+          const expanding = expandedStepId !== entry.id;
+          setExpandedStepId(expanding ? entry.id : null);
+          // A lone step is the whole log, so its detail is what to keep.
+          if (items.length === 1) keepOpen(expanding);
+        }}
       />
     );
   };
@@ -101,7 +120,10 @@ export const ActivityBlock = memo(function ActivityBlock({
         live={working}
         orbActivity={orbActivity}
         totals={workLogTotals(items)}
-        onOpen={() => setOpen(true)}
+        onOpen={() => {
+          setOpen(true);
+          keepOpen(true);
+        }}
       />
     );
   } else {
@@ -117,6 +139,7 @@ export const ActivityBlock = memo(function ActivityBlock({
             setOpen(false);
             setShowAll(false);
             setExpandedStepId(null);
+            keepOpen(false);
           }}
           className={ROW_CLASS}
         >
@@ -198,6 +221,9 @@ function CollapsedLine({
       <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
         {summary}
       </span>
+      {live && !isSubagentRun(entry) ? (
+        <StepElapsed step={entry} className={META_CLASS} separated />
+      ) : null}
       <TotalsLabel totals={totals} />
       <ChevronDown
         className="size-3 shrink-0 text-muted-foreground/45"
@@ -225,12 +251,18 @@ function TotalsLabel({ totals }: { totals: WorkLogTotals }) {
 function StepRow({
   step,
   live,
+  ticking,
   orbActivity,
   expanded,
   onToggle,
 }: {
   step: ActivityStep;
   live: boolean;
+  /** The step's turn is still running, so a `running` step really is. A
+   *  settled transcript can hold a call that never reported back (crash,
+   *  quit); its start time is no longer meaningful, so it keeps the static
+   *  meta instead of counting forever. */
+  ticking: boolean;
   orbActivity?: OrbActivity;
   expanded: boolean;
   onToggle: () => void;
@@ -255,10 +287,12 @@ function StepRow({
         <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
           {view.summary}
         </span>
-        {view.meta && !live ? (
+        {ticking && view.status === "running" && step.started_at != null ? (
+          <StepElapsed step={step} className={META_CLASS} />
+        ) : view.meta && !live ? (
           <span
             className={cn(
-              "shrink-0 font-mono text-caption text-muted-foreground/55",
+              META_CLASS,
               view.status === "error" && "text-status-attention",
             )}
           >
@@ -273,7 +307,7 @@ function StepRow({
           aria-hidden
         />
       </button>
-      {expanded && (
+      <Reveal open={expanded}>
         <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
           {step.kind === "reasoning" ? (
             <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
@@ -283,7 +317,7 @@ function StepRow({
             <ToolCallBody item={step} />
           )}
         </div>
-      )}
+      </Reveal>
     </div>
   );
 }

@@ -5,6 +5,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import type {
   ReasoningItem,
   SubagentView as SubagentViewModel,
+  ToolCallItem,
 } from "@/lib/agent-chat/types";
 
 import { SubagentView } from "./SubagentView";
@@ -20,6 +21,21 @@ function reasoning(overrides: Partial<ReasoningItem> = {}): ReasoningItem {
     text: "Checking whether the fixture still lines up.",
     streaming: false,
     ...overrides,
+  };
+}
+
+function runningTool(): ToolCallItem {
+  return {
+    kind: "tool_call",
+    id: "tc-1",
+    seq: 1,
+    tool_use_id: "tu-1",
+    tool_name: "Bash",
+    input: { command: "npm test" },
+    status: "running",
+    result_content: null,
+    approval_request_id: null,
+    started_at: Date.now(),
   };
 }
 
@@ -60,5 +76,19 @@ describe("SubagentView", () => {
     );
     expect(container.querySelector("[data-orb-state]")).toBeNull();
     expect(screen.getByText("Thought for 4s")).toBeInTheDocument();
+  });
+
+  it("ticks a running step while the subagent works", () => {
+    render(<SubagentView subagent={subagent({ items: [runningTool()] })} />);
+    expect(screen.getByTestId("step-elapsed")).toBeInTheDocument();
+  });
+
+  it("does not tick a step left running by a settled subagent", () => {
+    render(
+      <SubagentView
+        subagent={subagent({ status: "failed", items: [runningTool()] })}
+      />,
+    );
+    expect(screen.queryByTestId("step-elapsed")).toBeNull();
   });
 });

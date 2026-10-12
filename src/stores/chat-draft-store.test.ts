@@ -11,6 +11,7 @@ import {
   type DraftId,
 } from "./chat-draft-store";
 import { useAgentChatStore } from "./agent-chat-store";
+import { useSettingsStore } from "./settings-store";
 import { useProviderCapabilities } from "./provider-capabilities-store";
 import type { ChatModelInfo, ProviderChatCapabilities } from "@/tauri/types";
 
@@ -286,6 +287,16 @@ describe("chat-draft-store", () => {
       expect(next.effort).toBe("high");
     });
 
+    it("defaults new drafts to this device and stores a picked device", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(draft.hostId).toBeNull();
+      useChatDraftStore
+        .getState()
+        .updateDraftConfig(draft.draftId, { hostId: 7, lockedToHome: true });
+      const next = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(next.hostId).toBe(7);
+      expect(next.lockedToHome).toBe(true);
+    });
   });
 
   describe("promotion lifecycle", () => {
@@ -609,7 +620,7 @@ describe("chat-draft-store", () => {
       expect(parsed.state.draftsById[draft.draftId].inputDraft).toBe("remembered");
       expect(parsed.state.projectDraftIdByPath["/persist"]).toBe(draft.draftId);
       expect(parsed.state.activeDraftId).toBe(draft.draftId);
-      expect(parsed.version).toBe(2);
+      expect(parsed.version).toBe(3);
     });
 
     it("wipes draft state on v1→v2 migration (context-window default flip)", async () => {
@@ -658,5 +669,111 @@ describe("chat-draft-store", () => {
       expect(state.activeHomeDraftId).toBeNull();
       expect(state.activeDraftId).toBeNull();
     });
+
+    it("rehydrates a v2 draft saved before devices existed without a hostId", async () => {
+      const payload = {
+        state: {
+          draftsById: {
+            "pre-device": {
+              draftId: "pre-device",
+              createdAt: new Date().toISOString(),
+              target: { kind: "home" },
+              provider: "claude",
+              model: "claude-opus-4-8",
+              effort: null,
+              contextWindow: null,
+              permissionMode: "bypassPermissions",
+              inputDraft: "kept",
+              threadId: "t-pre-device",
+              promotedTo: null,
+              materializedTo: null,
+              promoting: false,
+              lastSendError: null,
+            },
+          },
+          activeHomeDraftId: "pre-device",
+          projectDraftIdByPath: {},
+          activeDraftId: "pre-device",
+        },
+        version: 2,
+      };
+      // Drop the debounced write `resetStore` queued, which the next read
+      // would otherwise flush over the payload below.
+      useChatDraftStore.persist.clearStorage();
+      window.localStorage.setItem(
+        "codemux:chat-drafts:v1",
+        JSON.stringify(payload),
+      );
+
+      await useChatDraftStore.persist.rehydrate();
+
+      const draft = useChatDraftStore.getState().draftsById["pre-device" as DraftId];
+      expect(draft.inputDraft).toBe("kept");
+      expect(draft.hostId ?? null).toBeNull();
+    });
   });
+
+  describe("new-chat defaults", () => {
+    afterEach(() => {
+      useSettingsStore.setState({ settings: {} });
+    });
+
+    it("starts drafts in the configured checkout mode", () => {
+      useSettingsStore.setState({
+        settings: { "chat.default_checkout": "current" },
+      });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(draft.checkoutMode).toBe("current");
+    });
+
+    it("re-seeds untouched drafts and leaves ones with text alone", () => {
+      const store = useChatDraftStore.getState();
+      const empty = store.getOrCreateHomeDraft();
+      const typed = store.getOrCreateProjectDraft("/repo");
+      store.updateDraftInput(typed.draftId, "keep me");
+
+      useSettingsStore.setState({
+        settings: {
+          "chat.default_provider": "codex",
+          "chat.default_model": "gpt-5.4",
+          "chat.default_checkout": "current",
+        },
+      });
+      useChatDraftStore.getState().applyNewChatDefaults();
+
+      const { draftsById } = useChatDraftStore.getState();
+      expect(draftsById[empty.draftId]).toMatchObject({
+        provider: "codex",
+        model: "gpt-5.4",
+        permissionMode: "danger-full-access",
+        checkoutMode: "current",
+        threadId: empty.threadId,
+      });
+      expect(draftsById[typed.draftId]).toMatchObject({
+        provider: "claude",
+        checkoutMode: "worktree",
+      });
+    });
+  });
+
+  it("migrates legacy Fast drafts without losing their text or identity", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore.persist.clearStorage();
+    window.localStorage.setItem("codemux:chat-drafts:v1", JSON.stringify({
+      version: 2,
+      state: {
+        draftsById: { [draft.draftId]: { ...draft, inputDraft: "Keep this draft", fastMode: true, serviceTier: undefined } },
+        activeHomeDraftId: draft.draftId,
+        activeDraftId: draft.draftId,
+        projectDraftIdByPath: {},
+      },
+    }));
+    await useChatDraftStore.persist.rehydrate();
+    const restored = useChatDraftStore.getState().draftsById[draft.draftId];
+    expect(restored.serviceTier).toBe("fast");
+    expect(restored.inputDraft).toBe("Keep this draft");
+    expect(restored.threadId).toBe(draft.threadId);
+    expect(restored).not.toHaveProperty("fastMode");
+  });
+
 });

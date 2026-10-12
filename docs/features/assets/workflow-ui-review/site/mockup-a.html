@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup A · Checkpoints — CodeMux workflow UI (illustrative)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3C%2Fsvg%3E">
+<link rel="stylesheet" href="assets/app.css">
+<style>
+  .a-sec { padding: 12px 14px 4px; }
+  .a-sec + .a-sec { border-top: 1px solid var(--hairline); }
+  .a-h { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .a-h .n { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); }
+  .a-list [role="listbox"] { display: grid; gap: 1px; margin: 0 -6px 8px; }
+  .a-row { display: grid; grid-template-columns: 16px 1fr auto; gap: 1px 9px; align-items: start; padding: 7px 6px; border-radius: 7px; }
+  .a-row:hover { background: var(--surface-2); }
+  .a-row[aria-selected="true"] { background: var(--surface-3); }
+  .a-row .ti { font-size: var(--t-body-sm); font-weight: 500; min-width: 0; }
+  .a-row .sub { grid-column: 2 / 4; font-size: var(--t-label); color: var(--muted-foreground); }
+  .a-row .r { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); padding-top: 2px; }
+  .a-row .icn { padding-top: 2px; }
+  .need { display: grid; gap: 7px; padding: 9px 10px; border-radius: 9px; margin-bottom: 8px; border: 1px solid var(--hairline-strong); }
+  .need.bad { border-color: color-mix(in oklch, var(--status-attention) 40%, transparent); background: color-mix(in oklch, var(--status-attention) 6%, transparent); }
+  .need.work { border-color: color-mix(in oklch, var(--status-working) 32%, transparent); background: color-mix(in oklch, var(--status-working) 5%, transparent); }
+  .need p { margin: 0; font-size: var(--t-body-sm); }
+  .quiet { margin: 0 0 10px; font-size: var(--t-body-sm); color: var(--muted-foreground); display: flex; gap: 7px; align-items: flex-start; }
+  .art { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--hairline); }
+  .art:last-child { border-bottom: 0; }
+  .art .sub { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); }
+  .a-split { display: grid; grid-template-columns: minmax(340px, 400px) 1fr; min-height: 100%; }
+  .a-split > .a-list { border-right: 1px solid var(--hairline); }
+  .a-empty { padding: 40px 20px; color: var(--muted-foreground); font-size: var(--t-body-sm); }
+  .deck[data-width="narrow"] .runbar .meta .opt { display: none; }
+</style>
+</head>
+<body>
+<noscript><p style="padding:20px">This interactive mockup needs JavaScript.</p></noscript>
+<script src="assets/kit.js"></script>
+<script>
+(function () {
+  const { ic, esc, t, stat, route, usageLine, runControls, runMeta, taskDetail, filesView, ledger } = K;
+  const S = K.S;
+  function row(id, s, sub, right) {
+    const tk = s.tasks[id], sel = S.sel === id && S.view !== "run";
+    return `<div class="a-row" role="option" aria-selected="${sel}" tabindex="-1" data-act="select" data-arg="${id}" data-fk="row-${id}">
+      <span class="icn">${stat(tk.status, "")}</span><span class="ti">${esc(tk.title)} <span class="sr-only">, ${K.ST[tk.status][2]}</span></span><span class="r">${right || ""}</span><span class="sub">${sub}</span></div>`;
+  }
+  function who(tk, s) {
+    const a = tk.current, r = a ? a.route : tk.route;
+    if (tk.status === "running") return `<span class="work">${tk.draining ? "finishing (draining)" : "running"}</span> · <span class="mono">${r}</span> · slot ${a.slot}${tk.gen > 1 ? ` · gen ${tk.gen} after a repaired failure` : ""}`;
+    if (tk.status === "waiting") return `waiting for ${tk.waitingFor.join(", ")} · yielded its slot`;
+    if (tk.status === "queued") return `queued · needs ${tk.waitingFor.join(", ")}${tk.held ? ` · <span class="work">${esc(tk.held)}</span>` : ""} · will use <span class="mono">${tk.route}</span>`;
+    if (tk.status === "unknown") return `<span class="bad">unknown — holding slot ${a.slot} and 12k tokens</span> · <span class="mono">${a.route}</span>`;
+    if (tk.status === "succeeded") return `<span class="ok">done</span> · <span class="mono">${a ? a.route : tk.route}</span>${tk.gen > 1 ? " · gen 2 replaced a failed attempt" : ""}`;
+    if (tk.status === "failed") return `<span class="bad">failed</span>`;
+    if (tk.status === "cancelled") return `cancelled${tk.needsRepair ? ' · <span class="work">required — needs repair</span>' : tk.note ? " · " + tk.note.toLowerCase() : ""}`;
+    return tk.status;
+  }
+  function list(s) {
+    const m = runMeta(s);
+    const ids = s.order, inflight = ids.filter((id) => ["running", "waiting", "queued", "unknown", "stopping"].includes(s.tasks[id].status));
+    const settled = ids.filter((id) => !inflight.includes(id));
+    const el = (a) => (a.end === null ? s.now - a.start : a.end - a.start);
+    const needAct = { resume: `<button class="btn sm" data-act="resume" data-fk="need-resume">${ic("play", 12)}Resume</button>`, reconcile: `<button class="btn sm" data-act="reconcile" data-fk="need-rec">${ic("shield", 12)}Reconcile task</button>`, retry: `<button class="btn sm" data-act="retry" data-arg="ui" data-fk="need-retry">${ic("rotate", 12)}Retry task</button>` };
+    const needs = s.needs.map((n) => `<div class="need ${n.kind === "paused" ? "work" : n.kind === "cancelled" ? "" : "bad"}" role="note"><p>${esc(n.text)}</p>${n.act || n.task ? `<div class="row-acts">${n.act ? needAct[n.act] : ""}${n.task ? `<button class="btn ghost sm" data-act="select" data-arg="${n.task}" data-fk="need-open-${n.task}">Open ${n.task}</button>` : ""}${n.act ? K.mockTag : ""}</div>` : ""}</div>`).join("");
+    return `<div class="a-list">
+    <div class="runbar"><div class="runbar-top"><h2>Refactor session recovery</h2>${m.html}</div>
+      <div class="meta"><span>phase ${s.phase}</span><span>${s.busy}/2 workers</span><span class="opt">${t(s.now)} elapsed</span><span class="opt">live routes</span><button class="chip" data-act="setup" data-fk="rb-setup">${ic("settings", 11)}setup & limits</button></div>
+      ${runControls(s)}</div>
+    <section class="a-sec" aria-labelledby="h-needs"><div class="a-h"><span class="eyebrow" id="h-needs">Needs you</span><span class="n">${s.needs.length}</span></div>
+      ${needs || `<p class="quiet">${ic("check", 13, "ok")}<span>Nothing needs you. ${s.status === "completed" ? "The run finished; changes below are waiting for your review." : "The coordinator already repaired the storage failure on its own (gen 2)."}</span></p>`}</section>
+    ${s.artifacts.length ? `<section class="a-sec" aria-labelledby="h-acc"><div class="a-h"><span class="eyebrow" id="h-acc">Ready to accept</span><span class="n">${s.artifacts.length}</span></div>
+      ${s.artifacts.map((a) => `<div class="art"><div><div class="sm" style="font-weight:500">${esc(K.TASKS[a.task].title)} <span class="muted lbl">· ${a.files.length} files</span></div><div class="sub">${a.label} · sealed ${t(a.sealed)} · ${a.canApply ? "hash-verified, not applied" : '<span class="bad">apply revoked by run cancel</span>'}</div></div>
+        <button class="btn sm" data-act="files" data-arg="${a.id}" data-fk="acc-${a.id}">${ic("diff", 12)}Review</button></div>`).join("")}</section>` : ""}
+    ${inflight.length ? `<section class="a-sec" aria-labelledby="h-fl"><div class="a-h"><span class="eyebrow" id="h-fl">In flight</span><span class="n">${inflight.length} tasks · ${s.busy} of 2 slots</span></div>
+      <div role="listbox" aria-labelledby="h-fl">${inflight.map((id) => { const tk = s.tasks[id]; return row(id, s, who(tk, s), tk.current && tk.status !== "queued" ? t(el(tk.current)) : ""); }).join("")}</div>
+      ${s.tasks.synthesis ? "" : `<p class="quiet lbl" style="font-size:var(--t-label)">${ic("network", 12)}<span>More tasks may appear: the coordinator decides after results arrive.</span></p>`}</section>` : ""}
+    <section class="a-sec" aria-labelledby="h-ver"><div class="a-h"><span class="eyebrow" id="h-ver">What is verified</span></div>${ledger(s)}<div style="height:10px"></div></section>
+    <section class="a-sec" aria-labelledby="h-set"><div class="a-h"><span class="eyebrow" id="h-set">Settled</span><span class="n">${settled.length}</span></div>
+      <div role="listbox" aria-labelledby="h-set">${settled.map((id) => row(id, s, who(s.tasks[id], s), s.tasks[id].attempts.length > 1 ? `${s.tasks[id].attempts.length} attempts` : "")).join("")}</div>
+      <p class="tok" style="margin:2px 0 12px">${usageLine(s.usage)}</p></section>
+    </div>`;
+  }
+  // Roving tabindex: first selected or first option in each listbox is tabbable.
+  function after() {
+    document.querySelectorAll('#pane [role="listbox"]').forEach((lb) => {
+      const o = lb.querySelector('[aria-selected="true"]') || lb.querySelector('[role="option"]'); if (o) o.tabIndex = 0;
+    });
+  }
+  K.mount({
+    letter: "A", name: "Checkpoints", tagline: "organized by what you need to do next",
+    setup: (s) => K.setupView(s, { order: ["goal", "routes", "limits", "writes", "script", "launch"],
+      head: `<div><h3 tabindex="-1" id="td-title">New workflow</h3><p class="why" style="margin:4px 0 0">Checked in decision order: what you're asking for, who may work on it, how much they may use, and whether files may change. The script comes last.</p></div>` }),
+    render(s) {
+      const split = S.width === "expanded";
+      const detail = S.view === "files" ? filesView(S.artifact, s, { back: split ? null : S.sel ? "Back to task" : "All checkpoints" })
+        : S.view === "task" ? taskDetail(S.sel, s, { back: split ? null : "All checkpoints" }) : null;
+      if (!split) return detail || list(s);
+      return `<div class="a-split">${list(s)}<div>${detail || `<div class="a-empty">Select a checkpoint to see its route, attempts, dependencies and result.</div>`}</div></div>`;
+    },
+    after
+  });
+})();
+</script>
+</body>
+</html>

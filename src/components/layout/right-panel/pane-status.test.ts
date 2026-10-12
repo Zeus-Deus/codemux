@@ -10,7 +10,6 @@ function input(overrides: Partial<DeckStatusInput> = {}): DeckStatusInput {
     tasks: null,
     changes: null,
     review: null,
-    diff: null,
     browser: null,
     subagents: null,
     ...overrides,
@@ -18,18 +17,10 @@ function input(overrides: Partial<DeckStatusInput> = {}): DeckStatusInput {
 }
 
 describe("deckStatusLine", () => {
-  // The deck lost its breadcrumb row when the panel collapsed to one band
-  // of chrome, so the foot is now the only place the diff pane says which
-  // file it is showing.
-  it("names the diff pane's file, and says so when there isn't one", () => {
-    expect(
-      deckStatusLine(
-        input({ activePane: "diff", diff: { filePath: "src/lib/utils.ts" } }),
-      ),
-    ).toBe("src/lib/utils.ts");
-    expect(
-      deckStatusLine(input({ activePane: "diff", diff: { filePath: null } })),
-    ).toBe("no file selected");
+  // The diff pane names its file in its own header, so the foot does not
+  // repeat it and keeps the deck line instead.
+  it("leaves the diff pane's file to the pane's own header", () => {
+    expect(deckStatusLine(input({ activePane: "diff" }))).toBe("3 panes · idle");
   });
 
   it("follows the tasks pane's own counts", () => {

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodeMux workflow UI — four directions</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3C%2Fsvg%3E">
+<link rel="stylesheet" href="assets/app.css">
+<style>
+  body { overflow-x: hidden; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 22px 20px 48px; }
+  header.top { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding-bottom: 14px; border-bottom: 1px solid var(--hairline); }
+  header.top h1 { margin: 0; font-size: 1.125rem; font-weight: 600; letter-spacing: -0.005em; flex: 1 1 320px; }
+  .label { font-family: var(--font-code); font-size: var(--t-caption); color: var(--status-working); border: 1px solid color-mix(in oklch, var(--status-working) 40%, transparent); border-radius: 5px; padding: 2px 7px; white-space: nowrap; }
+  .top a { font-size: var(--t-label); color: var(--muted-foreground); }
+  .intro { max-width: 760px; color: color-mix(in oklch, var(--foreground) 86%, var(--muted-foreground)); font-size: var(--t-body); margin: 14px 0 18px; }
+  .intro p { margin: 0 0 6px; }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--hairline); padding-bottom: 8px; }
+  .tab { border: 0; background: transparent; border-radius: 8px; padding: 6px 10px; text-align: left; display: grid; gap: 1px; color: var(--muted-foreground); min-width: 0; }
+  .tab b { font-weight: 600; font-size: var(--t-body-sm); color: var(--foreground); }
+  .tab span { font-size: var(--t-caption); font-family: var(--font-code); }
+  .tab:hover { background: var(--surface-2); }
+  .tab[aria-selected="true"] { background: var(--surface-3); }
+  .tab[aria-selected="true"] b::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 9px; background: var(--accent-ember); margin-right: 6px; vertical-align: 2px; }
+  .panel { display: grid; grid-template-columns: minmax(260px, 340px) 1fr; gap: 22px; padding-top: 16px; }
+  .panel h2 { margin: 0 0 4px; font-size: var(--t-body-lg); font-weight: 600; }
+  .panel .lead { margin: 0 0 12px; color: var(--muted-foreground); font-size: var(--t-body-sm); }
+  .panel dl { margin: 0; display: grid; gap: 10px; }
+  .panel dt { font-family: var(--font-code); font-size: var(--t-caption); letter-spacing: .1em; text-transform: uppercase; color: var(--muted-foreground); }
+  .panel dd { margin: 2px 0 0; font-size: var(--t-body-sm); }
+  .open { display: inline-flex; gap: 6px; align-items: center; margin-top: 14px; height: 32px; padding: 0 12px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); text-decoration: none; font-size: var(--t-body-sm); font-weight: 600; }
+  .open:hover { background: color-mix(in oklch, var(--primary) 88%, black); }
+  .pv { display: grid; gap: 6px; min-width: 0; }
+  .pv-cap { display: flex; flex-wrap: wrap; gap: 4px 10px; justify-content: space-between; font-size: var(--t-caption); color: var(--muted-foreground); font-family: var(--font-code); }
+  .pv-frame { position: relative; overflow: hidden; border: 1px solid var(--hairline-strong); border-radius: 10px; background: var(--background); }
+  .pv-frame img { position: absolute; top: 0; left: 0; width: 1440px; height: 900px; border: 0; transform-origin: 0 0; pointer-events: none; }
+  .pv-frame a.cover { position: absolute; inset: 0; z-index: 2; }
+  .pv-frame a.cover:focus-visible { outline-offset: -3px; }
+  .states { display: flex; flex-wrap: wrap; gap: 6px 2px; align-items: center; margin: 18px 0 0; }
+  .states .seg { flex-wrap: wrap; min-width: 0; }
+  section.block { margin-top: 34px; }
+  section.block > h2 { font-size: var(--t-body-lg); font-weight: 600; margin: 0 0 4px; }
+  section.block > p.sub { margin: 0 0 12px; color: var(--muted-foreground); font-size: var(--t-body-sm); }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .pair label { font-size: var(--t-label); color: var(--muted-foreground); display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+  .pair select { height: 28px; border-radius: 7px; border: 1px solid var(--input); background: var(--background); padding: 0 6px; font-size: var(--t-body-sm); }
+  .pair-note { display: none; font-size: var(--t-body-sm); color: var(--muted-foreground); }
+  .q { display: grid; grid-template-columns: 180px repeat(4, 1fr); border-top: 1px solid var(--hairline); }
+  .q > * { padding: 9px 10px 9px 0; font-size: var(--t-body-sm); }
+  .q .qh { font-weight: 600; font-size: var(--t-label); }
+  .q .cell b { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); font-weight: 500; }
+  .q .cell.prim { color: var(--foreground); } .q .cell { color: color-mix(in oklch, var(--foreground) 78%, var(--muted-foreground)); }
+  .q .cell.prim::before { content: "primary · "; font-family: var(--font-code); font-size: var(--t-caption); color: var(--accent-ember); }
+  .q.head > * { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); text-transform: uppercase; letter-spacing: .1em; }
+  .rec { border: 1px solid var(--hairline-strong); border-radius: 12px; padding: 14px 16px; max-width: 860px; }
+  .rec p { margin: 0 0 8px; font-size: var(--t-body-sm); }
+  .rec ul { margin: 0 0 8px; padding-left: 18px; font-size: var(--t-body-sm); display: grid; gap: 4px; }
+  footer.ft { margin-top: 36px; padding-top: 12px; border-top: 1px solid var(--hairline); font-size: var(--t-label); color: var(--muted-foreground); display: flex; flex-wrap: wrap; gap: 8px 18px; }
+  @media (max-width: 1099px) { .pair { display: none; } .pair-note { display: block; } }
+  @media (max-width: 860px) {
+    .panel { grid-template-columns: 1fr; }
+    .q { grid-template-columns: 1fr; padding: 8px 0; } .q.head { display: none; } .q > * { padding: 3px 0; } .q .cell b { position: static; width: auto; height: auto; overflow: visible; clip: auto; white-space: normal; display: inline; }
+  }
+  @media (max-width: 480px) { .wrap { padding: 16px 14px 40px; } .tab { flex: 1 1 45%; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>CodeMux workflow UI — four directions</h1>
+    <span class="label">Mockups for review — no design integrated</span>
+    <a href="verification.html">Verification notes</a>
+  </header>
+  <div class="intro">
+    <p>Four ways to arrange the Workflows pane, each showing the same synthetic run: <b>Refactor session recovery</b> in a fictional project. The run shown is an illustrative run that already opted in to file changes; a new draft starts with them off. It has one coordinator, four dynamic children, a repaired failure, a synthesis step and a two-worker ceiling. Each direction organizes the pane around a different primary unit — a decision, an attempt, a task, an event — inside the unchanged sidebar, chat and pane deck.</p>
+    <p class="muted sm">All states and numbers are illustrative. Interacting with these mockups calls no models, nothing is connected to a backend, and Apply never writes files. (Claude did use models to author them, and the verification notes record real inference from separate runtime tests.)</p>
+  </div>
+
+  <div class="tabs" role="tablist" aria-label="Design directions" id="tabs"></div>
+  <div id="panel" role="tabpanel"></div>
+
+  <div class="states" role="group" aria-label="Preview state"><span class="eyebrow" style="margin-right:8px">Preview state</span><span class="seg" id="states"></span></div>
+
+  <section class="block" aria-labelledby="cmp-h">
+    <h2 id="cmp-h">Side by side</h2>
+    <p class="sub">The same state rendered by two directions at the normal 500px pane width.</p>
+    <p class="pair-note">Side-by-side previews need a window at least 1100px wide. Use the direction tabs above, or open each mockup full screen.</p>
+    <div class="pair" id="pair"></div>
+  </section>
+
+  <section class="block" aria-labelledby="q-h">
+    <h2 id="q-h">How each answers the coordination questions</h2>
+    <p class="sub">“Primary” marks the question a direction is built around.</p>
+    <div id="qs"></div>
+  </section>
+
+  <section class="block" aria-labelledby="rec-h">
+    <h2 id="rec-h">Recommendation</h2>
+    <div class="rec">
+      <p><b>Lead with A · Checkpoints, and borrow B's slot strip as a single compact row under its run bar.</b></p>
+      <ul>
+        <li>Most of the time you shouldn't be watching a workflow. You need to know when to step in and what you can accept, and A is the only direction that puts both at the top of the pane.</li>
+        <li>Its “What is verified” ledger separates checks CodeMux made from agent judgment and from what was never run. That keeps agent prose and a test <em>plan</em> from passing as evidence.</li>
+        <li>A one-line slot strip from B answers “who holds capacity”, including an Unknown attempt holding a slot, without A losing its decision-first order.</li>
+        <li>C works well as an optional Map view when the pane is expanded. D's turn grouping fits inside task detail as attempt history, but on its own it's weak for spotting what needs you at a glance.</li>
+      </ul>
+      <p class="muted">The main risk with A is that a task moves between buckets as its state changes. Keep each bucket's order stable, and keep the selected task selected when it moves.</p>
+    </div>
+  </section>
+
+  <footer class="ft"><span>Design exploration by Claude (Opus 5.5). Synthetic, illustrative data only.</span><a href="verification.html">What the parent coding agent actually tested →</a></footer>
+</div>
+<script>
+(function () {
+  "use strict";
+  const D = [
+    { id: "a", name: "Checkpoints", unit: "decision-first", lead: "Organized by what you need to do next.",
+      concept: "The pane opens with decisions, not a task list: Needs you, then Ready to accept, In flight, What is verified, and Settled. Selecting a task opens its detail (side by side when the pane is expanded).",
+      best: "Spotting where to intervene, deciding what to accept, and seeing honestly what has been verified.",
+      trade: "No picture of time or dependencies. You have to open a task to see why it exists, and tasks move between buckets as their state changes." },
+    { id: "b", name: "Lanes", unit: "capacity-first", lead: "Organized by who holds capacity, over time.",
+      concept: "Two slot lanes show every attempt on a shared clock. The coordinator's yielded time gets its own row outside the ceiling, and an Unknown attempt is drawn as hatched capacity that stays held. Selecting a block opens that attempt's sheet.",
+      best: "Who is doing the work, why nothing new is being admitted, and how retries and repairs follow each other.",
+      trade: "A task is split across its attempts, dependencies appear only as text, long runs squeeze the time axis, and the view says little once the run is finished." },
+    { id: "c", name: "Map", unit: "dependency-first", lead: "Organized by what depends on what.",
+      concept: "Tasks are laid out left to right by dependency level, under the coordinator that created them. Selecting a task highlights everything upstream and downstream. Instead of inventing future tasks, a frontier marker shows where the coordinator decides next. In a narrow pane the map becomes a list of levels.",
+      best: "Dependencies, what is blocking synthesis, and what a repair affects.",
+      trade: "The layout needs width, so labels truncate at 500px. Nodes move as the coordinator adds tasks, and capacity and time are secondary." },
+    { id: "d", name: "Journal", unit: "history-first", lead: "Organized by coordinator turns over time.",
+      concept: "An append-only log grouped by coordinator turn, so every decision sits under the turn that made it. Entries expand in place to show results, errors and files, and a message box queues guidance for a task.",
+      best: "Why a task exists, what was repaired and by whom, and an audit trail.",
+      trade: "You have to read to find the current state, and intervention can scroll out of view (a pinned banner helps). Large runs will need paging." }
+  ];
+  const STATES = [["setup", "Setup"], ["running", "Running"], ["paused", "Paused"], ["unknown", "Unknown"], ["review", "Review"], ["cancelled", "Cancelled"]];
+  const Q = [
+    ["What is happening", ["Run bar plus the In flight bucket", "Lanes plus a per-slot “now” list", "Node states and the phase rail", "Now summary below the latest entry"], -1],
+    ["Who is doing it", ["Route and slot in each row", "Slots are the layout", "Route on each node", "Route on each entry"], 1],
+    ["What depends on what", ["Needs / Needed by in task detail", "Queue chips (“needs storage”)", "Edges, highlighting and a blocking list", "Decision entries (“storage ← arch”)"], 2],
+    ["Where you need to step in", ["“Needs you” is the first section", "Banner and a hatched held slot", "Banner and the blocking list", "Pinned banner and inline Reconcile"], 0],
+    ["What has been verified", ["Ledger section in the main view", "Shown in the sheet when nothing is selected", "Shown in the side panel by default", "Disclosure, or the side rail when expanded"], 0],
+    ["What can be accepted", ["“Ready to accept” section", "From the task's sheet", "From the node's detail", "Inline at “files sealed” entries"], 0],
+    ["Why a task exists", ["Prompt in task detail", "Attempt notes", "Created-by bracket", "Turn grouping"], 3],
+    ["Narrow, 360px", ["Same buckets; detail opens on top", "Lanes compress; labels hidden", "Switches to a list of levels", "Same log"], -1],
+    ["Expanded", ["List and detail side by side", "Lanes and the sheet side by side", "Map and detail side by side", "Log and a summary rail"], -1]
+  ];
+  let cur = "a", state = "running", left = "a", right = "c";
+  const $ = (s) => document.querySelector(s);
+  const src = (id) => `previews/${id}-${state}.png`;
+  function preview(id, cap) {
+    const d = D.find((x) => x.id === id);
+    return `<div class="pv"><div class="pv-cap"><span>${cap || `Rendered screenshot · mockup-${id}.html at 1440×900`}</span><span>${state}</span></div>
+      <div class="pv-frame" data-scale><img src="${src(id)}" data-direction="${id}" alt="Rendered ${state} screenshot of mockup ${id.toUpperCase()}, ${d.name}">
+      <a class="cover" href="mockup-${id}.html#state=${state}" aria-label="Open mockup ${id.toUpperCase()}, ${d.name}, full screen"></a></div></div>`;
+  }
+  function renderTabs() {
+    $("#tabs").innerHTML = D.map((d) => `<button class="tab" role="tab" id="t-${d.id}" aria-controls="panel" aria-selected="${d.id === cur}" tabindex="${d.id === cur ? 0 : -1}" data-id="${d.id}"><b>${d.id.toUpperCase()} · ${d.name}</b><span>${d.unit}</span></button>`).join("");
+  }
+  function renderPanel() {
+    const d = D.find((x) => x.id === cur);
+    $("#panel").setAttribute("aria-labelledby", "t-" + cur);
+    $("#panel").innerHTML = `<div class="panel"><div><h2>${d.id.toUpperCase()} · ${d.name}</h2><p class="lead">${d.lead}</p>
+      <dl><div><dt>Structure</dt><dd>${d.concept}</dd></div><div><dt>Best at</dt><dd>${d.best}</dd></div><div><dt>Tradeoff</dt><dd>${d.trade}</dd></div></dl>
+      <a class="open" href="mockup-${d.id}.html#state=${state}">Open mockup ${d.id.toUpperCase()} full screen →</a>
+      <p class="cap muted" style="margin:8px 0 0">The full-screen mockup keeps desktop geometry and has state and pane-width controls.</p></div>${preview(d.id)}</div>`;
+    scale();
+  }
+  function renderStates() {
+    $("#states").innerHTML = STATES.map(([id, l]) => `<button data-state="${id}" aria-pressed="${id === state}">${l}</button>`).join("");
+  }
+  function renderPair() {
+    const sel = (side, v) => `<label>${side}<select data-side="${side}" aria-label="${side} direction">${D.map((d) => `<option value="${d.id}" ${d.id === v ? "selected" : ""}>${d.id.toUpperCase()} · ${d.name}</option>`).join("")}</select></label>`;
+    $("#pair").innerHTML = `<div>${sel("Left", left)}${preview(left, `mockup-${left}.html`)}</div><div>${sel("Right", right)}${preview(right, `mockup-${right}.html`)}</div>`;
+    scale();
+  }
+  function renderQs() {
+    $("#qs").innerHTML = `<div class="q head" aria-hidden="true"><span>Question</span>${D.map((d) => `<span>${d.id.toUpperCase()} · ${d.name}</span>`).join("")}</div>` +
+      Q.map(([q, cells, p]) => `<div class="q" role="group" aria-label="${q}"><span class="qh">${q}</span>${cells.map((c, i) => `<span class="cell ${i === p ? "prim" : ""}"><b>${D[i].id.toUpperCase()} · ${D[i].name}: </b>${c}</span>`).join("")}</div>`).join("");
+  }
+  const ro = "ResizeObserver" in window ? new ResizeObserver((es) => es.forEach((e) => fit(e.target))) : null;
+  function fit(el) { const w = el.clientWidth, s = w / 1440; el.style.height = Math.round(900 * s) + "px"; el.querySelector("img").style.transform = `scale(${s})`; }
+  function scale() { document.querySelectorAll("[data-scale]").forEach((el) => { fit(el); if (ro) ro.observe(el); }); }
+  function setState(s) {
+    state = s; renderStates();
+    document.querySelectorAll(".pv-frame img").forEach((img) => { const id = img.dataset.direction; img.src = src(id); img.alt = `Rendered ${state} screenshot of mockup ${id.toUpperCase()}, ${D.find(d => d.id === id).name}`; });
+    document.querySelectorAll(".pv-frame a.cover, a.open").forEach((a) => { a.href = a.getAttribute("href").replace(/#.*$/, "#state=" + state); });
+    document.querySelectorAll(".pv-cap span:last-child").forEach((x) => (x.textContent = state));
+  }
+  document.addEventListener("click", (e) => {
+    const tab = e.target.closest(".tab"); if (tab) { cur = tab.dataset.id; renderTabs(); renderPanel(); document.getElementById("t-" + cur).focus(); return; }
+    const st = e.target.closest("[data-state]"); if (st) { const next = st.dataset.state; setState(next); document.querySelector(`[data-state="${next}"]`).focus(); }
+  });
+  document.addEventListener("change", (e) => { const s = e.target.dataset.side; if (!s) return; if (s === "Left") left = e.target.value; else right = e.target.value; renderPair(); document.querySelector(`[data-side="${s}"]`).focus(); });
+  $("#tabs").addEventListener("keydown", (e) => {
+    const i = D.findIndex((d) => d.id === cur), m = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: D.length - 1 }[e.key];
+    if (m === undefined) return; e.preventDefault(); cur = D[(m + D.length) % D.length].id; renderTabs(); renderPanel(); document.getElementById("t-" + cur).focus();
+  });
+  window.addEventListener("resize", scale);
+  renderTabs(); renderPanel(); renderStates(); renderPair(); renderQs();
+})();
+</script>
+</body>
+</html>

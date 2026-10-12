@@ -16,7 +16,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * reports real data; the fallback's only job is to make `defaultModelId`
  * synchronous and non-null.
  */
-const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> = {
+const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string | null> = {
   // The CLI's own `default` alias: it launches whatever the installed
   // Claude Code currently recommends, and `selectModel` resolves it to the
   // roster's leading row once capabilities hydrate. A concrete id here goes
@@ -31,6 +31,7 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> 
   // hydrates, so new Grok releases never require a Codemux update.
   grok: "default",
   hermes: "profile_default",
+  acp: null,
   // Step 12 Stage 1 placeholder. OpenCode capabilities are harvested
   // live in Stage 2 and effectively zero out this fallback once the
   // store hydrates; the slug here follows OpenCode's own
@@ -101,6 +102,7 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
   cursor: "agent",
   grok: "agent",
   hermes: null,
+  acp: null,
   opencode: null,
 };
 
@@ -149,6 +151,7 @@ const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
   cursor: false,
   grok: false,
   hermes: false,
+  acp: false,
   opencode: true,
 };
 
@@ -168,7 +171,7 @@ export function providerRequestsSurviveSessionRestart(
  * the store is a Zustand singleton). Returns the first model in the
  * capability payload, or the hardcoded fallback if capabilities aren't
  * hydrated yet. */
-export function defaultModelId(provider: AgentChatProviderKind): string {
+export function defaultModelId(provider: AgentChatProviderKind): string | null {
   const caps = selectCapabilities(
     useProviderCapabilities.getState(),
     provider,
@@ -237,7 +240,7 @@ export function modelLabel(
 }
 
 export interface CapabilityDefaults {
-  model: string;
+  model: string | null;
   effort: string | null;
   contextWindow: string | null;
   permissionMode: string | null;
@@ -261,7 +264,7 @@ export interface CapabilityDefaults {
  */
 export function capabilityDefaults(
   provider: AgentChatProviderKind,
-  modelId: string,
+  modelId: string | null,
 ): CapabilityDefaults {
   const caps = selectCapabilities(
     useProviderCapabilities.getState(),

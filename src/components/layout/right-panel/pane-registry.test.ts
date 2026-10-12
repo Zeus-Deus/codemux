@@ -9,7 +9,6 @@ import {
   isCorePane,
   isAddonPane,
   paneMeta,
-  relativeToRoot,
 } from "./pane-registry";
 
 describe("pane registry", () => {
@@ -27,6 +26,12 @@ describe("pane registry", () => {
     expect(PANE_REGISTRY.map((meta) => meta.id)).toContain("browser");
     expect(paneMeta("browser")?.label).toBe("Browser");
     expect(paneMeta("browser")?.conditional).toBeUndefined();
+  });
+
+  it("keeps dynamic workflows independent of native orchestration", () => {
+    expect(paneMeta("workflows")?.label).toBe("Workflows");
+    expect(paneMeta("workflows")?.conditional).toBeUndefined();
+    expect(paneMeta("orchestration")?.conditional).toBe(true);
   });
 
   it("lists exactly the availability-gated panes as conditional", () => {
@@ -63,17 +68,6 @@ describe("breadcrumb paths", () => {
   it("takes the last segment for a tab label", () => {
     expect(baseName("/p/src/lib/utils.ts")).toBe("utils.ts");
     expect(baseName("/p/")).toBe("p");
-  });
-
-  it("shows a workspace-relative path in the crumb", () => {
-    expect(relativeToRoot("/p/src/lib/utils.ts", "/p")).toBe("src/lib/utils.ts");
-    expect(relativeToRoot("/p/src/lib/utils.ts", "/p/")).toBe("src/lib/utils.ts");
-  });
-
-  // An absolute path from outside the workspace would blow out a 240px
-  // column, so the crumb degrades to the basename instead.
-  it("falls back to the basename for a file outside the workspace", () => {
-    expect(relativeToRoot("/etc/hosts", "/p")).toBe("hosts");
   });
 });
 

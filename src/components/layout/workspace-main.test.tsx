@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
 import type { TasksSnapshot } from "@/tauri/events";
@@ -19,6 +19,10 @@ const state = {
   tasks: null as TasksSnapshot | null,
   rightPanelTabs: {} as Record<string, string | null>,
   rightPanelMaximized: false,
+  rightPanelWidth: 320,
+  setRightPanelRowWidth: vi.fn(),
+  panelWidths: [] as number[],
+  panelResets: 0,
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
@@ -102,15 +106,22 @@ vi.mock("@/stores/ui-store", () => ({
         onboardingProjectDir: null,
         setOnboardingProjectDir: vi.fn(),
         rightPanelTabs: state.rightPanelTabs,
-        rightPanelWidth: 320,
+        rightPanelWidth: state.rightPanelWidth,
         rightPanelRowWidth: 0,
         rightPanelMaximized: state.rightPanelMaximized,
+        setRightPanelWidth: (width: number) => state.panelWidths.push(width),
+        resetRightPanelWidth: () => {
+          state.panelResets += 1;
+        },
       }),
     ),
     {
       getState: () => ({
-        setRightPanelWidth: vi.fn(),
-        setRightPanelRowWidth: vi.fn(),
+        setRightPanelWidth: (width: number) => state.panelWidths.push(width),
+        resetRightPanelWidth: () => {
+          state.panelResets += 1;
+        },
+        setRightPanelRowWidth: state.setRightPanelRowWidth,
       }),
     },
   ),
@@ -122,6 +133,8 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { WorkspaceMain } from "./workspace-main";
+import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
+import { RIGHT_PANEL_WIDTH_UI_KEY } from "@/lib/right-panel-width";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -181,6 +194,9 @@ beforeEach(() => {
   state.tasks = null;
   state.rightPanelTabs = {};
   state.rightPanelMaximized = false;
+  state.rightPanelWidth = 320;
+  state.panelWidths = [];
+  state.panelResets = 0;
 });
 
 afterEach(cleanup);
@@ -442,6 +458,47 @@ describe("WorkspaceMain right-panel full expand", () => {
     expect(getByTestId("right-panel-resizer")).toBeInTheDocument();
   });
 
+  describe("with a measured content row", () => {
+    const rowWidth = 800;
+    let rectSpy: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          observe() {}
+          disconnect() {}
+        },
+      );
+      rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+        width: rowWidth,
+        height: 600,
+      } as DOMRect);
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      rectSpy.mockRestore();
+    });
+
+    // The measurement only caps a panel that would squeeze the workspace
+    // column; a stored width that fits is drawn as it is.
+    it("keeps a stored width that fits as it is", () => {
+      state.enableAgentChat = true;
+      state.rightPanelTabs = { "ws-1": "files" };
+      state.rightPanelWidth = 400;
+      const { getByTestId } = render(<WorkspaceMain />);
+      expect(getByTestId("right-panel-column").style.width).toBe("400px");
+    });
+
+    it("caps a wide stored width so the workspace column keeps its room", () => {
+      state.enableAgentChat = true;
+      state.rightPanelTabs = { "ws-1": "files" };
+      state.rightPanelWidth = 3000;
+      const { getByTestId } = render(<WorkspaceMain />);
+      // min(800 * 0.75, 800 - 240) = 560
+      expect(getByTestId("right-panel-column").style.width).toBe("560px");
+    });
+  });
+
   it("swaps to a flexible panel and a zero-width workspace column when expanded", () => {
     state.enableAgentChat = true;
     state.rightPanelTabs = { "ws-1": "files" };
@@ -469,5 +526,131 @@ describe("WorkspaceMain right-panel full expand", () => {
     state.rightPanelMaximized = true;
     const { getByTestId } = render(<WorkspaceMain />);
     expect(getByTestId("workspace-content-column")).toHaveClass("flex-1");
+  });
+});
+
+describe("WorkspaceMain content row measurement", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // The panel is clamped against this row. WorkspaceMain renders nothing
+  // until a workspace exists, so the row mounts *after* the first render —
+  // and has to be measured then, not only on mount.
+  it("measures the row when it mounts after the first render", () => {
+    const observed: Element[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(el: Element) {
+          observed.push(el);
+        }
+        disconnect() {}
+      },
+    );
+    const rect = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({ width: 990 } as DOMRect);
+    try {
+      state.workspace = null;
+      const view = render(<WorkspaceMain />);
+      expect(observed).toHaveLength(0);
+
+      state.workspace = makeWorkspace();
+      view.rerender(<WorkspaceMain />);
+      expect(observed).toHaveLength(1);
+      expect(state.setRightPanelRowWidth).toHaveBeenLastCalledWith(990);
+    } finally {
+      rect.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // Regression: the observer attached in an effect keyed on a stable ref
+  // object. A first mount through an early return (no workspace yet) left
+  // the ref null, and the effect never re-ran once the row appeared, so the
+  // published row width stayed 0 for the session.
+  it("starts measuring once the row mounts after an early return", () => {
+    const observers: { cb: ResizeObserverCallback; el: Element | null }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        entry: { cb: ResizeObserverCallback; el: Element | null };
+        constructor(cb: ResizeObserverCallback) {
+          this.entry = { cb, el: null };
+          observers.push(this.entry);
+        }
+        observe(el: Element) {
+          this.entry.el = el;
+        }
+        disconnect() {}
+      },
+    );
+    state.workspace = null;
+    const view = render(<WorkspaceMain />);
+    expect(observers).toHaveLength(0);
+
+    state.workspace = makeWorkspace();
+    view.rerender(<WorkspaceMain />);
+    expect(observers).toHaveLength(1);
+    expect(observers[0].el).toHaveClass("flex", "flex-1");
+
+    act(() => {
+      observers[0].cb(
+        [{ contentRect: { width: 1200 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+    });
+    expect(state.setRightPanelRowWidth).toHaveBeenLastCalledWith(1200);
+  });
+});
+
+// The seam was pointer-only and could not be reset after an over-drag.
+describe("WorkspaceMain right panel resizer keyboard and reset", () => {
+  it("is focusable and reports the panel width", () => {
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByRole } = render(<WorkspaceMain />);
+    const seam = getByRole("separator", { name: "Resize right panel" });
+    expect(seam).toHaveAttribute("tabindex", "0");
+    expect(seam).toHaveAttribute("aria-valuenow", "320");
+    expect(seam).toHaveAttribute("aria-valuemin", "360");
+  });
+
+  it("grows the panel when the seam moves left and persists it", () => {
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByRole } = render(<WorkspaceMain />);
+    const seam = getByRole("separator", { name: "Resize right panel" });
+    fireEvent.keyDown(seam, { key: "ArrowLeft", shiftKey: true });
+    expect(state.panelWidths).toEqual([384]);
+    expect(dbSetUiState).toHaveBeenCalledWith(RIGHT_PANEL_WIDTH_UI_KEY, "384");
+
+    fireEvent.keyDown(seam, { key: "ArrowRight" });
+    // 320 - 16 is under the floor, so it clamps to the minimum.
+    expect(state.panelWidths[1]).toBe(360);
+  });
+
+  it("resets to the default width on double-click", () => {
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByRole } = render(<WorkspaceMain />);
+    fireEvent.doubleClick(getByRole("separator", { name: "Resize right panel" }));
+    // Back to the window-relative default, with the saved width cleared so
+    // a restart does not restore the dragged one.
+    expect(state.panelResets).toBe(1);
+    expect(state.panelWidths).toEqual([]);
+    expect(dbSetUiState).toHaveBeenLastCalledWith(RIGHT_PANEL_WIDTH_UI_KEY, "");
+  });
+
+  it("keeps the default after a reset was saved", async () => {
+    vi.mocked(dbGetUiState).mockResolvedValueOnce("");
+    render(<WorkspaceMain />);
+    await act(async () => {});
+    expect(state.panelResets).toBe(0);
+    expect(state.panelWidths).toEqual([]);
+  });
+
+  it("restores a saved width through the drag setter", async () => {
+    vi.mocked(dbGetUiState).mockResolvedValueOnce("480");
+    render(<WorkspaceMain />);
+    await act(async () => {});
+    expect(state.panelResets).toBe(0);
+    expect(state.panelWidths).toEqual([480]);
   });
 });
