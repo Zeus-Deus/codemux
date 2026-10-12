@@ -102,7 +102,7 @@ export function dispatch(actionId: string, event?: KeyboardEvent): boolean {
     // A dialog or popover open on top of an overlay (Radix marks the Escape
     // it dismissed on) owns this press; closing the overlay beneath it too
     // would throw away the page the user was returning to.
-    if (_e?.defaultPrevented) return false;
+    if (event?.defaultPrevented) return false;
     // Onboarding is a full-view replacement, not a modal — prioritize it over
     // dismissible overlays so Escape always provides an escape hatch.
     if (ui.onboardingProjectDir) {

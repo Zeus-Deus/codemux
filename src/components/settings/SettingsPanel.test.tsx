@@ -183,6 +183,7 @@ vi.mock("@/tauri/events", () => ({
   onPresetsChanged: vi.fn().mockReturnValue(Promise.resolve(() => {})),
   onAgentConnectorChanged: vi.fn().mockResolvedValue(() => {}),
 }));
+vi.mock("./custom-acp-settings", () => ({ CustomAcpSettings: () => null }));
 
 // ── Model picker mock ──
 //
