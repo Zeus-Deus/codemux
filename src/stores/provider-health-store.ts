@@ -42,6 +42,9 @@ export const HEALTH_REPROBE_MS = HEALTH_TTL_MS;
 interface ProviderHealthSlot {
   report: ProviderHealthReport | null;
   fetchedAt: number;
+  /** The last attempt failed at the command layer. Retain cached banner
+   *  data, but do not use it as a fresh answer for agent defaults. */
+  lastProbeFailed: boolean;
   /** In-flight probe, for single-flight coalescing. */
   inFlight: Promise<void> | null;
   /** A forced probe that arrived while `inFlight` was still running and
@@ -80,6 +83,7 @@ export function emptyHealthSlot(): ProviderHealthSlot {
   return {
     report: null,
     fetchedAt: 0,
+    lastProbeFailed: false,
     inFlight: null,
     queuedForce: null,
     dismissedKey: null,
@@ -154,6 +158,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
                 ...prev,
                 report,
                 fetchedAt: Date.now(),
+                lastProbeFailed: false,
                 inFlight: null,
                 dismissedKey,
               },
@@ -173,6 +178,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
             [provider]: {
               ...state.slots[provider],
               fetchedAt: Date.now(),
+              lastProbeFailed: true,
               inFlight: null,
             },
           },
@@ -267,8 +273,9 @@ export function providerReadiness(report: ProviderHealthReport): ProviderReadine
 
 export interface ProbedProviderHealth {
   report: ProviderHealthReport | null;
-  /** True until the first probe settles. A settled probe with no report
-   *  failed at the IPC layer, so its readiness is simply unknown. */
+  /** True while an opening needs a fresh answer, including an expired
+   *  cached report before its refresh starts. A settled probe with no
+   *  report failed at the IPC layer, so its readiness is unknown. */
   pending: boolean;
 }
 
@@ -294,11 +301,14 @@ export function useProbedProviderHealth(
         providers.map((provider) => {
           const slot = slots[provider];
           const pending =
-            slot.report === null && (slot.inFlight !== null || slot.fetchedAt === 0);
-          return [provider, { report: slot.report, pending }];
+            slot.inFlight !== null ||
+            slot.queuedForce !== null ||
+            slot.fetchedAt === 0 ||
+            Date.now() - slot.fetchedAt >= HEALTH_TTL_MS;
+          return [provider, { report: slot.lastProbeFailed ? null : slot.report, pending }];
         }),
       ),
-    [providers, slots],
+    [active, providers, slots],
   );
 }
 

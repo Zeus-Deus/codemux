@@ -192,8 +192,8 @@ interface FormDraft {
   /** True once the user has chosen "Other path…" in the project picker,
    *  so the manual-path input stays open even while it is still empty. */
   projectCustom: boolean;
-  /** False only on a new automation whose agent is still the default, so
-   *  the form may move it to an agent that is ready on this machine. */
+  /** True for a saved agent or an explicit user choice. Automatic defaults
+   *  may follow fresh readiness answers until the user chooses an agent. */
   agentPicked: boolean;
 }
 
@@ -854,7 +854,7 @@ function AutomationForm({
     if (!preferredAgent) return;
     setDraft((prev) =>
       prev && !prev.agentPicked
-        ? { ...prev, agent: preferredAgent, agentPicked: true }
+        ? { ...prev, agent: preferredAgent }
         : prev,
     );
   }, [preferredAgent, setDraft]);
