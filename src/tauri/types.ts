@@ -1543,6 +1543,12 @@ export interface DetectedSetup {
   enabled: boolean;
 }
 
+/** A suggested run command and the file it was detected from. */
+export interface RunCandidate {
+  command: string;
+  source: string;
+}
+
 // ── Theme ──
 
 export interface ThemeColors {
