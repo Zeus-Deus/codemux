@@ -62,7 +62,9 @@ impl Default for OpenCodeProviderConfig {
 /// and, crucially, the shape `extract_sdk_session_id` in
 /// `commands::agent_chat` knows how to persist. Keep those three in lockstep:
 /// a key rename here silently breaks the start-time cursor persist.
-pub fn resume_cursor_for(session_id: &crate::agent_provider::ProviderSessionId) -> serde_json::Value {
+pub fn resume_cursor_for(
+    session_id: &crate::agent_provider::ProviderSessionId,
+) -> serde_json::Value {
     serde_json::json!({ "resume": session_id.0 })
 }
 
@@ -71,6 +73,9 @@ pub fn resume_cursor_for(session_id: &crate::agent_provider::ProviderSessionId) 
 pub struct OpenCodeAgentProvider {
     manager: Arc<OpenCodeServerManager>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<OpenCodeSession>>>>,
+    managed_sessions: Arc<
+        RwLock<HashMap<ThreadId, Arc<crate::agent_provider::managed_bridge::ManagedBridgeSession>>>,
+    >,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
     /// Token accounting keyed by **OpenCode session id**, outliving the
@@ -101,6 +106,7 @@ impl OpenCodeAgentProvider {
         Self {
             manager,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            managed_sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             mcp_registry: config.mcp_registry,
             usage_states: Arc::new(RwLock::new(HashMap::new())),
@@ -126,6 +132,7 @@ impl OpenCodeAgentProvider {
 impl Drop for OpenCodeAgentProvider {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
+        let managed_sessions = Arc::clone(&self.managed_sessions);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let map = {
@@ -134,6 +141,9 @@ impl Drop for OpenCodeAgentProvider {
                 };
                 for (_, session) in map {
                     session.shutdown().await;
+                }
+                for (_, session) in std::mem::take(&mut *managed_sessions.write().await) {
+                    let _ = session.shutdown_managed().await;
                 }
             });
         }
@@ -177,6 +187,35 @@ impl AgentProvider for OpenCodeAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
+        if let Some(context) = crate::agent_provider::managed::lookup_session(&thread_id) {
+            if self.sessions.read().await.contains_key(&thread_id)
+                || self.managed_sessions.read().await.contains_key(&thread_id)
+            {
+                return Err(ProviderError::ValidationError {
+                    message: "OpenCode thread already has a session".into(),
+                });
+            }
+            let session = super::managed::spawn(input, context, self.event_tx.clone()).await?;
+            let ordinary = self.sessions.read().await;
+            let mut managed = self.managed_sessions.write().await;
+            if ordinary.contains_key(&thread_id) || managed.contains_key(&thread_id) {
+                drop(managed);
+                drop(ordinary);
+                session.shutdown_managed().await?;
+                return Err(ProviderError::ValidationError {
+                    message: "OpenCode thread already has a session".into(),
+                });
+            }
+            managed.insert(thread_id, Arc::clone(&session));
+            drop(managed);
+            drop(ordinary);
+            return Ok(session.provider_session().await);
+        }
+        if self.managed_sessions.read().await.contains_key(&thread_id) {
+            return Err(ProviderError::ValidationError {
+                message: "OpenCode thread already has a managed session".into(),
+            });
+        }
         // Evict a corpse before rebuilding: if the SSE listener gave up on an
         // unreachable server it flipped the session's `dead` flag but left the
         // entry in the map (only `stop_session` removes). Without this, the
@@ -265,6 +304,15 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        if let Some(session) = self
+            .managed_sessions
+            .read()
+            .await
+            .get(&input.thread_id)
+            .cloned()
+        {
+            return session.send_turn(input).await;
+        }
         let session = self.lookup(&input.thread_id).await?;
         session.enqueue_or_send(input).await
     }
@@ -312,6 +360,9 @@ impl AgentProvider for OpenCodeAgentProvider {
         thread_id: ThreadId,
         _turn_id: Option<TurnId>,
     ) -> Result<(), ProviderError> {
+        if let Some(session) = self.managed_sessions.read().await.get(&thread_id).cloned() {
+            return session.interrupt().await;
+        }
         // OpenCode's `/abort` is session-scoped — the optional
         // turn_id check is enforced client-side by callers that want
         // to avoid racing a turn that already finished. We don't try
@@ -360,6 +411,9 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        if self.managed_sessions.read().await.contains_key(&thread_id) {
+            return self.stop_managed_session(thread_id).await;
+        }
         let session = {
             let mut sessions = self.sessions.write().await;
             sessions.remove(&thread_id)
@@ -381,6 +435,15 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     async fn has_session(&self, thread_id: &ThreadId) -> bool {
+        if self
+            .managed_sessions
+            .read()
+            .await
+            .get(thread_id)
+            .is_some_and(|session| !session.is_dead())
+        {
+            return true;
+        }
         // A session whose SSE listener gave up on an unreachable server is
         // treated as absent, so `ensure_live_session` rebuilds a fresh one
         // (with the resume cursor) on the next send instead of routing to a
@@ -393,6 +456,9 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     async fn turn_active(&self, thread_id: &ThreadId) -> bool {
+        if let Some(session) = self.managed_sessions.read().await.get(thread_id).cloned() {
+            return session.turn_active().await;
+        }
         // Cheap in-memory check for the frontend hydrate path: a live
         // (non-dead) session bound to the thread whose SSE routing context has
         // `turn_active` armed. Does not touch the server. A dead session
@@ -424,7 +490,35 @@ impl AgentProvider for OpenCodeAgentProvider {
                 resume_cursor: Some(resume_cursor_for(&session.provider_session_id)),
             });
         }
+        for session in self.managed_sessions.read().await.values() {
+            out.push(session.provider_session().await);
+        }
         Ok(out)
+    }
+
+    fn managed_capabilities(&self) -> crate::agent_provider::managed::ManagedCapabilities {
+        crate::agent_provider::managed::ManagedCapabilities {
+            scoped_tools: true,
+            native_fanout_disabled: true,
+            enforced_read_only: true,
+            isolated_writes: true,
+            verified_stop: cfg!(target_os = "linux"),
+        }
+    }
+
+    async fn stop_managed_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let session = self
+            .managed_sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound {
+                thread_id: thread_id.clone(),
+            })?;
+        session.shutdown_managed().await?;
+        self.managed_sessions.write().await.remove(&thread_id);
+        Ok(())
     }
 
     fn event_stream(&self) -> ProviderEventStream {
@@ -439,6 +533,10 @@ impl AgentProvider for OpenCodeAgentProvider {
             }
         });
         Box::pin(stream) as Pin<Box<dyn Stream<Item = ProviderRuntimeEvent> + Send + 'static>>
+    }
+
+    fn managed_event_stream(&self, thread_id: &ThreadId) -> ProviderEventStream {
+        crate::agent_provider::managed_bridge::event_stream(&self.event_tx, thread_id)
     }
 }
 

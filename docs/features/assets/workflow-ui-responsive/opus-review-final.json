@@ -1,0 +1,31 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 114325,
+  "num_turns": 24,
+  "total_cost_usd": 0.7290472000000002,
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 32,
+      "outputTokens": 6565,
+      "cacheReadInputTokens": 658656,
+      "cacheCreationInputTokens": 58236,
+      "webSearchRequests": 0,
+      "costUSD": 0.7290472000000002,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 2479,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "model": "claude-opus-5-5",
+  "effort": "high",
+  "cliVersion": "2.1.295",
+  "requestedReview": "Read-only final followup using Read/Glob/Grep; safe mode; no work delegated",
+  "evidenceTiming": "Reviewed source after all behavioral UI fixes and route validation, before subsequent CI UUID-helper/radius-token alignment. Those small followups passed251 focused tests and refreshed19-flow/19-responsive-case evidence.",
+  "verdict": "No remaining material UI defects found; three previous findings verified fixed.",
+  "functionalTestBudget": "Separate from authorized $2 functional live-test cap"
+}

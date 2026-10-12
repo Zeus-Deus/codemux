@@ -128,7 +128,7 @@ export function SkillRow({
           className={cn(
             "flex items-center gap-1",
             "opacity-0 transition-opacity duration-150",
-            "group-hover:opacity-100 focus-within:opacity-100",
+            "group-hover:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100",
           )}
         >
           {skill.readable !== false && (

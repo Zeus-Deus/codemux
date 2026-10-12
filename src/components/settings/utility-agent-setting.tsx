@@ -118,10 +118,10 @@ export function UtilityAgentSetting() {
               const caps = selectCapabilities(capabilities, provider);
               const picked = caps?.models.find((entry) => entry.id === model);
               setSetting(UTILITY_SETTING_KEYS.provider, provider);
-              setSetting(UTILITY_SETTING_KEYS.model, model);
+              setSetting(UTILITY_SETTING_KEYS.model, model ?? "");
               setSetting(
                 UTILITY_SETTING_KEYS.effort,
-                utilityEffortFor(provider, model, picked) ?? "",
+                utilityEffortFor(provider, model ?? "", picked) ?? "",
               );
             }}
           />

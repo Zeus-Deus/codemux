@@ -1,5 +1,3 @@
-import { CheckCircle2 } from "lucide-react";
-
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import { Button } from "@/components/ui/button";
@@ -17,7 +15,8 @@ import type { SubagentView } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
-import { findingTone, workflowAgentTone } from "./workflow-tone";
+import { TerminalStatusIcon } from "./workflow-phase-list";
+import { findingTone, workflowAgentOutcome, workflowAgentTone } from "./workflow-tone";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** A label "looks like a file path" when it has no spaces and ends in a
@@ -98,7 +97,10 @@ export function WorkflowAgentDetail({
             <AgentOrb size={20} {...subagentOrbActivity(agent)} aria-hidden />
           </span>
         ) : (
-          <CheckCircle2 className={cn("size-4 shrink-0", tone.text)} aria-hidden />
+          <TerminalStatusIcon
+            outcome={workflowAgentOutcome(agent.status)}
+            className={cn("size-4 shrink-0", tone.text)}
+          />
         )}
         <div className="min-w-0 flex-1">
           <div className="truncate font-mono text-body-sm font-semibold text-foreground">{label}</div>

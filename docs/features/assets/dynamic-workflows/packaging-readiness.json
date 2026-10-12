@@ -1,0 +1,42 @@
+{
+  "linuxdeploy": "659c9db / bundled patchelf0.8",
+  "linuxdeployGtkExit": 0,
+  "gtkVersion": 3,
+  "gtkPluginSha256": "b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171",
+  "copiedSdkTree": true,
+  "nativeHelperSymlinks": false,
+  "sidecarIdentical": true,
+  "sidecarSha256": "1659a64fd679f88f8fc9fd537ed6ee94300711138b0ec5835f05eac0b3c65fbf",
+  "lddExit": 0,
+  "nativeBindingRpath": "$ORIGIN",
+  "helpers": {
+    "rg": {
+      "identical": true,
+      "exit": 0,
+      "sha256": "90a3b3eb75f41d9527a52517e884739ec65b9411dbb6a3cee24d1a58aa3470ae"
+    },
+    "cursorsandbox": {
+      "identical": true,
+      "exit": 0,
+      "sha256": "ffd8d58d12aedf40d694fd89e291c2057ec4d1ee97002521a2810dabfadaf9c5"
+    }
+  },
+  "nativeProbeExit": 0,
+  "nativeProbe": {
+    "protocolVersion": 1,
+    "cursorAdapterVersion": "cursor-sdk-1.0.37",
+    "nativePackageVersion": "1.0.37",
+    "ripgrepReady": true,
+    "parserReady": true,
+    "workspaceReady": true,
+    "modelTurns": 0
+  },
+  "finalArchiveBuilt": false,
+  "scope": "Owned temporary AppDir with copied sidecar and SDK assets; final installer archives are verified separately by CI.",
+  "checks": {
+    "packaging_regressions": 7,
+    "release_policy_tests": 4,
+    "provider_calls": 0,
+    "model_turns": 0
+  }
+}

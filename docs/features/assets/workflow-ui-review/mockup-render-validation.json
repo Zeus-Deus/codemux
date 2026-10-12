@@ -1,0 +1,583 @@
+[
+  {
+    "file": "index.html",
+    "title": "CodeMux workflow UI — four directions",
+    "screenshot": "index.png",
+    "errors": [],
+    "external": [],
+    "failedRequests": [],
+    "controls": [
+      {
+        "tag": "A",
+        "text": "Verification notes"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "A · Checkpointsdecision-first"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "B · Lanescapacity-first"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "C · Mapdependency-first"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "D · Journalhistory-first"
+      },
+      {
+        "tag": "A",
+        "text": "Open mockup A full screen →"
+      },
+      {
+        "tag": "A",
+        "text": "Open mockup A, Checkpoints, full screen"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Setup"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Running"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Paused"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Unknown"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancelled"
+      },
+      {
+        "tag": "SELECT",
+        "text": "Left direction"
+      },
+      {
+        "tag": "A",
+        "text": "Open mockup A, Checkpoints, full screen"
+      },
+      {
+        "tag": "SELECT",
+        "text": "Right direction"
+      },
+      {
+        "tag": "A",
+        "text": "Open mockup C, Map, full screen"
+      },
+      {
+        "tag": "A",
+        "text": "What the parent coding agent actually tested →"
+      }
+    ],
+    "mobile": {
+      "width": 375,
+      "scrollWidth": 375
+    }
+  },
+  {
+    "file": "mockup-a.html",
+    "title": "Mockup A · Checkpoints — CodeMux workflow UI (illustrative)",
+    "screenshot": "mockup-a.png",
+    "errors": [],
+    "external": [],
+    "failedRequests": [],
+    "controls": [
+      {
+        "tag": "A",
+        "text": "All directions"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Setup"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Running"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Paused"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Unknown"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancelled"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Narrow 360"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Normal 500"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expanded"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open in Workflows"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open Workflows pane"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Send (disabled in mockup)"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Changes 0"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Workflows 2/2"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "New workflow"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expand panel"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "setup & limits"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Pause"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancel run"
+      }
+    ],
+    "mobile": null
+  },
+  {
+    "file": "mockup-b.html",
+    "title": "Mockup B · Lanes — CodeMux workflow UI (illustrative)",
+    "screenshot": "mockup-b.png",
+    "errors": [],
+    "external": [],
+    "failedRequests": [],
+    "controls": [
+      {
+        "tag": "A",
+        "text": "All directions"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Setup"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Running"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Paused"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Unknown"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancelled"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Narrow 360"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Normal 500"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expanded"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open in Workflows"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open Workflows pane"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Send (disabled in mockup)"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Changes 0"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Workflows 2/2"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "New workflow"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expand panel"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "setup & limits"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Pause"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancel run"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "tests · needs storage"
+      }
+    ],
+    "mobile": null
+  },
+  {
+    "file": "mockup-c.html",
+    "title": "Mockup C · Map — CodeMux workflow UI (illustrative)",
+    "screenshot": "mockup-c.png",
+    "errors": [],
+    "external": [],
+    "failedRequests": [],
+    "controls": [
+      {
+        "tag": "A",
+        "text": "All directions"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Setup"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Running"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Paused"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Unknown"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancelled"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Narrow 360"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Normal 500"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expanded"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open in Workflows"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open Workflows pane"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Send (disabled in mockup)"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Changes 0"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Workflows 2/2"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "New workflow"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expand panel"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "setup & limits"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Pause"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancel run"
+      }
+    ],
+    "mobile": null
+  },
+  {
+    "file": "mockup-d.html",
+    "title": "Mockup D · Journal — CodeMux workflow UI (illustrative)",
+    "screenshot": "mockup-d.png",
+    "errors": [],
+    "external": [],
+    "failedRequests": [],
+    "controls": [
+      {
+        "tag": "A",
+        "text": "All directions"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Setup"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Running"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Paused"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Unknown"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancelled"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Narrow 360"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Normal 500"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expanded"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open in Workflows"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Open Workflows pane"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Send (disabled in mockup)"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Changes 0"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Review"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Workflows 2/2"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "New workflow"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Expand panel"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "setup & limits"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Pause"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Cancel run"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "All"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Coordinator decisions"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Results & problems"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Your actions"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Run startedlive routes · 2-worker ceiling · file changes allowed in src/session, src/ui/recovery"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "coordinator turn 1 admittedslot 1 · claude/coordinator"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Coordinator added arch, storage, uistorage ← arch · ui ← arch"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Coordinator yielded slot 1waiting for storage, ui · not counted against the ceiling"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "arch admittedslot 1 · codex/reviewer"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "arch result acceptedmatched output_schema"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "storage and ui admittedslot 1 storage · codex/writer — slot 2 ui · codex/writer"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "storage gen 1 failedresult rejected: migration_notes must be an array"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "coordinator turn 2 resumedslot 1 · received storage's failed outcome"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Coordinator replaced storage → gen 2 on claude/writerguidance: keep the v1 reader; return migration_"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Coordinator yielded slot 1waiting for storage, ui"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "storage gen 2 admittedslot 1 · claude/writer"
+      },
+      {
+        "tag": "SELECT",
+        "text": "coordinatorstorageuitests"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "Queue message"
+      },
+      {
+        "tag": "BUTTON",
+        "text": "What is verified"
+      }
+    ],
+    "mobile": null
+  },
+  {
+    "file": "verification.html",
+    "title": "Verification notes — CodeMux workflow runtime",
+    "screenshot": "verification.png",
+    "errors": [],
+    "external": [],
+    "failedRequests": [],
+    "controls": [
+      {
+        "tag": "A",
+        "text": "← Back to the four directions"
+      },
+      {
+        "tag": "A",
+        "text": "live-validation.json — record of the final native canary run: typed results, per-attempt usage, budg"
+      },
+      {
+        "tag": "A",
+        "text": "synthetic-validation.json — token-free production host integration record with deterministic provide"
+      },
+      {
+        "tag": "A",
+        "text": "native-functional-spending.json — cumulative functional attempts and incomplete-session allowances"
+      },
+      {
+        "tag": "A",
+        "text": "native-host-catalog.json — exact captured production tool schemas referenced by the canary record"
+      },
+      {
+        "tag": "A",
+        "text": "design-provenance.json — Claude Code Opus 5.5, high effort; two authoring passes reported $6.525519,"
+      }
+    ],
+    "mobile": null
+  }
+]

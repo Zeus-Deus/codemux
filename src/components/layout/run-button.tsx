@@ -6,6 +6,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
+import { useShortcutLabel } from "@/components/ui/menu-chrome";
 import {
   BAND_CONTROL_HOVER,
   BAND_CONTROL_RADIUS,
@@ -18,6 +19,7 @@ import {
   getWorkspaceConfig,
   runProjectDevCommand,
 } from "@/tauri/commands";
+import { reportFailure } from "@/lib/toast";
 
 interface RunButtonProps {
   workspaceId: string;
@@ -38,6 +40,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   const projectRoot = useActiveWorkspaceProjectRoot();
   const showSettings = useUIStore((s) => s.showSettings);
   const prevShowSettings = useRef(showSettings);
+  const runShortcut = useShortcutLabel("runDevCommand");
 
   useEffect(() => {
     // Re-fetch when settings closes (user may have edited the run command)
@@ -70,18 +73,18 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   const setShowSettings = useUIStore.getState().setShowSettings;
 
   const handleRun = () => {
-    runProjectDevCommand(workspaceId).catch(console.error);
+    runProjectDevCommand(workspaceId).catch(reportFailure("Couldn't run the dev command"));
   };
 
   const handleConfigure = () => {
     setShowSettings(true, "projects");
   };
 
-  const shortcutBadge = (
+  const shortcutBadge = runShortcut ? (
     <kbd className="ml-1 text-caption leading-none bg-muted px-1 py-0.5 rounded-sm border border-border text-muted-foreground font-sans">
-      Ctrl+Shift+G
+      {runShortcut}
     </kbd>
-  );
+  ) : null;
 
   const isConfigured = !!runCommand;
 
@@ -99,9 +102,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
     // semibold label are what mark it as the primary action. The inline
     // keyboard-shortcut badge is gone — the shortcut lives in the main
     // segment's tooltip instead of eating horizontal space.
-    const mainTooltip = isConfigured
-      ? `${runCommand} · Ctrl+Shift+G`
-      : "Set Run · Ctrl+Shift+G";
+    const mainTooltip = isConfigured ? runCommand : "Set Run";
     return (
       <div className="flex h-7 shrink-0 items-center gap-[2px]">
         <Tooltip>
@@ -120,7 +121,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
               <span>{isConfigured ? "Run" : "Set Run"}</span>
             </button>
           </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>
+          <TooltipContent side="bottom" sideOffset={4} shortcut="runDevCommand">
             {mainTooltip}
           </TooltipContent>
         </Tooltip>
@@ -172,7 +173,12 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
       {/* Gear button — opens settings, always available */}
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button variant="ghost" size="icon-xs" onClick={handleConfigure}>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={handleConfigure}
+            aria-label={isConfigured ? "Edit run command" : "Configure run command"}
+          >
             <Settings className="size-4" />
           </Button>
         </TooltipTrigger>
