@@ -33,6 +33,7 @@ pub mod usage_quota;
 pub mod usage_resume;
 pub mod workspace;
 pub mod workspaces_sync;
+pub mod workflows;
 
 pub use agent_chat::*;
 pub use ai::*;

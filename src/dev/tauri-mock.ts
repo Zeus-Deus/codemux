@@ -40,6 +40,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
 import {
@@ -4271,6 +4272,7 @@ const handlers: Record<string, Handler> = {
   // Empty by default: plugins never alter a clean core-only UI. Synthetic
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
+  ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () => "AppImage",
 
   // ── Settings ──

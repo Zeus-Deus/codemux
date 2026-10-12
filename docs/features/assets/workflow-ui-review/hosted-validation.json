@@ -1,0 +1,82 @@
+{
+  "status": "passed",
+  "url": "https://passpage.space/v/o94Lnzvie6mUE944jb2Xj5/",
+  "results": [
+    {
+      "file": "index.html",
+      "status": 200,
+      "csp": "sandbox allow-forms allow-popups allow-scripts; frame-ancestors 'none'; base-uri 'none'",
+      "initial": {
+        "title": "CodeMux workflow UI — four directions",
+        "origin": "null",
+        "fontStates": [
+          {
+            "family": "DM Sans Variable",
+            "status": "loaded"
+          },
+          {
+            "family": "JetBrains Mono Variable",
+            "status": "loaded"
+          }
+        ]
+      },
+      "previews": [
+        {
+          "src": "https://passpage.space/v/o94Lnzvie6mUE944jb2Xj5/previews/b-unknown.png",
+          "width": 1440,
+          "height": 900
+        },
+        {
+          "src": "https://passpage.space/v/o94Lnzvie6mUE944jb2Xj5/previews/a-unknown.png",
+          "width": 1440,
+          "height": 900
+        },
+        {
+          "src": "https://passpage.space/v/o94Lnzvie6mUE944jb2Xj5/previews/c-unknown.png",
+          "width": 1440,
+          "height": 900
+        }
+      ],
+      "mobile": {
+        "width": 375,
+        "scrollWidth": 375
+      }
+    },
+    {
+      "file": "mockup-a.html",
+      "status": 200,
+      "origin": "null",
+      "title": "Mockup A · Checkpoints — CodeMux workflow UI (illustrative)",
+      "coordinationUI": "held -> verified stop -> retry"
+    },
+    {
+      "file": "mockup-b.html",
+      "status": 200,
+      "origin": "null",
+      "title": "Mockup B · Lanes — CodeMux workflow UI (illustrative)",
+      "coordinationUI": "held -> verified stop -> retry"
+    },
+    {
+      "file": "mockup-c.html",
+      "status": 200,
+      "origin": "null",
+      "title": "Mockup C · Map — CodeMux workflow UI (illustrative)",
+      "coordinationUI": "held -> verified stop -> retry"
+    },
+    {
+      "file": "mockup-d.html",
+      "status": 200,
+      "origin": "null",
+      "title": "Mockup D · Journal — CodeMux workflow UI (illustrative)",
+      "coordinationUI": "held -> verified stop -> retry"
+    },
+    {
+      "file": "verification.html",
+      "status": 200,
+      "evidenceDownloads": 5
+    }
+  ],
+  "errors": [],
+  "failed": [],
+  "external": []
+}

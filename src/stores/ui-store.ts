@@ -19,6 +19,7 @@ export type RightPanelCorePane =
   | "files"
   | "review"
   | "orchestration"
+  | "workflows"
   | "tasks"
   | "subagents"
   | "diff"
