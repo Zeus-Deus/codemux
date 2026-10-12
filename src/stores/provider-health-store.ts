@@ -100,9 +100,11 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     cursor: emptyHealthSlot(),
     grok: emptyHealthSlot(),
     hermes: emptyHealthSlot(),
+    acp: emptyHealthSlot(),
     opencode: emptyHealthSlot(),
   },
   refresh: async (provider, opts) => {
+    if (provider === "acp") return; // Health is instance-scoped; never launch on generic provider intent.
     const slot = get().slots[provider];
     if (slot.inFlight) {
       // An unforced caller just wants a fresh-enough answer, and the

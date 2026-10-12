@@ -130,7 +130,7 @@ export function ComposerCommandMenu({
         loop
         className="flex flex-col"
       >
-        <div className="flex items-center gap-2.5 border-b border-border/60 px-3 py-2.5">
+        <div className="flex items-center gap-2.5 border-b border-hairline px-3 py-2.5">
           <Search
             className="size-3.5 shrink-0 text-muted-foreground"
             aria-hidden
@@ -156,7 +156,7 @@ export function ComposerCommandMenu({
             onKeyDown={(e) => {
               if (e.key !== "Escape" || e.defaultPrevented) e.stopPropagation();
             }}
-            className="flex items-center gap-0.5 border-b border-border/60 px-1.5 py-1"
+            className="flex items-center gap-0.5 border-b border-hairline px-1.5 py-1"
           >
             {headerSlot}
           </div>
@@ -204,7 +204,7 @@ export function ComposerCommandMenu({
                       className={cn(
                         "flex items-center gap-2.5 rounded-md px-2 py-1.5",
                         "cursor-pointer outline-none select-none",
-                        "data-[selected=true]:bg-muted/70",
+                        "data-[selected=true]:bg-surface-3",
                         // Disabled rows stay VISIBLE (dimmed) with their
                         // reason in the description slot.
                         disabled && "cursor-not-allowed opacity-[0.42]",
@@ -273,7 +273,7 @@ export function ComposerCommandMenu({
               data-testid="slash-popup-footer"
               data-tone={footerNote.tone}
               className={cn(
-                "border-t border-border/40 px-3 py-2 text-label",
+                "border-t border-hairline px-3 py-2 text-label",
                 footerNote.tone === "error"
                   ? "text-destructive"
                   : "text-muted-foreground/80",

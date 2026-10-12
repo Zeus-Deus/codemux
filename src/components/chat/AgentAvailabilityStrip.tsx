@@ -24,6 +24,7 @@ const PROVIDER_NAME: Record<AgentChatProviderKind, string> = {
   cursor: "Cursor",
   grok: "Grok",
   hermes: "Hermes",
+  acp: "Custom ACP",
   opencode: "OpenCode",
 };
 

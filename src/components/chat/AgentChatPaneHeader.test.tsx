@@ -1,6 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render as rtlRender } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
+// Tooltips need the provider `main.tsx` mounts around the whole app.
+const render = (ui: Parameters<typeof rtlRender>[0]) =>
+  rtlRender(ui, { wrapper: TooltipProvider });
 
 import type {
   AgentChatProviderKind,

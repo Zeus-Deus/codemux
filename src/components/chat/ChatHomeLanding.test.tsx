@@ -1,41 +1,57 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { useState } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-const mockProbe = vi.fn();
+const { openProjectMock, openCloneDialogMock, openProjectAtPathMock, recentProjectsMock, listDirectoryMock, toastErrorMock, mockProbe } = vi.hoisted(() => ({
+  mockProbe: vi.fn(),
+  openProjectMock: vi.fn(),
+  listDirectoryMock: vi.fn(),
+  openCloneDialogMock: vi.fn(),
+  openProjectAtPathMock: vi.fn(),
+  recentProjectsMock: vi.fn(),
+  toastErrorMock: vi.fn(),
+}));
+vi.mock("@/lib/toast", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }));
+vi.mock("@/hooks/use-project-actions", () => ({
+  useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: openCloneDialogMock }),
+  openProjectAtPath: openProjectAtPathMock,
+}));
 vi.mock("@/tauri/commands", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/tauri/commands")>()),
-  agentChatProviderHealth: (...args: unknown[]) => mockProbe(...args),
+  agentChatProviderHealth: mockProbe,
+  dbGetRecentProjects: recentProjectsMock,
+  listDirectory: listDirectoryMock,
+  dbGetUiState: vi.fn().mockResolvedValue(null),
 }));
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
-import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
 
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
-import type {
-  AgentChatProviderKind,
-  AppStateSnapshot,
-  ProviderHealthReport,
-} from "@/tauri/types";
+import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
+import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
 afterEach(cleanup);
 beforeEach(() => {
   mockProbe.mockReset();
   useProviderHealth.setState({
     slots: {
-      claude: emptyHealthSlot(),
-      codex: emptyHealthSlot(),
-      cursor: emptyHealthSlot(),
-      grok: emptyHealthSlot(),
-      hermes: emptyHealthSlot(),
+      claude: emptyHealthSlot(), codex: emptyHealthSlot(), cursor: emptyHealthSlot(),
+      grok: emptyHealthSlot(), hermes: emptyHealthSlot(), acp: emptyHealthSlot(),
       opencode: emptyHealthSlot(),
     },
   });
-  useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+  useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot, homeDir: null });
+  toastErrorMock.mockReset();
   useFeatureFlags.setState({ enableAgentChat: true });
   useUIStore.setState({ showLocalSessionImport: false, localSessionImportOfferDismissed: false });
   delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+  openProjectMock.mockReset().mockResolvedValue({ success: false });
+  openCloneDialogMock.mockReset();
+  openProjectAtPathMock.mockReset().mockResolvedValue({ success: true, path: "/work/parser", name: "parser" });
+  recentProjectsMock.mockReset().mockResolvedValue([]);
+  listDirectoryMock.mockReset().mockResolvedValue([]);
 });
 describe("ChatHomeLanding", () => {
   it("offers opt-in import only for first-run local enabled profiles", () => {
@@ -66,6 +82,96 @@ describe("ChatHomeLanding", () => {
     expect(heading?.textContent).toBe("What should we do today?");
   });
 
+  it("asks what to work on when the thread has no project", () => {
+    const { container } = render(
+      <ChatHomeLanding composer={<div />} projectName={null} />,
+    );
+    expect(container.querySelector("h1")?.textContent).toBe(
+      "What should we work on?",
+    );
+    expect(
+      screen.queryByRole("button", { name: "or start without a project" }),
+    ).toBeNull();
+  });
+
+  it("offers the project picker as 'No project' under the no-project headline", () => {
+    render(
+      <ChatHomeLanding
+        composer={<div />}
+        projectName={null}
+        projectPicker={(trigger) => <span data-testid="picker">{trigger}</span>}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "No project" });
+    expect(screen.getByTestId("picker")).toContainElement(trigger);
+    // Under the heading, not inside it.
+    expect(trigger.closest("h1")).toBeNull();
+  });
+
+  it("reserves the line under a project-scoped headline so it doesn't jump", () => {
+    const view = render(
+      <ChatHomeLanding
+        composer={<div />}
+        projectName="codemux"
+        projectPicker={(trigger) => trigger}
+        onStartWithoutProject={() => {}}
+      />,
+    );
+    const withProject = screen.getByTestId("landing-subline").className;
+    view.rerender(
+      <ChatHomeLanding
+        composer={<div />}
+        projectName={null}
+        projectPicker={(trigger) => trigger}
+        onStartWithoutProject={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("landing-subline").className).toBe(withProject);
+    expect(withProject).toContain("h-6");
+    view.rerender(<ChatHomeLanding composer={<div />} />);
+    expect(screen.queryByTestId("landing-subline")).toBeNull();
+  });
+
+  it("moves focus to the 'No project' picker after starting without a project", () => {
+    function Harness() {
+      const [projectName, setProjectName] = useState<string | null>("codemux");
+      return (
+        <ChatHomeLanding
+          composer={<div />}
+          projectName={projectName}
+          projectPicker={(trigger) => trigger}
+          onStartWithoutProject={() => setProjectName(null)}
+        />
+      );
+    }
+    render(<Harness />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "or start without a project" }),
+    );
+    expect(screen.getByRole("button", { name: "No project" })).toHaveFocus();
+  });
+
+  it("names the project through the picker and offers to drop it", () => {
+    const onStartWithoutProject = vi.fn();
+    const { container } = render(
+      <ChatHomeLanding
+        composer={<div />}
+        projectName="codemux"
+        projectPicker={(trigger) => <span data-testid="picker">{trigger}</span>}
+        onStartWithoutProject={onStartWithoutProject}
+      />,
+    );
+    expect(container.querySelector("h1")?.textContent).toBe(
+      "What should we build in codemux?",
+    );
+    const name = screen.getByRole("button", { name: "codemux" });
+    expect(screen.getByTestId("picker")).toContainElement(name);
+    fireEvent.click(
+      screen.getByRole("button", { name: "or start without a project" }),
+    );
+    expect(onStartWithoutProject).toHaveBeenCalledTimes(1);
+  });
+
   it("renders the composer passed via props", () => {
     const { container } = render(
       <ChatHomeLanding
@@ -77,17 +183,25 @@ describe("ChatHomeLanding", () => {
     ).not.toBeNull();
   });
 
-  it("uses only neutral foreground/muted color tokens — no accents", () => {
-    const { container } = render(
-      <ChatHomeLanding composer={<div />} />,
-    );
-    const html = container.innerHTML;
-    expect(html).not.toMatch(/\btext-primary\b/);
-    expect(html).not.toMatch(/\bbg-primary\b/);
-    expect(html).not.toMatch(/\btext-success\b/);
-    expect(html).not.toMatch(/\btext-warning\b/);
-    expect(html).not.toMatch(/\btext-danger\b/);
-  });
+  it.each(["codemux", null])(
+    "uses only neutral foreground/muted color tokens — no accents (project: %s)",
+    (projectName) => {
+      const { container } = render(
+        <ChatHomeLanding
+          composer={<div />}
+          projectName={projectName}
+          projectPicker={(trigger) => trigger}
+          onStartWithoutProject={() => {}}
+        />,
+      );
+      const html = container.innerHTML;
+      expect(html).not.toMatch(/\btext-primary\b/);
+      expect(html).not.toMatch(/\bbg-primary\b/);
+      expect(html).not.toMatch(/\btext-success\b/);
+      expect(html).not.toMatch(/\btext-warning\b/);
+      expect(html).not.toMatch(/\btext-danger\b/);
+    },
+  );
 
   it("centers content vertically and horizontally", () => {
     const { container } = render(
@@ -95,8 +209,110 @@ describe("ChatHomeLanding", () => {
     );
     const root = container.firstElementChild as HTMLElement;
     expect(root.className).toContain("items-center");
-    expect(root.className).toContain("justify-center");
+    // Vertical centring via auto margins, so a short pane scrolls instead
+    // of clipping the headline.
+    expect(root.className).toContain("overflow-y-auto");
+    expect((root.firstElementChild as HTMLElement).className).toContain("my-auto");
   });
+
+  describe("with no project open", () => {
+    it("offers Open project and Clone repository under the composer", async () => {
+      openProjectMock.mockResolvedValue({ success: true, path: "/work/api", name: "api" });
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/api"));
+      fireEvent.click(screen.getByRole("button", { name: "Clone repository" }));
+      expect(openCloneDialogMock).toHaveBeenCalledOnce();
+    });
+
+    it("reopens a recent project without the folder picker", async () => {
+      recentProjectsMock.mockResolvedValue([
+        { path: "/work/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" },
+      ]);
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      const row = await screen.findByRole("button", { name: /parser/ });
+      fireEvent.click(row);
+      await vi.waitFor(() => expect(onProjectOpened).toHaveBeenCalledWith("/work/parser"));
+      expect(openProjectAtPathMock).toHaveBeenCalledWith("/work/parser");
+      expect(openProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses a recent project whose folder is gone and drops its row", async () => {
+      recentProjectsMock.mockResolvedValue([
+        { path: "/work/parser", name: "parser", last_opened_at: "2026-10-01T10:00:00Z" },
+        { path: "/work/docs", name: "docs", last_opened_at: "2026-09-30T10:00:00Z" },
+      ]);
+      listDirectoryMock.mockImplementation(async (path: string) => {
+        if (path === "/work/parser") throw new Error("No such file or directory");
+        return [];
+      });
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      fireEvent.click(await screen.findByRole("button", { name: /parser/ }));
+      await vi.waitFor(() =>
+        expect(toastErrorMock).toHaveBeenCalledWith(
+          "Couldn't open parser at /work/parser: No such file or directory",
+        ),
+      );
+      expect(openProjectAtPathMock).not.toHaveBeenCalled();
+      expect(onProjectOpened).not.toHaveBeenCalled();
+      const list = screen.getByRole("region", { name: "Recent projects" });
+      expect(list).not.toHaveTextContent("parser");
+      expect(list).toHaveTextContent("docs");
+    });
+
+    it("says so when opening the picked folder fails", async () => {
+      openProjectMock.mockRejectedValue(new Error("workspace limit reached"));
+      const onProjectOpened = vi.fn();
+      render(<ChatHomeLanding composer={<div />} onProjectOpened={onProjectOpened} />);
+      fireEvent.click(screen.getByRole("button", { name: /Open project/ }));
+      await vi.waitFor(() =>
+        expect(toastErrorMock).toHaveBeenCalledWith(
+          "Couldn't open the project: workspace limit reached",
+        ),
+      );
+      expect(onProjectOpened).not.toHaveBeenCalled();
+    });
+
+    it("still lists five recent projects when Home is among them", async () => {
+      useAppStore.setState({ homeDir: "/home/me" });
+      recentProjectsMock.mockResolvedValue(
+        ["/home/me", "/w/a", "/w/b", "/w/c", "/w/d", "/w/e"].map((path) => ({
+          path,
+          name: path.split("/").pop(),
+          last_opened_at: "2026-10-01T10:00:00Z",
+        })),
+      );
+      render(<ChatHomeLanding composer={<div />} />);
+      const list = await screen.findByRole("region", { name: "Recent projects" });
+      expect(recentProjectsMock).toHaveBeenCalledWith(6);
+      expect(list.querySelectorAll("li")).toHaveLength(5);
+      expect(list).not.toHaveTextContent("/home/me");
+    });
+
+    it("hides the project actions once a workspace exists", () => {
+      useAppStore.setState({ appState: { workspaces: [{}] } as unknown as AppStateSnapshot });
+      render(<ChatHomeLanding composer={<div />} />);
+      expect(screen.queryByRole("button", { name: /Open project/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Clone repository" })).toBeNull();
+      expect(recentProjectsMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it("renders the notice slot above the composer", () => {
+    const { container } = render(
+      <ChatHomeLanding
+        composer={<div data-testid="composer-slot" />}
+        notice={<div data-testid="notice-slot" />}
+      />,
+    );
+    const notice = container.querySelector('[data-testid="notice-slot"]')!;
+    const composer = container.querySelector('[data-testid="composer-slot"]')!;
+    expect(notice.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
 
   describe("first-run agent strip", () => {
     const HEALTH: Partial<Record<AgentChatProviderKind, Partial<ProviderHealthReport>>> = {
@@ -172,4 +388,3 @@ describe("ChatHomeLanding", () => {
       expect(screen.queryByTestId("agent-availability-strip")).toBeNull();
     });
   });
-});

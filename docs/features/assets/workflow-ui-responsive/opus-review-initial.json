@@ -1,0 +1,30 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 346118,
+  "num_turns": 26,
+  "total_cost_usd": 1.0188494000000001,
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 26,
+      "outputTokens": 14946,
+      "cacheReadInputTokens": 617247,
+      "cacheCreationInputTokens": 74547,
+      "webSearchRequests": 0,
+      "costUSD": 1.0188494000000001,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 9216,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  },
+  "model": "claude-opus-5-5",
+  "effort": "high",
+  "cliVersion": "2.1.295",
+  "requestedReview": "Read-only UI review; tools Read, Glob, Grep; native safe mode; no model work delegated",
+  "evidenceTiming": "Review occurred during the responsive verification run. Its point-in-time incomplete-run findings were subsequently addressed and rechecked.",
+  "functionalTestBudget": "Separate from the authorized $2 functional live-test cap"
+}

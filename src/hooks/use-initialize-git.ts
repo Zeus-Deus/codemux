@@ -61,7 +61,7 @@ export function useInitializeGit(workspace: WorkspaceSnapshot | null) {
       await initGitRepoNoCommit(workspace.project_root ?? workspace.cwd);
       await refreshWorkspaceGitInfo(workspace.workspace_id);
     } catch (err) {
-      toast.error(`Git initialization failed: ${err}`);
+      toast.failure("Git initialization failed", err);
     } finally {
       setInitializing(false);
     }

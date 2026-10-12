@@ -29,6 +29,7 @@ pub enum MockCall {
     RespondToRequest(ThreadId, RequestId),
     SetModel(ThreadId, String),
     SetFastMode(ThreadId, bool),
+    SetServiceTier(ThreadId, String),
     SetPermissionMode(ThreadId, String),
     RollbackConversation(ThreadId, u32),
     StopSession(ThreadId),
@@ -70,7 +71,13 @@ pub struct MockAgentProvider {
     live: Arc<Mutex<HashSet<ThreadId>>>,
     rollback_error: Arc<Mutex<Option<String>>>,
     fast_mode_error: Mutex<Option<ProviderError>>,
+    start_error: Mutex<Option<ProviderError>>,
     send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    start_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// Threads `turn_active` reports as running a turn. The mock never
+    /// runs turns itself, so tests set this to stand in for one.
+    active_turns: Mutex<HashSet<ThreadId>>,
+    send_error: Mutex<Option<ProviderError>>,
     /// Every `StartSessionInput` received, in order, so tests can assert
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
@@ -88,7 +95,11 @@ impl MockAgentProvider {
             live: Arc::new(Mutex::new(HashSet::new())),
             rollback_error: Arc::new(Mutex::new(None)),
             fast_mode_error: Mutex::new(None),
+            start_error: Mutex::new(None),
             send_gate: Mutex::new(None),
+            start_gate: Mutex::new(None),
+            active_turns: Mutex::new(HashSet::new()),
+            send_error: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -99,6 +110,7 @@ impl MockAgentProvider {
         self.start_inputs.lock().unwrap().clone()
     }
 
+    #[allow(dead_code)]
     pub fn fail_next_rollback(&self, message: impl Into<String>) {
         *self.rollback_error.lock().unwrap() = Some(message.into());
     }
@@ -108,6 +120,33 @@ impl MockAgentProvider {
         *self.fast_mode_error.lock().unwrap() = Some(error);
     }
 
+    /// Make the next `start_session` fail with `error`.
+    #[allow(dead_code)]
+    pub fn fail_next_start(&self, error: ProviderError) {
+        *self.start_error.lock().unwrap() = Some(error);
+    }
+
+    /// Keep the next `start_session` in flight until the returned release
+    /// is notified (a slow CLI start). The first notify fires on entry.
+    #[allow(dead_code)]
+    pub fn hold_next_start(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.start_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (entered, release)
+    }
+
+    /// Report a turn in flight (or not) on `thread` from `turn_active`.
+    #[allow(dead_code)]
+    pub fn set_turn_active(&self, thread: &str, active: bool) {
+        let mut turns = self.active_turns.lock().unwrap();
+        if active {
+            turns.insert(ThreadId(thread.into()));
+        } else {
+            turns.remove(&ThreadId(thread.into()));
+        }
+    }
+
     /// Keep one dispatch in flight while a test drives concurrent commands.
     #[allow(dead_code)]
     pub fn hold_next_send(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
@@ -115,6 +154,12 @@ impl MockAgentProvider {
         let release = Arc::new(tokio::sync::Notify::new());
         *self.send_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
         (entered, release)
+    }
+
+    /// Reject the next `send_turn` (after any held gate releases).
+    #[allow(dead_code)]
+    pub fn fail_next_send(&self, error: ProviderError) {
+        *self.send_error.lock().unwrap() = Some(error);
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -167,8 +212,16 @@ impl AgentProvider for MockAgentProvider {
         &self,
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
+        let gate = self.start_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.calls.push(MockCall::StartSession(input.thread_id.clone()));
         self.start_inputs.lock().unwrap().push(input.clone());
+        if let Some(error) = self.start_error.lock().unwrap().take() {
+            return Err(error);
+        }
         self.live.lock().unwrap().insert(input.thread_id.clone());
         Ok(ProviderSession {
             thread_id: input.thread_id.clone(),
@@ -184,6 +237,9 @@ impl AgentProvider for MockAgentProvider {
         if let Some((entered, release)) = gate {
             entered.notify_one();
             release.notified().await;
+        }
+        if let Some(error) = self.send_error.lock().unwrap().take() {
+            return Err(error);
         }
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
@@ -233,6 +289,27 @@ impl AgentProvider for MockAgentProvider {
         }
     }
 
+    async fn set_service_tier(
+        &self,
+        thread_id: ThreadId,
+        tier: String,
+    ) -> Result<(), ProviderError> {
+        if self.kind != ProviderKind::Codex {
+            return match tier.as_str() {
+                "default" => self.set_fast_mode(thread_id, false).await,
+                "fast" => self.set_fast_mode(thread_id, true).await,
+                _ => Err(ProviderError::ValidationError {
+                    message: "unsupported tier".into(),
+                }),
+            };
+        }
+        self.calls.push(MockCall::SetServiceTier(thread_id, tier));
+        match self.fast_mode_error.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn set_permission_mode(
         &self,
         thread_id: ThreadId,
@@ -250,6 +327,10 @@ impl AgentProvider for MockAgentProvider {
 
     async fn has_session(&self, thread_id: &ThreadId) -> bool {
         self.live.lock().unwrap().contains(thread_id)
+    }
+
+    async fn turn_active(&self, thread_id: &ThreadId) -> bool {
+        self.active_turns.lock().unwrap().contains(thread_id)
     }
 
     async fn rollback_conversation(

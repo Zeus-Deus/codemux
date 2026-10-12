@@ -80,4 +80,5 @@ addon-native-ui-evidence/
 addon-native-ui-build.json
 
 src-tauri/addon-catalog/target/
+scripts/browser-benchmark/target/
 .worktrees/

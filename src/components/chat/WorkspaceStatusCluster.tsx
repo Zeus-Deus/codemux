@@ -168,7 +168,7 @@ export function WorkspaceStatusCluster() {
     try {
       await gitPullChanges(cwd);
     } catch (err) {
-      toast.error(`Sync failed: ${err}`);
+      toast.failure("Sync failed", err);
     } finally {
       setPulling(false);
     }

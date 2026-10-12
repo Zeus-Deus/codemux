@@ -28,7 +28,8 @@ export interface StepView {
   verb: string;
   /** One-line, truncatable summary (path / command / thought first line). */
   summary: string;
-  /** Right-aligned dim meta: `2 hits`, `+9 −1`, `ok`, `running`, `failed`. */
+  /** Right-aligned dim meta: `2 hits`, `+9 −1`, `ok · 3s`, `running`,
+   *  `failed`. Settled steps that took a second or more carry their duration. */
   meta: string;
   status: StepStatus;
 }
@@ -100,9 +101,33 @@ export function stepMeta(step: ActivityStep): string {
   }
 }
 
+/** How long a settled step took, in ms. `null` while it runs, when it is not
+ *  timestamped, or under a second: hydrated transcripts replay through the
+ *  reducer at one instant, so their spans collapse to ~0 and would print a
+ *  bogus "0s". */
+export function stepDurationMs(step: ActivityStep): number | null {
+  if (stepStatus(step) === "running") return null;
+  const ms = isReasoning(step)
+    ? (step.duration_ms ?? null)
+    : step.started_at != null && step.completed_at != null
+      ? step.completed_at - step.started_at
+      : null;
+  return ms != null && ms >= 1000 ? ms : null;
+}
+
+/** Live elapsed label for a running step, empty for its first second. */
+export function stepElapsedLabel(startedAt: number, now: number): string {
+  const ms = now - startedAt;
+  return ms >= 1000 ? formatActivityDuration(ms) : "";
+}
+
 export function toStepView(step: ActivityStep): StepView {
   const { verb, summary } = describeStep(step);
-  return { id: step.id, verb, summary, meta: stepMeta(step), status: stepStatus(step) };
+  const duration = stepDurationMs(step);
+  const meta = [stepMeta(step), duration != null ? formatActivityDuration(duration) : ""]
+    .filter(Boolean)
+    .join(" · ");
+  return { id: step.id, verb, summary, meta, status: stepStatus(step) };
 }
 
 export function isSubagentRun(entry: WorkEntry): entry is SubagentRunItem {
@@ -308,14 +333,14 @@ export function formatActivityDuration(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
-interface EditCounts {
+export interface EditCounts {
   added: number;
   removed: number;
 }
 
 /** Added / removed line counts for an Edit-family tool, reusing the same
  *  LCS diff the inline DiffView renders. `null` when no diff-able input. */
-function editCounts(item: ToolCallItem): EditCounts | null {
+export function editCounts(item: ToolCallItem): EditCounts | null {
   const input = isRecord(item.input) ? item.input : null;
   if (!input) return null;
   let oldText: string;
@@ -342,6 +367,15 @@ function editCounts(item: ToolCallItem): EditCounts | null {
       if (olds.length === 0 && news.length === 0) return null;
       oldText = olds.join("\n");
       newText = news.join("\n");
+      break;
+    }
+    case "NotebookEdit": {
+      // Only the new cell source is in the input, so this counts what was
+      // written, like Write; a cell delete carries none and stays unknown.
+      const source = strOrNull(input.new_source);
+      if (source == null) return null;
+      oldText = "";
+      newText = source;
       break;
     }
     default: {

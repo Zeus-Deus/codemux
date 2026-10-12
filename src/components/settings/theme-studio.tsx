@@ -285,7 +285,7 @@ function StudioBody({
           <div
             role="radiogroup"
             aria-label="Theme source"
-            className="flex flex-none rounded-md border border-border/60 bg-muted/40 p-0.5"
+            className="flex flex-none rounded-md border border-hairline bg-surface-1 p-0.5"
           >
             {(["generate", "import"] as const).map((value) => (
               <button
@@ -314,7 +314,7 @@ function StudioBody({
           onClick={onClose}
           aria-label="Close theme studio"
         >
-          <X className="size-[13px]" />
+          <X className="size-3.5" />
         </Button>
       </div>
 
@@ -384,7 +384,7 @@ function StudioBody({
       </div>
 
       {/* Footer */}
-      <div className="flex flex-none items-center gap-2.5 border-t border-border/60 bg-muted/30 px-[18px] py-3">
+      <div className="flex flex-none items-center gap-2.5 border-t border-hairline bg-surface-1 px-[18px] py-3">
         <span className="flex-1 text-label text-muted-foreground">
           Applies to shell, terminal, code and editor.
         </span>
@@ -571,7 +571,7 @@ function ImportColumn({
       ) : (
       <div className="flex flex-col gap-1.5">
         <ColumnLabel>{sourceKind === "file" ? "File" : "Paste it here"}</ColumnLabel>
-        <div className="overflow-hidden rounded-lg border border-border bg-muted/30">
+        <div className="overflow-hidden rounded-lg border border-border bg-surface-1">
           <Textarea
             value={text}
             onChange={(event) => onText(event.target.value)}
@@ -596,7 +596,7 @@ function ImportColumn({
               size="sm"
               onClick={onChooseFile}
             >
-              <FileUp className="size-[11px]" /> Choose file
+              <FileUp className="size-3" /> Choose file
             </Button>
             <span className="text-label text-muted-foreground">or drop it here</span>
           </div>
@@ -652,7 +652,7 @@ function DerivedRoles({ result }: { result: ThemeImportResult }) {
       {shown.map((role) => (
         <div
           key={role}
-          className="flex h-[30px] items-center gap-2.5 rounded-lg border border-border/60 bg-muted/30 px-2.5"
+          className="flex h-[30px] items-center gap-2.5 rounded-lg border border-hairline bg-surface-1 px-2.5"
         >
           <span
             className="size-3.5 flex-none rounded-sm"
@@ -759,7 +759,7 @@ function SeedRow({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="flex h-[38px] items-center gap-2.5 rounded-md border border-border bg-muted/30 px-2.5">
+    <label className="flex h-[38px] items-center gap-2.5 rounded-md border border-border bg-surface-1 px-2.5">
       <input
         type="color"
         value={normalizeColor(value) ?? "#000000"}
