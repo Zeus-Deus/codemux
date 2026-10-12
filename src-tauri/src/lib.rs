@@ -515,6 +515,16 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Tauri may exit without dropping managed state. Close admission
+                // and await the owned OpenCode direct child before other cleanup.
+                if let Err(error) = tauri::async_runtime::block_on(
+                    app.state::<std::sync::Arc<
+                        crate::agent_provider::opencode::OpenCodeServerManager,
+                    >>()
+                    .shutdown(),
+                ) {
+                    eprintln!("[codemux::opencode] shutdown incomplete: {error}");
+                }
                 if let Err(error) = tauri::async_runtime::block_on(
                     app.state::<commands::workflows::WorkflowState>().shutdown(),
                 ) {
@@ -626,8 +636,8 @@ fn build_core_app<R: tauri::Runtime>(
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
-        // not spawned until the first call. Shutting Codemux down
-        // drops this state, which `kill_on_drop`-kills the child.
+        // not spawned until the first call. Normal GUI quit explicitly
+        // shuts this manager down in RunEvent::Exit; Drop is only a fallback.
         .manage(std::sync::Arc::new(
             crate::agent_provider::opencode::OpenCodeServerManager::new(),
         ))

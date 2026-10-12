@@ -131,11 +131,11 @@ try {
         : await run('cargo', ['test', '-j', '2', '--locked', '--manifest-path', join(repository, 'src-tauri/Cargo.toml'), '--test', 'opencode_native_protocol', '--', '--ignored', '--test-threads=1', '--nocapture'], env, `native-v${version}.log`, 600000);
       const results = [...output.matchAll(/test result: ok\. (\d+) passed; 0 failed;/g)];
       assert.equal(results.length, 1, 'The native acceptance target must run, not silently skip');
-      assert.equal(Number(results[0][1]), 2, 'Both actual-runtime acceptance cases must pass');
+      assert.equal(Number(results[0][1]), 3, 'All three actual-runtime acceptance cases must pass');
       assert.equal(await readFile(join(checkout, 'opencode-proof.txt'), 'utf8'), 'OpenCode compatibility verified\n');
       assert.deepEqual(model.errors, [], 'The loopback peer must not hide fixture failures');
       assert.equal(model.heldCount, 0, 'Interrupt/cleanup must close the real model stream');
-      summary.checks.push({ major, version, nativeModels: true, approvalAndFileWrite: true, interruption: true, durableResume: true, childReaped: true, modelRequests: model.requests.length });
+      summary.checks.push({ major, version, nativeModels: true, approvalAndFileWrite: true, interruption: true, durableResume: true, childReaped: true, explicitShutdownReaped: true, modelRequests: model.requests.length });
       console.log(`Real OpenCode ${version}: catalog, approval, native tool write, interruption, durable resume and owned cleanup passed (scripted loopback model).`);
     } finally { await model.stop(); }
   }

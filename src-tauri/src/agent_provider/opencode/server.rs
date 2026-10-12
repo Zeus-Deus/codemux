@@ -21,13 +21,10 @@
 //!   prints `"server is unsecured"` and accepts any caller — even on
 //!   loopback that's a footgun if the user has another tool poking
 //!   at random localhost ports, so we always pin the password.
-//! * **Cleanup**: `kill_on_drop(true)` on the underlying
-//!   `tokio::process::Child` is the safety net — if the server
-//!   handle is dropped (panic, `OpenCodeServerManager::stop`,
-//!   process shutdown) the child receives `SIGKILL`. Graceful
-//!   `SIGTERM → 1s → SIGKILL` is a Stage 3 polish item; for Stage 2
-//!   the server is a stateless model-list cache and an immediate
-//!   kill loses nothing.
+//! * **Cleanup**: explicit shutdown terminates and awaits the direct
+//!   child. `kill_on_drop(true)` is a fallback when a handle is dropped;
+//!   it cannot run when the application exits without dropping state.
+//!   This does not guarantee cleanup on an OS crash or of descendants.
 //! * **GUI sanitation**: env is sanitised through
 //!   `sanitize_gui_env_tokio` so an OpenCode binary
 //!   that inadvertently launches a GUI helper does not pop windows
@@ -67,6 +64,10 @@ pub const READY_PREFIX: &str = "opencode server listening";
 /// command surface forwards verbatim.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound the direct child's termination/reap so GUI quit cannot hang
+/// indefinitely if the OS fails to complete process termination.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Length of the random server password. 32 alphanumeric characters
 /// = ~190 bits of entropy, vastly more than enough to make a
 /// loopback brute-force pointless. Locked here so tests can pin the
@@ -79,9 +80,8 @@ const SERVER_PASSWORD_LEN: usize = 32;
 /// any session that talks to its HTTP endpoint.
 #[derive(Debug)]
 pub struct OpenCodeServer {
-    /// `kill_on_drop(true)` is set on construction — letting `child`
-    /// drop is sufficient to terminate the server. The handle is
-    /// kept around so `Drop` reports the PID into a debug log.
+    /// Owned until explicit termination/reap. `kill_on_drop(true)` is
+    /// only a fallback, not proof that teardown completed.
     child: Child,
     /// Stable URL extracted from the ready banner — usable as-is for
     /// `reqwest` requests.
@@ -91,6 +91,13 @@ pub struct OpenCodeServer {
     /// this specific child. Bound to the server's lifetime: when the
     /// server dies the password becomes meaningless.
     server_password: String,
+}
+
+// Task-scoped scheduling gate. It delays actual cleanup without replacing
+// the production kill/wait or its result, and disappears with its owner.
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static SHUTDOWN_GATE: (std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>);
 }
 
 impl OpenCodeServer {
@@ -157,11 +164,11 @@ impl OpenCodeServer {
             Ok(Err(message)) => {
                 // Probe drained stdout before exiting — kill the
                 // child and surface the failure verbatim.
-                let _ = child.kill().await;
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.kill()).await;
                 return Err(message);
             }
             Err(_) => {
-                let _ = child.kill().await;
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.kill()).await;
                 return Err(format!(
                     "ready_timeout_after_{}ms",
                     ready_budget.as_millis()
@@ -199,6 +206,20 @@ impl OpenCodeServer {
     /// has been reaped.
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// Terminate and reap the owned direct child before returning success.
+    /// Idempotent after a completed wait; Drop remains the error fallback.
+    pub async fn shutdown(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Ok((entered, release)) = SHUTDOWN_GATE.try_with(Clone::clone) {
+            entered.notify_one();
+            release.notified().await;
+        }
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.kill())
+            .await
+            .map_err(|_| "opencode_shutdown_timeout".to_string())?
+            .map_err(|error| format!("opencode_shutdown_failed: {error}"))
     }
 }
 
@@ -337,6 +358,26 @@ mod tests {
         // change of plan would silently weaken loopback security on
         // every spawn. ~190 bits at 32 alphanumerics.
         assert_eq!(SERVER_PASSWORD_LEN, 32);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_reaps_owned_child_before_return() {
+        let child = Command::new("/bin/sleep")
+            .arg("600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut server = OpenCodeServer {
+            child,
+            base_url: "http://127.0.0.1:1".into(),
+            api: super::super::api::OpenCodeApi::Legacy,
+            server_password: "synthetic".into(),
+        };
+        assert!(server.pid().is_some());
+        server.shutdown().await.unwrap();
+        assert_eq!(server.pid(), None, "Shutdown must wait for the owned child");
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]

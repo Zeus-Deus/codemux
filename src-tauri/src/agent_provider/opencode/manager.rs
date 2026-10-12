@@ -15,12 +15,11 @@
 //!
 //! # Lifetime
 //!
-//! The manager stays alive for the whole Tauri process. Dropping
-//! it (process exit, hot-reload) drops the contained
-//! [`OpenCodeServer`], which `kill_on_drop`-kills the child.
-//! [`stop`](OpenCodeServerManager::stop) is the explicit teardown
-//! path used by tests and the (future) settings panel "restart
-//! OpenCode" button.
+//! Normal GUI quit explicitly calls [`shutdown`](OpenCodeServerManager::shutdown)
+//! to close admission and await the owned direct child's termination/reap.
+//! Tauri process exit need not drop managed state. Drop's `kill_on_drop`
+//! remains only a fallback, not OS-crash or descendant cleanup.
+//! [`stop`](OpenCodeServerManager::stop) awaits teardown but remains restartable.
 //!
 //! # Liveness + respawn
 //!
@@ -35,7 +34,7 @@
 //! error only condemns after one retry also fails — a server that is
 //! merely wedged for a moment must not be SIGKILLed, since dropping
 //! it invalidates every live session's handle at once. A confirmed
-//! corpse is dropped (`kill_on_drop` reaps a wedged child) and
+//! corpse is terminated and reaped, then
 //! respawned under the same lock. Without this, the dead-run
 //! recovery path (issue #154) dead-ends: the session rebuild would
 //! POST `session_create` at a stale handle forever.
@@ -46,7 +45,7 @@
 //! conversation context on the new server.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -65,11 +64,15 @@ use super::server::OpenCodeServer;
 /// start for long.
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Allow the existing bounded probe, resolver, ready handshake and reaps
+/// to settle, but never wait indefinitely for in-flight lifecycle work.
+const SHUTDOWN_LOCK_TIMEOUT: Duration = Duration::from_secs(40);
+
 /// Cheap, owned snapshot of "where the running server lives" handed
 /// to every caller of [`OpenCodeServerManager::ensure_running`].
 ///
 /// Cloning the handle does NOT extend the server's lifetime — the
-/// underlying `Arc<OpenCodeServer>` is held inside the manager. If
+/// underlying `OpenCodeServer` is owned by the manager. If
 /// the server is stopped between handing out a handle and using it,
 /// HTTP requests will fail with a connect error and the caller can
 /// re-call `ensure_running` to respawn.
@@ -90,7 +93,11 @@ pub struct OpenCodeServerManager {
     /// Held under an async mutex so the spawn path is serialised —
     /// a second `ensure_running()` racing with the first observes
     /// the server already populated and returns the cached handle.
-    server: Mutex<Option<Arc<OpenCodeServer>>>,
+    server: Mutex<Option<OpenCodeServer>>,
+    /// Terminal admission fence, published before waiting for the lifecycle
+    /// lock. Unlike restartable Stop, app shutdown must never admit a spawn.
+    closing: AtomicBool,
+    shutdown_lock_timeout: Duration,
 }
 
 impl OpenCodeServerManager {
@@ -100,6 +107,8 @@ impl OpenCodeServerManager {
     pub fn new() -> Self {
         Self {
             server: Mutex::new(None),
+            closing: AtomicBool::new(false),
+            shutdown_lock_timeout: SHUTDOWN_LOCK_TIMEOUT,
         }
     }
 
@@ -121,41 +130,82 @@ impl OpenCodeServerManager {
     ///   `"ready_timeout_after_…"` — passthrough from
     ///   [`OpenCodeServer::spawn`](super::server::OpenCodeServer::spawn).
     pub async fn ensure_running(&self) -> Result<OpenCodeServerHandle, String> {
+        self.check_open()?;
         let mut guard = self.server.lock().await;
+        self.check_open()?;
 
         if let Some(existing) = guard.as_ref() {
             let handle = handle_from(existing);
-            if probe_server_alive(&handle).await {
+            let alive = probe_server_alive(&handle).await;
+            self.check_open()?;
+            if alive {
                 return Ok(handle);
             }
-            // The cached child stopped serving. Drop the corpse —
-            // `kill_on_drop` reaps a wedged-but-alive child — and fall
-            // through to a fresh spawn while still holding the lock.
+            // Keep direct-child ownership until its reap completes, even
+            // when terminal shutdown races a dead-cache recovery.
             eprintln!(
                 "[codemux::opencode] cached server at {} is not responding — respawning",
                 handle.base_url
             );
+            if let Some(existing) = guard.as_mut() {
+                existing.shutdown().await?;
+            }
             *guard = None;
         }
 
         let binary_path = resolve_binary().await?;
+        self.check_open()?;
         let server = OpenCodeServer::spawn(&binary_path).await?;
-        let arc = Arc::new(server);
-        let handle = handle_from(&arc);
-        *guard = Some(arc);
+        if let Err(error) = self.check_open() {
+            // Shutdown may have begun while the ready banner was pending.
+            // Retain the ready child's owner before awaiting cleanup: a
+            // canceled/failed reap must remain available to shutdown joiners.
+            *guard = Some(server);
+            if let Some(server) = guard.as_mut() {
+                server.shutdown().await?;
+            }
+            *guard = None;
+            return Err(error);
+        }
+        let handle = handle_from(&server);
+        *guard = Some(server);
         Ok(handle)
     }
 
     /// Tear down the running server, if any. Idempotent — calling
     /// `stop()` on an already-stopped manager is a no-op. The next
-    /// `ensure_running()` call respawns from scratch.
+    /// `ensure_running()` call respawns from scratch unless terminal shutdown
+    /// has begun. Termination errors are logged, with Drop as the fallback.
     pub async fn stop(&self) {
         let mut guard = self.server.lock().await;
-        if let Some(server) = guard.take() {
-            // Drop happens implicitly when `server` goes out of
-            // scope at the end of this block; `kill_on_drop(true)`
-            // sends SIGKILL.
-            drop(server);
+        if let Some(server) = guard.as_mut() {
+            if let Err(error) = server.shutdown().await {
+                eprintln!("[codemux::opencode] stop incomplete: {error}");
+            }
+        }
+        *guard = None;
+    }
+
+    /// Permanently close admission, terminate and reap the direct child.
+    /// Concurrent callers join teardown under the same lifecycle lock;
+    /// a canceled/failed waiter leaves the child owned for a later retry.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.closing.store(true, Ordering::SeqCst);
+        let mut guard = tokio::time::timeout(self.shutdown_lock_timeout, self.server.lock())
+            .await
+            .map_err(|_| "opencode_shutdown_lock_timeout".to_string())?;
+        if let Some(server) = guard.as_mut() {
+            server.shutdown().await?;
+        }
+        *guard = None;
+        Ok(())
+    }
+
+    fn check_open(&self) -> Result<(), String> {
+        if self.closing.load(Ordering::SeqCst) {
+            Err("opencode_manager_shutdown".into())
+        } else {
+            Ok(())
         }
     }
 
@@ -174,7 +224,7 @@ impl Default for OpenCodeServerManager {
     }
 }
 
-fn handle_from(server: &Arc<OpenCodeServer>) -> OpenCodeServerHandle {
+fn handle_from(server: &OpenCodeServer) -> OpenCodeServerHandle {
     OpenCodeServerHandle {
         base_url: server.base_url().to_string(),
         api: server.api(),
@@ -202,10 +252,8 @@ fn handle_from(server: &Arc<OpenCodeServer>) -> OpenCodeServerHandle {
 ///   case is bounded at 2 × [`LIVENESS_PROBE_TIMEOUT`].
 ///
 /// An HTTP probe is used instead of `Child::try_wait` deliberately:
-/// `try_wait` needs `&mut Child`, which the shared `Arc<OpenCodeServer>`
-/// can't give without moving the child behind a mutex (touching
-/// `pid()` and `Drop`), and it can't detect a hung-but-alive server at
-/// all — the probe covers both failure shapes with no refactor.
+/// a process-exit check cannot detect a hung-but-alive server. The probe
+/// covers both failure shapes.
 async fn probe_server_alive(handle: &OpenCodeServerHandle) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(LIVENESS_PROBE_TIMEOUT)
@@ -513,6 +561,339 @@ mod tests {
         );
 
         manager.stop().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn stop_reaps_owned_child_before_return_and_remains_restartable() {
+        let backend = DisposableHttpServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = write_fake_opencode_binary(tmp.path());
+        let _env = EnvGuard::new(&[
+            ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
+            (
+                "FAKE_OPENCODE_URL",
+                Some(std::ffi::OsStr::new(&backend.url)),
+            ),
+        ]);
+        let manager = OpenCodeServerManager::new();
+        let first = manager.ensure_running().await.unwrap();
+        let pid = manager.server.lock().await.as_ref().unwrap().pid().unwrap();
+        manager.stop().await;
+        // No sleep or polling: completion of Stop must mean the owned child
+        // was waited, not merely sent a kill signal for later runtime cleanup.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "Stop returned before its owned child was reaped"
+        );
+        assert!(!manager.is_running_for_tests().await);
+        let second = manager.ensure_running().await.unwrap();
+        assert_ne!(first.server_password, second.server_password);
+        manager.stop().await;
+        backend.kill().await;
+    }
+
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn terminal_shutdown_denies_later_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("not-installed");
+        let _env = EnvGuard::new(&[("CODEMUX_OPENCODE_BINARY", Some(missing.as_os_str()))]);
+        let manager = OpenCodeServerManager::new();
+        manager.shutdown().await.unwrap();
+        manager.shutdown().await.unwrap();
+        manager.stop().await;
+        assert_eq!(
+            manager.ensure_running().await.unwrap_err(),
+            "opencode_manager_shutdown"
+        );
+        assert!(!manager.is_running_for_tests().await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn concurrent_terminal_shutdowns_wait_for_owned_reap() {
+        let backend = DisposableHttpServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = write_fake_opencode_binary(tmp.path());
+        let _env = EnvGuard::new(&[
+            ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
+            (
+                "FAKE_OPENCODE_URL",
+                Some(std::ffi::OsStr::new(&backend.url)),
+            ),
+        ]);
+        let manager = OpenCodeServerManager::new();
+        manager.ensure_running().await.unwrap();
+        let pid = manager.server.lock().await.as_ref().unwrap().pid().unwrap();
+        let joiner = || async {
+            manager.shutdown().await.unwrap();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "Every shutdown caller must await the owned child's reap"
+            );
+        };
+        let first = joiner();
+        let second = joiner();
+        tokio::pin!(first, second);
+        if futures_util::poll!(first.as_mut()).is_pending() {
+            // The first caller still owns teardown. Even an already-signaled
+            // child cannot let a second caller skip its owner's awaited reap.
+            assert!(futures_util::poll!(second.as_mut()).is_pending());
+            tokio::join!(first, second);
+        } else {
+            second.await;
+        }
+        assert!(!manager.is_running_for_tests().await);
+        backend.kill().await;
+    }
+
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn terminal_shutdown_denies_startup_already_queued_on_lifecycle_lock() {
+        let manager = OpenCodeServerManager::new();
+        let guard = manager.server.lock().await;
+        let start = manager.ensure_running();
+        let shutdown = manager.shutdown();
+        tokio::pin!(start, shutdown);
+        assert!(futures_util::poll!(start.as_mut()).is_pending());
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        // A fresh request must reject without waiting behind lifecycle work.
+        assert_eq!(
+            manager.ensure_running().await.unwrap_err(),
+            "opencode_manager_shutdown"
+        );
+        drop(guard);
+        assert_eq!(start.await.unwrap_err(), "opencode_manager_shutdown");
+        shutdown.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn terminal_shutdown_denies_racing_cached_handle_publication() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let tmp = tempfile::tempdir().unwrap();
+            let binary = write_fake_opencode_binary(tmp.path());
+            let _env = EnvGuard::new(&[
+                ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
+                ("FAKE_OPENCODE_URL", Some(std::ffi::OsStr::new(&url))),
+            ]);
+            let manager = OpenCodeServerManager::new();
+            manager.ensure_running().await.unwrap();
+            let pid = manager.server.lock().await.as_ref().unwrap().pid().unwrap();
+            let cached = manager.ensure_running();
+            tokio::pin!(cached);
+            let (mut peer, _) = tokio::select! {
+                result = &mut cached => panic!("Probe completed before HTTP reply: {result:?}"),
+                accepted = listener.accept() => accepted.unwrap(),
+            };
+            tokio::select! {
+                result = &mut cached => panic!("Probe completed before fixture read: {result:?}"),
+                _ = async {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(peer.read_u8().await.unwrap());
+                    }
+                    assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                } => {},
+            }
+            let shutdown = manager.shutdown();
+            tokio::pin!(shutdown);
+            assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+            peer.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let result = cached.await;
+            shutdown.await.unwrap();
+            assert_eq!(
+                result.unwrap_err(),
+                "opencode_manager_shutdown",
+                "A cached probe must recheck terminal admission before returning its handle"
+            );
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        })
+        .await
+        .expect("Racing cached probe/shutdown must settle");
+    }
+
+    #[cfg(unix)]
+    fn fixture_fifo(path: &std::path::Path) -> std::fs::File {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid owned path; mkfifo only creates this fixture's FIFO.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn terminal_shutdown_denies_racing_startup_publication() {
+        use std::{
+            io::{Read, Write},
+            os::unix::fs::PermissionsExt,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let started_path = tmp.path().join("started");
+            let ready_path = tmp.path().join("ready");
+            let started = tokio::io::unix::AsyncFd::new(fixture_fifo(&started_path)).unwrap();
+            let mut ready = fixture_fifo(&ready_path);
+            let binary = tmp.path().join("opencode");
+            // The direct child blocks before its ready banner, without any
+            // helper descendants or sleeps. FIFO acknowledgement owns ordering.
+            std::fs::write(&binary, b"#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FAKE_OPENCODE_STARTED\"\nread ready < \"$FAKE_OPENCODE_READY\"\necho 'opencode server listening on http://127.0.0.1:1'\nexec /bin/sleep 600\n").unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _env = EnvGuard::new(&[
+                ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
+                ("FAKE_OPENCODE_STARTED", Some(started_path.as_os_str())),
+                ("FAKE_OPENCODE_READY", Some(ready_path.as_os_str())),
+            ]);
+            let manager = OpenCodeServerManager::new();
+            let start = manager.ensure_running();
+            tokio::pin!(start);
+            let read_pid = async {
+                let mut bytes = [0; 32];
+                loop {
+                    let mut readable = started.readable().await.unwrap();
+                    match readable.try_io(|fd| fd.get_ref().read(&mut bytes)) {
+                        Ok(Ok(count)) => break std::str::from_utf8(&bytes[..count]).unwrap().trim().parse::<u32>().unwrap(),
+                        Ok(Err(error)) => panic!("fixture PID read: {error}"),
+                        Err(_) => continue,
+                    }
+                }
+            };
+            let pid = tokio::select! {
+                result = &mut start => panic!("Startup completed before fixture release: {result:?}"),
+                pid = read_pid => pid,
+            };
+            let shutdown = manager.shutdown();
+            tokio::pin!(shutdown);
+            assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+            ready.write_all(b"go\n").unwrap();
+            let result = start.await;
+            shutdown.await.unwrap();
+            assert_eq!(result.unwrap_err(), "opencode_manager_shutdown", "An in-flight spawn must not publish after terminal shutdown");
+            assert!(!manager.is_running_for_tests().await);
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }).await.expect("Racing startup/shutdown must settle");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(opencode_path)]
+    async fn cancelled_rejected_startup_retains_child_for_terminal_shutdown() {
+        use std::{
+            io::{Read, Write},
+            os::unix::fs::PermissionsExt,
+            sync::Arc,
+        };
+        // Failure-safe cleanup of only the direct fixture child. Do not mask
+        // the ownership/reap observations made before this guard drops.
+        struct FixtureChild(u32);
+        impl Drop for FixtureChild {
+            fn drop(&mut self) {
+                unsafe {
+                    if libc::waitpid(self.0 as i32, std::ptr::null_mut(), libc::WNOHANG) == 0 {
+                        libc::kill(self.0 as i32, libc::SIGKILL);
+                        libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let started_path = tmp.path().join("started");
+            let ready_path = tmp.path().join("ready");
+            let started = tokio::io::unix::AsyncFd::new(fixture_fifo(&started_path)).unwrap();
+            let mut ready = fixture_fifo(&ready_path);
+            let binary = tmp.path().join("opencode");
+            std::fs::write(&binary, b"#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FAKE_OPENCODE_STARTED\"\nread ready < \"$FAKE_OPENCODE_READY\"\necho 'opencode server listening on http://127.0.0.1:1'\nexec /bin/sleep 600\n").unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _env = EnvGuard::new(&[
+                ("CODEMUX_OPENCODE_BINARY", Some(binary.as_os_str())),
+                ("FAKE_OPENCODE_STARTED", Some(started_path.as_os_str())),
+                ("FAKE_OPENCODE_READY", Some(ready_path.as_os_str())),
+            ]);
+            let manager = OpenCodeServerManager::new();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut start = Box::pin(super::super::server::SHUTDOWN_GATE.scope(
+                (entered.clone(), release),
+                manager.ensure_running(),
+            ));
+            let read_pid = async {
+                let mut bytes = [0; 32];
+                loop {
+                    let mut readable = started.readable().await.unwrap();
+                    match readable.try_io(|fd| fd.get_ref().read(&mut bytes)) {
+                        Ok(Ok(count)) => break std::str::from_utf8(&bytes[..count]).unwrap().trim().parse::<u32>().unwrap(),
+                        Ok(Err(error)) => panic!("fixture PID read: {error}"),
+                        Err(_) => continue,
+                    }
+                }
+            };
+            let pid = tokio::select! {
+                result = &mut start => panic!("Startup completed before ready release: {result:?}"),
+                pid = read_pid => pid,
+            };
+            let _child = FixtureChild(pid);
+            let mut shutdown = Box::pin(manager.shutdown());
+            assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+            ready.write_all(b"go\n").unwrap();
+            tokio::select! {
+                result = &mut start => panic!("Rejected cleanup bypassed scheduling gate: {result:?}"),
+                _ = entered.notified() => {},
+            }
+            // Cancel the actual owned async future while production server
+            // shutdown is pending, not just a borrowed pinned reference.
+            drop(start);
+            // Cancel the queued lock waiter as well so ownership can be
+            // inspected before a fresh shutdown retry acquires the slot.
+            drop(shutdown);
+            let retained_pid = manager.server.lock().await.as_ref().and_then(OpenCodeServer::pid);
+            let result = manager.shutdown().await;
+            let reaped = !std::path::Path::new(&format!("/proc/{pid}")).exists();
+            eprintln!("rejected-startup cancellation: owned_pid={pid}, retained_pid={retained_pid:?}, shutdown={result:?}, reaped={reaped}");
+            assert_eq!(retained_pid, Some(pid), "Canceled rejected-publication cleanup must retain the ready child's owner; shutdown must not succeed on an empty slot");
+            result.unwrap();
+            assert!(reaped, "Terminal shutdown must await the retained direct child's reap");
+            assert!(!manager.is_running_for_tests().await);
+            assert_eq!(manager.ensure_running().await.unwrap_err(), "opencode_manager_shutdown");
+        }).await.expect("Canceled rejected startup/shutdown must settle");
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_bounds_wait_for_inflight_lifecycle_work() {
+        let mut manager = OpenCodeServerManager::new();
+        manager.shutdown_lock_timeout = Duration::ZERO;
+        let guard = manager.server.lock().await;
+        let result = tokio::time::timeout(Duration::from_millis(100), manager.shutdown()).await;
+        drop(guard);
+        assert_eq!(
+            result
+                .expect("Shutdown must bound its own lifecycle lock wait")
+                .unwrap_err(),
+            "opencode_shutdown_lock_timeout"
+        );
+        // A timed-out shutdown is still terminal, and another caller can
+        // retry the owned teardown once the lifecycle lock is available.
+        manager.shutdown().await.unwrap();
+        assert_eq!(
+            manager.ensure_running().await.unwrap_err(),
+            "opencode_manager_shutdown"
+        );
     }
 
     #[tokio::test]
