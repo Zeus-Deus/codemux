@@ -5,8 +5,9 @@ export interface EditorTabState {
   filePath: string | null;
   baselineContent: string;
   isDirty: boolean;
-  /** Transient request from a source reference. Omitted from persistence. */
-  revealRequest?: { line: number; column?: number; nonce: number };
+  /** Transient request from a source reference. Omitted from persistence.
+   *  `endColumn` (exclusive) selects the range from `column`, e.g. a search hit. */
+  revealRequest?: { line: number; column?: number; endColumn?: number; nonce: number };
 }
 
 const DEFAULT_TAB: EditorTabState = {
@@ -22,7 +23,7 @@ interface EditorStore {
   setFilePath: (tabId: string, filePath: string) => void;
   setBaselineContent: (tabId: string, content: string) => void;
   setDirty: (tabId: string, dirty: boolean) => void;
-  requestReveal: (tabId: string, line: number, column?: number) => void;
+  requestReveal: (tabId: string, line: number, column?: number, endColumn?: number) => void;
   clearReveal: (tabId: string, nonce: number) => void;
   removeTab: (tabId: string) => void;
 }
@@ -74,9 +75,11 @@ export const useEditorStore = create<EditorStore>()(
           },
         })),
 
-      requestReveal: (tabId, line, column) =>
+      requestReveal: (tabId, line, column, endColumn) =>
         set((s) => {
           const current = s.tabs[tabId] ?? DEFAULT_TAB;
+          const start = column != null ? Math.max(1, Math.floor(column)) : undefined;
+          const end = endColumn != null ? Math.floor(endColumn) : undefined;
           return {
             tabs: {
               ...s.tabs,
@@ -84,8 +87,9 @@ export const useEditorStore = create<EditorStore>()(
                 ...current,
                 revealRequest: {
                   line: Math.max(1, Math.floor(line)),
-                  ...(column != null
-                    ? { column: Math.max(1, Math.floor(column)) }
+                  ...(start != null ? { column: start } : {}),
+                  ...(start != null && end != null && end > start
+                    ? { endColumn: end }
                     : {}),
                   nonce: (current.revealRequest?.nonce ?? 0) + 1,
                 },
