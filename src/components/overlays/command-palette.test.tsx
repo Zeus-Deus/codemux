@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     takeCommandPaletteQuery: vi.fn<() => string | null>(() => null),
     setShowNewWorkspaceDialog: vi.fn(),
     setShowAutomations: vi.fn(),
+    setShowSettings: vi.fn(),
     setRightPanelTab: vi.fn(),
   },
   synced: {
@@ -875,6 +876,7 @@ describe("command palette — command catalogue", () => {
     renderPalette();
     await user.click(screen.getByRole("option", { name: /Automations/ }));
     expect(mocks.ui.setShowAutomations).toHaveBeenCalledWith(true);
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(false);
   });
 
   it("lists recently run commands first in the resting palette", async () => {
@@ -891,6 +893,32 @@ describe("command palette — command catalogue", () => {
 });
 
 describe("command palette — this workspace", () => {
+  it.each(["settle", "snooze"])("waits for inbox hydration before %s can persist", async (command) => {
+    useSidebarInboxStore.setState({ loaded: false });
+    let resolveInbox!: (raw: string | null) => void;
+    mocks.backend.dbGetUiState.mockImplementation(() => new Promise((resolve) => { resolveInbox = resolve; }));
+    mocks.app.appState = {
+      active_workspace_id: "ws-1", pane_statuses: {},
+      workspaces: [workspace("ws-1", "Done"), workspace("ws-2", "Existing shelf")],
+    };
+    mocks.ui.takeCommandPaletteQuery.mockReturnValue(`>${command}`);
+    const user = userEvent.setup();
+    renderPalette();
+    const optionName = command === "settle" ? /Settle workspace/ : /Snooze for 1 hour/;
+    expect(screen.queryByRole("option", { name: optionName })).toBeNull();
+    const { dbSetUiState } = await import("@/tauri/commands");
+    expect(dbSetUiState).not.toHaveBeenCalled();
+    await act(async () => resolveInbox(JSON.stringify({
+      settled: [{ id: "ws-2", at: 1 }], snoozed: [], keepActive: ["ws-3"],
+      activity: { "ws-2": 1 },
+    })));
+    await user.click(await screen.findByRole("option", { name: optionName }));
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toContain("ws-2");
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-3": true });
+    expect(useSidebarInboxStore.getState().activity).toEqual({ "ws-2": 1 });
+    expect(dbSetUiState).toHaveBeenCalled();
+  });
+
   it("stops the running agent from '>stop'", async () => {
     mocks.backend.agentChatInterruptTurn.mockResolvedValue(true);
     mocks.app.appState = {

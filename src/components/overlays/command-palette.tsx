@@ -200,6 +200,7 @@ interface PaletteCommand {
 }
 
 interface CommandContext {
+  inboxLoaded: boolean;
   workspace: WorkspaceSnapshot | null;
   activePaneId: string | undefined;
   workspaceStatus: ActivePaneStatus | null;
@@ -214,8 +215,9 @@ interface CommandContext {
 /** Same guard as the inbox card's Settle and Snooze: live or blocked work is
  *  never swept out of sight, and a pin is a visibility override that parking
  *  would silently defeat. */
-function canPark({ workspace, workspaceStatus, parked }: CommandContext): boolean {
+function canPark({ inboxLoaded, workspace, workspaceStatus, parked }: CommandContext): boolean {
   return (
+    inboxLoaded &&
     !!workspace &&
     !parked &&
     workspace.pinned_at == null &&
@@ -225,7 +227,7 @@ function canPark({ workspace, workspaceStatus, parked }: CommandContext): boolea
 }
 
 function parkActiveWorkspace(ctx: CommandContext, park: (workspaceId: string) => void) {
-  if (!ctx.workspace) return;
+  if (!canPark(ctx) || !ctx.workspace || !useSidebarInboxStore.getState().loaded) return;
   park(ctx.workspace.workspace_id);
   if (ctx.nextWorkspaceId) activateWorkspaceInteraction(ctx.nextWorkspaceId).catch(console.error);
 }
@@ -414,7 +416,11 @@ export const PALETTE_COMMANDS: PaletteCommand[] = [
     label: "Automations",
     icon: CalendarClock,
     keywords: "schedule cron recurring routine",
-    run: () => useUIStore.getState().setShowAutomations(true),
+    run: () => {
+      const ui = useUIStore.getState();
+      ui.setShowSettings(false);
+      ui.setShowAutomations(true);
+    },
   },
   {
     id: "pull-requests",
@@ -697,6 +703,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
   const commandContext = useMemo<CommandContext>(
     () => ({
+      inboxLoaded,
       workspace: activeWorkspace,
       activePaneId,
       workspaceStatus: activeStatus,
@@ -708,7 +715,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         workspaceRows.find((r) => !r.parked && r.workspace.workspace_id !== activeWorkspaceId)
           ?.workspace.workspace_id ?? null,
     }),
-    [activeWorkspace, activePaneId, activeStatus, activeWorkspaceId, parkedIds, paneStatuses, workspaceRows],
+    [inboxLoaded, activeWorkspace, activePaneId, activeStatus, activeWorkspaceId, parkedIds, paneStatuses, workspaceRows],
   );
   const commandRows = useMemo<CommandRow[]>(
     () =>

@@ -72,7 +72,8 @@ vi.mock("@/components/automations/automations-view", () => ({
 vi.mock("@/components/devices/devices-view", () => ({
   DevicesView: () => <div data-testid="devices-view" />,
 }));
-vi.mock("@/components/overlays/command-palette", () => ({
+vi.mock("@/components/overlays/command-palette", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/components/overlays/command-palette")>(),
   CommandPalette: () => null,
 }));
 vi.mock("@/components/overlays/new-project-screen", () => ({
@@ -147,6 +148,8 @@ vi.mock("@/stores/ui-store", () => ({
     {
       getState: () => ({
         setSidebarToggleFn: vi.fn(),
+        setShowSettings: (show: boolean) => { showSettingsFlag = show; },
+        setShowAutomations: (show: boolean) => { showAutomationsFlag = show; },
       }),
     },
   ),
@@ -299,6 +302,20 @@ describe("AppShell rendering gates", () => {
     const { findByTestId, queryByTestId } = render(<AppShell />);
     expect(await findByTestId("settings-view")).toBeInTheDocument();
     expect(queryByTestId("devices-view")).toBeNull();
+  });
+
+  it("opens Automations from the Settings command palette", async () => {
+    showSettingsFlag = true;
+    const { PALETTE_COMMANDS } = await import("@/components/overlays/command-palette");
+    const view = render(<AppShell />);
+    expect(await view.findByTestId("settings-view")).toBeInTheDocument();
+    PALETTE_COMMANDS.find((command) => command.id === "automations")?.run?.({
+      inboxLoaded: true, workspace: null, activePaneId: undefined,
+      workspaceStatus: null, parked: false, runningAgent: null, nextWorkspaceId: null,
+    });
+    view.rerender(<AppShell />);
+    expect(await view.findByTestId("automations-view")).toBeInTheDocument();
+    expect(view.queryByTestId("settings-view")).toBeNull();
   });
 
   it("marks shell ready, paints twice, then schedules idle prefetch", () => {
