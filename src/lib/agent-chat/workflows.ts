@@ -200,15 +200,25 @@ export function workflowPhaseStats(
   return { total: phase.agents.length, running, done, failed, tokens, elapsedMs };
 }
 
+export type WorkflowPhaseStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "stopped"
+  | "skipped";
+
 /** Derived per-phase status: agents running → `running`; every agent
- *  terminal → `done` (or `failed` when any of them failed); no agents yet
- *  while the run is still going → `pending`; no agents ever attributed
- *  and the run has already ended → `done`/`failed` alongside the run
- *  (an empty planned phase the workflow skipped). */
+ *  terminal → `failed` when any failed, `done` when all completed, else
+ *  `stopped` (some agents were stopped or interrupted before finishing);
+ *  no agents yet while the run is still going → `pending`. A phase that
+ *  never got an agent is `done` once the run completed (the workflow had
+ *  nothing for it) and `skipped` when the run failed or was stopped
+ *  before reaching it. */
 export function workflowPhaseStatus(
   phase: WorkflowPhaseView,
   runStatus: WorkflowRunStatus,
-): "pending" | "running" | "done" | "failed" {
+): WorkflowPhaseStatus {
   const hasRunning = phase.agents.some((a) => a.status === "running" || a.status === "pending");
   if (hasRunning) return "running";
   if (phase.agents.length > 0) {
@@ -219,17 +229,13 @@ export function workflowPhaseStatus(
         a.status === "stopped" ||
         a.status === "interrupted",
     );
-    if (allTerminal) {
-      // `interrupted` behaves like `stopped` here — only a real `failed`
-      // marks the phase failed.
-      const hasFailed = phase.agents.some((a) => a.status === "failed");
-      return hasFailed ? "failed" : "done";
-    }
-    return "pending";
+    if (!allTerminal) return "pending";
+    if (phase.agents.some((a) => a.status === "failed")) return "failed";
+    if (phase.agents.every((a) => a.status === "completed")) return "done";
+    return "stopped";
   }
-  if (runStatus === "completed" || runStatus === "failed" || runStatus === "stopped") {
-    return runStatus === "failed" ? "failed" : "done";
-  }
+  if (runStatus === "completed") return "done";
+  if (runStatus === "failed" || runStatus === "stopped") return "skipped";
   return "pending";
 }
 
@@ -261,6 +267,8 @@ export function workflowRunStats(
     : Math.max(0, now - item.startedAt);
   const phasesTotal = Math.max(item.plannedPhases.length, item.phases.length);
   const statuses = item.phases.map((p) => workflowPhaseStatus(p, item.status));
+  // Phases that never finished their work (stopped or skipped) are not
+  // progress.
   const phasesDone = statuses.filter((s) => s === "done" || s === "failed").length;
   const runningIndex = statuses.findIndex((s) => s === "running");
   const currentPhaseIndex = runningIndex >= 0 ? runningIndex : statuses.length;

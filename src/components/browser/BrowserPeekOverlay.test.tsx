@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
-import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import { DEFAULT_PEEK_SIZE, useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
@@ -14,19 +14,28 @@ import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@
 // testable in jsdom without heavy mocking). Stub it to a sentinel so we
 // can assert the props the overlay hands it.
 vi.mock("@/components/browser/BrowserPane", () => ({
-  BrowserPane: (props: Record<string, unknown>) => (
-    <div
-      data-testid="browser-pane-stub"
-      data-browser-id={props.browserId as string}
-      data-workspace-id={props.workspaceId as string}
-      data-hide-toolbar={String(props.hideToolbar)}
-    />
-  ),
+  BrowserPane: (props: Record<string, unknown>) => {
+    mocks.onStatusChange = props.onStatusChange as typeof mocks.onStatusChange;
+    return (
+      <div
+        data-testid="browser-pane-stub"
+        data-browser-id={props.browserId as string}
+        data-workspace-id={props.workspaceId as string}
+        data-hide-toolbar={String(props.hideToolbar)}
+      />
+    );
+  },
 }));
 
 const mocks = vi.hoisted(() => ({
   guiChrome: true,
   dockBrowserInRightPanel: vi.fn().mockResolvedValue(undefined),
+  onStatusChange: undefined as undefined | ((status: string) => void),
+  toastError: vi.fn(),
+}));
+
+vi.mock("@/lib/toast", () => ({
+  toast: { error: (...a: unknown[]) => mocks.toastError(...a) },
 }));
 
 vi.mock("@/hooks/use-gui-chrome", () => ({
@@ -125,9 +134,10 @@ function renderOverlay() {
 
 beforeEach(() => {
   mocks.guiChrome = true;
-  mocks.dockBrowserInRightPanel.mockClear();
+  mocks.dockBrowserInRightPanel.mockReset().mockResolvedValue(undefined);
+  mocks.toastError.mockClear();
   useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
-  useBrowserPeekStore.setState({ openWorkspaceId: null });
+  useBrowserPeekStore.setState({ openWorkspaceId: null, size: DEFAULT_PEEK_SIZE });
 });
 
 afterEach(() => {
@@ -230,5 +240,80 @@ describe("BrowserPeekOverlay", () => {
     });
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("keeps the panel mounted while it animates out, then removes it", async () => {
+    setAppState([makeSession()]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    act(() => useBrowserPeekStore.getState().close("ws-1"));
+    expect(screen.getByRole("dialog")).toHaveAttribute("data-state", "closed");
+    await vi.waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  it("drives the status dot from the stream status", () => {
+    setAppState([makeSession()]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    expect(screen.getByRole("img", { name: "Connecting" })).toBeInTheDocument();
+    act(() => mocks.onStatusChange?.("live"));
+    expect(screen.getByRole("img", { name: "Live" })).toBeInTheDocument();
+    act(() => mocks.onStatusChange?.("error"));
+    expect(screen.getByRole("img", { name: "Disconnected" })).toBeInTheDocument();
+  });
+
+  it("uses the stored size", () => {
+    useBrowserPeekStore.setState({ size: { width: 500, height: 320 } });
+    setAppState([makeSession()]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.style.getPropertyValue("--peek-w")).toBe("500px");
+    expect(dialog.style.getPropertyValue("--peek-h")).toBe("320px");
+  });
+
+  it("shrinks to the 60% cap when the window gets smaller", () => {
+    const original = { width: window.innerWidth, height: window.innerHeight };
+    const setWindow = (width: number, height: number) => {
+      Object.defineProperty(window, "innerWidth", { value: width, configurable: true });
+      Object.defineProperty(window, "innerHeight", { value: height, configurable: true });
+    };
+    try {
+      setWindow(1400, 1000);
+      useBrowserPeekStore.setState({ size: { width: 600, height: 400 } });
+      setAppState([makeSession()]);
+      useBrowserPeekStore.getState().open("ws-1");
+      renderOverlay();
+      const dialog = screen.getByRole("dialog");
+      expect(dialog.style.getPropertyValue("--peek-w")).toBe("600px");
+
+      act(() => {
+        setWindow(800, 600);
+        window.dispatchEvent(new Event("resize"));
+      });
+      expect(dialog.style.getPropertyValue("--peek-w")).toBe("480px");
+      expect(dialog.style.getPropertyValue("--peek-h")).toBe("360px");
+    } finally {
+      setWindow(original.width, original.height);
+    }
+  });
+
+  it("says so when promoting to the side panel fails, and stays open", async () => {
+    mocks.dockBrowserInRightPanel.mockRejectedValueOnce("dock failed");
+    setAppState([makeSession()]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open in side panel" }),
+    );
+    await vi.waitFor(() => {
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        "Couldn't open the browser in the side panel",
+        { description: "dock failed" },
+      );
+    });
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
   });
 });

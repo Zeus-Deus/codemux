@@ -115,6 +115,7 @@ export function CloneDialog() {
                 size="sm"
                 className="shrink-0"
                 onClick={handlePickDir}
+                aria-label="Choose folder"
               >
                 <FolderOpen className="size-3.5" />
               </Button>

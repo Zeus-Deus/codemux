@@ -197,7 +197,9 @@ export function SidebarEmptyState({ filterName }: { filterName: string | null })
       <figure className="flex flex-col items-center gap-2">
         <blockquote
           style={{ fontFamily: "'Instrument Serif', Georgia, serif" }}
-          className="max-w-[15.5rem] text-[23px] italic leading-[1.1] text-foreground/90"
+          // Display size for the serif quote, above the UI type scale on
+          // purpose, but in rem so it still follows the interface size.
+          className="max-w-[15.5rem] text-[1.4375rem] italic leading-[1.1] text-foreground/90"
         >
           {`“${plate.quote}”`}
         </blockquote>

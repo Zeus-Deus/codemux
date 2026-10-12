@@ -15,6 +15,10 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     listMcpServers: vi.fn(),
+    agentConnectorStatus: vi.fn().mockResolvedValue({
+      enabled: false, publicOrigin: null, listenerRunning: false, mcpUrl: null,
+      localCommand: "/usr/bin/codemux mcp", pending: [], clients: [],
+    }),
     getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
     setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
     primeMcpRuntime: vi.fn().mockResolvedValue([]),
@@ -24,12 +28,18 @@ vi.mock("@/tauri/commands", async (importActual) => {
   };
 });
 
+const { mockToastError } = vi.hoisted(() => ({ mockToastError: vi.fn() }));
+vi.mock("@/lib/toast", () => ({
+  toast: { error: mockToastError, success: vi.fn(), info: vi.fn() },
+}));
+
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
 import { McpSection } from "./mcp-section";
 import { listMcpServers } from "@/tauri/commands";
+import { useMcpStore } from "@/stores/mcp-store";
 
 const listMcpServersMock = listMcpServers as unknown as ReturnType<typeof vi.fn>;
 
@@ -57,6 +67,31 @@ afterEach(() => {
 });
 
 describe("McpSection", () => {
+  it("separates inbound Outside assistants from outbound MCP servers", async () => {
+    listMcpServersMock.mockResolvedValueOnce([makeServer({ name: "outbound" })]);
+    render(<McpSection projectRoot={null} />);
+    expect(await screen.findByText("outbound")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Outside assistants" })).toBeInTheDocument();
+    expect(await screen.findByText("/usr/bin/codemux mcp")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Enable HTTP MCP connections" })).not.toBeChecked();
+  });
+  it("hides inbound administration from remote clients in classic CLI mode without outbound IPC", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    const { agentConnectorStatus, getMcpRuntimeStatus, primeMcpRuntime } = await import("@/tauri/commands");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    (window as unknown as { __CODEMUX_REMOTE__: boolean }).__CODEMUX_REMOTE__ = true;
+    vi.clearAllMocks();
+    const view = render(<McpSection projectRoot={null} />);
+    try {
+      expect(screen.getByText("Manage connections from the desktop")).toBeInTheDocument();
+      expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+      expect(agentConnectorStatus).not.toHaveBeenCalled();
+      expect(listMcpServers).not.toHaveBeenCalled();
+      expect(getMcpRuntimeStatus).not.toHaveBeenCalled();
+      expect(primeMcpRuntime).not.toHaveBeenCalled();
+    } finally { view.unmount(); useFeatureFlags.setState({ enableAgentChat: true }); (window as unknown as { __CODEMUX_REMOTE__: boolean }).__CODEMUX_REMOTE__ = false; }
+  });
+
   it("renders discovered servers grouped by primary source", async () => {
     listMcpServersMock.mockResolvedValueOnce([
       makeServer({
@@ -293,6 +328,66 @@ describe("McpSection", () => {
     await waitFor(() => {
       expect(stopMcpServerCmd).toHaveBeenCalledWith("id-toggle");
     });
+  });
+
+  it.each([
+    { verb: "start", command: "startMcpServerCmd", testId: "toggle" },
+    { verb: "stop", command: "stopMcpServerCmd", testId: "toggle" },
+    { verb: "restart", command: "restartMcpServerCmd", testId: "restart" },
+  ] as const)(
+    "tells the user when trying to $verb a server fails",
+    async ({ verb, command, testId }) => {
+      const commands = (await import(
+        "@/tauri/commands"
+      )) as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      commands[command].mockRejectedValueOnce(new Error("process busy"));
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      mockToastError.mockClear();
+      // Start fires when re-enabling a disabled row; restart only renders
+      // for an errored row.
+      useMcpStore.setState({ disabledIds: verb === "start" ? ["id-fail"] : [] });
+      if (verb === "restart") {
+        commands.getMcpRuntimeStatus.mockResolvedValueOnce([
+          {
+            id: "id-fail",
+            name: "flaky",
+            status: { kind: "errored", message: "crashed" },
+            toolsCount: 0,
+            errorMessage: "crashed",
+            stderrTail: null,
+            startedAtMs: null,
+          },
+        ]);
+      }
+
+      listMcpServersMock.mockResolvedValueOnce([
+        makeServer({ id: "id-fail", name: "flaky", sources: ["claudeUser"] }),
+      ]);
+
+      render(<McpSection projectRoot={null} />);
+
+      fireEvent.click(await screen.findByTestId(`mcp-row-id-fail-${testId}`));
+
+      await waitFor(() => {
+        expect(mockToastError).toHaveBeenCalledWith(`Couldn't ${verb} flaky`, {
+          description: "process busy",
+        });
+      });
+      expect(mockToastError).toHaveBeenCalledTimes(1);
+      useMcpStore.setState({ disabledIds: [] });
+    },
+  );
+
+  it("reveals View tools on keyboard focus and touch, not only hover", async () => {
+    listMcpServersMock.mockResolvedValueOnce([
+      makeServer({ id: "id-view", name: "viewable", sources: ["claudeUser"] }),
+    ]);
+
+    render(<McpSection projectRoot={null} />);
+
+    const view = await screen.findByTestId("mcp-row-id-view-view");
+    expect(view.className).toContain("group-focus-within:opacity-100");
+    expect(view.className).toContain("pointer-coarse:opacity-100");
   });
 
   it("does NOT show a disambiguator when a name appears only once", async () => {

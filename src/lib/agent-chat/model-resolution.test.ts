@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import type { ChatModelInfo } from "@/tauri/types";
 import {
+  resolveServiceTier,
+  serviceTierOptions,
   resolveEffort,
   effortForApi,
   resolveContextWindow,
@@ -158,5 +160,32 @@ describe("small predicates", () => {
     expect(isPromptInjectedEffort(OPUS_4_7, "ultrathink")).toBe(true);
     expect(isPromptInjectedEffort(OPUS_4_7, "xhigh")).toBe(false);
     expect(isPromptInjectedEffort(HAIKU, "ultrathink")).toBe(false);
+  });
+});
+
+describe("service tiers", () => {
+  const model: ChatModelInfo = {
+    ...OPUS_4_7,
+    supports_fast_mode: true,
+    service_tiers: [
+      { value: "priority", label: "Fast", description: "Premium speed" },
+      { value: "ultrafast", label: "Ultrafast", description: "Higher usage rate" },
+    ],
+  };
+
+  it("uses advertised IDs and resolves the legacy Fast alias", () => {
+    expect(serviceTierOptions(model).map((tier) => tier.value)).toEqual(["default", "priority", "ultrafast"]);
+    expect(resolveServiceTier(model, "fast")).toBe("priority");
+    expect(resolveServiceTier(model, "ultrafast")).toBe("ultrafast");
+  });
+
+  it("clears an unavailable premium tier on model changes", () => {
+    expect(resolveServiceTier({ ...model, service_tiers: model.service_tiers?.slice(0, 1) }, "ultrafast")).toBe("default");
+    expect(resolveServiceTier({ ...model, service_tiers: [], supports_fast_mode: false }, "priority")).toBe("default");
+  });
+
+  it("supports boolean providers and older capability payloads", () => {
+    expect(resolveServiceTier({ ...model, service_tiers: undefined }, "fast")).toBe("fast");
+    expect(resolveServiceTier({ ...model, service_tiers: undefined }, "ultrafast")).toBe("default");
   });
 });

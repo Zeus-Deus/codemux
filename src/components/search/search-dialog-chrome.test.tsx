@@ -14,9 +14,11 @@ import { useUIStore } from "@/stores/ui-store";
 
 vi.mock("@/tauri/commands", () => ({
   searchFileNames: vi.fn().mockResolvedValue([]),
-  searchFileContents: vi.fn().mockResolvedValue([]),
+  searchInFiles: vi.fn().mockResolvedValue([]),
+  getGitStatus: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("@/stores/app-store", () => ({
+  selectActiveWorkspaceId: () => null,
   useActiveWorkspaceCwd: () => "/repo",
   useAppStore: Object.assign(
     vi.fn(() => null),

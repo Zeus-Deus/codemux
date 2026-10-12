@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
-import { btnCard, btnCardStrong, tzBodyLg, tzMeta } from "./review-ui";
+import { modEnterLabel } from "@/lib/keybind-utils";
+import { btnCard, btnCardStrong, kbdChip, tzBodyLg, tzMeta, underRowInset } from "./review-ui";
 
 interface Props {
   /** "line 43" or "lines 43–44". */
@@ -78,7 +79,10 @@ export function ReviewLineComposer({
   return (
     <div
       data-testid="line-composer"
-      className="my-1 ml-[72px] mr-3 overflow-hidden rounded-lg bg-muted/40 ring-1 ring-accent-ember/30"
+      className={cn(
+        "my-1 overflow-hidden rounded-lg bg-muted/40 ring-1 ring-accent-ember/30",
+        underRowInset,
+      )}
     >
       <div className="flex items-center gap-2 border-b border-border/40 px-2.5 py-2">
         <span className={cn("font-mono text-accent-ember", tzMeta)}>{label}</span>
@@ -131,7 +135,7 @@ export function ReviewLineComposer({
             </button>
           )}
           <span className="flex-1" />
-          <span className={cn("font-mono text-muted-foreground", tzMeta)}>⌘↵</span>
+          <kbd className={kbdChip}>{modEnterLabel()}</kbd>
         </div>
       </div>
     </div>
