@@ -53,6 +53,9 @@ pub struct State {
     models: HashMap<String, Value>,
     recovered_sequences: HashMap<String, u64>,
     terminal_sequences: HashMap<String, (String, u64)>,
+    recovered_terminals: HashSet<(String, String)>,
+    user_admissions: HashMap<String, (String, String)>,
+    awaiting_execution: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +80,44 @@ impl State {
             .into_iter()
             .chain(self.terminal_sequences.get(session).map(|(_, seq)| *seq))
             .max()
+    }
+    pub fn observed_idle_id(&self, session: &str) -> Option<String> {
+        let recovered = self.recovered_idle.get(session).and_then(Value::as_str);
+        let terminal = self.terminal_sequences.get(session);
+        if recovered.is_some() && self.recovered_sequence(session)
+            .is_some_and(|seq| terminal.is_none_or(|(_, live)| seq >= *live)) {
+            return recovered.map(str::to_string);
+        }
+        terminal.and_then(|(id, _)| id.strip_prefix("evt_"))
+            .map(|suffix| format!("msg_{suffix}"))
+    }
+    pub fn remember_user_admission(&mut self, session: &str, input_id: &str, turn_id: &str) {
+        self.user_admissions.insert(session.into(), (input_id.into(), turn_id.into()));
+    }
+    pub fn user_admission_for(&self, session: &str, turn_id: &str) -> Option<String> {
+        self.user_admissions.get(session)
+            .filter(|(_, admitted)| admitted == turn_id).map(|(input, _)| input.clone())
+    }
+    pub fn awaiting_execution(&self, session: &str) -> bool {
+        self.awaiting_execution.contains_key(session)
+    }
+    pub fn defer_execution(&mut self, session: &str, sequence: u64) {
+        self.awaiting_execution.insert(session.into(), sequence);
+        self.running.insert(session.into());
+    }
+    pub fn clear_deferred_execution(&mut self, session: &str) -> bool {
+        if self.awaiting_execution.remove(session).is_some() {
+            self.running.remove(session);
+            return true;
+        }
+        false
+    }
+    fn observe_terminal(&mut self, session: &str, event: &Event) {
+        if let Some(seq) = event.sequence(session) {
+            if self.terminal_sequences.get(session).is_none_or(|(_, observed)| seq > *observed) {
+                self.terminal_sequences.insert(session.into(), (event.id.clone(), seq));
+            }
+        }
     }
     pub fn completed_idle_sequence(&self, session: &str, idle_id: &str) -> Option<u64> {
         let event_id = idle_id
@@ -106,7 +147,8 @@ impl State {
                 .terminal_sequences
                 .get(session)
                 .is_some_and(|(id, _)| id == &event_id);
-            return !observed && previous.as_ref().is_none_or(|old| old != &boundary);
+            let unseen = self.recovered_terminals.insert((session.into(), event_id));
+            return !observed && unseen;
         }
         self.running.contains(session)
             || previous.as_ref().is_some_and(|old| old != &boundary)
@@ -114,6 +156,20 @@ impl State {
     }
     pub fn reduce(&mut self, event: &Event) -> Result<Vec<Update>, String> {
         if let Some(session) = event.session_id() {
+            // The active snapshot can include a buffered start without enough
+            // current history to distinguish it from completed callbacks.
+            // Only newer starts or genuine new content/requests admit a turn.
+            if event.kind == "session.execution.started"
+                && event.sequence(session).zip(self.awaiting_execution.get(session))
+                    .is_some_and(|(seq, checkpoint)| seq <= *checkpoint) {
+                return Ok(vec![]);
+            }
+            if matches!(event.kind.as_str(), "session.execution.succeeded"
+                | "session.execution.failed" | "session.execution.interrupted")
+                && self.recovered_terminals.contains(&(session.into(), event.id.clone())) {
+                self.observe_terminal(session, event);
+                return Ok(vec![]);
+            }
             if event
                 .sequence(session)
                 .zip(self.recovered_sequence(session))
@@ -165,10 +221,7 @@ impl State {
             "session.execution.succeeded"
             | "session.execution.failed"
             | "session.execution.interrupted" => {
-                if let Some(seq) = event.sequence(session) {
-                    self.terminal_sequences
-                        .insert(session.into(), (event.id.clone(), seq));
-                }
+                self.observe_terminal(session, event);
                 if self.running.remove(session) {
                     self.settled.insert(session.into());
                     out.push(Update::Terminal {
@@ -322,6 +375,15 @@ impl State {
             // Busy/idle, step completion, and deprecated session.idle never
             // settle the user turn. Execution terminals are authoritative.
             _ => {}
+        }
+        if self.awaiting_execution.contains_key(session) && out.iter().any(|update|
+            matches!(update, Update::Started | Update::Terminal { .. }
+                | Update::Content { .. } | Update::ToolUse { .. } | Update::ToolResult { .. }
+                | Update::Permission(_) | Update::Form(_))) {
+            self.awaiting_execution.remove(session);
+            if !out.iter().any(|update| matches!(update, Update::Started)) {
+                out.insert(0, Update::Started);
+            }
         }
         Ok(out)
     }
