@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button";
 import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
-import { closePane, splitPane } from "@/tauri/commands";
+import { splitPane } from "@/tauri/commands";
+import { requestClosePane } from "@/lib/close-guard";
 import type { PaneNodeSnapshot } from "@/tauri/types";
 import { cn } from "@/lib/utils";
 import { PanelHeader } from "@/components/ui/panel-header";
@@ -43,7 +44,7 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
     splitPane(pane.pane_id, direction).catch(console.error);
   };
   const handleClose = () => {
-    closePane(pane.pane_id).catch(console.error);
+    void requestClosePane(pane.pane_id);
   };
 
   return (

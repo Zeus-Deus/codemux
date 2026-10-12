@@ -1,15 +1,18 @@
 import { useEffect, useRef } from "react";
 import {
   splitPane,
-  closePane,
   createTab,
-  closeTab,
   activateTab,
   activateWorkspace,
   createEmptyWorkspace,
   runProjectDevCommand,
 } from "@/tauri/commands";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
+import {
+  reopenClosedTab,
+  requestClosePane,
+  requestCloseTab,
+} from "@/lib/close-guard";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -322,8 +325,11 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
   if (actionId === "closeTab") {
-    if (ws.tabs.length > 0)
-      closeTab(ws.workspace_id, ws.active_tab_id).catch(reportFailure("Couldn't close the tab"));
+    if (ws.tabs.length > 0) void requestCloseTab(ws.workspace_id, ws.active_tab_id);
+    return true;
+  }
+  if (actionId === "reopenClosedTab") {
+    reopenClosedTab();
     return true;
   }
 
@@ -346,7 +352,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     return true;
   }
   if (actionId === "closePane") {
-    if (activePaneId) closePane(activePaneId).catch(reportFailure("Couldn't close the pane"));
+    if (activePaneId) void requestClosePane(activePaneId);
     return true;
   }
 

@@ -502,6 +502,10 @@ export const cyclePane = (step: number) =>
 export const closePane = (paneId: string) =>
   invoke<string | null>("close_pane", { paneId });
 
+/** Capture and shut down the provider session before removing its pane. */
+export const agentChatClosePane = (paneId: string) =>
+  invoke<void>("agent_chat_close_pane", { paneId });
+
 export const swapPanes = (sourcePaneId: string, targetPaneId: string) =>
   invoke("swap_panes", { sourcePaneId, targetPaneId });
 
@@ -1416,6 +1420,12 @@ export const resumePtyOutput = (sessionId: string, generation?: number) =>
  *  they already had rather than clearing. See `terminal_session_cwds`. */
 export const terminalSessionCwds = (sessionIds: string[]) =>
   invoke<Record<string, string>>("terminal_session_cwds", { sessionIds });
+
+/** `session_id -> command name` for the sessions whose shell is running a
+ *  foreground job (a dev server, a build, an agent CLI). Idle shells, remote
+ *  panes and non-Linux hosts are omitted. See `terminal_foreground_jobs`. */
+export const terminalForegroundJobs = (sessionIds: string[]) =>
+  invoke<Record<string, string>>("terminal_foreground_jobs", { sessionIds });
 
 /** Attach an output subscriber to a session's PTY stream. Resolves with the
  *  subscriber generation token, which must be handed to `detachPtyOutput` /

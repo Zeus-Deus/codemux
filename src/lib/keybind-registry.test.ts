@@ -72,6 +72,19 @@ describe("keybind-registry", () => {
     expect(entry!.when).toBe("non-terminal");
   });
 
+  it("keeps Ctrl+W out of the terminal's way", () => {
+    const entry = getRegistryEntry("closeTab");
+    expect(entry!.defaultKeys).toBe("Ctrl+W");
+    // Ctrl+W is delete-word in every shell.
+    expect(entry!.when).toBe("non-terminal");
+  });
+
+  it("registers reopen-closed-chat on Ctrl+Shift+T", () => {
+    const entry = getRegistryEntry("reopenClosedTab");
+    expect(entry!.defaultKeys).toBe("Ctrl+Shift+T");
+    expect(entry!.category).toBe("tabs");
+  });
+
   it("registers reload-blocking shortcuts", () => {
     const blockReload = getRegistryEntry("blockReload");
     expect(blockReload).toBeDefined();

@@ -700,6 +700,21 @@ function emitAppStateDelta(delta: AppStateDelta): void {
   emitEvent("app-state-delta", payload);
 }
 
+/** Replace a workspace with an updated copy. The renderer shares structure
+ *  with the snapshot it already holds, so mutating that object in place would
+ *  leave the next emit looking unchanged. */
+function replaceWorkspace(
+  workspaceId: string,
+  update: (ws: WorkspaceSnapshot) => Partial<WorkspaceSnapshot>,
+): void {
+  appState = {
+    ...appState,
+    workspaces: appState.workspaces.map((w) =>
+      w.workspace_id === workspaceId ? { ...w, ...update(w) } : w,
+    ),
+  };
+}
+
 /** Every leaf pane id under `node`, in tree order. */
 function leafPaneIds(node: PaneNodeSnapshot): string[] {
   if (node.kind !== "split") return [node.pane_id];
@@ -1182,6 +1197,13 @@ let floodCounter = 0;
  *
  *   window.__codemuxTerminalMock.emitOsc7("/home/zeus/proj/src-tauri")
  */
+/** Per-session overrides for `terminal_foreground_jobs` (null = idle). */
+const mockForegroundJobs = new Map<string, string | null>();
+
+function setForegroundJob(sessionId: string, job: string | null): void {
+  mockForegroundJobs.set(sessionId, job);
+}
+
 function emitOsc7(cwd: string, sessionId?: string): void {
   // `ESC ] 7 ; file://<host>/<path> BEL` — the form vte, fish, and
   // kitty's shell integration all emit.
@@ -3411,12 +3433,14 @@ function streamMockDelegatedTask(
       flood: typeof floodTerminals;
       emitSerializeBuffers: typeof emitSerializeBuffers;
       emitOsc7: typeof emitOsc7;
+      setForegroundJob: typeof setForegroundJob;
     };
   }
 ).__codemuxTerminalMock = {
   flood: floodTerminals,
   emitSerializeBuffers,
   emitOsc7,
+  setForegroundJob,
 };
 
 // ── Editor disk overlay ──────────────────────────────────────────────
@@ -6787,6 +6811,30 @@ const handlers: Record<string, Handler> = {
     }
     return out;
   },
+  // Twin of `terminal_foreground_jobs`. There is no shell here, so the
+  // port-detection workspace's terminal plays a running dev server and every
+  // other session sits at its prompt. Override per session with
+  // `window.__codemuxTerminalMock.setForegroundJob(sessionId, "cargo" | null)`.
+  terminal_foreground_jobs: (a) => {
+    const out: Record<string, string> = {};
+    const ports = findWorkspace("ws-codemux-ports");
+    const portsSessions = new Set(
+      (ports?.surfaces ?? []).flatMap((surface) =>
+        leafPaneNodes(surface.root).flatMap((node) =>
+          node.kind === "terminal" ? [node.session_id] : [],
+        ),
+      ),
+    );
+    for (const id of (a.sessionIds as string[]) ?? []) {
+      const job = mockForegroundJobs.has(id)
+        ? mockForegroundJobs.get(id)
+        : portsSessions.has(id)
+          ? "node"
+          : null;
+      if (job) out[id] = job;
+    }
+    return out;
+  },
   clear_agent_status: () => undefined,
 
   // ── Terminal scrollback (issue #128) — faithful two-store twin of
@@ -7052,6 +7100,16 @@ const handlers: Record<string, Handler> = {
     emitAppState();
     return undefined;
   },
+  reorder_tabs: (a) => {
+    const order = (a.tabIds as string[]) ?? [];
+    replaceWorkspace(a.workspaceId as string, (ws) => ({
+      tabs: [...ws.tabs].sort(
+        (x, y) => order.indexOf(x.tab_id) - order.indexOf(y.tab_id),
+      ),
+    }));
+    emitAppState();
+    return undefined;
+  },
   // Both replace the workspace object rather than mutating it, so the
   // store's structural sharing sees the change.
   rename_tab: (a) => {
@@ -7080,9 +7138,11 @@ const handlers: Record<string, Handler> = {
     // Like the backend, drop the terminal and browser sessions the tab owned.
     const removedSessions = new Set<string>();
     const removedBrowsers = new Set<string>(closed.browser_id ? [closed.browser_id] : []);
+    const removedPaneIds = new Set<string>();
     for (const surface of ws.surfaces) {
       if (surface.surface_id !== closed.surface_id) continue;
       for (const node of leafPaneNodes(surface.root)) {
+        removedPaneIds.add(node.pane_id);
         if (node.kind === "terminal") removedSessions.add(node.session_id);
         if (node.kind === "browser") removedBrowsers.add(node.browser_id);
       }
@@ -7108,6 +7168,9 @@ const handlers: Record<string, Handler> = {
       ),
       browser_sessions: appState.browser_sessions.filter(
         (b) => !removedBrowsers.has(b.browser_id),
+      ),
+      pane_statuses: Object.fromEntries(
+        Object.entries(appState.pane_statuses).filter(([id]) => !removedPaneIds.has(id)),
       ),
     };
     emitAppState();
@@ -7249,6 +7312,50 @@ const handlers: Record<string, Handler> = {
           }
         }
       }
+    }
+    // `NewTab` gets its own tab, as in the backend (reopening a closed chat
+    // lands here with the chat's old thread id).
+    if (ws && a.launchMode === "new_tab") {
+      const n = ++mockTabSeq;
+      const paneId = `pane-mock-chat-${n}`;
+      const surfaceId = `surface-mock-chat-${n}`;
+      const tabId = `tab-mock-chat-${n}`;
+      replaceWorkspace(ws.workspace_id, () => ({
+        surfaces: [
+          ...ws.surfaces,
+          {
+            surface_id: surfaceId,
+            title: "Agent Chat",
+            active_pane_id: paneId,
+            root: {
+              kind: "agent_chat",
+              pane_id: paneId,
+              title: "Agent Chat",
+              thread_id: threadId,
+              provider: (a.provider as AgentChatProviderKind | null) ?? null,
+              cwd: (a.cwd as string | null) ?? null,
+            },
+          },
+        ],
+        tabs: [
+          ...ws.tabs,
+          {
+            tab_id: tabId,
+            kind: "terminal",
+            title: "Agent Chat",
+            surface_id: surfaceId,
+            browser_id: null,
+            icon: null,
+          },
+        ],
+        active_tab_id: tabId,
+        active_surface_id: surfaceId,
+      }));
+      if (a.select !== false) {
+        appState = { ...appState, active_workspace_id: ws.workspace_id };
+      }
+      emitAppState();
+      return paneId;
     }
     // The deferred worktree workspace already carries a fresh
     // agent_chat pane (empty thread); bind the session to it. Falls
