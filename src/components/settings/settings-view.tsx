@@ -3,7 +3,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AddonsSettings } from "./addons-settings";
 import { HermesDefaultProfileSetting, HermesSetting } from "./hermes-setting";
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
 import { Button } from "@/components/ui/button";
@@ -1362,6 +1362,18 @@ export function SettingsView() {
     if (settingsSection !== null) setActiveSection(settingsSection);
   }, [settingsSection, settingsNavigationVersion]);
   const sectionAvailable = isSettingsSectionAvailable(activeSection, enableAgentChat);
+  const contentRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    // Repeated Settings requests should scroll to the top while preserving
+    // local editor state, including unsaved preset fields in the sheet.
+    const viewport = contentRef.current?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]',
+    );
+    if (viewport) {
+      viewport.scrollTop = 0;
+      viewport.scrollLeft = 0;
+    }
+  }, [activeSection, settingsNavigationVersion]);
   // The nav scrolls on short windows; keep the active row visible when a
   // deep link selects a section further down.
   const navRef = useRef<HTMLElement>(null);
@@ -2551,10 +2563,7 @@ export function SettingsView() {
         </nav>
 
         {/* Content */}
-        {/* Keyed by section and navigation: each page (including a deep link
-            back to the current one) opens at its top instead of the previous
-            scroll offset, and eases in rather than cutting. */}
-        <ScrollArea key={`${activeSection}:${settingsNavigationVersion}`} className="flex-1 bg-card">
+        <ScrollArea ref={contentRef} className="flex-1 bg-card">
           <div
             className={cn(
               "animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none",

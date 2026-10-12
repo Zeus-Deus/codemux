@@ -141,6 +141,10 @@ vi.mock("@/tauri/commands", () => ({
   deletePreset: vi.fn().mockResolvedValue(undefined),
   updatePreset: vi.fn().mockResolvedValue(undefined),
   listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
+  listChatProviderCapabilities: vi.fn().mockResolvedValue({
+    provider: "claude", models: [], effort_label_map: {},
+  }),
+  agentChatProviderHealth: vi.fn().mockResolvedValue({ status: "ready" }),
   // Usage section — needed so switching to it renders rather than
   // throwing on an undefined command wrapper.
   usageSummary: vi.fn().mockResolvedValue(null),
@@ -632,10 +636,42 @@ describe("Settings footer navigation", () => {
     const name = await screen.findByPlaceholderText("e.g. Git Pull");
     fireEvent.change(name, { target: { value: "Git Pull --rebase" } });
     expect(commands.updatePreset).not.toHaveBeenCalled();
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+    expect(screen.getByPlaceholderText("e.g. Git Pull")).toHaveValue("Git Pull --rebase");
     fireEvent.keyDown(name, { key: "Escape" });
     expect(commands.updatePreset).toHaveBeenCalledWith(
       expect.objectContaining({ id: "p1", name: "Git Pull --rebase" }),
     );
+    view.unmount();
+  });
+
+  it("preserves a new preset's draft fields when Settings is requested again", async () => {
+    vi.mocked(commands.updatePreset).mockClear();
+    requestedSection = "presets";
+    const view = render(<SettingsView />);
+    await view.findByText("Show preset bar");
+    fireEvent.click(view.getByRole("button", { name: "New preset" }));
+    const name = await screen.findByPlaceholderText("e.g. Git Pull");
+    const description = screen.getByPlaceholderText("Optional description");
+    const prompt = screen.getByPlaceholderText("e.g. pull the latest changes and resolve any conflicts");
+    fireEvent.change(name, { target: { value: "Review my changes" } });
+    fireEvent.change(description, { target: { value: "A draft I am still editing" } });
+    fireEvent.change(prompt, { target: { value: "Review the diff and run the affected tests" } });
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+    viewport.scrollTop = 400;
+
+    // Ctrl+, requests Settings without a section while it is already open.
+    requestedSection = null;
+    navigationVersion += 1;
+    view.rerender(<SettingsView />);
+
+    expect(screen.getByPlaceholderText("e.g. Git Pull")).toHaveValue("Review my changes");
+    expect(screen.getByPlaceholderText("Optional description")).toHaveValue("A draft I am still editing");
+    expect(screen.getByPlaceholderText("e.g. pull the latest changes and resolve any conflicts")).toHaveValue("Review the diff and run the affected tests");
+    expect(view.container.querySelector('[data-slot="scroll-area-viewport"]')).toBe(viewport);
+    expect(viewport.scrollTop).toBe(0);
+    expect(commands.updatePreset).not.toHaveBeenCalled();
     view.unmount();
   });
 
