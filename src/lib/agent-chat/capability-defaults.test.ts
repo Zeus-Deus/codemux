@@ -5,7 +5,6 @@ import {
   defaultModelId,
   defaultPermissionModeForProvider,
   fallbackModelLabel,
-  isBootstrapModelId,
   modelLabel,
   modelsForProvider,
 } from "./capability-defaults";
@@ -217,17 +216,6 @@ describe("capability-defaults", () => {
       expect(fallbackModelLabel("anthropic/claude-sonnet-4-6")).toBe(
         "anthropic/claude-sonnet-4-6",
       );
-    });
-  });
-
-  describe("isBootstrapModelId", () => {
-    it("recognises current and legacy placeholders only for their provider", () => {
-      expect(isBootstrapModelId("claude", "default")).toBe(true);
-      expect(isBootstrapModelId("claude", "claude-opus-4-8")).toBe(true);
-      expect(isBootstrapModelId("claude", "opus")).toBe(false);
-      expect(isBootstrapModelId("codex", "claude-opus-4-8")).toBe(false);
-      expect(isBootstrapModelId("codex", "gpt-5.4")).toBe(true);
-      expect(isBootstrapModelId("claude", null)).toBe(false);
     });
   });
 

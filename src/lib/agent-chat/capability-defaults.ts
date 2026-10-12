@@ -41,29 +41,6 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string |
   opencode: "anthropic/claude-sonnet-4-6",
 };
 
-/** Bootstrap ids earlier releases seeded before capabilities hydrated.
- *  Unsent persisted drafts can still carry them; they never reflect a
- *  user's choice, because the picker has no rows to pick from until the
- *  roster loads. */
-const LEGACY_BOOTSTRAP_MODEL_IDS: Partial<
-  Record<AgentChatProviderKind, ReadonlyArray<string>>
-> = {
-  claude: ["claude-opus-4-8"],
-};
-
-/** Whether `modelId` is a pre-hydration placeholder rather than a model
- *  the user picked from the roster. */
-export function isBootstrapModelId(
-  provider: AgentChatProviderKind,
-  modelId: string | null | undefined,
-): boolean {
-  if (!modelId) return false;
-  return (
-    modelId === FALLBACK_DEFAULT_MODEL_BY_PROVIDER[provider] ||
-    (LEGACY_BOOTSTRAP_MODEL_IDS[provider]?.includes(modelId) ?? false)
-  );
-}
-
 const CLAUDE_MODEL_ID =
   /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(?:\[[^\]]+\])?$/;
 

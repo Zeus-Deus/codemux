@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { act, renderHook } from "@testing-library/react";
 
 import {
   chatDraftHasUserContent,
@@ -7,11 +8,14 @@ import {
   selectActiveDraft,
   selectDraftForWorkspace,
   useChatDraftStore,
+  useReseedBootstrapDrafts,
   type ChatDraft,
   type DraftId,
 } from "./chat-draft-store";
 import { useAgentChatStore } from "./agent-chat-store";
 import { useSettingsStore } from "./settings-store";
+import { useAppStore } from "./app-store";
+import { createSeedAppState } from "@/dev/mock-fixtures";
 import { useProviderCapabilities } from "./provider-capabilities-store";
 import type { ChatModelInfo, ProviderChatCapabilities } from "@/tauri/types";
 
@@ -49,7 +53,8 @@ function resetStore() {
     activeDraftId: null,
   });
   useAgentChatStore.setState({ threads: {} });
-  useProviderCapabilities.setState({ claude: null });
+  useProviderCapabilities.setState({ claude: null, codex: null, cursor: null, grok: null, opencode: null });
+  useAppStore.setState({ appState: null });
 }
 
 describe("chat-draft-store", () => {
@@ -495,7 +500,7 @@ describe("chat-draft-store", () => {
         settings: {
           ...useSettingsStore.getState().settings,
           "chat.default_provider": "claude",
-          "chat.default_model": "default",
+          "chat.default_model": "",
           "chat.default_effort": "low",
         },
       });
@@ -522,14 +527,11 @@ describe("chat-draft-store", () => {
     });
 
     it("reseeds against a roster that was already restored from storage", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       unsubscribe();
       useProviderCapabilities.setState({
         claude: claudeCaps([{ id: "opus", label: "Claude Opus 5.5" }]),
       });
-      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
-      useChatDraftStore
-        .getState()
-        .updateDraftConfig(draft.draftId, { model: "claude-opus-4-8" });
 
       reseedBootstrapDrafts();
 
@@ -538,19 +540,115 @@ describe("chat-draft-store", () => {
       ).toBe("opus");
     });
 
-    it("migrates the legacy hardcoded id when the roster does not list it", () => {
+    it("preserves an explicit concrete choice absent from the refreshed roster", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore
         .getState()
-        .updateDraftConfig(draft.draftId, { model: "claude-opus-4-8" });
+        .updateDraftConfig(draft.draftId, {
+          model: "claude-opus-4-8", effort: "low", contextWindow: "200k",
+        });
 
       useProviderCapabilities.setState({
         claude: claudeCaps([{ id: "opus", label: "Claude Opus 5.5" }]),
       });
 
-      expect(
-        useChatDraftStore.getState().draftsById[draft.draftId].model,
-      ).toBe("opus");
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+        model: "claude-opus-4-8", effort: "low", contextWindow: "200k",
+        bootstrapModel: false,
+      });
+    });
+
+    it("preserves a concrete model chosen in new-chat settings before hydration", () => {
+      useSettingsStore.setState({ settings: {
+        "chat.default_provider": "claude", "chat.default_model": "claude-opus-4-8",
+      } });
+      try {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        useProviderCapabilities.setState({
+          claude: claudeCaps([{ id: "opus", label: "Claude Opus 5.5" }]),
+        });
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+          model: "claude-opus-4-8", bootstrapModel: false,
+        });
+      } finally {
+        useSettingsStore.setState({ settings: {} });
+      }
+    });
+
+    it("hydrates an automatic provider switch but preserves an explicit model pick", () => {
+      const automatic = useChatDraftStore.getState().getOrCreateHomeDraft();
+      const explicit = useChatDraftStore.getState().getOrCreateProjectDraft("/explicit");
+      useChatDraftStore.getState().updateDraftConfig(automatic.draftId, { provider: "codex" });
+      useChatDraftStore.getState().updateDraftConfig(explicit.draftId, {
+        provider: "codex", model: "gpt-5.4",
+      });
+      expect(useChatDraftStore.getState().draftsById[automatic.draftId]).toMatchObject({
+        model: "gpt-5.4", bootstrapModel: true,
+      });
+      useProviderCapabilities.setState({ codex: claudeCaps([
+        { id: "gpt-5.5", label: "GPT-5.5", default_effort: "high" },
+      ]) });
+      const { draftsById } = useChatDraftStore.getState();
+      expect(draftsById[automatic.draftId]).toMatchObject({
+        model: "gpt-5.5", effort: "high", bootstrapModel: false,
+      });
+      expect(draftsById[explicit.draftId]).toMatchObject({ model: "gpt-5.4", bootstrapModel: false });
+    });
+
+    it("finishes hydration when the automatic seed is already in the roster", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useProviderCapabilities.setState({ claude: claudeCaps([
+        { id: "default", label: "Default", default_effort: "high" },
+      ]) });
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+        model: "default", effort: "high", bootstrapModel: false,
+      });
+      useProviderCapabilities.setState({ claude: roster });
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].model).toBe("default");
+    });
+
+    it("preserves provider-native defaults for a draft with an explicit device", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: 7 });
+      useProviderCapabilities.setState({ claude: roster });
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+        model: "default", effort: null, contextWindow: null, bootstrapModel: true,
+      });
+    });
+
+    it.each([7, null])("resolves existing-workspace placement from its host %s", (hostId) => {
+      const appState = createSeedAppState();
+      const workspace = { ...appState.workspaces[0], host_id: hostId };
+      appState.workspaces = [workspace];
+      useAppStore.setState({ appState });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftConfig(draft.draftId, { hostId: hostId === null ? 7 : null });
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace", workspaceId: workspace.workspace_id,
+      });
+      useProviderCapabilities.setState({ claude: roster });
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject(hostId === null
+        ? { model: "opus", effort: "high", contextWindow: "1m", bootstrapModel: false }
+        : { model: "default", effort: null, contextWindow: null, bootstrapModel: true });
+    });
+
+    it("waits for an existing workspace to confirm local placement before hydration", () => {
+      const appState = createSeedAppState();
+      const workspace = { ...appState.workspaces[0], host_id: null };
+      appState.workspaces = [workspace];
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace", workspaceId: workspace.workspace_id,
+      });
+      const { unmount } = renderHook(useReseedBootstrapDrafts);
+      try {
+        act(() => useProviderCapabilities.setState({ claude: roster }));
+        expect(useChatDraftStore.getState().draftsById[draft.draftId].model).toBe("default");
+        act(() => useAppStore.setState({ appState }));
+        expect(useChatDraftStore.getState().draftsById[draft.draftId].model).toBe("opus");
+      } finally {
+        unmount();
+      }
     });
 
     it("keeps a model the roster lists, even a former placeholder id", () => {
@@ -605,6 +703,49 @@ describe("chat-draft-store", () => {
   });
 
   describe("persistence", () => {
+    it.each([false, true])("preserves model provenance across restore (explicit %s)", async (explicit) => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      if (explicit) {
+        useChatDraftStore.getState().updateDraftConfig(draft.draftId, { model: "claude-opus-4-8" });
+      }
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "unfinished draft");
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const raw = window.localStorage.getItem("codemux:chat-drafts:v1");
+      expect(raw).toBeTruthy();
+      useChatDraftStore.setState({ draftsById: {}, activeHomeDraftId: null });
+      useChatDraftStore.persist.clearStorage();
+      window.localStorage.setItem("codemux:chat-drafts:v1", raw!);
+      await useChatDraftStore.persist.rehydrate();
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].bootstrapModel).toBe(!explicit);
+      useProviderCapabilities.setState({ claude: claudeCaps([{ id: "opus", label: "Opus 5.5" }]) });
+      reseedBootstrapDrafts();
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+        model: explicit ? "claude-opus-4-8" : "opus",
+        inputDraft: "unfinished draft",
+        bootstrapModel: false,
+      });
+    });
+
+    it.each([2, 3])("preserves an unmarked legacy model restored from storage v%s", async (version) => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      const legacy = { ...draft, model: "claude-opus-4-8", inputDraft: "saved choice" };
+      delete legacy.bootstrapModel;
+      const payload = {
+        version,
+        state: { ...partializeChatDraftStoreState(useChatDraftStore.getState()),
+          draftsById: { [draft.draftId]: legacy } },
+      };
+      useChatDraftStore.persist.clearStorage();
+      window.localStorage.setItem("codemux:chat-drafts:v1", JSON.stringify(payload));
+      await useChatDraftStore.persist.rehydrate();
+      useProviderCapabilities.setState({ claude: claudeCaps([{ id: "opus", label: "Opus 5.5" }]) });
+      reseedBootstrapDrafts();
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toMatchObject({
+        model: "claude-opus-4-8", inputDraft: "saved choice",
+      });
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].bootstrapModel).toBeUndefined();
+    });
+
     it("keeps invested unmapped drafts and drops empty unmapped sessions", () => {
       const first = useChatDraftStore
         .getState()
