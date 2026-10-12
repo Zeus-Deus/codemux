@@ -57,7 +57,7 @@ pub struct State {
     recovered_terminals: HashSet<(String, String)>,
     user_admissions: HashMap<String, (String, String)>,
     pending_user_admissions: HashMap<String, (String, String)>,
-    awaiting_execution: HashMap<String, u64>,
+    awaiting_execution: HashMap<String, Option<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -137,6 +137,9 @@ impl State {
         self.awaiting_execution.contains_key(session)
     }
     pub fn defer_execution(&mut self, session: &str, sequence: u64) {
+        self.defer_live_execution(session, Some(sequence));
+    }
+    pub fn defer_live_execution(&mut self, session: &str, sequence: Option<u64>) {
         self.awaiting_execution.insert(session.into(), sequence);
         self.running.insert(session.into());
     }
@@ -202,8 +205,8 @@ impl State {
             if event.kind == "session.execution.started"
                 && event
                     .sequence(session)
-                    .zip(self.awaiting_execution.get(session))
-                    .is_some_and(|(seq, checkpoint)| seq <= *checkpoint)
+                    .zip(self.awaiting_execution.get(session).copied().flatten())
+                    .is_some_and(|(seq, checkpoint)| seq <= checkpoint)
             {
                 return Ok(vec![]);
             }
@@ -437,19 +440,25 @@ impl State {
                 matches!(
                     update,
                     Update::Started
-                        | Update::Terminal { .. }
                         | Update::Content { .. }
                         | Update::ToolUse { .. }
                         | Update::ToolResult { .. }
                         | Update::Permission(_)
                         | Update::Form(_)
-                )
+                ) || matches!(update, Update::Terminal { outcome, .. } if outcome != "succeeded")
             })
         {
             self.awaiting_execution.remove(session);
             if !out.iter().any(|update| matches!(update, Update::Started)) {
                 out.insert(0, Update::Started);
             }
+        } else if out
+            .iter()
+            .any(|update| matches!(update, Update::Terminal { .. }))
+        {
+            // An idle doorbell may start and finish without delivering input.
+            // Retire its activity without inventing a successful user callback.
+            self.awaiting_execution.remove(session);
         }
         Ok(out)
     }

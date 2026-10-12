@@ -610,6 +610,7 @@ pub(super) async fn handle_native(
         router.record_form(event.data["form"].clone());
     }
     // Retain routing until a reply has actually succeeded, not merely clicked.
+    let awaiting_execution = router.native.awaiting_execution(&session);
     let updates = match router.native.reduce(&event) {
         Ok(updates) => updates,
         Err(message) => {
@@ -619,6 +620,20 @@ pub(super) async fn handle_native(
         }
     };
     let parked_user = router.native.has_pending_user_admission(&session);
+    if subagent.is_none()
+        && !live.turn_active
+        && event.kind == "session.execution.started"
+        && updates
+            .iter()
+            .any(|update| matches!(update, super::v2::Update::Started))
+    {
+        // Native wake publishes Started even when another execution already
+        // consumed this input. Wait for delivered input/output before assigning
+        // a Codemux turn; native activity still fences outbound admission.
+        router
+            .native
+            .defer_live_execution(&session, event.sequence(&session));
+    }
     drop(router);
     let mut usage = peer.usage.lock().await;
     let mut events = Vec::new();
@@ -646,20 +661,22 @@ pub(super) async fn handle_native(
                 });
                 continue;
             }
-            if parked_user && !live.turn_active {
+            if !live.turn_active {
                 if matches!(&update, super::v2::Update::Started) {
-                    // Started precedes inbox drain and cannot identify the
-                    // parked user. Its delivery event owns that local turn.
+                    // Started precedes inbox drain. Exact user delivery or
+                    // genuine callback evidence owns the turn identity.
                     continue;
                 }
-                if matches!(
+                if (awaiting_execution || parked_user)
+                    && (matches!(
                     &update,
                     super::v2::Update::Content { .. }
                         | super::v2::Update::ToolUse { .. }
                         | super::v2::Update::ToolResult { .. }
                         | super::v2::Update::Permission(_)
                         | super::v2::Update::Form(_)
-                ) {
+                ) || matches!(&update, super::v2::Update::Terminal { outcome, .. } if outcome != "succeeded"))
+                {
                     admit_native_root(&mut live);
                     events.push(ProviderRuntimeEvent::SessionStateChanged {
                         thread_id: live.thread_id.clone(),
@@ -669,12 +686,6 @@ pub(super) async fn handle_native(
                     });
                 }
             }
-        }
-        // A background child's callback can admit a new root execution after
-        // the user turn settled. Only a live start accepted by the reducer
-        // may reactivate it; recovery and replay filtering happen above.
-        if subagent.is_none() && matches!(&update, super::v2::Update::Started) {
-            admit_native_root(&mut live);
         }
         // Root content that precedes attachment is already in durable history.
         // Child callbacks and lifecycle remain live after the parent settles.
@@ -701,6 +712,18 @@ pub(super) async fn handle_native(
         .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &live.turn_id))
     {
         live.turn_active = false;
+    }
+    if subagent.is_none()
+        && !live.turn_active
+        && !parked_user
+        && awaiting_execution
+        && event.kind == "session.execution.succeeded"
+        && events.is_empty()
+    {
+        let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: live.thread_id.clone(),
+            status: crate::agent_provider::SessionStatus::Ready,
+        });
     }
     for event in events {
         let _ = event_tx.send(event);
@@ -1056,6 +1079,15 @@ async fn reconcile_native_history(
                 replay_native_terminal(&terminal, session, peer, event_tx).await?;
                 continue;
             }
+            if execution.is_empty()
+                && terminal["outcome"] == "succeeded"
+                && !ctx.turn_active
+                && active_background_turn.is_none()
+            {
+                // A duplicate native doorbell can settle without consuming
+                // input. Claim its Idle boundary without creating a callback.
+                continue;
+            }
             // The first unseen execution completes the already-active
             // background turn; later callbacks receive independent identities.
             let recovered_turn = active_background_turn.take();
@@ -1211,6 +1243,10 @@ async fn reconcile_native_history(
                 // durable event/content, it cannot admit another root turn.
                 return Ok(());
             }
+            if !ctx.turn_active && messages.is_empty() {
+                router.native.defer_live_execution(session, sequence);
+                return Ok(());
+            }
             admit_native_root(&mut ctx);
             router.native.mark_running(session);
             drop(router);
@@ -1245,6 +1281,18 @@ async fn reconcile_native_history(
             if !advanced || !unseen {
                 // Initial attachment records its baseline silently. An unchanged
                 // Idle remains retired even if unrelated durable state advances.
+                return Ok(());
+            }
+            if message["outcome"] == "succeeded"
+                && messages.iter().all(|message| message["type"] == "idle")
+            {
+                let was_awaiting = router.native.clear_deferred_execution(session);
+                if was_awaiting && !router.native.has_pending_user_admission(session) {
+                    let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: ctx.thread_id.clone(),
+                        status: crate::agent_provider::SessionStatus::Ready,
+                    });
+                }
                 return Ok(());
             }
             admit_native_root(&mut ctx);
@@ -4097,10 +4145,13 @@ mod tests {
             &tx,
         )
         .await;
+        assert_eq!(p.event_ctx.lock().await.turn_id, initial);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        assert!(p.router.lock().await.native.awaiting_execution("root"));
+        handle_record(&record("callback-text", "session.text.ended", serde_json::json!({"sessionID":"root","assistantMessageID":"follow-up","ordinal":0,"text":"child result received"})), &p, &tx).await;
         let resumed = p.event_ctx.lock().await.turn_id.clone();
         assert_ne!(resumed, initial);
         assert!(p.event_ctx.lock().await.turn_active);
-        handle_record(&record("callback-text", "session.text.ended", serde_json::json!({"sessionID":"root","assistantMessageID":"follow-up","ordinal":0,"text":"child result received"})), &p, &tx).await;
         handle_record(
             &record(
                 "callback-end",

@@ -216,11 +216,16 @@ async fn real_opencode_models_approvals_tools_interrupt_and_resume() {
     );
     assert_single_completion(&mut stream, &held.turn_id).await;
 
-    // Kill the actual owned server first, then detach. Legacy detach deletes a
-    // session on a live server; restarting this one proves durable readoption
-    // without requiring a legacy behavioral change.
-    manager.stop().await;
-    provider.stop_session(thread.clone()).await.unwrap();
+    // Native detach acknowledges pending admission and preserves history, so
+    // finish its server-side fence before reaping the owned process. Legacy
+    // detach deletes live history; reap first to keep its resume fixture.
+    if expected == OpenCodeApi::V2 {
+        provider.stop_session(thread.clone()).await.unwrap();
+        manager.stop().await;
+    } else {
+        manager.stop().await;
+        provider.stop_session(thread.clone()).await.unwrap();
+    }
     let mut resume = start_input(&thread.0);
     resume.resume_cursor = session.resume_cursor.clone();
     let resumed = provider.start_session(resume).await.unwrap();
