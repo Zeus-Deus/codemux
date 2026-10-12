@@ -6,11 +6,14 @@ import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 
 import { Command as CommandPrimitive } from "cmdk";
 import {
   AlarmClock,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
   Bot,
   CalendarClock,
   Check,
+  CircleAlert,
   ClipboardPaste,
   Code,
   Columns2,
@@ -23,6 +26,7 @@ import {
   Keyboard,
   LayoutGrid,
   LoaderCircle,
+  Maximize2,
   MessageSquareText,
   Palette,
   PanelLeft,
@@ -132,6 +136,10 @@ import {
   workspaceSearchText,
 } from "./command-palette-model";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { useAuthStore } from "@/stores/auth-store";
+import { buildNavGroups } from "@/lib/settings-sections";
+import { settingsPagesForQuery } from "@/lib/settings-search";
 import { KeyHint } from "@/components/ui/key-hint";
 import { formatKeyCombo } from "@/components/ui/menu-chrome";
 import { toast, reportFailure } from "@/lib/toast";
@@ -359,6 +367,13 @@ export const PALETTE_COMMANDS: PaletteCommand[] = [
   },
   { id: "next-workspace", label: "Next workspace", icon: ArrowRight, actionId: "nextWorkspace" },
   { id: "prev-workspace", label: "Previous workspace", icon: ArrowLeft, actionId: "prevWorkspace" },
+  {
+    id: "jump-needs-you",
+    label: "Jump to a workspace that needs you",
+    icon: CircleAlert,
+    actionId: "jumpToNeedsYou",
+    keywords: "waiting permission attention stuck",
+  },
 
   // Search
   { id: "file-search", label: "Find file by name", icon: Search, actionId: "fileSearch", keywords: "goto open" },
@@ -370,6 +385,21 @@ export const PALETTE_COMMANDS: PaletteCommand[] = [
   { id: "close-pane", label: "Close pane", icon: X, actionId: "closePane", requiresWorkspace: true },
   { id: "new-tab", label: "New terminal tab", icon: Terminal, actionId: "newTab", keywords: "shell console", requiresWorkspace: true },
   { id: "close-tab", label: "Close tab", icon: X, actionId: "closeTab", requiresWorkspace: true },
+  { id: "reopen-closed-tab", label: "Reopen closed chat", icon: RotateCcw, actionId: "reopenClosedTab", keywords: "restore undo transcript", requiresWorkspace: true },
+  { id: "next-tab", label: "Next tab", icon: ArrowRight, actionId: "nextTab", requiresWorkspace: true },
+  { id: "prev-tab", label: "Previous tab", icon: ArrowLeft, actionId: "prevTab", requiresWorkspace: true },
+  { id: "focus-pane-left", label: "Focus pane left", icon: ArrowLeft, actionId: "focusPaneLeft", requiresWorkspace: true },
+  { id: "focus-pane-right", label: "Focus pane right", icon: ArrowRight, actionId: "focusPaneRight", requiresWorkspace: true },
+  { id: "focus-pane-up", label: "Focus pane above", icon: ArrowUp, actionId: "focusPaneUp", requiresWorkspace: true },
+  { id: "focus-pane-down", label: "Focus pane below", icon: ArrowDown, actionId: "focusPaneDown", requiresWorkspace: true },
+  {
+    id: "zoom-pane",
+    label: "Zoom pane",
+    icon: Maximize2,
+    actionId: "togglePaneZoom",
+    keywords: "maximize fullscreen focus restore split",
+    requiresWorkspace: true,
+  },
   {
     id: "focus-next-pane",
     label: "Focus next pane",
@@ -864,6 +894,30 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     [commandRows, query, commandsOnly, prsOnly],
   );
 
+  // Settings pages are search-only: "settings" lists them all, and a query
+  // that names a page or one of its rows ("scrollback") jumps straight there.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const signedIn = useAuthStore((s) => s.user !== null);
+  const settingsRows = useMemo<CommandRow[]>(() => {
+    if (prsOnly || query.pathMode) return [];
+    const pages = buildNavGroups(enableAgentChat).flatMap((group) => group.items);
+    return settingsPagesForQuery(query.needle, enableAgentChat, signedIn).flatMap((id) => {
+      const page = pages.find((item) => item.id === id);
+      if (!page) return [];
+      return [{
+        kind: "command" as const,
+        key: `cmd:settings:${id}`,
+        command: {
+          id: `settings:${id}`,
+          label: `Settings · ${page.label}`,
+          icon: page.icon,
+          run: () => useUIStore.getState().setShowSettings(true, id),
+        },
+        keys: "",
+      }];
+    });
+  }, [prsOnly, query.pathMode, query.needle, enableAgentChat, signedIn]);
+
   const searching = query.needle !== "";
   const conversationsEligible =
     searching && !commandsOnly && !prsOnly && !query.pathMode;
@@ -1005,7 +1059,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     matchedThemes.length +
     matchedThemeStudio.length +
     shownRecent.length +
-    matchedCommands.length;
+    matchedCommands.length +
+    settingsRows.length;
 
   // ── Live preview ───────────────────────────────────────────────────────
   //
@@ -1351,6 +1406,16 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           {matchedCoreCommands.map((row) => (
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
+          {settingsRows.length > 0 && (
+            <GroupHeader
+              label="Settings pages"
+              count={`${settingsRows.length}`}
+              first={nothingBeforeCommands && matchedWorkspaceCommands.length === 0 && matchedCoreCommands.length === 0}
+            />
+          )}
+          {settingsRows.map((row) => (
+            <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
+          ))}
           {matchedAddonCommands.length > 0 && (
             <GroupHeader
               label="Add-ons"
@@ -1358,7 +1423,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
               first={
                 nothingBeforeCommands &&
                 matchedWorkspaceCommands.length === 0 &&
-                matchedCoreCommands.length === 0
+                matchedCoreCommands.length === 0 &&
+                settingsRows.length === 0
               }
             />
           )}

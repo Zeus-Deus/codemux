@@ -2,6 +2,7 @@ import { useAddonPlatform } from "@/lib/addons/platform";
 import { lazy, useCallback, useEffect, useRef } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+import { useWorkspaceStatusTracking } from "@/hooks/use-workspace-status-tracking";
 import { useAsyncQuestionAttention } from "@/hooks/use-async-question-attention";
 import { useAuthEvents } from "@/hooks/use-auth-events";
 import { useTunnelStatusEvents } from "@/hooks/use-tunnel-status-events";
@@ -27,11 +28,13 @@ import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
+import { useReseedBootstrapDrafts } from "@/stores/chat-draft-store";
 import { useTranscriptSelectionHighlight } from "@/hooks/use-transcript-selection-highlight";
 import { getHomeDir, repairInactiveMcpConfigs } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import { useRemotePathPickerStore } from "@/components/remote/remote-path-picker-store";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { useCloseGuardStore } from "@/lib/close-guard";
 import { useActiveWorkspacePersistenceErrors } from "@/hooks/use-active-workspace-persistence-errors";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { usePostPaintPendingSessionRefresh } from "@/hooks/use-post-paint-session-refresh";
@@ -57,6 +60,12 @@ const ShortcutsSheet = lazy(() =>
   })),
 );
 
+const CloseGuardDialog = lazy(() =>
+  import("@/components/overlays/close-guard-dialog").then((module) => ({
+    default: module.CloseGuardDialog,
+  })),
+);
+
 function App() {
   useAddonPlatform();
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -66,6 +75,7 @@ function App() {
   const themeStudioRequest = useUIStore((s) => s.themeStudio);
   const showShortcutsSheet = useUIStore((s) => s.showShortcutsSheet);
   const remotePathRequest = useRemotePathPickerStore((s) => s.request);
+  const closeGuardPrompt = useCloseGuardStore((s) => s.prompt);
   const postPaintStartupBegan = useRef(false);
 
   // Paint from the local auth/settings cache first. AppShell explicitly tells
@@ -139,16 +149,19 @@ function App() {
   // Only initialize app state and shortcuts when authenticated
   useAppStateInit(!isAuthenticated);
   useKeyboardShortcuts();
+  // Ctrl+Shift+J ranks blocked workspaces by how long they have waited, so
+  // their status marks must keep updating while the sidebar is collapsed.
+  useWorkspaceStatusTracking();
   useScrollbackSerializer();
   useFeatureFlagsInit();
   useEnsureDraftWhenEmpty();
+  useReseedBootstrapDrafts();
   useTerminalCacheGc();
   useTerminalThemeSync();
   useTerminalCwdPoll();
   useAutomationFireToast();
   useActiveWorkspacePersistenceErrors();
-  // Re-apply a persisted "smooth scrolling: on" to the fresh webview once the
-  // machine-local settings have loaded. Off is the native default — no-op.
+  // Default short Linux wheel glides; native WebKit animation stays off.
   useSmoothScrollingInit();
   // Ask the backend which renderer it ended up on, so composited-only UI
   // effects (the transcript edge-fade) switch themselves off when the webview
@@ -199,6 +212,15 @@ function App() {
           presentation="overlay"
         >
           <ThemeStudio />
+        </LazyBoundary>
+      )}
+      {closeGuardPrompt && (
+        <LazyBoundary
+          label="close confirmation"
+          className="fixed inset-0 z-50 h-screen"
+          presentation="overlay"
+        >
+          <CloseGuardDialog />
         </LazyBoundary>
       )}
       <UpdateToast />

@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { Profiler } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import type { AuthUser } from "@/tauri/types";
 
 const mocks = vi.hoisted(() => ({
   ui: {
@@ -25,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   app: {
     appState: null as unknown,
   },
+  auth: { user: null as AuthUser | null },
   backend: {
     dbGetUiState: vi.fn(),
     prOverview: vi.fn((_enabled: boolean) => ({
@@ -64,6 +66,9 @@ vi.mock("@/stores/app-store", async (importOriginal) => ({
 }));
 
 vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
+vi.mock("@/stores/auth-store", () => ({
+  useAuthStore: (selector: (state: typeof mocks.auth) => unknown) => selector(mocks.auth),
+}));
 
 // Use the real inbox subscriptions to cover its asynchronous first read.
 
@@ -159,6 +164,8 @@ beforeEach(() => {
     allRootsFailed: false,
     rateLimitedUntil: 0,
   }));
+  useFeatureFlags.setState({ enableAgentChat: true });
+  mocks.auth.user = { id: "u1", email: "test@codemux.org", name: "Test User", image: null };
   useSettingsStore.setState({ settings: { "appearance.theme_source": "manual" }, loaded: true });
   useOmarchyStore.setState({ theme: null, loaded: true });
   vi.clearAllMocks();
@@ -855,6 +862,7 @@ describe("command palette — command catalogue", () => {
     const missing = KEYBIND_REGISTRY.filter(
       (entry) =>
         entry.when !== "terminal" &&
+        entry.when !== "composer" &&
         !/^(workspaceJump|switchTab)\d$/.test(entry.id) &&
         !notCommands.has(entry.id) &&
         !PALETTE_COMMANDS.some((command) => command.actionId === entry.id),
@@ -995,6 +1003,50 @@ describe("command palette — pull-request mode", () => {
     mocks.ui.takeCommandPaletteQuery.mockReturnValue("pr 123");
     renderPalette();
     expect(screen.getByText("Couldn't reach your pull requests")).toBeInTheDocument();
+  });
+});
+
+describe("command palette — settings pages", () => {
+  it("updates row-based page matches when Agent Chat or sign-in state changes", () => {
+    const view = renderPalette();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "checkpoint" } });
+    expect(screen.getByText("Settings · Agent")).toBeInTheDocument();
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: false }));
+    expect(screen.queryByText("Settings · Agent")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "skills sync" } });
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+
+    act(() => useFeatureFlags.setState({ enableAgentChat: true }));
+    expect(screen.getByText("Settings · Account")).toBeInTheDocument();
+    mocks.auth.user = null;
+    view.rerender(withClient(<CommandPalette open onOpenChange={vi.fn()} />));
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "email" } });
+    expect(screen.queryByText("Settings · Account")).not.toBeInTheDocument();
+  });
+
+  it("keeps settings pages out of the resting list", () => {
+    renderPalette();
+    expect(screen.queryByText("Settings pages")).not.toBeInTheDocument();
+  });
+
+  it("opens the page that holds a setting named by the query", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "scrollback");
+
+    expect(screen.getByText("Settings pages")).toBeInTheDocument();
+    await user.click(screen.getByText("Settings · Session Restore"));
+    expect(mocks.ui.setShowSettings).toHaveBeenCalledWith(true, "session_restore");
+  });
+
+  it("lists every page for 'settings'", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "settings");
+    expect(screen.getByText("Settings · Account")).toBeInTheDocument();
+    expect(screen.getByText("Settings · About")).toBeInTheDocument();
   });
 });
 

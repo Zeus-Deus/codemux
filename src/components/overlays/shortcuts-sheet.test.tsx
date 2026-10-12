@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
+import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { buildShortcutGroups, ShortcutsSheet } from "./shortcuts-sheet";
@@ -11,6 +12,19 @@ function rowsOf(overrides: Record<string, string>, query = "") {
   return buildShortcutGroups(resolveKeybinds(overrides).keybindMap, query).flatMap(
     (group) => group.rows,
   );
+}
+
+function WorkspaceWithShortcuts() {
+  useKeyboardShortcuts();
+  const sheetOpen = useUIStore((s) => s.showShortcutsSheet);
+  const settingsOpen = useUIStore((s) => s.showSettings);
+  return <>
+    <main aria-label="Workspace">
+      <button onClick={() => useUIStore.getState().setShowShortcutsSheet(true)}>Keyboard shortcuts</button>
+      {settingsOpen && <div data-testid="settings-underlay">Settings</div>}
+    </main>
+    {sheetOpen && <ShortcutsSheet />}
+  </>;
 }
 
 describe("buildShortcutGroups", () => {
@@ -51,7 +65,11 @@ describe("ShortcutsSheet", () => {
   const original = useSyncedSettingsStore.getState().settings;
 
   beforeEach(() => {
-    useUIStore.setState({ showShortcutsSheet: true, showSettings: false, settingsSection: null });
+    useUIStore.setState({
+      showShortcutsSheet: true, showSettings: false, settingsSection: null,
+      onboardingProjectDir: null, themeStudio: null, renameWorkspaceId: null,
+      showFileSearch: false, showContentSearch: false, showCommandPalette: false,
+    });
   });
 
   afterEach(() => {
@@ -70,6 +88,30 @@ describe("ShortcutsSheet", () => {
     const general = screen.getByRole("region", { name: "General" });
     const row = within(general).getByText("Command palette").closest("li")!;
     expect(row).toHaveTextContent("Ctrl+P");
+  });
+
+  it.each([false, true])("closes with Escape over a workspace, preserving Settings when open (%s)", (settingsOpen) => {
+    useUIStore.setState({ showShortcutsSheet: false, showSettings: settingsOpen });
+    render(<WorkspaceWithShortcuts />);
+    fireEvent.click(screen.getByRole("button", { name: "Keyboard shortcuts" }));
+    expect(screen.getByTestId("shortcuts-sheet")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Filter shortcuts"), { key: "Escape" });
+    expect(screen.queryByTestId("shortcuts-sheet")).toBeNull();
+    expect(useUIStore.getState().showSettings).toBe(settingsOpen);
+    if (settingsOpen) expect(screen.getByTestId("settings-underlay")).toBeInTheDocument();
+  });
+
+  it("closes a lone sheet with the rebound close-overlay key", () => {
+    useSyncedSettingsStore.setState({ settings: {
+      ...original, keyboard: { ...original.keyboard, shortcuts: { closeOverlay: "F6" } },
+    } });
+    useUIStore.setState({ showShortcutsSheet: false });
+    render(<WorkspaceWithShortcuts />);
+    fireEvent.click(screen.getByRole("button", { name: "Keyboard shortcuts" }));
+    fireEvent.keyDown(screen.getByLabelText("Filter shortcuts"), { key: "Escape" });
+    expect(screen.getByTestId("shortcuts-sheet")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Filter shortcuts"), { key: "F6" });
+    expect(screen.queryByTestId("shortcuts-sheet")).toBeNull();
   });
 
   it("filters as you type", () => {
