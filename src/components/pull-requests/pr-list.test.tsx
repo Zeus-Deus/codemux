@@ -12,7 +12,13 @@ vi.mock("@/lib/toast", () => ({
   toast: { info: vi.fn(), success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock("@/hooks/use-project-actions", () => ({
+  openProjectFlow: vi.fn().mockResolvedValue({ success: false }),
+}));
+
 import { PrList, clockTime } from "./pr-list";
+import { openProjectFlow } from "@/hooks/use-project-actions";
+import { useUIStore } from "@/stores/ui-store";
 import { rowKey, type PrRow } from "@/lib/pr-overview";
 
 const ROOT = "/home/dev/projects/codemux";
@@ -360,11 +366,16 @@ describe("footer and empty states", () => {
   it("says what to do next when there is nothing to show", () => {
     renderList({ rows: [], hostCount: 0 });
     expect(screen.getByText("No projects open.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+    expect(openProjectFlow).toHaveBeenCalledOnce();
   });
 
   it("distinguishes no projects from no open pull requests", () => {
+    useUIStore.setState({ showSettings: false, settingsSection: null });
     renderList({ rows: [], hostCount: 2 });
     expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Source Control settings" }));
+    expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "source_control" });
   });
 });
 

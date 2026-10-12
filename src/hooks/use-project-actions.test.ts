@@ -21,7 +21,8 @@ import {
   createEmptyWorkspace,
   activateWorkspace,
 } from "@/tauri/commands";
-import { useProjectActions } from "./use-project-actions";
+import { openProjectAtPath, useProjectActions } from "./use-project-actions";
+import { dbAddRecentProject } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
@@ -250,5 +251,17 @@ describe("useProjectActions — onboarding trigger gate", () => {
       });
       expect(useUIStore.getState().onboardingProjectDir).toBeNull();
     });
+  });
+});
+
+describe("openProjectAtPath", () => {
+  it("opens a known folder without the picker", async () => {
+    useAppStore.setState({ appState: makeAppState([makeWs("ws-1")]) });
+    const result = await openProjectAtPath("/home/user/parser");
+    expect(result).toEqual({ success: true, path: "/home/user/parser", name: "parser" });
+    expect(mockPickFolderDialog).not.toHaveBeenCalled();
+    expect(vi.mocked(dbAddRecentProject)).toHaveBeenCalledWith("/home/user/parser", "parser");
+    expect(mockCreateEmptyWorkspace).toHaveBeenCalledWith("/home/user/parser");
+    expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-new");
   });
 });

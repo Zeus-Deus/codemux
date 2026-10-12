@@ -87,3 +87,25 @@ export function utilitySelectionFromStores(): UtilityModelSelection | null {
   const effort = settings.get(UTILITY_SETTING_KEYS.effort).trim() || null;
   return { provider, model, effort };
 }
+
+/**
+ * The CLI and model a one-shot text job (a commit message, a PR's title
+ * and description) runs on.
+ *
+ * An explicit commit-message CLI wins; otherwise the Utility agent
+ * supplies the provider. Its model only rides along when the provider
+ * matches, so an override CLI is never handed another provider's model
+ * name (`claude --model <codex model>` fails every run).
+ */
+export function aiTextCliSelection(
+  config:
+    | { ai_commit_message_cli: string | null; ai_commit_message_model: string | null }
+    | null
+    | undefined,
+  utility: UtilityModelSelection | null,
+): { cli: string; model: string | null } {
+  const cli = config?.ai_commit_message_cli ?? utility?.provider ?? "claude";
+  const model =
+    config?.ai_commit_message_model ?? (utility?.provider === cli ? utility.model : null);
+  return { cli, model };
+}

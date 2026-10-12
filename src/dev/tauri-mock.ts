@@ -41,6 +41,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { createAgentConnectorMock } from "./agent-connector-mock";
+import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
 import {
@@ -169,6 +170,11 @@ const sessionImportFixture = new URLSearchParams(window.location.search).get("fi
 if (sessionImportFixture) {
   appState = { ...appState, workspaces: [], active_workspace_id: "", archived_workspaces: [], pane_statuses: {} };
 }
+const MOCK_RECENT_PROJECTS = [
+  { path: `${MOCK_HOME_DIR}/code/parser`, name: "parser", last_opened_at: "2026-10-05T09:12:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/field-notes`, name: "field-notes", last_opened_at: "2026-10-03T16:40:00Z" },
+  { path: `${MOCK_HOME_DIR}/code/api-gateway`, name: "api-gateway", last_opened_at: "2026-09-29T11:05:00Z" },
+];
 // `?mockScenario=delegation…`: the seeded chat starts empty, as a Claude chat
 // in Full access, and plays the delegation flow once its channel attaches.
 const delegationScenario = delegationScenarioFromSearch(window.location.search);
@@ -1274,8 +1280,10 @@ const FEATURE_FLAGS: FeatureFlags = {
   // Scope row below the composer) is a primary dev-iteration surface —
   // "New thread"/"New agent" render the draft composer with the
   // location · checkout · from-branch controls instead of eagerly
-  // creating a workspace.
-  enable_lazy_workspace_creation: true,
+  // creating a workspace. `?lazy=0` turns it off to reach the legacy
+  // full-screen Open Project page (with `?fixture=session-import`).
+  enable_lazy_workspace_creation:
+    new URLSearchParams(location.search).get("lazy") !== "0",
 };
 
 const SYNCED_SETTINGS: UserSettings = {
@@ -3988,6 +3996,22 @@ const mockHooks = [{
   enabled: false, isManaged: false, trustStatus: "untrusted", timeoutSec: 30, matcher: null,
 }];
 
+/** The repo-shaped file list behind both search dialogs in browser dev. */
+const MOCK_SEARCH_PATHS = [
+  "AGENTS.md",
+  "README.md",
+  "CLAUDE.md",
+  "package.json",
+  "CONTRIBUTING.md",
+  "src/components/layout/right-panel.tsx",
+  "src/stores/ui-store.ts",
+  "src-tauri/Cargo.toml",
+  // No real filesystem backs browser dev, so an opened image always
+  // 404s — which is exactly what makes the ImageViewer failure card
+  // reachable here.
+  "docs/screenshots/dashboard.png",
+];
+
 // ── Devices (SSH hosts) ─────────────────────────────────────────────
 //
 // Mutable so Settings → Devices can add, rename, set up and remove devices
@@ -4260,6 +4284,7 @@ const handlers: Record<string, Handler> = {
   // Empty by default: plugins never alter a clean core-only UI. Synthetic
   // manager states are opt-in with `?addons=…` (see ./addon-mock).
   ...addonMockHandlers(),
+  ...workflowMockHandlers((event) => emitEvent("workflow-changed", event)),
   get_package_format: () => "AppImage",
 
   // ── Settings ──
@@ -4296,8 +4321,36 @@ const handlers: Record<string, Handler> = {
   db_set_setting: () => undefined,
   db_get_setting: () => null,
   db_delete_setting: () => undefined,
-  db_get_recent_projects: () => [],
+  // A few folders "opened before", so the zero-project landings (try
+  // `?fixture=session-import`) and the project picker have recents to show.
+  db_get_recent_projects: (a) =>
+    MOCK_RECENT_PROJECTS.slice(0, typeof a.limit === "number" ? a.limit : undefined),
   db_add_recent_project: () => undefined,
+  // Opening a project (folder picker or a recent row) adds a main-checkout
+  // workspace for that folder and returns its id, like the backend.
+  create_empty_workspace: (a) => {
+    const cwd = String(a.cwd ?? "");
+    const existing = appState.workspaces.find((w) => w.cwd === cwd);
+    if (existing) return existing.workspace_id;
+    const id = `ws-opened-${appState.workspaces.length + 1}`;
+    const workspace = buildRestoredWorkspace({
+      archive_id: id,
+      workspace_id: id,
+      title: cwd.split("/").pop() || cwd,
+      cwd,
+      project_root: cwd,
+      project_uid: null,
+      workspace_kind: "main",
+      worktree_path: null,
+      git_branch: "main",
+      is_git: true,
+      protected: true,
+      archived_at: 0,
+    });
+    appState = { ...appState, workspaces: [...appState.workspaces, workspace] };
+    emitAppState();
+    return id;
+  },
 
   // ── File dialogs ──
   // Default: resolve as a cancel (null / empty) like the previous
@@ -4334,6 +4387,8 @@ const handlers: Record<string, Handler> = {
     // and the generic listing would hand the form a stack of unrelated
     // `.md` files to mistake for one.
     if (path.includes("merge_request_templates")) return [];
+    // The seeded recent projects must probe as folders so a recent row opens.
+    if (MOCK_RECENT_PROJECTS.some((p) => p.path === path)) return [];
     return mockListDirectory(path, Boolean(a.showHidden));
   },
 
@@ -4343,21 +4398,44 @@ const handlers: Record<string, Handler> = {
   // in browser dev.
   search_file_names: (a) => {
     const query = String(a.query ?? "").toLowerCase();
-    const paths = [
-      "AGENTS.md",
-      "README.md",
-      "CLAUDE.md",
-      "package.json",
-      "CONTRIBUTING.md",
-      "src/components/layout/right-panel.tsx",
-      "src/stores/ui-store.ts",
-      "src-tauri/Cargo.toml",
-      // No real filesystem backs browser dev, so an opened image always
-      // 404s — which is exactly what makes the ImageViewer failure card
-      // reachable here.
-      "docs/screenshots/dashboard.png",
-    ];
+    const paths = MOCK_SEARCH_PATHS;
     return query ? paths.filter((p) => p.toLowerCase().includes(query)) : paths;
+  },
+
+  // Searches the same synthetic contents `read_file` serves, so opening a
+  // hit lands on a line that really holds the match in the mock editor.
+  // Mirrors the real command: literal unless `regex`, case-insensitive
+  // unless `caseSensitive`, absolute paths, UTF-16 offsets, and a rejected
+  // promise for an invalid pattern.
+  search_in_files: (a) => {
+    const root = String(a.path ?? "");
+    const query = String(a.query ?? "");
+    if (!query) return [];
+    const source = a.regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(source, a.caseSensitive ? "" : "i");
+    } catch (err) {
+      return Promise.reject(err instanceof Error ? err.message : String(err));
+    }
+    const limit = Number(a.maxResults ?? 100);
+    const results: Array<Record<string, unknown>> = [];
+    for (const rel of MOCK_SEARCH_PATHS) {
+      if (rel.endsWith(".png")) continue;
+      const lines = mockReadFile(`${root}/${rel}`).split("\n");
+      lines.forEach((line, i) => {
+        const hit = pattern.exec(line);
+        if (!hit || hit[0].length === 0 || results.length >= limit) return;
+        results.push({
+          file_path: `${root}/${rel}`,
+          line_number: i + 1,
+          line_content: line,
+          match_start: hit.index,
+          match_end: hit.index + hit[0].length,
+        });
+      });
+    }
+    return results;
   },
 
   // Enough content for the editor surfaces (main-area tab and the right
@@ -5784,6 +5862,21 @@ const handlers: Record<string, Handler> = {
 
   /** The commits the form drafts a title and a description from. */
   git_commits_ahead: (a) => MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [],
+  // A beat of latency so the form's "writing" state is visible.
+  generate_ai_pr_description: async (a) => {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const commits = MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [];
+    return {
+      title: "feat(chat): stream replies through one channel",
+      body: [
+        "Replies arrived only once the whole turn had finished, so long answers sat blank for seconds.",
+        "",
+        "This streams each reply through a single channel as it is produced.",
+        "",
+        ...commits.map((c) => `- ${c.subject}`),
+      ].join("\n"),
+    };
+  },
 
   /**
    * Create, for real as far as the rest of the mock is concerned.
@@ -6917,6 +7010,19 @@ const handlers: Record<string, Handler> = {
     return { workspace_id: ws.workspace_id, cwd, adopted: false };
   },
   create_worktree_workspace: (a) => {
+    // Mirror the backend's rejections so the New Workspace dialog's
+    // failure recovery can be exercised: a non-git folder always fails,
+    // and `?worktreeFail=1` makes every worktree create fail like git does
+    // when the target path is already taken.
+    const repoPath = String(a.repoPath ?? "");
+    if (repoPath.endsWith("/scratchpad")) {
+      throw new Error(`Not a git repository: ${repoPath}`);
+    }
+    if (new URLSearchParams(location.search).get("worktreeFail") === "1") {
+      throw new Error(
+        `fatal: '${MOCK_HOME_DIR}/.codemux/worktrees/codemux/${String(a.branch ?? "")}' already exists`,
+      );
+    }
     const ws = buildWorktreeWorkspace(
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),

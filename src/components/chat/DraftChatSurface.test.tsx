@@ -67,6 +67,13 @@ vi.mock("@/tauri/commands", () => ({
   hostsList: vi.fn().mockResolvedValue([]),
 }));
 
+// The empty home's "Open project" button; resolved per test.
+const { openProjectMock } = vi.hoisted(() => ({ openProjectMock: vi.fn() }));
+vi.mock("@/hooks/use-project-actions", () => ({
+  useProjectActions: () => ({ openProject: openProjectMock, openCloneDialog: vi.fn() }),
+  openProjectAtPath: vi.fn(),
+}));
+
 vi.mock("@/lib/agent-chat/materialize", () => ({
   materializeAndSend: vi.fn(),
 }));
@@ -212,10 +219,12 @@ import { agentChatGetSessionContext, hostsList, type HostView, listSkills, listC
 import { useSkillsStore } from "@/stores/skills-store";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useDraftComposerFocusStore } from "@/stores/draft-composer-focus-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import type { AppStateSnapshot } from "@/tauri/types";
 import { __resetHostsStoreForTests, useHostsStore } from "@/stores/hosts-store";
 import { host } from "@/components/devices/host-fixtures.test-utils";
 
@@ -778,6 +787,65 @@ describe("DraftChatSurface", () => {
       expect(container.querySelector("textarea")).toHaveValue("");
       expect(document.activeElement).toBe(outside);
       outside.remove();
+    });
+
+    it("focuses the composer when New agent asks for the draft already on screen", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      const textarea = container.querySelector("textarea")!;
+      expect(document.activeElement).not.toBe(textarea);
+
+      act(() => useDraftComposerFocusStore.getState().requestFocus(draft.draftId));
+      expect(document.activeElement).toBe(textarea);
+      // Consumed: a later visit must not steal focus again.
+      expect(useDraftComposerFocusStore.getState().request).toBeNull();
+    });
+
+    it("pulses the composer card once when New agent lands on the draft on screen", () => {
+      const animate = vi.fn();
+      const original = HTMLElement.prototype.animate;
+      HTMLElement.prototype.animate = animate as unknown as typeof original;
+      try {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        useChatDraftStore.getState().setActiveDraft(draft.draftId);
+        const { container } = renderSurface();
+        expect(animate).not.toHaveBeenCalled();
+
+        act(() => useDraftComposerFocusStore.getState().requestFocus(draft.draftId));
+        expect(animate).toHaveBeenCalledTimes(1);
+        expect(animate.mock.instances[0]).toBe(
+          container.querySelector('[data-testid="composer-wrapper"]'),
+        );
+        expect(animate.mock.calls[0][1]).toMatchObject({ duration: 300 });
+      } finally {
+        HTMLElement.prototype.animate = original;
+      }
+    });
+
+    it("points the home draft at a project opened from the empty home", async () => {
+      openProjectMock.mockResolvedValueOnce({ success: true, path: "/work/api", name: "api" });
+      useAppStore.setState({ appState: { workspaces: [] } as unknown as AppStateSnapshot });
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { getByRole } = renderSurface();
+      fireEvent.click(getByRole("button", { name: /Open project/ }));
+      await vi.waitFor(() =>
+        expect(useChatDraftStore.getState().draftsById[draft.draftId]?.target).toEqual({
+          kind: "project",
+          projectPath: "/work/api",
+        }),
+      );
+    });
+
+    it("leaves a focus request for another draft alone", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      act(() => useDraftComposerFocusStore.getState().requestFocus("other-draft"));
+      expect(document.activeElement).not.toBe(container.querySelector("textarea"));
+      expect(useDraftComposerFocusStore.getState().request?.draftId).toBe("other-draft");
+      act(() => useDraftComposerFocusStore.getState().clear());
     });
 
     it("keeps a failed background prompt recoverable without interrupting the next draft", async () => {

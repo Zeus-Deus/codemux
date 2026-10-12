@@ -2464,6 +2464,30 @@ mod tests {
     }
 
     #[test]
+    fn result_success_subtype_with_error_flag_preserves_failure_and_usage() {
+        let msg = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "turn_id": "t",
+            "result": "API Error: response exceeded the output token maximum",
+            "total_cost_usd": 0.002,
+            "usage": {},
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted { turn_id, status, usage, .. } => {
+                assert_eq!(turn_id.0, "t");
+                assert!(matches!(status, TurnStatus::Error { subtype, message }
+                    if subtype == "api_error"
+                        && message == "API Error: response exceeded the output token maximum"));
+                assert_eq!(usage.as_ref().unwrap().total_cost_usd, Some(0.002));
+            }
+            _ => panic!("expected failed TurnCompleted"),
+        }
+    }
+
+    #[test]
     fn result_max_turns_emits_turn_max_turns() {
         let msg = json!({"type": "result", "subtype": "error_max_turns", "turn_id": "t"});
         let events = translate_sdk_message(&tid(), &msg);

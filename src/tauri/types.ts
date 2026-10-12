@@ -211,6 +211,14 @@ export interface PrReviewThread {
   is_resolvable: boolean;
   path: string | null;
   line: number | null;
+  /** Which column `line` counts in. Absent from older payloads, where
+   *  RIGHT (the new file) is the safe reading. */
+  side?: "LEFT" | "RIGHT" | null;
+  /** First line of a multi-line thread. */
+  start_line?: number | null;
+  /** Which column `start_line` counts in; GitHub lets a range start on
+   *  the other side from where it ends. Absent ⇒ the same as `side`. */
+  start_side?: "LEFT" | "RIGHT" | null;
   comments: PrThreadComment[];
 }
 
@@ -629,6 +637,12 @@ export interface CommitSummary {
   body: string;
 }
 
+/** Mirrors src-tauri/src/ai.rs:PrDescriptionDraft. */
+export interface PrDescriptionDraft {
+  title: string;
+  body: string;
+}
+
 export interface EditorInfo {
   id: string;
   name: string;
@@ -651,12 +665,33 @@ export interface WorktreeInfo {
   is_bare: boolean;
 }
 
+/** Everything the user typed into the New Workspace dialog. Kept on the
+ *  pending row so a failed create can reopen the dialog with the prompt,
+ *  attachments and linked issue intact instead of losing them. */
+export interface NewWorkspaceDraft {
+  projectDir: string;
+  workspaceName: string;
+  branchName: string;
+  branchAutoFilled: boolean;
+  prompt: string;
+  attachments: string[];
+  linkedIssue: GitHubIssue | null;
+  selectedAgentId: string | null;
+  modelSelection: ModelSelection;
+  baseBranch: string;
+  branchMode: "create_new" | "open_existing";
+  openExistingBranch: string | null;
+}
+
 export interface PendingWorkspace {
   id: string;
   name: string;
   projectPath: string;
   status: "creating" | "failed";
   errorMessage?: string;
+  /** Present when the row came from the New Workspace dialog. A failed
+   *  row with a draft stays until the user retries or dismisses it. */
+  draft?: NewWorkspaceDraft;
 }
 
 export interface PullRequestInfo {
@@ -815,6 +850,9 @@ export interface InlineReviewComment {
   body: string;
   path: string;
   line: number | null;
+  /** Which column `line` counts in: LEFT for a comment on a deleted
+   *  line. Absent ⇒ RIGHT, the new file. */
+  side?: "LEFT" | "RIGHT" | null;
   created_at: string;
   in_reply_to_id: number | null;
   pull_request_review_id: number | null;

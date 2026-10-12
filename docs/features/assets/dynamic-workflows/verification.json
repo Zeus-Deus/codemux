@@ -1,0 +1,24 @@
+{
+  "checked": [
+    "mixed-provider dynamic fan-out",
+    "two-worker ceiling",
+    "pause drains admitted work",
+    "save script",
+    "reload replay without duplicate tasks",
+    "dynamic synthesis",
+    "task output/route attribution",
+    "individual cancellation/retry",
+    "write permission refusal",
+    "narrow pane overflow"
+  ],
+  "providerCalls": 0,
+  "modelTokens": 0,
+  "screenshots": [
+    "before.png",
+    "after-setup.png",
+    "after-running.png",
+    "after-completed.png",
+    "after-result.png",
+    "after-narrow.png"
+  ]
+}

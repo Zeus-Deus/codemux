@@ -42,6 +42,8 @@ import {
 } from "@/lib/pr-overview";
 import type { PrStateFilter, RootFailure } from "@/lib/pr-overview-query";
 import { PrRow } from "./pr-row";
+import { openProjectFlow } from "@/hooks/use-project-actions";
+import { useUIStore } from "@/stores/ui-store";
 
 /**
  * Past this many rows the list stops rendering and says so.
@@ -619,6 +621,13 @@ function EmptyList({
           This page lists pull requests across the projects you have open. Open one and
           its repository shows up here.
         </p>
+        <button
+          type="button"
+          className={btnCard}
+          onClick={() => void openProjectFlow().catch(console.error)}
+        >
+          Open project
+        </button>
       </div>
     );
   }
@@ -698,6 +707,13 @@ function EmptyList({
       <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
         Nothing is open on the repositories that answered.
       </p>
+      <button
+        type="button"
+        className={btnCard}
+        onClick={() => useUIStore.getState().setShowSettings(true, "source_control")}
+      >
+        Open Source Control settings
+      </button>
     </div>
   );
 }
