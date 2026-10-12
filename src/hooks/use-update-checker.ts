@@ -137,6 +137,7 @@ export function useUpdateChecker(): UpdateCheckerResult {
   const [dismissed, setDismissedState] = useState(false);
   const [remoteClientsConnected, setRemoteClientsConnected] = useState(false);
   const [updateRequested, setUpdateRequested] = useState(false);
+  const [lastCheck, setLastCheck] = useState<{ at: number; ok: boolean } | null>(null);
 
   const updateRef = useRef<Update | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -164,9 +165,11 @@ export function useUpdateChecker(): UpdateCheckerResult {
       } else {
         setState("idle");
       }
+      setLastCheck({ at: Date.now(), ok: true });
     } catch (e) {
       console.error("[update-checker] check failed:", e);
       setState("idle");
+      setLastCheck({ at: Date.now(), ok: false });
     }
   }, []);
 
@@ -372,6 +375,9 @@ export function useUpdateChecker(): UpdateCheckerResult {
       startDownload,
       installAndRestart,
       requestDesktopUpdate,
+      // The web client has no updater plugin; the desktop does its checking.
+      checkNow: isRemote ? null : doCheck,
+      lastCheck,
     });
   }, [
     publishUpdateStatus,
@@ -382,6 +388,8 @@ export function useUpdateChecker(): UpdateCheckerResult {
     startDownload,
     installAndRestart,
     requestDesktopUpdate,
+    doCheck,
+    lastCheck,
   ]);
 
   return {
