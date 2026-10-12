@@ -174,6 +174,7 @@ fn flatten_model(
         // OpenCode's models are vision-capable and the set shifts as
         // upstreams add models.
         supports_fast_mode: false,
+        service_tiers: vec![],
         supports_images: model.supports_images,
         sub_provider: Some(provider.id.clone()),
         // Only OpenCode Zen's own free-tier signal makes it onto the

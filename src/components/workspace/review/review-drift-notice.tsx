@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
-import { btnCard, btnCardStrong, btnEmberSolid, tzBody } from "./review-ui";
+import { btnCard, btnCardStrong, btnEmberSolid, spinnerRing, tzBody } from "./review-ui";
 
 /**
  * Severity order. Exactly one notice shows at a time, and it is always
@@ -35,6 +35,12 @@ export interface DriftAction {
   onClick: () => void;
   /** `strong` is emphasized-neutral; `primary` is ember-solid (Retry). */
   emphasis?: "card" | "strong" | "primary";
+  /** In flight: the button shows progress and refuses a second click. */
+  busy?: boolean;
+  /** What the button says while busy ("Pulling"); defaults to the label. */
+  busyLabel?: string;
+  /** Other work is in flight and would drop this click, so don't look live. */
+  disabled?: boolean;
 }
 
 export interface DriftNotice {
@@ -73,6 +79,7 @@ export function mostSevere(notices: DriftNotice[]): DriftNotice | null {
  * changes underneath you.
  */
 export function ReviewDriftNotice({ notice }: { notice: DriftNotice }) {
+  const anyBusy = notice.actions.some((action) => action.busy);
   return (
     <div
       role="status"
@@ -97,6 +104,8 @@ export function ReviewDriftNotice({ notice }: { notice: DriftNotice }) {
           key={action.label}
           type="button"
           onClick={action.onClick}
+          disabled={anyBusy || action.disabled}
+          aria-busy={action.busy || undefined}
           className={
             action.emphasis === "primary"
               ? btnEmberSolid
@@ -105,7 +114,14 @@ export function ReviewDriftNotice({ notice }: { notice: DriftNotice }) {
                 : btnCard
           }
         >
-          {action.label}
+          {action.busy ? (
+            <>
+              <span aria-hidden className={spinnerRing} />
+              {action.busyLabel ?? action.label}
+            </>
+          ) : (
+            action.label
+          )}
         </button>
       ))}
     </div>

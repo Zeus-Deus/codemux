@@ -31,15 +31,14 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
     InterruptParams, RespondToRequestParams, RespondToUserInputParams, SendTurnImage,
-    SendTurnParams, SetModelParams, SetPermissionModeParams, SidecarDecision,
-    SidecarNotification, StartSessionParams, StartSessionResponse, StopSessionParams,
-    StopSessionResponse, METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST,
-    METHOD_RESPOND_TO_USER_INPUT, METHOD_SEND_TURN, METHOD_SET_MODEL,
-    METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION, METHOD_STOP_SESSION,
+    SendTurnParams, SetModelParams, SetPermissionModeParams, SidecarDecision, SidecarNotification,
+    StartSessionParams, StartSessionResponse, StopSessionParams, StopSessionResponse,
+    METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST, METHOD_RESPOND_TO_USER_INPUT, METHOD_SEND_TURN,
+    METHOD_SET_MODEL, METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION, METHOD_STOP_SESSION,
 };
+use super::translate::{translate_notification_with, SubagentDemux};
 use crate::agent_provider::ImageInput;
 use base64::Engine;
-use super::translate::{translate_notification_with, SubagentDemux};
 
 /// Default per-RPC timeout for the sidecar. Matches the value
 /// production integrations use.
@@ -198,9 +197,9 @@ pub(crate) struct ClaudeSession {
     /// recoverable in place without a teardown/rebuild.
     dead: Arc<AtomicBool>,
     /// Optional MCP runtime registry — populated when the provider was
-    /// constructed with `mcp_registry: Some(...)`. Used by
-    /// `handle_mcp_tool_call` to route `mcp-tool-call` requests from
-    /// the sidecar to the right MCP child.
+    /// constructed with `mcp_registry: Some(...)`, and always `None` for a
+    /// session on a device. Used by `handle_mcp_tool_call` to route
+    /// `mcp-tool-call` requests from the sidecar to the right MCP child.
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
     /// Owning workspace of the chat pane this session runs in, from
     /// `StartSessionInput.workspace_id`. Attached per-call to MCP
@@ -208,6 +207,55 @@ pub(crate) struct ClaudeSession {
     /// session's workspace — the registry's shared MCP child cannot
     /// learn the caller from its env.
     workspace_id: Option<String>,
+    managed: Option<Arc<crate::agent_provider::managed::ManagedSession>>,
+    managed_diagnostics: bool,
+}
+
+/// Spawn the bundled sidecar on this computer in `cwd`.
+async fn spawn_local_sidecar(
+    sidecar_binary: &std::path::Path,
+    env: HashMap<String, String>,
+    cwd: PathBuf,
+    managed: bool,
+) -> Result<JsonRpcChild, ProviderError> {
+    let sidecar_config = SpawnConfig {
+        program: sidecar_binary.to_path_buf(),
+        args: vec![],
+        env,
+        cwd: Some(cwd),
+        default_timeout: DEFAULT_RPC_TIMEOUT,
+    };
+    if managed {
+        JsonRpcChild::spawn_managed(sidecar_config).await
+    } else {
+        JsonRpcChild::spawn(sidecar_config).await
+    }
+    .map_err(|e| match e {
+        crate::json_rpc_child::RpcChildError::SpawnFailed(ref io) if managed => {
+            ProviderError::ValidationError {
+                message: format!("managed-start-rejected: setup_required: failed to spawn Claude workflow sidecar: {io}"),
+            }
+        }
+        // A missing sidecar binary is an install problem, not a
+        // generic process failure — classify it so the UI can render
+        // the actionable "not installed" state (mirrors the probe
+        // path in `claude/auth.rs`).
+        crate::json_rpc_child::RpcChildError::SpawnFailed(ref io)
+            if io.kind() == std::io::ErrorKind::NotFound =>
+        {
+            ProviderError::NotInstalled {
+                provider: crate::agent_provider::ProviderKind::Claude,
+                hint: format!(
+                    "claude-agent sidecar not found at {}",
+                    sidecar_binary.display()
+                ),
+            }
+        }
+        other => ProviderError::ProcessError {
+            message: "failed to spawn claude-agent sidecar".into(),
+            source: Some(other.to_string()),
+        },
+    })
 }
 
 impl ClaudeSession {
@@ -228,46 +276,94 @@ impl ClaudeSession {
         // one the user is viewing. `JsonRpcChild` applies these as overlays on
         // the inherited env, so an empty map (no workspace resolved) is a
         // no-op and the sidecar inherits Codemux's env unchanged.
-        let sidecar_binary = spawn.sidecar_binary;
-        let sidecar = JsonRpcChild::spawn(SpawnConfig {
-            program: sidecar_binary.clone(),
-            args: vec![],
-            env: input.env.clone().unwrap_or_default(),
-            cwd: Some(input.cwd.clone()),
-            default_timeout: DEFAULT_RPC_TIMEOUT,
-        })
-        .await
-        .map_err(|e| match e {
-            // A missing sidecar binary is an install problem, not a
-            // generic process failure — classify it so the UI can render
-            // the actionable "not installed" state (mirrors the probe
-            // path in `claude/auth.rs`).
-            crate::json_rpc_child::RpcChildError::SpawnFailed(ref io)
-                if io.kind() == std::io::ErrorKind::NotFound =>
-            {
-                ProviderError::NotInstalled {
-                    provider: crate::agent_provider::ProviderKind::Claude,
-                    hint: format!(
-                        "claude-agent sidecar not found at {}",
-                        sidecar_binary.display()
-                    ),
-                }
-            }
-            other => ProviderError::ProcessError {
-                message: "failed to spawn claude-agent sidecar".into(),
-                source: Some(other.to_string()),
+        let managed = crate::agent_provider::managed::lookup_session(&thread_id);
+        if managed.is_some() && !cfg!(target_os = "linux") {
+            return Err(ProviderError::ValidationError {
+                message: "managed-start-rejected: managed Claude requires Linux process containment".into(),
+            });
+        }
+        let budget_error = |message: String| ProviderError::ValidationError {
+            message: if managed.is_some() {
+                format!("managed-start-rejected: {message}")
+            } else {
+                message
             },
-        })?;
+        };
+        let max_budget_usd = optional_positive_budget(&input.extra).map_err(budget_error)?;
+        let max_turns = optional_positive_turns(&input.extra).map_err(budget_error)?;
+        if managed.is_some() && input.resume_cursor.is_some() {
+            return Err(ProviderError::ValidationError {
+                message: "managed-start-rejected: managed attempts cannot resume an unscoped native session".into(),
+            });
+        }
+        let sidecar_binary = spawn.sidecar_binary;
+        let env = input.env.clone().unwrap_or_default();
+        let sidecar = match input.remote.as_ref() {
+            // On a device the runtime installed there runs over `ssh -T`;
+            // `input.cwd` is already a path on that device.
+            #[cfg(unix)]
+            Some(remote) => {
+                let claude =
+                    crate::ssh::sidecar::device_program(remote, &spawn.claude_binary).await?;
+                JsonRpcChild::spawn(crate::ssh::sidecar::claude_spawn_config(
+                    remote,
+                    &claude,
+                    &env,
+                    &input.cwd,
+                    DEFAULT_RPC_TIMEOUT,
+                )?)
+                .await
+                .map_err(crate::ssh::sidecar::ssh_spawn_error)?
+            }
+            #[cfg(not(unix))]
+            Some(_) => {
+                return Err(ProviderError::ValidationError {
+                    message: "Threads on another device need macOS or Linux on this computer"
+                        .into(),
+                })
+            }
+            None => {
+                spawn_local_sidecar(&sidecar_binary, env, input.cwd.clone(), managed.is_some())
+                    .await?
+            }
+        };
         let sidecar = Arc::new(sidecar);
+        let mut startup_guard = sidecar.managed_startup_guard();
+        if let Some(context) = managed.as_ref() {
+            let recorded = sidecar
+                .managed_evidence()
+                .map_err(|e| e.to_string())
+                .and_then(|evidence| context.handler.record_runtime(evidence));
+            if let Err(error) = recorded {
+                sidecar
+                    .shutdown_managed()
+                    .await
+                    .map_err(|stop| ProviderError::ProcessError {
+                        message: "managed Claude startup stop unconfirmed".into(),
+                        source: Some(stop.to_string()),
+                    })?;
+                return Err(ProviderError::ValidationError {
+                    message: format!("managed-start-rejected: {error}"),
+                });
+            }
+        }
 
         // Claim the single incoming-request receiver before any
         // background task starts.
-        let incoming_rx = sidecar.incoming_requests().ok_or_else(|| {
-            ProviderError::ProcessError {
-                message: "sidecar incoming-request channel already claimed".into(),
-                source: None,
-            }
-        })?;
+        let incoming_rx =
+            sidecar
+                .incoming_requests()
+                .ok_or_else(|| ProviderError::ProcessError {
+                    message: "sidecar incoming-request channel already claimed".into(),
+                    source: None,
+                })?;
+
+        // A session on a device publishes none of this computer's tools and
+        // keeps no registry to run the device's tool calls through.
+        let mcp_registry = crate::agent_provider::local_tool_registry(
+            spawn.mcp_registry.as_ref(),
+            input.remote.as_ref(),
+        );
 
         // Build `start-session` params from the trait-level input.
         //
@@ -276,15 +372,12 @@ impl ClaudeSession {
         // passthrough. Context window is encoded into the model id
         // itself via `resolve_claude_api_model_id` — Anthropic's API
         // expects the `[1m]` suffix as part of the model string.
-        let resolved_model = input
-            .model
-            .as_deref()
-            .map(|m| {
-                crate::agent_provider::claude::capabilities::resolve_claude_api_model_id(
-                    m,
-                    input.context_window.as_deref(),
-                )
-            });
+        let resolved_model = input.model.as_deref().map(|m| {
+            crate::agent_provider::claude::capabilities::resolve_claude_api_model_id(
+                m,
+                input.context_window.as_deref(),
+            )
+        });
         let resolved_effort = input.effort.clone().or_else(|| {
             input
                 .extra
@@ -301,6 +394,8 @@ impl ClaudeSession {
             // and served-speed checks exist. Do not revive an older saved
             // Fast choice as a hidden premium override on resume.
             fast_mode: Some(false),
+            max_budget_usd,
+            max_turns,
             permission_mode: input.permission_mode.clone(),
             allow_dangerously_skip_permissions: match input.permission_mode.as_deref() {
                 Some("bypassPermissions") => Some(true),
@@ -311,10 +406,7 @@ impl ClaudeSession {
             } else {
                 Some(input.additional_directories.clone())
             },
-            settings: input
-                .extra
-                .get("settings")
-                .cloned(),
+            settings: input.extra.get("settings").cloned(),
             resume: input
                 .resume_cursor
                 .as_ref()
@@ -326,7 +418,13 @@ impl ClaudeSession {
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            path_to_claude_code_executable: spawn.claude_binary.clone(),
+            // On a device the bare name resolves through the PATH the
+            // remote launch sets up; a local path would mean nothing there.
+            path_to_claude_code_executable: if input.remote.is_some() {
+                PathBuf::from("claude")
+            } else {
+                spawn.claude_binary.clone()
+            },
             extra_args: input
                 .extra
                 .get("extraArgs")
@@ -338,18 +436,75 @@ impl ClaudeSession {
             // server. Tools added after session start aren't visible
             // until the chat is restarted (Stage 4 polish will add a
             // `setMcpServers` push path so dynamic refreshes work).
-            mcp_tools: collect_mcp_tools(spawn.mcp_registry.as_ref()).await,
+            mcp_tools: match managed.as_ref() {
+                Some(context) => context
+                    .handler
+                    .tools()
+                    .into_iter()
+                    .map(|tool| super::protocol::McpToolEntry {
+                        name: tool.name.clone(),
+                        prefixed_name: tool.name,
+                        description: Some(tool.description),
+                        input_schema: tool.input_schema,
+                        server_id: "workflow".into(),
+                    })
+                    .collect(),
+                None => {
+                    collect_mcp_tools(
+                        mcp_registry.as_ref(),
+                        &crate::mcp::registry::HostCaller {
+                            thread_id: thread_id.0.clone(),
+                            provider: crate::agent_provider::ProviderKind::Claude,
+                            workspace_id: input.workspace_id.clone(),
+                            permission_mode: input.permission_mode.clone(),
+                        },
+                    )
+                    .await
+                }
+            },
         };
-        let params_value = serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
-            message: "failed to serialize start-session params".into(),
-            source: Some(e.to_string()),
-        })?;
-        let resp = sidecar
-            .request(METHOD_START_SESSION, params_value)
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("start-session RPC failed: {e}"),
+        let mut params_value =
+            serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
+                message: "failed to serialize start-session params".into(),
+                source: Some(e.to_string()),
             })?;
+        if managed.is_some() {
+            params_value["managed"] = json!(true);
+        }
+        let resp = match sidecar.request(METHOD_START_SESSION, params_value).await {
+            Ok(response) => response,
+            Err(error) if managed.is_some() => {
+                // No user prompt is sent before this managed readiness ACK.
+                // Known-zero rejection still requires actual group shutdown.
+                sidecar
+                    .shutdown_managed()
+                    .await
+                    .map_err(|stop| ProviderError::ProcessError {
+                        message: "managed Claude initialization stop unconfirmed".into(),
+                        source: Some(stop.to_string()),
+                    })?;
+                return Err(ProviderError::ValidationError {
+                    message: format!(
+                        "managed-start-rejected: native tool initialization failed: {error}"
+                    ),
+                });
+            }
+            Err(error) => {
+                // A runtime that dies before answering on a device is an
+                // install or connection problem there; name the device.
+                #[cfg(unix)]
+                if let Some(error) = input
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| crate::ssh::sidecar::claude_start_error(&error, remote))
+                {
+                    return Err(error);
+                }
+                return Err(ProviderError::RpcError {
+                    message: format!("start-session RPC failed: {error}"),
+                });
+            }
+        };
         let parsed: StartSessionResponse =
             serde_json::from_value(resp).map_err(|e| ProviderError::RpcError {
                 message: format!("malformed start-session response: {e}"),
@@ -357,6 +512,7 @@ impl ClaudeSession {
 
         let provider_session_id = ProviderSessionId(parsed.thread_id.clone());
         let (shutdown_tx, _) = broadcast::channel(4);
+        if let Some(guard) = startup_guard.as_mut() { guard.set_task_shutdown(shutdown_tx.clone()); }
         let state = Mutex::new(ClaudeSessionState {
             status: SessionStatus::Ready,
             active_turn: None,
@@ -378,8 +534,18 @@ impl ClaudeSession {
             tasks: Mutex::new(Vec::new()),
             intentionally_closed: Arc::new(RwLock::new(false)),
             dead: Arc::new(AtomicBool::new(false)),
-            mcp_registry: spawn.mcp_registry.clone(),
+            mcp_registry: if managed.is_some() {
+                None
+            } else {
+                mcp_registry
+            },
             workspace_id: input.workspace_id.clone(),
+            managed_diagnostics: input
+                .extra
+                .get("managedDiagnostics")
+                .and_then(Value::as_bool)
+                == Some(true),
+            managed,
         });
 
         // Announce the session up front.
@@ -415,7 +581,8 @@ impl ClaudeSession {
         // registry's status broadcaster; whenever a server transitions
         // (Running ↔ Stopped / Errored), re-collect tools and push the
         // fresh snapshot to the sidecar via `update-mcp-tools`. The
-        // task does nothing when no registry is configured.
+        // task does nothing when no registry is configured, which
+        // includes every session on a device.
         let mcp_refresh_task = spawn_mcp_refresh_task(
             Arc::clone(&session),
             shutdown_tx.subscribe(),
@@ -429,7 +596,14 @@ impl ClaudeSession {
             guard.push(mcp_refresh_task);
         }
 
+        if let Some(guard) = startup_guard.as_mut() { guard.disarm(); }
         Ok(session)
+    }
+
+    pub(crate) fn managed_startup_guard(&self) -> Option<crate::json_rpc_child::ManagedStartupGuard> {
+        let mut guard = self.sidecar.managed_startup_guard()?;
+        guard.set_task_shutdown(self.shutdown_tx.clone());
+        Some(guard)
     }
 
     /// Send a user turn, or **queue** it behind the active turn.
@@ -581,10 +755,12 @@ impl ClaudeSession {
                         ),
                         original_payload: None,
                     });
-                    let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                        thread_id: self.thread_id.clone(),
-                        queued_id: queued.queued_id,
-                    });
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                            thread_id: self.thread_id.clone(),
+                            queued_id: queued.queued_id,
+                        });
                     continue;
                 }
             }
@@ -610,10 +786,12 @@ impl ClaudeSession {
             }
         };
         if removed {
-            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                thread_id: self.thread_id.clone(),
-                queued_id: queued_id.to_string(),
-            });
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id: queued_id.to_string(),
+                });
         }
         Ok(removed)
     }
@@ -676,11 +854,7 @@ impl ClaudeSession {
                     // queue silently rearranged.
                     {
                         let mut state = self.state.lock().await;
-                        restore_queued_position(
-                            &mut state.queued_turns,
-                            queued_id,
-                            original_index,
-                        );
+                        restore_queued_position(&mut state.queued_turns, queued_id, original_index);
                     }
                     Err(err)
                 }
@@ -702,10 +876,12 @@ impl ClaudeSession {
             state.queued_turns.drain(..).map(|q| q.queued_id).collect()
         };
         for queued_id in drained {
-            let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnCancelled {
-                thread_id: self.thread_id.clone(),
-                queued_id,
-            });
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id,
+                });
         }
     }
 
@@ -736,15 +912,6 @@ impl ClaudeSession {
             model_override,
             images: encoded_images,
         };
-        self.sidecar
-            .request(
-                METHOD_SEND_TURN,
-                serde_json::to_value(&params).unwrap(),
-            )
-            .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("send-turn RPC failed: {e}"),
-            })?;
         let turn_id = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
         {
             let mut state = self.state.lock().await;
@@ -758,13 +925,49 @@ impl ClaudeSession {
         // text delta for a pure-tool turn, so without this event the
         // frontend's streaming flag would stay false for the entire
         // turn and let the user queue a second one.
-        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: self.thread_id.clone(),
-            status: SessionStatus::Running {
-                active_turn: turn_id.clone(),
-            },
-        });
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: self.thread_id.clone(),
+                status: SessionStatus::Running {
+                    active_turn: turn_id.clone(),
+                },
+            });
+        // The SDK can emit messages before the RPC acknowledgment. Own the
+        // turn first so even an immediate result has the correct identity.
+        if let Err(error) = self
+            .sidecar
+            .request(METHOD_SEND_TURN, serde_json::to_value(&params).unwrap())
+            .await
+        {
+            let mut state = self.state.lock().await;
+            if state.active_turn.as_ref() == Some(&turn_id) {
+                state.active_turn = None;
+                if matches!(state.status, SessionStatus::Running { .. }) {
+                    state.status = SessionStatus::Ready;
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::SessionStateChanged {
+                            thread_id: self.thread_id.clone(),
+                            status: SessionStatus::Ready,
+                        });
+                }
+            }
+            return Err(ProviderError::RpcError {
+                message: format!("send-turn RPC failed: {error}"),
+            });
+        }
         Ok(turn_id)
+    }
+
+    /// This session as a host-tool caller, with its current permission mode.
+    async fn host_caller(&self) -> crate::mcp::registry::HostCaller {
+        crate::mcp::registry::HostCaller {
+            thread_id: self.thread_id.0.clone(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: self.workspace_id.clone(),
+            permission_mode: self.state.lock().await.permission_mode.clone(),
+        }
     }
 
     /// Whether the child-exit watchdog has declared this session's sidecar
@@ -824,10 +1027,12 @@ impl ClaudeSession {
                 // Announce Ready while holding the lock so subscribers
                 // never observe `Ready` in the struct with no
                 // corresponding event in flight.
-                let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: self.thread_id.clone(),
-                    status: SessionStatus::Ready,
-                });
+                let _ = self
+                    .event_tx
+                    .send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: self.thread_id.clone(),
+                        status: SessionStatus::Ready,
+                    });
             }
         }
         // Fallback drain: if the notification hasn't run yet, this
@@ -855,6 +1060,11 @@ impl ClaudeSession {
     }
 
     pub async fn set_permission_mode(&self, mode: String) -> Result<(), ProviderError> {
+        if self.managed.is_some() {
+            return Err(ProviderError::ValidationError {
+                message: "managed workflow tool permissions cannot be relaxed".into(),
+            });
+        }
         let params = SetPermissionModeParams {
             thread_id: self.thread_id.0.clone(),
             mode: mode.clone(),
@@ -1011,6 +1221,34 @@ impl ClaudeSession {
             state.pending_approvals.clear();
         }
     }
+
+    pub async fn shutdown_managed(&self) -> Result<(), ProviderError> {
+        if self.managed.is_none() {
+            return Err(ProviderError::ValidationError {
+                message: "session is not a managed attempt".into(),
+            });
+        }
+        // Quiesce first; never drop a failed cleanup handle from the map.
+        self.sidecar
+            .shutdown_managed()
+            .await
+            .map_err(|error| ProviderError::ProcessError {
+                message: "managed Claude stop is unconfirmed".into(),
+                source: Some(error.to_string()),
+            })?;
+        if let Some(context) = self.managed.as_ref() {
+            context
+                .handler
+                .quiesce()
+                .await
+                .map_err(|error| ProviderError::ProcessError {
+                    message: "managed Claude host-tool stop unconfirmed".into(),
+                    source: Some(error),
+                })?;
+        }
+        self.shutdown().await;
+        Ok(())
+    }
 }
 
 /// The sidecar now reports a missing callback as InvalidParams (`-32602`),
@@ -1028,15 +1266,31 @@ fn is_request_not_pending_rpc(err: &crate::json_rpc_child::RpcError) -> bool {
         || message.contains("no pending approval")
 }
 
-/// Replace an empty [`TurnId`] on an event with the session's
-/// currently-active turn id. No-op when the event already carries a
-/// non-empty turn id or when the session has no active turn.
-///
-/// Claude's SDK does not expose per-turn identifiers — every message
-/// carries `session_id` but no `turn_id`. The translator falls back to
-/// an empty string, which breaks every frontend consumer that keys on
-/// turn_id. We stamp the adapter's own turn id (minted in `send_turn`)
-/// onto events as they leave the broadcaster.
+fn optional_positive_budget(extra: &Value) -> Result<Option<f64>, String> {
+    match extra.get("maxBudgetUsd").filter(|value| !value.is_null()) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(Some)
+            .ok_or_else(|| "maxBudgetUsd must be a finite positive number".into()),
+    }
+}
+
+fn optional_positive_turns(extra: &Value) -> Result<Option<u32>, String> {
+    match extra.get("maxTurns").filter(|value| !value.is_null()) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| "maxTurns must be a positive 32-bit integer".into()),
+    }
+}
+
+/// SDK messages carry session IDs rather than turn IDs; preserve the host's
+/// active turn before result handling clears it.
 fn stamp_turn_id(event: &mut ProviderRuntimeEvent, active: Option<&TurnId>) {
     let Some(active) = active else { return };
     if active.0.is_empty() {
@@ -1074,14 +1328,43 @@ impl Drop for ClaudeSession {
 // Background tasks
 // ---------------------------------------------------------------------------
 
+fn managed_catalog_diagnostic(params: &Value) -> Option<Value> {
+    let message = params.get("message")?;
+    if message.get("type").and_then(Value::as_str) != Some("system")
+        || message.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    let tools = message
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(Value::as_str)
+                .take(256)
+                .map(|name| name.chars().take(512).collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let servers = message.get("mcp_servers").and_then(Value::as_array).map(|servers| {
+        servers.iter().take(32).map(|server|json!({
+            "name":server.get("name").and_then(Value::as_str).map(|name|name.chars().take(512).collect::<String>()),
+            "status":server.get("status").and_then(Value::as_str),
+        })).collect::<Vec<_>>()
+    }).unwrap_or_default();
+    Some(json!({"tools":tools,"mcp_servers":servers}))
+}
+
 fn spawn_notifications_task(
     session: Arc<ClaudeSession>,
     sidecar: Arc<JsonRpcChild>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
+    // Subscribe synchronously before the caller can start a native turn.
+    let mut notifications = sidecar.notifications();
     tokio::spawn(async move {
-        let mut notifications = sidecar.notifications();
         // Per-session subagent demux state. Owned by this single
         // notification task and passed by `&mut` into the translator so
         // subagent launch → inner routing → progress → completion spans
@@ -1093,12 +1376,24 @@ fn spawn_notifications_task(
                 maybe_note = notifications.recv() => {
                     match maybe_note {
                         Ok(note) => {
+                            if session.managed.is_some() && session.managed_diagnostics {
+                                if let Some(catalog) = managed_catalog_diagnostic(&note.params) {
+                                    let _=event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                                        thread_id:Some(session.thread_id.clone()),
+                                        message:"Managed native tool catalog".into(),
+                                        original_payload:Some(catalog),
+                                    });
+                                }
+                            }
                             // Update local state for specific notifications
                             // before broadcasting.
                             let structured = SidecarNotification::from_method_params(
                                 &note.method,
                                 note.params.clone(),
                             );
+                            // Result/interruption handling clears the active
+                            // turn. Preserve its identity before that mutation.
+                            let active_turn=session.state.lock().await.active_turn.clone();
                             mutate_state_from_notification(&session, &structured).await;
                             // Catch any panic in the pure translator so
                             // a bug can't kill this task.
@@ -1114,7 +1409,7 @@ fn spawn_notifications_task(
                             .unwrap_or_else(|_| {
                                 vec![ProviderRuntimeEvent::RuntimeWarning {
                                     thread_id: Some(session.thread_id.clone()),
-                                    message: "panic while translating sidecar notification".into(),
+                                    message: if session.managed.is_some() {"Managed event stream lagged: sidecar notification translation failed"} else {"panic while translating sidecar notification"}.into(),
                                     original_payload: Some(note.params),
                                 }]
                             });
@@ -1129,10 +1424,6 @@ fn spawn_notifications_task(
                             // match-by-turn_id collapses across turns
                             // and the 2nd turn's deltas overwrite the
                             // 1st turn's assistant message.
-                            let active_turn = {
-                                let state = session.state.lock().await;
-                                state.active_turn.clone()
-                            };
                             for mut e in events {
                                 stamp_turn_id(&mut e, active_turn.as_ref());
                                 let _ = event_tx.send(e);
@@ -1161,7 +1452,7 @@ fn spawn_notifications_task(
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                                 thread_id: Some(session.thread_id.clone()),
-                                message: format!("sidecar notification channel lagged, dropped {n}"),
+                                message: if session.managed.is_some() {format!("Managed event stream lagged: sidecar notification channel dropped {n}")} else {format!("sidecar notification channel lagged, dropped {n}")},
                                 original_payload: None,
                             });
                             continue;
@@ -1294,7 +1585,8 @@ async fn push_mcp_refresh(
     session: &Arc<ClaudeSession>,
     registry: &crate::mcp::registry::McpRegistry,
 ) {
-    let tools = collect_shared_tools_for_claude(registry).await;
+    let caller = session.host_caller().await;
+    let tools = collect_shared_tools_for_claude(registry, &caller).await;
     let entries: Vec<super::protocol::McpToolEntry> = tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1316,10 +1608,7 @@ async fn push_mcp_refresh(
     };
     if let Err(err) = session
         .sidecar
-        .request(
-            super::protocol::METHOD_UPDATE_MCP_TOOLS,
-            params_value,
-        )
+        .request(super::protocol::METHOD_UPDATE_MCP_TOOLS, params_value)
         .await
     {
         let _ = session.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
@@ -1336,11 +1625,12 @@ async fn push_mcp_refresh(
 /// just doesn't register the in-process MCP server.
 async fn collect_mcp_tools(
     registry: Option<&crate::mcp::registry::McpRegistry>,
+    caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<super::protocol::McpToolEntry> {
     let Some(registry) = registry else {
         return Vec::new();
     };
-    let tools = collect_shared_tools_for_claude(registry).await;
+    let tools = collect_shared_tools_for_claude(registry, caller).await;
     tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1353,16 +1643,22 @@ async fn collect_mcp_tools(
         .collect()
 }
 
+/// The single choke point for the tools a Claude session sees, at start and
+/// on every live refresh: the shared registry surface plus the host tools
+/// Codemux serves to this particular chat.
 async fn collect_shared_tools_for_claude(
     registry: &crate::mcp::registry::McpRegistry,
+    caller: &crate::mcp::registry::HostCaller,
 ) -> Vec<crate::mcp::runtime::McpTool> {
-    registry
+    let mut tools = registry
         .list_all_tools_excluding_sources(&[
             crate::mcp::McpConfigSource::ClaudeUser,
             crate::mcp::McpConfigSource::ClaudeLocal,
             crate::mcp::McpConfigSource::ClaudeProject,
         ])
-        .await
+        .await;
+    tools.extend(registry.host_tools(caller));
+    tools
 }
 
 /// Format a tool result payload the way Anthropic's MCP SDK expects:
@@ -1401,50 +1697,71 @@ async fn handle_mcp_tool_call(
     };
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // Look up the registry. If the provider was constructed without
-    // one (tests, headless contexts) surface a clean error to the
-    // SDK rather than panicking.
-    let Some(registry) = session.mcp_registry.clone() else {
-        let _ = session
-            .sidecar
-            .respond(
-                req.id,
-                Ok(tool_result_text(
-                    "MCP runtime not available in this Codemux build",
-                    true,
-                )),
-            )
-            .await;
+    if let Some(context) = session.managed.as_ref() {
+        let payload = match context.call(&prefixed_name, arguments).await {
+            Ok(value) => tool_result_text(value.to_string(), false),
+            Err(error) => tool_result_text(error, true),
+        };
+        let _ = session.sidecar.respond(req.id, Ok(payload)).await;
         return;
+    }
+
+    let caller = session.host_caller().await;
+    let (payload, failure) = run_mcp_tool_call(
+        session.mcp_registry.as_ref(),
+        &caller,
+        session.workspace_id.as_deref(),
+        &prefixed_name,
+        arguments,
+    )
+    .await;
+    if let Some(message) = failure {
+        let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(session.thread_id.clone()),
+            message: format!("mcp-tool-call {prefixed_name} failed: {message}"),
+            original_payload: None,
+        });
+    }
+    let _ = session.sidecar.respond(req.id, Ok(payload)).await;
+}
+
+/// Run one `mcp-tool-call` and build the tool result for the SDK, plus the
+/// dispatch failure worth a runtime warning, if any.
+async fn run_mcp_tool_call(
+    registry: Option<&crate::mcp::registry::McpRegistry>,
+    caller: &crate::mcp::registry::HostCaller,
+    workspace_id: Option<&str>,
+    prefixed_name: &str,
+    arguments: Value,
+) -> (Value, Option<String>) {
+    // No registry: a session on a device (which must not reach this
+    // computer's tools whatever name it sends), or a provider built without
+    // one (tests, headless contexts). Answer with a tool error rather than
+    // dispatching.
+    let Some(registry) = registry else {
+        return (
+            tool_result_text("Codemux's tools aren't available to this thread", true),
+            None,
+        );
     };
 
+    // Host tools first. The caller carries the LIVE permission mode, so a
+    // Plan/Ask pill flipped after the session started is honoured.
+    if let Some(result) = registry.host_call(caller, prefixed_name, &arguments) {
+        return (result, None);
+    }
+
     match registry
-        .dispatch_tool_call(&prefixed_name, arguments, session.workspace_id.as_deref())
+        .dispatch_tool_call(prefixed_name, arguments, workspace_id)
         .await
     {
-        Ok(result) => {
-            // The MCP child returns the full `tools/call` result —
-            // including `content` and optional `isError`. Forward it
-            // verbatim. If the shape is wrong (no `content` key)
-            // wrap it so the SDK still sees a valid shape.
-            let payload = if result.get("content").is_some() {
-                result
-            } else {
-                tool_result_text(result.to_string(), false)
-            };
-            let _ = session.sidecar.respond(req.id, Ok(payload)).await;
-        }
-        Err(message) => {
-            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                thread_id: Some(session.thread_id.clone()),
-                message: format!("mcp-tool-call {prefixed_name} failed: {message}"),
-                original_payload: None,
-            });
-            let _ = session
-                .sidecar
-                .respond(req.id, Ok(tool_result_text(message, true)))
-                .await;
-        }
+        // The MCP child returns the full `tools/call` result — including
+        // `content` and optional `isError`. Forward it verbatim. If the
+        // shape is wrong (no `content` key) wrap it so the SDK still sees a
+        // valid shape.
+        Ok(result) if result.get("content").is_some() => (result, None),
+        Ok(result) => (tool_result_text(result.to_string(), false), None),
+        Err(message) => (tool_result_text(message.clone(), true), Some(message)),
     }
 }
 
@@ -1608,6 +1925,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_claude_budget_and_turn_caps_are_optional_and_bounded() {
+        assert_eq!(optional_positive_budget(&Value::Null).unwrap(), None);
+        assert_eq!(optional_positive_turns(&json!({})).unwrap(), None);
+        assert_eq!(
+            optional_positive_budget(&json!({"maxBudgetUsd":0.2})).unwrap(),
+            Some(0.2)
+        );
+        assert_eq!(
+            optional_positive_turns(&json!({"maxTurns":6})).unwrap(),
+            Some(6)
+        );
+        for value in [json!(0), json!(-1), json!("1")] {
+            assert!(optional_positive_budget(&json!({"maxBudgetUsd":value})).is_err());
+        }
+        for value in [json!(0), json!(-1), json!(1.5), json!(u64::MAX)] {
+            assert!(optional_positive_turns(&json!({"maxTurns":value})).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_claude_catalog_diagnostic_excludes_authentication_and_prompts() {
+        let catalog=managed_catalog_diagnostic(&json!({"message":{"type":"system","subtype":"init",
+            "tools":["mcp__codemux__workflow_wait"],"mcp_servers":[{"name":"codemux","status":"connected","secret":"excluded"}],
+            "apiKey":"excluded","prompt":"excluded"}})).unwrap();
+        assert_eq!(
+            catalog,
+            json!({"tools":["mcp__codemux__workflow_wait"],"mcp_servers":[{"name":"codemux","status":"connected"}]})
+        );
+        assert!(managed_catalog_diagnostic(&json!({"message":{"type":"assistant"}})).is_none());
+    }
+
+    #[test]
     fn stop_response_indicates_already_closed_parses() {
         assert!(stop_response_indicates_already_closed(&json!({
             "alreadyClosed": true
@@ -1717,5 +2066,61 @@ mod tests {
         restore_queued_position(&mut q, "c", 9);
         let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    fn test_caller() -> crate::mcp::registry::HostCaller {
+        crate::mcp::registry::HostCaller {
+            thread_id: "thread".into(),
+            provider: crate::agent_provider::ProviderKind::Claude,
+            workspace_id: Some("ws-42".into()),
+            permission_mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_session_publishes_and_runs_shared_tools() {
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let local = crate::agent_provider::local_tool_registry(Some(&registry), None);
+        assert_eq!(collect_mcp_tools(local.as_ref(), &test_caller()).await.len(), 1);
+        let (payload, failure) = run_mcp_tool_call(
+            local.as_ref(),
+            &test_caller(),
+            Some("ws-42"),
+            "mcp__codemux-remote__echo",
+            json!({"text": "hi"}),
+        )
+        .await;
+        assert_eq!(payload["content"][0]["text"], "routed");
+        assert!(failure.is_none());
+        call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn device_session_gets_and_runs_none_of_this_computers_tools() {
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let device = crate::agent_provider::types::RemoteSpawnTarget {
+            host_id: 3,
+            ssh_target: "deus@ai-node".into(),
+            host_name: "ai-node".into(),
+        };
+        let on_device = crate::agent_provider::local_tool_registry(Some(&registry), Some(&device));
+        assert!(collect_mcp_tools(on_device.as_ref(), &test_caller())
+            .await
+            .is_empty());
+
+        // A call the device sends anyway, by a name it guessed, is answered
+        // with a tool error and never reaches the registry.
+        let (payload, _) = run_mcp_tool_call(
+            on_device.as_ref(),
+            &test_caller(),
+            Some("ws-42"),
+            "mcp__codemux-remote__echo",
+            json!({"text": "hi"}),
+        )
+        .await;
+        assert_eq!(payload["isError"], true);
+        assert!(!call.matched_async().await);
     }
 }

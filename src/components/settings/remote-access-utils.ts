@@ -431,7 +431,7 @@ export function connectedSessionCount(status: WebRemoteStatus | null): number {
 /**
  * The ids of devices that are pending in `next` but were NOT pending in
  * `prev` — i.e. brand-new approval requests. Drives the "new device
- * requesting access" toast + badge. A device that flips from approved
+ * requesting access" question (useRemotePairingRequests). A device that flips from approved
  * back to pending (impossible today, but cheap to be correct about) also
  * counts.
  */

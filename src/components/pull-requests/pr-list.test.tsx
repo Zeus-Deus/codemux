@@ -12,7 +12,13 @@ vi.mock("@/lib/toast", () => ({
   toast: { info: vi.fn(), success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock("@/hooks/use-project-actions", () => ({
+  openProjectFlow: vi.fn().mockResolvedValue({ success: false }),
+}));
+
 import { PrList, clockTime } from "./pr-list";
+import { openProjectFlow } from "@/hooks/use-project-actions";
+import { useUIStore } from "@/stores/ui-store";
 import { rowKey, type PrRow } from "@/lib/pr-overview";
 
 const ROOT = "/home/dev/projects/codemux";
@@ -360,11 +366,16 @@ describe("footer and empty states", () => {
   it("says what to do next when there is nothing to show", () => {
     renderList({ rows: [], hostCount: 0 });
     expect(screen.getByText("No projects open.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+    expect(openProjectFlow).toHaveBeenCalledOnce();
   });
 
   it("distinguishes no projects from no open pull requests", () => {
+    useUIStore.setState({ showSettings: false, settingsSection: null });
     renderList({ rows: [], hostCount: 2 });
     expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Source Control settings" }));
+    expect(useUIStore.getState()).toMatchObject({ showSettings: true, settingsSection: "source_control" });
   });
 });
 
@@ -685,5 +696,80 @@ describe("PrList — nothing to show, and why", () => {
     expect(strip).toHaveTextContent("resuming at");
     expect(strip).not.toHaveTextContent("showing the last list loaded");
     expect(strip).not.toHaveTextContent("showing the list from");
+  });
+});
+
+describe("PrList — local-only and unreachable repositories", () => {
+  const failure = (message: string) => ({
+    root: { path: ROOT, providerKind: null, name: "codemux" },
+    message,
+  });
+
+  it("names what each repository answered when every one of them failed", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("could not resolve host: code.example.com")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+
+    expect(screen.queryByText("No open pull requests.")).not.toBeInTheDocument();
+    const empty = screen.getByTestId("pr-list-all-failed");
+    expect(empty).toHaveTextContent("Couldn't list pull requests for 1 repository.");
+    expect(empty).toHaveTextContent("codemux: could not resolve host: code.example.com");
+    // A network failure is not a sign-in problem.
+    expect(empty).not.toHaveTextContent("signed in");
+  });
+
+  it("points at signing in only when the host said so", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("To get started with GitHub CLI, please run: gh auth login")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+    expect(screen.getByTestId("pr-list-all-failed")).toHaveTextContent(
+      "Check that the host CLI is signed in",
+    );
+  });
+
+  it("does not read a repository named after auth as a sign-in problem", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("GraphQL: Could not resolve to a Repository with the name 'acme/auth-service'.")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+    expect(screen.getByTestId("pr-list-all-failed")).not.toHaveTextContent("signed in");
+  });
+
+  it("reads an authentication failure as a sign-in problem", () => {
+    renderList({
+      rows: [],
+      hostCount: 1,
+      failures: [failure("remote: Unauthorized. Requires authentication.")],
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+    expect(screen.getByTestId("pr-list-all-failed")).toHaveTextContent(
+      "Check that the host CLI is signed in",
+    );
+  });
+
+  it("counts repositories without a remote apart from unreachable ones", () => {
+    renderList({ rows: [], hostCount: 3, localOnlyCount: 1 });
+    expect(screen.getByTestId("pr-list-local-only")).toHaveTextContent("1 local-only");
+    expect(screen.queryByTestId("pr-list-failures")).not.toBeInTheDocument();
+    expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
+  });
+
+  it("says so when no open project has a remote", () => {
+    renderList({ rows: [], hostCount: 1, localOnlyCount: 1 });
+    expect(screen.getByTestId("pr-list-local-only-empty")).toHaveTextContent(
+      "No repositories with a remote.",
+    );
   });
 });
