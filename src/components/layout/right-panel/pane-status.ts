@@ -25,10 +25,6 @@ export interface DeckStatusInput {
    *  net line delta. Both come straight off the workspace snapshot. */
   changes: { changedFiles: number; additions: number; deletions: number } | null;
   review: { prNumber: number | null; state: string | null } | null;
-  /** The diff pane's current file, relative to the workspace root. The
-   *  deck has no breadcrumb row any more, so this is where "which file am
-   *  I diffing?" is answered. */
-  diff: { filePath: string | null } | null;
   /** The workspace's agent browser session, when the browser pane is open.
    *  `docked` is false for the beat before the backend hands the session
    *  back; `agentDriven` is its `is_active` flag, which the backend raises
@@ -57,10 +53,6 @@ export function deckStatusLine(input: DeckStatusInput): string {
     const { changedFiles, additions, deletions } = input.changes;
     if (changedFiles === 0) return "working tree clean";
     return `${plural(changedFiles, "file")} changed · +${additions} −${deletions}`;
-  }
-
-  if (activePane === "diff" && input.diff) {
-    return input.diff.filePath ?? "no file selected";
   }
 
   if (activePane === "review" && input.review) {

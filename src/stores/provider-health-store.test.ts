@@ -73,6 +73,7 @@ describe("provider-health-store", () => {
         cursor: emptyHealthSlot(),
         grok: emptyHealthSlot(),
         hermes: emptyHealthSlot(),
+        acp: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
       },
     });
@@ -392,5 +393,10 @@ describe("provider-health-store", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("leaves ACP readiness to the instance without starting a generic probe", async () => {
+    expect(await useProviderHealth.getState().ensureReady("acp")).toBeNull();
+    expect(mockProbe).not.toHaveBeenCalled();
   });
 });

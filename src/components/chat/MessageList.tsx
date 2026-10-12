@@ -25,10 +25,12 @@ import {
 } from "react";
 
 import { Button } from "@/components/ui/button";
+import { isInlineHtmlRender } from "@/lib/agent-chat/html-render";
 import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import { isDelegationResultsText } from "@/lib/agent-chat/delegation";
 import {
   isAutoResumeText,
   usageLimitRecordText,
@@ -40,6 +42,8 @@ import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
+import { DelegationCard } from "./DelegationCard";
+import { DelegationResultsDivider } from "./DelegationResultsDivider";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
@@ -47,7 +51,10 @@ import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { SignInNotice } from "./SignInNotice";
+import { HtmlRenderFrame } from "./HtmlRenderFrame";
 import { ToolCallCard } from "./ToolCallCard";
+import { TurnChangesChip } from "./TurnChangesChip";
+import { AsyncQuestionRecord } from "./AsyncQuestionPanel";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
@@ -62,6 +69,7 @@ import {
 import { CHAT_COLUMN } from "./chat-column";
 import { isReadingBack } from "./composer-overlay";
 import { useTranscriptTopInset } from "./transcript-top-inset";
+import type { TurnChangeSummary } from "./turn-changes";
 import {
   subscribeTranscriptFade,
   transcriptFadeEnabled,
@@ -82,6 +90,7 @@ import type {
   TranscriptSlot,
 } from "./transcript-slots";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { withTimeFormat } from "@/lib/time-format";
 
 interface Props {
   messages: ChatViewItem[];
@@ -100,6 +109,8 @@ interface Props {
    *  as silent (issue #154). Renders an amber "no activity" notice at the
    *  transcript tail in place of the ember streaming marker. */
   stalled?: { silentForSecs: number } | null;
+  /** Stops the running turn; offered on the stall notice. */
+  onStop?: () => void;
   /** True when the last run never cleanly settled (child exit / crash).
    *  Renders a "Run interrupted" tail divider while not streaming. */
   interrupted?: boolean;
@@ -204,6 +215,7 @@ export const MessageList = memo(function MessageList({
   showThinking = false,
   streaming = false,
   stalled = null,
+  onStop,
   interrupted = false,
   sendAnchor,
   positionedNonceRef,
@@ -266,11 +278,26 @@ export const MessageList = memo(function MessageList({
   const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const toggleTurnFold = useCallback((turnId: string) => {
+  const toggleTurnFold = useCallback((turnId: string, pinnedBy: readonly string[]) => {
     setExpandedTurnIds((current) => {
       const next = new Set(current);
-      if (next.has(turnId)) next.delete(turnId);
-      else next.add(turnId);
+      if (next.has(turnId) || pinnedBy.some((id) => next.has(id))) {
+        next.delete(turnId);
+        for (const id of pinnedBy) next.delete(id);
+      } else {
+        next.add(turnId);
+      }
+      return next;
+    });
+  }, []);
+  // A work log opened mid-run pins its turn's fold open once the turn
+  // settles (see `buildTranscriptSlots`).
+  const keepWorkLogOpen = useCallback((entryId: string, keep: boolean) => {
+    setExpandedTurnIds((current) => {
+      if (current.has(entryId) === keep) return current;
+      const next = new Set(current);
+      if (keep) next.add(entryId);
+      else next.delete(entryId);
       return next;
     });
   }, []);
@@ -316,6 +343,19 @@ export const MessageList = memo(function MessageList({
     (compacting || showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
     !tailIsWorkingActivity;
 
+  // "Keep waiting" on the stall notice hides it until the run has been silent
+  // for another full stall threshold. Any activity clears `stalled`, and the
+  // snooze with it, so a fresh stall always shows.
+  const [stallSnoozedUntil, setStallSnoozedUntil] = useState<number | null>(null);
+  if (!stalled && stallSnoozedUntil !== null) setStallSnoozedUntil(null);
+  const showStalled =
+    stalled != null &&
+    streaming &&
+    (stallSnoozedUntil === null || stalled.silentForSecs >= stallSnoozedUntil);
+  const keepWaiting = useCallback(() => {
+    if (stalled) setStallSnoozedUntil(stalled.silentForSecs + STALL_THRESHOLD_SECS);
+  }, [stalled]);
+
   const listRef = useRef<LegendListRef | null>(null);
   // Chrome floating over the viewport's top edge (the titlebar band for a
   // lone chat). Rows the reader asked to see are parked below it. Mirrored
@@ -332,6 +372,16 @@ export const MessageList = memo(function MessageList({
   const modeRef = useRef<SendScrollMode>("following-end");
   const isAtEndRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const approvalPending = useMemo(
+    () =>
+      messages.some(
+        (m) =>
+          m.kind === "permission_request" &&
+          m.request_kind !== "user-input" &&
+          m.resolution.state === "pending",
+      ),
+    [messages],
+  );
   const pillTimerRef = useRef<number | null>(null);
   // Bumped whenever a pending "show the pill" decision is invalidated. The
   // timer callback compares against it instead of being cleared, so the
@@ -626,15 +676,30 @@ export const MessageList = memo(function MessageList({
         if (event.target !== viewport) return;
         cancelFollowForUserNavigation();
       };
+      // Keyboard scrolling is navigation too. Editable targets keep their
+      // keys: arrows inside an answer field move the caret, not the list.
+      // Space on a control (Copy, a fold, an approval) activates it rather
+      // than scrolling, so it must not retire follow any more than a click.
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (!SCROLL_KEYS.has(event.key)) return;
+        const target = event.target as HTMLElement | null;
+        if (target?.closest("input, textarea, select, [contenteditable='true']"))
+          return;
+        if (event.key === " " && target?.closest(SPACE_ACTIVATED_CONTROLS))
+          return;
+        cancelFollowForUserNavigation();
+      };
       viewport.addEventListener("wheel", onGesture, { passive: true });
       viewport.addEventListener("touchmove", onGesture, { passive: true });
       viewport.addEventListener("pointerdown", onPointerDown, {
         passive: true,
       });
+      viewport.addEventListener("keydown", onKeyDown);
       removeListeners = () => {
         viewport.removeEventListener("wheel", onGesture);
         viewport.removeEventListener("touchmove", onGesture);
         viewport.removeEventListener("pointerdown", onPointerDown);
+        viewport.removeEventListener("keydown", onKeyDown);
       };
     });
     return () => {
@@ -969,6 +1034,21 @@ export const MessageList = memo(function MessageList({
     scheduleAdvance();
   }, [anchoredEndSpace, ownsScroll, scheduleAdvance, slots, threadKey]);
 
+  // LegendList can also move the viewport with no data change of ours. A
+  // tail-first cold open backfills the older history while the list is still
+  // settling its initial scroll, and on a narrow viewport that settle can
+  // finish against the tail's old end — parking the reader hundreds of turns
+  // up. Follow intent still holds (no gesture has released it), so leaving
+  // the edge here is the list's doing: re-pin through the same advance.
+  useEffect(() => {
+    const state = listRef.current?.getState();
+    if (!state) return;
+    return state.listen("isNearEnd", (atEnd) => {
+      if (atEnd || !ownsScroll() || modeRef.current !== "following-end") return;
+      scheduleAdvance();
+    });
+  }, [ownsScroll, scheduleAdvance, threadKey]);
+
   /** The pill is the deliberate way back to the live edge, so it re-claims
    *  follow rather than cancelling it. Animated for the same reason the send
    *  glide is: a long-distance return should read as travel. */
@@ -1230,6 +1310,7 @@ export const MessageList = memo(function MessageList({
           onRevertTurn={onRevertTurn}
           revertingTurnIndex={revertingTurnIndex}
           onToggleTurnFold={toggleTurnFold}
+          onKeepWorkLogOpen={keepWorkLogOpen}
         />
       </div>
     ),
@@ -1247,6 +1328,7 @@ export const MessageList = memo(function MessageList({
       revertingTurnIndex,
       subagentNames,
       toggleTurnFold,
+      keepWorkLogOpen,
       turnCheckpointByNonce,
       workspaceId,
       cwd,
@@ -1280,12 +1362,16 @@ export const MessageList = memo(function MessageList({
             "calc(30px + var(--composer-overlay-height, 0px))",
         }}
       >
-        {stalled && streaming && (
+        {showStalled && (
           <div className="mt-[13px]">
-            <RunStalledNotice silentForSecs={stalled.silentForSecs} />
+            <RunStalledNotice
+              silentForSecs={stalled.silentForSecs}
+              onStop={onStop}
+              onKeepWaiting={keepWaiting}
+            />
           </div>
         )}
-        {showLiveMarker && (compacting || !(stalled && streaming)) && (
+        {showLiveMarker && (compacting || !showStalled) && (
           <div className="mt-[13px]">
             <StreamingMarker messages={ordered} compacting={compacting} workspaceId={workspaceId} />
           </div>
@@ -1297,7 +1383,7 @@ export const MessageList = memo(function MessageList({
         )}
       </div>
     ),
-    [compacting, interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
+    [compacting, interrupted, keepWaiting, onStop, ordered, showLiveMarker, showStalled, stalled, streaming, workspaceId],
   );
 
   return (
@@ -1385,9 +1471,16 @@ export const MessageList = memo(function MessageList({
           style={{
             bottom: "calc(1rem + var(--composer-overlay-height, 0px))",
           }}
-          className="absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className={cn(
+            "absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border bg-card font-semibold shadow-lg hover:bg-card hover:text-foreground",
+            approvalPending
+              ? "border-status-working/50 text-foreground"
+              : "border-border text-muted-foreground",
+          )}
         >
-          Jump to latest
+          {/* Approvals render at the live edge, so off the edge means the
+              waiting card is below the viewport. */}
+          {approvalPending ? "Approval needed" : "Jump to latest"}
           <ArrowDown className="size-3.5" aria-hidden />
         </Button>
       )}
@@ -1401,6 +1494,26 @@ export const MessageList = memo(function MessageList({
  *  who scrolls up gets the affordance without noticing the wait. Hiding is
  *  always immediate — an unwanted pill is worse than a late one. */
 const JUMP_PILL_SHOW_DELAY_MS = 150;
+
+/** How long "Keep waiting" holds the stall notice back. Matches the backend
+ *  watchdog's `STALL_THRESHOLD` (commands/agent_chat.rs), so the notice
+ *  returns after the same silence that raised it the first time. */
+const STALL_THRESHOLD_SECS = 600;
+
+/** Keys a browser scrolls a focused scroller with. */
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
+
+/** Focused controls that consume Space as activation instead of scrolling. */
+const SPACE_ACTIVATED_CONTROLS =
+  "button, summary, [role='button'], [role='checkbox'], [role='switch'], [role='tab'], [role='menuitem'], [role='option'], [role='radio']";
 
 /** Frames the anchor positioner will wait for the list ref to exist before
  *  giving up. A frame budget, not a fixed timeout: it cannot assume layout
@@ -1523,6 +1636,10 @@ function slotBodyContains(body: SlotBody, id: string): boolean {
       return body.item.id === id;
     case "activity":
       return body.items.some((entry) => entry.id === id);
+    case "delegation":
+      return body.entries.some(
+        (entry) => entry.call?.id === id || entry.view?.id === id,
+      );
     case "turn_fold":
       return false;
   }
@@ -1530,18 +1647,43 @@ function slotBodyContains(body: SlotBody, id: string): boolean {
 
 /** Amber "no activity" notice shown at the tail of a silently-stalled
  *  mid-turn run (issue #154). Advisory only — the run may still be alive
- *  (a long quiet tool call), so the copy hedges. Uses design tokens only. */
-function RunStalledNotice({ silentForSecs }: { silentForSecs: number }) {
+ *  (a long quiet tool call), so the copy hedges and offers both answers:
+ *  stop the run, or keep waiting. Uses design tokens only. */
+function RunStalledNotice({
+  silentForSecs,
+  onStop,
+  onKeepWaiting,
+}: {
+  silentForSecs: number;
+  onStop?: () => void;
+  onKeepWaiting: () => void;
+}) {
   const minutes = Math.max(1, Math.floor(silentForSecs / 60));
   return (
     <div
       role="status"
       data-testid="run-stalled-notice"
-      className="flex items-center gap-2 rounded-md bg-warning/10 px-3 py-2 text-body-sm text-warning"
+      className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-warning/10 py-1.5 pl-3 pr-1.5 text-body-sm text-warning"
     >
       <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
-      <span>
+      <span className="min-w-0 flex-1">
         No activity for {minutes}m — the agent may have stopped.
+      </span>
+      <span className="flex shrink-0 items-center gap-1">
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="text-warning hover:bg-warning/10 hover:text-warning"
+          onClick={onKeepWaiting}
+        >
+          Keep waiting
+        </Button>
+        {onStop && (
+          <Button type="button" variant="outline" size="xs" onClick={onStop}>
+            Stop
+          </Button>
+        )}
       </span>
     </div>
   );
@@ -1619,7 +1761,10 @@ function SessionStartMarker({ startedAt }: { startedAt?: number }) {
 function formatSessionStart(startedAt?: number): string {
   if (startedAt == null) return "Session started";
   const d = new Date(startedAt);
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = d.toLocaleTimeString(
+    [],
+    withTimeFormat({ hour: "2-digit", minute: "2-digit" }),
+  );
   const sameDay = d.toDateString() === new Date().toDateString();
   const datePart = sameDay
     ? "Today"
@@ -1658,6 +1803,7 @@ function transcriptSlotsAreEqual(
 function transcriptSlotType(slot: TranscriptSlot): string {
   if (slot.body.kind === "activity") return "activity";
   if (slot.body.kind === "turn_fold") return "turn_fold";
+  if (slot.body.kind === "delegation") return "delegation";
   return slot.body.item.kind;
 }
 
@@ -1667,6 +1813,7 @@ function transcriptSlotType(slot: TranscriptSlot): string {
 
 function ItemRow({
   item,
+  turnLive = false,
   approval,
   subagentName,
   onRespondToRequest,
@@ -1684,6 +1831,8 @@ function ItemRow({
   referencePaths,
 }: {
   item: ChatViewItem;
+  /** The item's turn is still running; gates a tool card's live timer. */
+  turnLive?: boolean;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
@@ -1727,6 +1876,15 @@ function ItemRow({
     return <AutoResumedTurnDivider text={item.text} />;
   }
 
+  // Likewise the round of delegated-task reports Codemux posts back.
+  if (
+    item.kind === "user_message" &&
+    !item.queued &&
+    isDelegationResultsText(item.text)
+  ) {
+    return <DelegationResultsDivider text={item.text} />;
+  }
+
   if (item.kind === "user_message") {
     const checkpoint = item.clientNonce
       ? turnCheckpointByNonce?.get(item.clientNonce)
@@ -1766,6 +1924,7 @@ function ItemRow({
   }
 
   return renderAssistantBody(item, {
+    turnLive,
     approval,
     subagentName,
     workspaceId,
@@ -1781,6 +1940,7 @@ function ItemRow({
 function renderAssistantBody(
   item: Exclude<ChatViewItem, { kind: "user_message" }>,
   handlers: {
+    turnLive: boolean;
     approval: PermissionRequestItem | null;
     subagentName: string | null;
     workspaceId?: string | null;
@@ -1794,25 +1954,7 @@ function renderAssistantBody(
 ) {
   switch (item.kind) {
     case "async_question":
-      return (
-        <div className="space-y-1 py-1 text-body">
-          {item.question.text && (
-            <p className="text-muted-foreground">{item.question.text}</p>
-          )}
-          {item.question.questions
-            .filter((question) => !item.question.text.includes(question.title))
-            .map((question, index) => (
-              <p key={index}>{question.title}</p>
-            ))}
-          <p className="text-label text-muted-foreground">
-            {item.resolution.status === "answered"
-              ? "Answered"
-              : item.resolution.status === "dismissed"
-                ? "Dismissed"
-                : "Answer above the composer · work can continue"}
-          </p>
-        </div>
-      );
+      return <AsyncQuestionRecord item={item} />;
     case "assistant_message":
       return (
         <AssistantMessage
@@ -1828,9 +1970,12 @@ function renderAssistantBody(
     case "tool_call":
       return isTaskSummaryTool(item) ? (
         <TaskSummaryCard item={item} workspaceId={handlers.workspaceId} />
+      ) : isInlineHtmlRender(item) ? (
+        <HtmlRenderFrame item={item} />
       ) : (
         <ToolCallCard
           item={item}
+          turnLive={handlers.turnLive}
           approval={handlers.approval}
           onDecide={handlers.handleDecide}
         />
@@ -1945,37 +2090,55 @@ function renderAssistantBody(
 function ActivityRow({
   items,
   working,
+  turnLive,
   workspaceId,
+  onKeepOpen,
 }: {
   items: WorkEntry[];
   working: boolean;
+  turnLive: boolean;
   workspaceId?: string | null;
+  onKeepOpen?: (entryId: string, keep: boolean) => void;
 }) {
   return (
-    <ActivityBlock items={items} working={working} workspaceId={workspaceId} />
+    <ActivityBlock
+      items={items}
+      working={working}
+      turnLive={turnLive}
+      workspaceId={workspaceId}
+      onKeepOpen={onKeepOpen}
+    />
   );
 }
 
 function TurnFoldRow({
   turnId,
+  pinnedBy,
   label,
   expanded,
   failedCount,
+  changes,
+  workspaceId,
+  cwd,
   onToggleTurnFold,
 }: {
   turnId: string;
+  pinnedBy: readonly string[];
   label: string;
   expanded: boolean;
   failedCount: number;
-  onToggleTurnFold: (turnId: string) => void;
+  changes?: TurnChangeSummary;
+  workspaceId?: string | null;
+  cwd?: string | null;
+  onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
 }) {
   const Icon = expanded ? ChevronDown : ChevronRight;
   return (
-    <div className="border-b border-border/60 pb-2 pt-1">
+    <div className="flex items-center justify-between gap-3 border-b border-border/60 pb-2 pt-1">
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={() => onToggleTurnFold(turnId)}
+        onClick={() => onToggleTurnFold(turnId, pinnedBy)}
         className="flex items-center gap-1 rounded-md px-1 text-label tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
         <span>{label}</span>
@@ -1986,6 +2149,9 @@ function TurnFoldRow({
         ) : null}
         <Icon className="size-3.5" aria-hidden />
       </button>
+      {changes ? (
+        <TurnChangesChip changes={changes} workspaceId={workspaceId} cwd={cwd} />
+      ) : null}
     </div>
   );
 }
@@ -2028,6 +2194,7 @@ function SlotRow({
   onRevertTurn,
   revertingTurnIndex,
   onToggleTurnFold,
+  onKeepWorkLogOpen,
 }: {
   slot: TranscriptSlot;
   approval: PermissionRequestItem | null;
@@ -2045,18 +2212,21 @@ function SlotRow({
   turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
   onRevertTurn?: (turnIndex: number) => void;
   revertingTurnIndex?: number | null;
-  onToggleTurnFold: (turnId: string) => void;
+  onToggleTurnFold: (turnId: string, pinnedBy: readonly string[]) => void;
+  onKeepWorkLogOpen?: (entryId: string, keep: boolean) => void;
 }) {
   const marginClass =
     slot.body.kind === "activity"
       ? "mt-2"
       : slot.body.kind === "turn_fold"
         ? "mt-4"
-        : slot.body.item.kind === "user_message"
-          ? "mt-5"
-          : slot.turnStart
-            ? "mt-4"
-            : "mt-2.5";
+        : slot.body.kind === "delegation"
+          ? "mt-3"
+          : slot.body.item.kind === "user_message"
+            ? "mt-5"
+            : slot.turnStart
+              ? "mt-4"
+              : "mt-2.5";
   return (
     <div
       data-message-id={slot.messageId}
@@ -2066,19 +2236,29 @@ function SlotRow({
         <ActivityRowMemo
           items={slot.body.items}
           working={slot.body.working}
+          turnLive={slot.body.turnLive}
           workspaceId={workspaceId}
+          onKeepOpen={onKeepWorkLogOpen}
         />
       ) : slot.body.kind === "turn_fold" ? (
         <TurnFoldRow
           turnId={slot.body.turnId}
+          pinnedBy={slot.body.pinnedBy}
           label={slot.body.label}
           expanded={slot.body.expanded}
           failedCount={slot.body.failedCount}
+          changes={slot.body.changes}
+          workspaceId={workspaceId}
+          cwd={cwd}
           onToggleTurnFold={onToggleTurnFold}
         />
+      ) : slot.body.kind === "delegation" ? (
+        // Memoized itself; `entries` keeps identity across untouched rebuilds.
+        <DelegationCard entries={slot.body.entries} />
       ) : (
         <ItemRowMemo
           item={slot.body.item}
+          turnLive={slot.body.turnLive}
           approval={approval}
           subagentName={subagentName}
           onRespondToRequest={onRespondToRequest}

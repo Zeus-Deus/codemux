@@ -115,7 +115,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
       });
     } catch (err) {
       console.warn("[incoming-prs] checkout failed:", err);
-      toast.error(String(err));
+      toast.failure("Couldn't check out the pull request", err);
     }
   };
 

@@ -42,7 +42,7 @@ export function AssistantAvatar({ provider }: Props) {
           provider === "claude" ? "bg-accent-ember/15" : "bg-surface-3",
         )}
       >
-        <ProviderLogo provider={provider} className="h-[15px] w-[15px]" />
+        <ProviderLogo provider={provider} className="size-4" />
       </span>
     );
   }
@@ -53,7 +53,7 @@ export function AssistantAvatar({ provider }: Props) {
       data-wash="ember"
       className="flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-md bg-accent-ember/15 text-accent-ember"
     >
-      <Sparkle className="h-[15px] w-[15px]" />
+      <Sparkle className="size-4" />
     </span>
   );
 }

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup D · Journal — CodeMux workflow UI (illustrative)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3C%2Fsvg%3E">
+<link rel="stylesheet" href="assets/app.css">
+<style>
+  .filters { padding: 8px 14px 0; }
+  .stream { list-style: none; margin: 0; padding: 8px 14px 6px; display: grid; gap: 1px; }
+  .ev { display: grid; grid-template-columns: 44px 1fr; gap: 0 8px; }
+  .ev .tm { font-family: var(--font-code); font-size: var(--t-caption); color: var(--muted-foreground); padding-top: 7px; text-align: right; }
+  .ev-b { display: grid; grid-template-columns: 16px 1fr 12px; gap: 0 8px; align-items: start; width: 100%; border: 0; background: transparent; text-align: left; padding: 5px 6px; border-radius: 7px; font-size: var(--t-body-sm); }
+  .ev-b:hover { background: var(--surface-2); }
+  .ev-b[aria-expanded="true"] { background: var(--surface-1); }
+  .ev-b .ic.chev { margin-top: 3px; color: var(--muted-foreground); transition: transform .12s; }
+  .ev-b[aria-expanded="true"] .ic.chev { transform: rotate(90deg); }
+  .ev-b .s2 { display: block; font-size: var(--t-label); color: var(--muted-foreground); margin-top: 1px; }
+  .ev-b .k { padding-top: 2px; }
+  .ev-x { margin: 2px 0 8px 30px; padding: 8px 10px; border-left: 1px solid var(--hairline-strong); display: grid; gap: 8px; font-size: var(--t-body-sm); }
+  .ev-x[hidden] { display: none; }
+  .turn { display: grid; grid-template-columns: 44px 1fr; gap: 0 8px; margin: 4px 0; }
+  .turn-in { border-left: 2px solid color-mix(in oklch, var(--status-monitoring) 45%, transparent); padding-left: 6px; display: grid; gap: 1px; }
+  .turn-h { font-family: var(--font-code); font-size: var(--t-caption); color: var(--status-monitoring); padding: 5px 6px 1px; }
+  .turn-in .ev { grid-template-columns: 0 1fr; }
+  .turn-in .ev .tm { visibility: hidden; }
+  .nowline { margin: 4px 14px 10px 66px; padding: 8px 10px; border-radius: 8px; border: 1px dashed var(--hairline-strong); font-size: var(--t-body-sm); display: grid; gap: 3px; }
+  .compose { margin: 0 14px 12px; border: 1px solid var(--hairline-strong); border-radius: 12px; padding: 8px 10px; display: grid; gap: 6px; }
+  .compose .r { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .d-split { display: grid; grid-template-columns: 1fr minmax(300px, 34%); min-height: 100%; }
+  .d-split > aside { border-left: 1px solid var(--hairline); padding: 12px 14px; display: grid; gap: 16px; align-content: start; }
+</style>
+</head>
+<body>
+<noscript><p style="padding:20px">This interactive mockup needs JavaScript.</p></noscript>
+<script src="assets/kit.js"></script>
+<script>
+(function () {
+  const { ic, esc, t, stat, usageLine, runControls, runMeta, taskDetail, filesView, ledger, tokLine } = K;
+  const S = K.S;
+  S.extra.filter = "all";
+  const KIND = { run: ["network", "muted"], admit: ["play", "muted"], decision: ["branch", "mon"], yield: ["hourglass", "mon"], result: ["check", "ok"], fail: ["x", "bad"], user: ["pen", "ember"], unknown: ["help", "bad"], cancel: ["ban", "muted"] };
+  const FILTERS = { all: ["All", () => true], decisions: ["Coordinator decisions", (e) => ["decision", "yield"].includes(e.kind)], results: ["Results & problems", (e) => ["result", "fail", "unknown", "cancel"].includes(e.kind)], you: ["Your actions", (e) => e.kind === "user"] };
+  function evDetail(e, s, i) {
+    const tk = e.task && s.tasks[e.task], out = [];
+    if (e.kind === "decision" && e.text.includes("replaced")) out.push(`<dl class="kv"><dt>Generation</dt><dd class="mono lbl">1 → 2 (dependents invalidated)</dd><dt>Route</dt><dd class="mono lbl">codex/writer → claude/writer</dd><dt>Guidance</dt><dd class="lbl">Keep the v1 snapshot reader. Return migration_notes as an array.</dd></dl>`);
+    else if (e.sub) out.push(`<p class="lbl muted" style="margin:0">${esc(e.sub)}</p>`);
+    if (e.kind === "yield") out.push(`<p class="lbl" style="margin:0">While waiting, the coordinator holds no worker slot. It resumes in a fresh attempt with the children's typed outcomes.</p>`);
+    if (tk && ["result", "fail", "unknown"].includes(e.kind)) {
+      const a = e.kind === "fail" ? tk.attempts.find((x) => x.status === "failed") : tk.attempts[0];
+      if (a) out.push(`<div class="lbl"><span class="mono">${a.route}</span> · attempt #${a.n} · gen ${a.gen} · ${tokLine(a)}</div>`);
+      if (e.kind === "fail" || e.kind === "unknown") out.push(`<p class="err" style="margin:0">${esc(a.error)}</p>`);
+      if (e.kind === "result" && tk.result && e.task !== "coordinator") out.push(`<pre class="out" tabindex="0" aria-label="${e.task} result JSON">${esc(JSON.stringify(tk.result, null, 2))}</pre>`);
+      if (e.task === "tests" && e.kind === "result") out.push(`<p class="notice work">A plan, not a run: managed workers can't execute tests.</p>`);
+    }
+    const art = /sealed/.test(e.text) && s.artifacts.find((x) => x.task === e.task);
+    const btns = [];
+    if (tk) btns.push(`<button class="btn sm" data-act="select" data-arg="${e.task}" data-fk="open-${i}">Open ${e.task}</button>`);
+    if (art) btns.push(`<button class="btn sm" data-act="files" data-arg="${art.id}" data-fk="files-${i}">${ic("diff", 12)}Review ${art.files.length} files</button>`);
+    if (e.kind === "unknown" && tk && tk.status === "unknown") btns.push(`<button class="btn sm" data-act="reconcile" data-fk="rec-${i}">${ic("shield", 12)}Reconcile task</button>${K.mockTag}`);
+    if (btns.length) out.push(`<div class="row-acts">${btns.join("")}</div>`);
+    return out.join("");
+  }
+  function evRow(e, s, i) {
+    const key = "ev-" + i, open = S.open.has(key), [icn, cls] = KIND[e.kind];
+    return `<li class="ev"><span class="tm">${t(e.at)}</span><div><button class="ev-b" aria-expanded="${open}" aria-controls="x-${key}" data-act="toggle" data-arg="${key}" data-fk="${key}">
+      <span class="k ${cls}">${ic(icn, 13)}</span><span>${esc(e.text)}${e.sub && !open ? `<span class="s2">${esc(e.sub)}</span>` : ""}</span>${ic("right", 12, "chev")}</button>
+      <div class="ev-x" id="x-${key}" ${open ? "" : "hidden"}>${open ? evDetail(e, s, i) : ""}</div></div></li>`;
+  }
+  function stream(s) {
+    const f = FILTERS[S.extra.filter][1], ev = s.events.map((e, i) => Object.assign({ i }, e)).filter(f), out = [];
+    for (let j = 0; j < ev.length; j++) {
+      const e = ev[j];
+      if (e.turn && S.extra.filter !== "you") {
+        const group = [e]; while (ev[j + 1] && ev[j + 1].turn === e.turn) group.push(ev[++j]);
+        out.push(`<li class="turn"><span class="ev tm" style="display:block;font-family:var(--font-code);font-size:var(--t-caption);color:var(--muted-foreground);text-align:right;padding-top:5px">${t(group[0].at)}</span><div class="turn-in" role="group" aria-label="Coordinator turn ${e.turn}"><div class="turn-h">coordinator · turn ${e.turn} · claude/coordinator</div><ul style="list-style:none;margin:0;padding:0;display:grid;gap:1px">${group.map((g) => evRow(g, s, g.i)).join("")}</ul></div></li>`);
+      } else out.push(evRow(e, s, e.i));
+    }
+    return out.length ? `<ul class="stream" aria-label="Workflow journal, oldest first">${out.join("")}</ul>` : `<p class="ph">No entries match this filter.</p>`;
+  }
+  function nowLine(s) {
+    if (s.status === "completed") return `<div class="nowline"><span>${stat("completed")} Run completed at ${t(s.now)}. 2 change sets are waiting for your review.</span></div>`;
+    if (s.status === "cancelled") return `<div class="nowline"><span>${stat("cancelled")} Nothing running. Retry and Apply are revoked.</span></div>`;
+    const rows = s.slots.map((sl) => { const a = sl.attempt && s.att[sl.attempt]; return `<span class="lbl">slot ${sl.n}: ${a ? `${stat(a.status, a.status === "unknown" ? "held" : a.draining ? "draining" : "running")} ${a.task}${a.gen > 1 ? " g2" : ""} <span class="mono cap muted">${a.route} · ${t(s.now - a.start)}</span>` : '<span class="muted">free</span>'}</span>`; });
+    const c = s.tasks.coordinator;
+    return `<div class="nowline" aria-label="Now"><span class="eyebrow">Now · ${s.busy} of 2 workers</span>${rows.join("")}<span class="lbl">coordinator: ${c.status === "waiting" ? `yielded, waiting for ${c.waitingFor.join(", ")}` : K.ST[c.status][2]}</span></div>`;
+  }
+  function compose(s) {
+    const live = ["running", "paused", "unknown"].includes(s.status), targets = s.order.filter((id) => ["running", "waiting", "queued"].includes(s.tasks[id].status));
+    return `<form class="compose" data-mock-form aria-label="Message a task (illustrative)"><div class="r"><label for="msg-to" class="lbl muted">Message</label><select id="msg-to" class="inp" style="width:auto;height:26px" ${live && targets.length ? "" : "disabled"}>${targets.map((id) => `<option>${id}</option>`).join("") || "<option>no active tasks</option>"}</select><span class="why">queued for its next admission or continuation</span></div>
+      <label for="msg-tx" class="sr-only">Guidance text</label><textarea id="msg-tx" class="inp" rows="2" placeholder="${live ? "e.g. Keep the v1 reader; don't touch boot.ts" : "Messaging is unavailable — the run is not active"}" ${live ? "" : "disabled"}></textarea>
+      <div class="r"><button class="btn sm" data-act="message" data-arg="selected task" data-fk="msg-send" ${live && targets.length ? "" : "disabled"}>${ic("msg", 12)}Queue message</button>${K.mockTag}</div></form>`;
+  }
+  function main(s) {
+    const m = runMeta(s);
+    return `<div class="runbar"><div class="runbar-top"><h2>Refactor session recovery</h2>${m.html}</div>
+      <div class="meta"><span>phase ${s.phase}</span><span>${s.busy}/2 workers</span><span>${s.events.length} entries</span><button class="chip" data-act="setup" data-fk="rb-setup">${ic("settings", 11)}setup & limits</button></div>${runControls(s)}</div>
+      ${s.needs.map((n) => `<div class="banner ${n.kind === "paused" ? "work" : n.kind === "cancelled" ? "" : "bad"}" role="note"><span class="sm">${esc(n.text)}</span>${n.act ? `<div class="row-acts"><button class="btn sm" data-act="${n.act}" data-arg="${n.task || ""}" data-fk="nb-${n.act}">${{ resume: "Resume", reconcile: "Reconcile task", retry: "Retry task" }[n.act]}</button>${K.mockTag}</div>` : ""}</div>`).join("")}
+      <div class="filters seg" role="group" aria-label="Filter journal">${Object.entries(FILTERS).map(([id, [l]]) => `<button data-act="filter" data-arg="${id}" aria-pressed="${S.extra.filter === id}" data-fk="flt-${id}">${l}</button>`).join("")}</div>
+      ${stream(s)}${nowLine(s)}${compose(s)}`;
+  }
+  K.mount({
+    letter: "D", name: "Journal", tagline: "organized by coordinator turns over time",
+    setup: (s) => K.setupView(s, { head: `<div><h3 tabindex="-1" id="td-title">Draft</h3><p class="why" style="margin:4px 0 0">The journal starts with the first entry when you run. Until then, this draft is all there is.</p></div>` }),
+    act(a, arg) {
+      if (a === "filter") { S.extra.filter = arg; return true; }
+      if (a === "back") { if (S.view === "files" && S.sel) { S.view = "task"; K.focusAfter("#td-title"); } else { S.view = "run"; K.focusAfter("#pane"); } return true; }
+    },
+    render(s) {
+      if (S.view === "files") return filesView(S.artifact, s, { back: S.sel ? "Back to task" : "Back to journal" });
+      if (S.view === "task") return taskDetail(S.sel, s, { back: "Back to journal" });
+      if (S.width === "expanded") return `<div class="d-split"><div>${main(s)}</div><aside aria-label="Run summary"><div class="sec"><div class="eyebrow">What is verified</div>${ledger(s)}</div><p class="tok" style="margin:0">${usageLine(s.usage)}</p></aside></div>`;
+      return main(s) + `<div style="padding:0 14px 14px">${K.disclosure("d-ledger", "What is verified", ledger(s))}<p class="tok" style="margin:6px 0 0">${usageLine(s.usage)}</p></div>`;
+    }
+  });
+  document.addEventListener("submit", (e) => { if (e.target.matches("[data-mock-form]")) e.preventDefault(); });
+})();
+</script>
+</body>
+</html>

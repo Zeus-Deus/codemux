@@ -32,6 +32,12 @@ export function signedOutProviderFromWarning(message: string): "claude" | null {
  *  fresh one. The remainder is the ready-to-render notice text. */
 const RESUME_FALLBACK_PREFIX = "resume-fallback: ";
 
+/** Codex could not apply a saved premium tier and selected Standard. */
+export const SERVICE_TIER_FALLBACK_PREFIX = "service-tier-fallback: ";
+
+/** Explicit restriction emitted by the pinned Hermes adapter on session start. */
+const HERMES_USAGE_LIMIT_RECOVERY_PREFIX = "hermes-usage-limit-recovery: ";
+
 /** Defensive nested access: `originalPayload.rate_limit_info.status`. */
 function readRateLimitStatus(originalPayload: unknown): string | null {
   if (!originalPayload || typeof originalPayload !== "object") return null;
@@ -59,6 +65,10 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  *   the transcript record and the resume affordance.
  * - `"resume-fallback: <text>"` → `<text>` (stale-session recovery: the
  *   remainder is already user-ready copy explaining the fresh session).
+ * - "service-tier-fallback: <text>" → `<text>` (saved premium tier
+ *   could not be applied; the session uses Standard).
+ * - `"hermes-usage-limit-recovery: <text>"` → `<text>` (the adapter's
+ *   explicit compatibility restriction, persisted for reopened chats).
  * - anything else → null (SDK debug noise).
  */
 export function runtimeNoticeFromWarning(
@@ -76,8 +86,14 @@ export function runtimeNoticeFromWarning(
     if (reason === RATE_LIMIT_REASON) return null;
     return "Provider error: " + reason;
   }
+  if (message.startsWith(SERVICE_TIER_FALLBACK_PREFIX)) {
+    return message.slice(SERVICE_TIER_FALLBACK_PREFIX.length);
+  }
   if (message.startsWith(RESUME_FALLBACK_PREFIX)) {
     return message.slice(RESUME_FALLBACK_PREFIX.length);
+  }
+  if (message.startsWith(HERMES_USAGE_LIMIT_RECOVERY_PREFIX)) {
+    return message.slice(HERMES_USAGE_LIMIT_RECOVERY_PREFIX.length);
   }
   return null;
 }

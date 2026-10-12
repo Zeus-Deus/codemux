@@ -21,8 +21,10 @@ vi.mock("@/tauri/commands", () => ({
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Per-test device list; reset in `beforeEach`.
+let hosts: { id: number; name: string }[] = [];
 vi.mock("@/stores/hosts-store", () => ({
-  useHosts: () => [],
+  useHosts: () => hosts,
 }));
 
 // App store: a plain object driven per-test. The rail derives everything
@@ -150,6 +152,7 @@ beforeEach(() => {
   activeWorkspaceId = "";
   pendingActiveWorkspaceId = null;
   wsCounter = 0;
+  hosts = [];
 });
 
 afterEach(async () => {
@@ -329,6 +332,26 @@ describe("SidebarRailWorkspaces", () => {
     expect(dotIn("ws-4")).toBeNull();
   });
 
+  it("marks a device thread with the device it runs on", async () => {
+    hosts = [{ id: 7, name: "zeus" }];
+    workspaces = [
+      makeWorkspace({ title: "Local" }),
+      makeWorkspace({ title: "On zeus", host_id: 7 }),
+    ];
+    const { container } = await renderRail();
+
+    const glyph = container
+      .querySelector('[data-rail-ws="ws-2"]')!
+      .querySelector('[aria-label="Runs on zeus"]');
+    expect(glyph).toHaveAttribute("role", "img");
+    expect(glyph).toHaveAttribute("title", "Runs on zeus");
+    expect(
+      container
+        .querySelector('[data-rail-ws="ws-1"]')!
+        .querySelector('[aria-label^="Runs on"]'),
+    ).toBeNull();
+  });
+
   it("marks the active workspace's button with the neutral selection fill", async () => {
     workspaces = [
       makeWorkspace({ title: "Alpha" }),
@@ -427,6 +450,44 @@ describe("SidebarRailWorkspaces", () => {
     expect(state.settled).toEqual([]);
     expect(state.keepActive).toEqual({});
     expect(state.activity).toEqual({});
+  });
+
+  it("names each button with its status and pin and marks the current one", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Blocked", surfaces: surfaceWithPane("p1"), pinned_at: 100 }),
+      makeWorkspace({ title: "Quiet" }),
+    ];
+    paneStatuses = { p1: "permission" };
+    activeWorkspaceId = "ws-2";
+    const { container } = await renderRail();
+
+    const blocked = container.querySelector('[data-rail-ws="ws-1"]');
+    const quiet = container.querySelector('[data-rail-ws="ws-2"]');
+    expect(blocked).toHaveAttribute("aria-label", "Blocked, Needs you, pinned");
+    expect(blocked).not.toHaveAttribute("aria-current");
+    expect(quiet).toHaveAttribute("aria-label", "Quiet");
+    expect(quiet).toHaveAttribute("aria-current", "page");
+  });
+
+  it("gives workspaces that share a project a monogram, and a lone one none", async () => {
+    workspaces = [
+      makeWorkspace({ title: "bom-import" }),
+      makeWorkspace({ title: "supplier sync" }),
+      makeWorkspace({
+        title: "Solo",
+        cwd: "/home/u/projects/other",
+        project_root: "/home/u/projects/other",
+      }),
+    ];
+    const { container } = await renderRail();
+
+    const monogram = (id: string) =>
+      container
+        .querySelector(`[data-rail-ws="${id}"] [data-rail-monogram]`)
+        ?.textContent ?? null;
+    expect(monogram("ws-1")).toBe("BI");
+    expect(monogram("ws-2")).toBe("SS");
+    expect(monogram("ws-3")).toBeNull();
   });
 
   it("clicking a button activates its workspace", async () => {

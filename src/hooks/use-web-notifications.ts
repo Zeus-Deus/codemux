@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { toast } from "@/lib/toast";
+import { openNotificationTarget } from "@/lib/open-notification-target";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 /**
@@ -29,6 +30,8 @@ export interface WebNotificationPayload {
   title: string;
   body: string;
   workspace_title: string;
+  workspace_id: string;
+  pane_id: string;
 }
 
 export type NotificationDelivery = "web" | "toast";
@@ -57,8 +60,14 @@ function webNotificationsAvailable(): boolean {
   return typeof window !== "undefined" && "Notification" in window;
 }
 
-function showToast(payload: WebNotificationPayload): void {
-  toast.info(payload.title, { description: payload.body });
+export function showToast(payload: WebNotificationPayload): void {
+  toast.info(payload.title, {
+    description: payload.body,
+    action: {
+      label: "Open",
+      onClick: () => void openNotificationTarget(payload),
+    },
+  });
 }
 
 function showWebNotification(payload: WebNotificationPayload): void {
@@ -69,6 +78,7 @@ function showWebNotification(payload: WebNotificationPayload): void {
     notification.onclick = () => {
       window.focus();
       notification.close();
+      void openNotificationTarget(payload);
     };
   } catch {
     // Some engines throw if the API exists but construction is disallowed

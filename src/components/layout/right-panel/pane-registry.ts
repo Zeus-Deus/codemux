@@ -24,6 +24,7 @@
  */
 import {
   Bot,
+  Network,
   Folder,
   GitCompare,
   GitPullRequest,
@@ -78,6 +79,12 @@ export const PANE_REGISTRY: readonly PaneMeta[] = [
     label: "Browser",
     icon: Globe,
     description: "Open a local app or URL beside the chat.",
+  },
+  {
+    id: "workflows",
+    label: "Workflows",
+    icon: Network,
+    description: "Run dynamic tasks across your providers.",
   },
   {
     id: "tasks",
@@ -139,17 +146,4 @@ export function isCorePane(id: RightPanelTab): id is RightPanelCorePane {
 /** Last path segment — the doc tab's label and breadcrumb leaf. */
 export function baseName(filePath: string): string {
   return filePath.split(/[/\\]/).filter(Boolean).pop() ?? filePath;
-}
-
-/**
- * A file path relative to the workspace root, for the pane-bar
- * breadcrumb. Falls back to the bare basename when the file lives
- * outside the workspace (an absolute path would blow out a 240px column).
- */
-export function relativeToRoot(filePath: string, root: string): string {
-  const normalizedRoot = root.replace(/[/\\]+$/, "");
-  if (normalizedRoot && filePath.startsWith(`${normalizedRoot}/`)) {
-    return filePath.slice(normalizedRoot.length + 1);
-  }
-  return baseName(filePath);
 }

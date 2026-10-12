@@ -1,0 +1,151 @@
+{
+  "checked": [
+    "progressive setup with script/routes/limits collapsed and writes off",
+    "mixed-provider dynamic fan-out",
+    "two-worker ceiling",
+    "pause drains admitted work",
+    "save script",
+    "reload replay without duplicate tasks",
+    "dynamic synthesis",
+    "task output/route attribution",
+    "settled tasks collapsed until requested",
+    "keyboard task selection and return focus",
+    "individual cancellation/retry",
+    "write permission refusal",
+    "expanded checkpoint/detail split",
+    "retained file review before whole-manifest apply",
+    "historical artifacts inspectable without current authority",
+    "browser host refuses file application",
+    "Unknown needs attention without retry or released capacity",
+    "cancelled run preserves evidence and suppresses apply/retry",
+    "narrow pane overflow"
+  ],
+  "providerCalls": 0,
+  "modelTokens": 0,
+  "capturedLayouts": [
+    {
+      "file": "after-setup.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "setup"
+    },
+    {
+      "file": "after-advanced.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "setup"
+    },
+    {
+      "file": "after-running.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-paused.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-completed.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-result.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-expanded.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 1152,
+      "layout": "split"
+    },
+    {
+      "file": "after-review.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-unknown.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-cancelled.png",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "paneWidth": 503,
+      "layout": "single"
+    },
+    {
+      "file": "after-narrow.png",
+      "viewport": {
+        "width": 1024,
+        "height": 844
+      },
+      "paneWidth": 363,
+      "layout": "single"
+    }
+  ],
+  "screenshots": [
+    "after-advanced-pane.png",
+    "after-advanced.png",
+    "after-cancelled-pane.png",
+    "after-cancelled.png",
+    "after-completed-pane.png",
+    "after-completed.png",
+    "after-expanded-pane.png",
+    "after-expanded.png",
+    "after-narrow-pane.png",
+    "after-narrow.png",
+    "after-paused-pane.png",
+    "after-paused.png",
+    "after-result-pane.png",
+    "after-result.png",
+    "after-review-pane.png",
+    "after-review.png",
+    "after-running-pane.png",
+    "after-running.png",
+    "after-setup-pane.png",
+    "after-setup.png",
+    "after-unknown-pane.png",
+    "after-unknown.png"
+  ],
+  "captureContext": "Actual integrated CodeMux UI using the token-free development Tauri mock; retained live-mode snapshots are synthetic fixtures."
+}
