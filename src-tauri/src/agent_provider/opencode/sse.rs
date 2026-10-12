@@ -2105,7 +2105,7 @@ mod tests {
                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         } else { counter.load(std::sync::atomic::Ordering::Relaxed) };
                         watermark_record("root", seq).into_bytes()
-                    }).create_async().await]
+                    }).expect_at_least(1).create_async().await]
             } else {
                 mock_watermarks(&mut server, "root", 30).await
             };
