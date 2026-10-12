@@ -18,10 +18,10 @@
 //! 4. [`respond_to_request`](OpenCodeSession::respond_to_request) —
 //!    `POST /session/{id}/permissions/{permID}` with the user's
 //!    decision.
-//! 5. [`shutdown`](OpenCodeSession::shutdown) — abort the SSE task,
-//!    `DELETE /session/{id}`, emit `Closed` state.
+//! 5. [`shutdown`](OpenCodeSession::shutdown) — fence admitted input,
+//!    interrupt this attachment and confirm idle before emitting `Closed`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -47,6 +47,111 @@ use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
     OpenCodeUsageState,
 };
+
+const NATIVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+type NativeAdmission = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
+/// Detached requests keep responsibility for native masked admission after
+/// their caller stops waiting. Closing an HTTP connection is not a server ACK.
+#[derive(Clone)]
+struct NativeAdmissionPeer {
+    http: reqwest::Client,
+    base: String,
+    password: String,
+    session: String,
+    inputs: Arc<Mutex<HashSet<String>>>,
+}
+
+impl NativeAdmissionPeer {
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, format!("{}{}", self.base, path))
+            .basic_auth("opencode", Some(&self.password))
+    }
+
+    async fn acknowledged(request: reqwest::RequestBuilder) -> Result<Vec<u8>, String> {
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("native_admission_unconfirmed: {e}"))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("native_response_unconfirmed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "native_http_status_{}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        Ok(body.to_vec())
+    }
+
+    async fn interrupt(&self) -> Result<(), String> {
+        Self::acknowledged(self.request(
+            reqwest::Method::POST,
+            &format!("/api/session/{}/interrupt?resume=false", self.session),
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    async fn finish(&self) -> Result<(), String> {
+        // Only cancel this attachment's acknowledged inputs. Other sessions
+        // and the durable conversation are never deleted.
+        let body = Self::acknowledged(self.request(
+            reqwest::Method::GET,
+            &format!("/api/session/{}/inbox", self.session),
+        ))
+        .await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| format!("native_inbox_decode_failed: {e}"))?;
+        let pending = value["data"]
+            .as_array()
+            .ok_or("native_inbox_missing_data")?;
+        let owned = self.inputs.lock().await.clone();
+        for item in pending {
+            let id = item["id"].as_str().ok_or("native_inbox_missing_identity")?;
+            if owned.contains(id) {
+                Self::acknowledged(self.request(
+                    reqwest::Method::DELETE,
+                    &format!(
+                        "/api/session/{}/inbox/{}",
+                        self.session,
+                        urlencoding::encode(id)
+                    ),
+                ))
+                .await?;
+            }
+        }
+        self.interrupt().await?;
+        // Interrupt acknowledges cancellation before coordinator settlement.
+        Self::acknowledged(self.request(
+            reqwest::Method::POST,
+            &format!("/api/experimental/session/{}/wait", self.session),
+        ))
+        .await?;
+        Ok(())
+    }
+}
+
+async fn await_native_admissions(mut requests: Vec<NativeAdmission>) -> Result<(), String> {
+    for request in &mut requests {
+        loop {
+            if let Some(result) = request.borrow().clone() {
+                result?;
+                break;
+            }
+            request
+                .changed()
+                .await
+                .map_err(|_| "native_admission_owner_lost".to_string())?;
+        }
+    }
+    Ok(())
+}
 
 /// Live handle to an OpenCode session bound to one Codemux thread.
 pub struct OpenCodeSession {
@@ -90,6 +195,8 @@ pub struct OpenCodeSession {
     queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
     queue_worker: Mutex<Option<JoinHandle<()>>>,
     native_requests: Mutex<Vec<JoinHandle<()>>>,
+    native_admissions: Mutex<Vec<NativeAdmission>>,
+    native_inputs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl OpenCodeSession {
@@ -392,10 +499,12 @@ impl OpenCodeSession {
             queued: Mutex::new(VecDeque::new()),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
+            native_admissions: Mutex::new(Vec::new()),
+            native_inputs: Arc::new(Mutex::new(HashSet::new())),
         });
         if native_v2 {
             if let Err(error) = session.wait_ready().await {
-                session.shutdown().await;
+                let _ = session.shutdown().await;
                 return Err(error);
             }
             // A resumed conversation keeps its native history, while explicit
@@ -411,7 +520,7 @@ impl OpenCodeSession {
                 if let Some(model) = selected {
                     if let Err(error) = session.apply_native_model(&model, variant.as_deref()).await
                     {
-                        session.shutdown().await;
+                        let _ = session.shutdown().await;
                         return Err(error);
                     }
                     *session.current_model.lock().await = Some(model);
@@ -924,7 +1033,10 @@ impl OpenCodeSession {
                             message: "OpenCode /compact accepts no arguments or images.".into(),
                         });
                     }
-                    ("compact", serde_json::json!({"delivery":"queue"}))
+                    (
+                        "compact",
+                        serde_json::json!({"id":format!("msg_codemux_{}",Uuid::new_v4()),"delivery":"queue"}),
+                    )
                 }
                 Some((name, arguments)) => {
                     let mut body =
@@ -934,7 +1046,12 @@ impl OpenCodeSession {
                     }
                     ("command", body)
                 }
-                None => ("prompt", super::v2::prompt_body(&text, files, steer)),
+                None => {
+                    let mut body = super::v2::prompt_body(&text, files, steer);
+                    body["id"] = serde_json::json!(format!("msg_codemux_{}", Uuid::new_v4()));
+                    body["resume"] = serde_json::json!(false);
+                    ("prompt", body)
+                }
             }
         } else {
             match native {
@@ -1005,6 +1122,12 @@ impl OpenCodeSession {
                         active_turn: turn_id.clone(),
                     },
                 });
+        }
+        if native_v2 {
+            return self
+                .post_native_admission(endpoint, body, turn_id)
+                .await
+                .map(Some);
         }
         let url = format!(
             "{}{}/session/{}/{}",
@@ -1093,8 +1216,8 @@ impl OpenCodeSession {
         let response = match response {
             Ok(r) => r,
             Err(err) => {
-                // POST never landed — make sure the give-up path stays disarmed
-                // (defensive against a stale prior arm) and surface the error.
+                // Transport failure does not prove that the server rejected the
+                // request. Native admission is tracked separately above.
                 if !steer {
                     self.event_ctx.lock().await.turn_active = false;
                     let _ = self
@@ -1128,6 +1251,134 @@ impl OpenCodeSession {
         // SSE may already have completed the turn before this HTTP response.
         // Never re-arm it here. A steer retains the active turn's identity.
         Ok(Some(turn_id))
+    }
+
+    pub(crate) async fn has_unconfirmed_native_admissions(&self) -> bool {
+        self.native_admissions
+            .lock()
+            .await
+            .iter()
+            .any(|request| !matches!(request.borrow().as_ref(), Some(Ok(()))))
+    }
+
+    fn native_peer(&self) -> NativeAdmissionPeer {
+        NativeAdmissionPeer {
+            http: self.http.clone(),
+            base: self
+                .server_handle
+                .base_url
+                .trim_end_matches('/')
+                .to_string(),
+            password: self.server_handle.server_password.clone(),
+            session: urlencoding::encode(&self.provider_session_id.0).into_owned(),
+            inputs: self.native_inputs.clone(),
+        }
+    }
+
+    async fn post_native_admission(
+        &self,
+        endpoint: &'static str,
+        mut body: serde_json::Value,
+        turn_id: TurnId,
+    ) -> Result<TurnId, ProviderError> {
+        let peer = self.native_peer();
+        let closing = self.closing.subscribe();
+        let (done, mut result) = tokio::sync::watch::channel(None);
+        let input_id = body["id"].as_str().map(str::to_string);
+        if let Some(id) = &input_id {
+            self.native_inputs.lock().await.insert(id.clone());
+        }
+        // Register before spawning/writing. The closure-cancellable caller can
+        // leave at any await, but shutdown still owns the original admission.
+        let mut admissions = self.native_admissions.lock().await;
+        self.ensure_open()?;
+        admissions.retain(|request| !matches!(request.borrow().as_ref(), Some(Ok(()))));
+        admissions.push(result.clone());
+        let events = self.event_tx.clone();
+        let thread_id = self.thread_id.clone();
+        let dead = self.dead.clone();
+        let close = self.closing.clone();
+        tokio::spawn(async move {
+            let admission = async {
+                let path = format!("/api/session/{}/{endpoint}", peer.session);
+                let bytes = NativeAdmissionPeer::acknowledged(
+                    peer.request(reqwest::Method::POST, &path).json(&body),
+                )
+                .await?;
+                if endpoint == "compact" {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|e| format!("native_compact_decode_failed: {e}"))?;
+                    let id = value["data"]["id"]
+                        .as_str()
+                        .ok_or("native_compact_missing_identity")?;
+                    // Compaction may coalesce into an existing pending item.
+                    peer.inputs.lock().await.insert(id.to_string());
+                }
+                if endpoint == "prompt" && !*closing.borrow() {
+                    // Reconcile the exact acknowledged input, then wake once.
+                    // Never repeat this request after cancellation: cancelled
+                    // IDs have no native tombstone and could be re-admitted.
+                    body["resume"] = serde_json::json!(true);
+                    NativeAdmissionPeer::acknowledged(
+                        peer.request(reqwest::Method::POST, &path).json(&body),
+                    )
+                    .await?;
+                }
+                if *closing.borrow() {
+                    peer.finish().await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(message) = &admission {
+                if !*closing.borrow() {
+                    dead.store(true, Ordering::Relaxed);
+                    close.send_replace(true);
+                    let _ = events.send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id,
+                        status: SessionStatus::Error {
+                            message: message.clone(),
+                        },
+                    });
+                }
+            }
+            done.send_replace(Some(admission));
+        });
+        drop(admissions);
+        if endpoint == "command" {
+            // Commands can acknowledge only after their generation finishes.
+            // Keep the composer responsive while retaining the teardown fence.
+            return Ok(turn_id);
+        }
+        // This bounds the UI wait, not the server-side masked operation. The
+        // owned task continues and shutdown cannot claim Closed before its ACK.
+        let response = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(response) = result.borrow().clone() {
+                    return response;
+                }
+                result
+                    .changed()
+                    .await
+                    .map_err(|_| "native_admission_owner_lost".to_string())?;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err("native_admission_ack_timeout; cleanup remains pending".into()));
+        if let Err(message) = response {
+            self.dead.store(true, Ordering::Relaxed);
+            self.closing.send_replace(true);
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: self.thread_id.clone(),
+                    status: SessionStatus::Error {
+                        message: message.clone(),
+                    },
+                });
+            return Err(ProviderError::RpcError { message });
+        }
+        Ok(turn_id)
     }
 
     pub async fn interrupt_selected(&self, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
@@ -1391,22 +1642,12 @@ impl OpenCodeSession {
         );
     }
 
-    /// Tear down the session. Aborts the SSE task, interrupts the
-    /// OpenCode-side execution, and emits the closed state.
-    pub async fn shutdown(&self) {
+    /// Close this attachment only after all native admission/wake requests
+    /// are acknowledged, its pending input is cancelled and execution is idle.
+    pub async fn shutdown(&self) -> Result<(), ProviderError> {
         self.dead.store(true, Ordering::Relaxed);
         self.closing.send_replace(true);
-        // Cancel preparation/header waits before awaiting outbound. Dispatch
-        // keeps the fence until its request future is dropped, so the final
-        // interrupt cannot race a later prompt write.
         let _outbound = self.outbound.lock().await;
-        let requests: Vec<_> = self.native_requests.lock().await.drain(..).collect();
-        for request in &requests {
-            request.abort();
-        }
-        for request in requests {
-            let _ = request.await;
-        }
         if let Some(worker) = self.queue_worker.lock().await.take() {
             worker.abort();
         }
@@ -1414,10 +1655,51 @@ impl OpenCodeSession {
         if let Some(handle) = self.sse_handle.lock().await.take() {
             handle.abort();
         }
-        // Closing a live attachment is not deleting its durable transcript.
-        // Interrupt only our root; retained child sessions/history remain
-        // addressable for resume. Explicit destructive APIs belong elsewhere.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), self.interrupt()).await;
+        let result = if self.server_handle.api == super::api::OpenCodeApi::V2 {
+            let peer = self.native_peer();
+            // Stop an existing execution immediately, but an idle interrupt is
+            // not evidence that an outstanding admission cannot arrive later.
+            let initial_interrupt =
+                tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, peer.interrupt()).await;
+            match initial_interrupt {
+                Ok(Ok(())) => {
+                    let admissions = self.native_admissions.lock().await.clone();
+                    tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, async {
+                        await_native_admissions(admissions).await?;
+                        peer.finish().await
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err("native_shutdown_admission_unconfirmed; cleanup remains owned".into())
+                    })
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err("native_shutdown_interrupt_unconfirmed".into()),
+            }
+        } else {
+            let requests: Vec<_> = self.native_requests.lock().await.drain(..).collect();
+            for request in &requests {
+                request.abort();
+            }
+            for request in requests {
+                let _ = request.await;
+            }
+            tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, self.interrupt())
+                .await
+                .map_err(|_| "legacy_shutdown_interrupt_timeout".into())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+        };
+        if let Err(message) = result {
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: self.thread_id.clone(),
+                    status: SessionStatus::Error {
+                        message: message.clone(),
+                    },
+                });
+            return Err(ProviderError::RpcError { message });
+        }
         {
             let mut ctx = self.event_ctx.lock().await;
             if ctx.turn_active {
@@ -1439,6 +1721,7 @@ impl OpenCodeSession {
                 thread_id: self.thread_id.clone(),
                 status: SessionStatus::Closed,
             });
+        Ok(())
     }
 
     async fn until_closed<T>(
@@ -1472,6 +1755,18 @@ impl OpenCodeSession {
 impl Drop for OpenCodeSession {
     fn drop(&mut self) {
         self.dead.store(true, Ordering::Relaxed);
+        self.closing.send_replace(true);
+        if self.server_handle.api == super::api::OpenCodeApi::V2 {
+            let peer = self.native_peer();
+            let admissions = self.native_admissions.get_mut().clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if await_native_admissions(admissions).await.is_ok() {
+                        let _ = peer.finish().await;
+                    }
+                });
+            }
+        }
         if let Some(handle) = self.sse_handle.get_mut().take() {
             handle.abort();
         }
@@ -1938,7 +2233,7 @@ pub(crate) mod tests {
             }
         }
         assert!(warned, "a failed attach must surface as a RuntimeWarning");
-        session.shutdown().await;
+        let _ = session.shutdown().await;
     }
 
     /// Developer smoke test against the installed OpenCode binary. Ignored in
@@ -1978,7 +2273,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(status["codemux"]["status"], "connected", "{status}");
-        session.shutdown().await;
+        let _ = session.shutdown().await;
         manager.stop().await;
     }
 
@@ -2053,6 +2348,8 @@ pub(crate) mod tests {
             queued: Mutex::new(VecDeque::new()),
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
+            native_admissions: Mutex::new(Vec::new()),
+            native_inputs: Arc::new(Mutex::new(HashSet::new())),
         });
         session.start_queue_worker(tx.subscribe()).await;
         (session, tx, rx)
@@ -2653,7 +2950,7 @@ pub(crate) mod tests {
         assert!(session.queued.lock().await.is_empty());
         model.assert_async().await;
         prompt.assert_async().await;
-        session.shutdown().await;
+        let _ = session.shutdown().await;
         interrupt.assert_async().await;
     }
 
@@ -2700,7 +2997,7 @@ pub(crate) mod tests {
             .unwrap();
         reply.assert_async().await;
         session.interrupt().await.unwrap();
-        session.shutdown().await;
+        let _ = session.shutdown().await;
         abort.assert_async().await;
         delete.assert_async().await;
     }
@@ -2884,7 +3181,7 @@ pub(crate) mod tests {
             .create_async()
             .await;
         let (session, _tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
-        session.shutdown().await;
+        let _ = session.shutdown().await;
         mock.assert_async().await;
         let event = rx.try_recv().expect("closed event published");
         match event {
@@ -2997,7 +3294,7 @@ pub(crate) mod tests {
             "rebuilt session must readopt the persisted session id"
         );
         readopt.assert_async().await;
-        session.shutdown().await;
+        let _ = session.shutdown().await;
     }
 
     #[tokio::test]

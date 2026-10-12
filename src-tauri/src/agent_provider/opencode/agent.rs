@@ -140,7 +140,7 @@ impl Drop for OpenCodeAgentProvider {
                     std::mem::take(&mut *guard)
                 };
                 for (_, session) in map {
-                    session.shutdown().await;
+                    let _ = session.shutdown().await;
                 }
                 for (_, session) in std::mem::take(&mut *managed_sessions.write().await) {
                     let _ = session.shutdown_managed().await;
@@ -216,36 +216,33 @@ impl AgentProvider for OpenCodeAgentProvider {
                 message: "OpenCode thread already has a managed session".into(),
             });
         }
-        // Evict a corpse before rebuilding: if the SSE listener gave up on an
-        // unreachable server it flipped the session's `dead` flag but left the
-        // entry in the map (only `stop_session` removes). Without this, the
-        // rebuild `ensure_live_session` drives after `has_session` reports the
-        // dead session absent would hit the `contains_key` guard below and fail
-        // permanently. Remove the dead entry under the write lock (atomic
-        // check→remove against a concurrent rebuild) and shut it down cleanly
-        // below. A still-live session for this thread is a genuine double-start
-        // and stays a ValidationError.
-        let dead_evicted = {
-            let mut sessions = self.sessions.write().await;
-            match sessions.get(&thread_id) {
-                Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
-                Some(_) => {
-                    return Err(ProviderError::ValidationError {
-                        message: format!(
-                            "opencode session already exists for thread {:?}",
-                            thread_id.0
-                        ),
-                    });
-                }
-                None => None,
+        // Keep unknown native admission registered until its fence completes,
+        // without holding the registry lock during network teardown.
+        let existing = self.sessions.read().await.get(&thread_id).cloned();
+        if let Some(existing) = existing {
+            if !existing.is_dead() {
+                return Err(ProviderError::ValidationError {
+                    message: format!(
+                        "opencode session already exists for thread {:?}",
+                        thread_id.0
+                    ),
+                });
             }
-        };
-        // Drop the corpse WITHOUT calling `shutdown()`: its SSE listener task
-        // has already exited (the give-up path returns after flipping `dead`),
-        // so there is nothing to abort, and `shutdown()` would
-        // `DELETE /session/{id}` — destroying the very server-side session the
-        // resume below wants to readopt. Just let the Arc drop.
-        drop(dead_evicted);
+            if existing.has_unconfirmed_native_admissions().await {
+                existing.shutdown().await?;
+            }
+            let mut sessions = self.sessions.write().await;
+            if sessions
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &existing))
+            {
+                sessions.remove(&thread_id);
+            } else if sessions.contains_key(&thread_id) {
+                return Err(ProviderError::ValidationError {
+                    message: "OpenCode session was replaced during rebuild".into(),
+                });
+            }
+        }
         // Best-effort resume: `ensure_live_session` passes
         // `{"resume": <opencode_session_id>}` when the persisted row carries the
         // server-side session id. OpenCode keeps sessions on disk, so a rebuilt
@@ -408,23 +405,35 @@ impl AgentProvider for OpenCodeAgentProvider {
         if self.managed_sessions.read().await.contains_key(&thread_id) {
             return self.stop_managed_session(thread_id).await;
         }
-        let session = {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(&thread_id)
-        };
-        let session = session.ok_or_else(|| ProviderError::SessionNotFound {
-            thread_id: thread_id.clone(),
-        })?;
-        // Drop the carried usage state too — this is an explicit teardown,
-        // not the dead-session eviction the carry-over exists for, and the
-        // shutdown below closes the server session, so nothing survives
-        // that could be re-broadcast. Keeps `usage_states` bounded by live
-        // sessions rather than by everything the app has ever opened.
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound {
+                thread_id: thread_id.clone(),
+            })?;
+        // Failed teardown keeps the ACK owner available for a later retry.
+        session.shutdown().await?;
+        let mut sessions = self.sessions.write().await;
+        let removed = if sessions
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
         {
-            let mut usage_states = self.usage_states.write().await;
-            usage_states.remove(&session.provider_session_id.0);
+            sessions.remove(&thread_id);
+            true
+        } else {
+            false
+        };
+        drop(sessions);
+        if removed {
+            self.usage_states
+                .write()
+                .await
+                .remove(&session.provider_session_id.0);
         }
-        session.shutdown().await;
+
         Ok(())
     }
 
