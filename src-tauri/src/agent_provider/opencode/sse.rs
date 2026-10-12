@@ -245,7 +245,9 @@ async fn run_sse_listener(
 
         let response = match connect {
             Ok(r) if r.status().is_success() => {
-                attempt = 0;
+                if peer.api == super::api::OpenCodeApi::Legacy {
+                    attempt = 0;
+                }
                 r
             }
             Ok(r) => {
@@ -270,7 +272,15 @@ async fn run_sse_listener(
         if peer.api == super::api::OpenCodeApi::Legacy {
             peer.ready.send_replace(true);
         }
-        consume_stream(response, &peer, &event_tx, &base_url, &server_password).await;
+        consume_stream(
+            response,
+            &peer,
+            &event_tx,
+            &base_url,
+            &server_password,
+            &mut attempt,
+        )
+        .await;
         if peer.api == super::api::OpenCodeApi::V2 {
             peer.ready.send_replace(false);
         }
@@ -290,6 +300,7 @@ async fn consume_stream(
     event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
     base_url: &str,
     server_password: &str,
+    attempt: &mut u32,
 ) {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::<u8>::new();
@@ -323,6 +334,9 @@ async fn consume_stream(
                     ));
                     return;
                 }
+                // HTTP 200 alone is not a healthy native attachment. Only a
+                // completed recovery/readiness handshake resets its budget.
+                *attempt = 0;
             }
             handle_record(&record, peer, event_tx).await;
         }
@@ -597,6 +611,14 @@ async fn handle_native(
     let mut usage = peer.usage.lock().await;
     let mut events = Vec::new();
     for update in updates {
+        // A background child's callback can admit a new root execution after
+        // the user turn settled. Only a live start accepted by the reducer
+        // may reactivate it; recovery and replay filtering happen above.
+        if subagent.is_none() && matches!(&update, super::v2::Update::Started) && !live.turn_active
+        {
+            live.turn_id = crate::agent_provider::TurnId(format!("turn_{}", uuid::Uuid::new_v4()));
+            live.turn_active = true;
+        }
         // Root content that precedes attachment is already in durable history.
         // Child callbacks and lifecycle remain live after the parent settles.
         if !live.turn_active
@@ -1525,6 +1547,127 @@ mod tests {
             1
         );
         assert!(!p.event_ctx.lock().await.turn_active);
+    }
+
+    #[tokio::test]
+    async fn native_live_root_start_resumes_after_parent_completion() {
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        p.event_ctx.lock().await.turn_active = true;
+        let initial = p.event_ctx.lock().await.turn_id.clone();
+        let (tx, mut rx) = broadcast::channel(32);
+        let record = |id: &str, kind: &str, data: serde_json::Value| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"id":id,"type":kind,"data":data})
+            )
+        };
+        handle_record(
+            &record(
+                "first-start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            p.event_ctx.lock().await.turn_id,
+            initial,
+            "an already-admitted user turn keeps its ID"
+        );
+        handle_record(
+            &record(
+                "first-end",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        assert!(!p.event_ctx.lock().await.turn_active);
+        let first: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(first.iter().any(|event| matches!(event, ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &initial)));
+
+        handle_record(&record("cold-text", "session.text.ended", serde_json::json!({"sessionID":"root","assistantMessageID":"cold","ordinal":0,"text":"old history"})), &p, &tx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "content alone does not admit a live execution"
+        );
+        handle_record(
+            &record(
+                "callback-start",
+                "session.execution.started",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        let resumed = p.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(resumed, initial);
+        assert!(p.event_ctx.lock().await.turn_active);
+        handle_record(&record("callback-text", "session.text.ended", serde_json::json!({"sessionID":"root","assistantMessageID":"follow-up","ordinal":0,"text":"child result received"})), &p, &tx).await;
+        handle_record(
+            &record(
+                "callback-end",
+                "session.execution.succeeded",
+                serde_json::json!({"sessionID":"root"}),
+            ),
+            &p,
+            &tx,
+        )
+        .await;
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(event, ProviderRuntimeEvent::SessionStateChanged { status: crate::agent_provider::SessionStatus::Running { active_turn }, .. } if active_turn == &resumed)));
+        assert!(events.iter().any(|event| matches!(event, ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. } if turn_id == &resumed && text == "child result received")));
+        assert_eq!(events.iter().filter(|event| matches!(event, ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &resumed)).count(), 1);
+        assert!(!p.event_ctx.lock().await.turn_active);
+    }
+
+    #[tokio::test]
+    async fn native_reconciliation_failures_exhaust_the_reconnect_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let connections = server
+            .mock("GET", "/api/event")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"id\":\"connected\",\"type\":\"server.connected\",\"data\":{}}\n\n")
+            .expect((MAX_RECONNECT_ATTEMPTS + 1) as usize)
+            .create_async()
+            .await;
+        let snapshots = server
+            .mock("GET", "/api/session/active")
+            .with_status(503)
+            .expect((MAX_RECONNECT_ATTEMPTS + 1) as usize)
+            .create_async()
+            .await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        p.ready = watch::channel(false).0;
+        p.event_ctx.lock().await.turn_active = true;
+        let (tx, mut rx) = broadcast::channel(64);
+        tokio::time::timeout(
+            Duration::from_secs(35),
+            run_sse_listener(server.url(), "fixture".into(), p.clone(), tx),
+        )
+        .await
+        .expect("failed reconciliation must have a finite retry budget");
+        assert!(p.dead.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!*p.ready.borrow());
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderRuntimeEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(event, ProviderRuntimeEvent::RuntimeWarning { message, .. } if message.contains("giving_up"))));
+        connections.assert_async().await;
+        snapshots.assert_async().await;
     }
 
     #[tokio::test]

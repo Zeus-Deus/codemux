@@ -795,7 +795,9 @@ impl OpenCodeSession {
         steer: bool,
         checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
+        self.ensure_open()?;
         self.wait_ready().await?;
+        self.ensure_open()?;
         let current_model = self.current_model.lock().await.clone();
         let model = match model_override {
             Some(m) => Some(m),
@@ -843,6 +845,7 @@ impl OpenCodeSession {
                 };
                 self.apply_native_model(&selected_model, selected_variant)
                     .await?;
+                self.ensure_open()?;
                 *self.current_model.lock().await = Some(selected_model.clone());
                 *self.current_variant.lock().await = selected_variant.map(str::to_string);
                 self.refresh_model_context(selected_model).await;
@@ -927,6 +930,7 @@ impl OpenCodeSession {
         };
         let turn_id = {
             let mut ctx = self.event_ctx.lock().await;
+            self.ensure_open()?;
             if let Some(checkpoint) = &checkpoint {
                 checkpoint.authorize_dispatch()?;
             }
@@ -1321,6 +1325,10 @@ impl OpenCodeSession {
     /// OpenCode-side execution, and emits the closed state.
     pub async fn shutdown(&self) {
         self.dead.store(true, Ordering::Relaxed);
+        // Dispatch holds outbound through prompt admission. Mark closure first
+        // so asynchronous preparation rejects, then wait for any admitted
+        // request before the final interrupt and Closed event.
+        let _outbound = self.outbound.lock().await;
         for request in self.native_requests.lock().await.drain(..) {
             request.abort();
         }
@@ -1356,6 +1364,16 @@ impl OpenCodeSession {
                 thread_id: self.thread_id.clone(),
                 status: SessionStatus::Closed,
             });
+    }
+
+    fn ensure_open(&self) -> Result<(), ProviderError> {
+        if self.is_dead() {
+            Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2107,6 +2125,85 @@ pub(crate) mod tests {
         assert!(session.set_model("p/bad".into()).await.is_err());
         reject.assert_async().await;
         assert_eq!(session.current_model.lock().await.as_deref(), Some("p/m"));
+    }
+
+    #[tokio::test]
+    async fn native_shutdown_rejects_prompt_after_pending_model_ack() {
+        let mut server = Server::new_async().await;
+        let (seen, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(gate);
+        let model = server
+            .mock("POST", "/api/session/s/model")
+            .match_request(move |_| {
+                seen.send(()).unwrap();
+                gate.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                true
+            })
+            .with_status(204)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let interrupt = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .create_async()
+            .await;
+        let (session, _, mut events) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        let sending = tokio::spawn({
+            let session = session.clone();
+            async move {
+                let mut input = delivery_input("hi");
+                input.model_override = Some("p/m".into());
+                session.enqueue_or_send(input).await
+            }
+        });
+        received.recv().await.unwrap();
+        let closing = tokio::spawn({
+            let session = session.clone();
+            async move { session.shutdown().await }
+        });
+        while !session.is_dead() {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        assert!(matches!(
+            sending.await.unwrap(),
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        closing.await.unwrap();
+        model.assert_async().await;
+        prompt.assert_async().await;
+        interrupt.assert_async().await;
+        let events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Running { .. },
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
