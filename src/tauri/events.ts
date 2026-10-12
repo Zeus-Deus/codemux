@@ -16,6 +16,11 @@ import type { AutomationRunView } from "./commands";
 
 export type EventCallback<T> = (payload: T) => void;
 
+/** Invalidation only: do not forward any event fields, even if a backend
+ * version includes its sanitized status. Read the authoritative native view. */
+export const onAgentConnectorChanged = (cb: EventCallback<null>): Promise<UnlistenFn> =>
+  listen<unknown>("agent-connector-changed", () => cb(null));
+
 export type UsageResumeBlockedReason =
   | "disabled" | "unknown_reset" | "reset_passed" | "reset_too_far"
   | "attempts_exhausted" | "cancelled" | "dispatch_failed" | "storage_failed";

@@ -61,7 +61,7 @@ interface NavGroup {
  *  - The "Interface" row (home of the Agent Chat GUI toggle, default
  *    on) lives in PERSONAL and stays visible regardless of the flag
  *    so users in either mode can find their way back.
- *  - The chat-only rows (Permissions, Skills, MCP Servers) are only
+ *  - The chat-only rows (Usage, Permissions, Skills) are only
  *    surfaced when the GUI is on; they reach into chat-only data.
  *    Hiding them when off matches the "feature absent, no work
  *    performed" promise of the master toggle.
@@ -93,9 +93,11 @@ export function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
           { id: "usage", label: "Usage", icon: ChartColumn },
           { id: "permissions", label: "Permissions", icon: ShieldCheck },
           { id: "skills", label: "Skills", icon: BookOpen },
-          { id: "mcp", label: "MCP Servers", icon: Server },
         ] as NavItem[])
       : []),
+    // Inbound administration must remain reachable when the chat GUI is off.
+    // McpSection gates outbound discovery/runtime separately.
+    { id: "mcp", label: "MCP Servers", icon: Server },
     { id: "browser", label: "Browser", icon: Globe },
     // Hosts pane — Step 2 of cloud-push. Listed in Editor & Workflow
     // because picking which machine to run on is a workflow decision,

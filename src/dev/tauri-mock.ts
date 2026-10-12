@@ -40,6 +40,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { createAgentConnectorMock } from "./agent-connector-mock";
 import { workflowMockHandlers } from "./workflow-mock";
 import { createCustomAcpMock } from "./custom-acp-mock";
 import { addonMockHandlers } from "./addon-mock";
@@ -3762,6 +3763,7 @@ function buildWebRemoteStatus(): WebRemoteStatus {
 
 function emitWebRemoteState(): void {
   emitEvent("web-remote-state-changed", buildWebRemoteStatus());
+  emitEvent("agent-connector-changed", null);
 }
 
 // Console/automation hooks: inject devices so the live "device wants to
@@ -4102,8 +4104,18 @@ function markMockHostInstalled(id: number): void {
 }
 
 const customAcpMock = createCustomAcpMock(emitEvent);
+
+const agentConnectorMock = createAgentConnectorMock(
+  () => ({ running: webRemoteLanRunning(), port: webRemotePort }),
+  () => emitEvent("agent-connector-changed", null),
+);
+
+// Dev-only console hook for the outside-assistant approval screenshots.
+(window as unknown as { __codemuxAgentConnectorMock: typeof agentConnectorMock }).__codemuxAgentConnectorMock = agentConnectorMock;
+
 const handlers: Record<string, Handler> = {
   ...customAcpMock.handlers,
+  ...agentConnectorMock.handlers,
   agent_chat_hooks: (a) => {
     const update = a.update as { action: string; key: string; hash: string; enabled?: boolean } | null;
     if (update) {

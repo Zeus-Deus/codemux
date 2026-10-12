@@ -652,7 +652,7 @@ impl ClaudeSession {
             checkpoint.prepare().await;
         }
         let sent = self
-            .do_send(input.text, input.images, input.model_override)
+            .do_send(input.text, input.images, input.model_override, checkpoint.clone())
             .await;
         match sent {
             Ok(turn_id) => {
@@ -715,6 +715,7 @@ impl ClaudeSession {
                     queued.input.text,
                     queued.input.images,
                     queued.input.model_override,
+                    checkpoint.clone(),
                 )
                 .await
             {
@@ -894,6 +895,7 @@ impl ClaudeSession {
         text: String,
         images: Vec<ImageInput>,
         model_override: Option<String>,
+        checkpoint: Option<Arc<dyn crate::agent_provider::types::TurnDispatchCheckpoint>>,
     ) -> Result<TurnId, ProviderError> {
         // Encode raw bytes as standard base64 here so the JSON-RPC
         // frame stays text-only and the sidecar pipes the data
@@ -912,6 +914,7 @@ impl ClaudeSession {
             model_override,
             images: encoded_images,
         };
+        if let Some(checkpoint) = &checkpoint { checkpoint.authorize_dispatch()?; }
         let turn_id = TurnId(format!("claude-turn-{}", uuid::Uuid::new_v4()));
         {
             let mut state = self.state.lock().await;

@@ -23,6 +23,7 @@ use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::io::AsyncReadExt;
 
+use crate::agent_control::{NativeControlGuard, NativeControlState, ThreadGate};
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, CostSource, ProviderChatCapabilities, ProviderError,
     ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
@@ -944,9 +945,39 @@ pub async fn agent_chat_start_session<R: Runtime>(
     app: AppHandle<R>,
     pane_id: String,
     provider: ProviderKind,
-    mut input: StartSessionInput,
+    input: StartSessionInput,
     expected_thread: Option<String>,
 ) -> Result<ThreadId, String> {
+    agent_chat_start_session_guarded(app, pane_id, provider, input, expected_thread, None).await
+}
+
+pub async fn agent_chat_start_session_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    pane_id: String,
+    provider: ProviderKind,
+    mut input: StartSessionInput,
+    expected_thread: Option<String>,
+    control: Option<NativeControlGuard>,
+) -> Result<ThreadId, String> {
+    let native_gate = native_thread_gate(&app, &input.thread_id.0);
+    let generation = native_gate.generation();
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
     if let Some(tier) = input.service_tier.as_deref() {
         input.fast_mode = match tier {
             "default" => false,
@@ -1007,6 +1038,18 @@ pub async fn agent_chat_start_session<R: Runtime>(
     }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Explicit UI starts and automatic rebuilds own the same native launch
+    // transaction. A pane claim alone cannot serialize a same-thread start.
+    let resume_lock = resume_lock_for(&input.thread_id.0);
+    let _resume_guard = resume_lock.lock().await;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     // Extract the cwd for persistence BEFORE moving input into the
@@ -1029,6 +1072,14 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // `healed_permission_mode`) so BOTH session-minting entry points are immune
     // to a null-passing caller. OpenCode has no permission modes, so its
     // fallback is `None` and this is a no-op there.
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
     let requested_permission_mode = input.permission_mode.take();
     let resolved_permission_mode =
         resolve_start_permission_mode(provider, requested_permission_mode.clone());
@@ -1157,18 +1208,48 @@ pub async fn agent_chat_start_session<R: Runtime>(
                     return Err("The live ACP process does not match this durable workspace binding.".into());
                 }
             }
+            verify_native_control(
+                &app,
+                provider,
+                &input.thread_id.0,
+                control.as_ref(),
+                &native_gate,
+                generation,
+            )?;
+            if let Some(control) = &control {
+                control.verify_start(&app, &input)?;
+            }
             return Ok(input.thread_id);
         }
         // Its workspace moved to another machine since (push / pull): stop
-        // it, serialized with an auto-resume rebuild, and start it there.
-        let resume_lock = resume_lock_for(&requested_thread_id);
-        let _resume_guard = resume_lock.lock().await;
-        if impl_.has_session(&input.thread_id).await {
-            if !session_moved(&requested_thread_id, host_now) {
-                // A rebuild already put it there.
-                return Ok(input.thread_id);
-            }
-            stop_moved_session(&app, impl_.as_ref(), &input.thread_id).await?;
+        // it and start it there. The resume lock taken above already
+        // serializes this with an auto-resume rebuild.
+        verify_native_control(
+            &app,
+            provider,
+            &input.thread_id.0,
+            control.as_ref(),
+            &native_gate,
+            generation,
+        )?;
+        stop_moved_session(&app, impl_.as_ref(), &input.thread_id).await?;
+    }
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )?;
+    if let Some(control) = &control {
+        control.verify_start(&app, &input)?;
+        let state = app.state::<AppStateStore>();
+        if state.agent_chat_pane_thread(&pane_id) != Some((provider, input.thread_id.0.clone()))
+            || state.workspace_id_for_pane(&pane_id).as_deref()
+                != Some(control.workspace_id.as_str())
+        {
+            return Err("stale_thread_binding: guarded start targets another pane".into());
         }
     }
     // Launch eligibility belongs only to new/rebuilt processes. A live child
@@ -1215,6 +1296,40 @@ pub async fn agent_chat_start_session<R: Runtime>(
         crate::state::emit_app_state(&app);
     }
 
+    let handoff = async {
+        if let (Some(old_provider), Some(old_thread)) = &claim.previous {
+            if *old_provider != provider && old_thread == &requested_thread_id {
+                if let Some(old_impl) = registry.get(*old_provider).await {
+                    verify_native_control(
+                        &app, provider, &input.thread_id.0, control.as_ref(),
+                        &native_gate, generation,
+                    )?;
+                    match old_impl.stop_session(ThreadId(old_thread.clone())).await {
+                        Ok(()) | Err(ProviderError::SessionNotFound { .. })
+                        | Err(ProviderError::SessionClosed { .. }) => {}
+                        Err(error) => return Err(provider_err(error)),
+                    }
+                }
+            }
+        }
+        verify_native_control(
+            &app, provider, &input.thread_id.0, control.as_ref(),
+            &native_gate, generation,
+        )?;
+        if let Some(control) = &control {
+            control.verify_start(&app, &input)?;
+        }
+        Ok::<(), String>(())
+    }.await;
+    if let Err(error) = handoff {
+        let state = app.state::<AppStateStore>();
+        if claim.changed && state.release_agent_chat_pane_claim(
+            &pane_id, provider, &requested_thread_id, claim.previous.clone(),
+        ) {
+            crate::state::emit_app_state(&app);
+        }
+        return Err(error);
+    }
     // Lazy MCP spawn: first chat session triggers child-process startup
     // for every enabled (non-disabled) MCP server discovered for this
     // workspace. Stage 3 needs the spawn to COMPLETE before
@@ -1271,7 +1386,34 @@ pub async fn agent_chat_start_session<R: Runtime>(
         input.env = env;
         input.workspace_id = workspace_id;
     }
-    let session = match impl_.start_session(input).await {
+    let validation = verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        generation,
+    )
+    .and_then(|_| match &control {
+        Some(control) => control.verify_start(&app, &input),
+        None => Ok(()),
+    });
+    if let Err(error) = validation {
+        let state = app.state::<AppStateStore>();
+        if claim.changed
+            && state.release_agent_chat_pane_claim(
+                &pane_id,
+                provider,
+                &requested_thread_id,
+                claim.previous.clone(),
+            )
+        {
+            crate::state::emit_app_state(&app);
+        }
+        return Err(error);
+    }
+    let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_gate.clone(),generation});
+    let session = match impl_.start_session_with_cancellation(input, Some(cancellation)).await {
         Ok(session) => session,
         Err(error) => {
             // The claim outlived its reason to exist: put the pane back the
@@ -1305,6 +1447,14 @@ pub async fn agent_chat_start_session<R: Runtime>(
             return Err(provider_err(error));
         }
     };
+    if let Some(control_state) = app.try_state::<NativeControlState>() {
+        control_state.record_worker_mode(
+            &session.thread_id.0,
+            provider,
+            config_for_persist.permission_mode.clone().flatten(),
+        );
+        control_state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id.clone(),status:session.status.clone()});
+    }
     record_session_host(
         &session.thread_id.0,
         device.as_ref().map(|device| device.remote.host_id),
@@ -1824,9 +1974,9 @@ impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
                             );
                         }
                     }
-                    Err(error) => eprintln!(
-                        "[codemux::agent_chat] failed to prune turn checkpoints: {error}"
-                    ),
+                    Err(error) => {
+                        eprintln!("[codemux::agent_chat] failed to prune turn checkpoints: {error}")
+                    }
                 }
                 let payload = AgentChatTurnCheckpointEventPayload {
                     thread_id: ThreadId(self.thread_id.clone()),
@@ -2151,10 +2301,9 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         )?
     };
     for (repo_path, ref_name) in outcome.removed_refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!("[codemux::agent_chat] failed to delete reverted ref: {error}");
         }
     }
@@ -2266,6 +2415,42 @@ pub(super) fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     map.entry(thread_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+fn native_thread_gate<R: Runtime>(app: &AppHandle<R>, thread_id: &str) -> Arc<ThreadGate> {
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        return state.thread_gate(thread_id);
+    }
+    // Older bounded unit fixtures predate this managed state.
+    static LEGACY: OnceLock<NativeControlState> = OnceLock::new();
+    LEGACY.get_or_init(Default::default).thread_gate(thread_id)
+}
+
+fn verify_native_control<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: ProviderKind,
+    thread: &str,
+    control: Option<&NativeControlGuard>,
+    gate: &ThreadGate,
+    generation: u64,
+) -> Result<(), String> {
+    gate.verify(generation)?;
+    if let Some(control) = control {
+        control.verify_target(provider, thread)?;
+        control.verify(app)?;
+    }
+    Ok(())
+}
+
+fn record_native_worker_mode<R: Runtime>(
+    app: &AppHandle<R>,
+    thread: &str,
+    provider: ProviderKind,
+    mode: Option<String>,
+) {
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.record_worker_mode(thread, provider, mode);
+    }
 }
 
 /// Per-workspace gate between push / pull and chat session starts.
@@ -2457,7 +2642,10 @@ fn hermes_send_gate(thread_id: &str) -> Arc<HermesSendGate> {
         .entry(thread_id.into()).or_default().clone()
 }
 impl HermesSendGate {
-    async fn before_dispatch(&self, generation: u64) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    async fn before_dispatch(
+        &self,
+        generation: u64,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
         let guard = self.dispatch.lock().await;
         if self.cancelled.load(Ordering::SeqCst) != generation {
             return Err("cancelled: send stopped before dispatch".into());
@@ -2615,15 +2803,42 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     thread_id: &ThreadId,
     require_original: bool,
 ) -> Result<(), String> {
-    crate::local_session_import::require_live_session(app,&thread_id.0)?;
+    let gate = native_thread_gate(app, &thread_id.0);
+    let generation = gate.generation();
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    ensure_live_session_locked(
+        app,
+        provider_kind,
+        thread_id,
+        require_original,
+        None,
+        &gate,
+        generation,
+    )
+    .await
+}
+
+async fn ensure_live_session_locked<R: Runtime>(
+    app: &AppHandle<R>,
+    provider_kind: ProviderKind,
+    thread_id: &ThreadId,
+    require_original: bool,
+    control: Option<&NativeControlGuard>,
+    gate: &ThreadGate,
+    generation: u64,
+) -> Result<(), String> {
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+    crate::local_session_import::require_live_session(app, &thread_id.0)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider_kind).await?;
     // Fast path: a live session already exists, so no need to serialize
     // — this is the common case (every send after the first). Unless its
     // workspace moved to another machine since the session started.
     if impl_.has_session(thread_id).await && !live_session_moved(app, &thread_id.0) {
+        verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
         return Ok(());
     }
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
 
     // Wait out a push / pull of the thread's workspace, and keep the next
     // one from starting until the rebuild below has placed the session (see
@@ -2640,12 +2855,15 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
     // while we were waiting to acquire it.
     if impl_.has_session(thread_id).await {
         if !live_session_moved(app, &thread_id.0) {
+            verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
             return Ok(());
         }
         // Push / pull moved the workspace: rebuild the session where it is
         // now, resuming the conversation like any other rebuild.
+        verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
         stop_moved_session(app, impl_.as_ref(), thread_id).await?;
     }
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
 
     // No live session — try to rebuild from the persisted row.
     let record = {
@@ -2776,6 +2994,9 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         }
     }
 
+    if let Some(control) = control {
+        control.verify_mode(permission_mode.as_deref())?;
+    }
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
@@ -2805,11 +3026,17 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
         record.model,
     );
 
-    match impl_
-        .start_session(build_input(resume_cursor.clone()))
-        .await
-    {
-        Ok(_) => {}
+    verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+    let resume_input = build_input(resume_cursor.clone());
+    if let Some(control) = control {
+        control.verify_start(app, &resume_input)?;
+    }
+    let cancellation = Arc::new(crate::agent_control::NativeStartCancellation {gate:native_thread_gate(app, &thread_id.0),generation});
+    match impl_.start_session_with_cancellation(resume_input, Some(cancellation.clone())).await {
+        Ok(session) => {
+            record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
+            if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
+        }
         Err(err)
             if resume_cursor.is_some()
                 && !require_original
@@ -2823,10 +3050,14 @@ pub(super) async fn ensure_live_session_mode<R: Runtime>(
                  retrying as a fresh session",
                 thread_id.0,
             );
-            impl_
-                .start_session(build_input(None))
-                .await
-                .map_err(provider_err)?;
+            verify_native_control(app, provider_kind, &thread_id.0, control, gate, generation)?;
+            let fresh = build_input(None);
+            if let Some(control) = control {
+                control.verify_start(app, &fresh)?;
+            }
+            let session = impl_.start_session_with_cancellation(fresh, Some(cancellation)).await.map_err(provider_err)?;
+            record_native_worker_mode(app, &thread_id.0, provider_kind, permission_mode.clone());
+            if let Some(state) = app.try_state::<NativeControlState>() {state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {thread_id:session.thread_id,status:session.status});}
         }
         Err(err) => return Err(provider_err(err)),
     }
@@ -3024,10 +3255,50 @@ pub enum TurnOrigin {
 pub async fn send_turn_with_origin<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
-    mut input: SendTurnCommandInput,
+    input: SendTurnCommandInput,
     origin: TurnOrigin,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
-    crate::local_session_import::require_live_session(&app,&input.thread_id.0)?;
+    send_turn_internal(app, provider, input, origin, None).await
+}
+
+pub async fn send_turn_with_control<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    input: SendTurnCommandInput,
+    control: Option<NativeControlGuard>,
+) -> Result<crate::agent_provider::TurnStartResult, String> {
+    send_turn_internal(app, provider, input, TurnOrigin::User, control).await
+}
+
+async fn send_turn_internal<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    mut input: SendTurnCommandInput,
+    origin: TurnOrigin,
+    control: Option<NativeControlGuard>,
+) -> Result<crate::agent_provider::TurnStartResult, String> {
+    let native_gate = native_thread_gate(&app, &input.thread_id.0);
+    let native_generation = native_gate.generation();
+    // ACP applies this option to the whole live session (including queued
+    // turns), not a turn sandbox. The existing permission setter owns that
+    // mutation and its live/persisted witness.
+    if input.permission_mode_override.is_some() && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+        return Err("unsupported_permission_override: use the native session permission setter for ACP providers".into());
+    }
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
+    if let Some(control) = &control {
+        if let Some(mode) = &input.permission_mode_override {
+            control.verify_mode(Some(mode))?;
+        }
+    }
+    crate::local_session_import::require_live_session(&app, &input.thread_id.0)?;
     if provider == ProviderKind::Hermes && !input.skill_ids.is_empty() {
         return Err("unsupported: Hermes owns its native skills; projected Codemux skills cannot be injected".into());
     }
@@ -3058,6 +3329,25 @@ pub async fn send_turn_with_origin<R: Runtime>(
     } else {
         None
     };
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
+    // Lock order is activity -> native lifecycle -> resume -> checkpoint.
+    // Usage-resume already owns activity; never reacquire it below this gate.
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     if origin == TurnOrigin::User {
         // A previously claimed resume may have hit another limit while this
         // user send waited for its dispatch to finish.
@@ -3068,9 +3358,34 @@ pub async fn send_turn_with_origin<R: Runtime>(
     // this thread (e.g. the app was restarted), rebuild it from the
     // persisted row before the turn so the user never sees a
     // `session_not_found`. No-op when a session is already live.
-    ensure_live_session(&app, provider, &input.thread_id).await?;
+    ensure_live_session_locked(
+        &app,
+        provider,
+        &input.thread_id,
+        false,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )
+    .await?;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     use crate::agent_provider::types::MessageDelivery;
     if input.client_nonce.as_deref().is_none_or(str::is_empty) {
         input.client_nonce = Some(uuid::Uuid::new_v4().to_string());
@@ -3099,6 +3414,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
     // image fs failure is logged and skipped inside the helper.
     let (saved_images, image_inputs) =
         finalize_chat_images(&thread_id_for_persist, &input.images).await?;
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     let db: State<'_, DatabaseStore> = app.state();
     // Checkpoints snapshot the repo with local git, which can't reach a
     // device thread's files.
@@ -3145,6 +3468,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
             )
             .await?
     };
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     let rendered_text = render_skill_invocations(
         &input.text,
         input.skill_text.as_deref(),
@@ -3167,10 +3498,9 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if turn_checkpoint.is_none() && db.has_agent_chat_turn_checkpoints(&thread_id_for_persist) {
         let stale_refs = db.clear_agent_chat_turn_checkpoints(&thread_id_for_persist)?;
         for (repo_path, ref_name) in stale_refs {
-            if let Err(error) = crate::git::git_checkpoint_delete_ref(
-                std::path::Path::new(&repo_path),
-                &ref_name,
-            ) {
+            if let Err(error) =
+                crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+            {
                 eprintln!("[codemux::agent_chat] failed to delete stale turn ref: {error}");
             }
         }
@@ -3180,6 +3510,12 @@ pub async fn send_turn_with_origin<R: Runtime>(
         );
     }
     drop(invalidation_guard);
+    let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = match &control {
+        Some(control) => Some(Arc::new(crate::agent_control::GuardedTurnCheckpoint {
+            app: app.clone(), control: control.clone().retain_admission(&app), inner: turn_checkpoint,
+        })),
+        None => turn_checkpoint,
+    };
     // Build the provider's byte-carrying input from the command DTO.
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
@@ -3197,6 +3533,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
         (Some(gate), Some(generation)) => Some(gate.before_dispatch(generation).await?),
         _ => None,
     };
+    verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    )?;
     // Register attachments before the provider can emit TurnQueued and
     // immediately dispatch it. The event bridge and RPC return race to
     // transfer this entry, so exactly one owns its deferred persistence.
@@ -3216,6 +3560,17 @@ pub async fn send_turn_with_origin<R: Runtime>(
     if input.delivery != MessageDelivery::Steer {
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.begin_turn(&thread_id_for_persist);
+    }
+    if let Err(error) = verify_native_control(
+        &app,
+        provider,
+        &input.thread_id.0,
+        control.as_ref(),
+        &native_gate,
+        native_generation,
+    ) {
+        pending_send_images().lock().unwrap().remove(&pending_key);
+        return Err(error);
     }
     let sent = match input.delivery {
         MessageDelivery::Steer => impl_.steer_turn(provider_input).await,
@@ -3239,6 +3594,14 @@ pub async fn send_turn_with_origin<R: Runtime>(
     }
     drop(dispatch_guard);
     let result = sent.map_err(provider_err)?;
+    if let Some(queued_id) = &result.queued_id {
+        // Do not acknowledge queued acceptance without durable evidence.
+        // The event bridge may lag, or dispatch/cancellation may beat this ACK.
+        db.control_record_queue_admission(&input.thread_id.0, queued_id)?;
+    }
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.record_accepted_turn(&input.thread_id.0, &result);
+    }
     if input.delivery == MessageDelivery::Steer && !result.steered {
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.begin_turn(&thread_id_for_persist);
@@ -3269,7 +3632,8 @@ pub async fn send_turn_with_origin<R: Runtime>(
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
-                result.steered.then_some(&result.turn_id),
+                &result.turn_id,
+                result.steered,
             );
             bind_turn_checkpoint_transcript(
                 &app,
@@ -3305,10 +3669,21 @@ pub async fn send_turn_with_origin<R: Runtime>(
 
     if input.delivery == MessageDelivery::Interrupt {
         if let Some(queued_id) = &result.queued_id {
-            if let Err(error) = impl_
-                .send_queued_turn_now(input.thread_id.clone(), queued_id.clone())
-                .await
-            {
+            let promotion = match verify_native_control(
+                &app,
+                provider,
+                &input.thread_id.0,
+                control.as_ref(),
+                &native_gate,
+                native_generation,
+            ) {
+                Ok(()) => impl_
+                    .send_queued_turn_now(input.thread_id.clone(), queued_id.clone())
+                    .await
+                    .map_err(provider_err),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = promotion {
                 // The message is accepted and still queued. Reporting a send
                 // failure would restore the draft and invite a duplicate.
                 let payload = AgentChatEventPayload {
@@ -3369,6 +3744,8 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
     queued_id: String,
     delivery: Option<crate::agent_provider::types::MessageDelivery>,
 ) -> Result<(), String> {
+    let gate = native_thread_gate(&app, &thread_id.0);
+    let generation = gate.generation();
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
@@ -3379,8 +3756,11 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &thread_id.0);
     }
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    gate.verify(generation)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    gate.verify(generation)?;
     use crate::agent_provider::types::MessageDelivery;
     match delivery.unwrap_or(MessageDelivery::Interrupt) {
         MessageDelivery::Steer => impl_.steer_queued_turn(thread_id, queued_id).await,
@@ -4080,14 +4460,15 @@ fn persist_user_message(
     text: &str,
     images: &[PersistedChatImage],
     client_nonce: Option<&str>,
-    steered_turn_id: Option<&TurnId>,
+    turn_id: &TurnId,
+    steered: bool,
 ) -> Option<i64> {
     let mut user_msg = serde_json::json!({
         "type": "user_message",
         "thread_id": thread_id,
         "text": text,
     });
-    if let Some(turn_id) = steered_turn_id {
+    if steered {
         user_msg["steered_turn_id"] = serde_json::json!(turn_id);
     }
     if let Some(nonce) = client_nonce.filter(|n| !n.is_empty()) {
@@ -4106,7 +4487,7 @@ fn persist_user_message(
         user_msg["images"] = serde_json::Value::Array(images_json);
     }
     let payload = serde_json::to_string(&user_msg).ok()?;
-    db.append_agent_chat_message(thread_id, &payload)
+    db.control_append_user_message(thread_id, &payload, &turn_id.0, steered)
         .ok()
         .flatten()
 }
@@ -4158,24 +4539,54 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     thread_id: ThreadId,
     turn_id: Option<TurnId>,
 ) -> Result<bool, String> {
+    agent_chat_interrupt_turn_guarded(app, provider, thread_id, turn_id, None).await
+}
+
+pub async fn agent_chat_interrupt_turn_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    turn_id: Option<TurnId>,
+    control: Option<NativeControlGuard>,
+) -> Result<bool, String> {
+    if let Some(control) = &control {
+        control.verify_target(provider, &thread_id.0)?;
+        control.verify(&app)?;
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    // Before the lock: a delegated child's starter holds it while it starts,
-    // and the task must read Stopped at once rather than after the start.
-    super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
-    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    // A selected interrupt applies only to an already-running turn. The
+    // provider must first match that identity; it is not a blanket Stop of
+    // newer admitted sends, usage resumes or delegated tasks.
+    if turn_id.is_none() {
+        native_gate.cancel();
+        // Before the lock: a delegated child's starter holds it while it starts,
+        // and the task must read Stopped at once rather than after the start.
+        super::delegation::on_thread_stopped(&app, &thread_id.0, super::delegation::StopKind::Stop);
+        super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    }
     let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
         .lock_owned()
         .await;
-    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    if turn_id.is_none() { super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0); }
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    if let Some(control) = &control {
+        control.verify(&app)?;
+    }
     let hermes_gate = (matches!(provider, ProviderKind::Hermes | ProviderKind::Acp) && turn_id.is_none())
         .then(|| hermes_send_gate(&thread_id.0));
     let _dispatch_guard = if let Some(gate) = hermes_gate.as_ref() {
         gate.cancelled.fetch_add(1, Ordering::SeqCst);
         Some(gate.dispatch.lock().await)
-    } else { None };
+    } else {
+        None
+    };
+    if let Some(control) = &control {
+        control.verify(&app)?;
+    }
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
         Ok(()) => true,
         Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
@@ -4261,14 +4672,13 @@ pub async fn agent_chat_stop_monitoring<R: Runtime>(
     // Best-effort: a dead session (`SessionNotFound`) or a provider that
     // declines the call must not stop the state from clearing.
     if let Some(thread_id) = thread_id.as_ref() {
-        let registry: State<'_, ProviderRegistry> = app.state();
-        if let Ok(impl_) = lookup_provider(&registry, provider).await {
-            if let Err(error) = impl_.interrupt_turn(thread_id.clone(), None).await {
-                eprintln!(
-                    "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
-                     (state cleared anyway): {error:?}"
-                );
-            }
+        if let Err(error) =
+            agent_chat_interrupt_turn(app.clone(), provider, thread_id.clone(), None).await
+        {
+            eprintln!(
+                "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
+                 (state cleared anyway): {error:?}"
+            );
         }
     }
 
@@ -4358,6 +4768,32 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
     request_id: RequestId,
     decision: ApprovalDecision,
 ) -> Result<(), String> {
+    agent_chat_respond_to_request_guarded(app, provider, thread_id, request_id, decision, None)
+        .await
+}
+
+pub async fn agent_chat_respond_to_request_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    request_id: RequestId,
+    decision: ApprovalDecision,
+    control: Option<NativeControlGuard>,
+) -> Result<(), String> {
+    if let Some(control) = &control {
+        control.verify_target(provider, &thread_id.0)?;
+        control.verify(&app)?;
+        if control.caller.access != crate::agent_control::ControlAccess::FullAccess
+            && !matches!(
+                decision,
+                ApprovalDecision::Deny { .. } | ApprovalDecision::Cancel
+            )
+        {
+            return Err(
+                "permission_ceiling: supervised clients cannot approve worker requests".into(),
+            );
+        }
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -4370,19 +4806,45 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
     // orphan instead. OpenCode opts into resume because its permission
     // request lives in the external HTTP server rather than this process.
     if !impl_.has_session(&thread_id).await {
-        if !impl_.pending_requests_survive_session_restart() {
+        if control.is_some() || !impl_.pending_requests_survive_session_restart() {
             emit_stale_request_failure(&app, thread_id, request_id);
-            return Ok(());
+            return if control.is_some() {
+                Err("stale_provider_callback: request is not pending in the current provider process".into())
+            } else {
+                Ok(())
+            };
         }
         ensure_live_session(&app, provider, &thread_id).await?;
     }
 
+    if let Some(control) = &control {
+        control.verify(&app)?;
+        if !app
+            .try_state::<NativeControlState>()
+            .is_some_and(|state| state.request_is_current(&thread_id.0, &request_id.0))
+        {
+            emit_stale_request_failure(&app, thread_id, request_id);
+            return Err(
+                "stale_provider_callback: no current-process request matches this ID".into(),
+            );
+        }
+    }
+    let dispatch_decision = if control.is_some() && matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+        app.state::<NativeControlState>().exact_acp_decision(&thread_id.0, &request_id.0, &decision)?
+    } else { decision.clone() };
     match impl_
-        .respond_to_request(thread_id.clone(), request_id.clone(), decision)
+        .respond_to_request(thread_id.clone(), request_id.clone(), dispatch_decision)
         .await
     {
         Ok(()) => {
             super::delegation::on_request_answered(&app, &thread_id.0, &request_id.0);
+            if let Some(state) = app.try_state::<NativeControlState>() {
+                state.observe_event(&ProviderRuntimeEvent::RequestResolved {
+                    thread_id,
+                    request_id,
+                    decision,
+                });
+            }
             Ok(())
         }
         // A provider can lose the callback between the liveness check and
@@ -4393,7 +4855,11 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
         | Err(ProviderError::SessionNotFound { .. })
         | Err(ProviderError::SessionClosed { .. }) => {
             emit_stale_request_failure(&app, thread_id, request_id);
-            Ok(())
+            if control.is_some() {
+                Err("stale_provider_callback: request is no longer pending".into())
+            } else {
+                Ok(())
+            }
         }
         Err(err) => Err(provider_err(err)),
     }
@@ -4436,6 +4902,14 @@ pub async fn agent_chat_set_model<R: Runtime>(
     thread_id: ThreadId,
     model: Option<String>,
 ) -> Result<(), String> {
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    // Custom ACP orders a model change against its own turns: sends stay
+    // admissible while the change awaits the agent's acknowledgement.
+    let _native_guard = if provider == ProviderKind::Acp {
+        None
+    } else {
+        Some(native_gate.dispatch.clone().lock_owned().await)
+    };
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -4456,9 +4930,13 @@ pub async fn agent_chat_set_model<R: Runtime>(
         // Resume takes this same lock. Finish it before locking the mutation;
         // a missing session is never acknowledgement of a model request.
         ensure_live_session(&app, provider, &thread_id).await?;
+        // The live session orders the change against its own turns. Lock only
+        // after the agent acknowledges it: starts and settings take this lock
+        // under the native gate, so holding it here would queue sends,
+        // interrupts and Stop behind the acknowledgement.
+        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
         let lock = resume_lock_for(&thread_id.0);
         let _guard = lock.lock().await;
-        impl_.set_model(thread_id.clone(), model).await.map_err(provider_err)?;
         let acp = app.state::<Arc<crate::agent_provider::custom_acp::GenericAcpProvider>>();
         let catalog = acp.catalog(&thread_id).await.map_err(provider_err)?;
         return super::custom_acp::persist_catalog(&app.state::<DatabaseStore>(), &thread_id.0, &catalog);
@@ -4496,6 +4974,8 @@ pub async fn agent_chat_set_fast_mode<R: Runtime>(
     thread_id: ThreadId,
     fast_mode: bool,
 ) -> Result<(), String> {
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -4570,6 +5050,8 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
     thread_id: ThreadId,
     mode: String,
 ) -> Result<(), String> {
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -4593,6 +5075,9 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
         });
     }
     // Persist first so the value survives a restart / next auto-resume.
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.mark_worker_mode_uncertain(&thread_id.0);
+    }
     {
         let db: State<'_, DatabaseStore> = app.state();
         let config = AgentChatSessionConfig {
@@ -4603,9 +5088,20 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
             eprintln!("[codemux::agent_chat] failed to persist permission_mode config: {error}");
         }
     }
-    match impl_.set_permission_mode(thread_id, mode).await {
-        Ok(()) => Ok(()),
-        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+    match impl_
+        .set_permission_mode(thread_id.clone(), mode.clone())
+        .await
+    {
+        Ok(()) => {
+            record_native_worker_mode(&app, &thread_id.0, provider, Some(mode));
+            Ok(())
+        }
+        Err(ProviderError::SessionNotFound { .. }) => {
+            if let Some(state) = app.try_state::<NativeControlState>() {
+                state.clear_worker(&thread_id.0);
+            }
+            Ok(())
+        }
         Err(err) => Err(provider_err(err)),
     }
 }
@@ -4659,7 +5155,10 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
         '_,
         std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
     >,
-    opencode_manager: State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    opencode_manager: State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
@@ -4788,7 +5287,9 @@ pub async fn agent_chat_hooks(
     }
     let directory = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => std::path::PathBuf::from(cwd),
-        None => dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?,
+        None => {
+            dirs::home_dir().ok_or_else(|| "Cannot resolve your home directory.".to_string())?
+        }
     };
     lookup_provider(&registry, provider).await?.manage_hooks(&directory, thread_id, update).await
 }
@@ -4816,7 +5317,10 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
     >,
-    opencode_manager: tauri::State<'_, std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>>,
+    opencode_manager: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+    >,
     force: Option<bool>,
     thread_id: Option<ThreadId>,
     registry: tauri::State<'_, ProviderRegistry>,
@@ -4886,18 +5390,22 @@ pub async fn list_chat_slash_commands(
             let mut config = crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
             config.server_password = Some(handle.server_password);
             let client = crate::agent_provider::opencode::OpenCodeClient::new(config)?;
-            let mut commands = vec![crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
-                name: "compact".into(),
-                description: "Summarize conversation history to free up context".into(),
-                argument_hint: String::new(),
-            }];
+            let mut commands = vec![
+                crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                    name: "compact".into(),
+                    description: "Summarize conversation history to free up context".into(),
+                    argument_hint: String::new(),
+                },
+            ];
             for command in client.list_commands(std::path::Path::new(&cwd)).await? {
                 if command.name != "compact" && command.source.as_deref() != Some("skill") {
-                    commands.push(crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
-                        name: command.name,
-                        description: command.description.unwrap_or_default(),
-                        argument_hint: command.hints.join(" "),
-                    });
+                    commands.push(
+                        crate::agent_provider::claude::slash_commands::ProviderSlashCommand {
+                            name: command.name,
+                            description: command.description.unwrap_or_default(),
+                            argument_hint: command.hints.join(" "),
+                        },
+                    );
                 }
             }
             Ok(commands)
@@ -4918,8 +5426,23 @@ pub async fn agent_chat_stop_session<R: Runtime>(
     provider: ProviderKind,
     thread_id: ThreadId,
 ) -> Result<(), String> {
+    agent_chat_stop_session_guarded(app, provider, thread_id, None).await
+}
+
+pub async fn agent_chat_stop_session_guarded<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    control: Option<NativeControlGuard>,
+) -> Result<(), String> {
+    if let Some(control) = &control {
+        control.verify_target(provider, &thread_id.0)?;
+        control.verify(&app)?;
+    }
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    let native_gate = native_thread_gate(&app, &thread_id.0);
+    native_gate.cancel();
     // A restart in place: a delegated child's task stops quietly, a
     // parent's tasks keep running (New Chat / history pick rebinds the
     // pane afterwards, and that rebind is what stops them).
@@ -4929,10 +5452,23 @@ pub async fn agent_chat_stop_session<R: Runtime>(
         .lock_owned()
         .await;
     super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    let _native_guard = native_gate.dispatch.clone().lock_owned().await;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    match impl_.stop_session(thread_id).await {
-        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+    if let Some(control) = &control {
+        control.verify(&app)?;
+    }
+    match impl_.stop_session(thread_id.clone()).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => {
+            if let Some(state) = app.try_state::<NativeControlState>() {
+                state.clear_worker(&thread_id.0);
+                state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id,
+                    status: SessionStatus::Closed,
+                });
+            }
+            Ok(())
+        }
         Err(err) => Err(provider_err(err)),
     }
 }
@@ -4974,14 +5510,23 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
         super::usage_resume::cancel_for_stopped_thread(app, thread_id);
         super::delegation::on_thread_stopped(app, thread_id, super::delegation::StopKind::Close);
     }
+    let threads: Vec<_> = threads
+        .into_iter()
+        .map(|(kind, thread_id)| {
+            let gate = native_thread_gate(app, &thread_id);
+            gate.cancel();
+            (kind, thread_id, gate)
+        })
+        .collect();
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let registry: State<'_, ProviderRegistry> = app_handle.state();
-        for (kind, thread_id) in threads {
+        for (kind, thread_id, gate) in threads {
             let _activity_guard = super::usage_resume::activity_lock(&thread_id)
                 .lock_owned()
                 .await;
             super::usage_resume::cancel_for_stopped_thread(&app_handle, &thread_id);
+            let _native_guard = gate.dispatch.clone().lock_owned().await;
             let Some(impl_) = registry.get(kind).await else {
                 continue;
             };
@@ -4989,6 +5534,12 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
                 eprintln!(
                     "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
                 );
+            } else if let Some(state) = app_handle.try_state::<NativeControlState>() {
+                state.clear_worker(&thread_id);
+                state.observe_event(&ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: ThreadId(thread_id.clone()),
+                    status: SessionStatus::Closed,
+                });
             }
         }
     });
@@ -5644,12 +6195,25 @@ pub async fn agent_chat_get_session(
 /// Not gated on the feature flag, same rationale as
 /// [`agent_chat_get_session`].
 #[tauri::command]
-pub async fn agent_chat_update_session_config(
+pub async fn agent_chat_update_session_config<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, DatabaseStore>,
     thread_id: String,
     config: AgentChatSessionConfig,
 ) -> Result<(), String> {
-    db.update_agent_chat_session_config(&thread_id, &config)
+    let gate = native_thread_gate(&app, &thread_id);
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
+    let permission_changed = config.permission_mode.is_some()
+        && db
+            .get_agent_chat_session(&thread_id)
+            .is_some_and(|record| config.permission_mode.as_ref() != Some(&record.permission_mode));
+    db.update_agent_chat_session_config(&thread_id, &config)?;
+    if permission_changed {
+        if let Some(state) = app.try_state::<NativeControlState>() {
+            state.mark_worker_mode_uncertain(&thread_id);
+        }
+    }
+    Ok(())
 }
 
 /// Rename a persisted chat session. Used by the dropdown's per-row
@@ -5677,6 +6241,9 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     db: State<'_, DatabaseStore>,
     thread_id: String,
 ) -> Result<(), String> {
+    let gate = native_thread_gate(&app, &thread_id);
+    gate.cancel();
+    let _native_guard = gate.dispatch.clone().lock_owned().await;
     if db.hermes_binding(&thread_id)?.is_some() {
         let registry: State<'_, ProviderRegistry> = app.state();
         if let Some(provider) = registry.get(ProviderKind::Hermes).await {
@@ -5714,8 +6281,14 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     }
     checkpoint_refs.extend(safety_repos.into_iter().flat_map(|repo_path| {
         [
-            (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
-            (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+            (
+                repo_path.clone(),
+                crate::git::pre_restore_ref_name(&thread_id),
+            ),
+            (
+                repo_path,
+                crate::git::pre_restore_failed_ref_name(&thread_id),
+            ),
         ]
     }));
     db.delete_agent_chat_session(&thread_id)?;
@@ -5723,10 +6296,9 @@ pub async fn agent_chat_delete_session<R: Runtime>(
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
     for (repo_path, ref_name) in checkpoint_refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!("[codemux::agent_chat] failed to delete session checkpoint ref: {error}");
         }
     }
@@ -5750,16 +6322,21 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
             .into_iter()
             .flat_map(|(thread_id, repo_path)| {
                 [
-                    (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
-                    (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+                    (
+                        repo_path.clone(),
+                        crate::git::pre_restore_ref_name(&thread_id),
+                    ),
+                    (
+                        repo_path,
+                        crate::git::pre_restore_failed_ref_name(&thread_id),
+                    ),
                 ]
             }),
     );
     for (repo_path, ref_name) in refs {
-        if let Err(error) = crate::git::git_checkpoint_delete_ref(
-            std::path::Path::new(&repo_path),
-            &ref_name,
-        ) {
+        if let Err(error) =
+            crate::git::git_checkpoint_delete_ref(std::path::Path::new(&repo_path), &ref_name)
+        {
             eprintln!(
                 "[codemux::agent_chat] failed to delete merged-session checkpoint ref: {error}"
             );
@@ -6343,6 +6920,15 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             }
         }
     }
+    // Queue events contain prompt text for LIVE rendering only. Persist a
+    // control-only ID/disposition journal instead of replayable actor events.
+    if matches!(&event, ProviderRuntimeEvent::TurnQueued { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. } | ProviderRuntimeEvent::QueuedTurnCancelled { .. }) {
+        let db: State<'_, DatabaseStore> = app.state();
+        if let Err(error) = db.control_record_queue_event(&event) {
+            eprintln!("[codemux::agent_chat] failed to persist queue disposition: {error}");
+        }
+    }
     if let ProviderRuntimeEvent::TurnQueued {
         thread_id,
         client_nonce: Some(nonce),
@@ -6396,7 +6982,8 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
                 text,
                 &pending.images,
                 pending.client_nonce.as_deref(),
-                (*steered).then_some(turn_id),
+                turn_id,
+                *steered,
             );
             bind_turn_checkpoint_transcript(
                 app,
@@ -6470,6 +7057,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeE
             }
         }
         super::usage_resume::end_turn(thread_id);
+    }
+    if let Some(state) = app.try_state::<NativeControlState>() {
+        state.observe_event(&event);
     }
     // Best-effort transcript persistence so the SessionSelector resume
     // path can replay the visible conversation. We only persist events
