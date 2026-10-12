@@ -26,7 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Loader2, Sparkles, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Sparkles, X } from "lucide-react";
 
 import {
   Select,
@@ -510,7 +510,7 @@ export function CreatePrForm({
               onClick={() => void writeWithAgent()}
             >
               {writing ? (
-                <Loader2 className="size-3 motion-safe:animate-spin" />
+                <Spinner className="size-3" aria-hidden />
               ) : (
                 <Sparkles className="size-3" />
               )}

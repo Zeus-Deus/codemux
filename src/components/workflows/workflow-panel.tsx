@@ -1,9 +1,10 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronLeft, Code2, Loader2, Pause, Play, Plus, RotateCw, Square, X } from "lucide-react";
+import { Check, ChevronLeft, Code2, Pause, Play, Plus, RotateCw, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Eyebrow } from "@/components/ui/eyebrow";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { useWorkflowUIStore, type WorkflowDraft } from "@/stores/workflow-ui-store";
 import { DEFAULT_WORKFLOW_LIMITS, workflowArtifactPreview, workflowError, workflowIntegrateArtifact, type WorkflowRunSnapshot, type WorkflowTaskSnapshot, type WorkflowTaskStatus } from "@/tauri/workflows";
@@ -311,7 +312,7 @@ function TaskDetail({ run, task, busy, wide, onBack, onControl }: { wide: boolea
 }
 
 function TaskIcon({ status }: { status: WorkflowTaskStatus }) {
-  return <span className={cn("mt-0.5 flex size-3.5 shrink-0 items-center justify-center", statusClass(status))}>{status === "succeeded" ? <Check className="size-3.5" /> : status === "running" || status === "stopping" ? <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" /> : status === "failed" || status === "unknown" ? <X className="size-3.5" /> : <span className="size-1.5 rounded-full border border-current" />}</span>;
+  return <span className={cn("mt-0.5 flex size-3.5 shrink-0 items-center justify-center", statusClass(status))}>{status === "succeeded" ? <Check className="size-3.5" /> : status === "running" || status === "stopping" ? <Spinner className="size-3.5" aria-hidden /> : status === "failed" || status === "unknown" ? <X className="size-3.5" /> : <span className="size-1.5 rounded-full border border-current" />}</span>;
 }
 function Output({ value }: { value: unknown }) {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "";

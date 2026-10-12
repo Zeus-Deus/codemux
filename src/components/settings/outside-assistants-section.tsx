@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Copy, Loader2 } from "lucide-react";
+import { Copy } from "lucide-react";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { useUIStore } from "@/stores/ui-store";
@@ -161,7 +162,7 @@ function NativeOutsideAssistantsSection() {
       {error && <p role="alert" className="mt-3 text-label text-destructive">{error}</p>}
       {subscriptionError && <p role="alert" className="mt-3 text-label text-destructive">{subscriptionError}</p>}
       {!status ? (
-        !error && <p className="mt-3 flex items-center gap-2 text-body-sm text-muted-foreground"><Loader2 className="size-3.5 animate-spin" aria-hidden />Loading connections…</p>
+        !error && <p className="mt-3 flex items-center gap-2 text-body-sm text-muted-foreground"><Spinner className="size-3.5" aria-hidden />Loading connections…</p>
       ) : (
         <div className="mt-3 divide-y divide-border/40 rounded-md border border-border/50">
           <div className="space-y-1.5 p-3">

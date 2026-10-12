@@ -1,7 +1,7 @@
 import type { Ref } from "react";
-import { Loader2 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { KeyHint } from "@/components/ui/key-hint";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
 /**
@@ -32,9 +32,9 @@ export function SearchQueryInput({
         className="h-9 pr-8 text-body"
       />
       {loading && (
-        <Loader2
-          aria-label="Searching"
-          className="pointer-events-none absolute top-1/2 right-2.5 size-3.5 -translate-y-1/2 text-muted-foreground motion-safe:animate-spin"
+        <Spinner
+          label="Searching"
+          className="pointer-events-none absolute top-1/2 right-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
         />
       )}
     </div>

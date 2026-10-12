@@ -20,7 +20,6 @@ import {
   FolderGit,
   ChevronDown,
   CornerDownRight,
-  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BranchDetail, WorktreeInfo } from "@/tauri/types";
@@ -279,7 +278,7 @@ export function BranchPicker({
                 className="flex shrink-0 items-center gap-1 px-1.5 text-caption text-muted-foreground"
                 title="Fetching from origin. New remote branches appear when it finishes."
               >
-                <RefreshCw className="size-3 motion-safe:animate-spin" />
+                <Spinner className="size-3" aria-hidden />
                 Syncing
               </span>
             )}
