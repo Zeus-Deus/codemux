@@ -15,7 +15,7 @@
 //    git treat the whole store file as binary.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 
 const mockProbe = vi.fn();
 
@@ -83,6 +83,7 @@ describe("provider-health-store", () => {
     });
   });
   afterEach(() => {
+    cleanup();
     vi.useRealTimers();
   });
 

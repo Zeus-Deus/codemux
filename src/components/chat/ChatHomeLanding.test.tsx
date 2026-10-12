@@ -30,9 +30,12 @@ import { ChatHomeLanding } from "./ChatHomeLanding";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
-import { emptyHealthSlot, useProviderHealth } from "@/stores/provider-health-store";
+import { emptyHealthSlot, HEALTH_REPROBE_MS, useProviderHealth } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind, ProviderHealthReport, AppStateSnapshot } from "@/tauri/types";
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 beforeEach(() => {
   mockProbe.mockReset();
   useProviderHealth.setState({
@@ -374,6 +377,50 @@ describe("ChatHomeLanding", () => {
       mockProbe.mockImplementation(() => new Promise(() => {}));
       await renderWithAgents();
       expect(screen.getByTestId("agent-availability-strip")).toBeEmptyDOMElement();
+    });
+
+    it("shows its chips after a cache expires while another opening probe is outstanding", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const openedAt = Date.now();
+      const missingClaude: ProviderHealthReport = {
+        provider: "claude", status: "error", installed: false,
+        message: "Not on PATH.", version: null,
+      };
+      useProviderHealth.setState((state) => ({
+        slots: {
+          ...state.slots,
+          claude: {
+            ...emptyHealthSlot(),
+            report: missingClaude,
+            fetchedAt: openedAt - HEALTH_REPROBE_MS + 1,
+          },
+        },
+      }));
+      let resolveClaude!: (report: ProviderHealthReport) => void;
+      let resolveCodex!: (report: ProviderHealthReport) => void;
+      const claude = new Promise<ProviderHealthReport>((resolve) => { resolveClaude = resolve; });
+      const codex = new Promise<ProviderHealthReport>((resolve) => { resolveCodex = resolve; });
+      mockProbe.mockImplementation((provider: AgentChatProviderKind) =>
+        provider === "claude" ? claude : provider === "codex" ? codex :
+          Promise.resolve({ provider, status: "ready", installed: true, message: null, version: null }),
+      );
+      await renderWithAgents();
+      expect(mockProbe).not.toHaveBeenCalledWith("claude");
+
+      vi.setSystemTime(openedAt + 2);
+      await act(async () => {
+        resolveCodex({ provider: "codex", status: "ready", installed: true, message: null, version: null });
+        await codex;
+      });
+      expect(mockProbe).toHaveBeenCalledWith("claude");
+      expect(screen.getByTestId("agent-availability-strip")).toBeEmptyDOMElement();
+
+      await act(async () => {
+        resolveClaude(missingClaude);
+        await claude;
+      });
+      expect(screen.getByTestId("agent-chip-codex")).toHaveAttribute("data-readiness", "ready");
+      expect(screen.getByTestId("agent-chip-claude")).toBeDisabled();
     });
 
     it("only appears on a first run, and only where the composer can switch", async () => {

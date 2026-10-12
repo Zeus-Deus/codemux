@@ -58,9 +58,12 @@ describe("automation agent defaults", () => {
     }));
   });
 
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
 
-  async function openForm() {
+  async function openForm(expectedProbes = 2) {
     const claude = deferred();
     const codex = deferred();
     probe.mockImplementation((provider: string) =>
@@ -69,7 +72,7 @@ describe("automation agent defaults", () => {
     const user = userEvent.setup();
     render(<AutomationsSection />);
     await user.click(await screen.findByRole("button", { name: "New automation" }));
-    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledTimes(expectedProbes);
     return { claude, codex, user };
   }
 
@@ -119,5 +122,37 @@ describe("automation agent defaults", () => {
     expect(agentTrigger()).toHaveTextContent("Codex");
     expect(screen.getByTestId("automation-agent-readiness")).toHaveAttribute("data-readiness", "ready");
     warn.mockRestore();
+  });
+
+  it("refreshes a cache that expires while another opening probe is outstanding", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const openedAt = Date.now();
+    useProviderHealth.setState((state) => ({
+      slots: {
+        ...state.slots,
+        claude: {
+          ...emptyHealthSlot(),
+          report: report("claude", "error", false),
+          fetchedAt: openedAt - HEALTH_REPROBE_MS + 1,
+        },
+        codex: emptyHealthSlot(),
+      },
+    }));
+    const { claude, codex } = await openForm(1);
+    expect(probe).toHaveBeenCalledWith("codex");
+
+    vi.setSystemTime(openedAt + 2);
+    await act(async () => {
+      codex.resolve(report("codex", "ready"));
+      await codex.promise;
+    });
+    expect(probe).toHaveBeenCalledWith("claude");
+
+    await act(async () => {
+      claude.resolve(report("claude", "error", false));
+      await claude.promise;
+    });
+    expect(agentTrigger()).toHaveTextContent("Codex");
+    expect(screen.getByTestId("automation-agent-readiness")).toHaveAttribute("data-readiness", "ready");
   });
 });

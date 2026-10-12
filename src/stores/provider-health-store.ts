@@ -294,7 +294,10 @@ export function useProbedProviderHealth(
   useEffect(() => {
     if (!active) return;
     for (const provider of providers) void refresh(provider);
-  }, [active, providers, refresh]);
+    // Another probe's completion can expose a cached answer that expired
+    // while this surface was open. Schedule that refresh too; the store
+    // still applies its TTL and single-flight guards.
+  }, [active, providers, refresh, slots]);
   return useMemo(
     () =>
       Object.fromEntries(
