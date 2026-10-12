@@ -1268,6 +1268,13 @@ async fn reconcile_native_history(
         return Ok(());
     }
     if exact_user_found {
+        if messages.iter().any(|message| message["type"] == "idle") {
+            // A moving range can contain the User's completion or earlier missed
+            // callbacks. Do not publish a later User ahead of them or release a
+            // feed that could move its terminal anchor past unrecovered answers.
+            // Preserve the reservation and retry within the existing budget.
+            return Err("native_user_completion_snapshot_unconfirmed".into());
+        }
         // Even an advancing window proves the exact User was delivered. Claim
         // its original turn and replay only its busy period; a coherent Idle or
         // the live terminal must still establish completion and a replay floor.
@@ -1305,13 +1312,6 @@ async fn reconcile_native_history(
             event_tx,
         )
         .await?;
-        if newer_boundary > 0 {
-            // The User already has an Idle, but this moving window cannot
-            // settle it safely. Releasing feed readiness would let a newer
-            // callback borrow the still-active User identity. Retry recovery
-            // within the existing budget before consuming that live feed.
-            return Err("native_user_completion_snapshot_unconfirmed".into());
-        }
         return Ok(());
     }
     // A moving checkpoint cannot settle executions. If the known boundary
@@ -2086,14 +2086,29 @@ mod tests {
     #[tokio::test]
     async fn native_recovery_recovers_two_completed_root_callbacks_across_pages_on_distinct_turns()
     {
-        for (admitted_first, running_tail, absent_input) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, false, true),
+        for (admitted_first, running_tail, absent_input, moving) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, true, false, true),
         ] {
             let mut server = mockito::Server::new_async().await;
-            let mut mocks = mock_watermarks(&mut server, "root", 30).await;
+            let changing = Arc::new(std::sync::atomic::AtomicBool::new(moving));
+            let mut mocks = if moving {
+                let changing = changing.clone();
+                let counter = Arc::new(std::sync::atomic::AtomicU64::new(30));
+                vec![server.mock("GET", mockito::Matcher::Regex(
+                    "^/api/experimental/session/root/log\\?follow=false(?:&after=[0-9]+)?$".into()))
+                    .with_status(200).with_body_from_request(move |_| {
+                        let seq = if changing.load(std::sync::atomic::Ordering::Relaxed) {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        } else { counter.load(std::sync::atomic::Ordering::Relaxed) };
+                        watermark_record("root", seq).into_bytes()
+                    }).create_async().await]
+            } else {
+                mock_watermarks(&mut server, "root", 30).await
+            };
             for (path, body) in [
                 (
                     "/api/session/active",
@@ -2135,7 +2150,7 @@ mod tests {
                 .mock("GET", "/api/session/root/message?limit=200&order=desc")
                 .with_status(200)
                 .with_body(serde_json::json!({"data":newest,"cursor":{"next":"older"}}).to_string())
-                .expect(2)
+                .expect(if moving { 5 } else { 2 })
                 .create_async()
                 .await;
             let older_page = server.mock("GET", "/api/session/root/message?limit=200&cursor=older")
@@ -2144,7 +2159,7 @@ mod tests {
                     {"id":"input_b","type":"user","text":"B"},
                     {"id":"msg_a_done","type":"idle","outcome":"succeeded"},
                     {"id":"m_a","type":"assistant","time":{"completed":1},"content":[{"type":"text","text":"old A"}]}
-                ]}).to_string()).expect(if running_tail { 2 } else { 1 }).create_async().await;
+                ]}).to_string()).expect(if moving { 5 } else if running_tail || absent_input { 2 } else { 1 }).create_async().await;
             let mut p = peer("root");
             p.api = super::super::api::OpenCodeApi::V2;
             let (tx, mut rx) = broadcast::channel(64);
@@ -2178,6 +2193,54 @@ mod tests {
                 );
             }
             while rx.try_recv().is_ok() {}
+            if moving {
+                p.ready.send_replace(false);
+                let feed = [
+                    native_record("connected", "server.connected", serde_json::json!({}), None),
+                    native_record(
+                        "evt_d_done",
+                        "session.execution.succeeded",
+                        serde_json::json!({"sessionID":"root"}),
+                        Some(40),
+                    ),
+                ]
+                .concat();
+                let _feed = server
+                    .mock("GET", "/test-native-feed")
+                    .with_status(200)
+                    .with_body(feed)
+                    .create_async()
+                    .await;
+                let response = reqwest::get(format!("{}/test-native-feed", server.url()))
+                    .await
+                    .unwrap();
+                let mut attempt = 2;
+                consume_stream(response, &p, &tx, &server.url(), "fixture", &mut attempt).await;
+                assert_eq!(attempt, 2);
+                assert!(!*p.ready.borrow());
+                assert!(p
+                    .router
+                    .lock()
+                    .await
+                    .native
+                    .has_pending_user_admission("root"));
+                assert_eq!(
+                    p.router
+                        .lock()
+                        .await
+                        .native
+                        .observed_execution_sequence("root"),
+                    Some(10)
+                );
+                assert!(
+                    !std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+                        event,
+                        ProviderRuntimeEvent::ItemCompleted { .. }
+                            | ProviderRuntimeEvent::TurnCompleted { .. }
+                    ))
+                );
+                changing.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             reconcile_native(&server.url(), "fixture", &p, &tx)
                 .await
                 .unwrap();
@@ -3733,12 +3796,14 @@ mod tests {
                 recovered.unwrap();
             }
         }
-        assert!(!p
-            .router
-            .lock()
-            .await
-            .native
-            .has_pending_user_admission("root"));
+        assert_eq!(
+            p.router
+                .lock()
+                .await
+                .native
+                .has_pending_user_admission("root"),
+            moving
+        );
         let mut observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         if moving && buried {
             assert!(!observed.iter().any(|e| matches!(e,
@@ -3754,10 +3819,10 @@ mod tests {
         }
         assert_eq!(observed.iter().filter(|e| matches!(e,
             ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
-                if turn_id == &a.turn_id && text == "first answer")).count(), 1);
+                if turn_id == &a.turn_id && text == "first answer")).count(), usize::from(!moving));
         if running || moving {
             assert_eq!(p.event_ctx.lock().await.turn_id, a.turn_id);
-            assert!(p.event_ctx.lock().await.turn_active);
+            assert_eq!(p.event_ctx.lock().await.turn_active, !moving);
             assert!(!observed
                 .iter()
                 .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })));
@@ -3770,8 +3835,8 @@ mod tests {
                 .is_none());
         }
         if moving {
-            // The exact User claim survives an advancing window, but only a
-            // later coherent Idle can complete it or retire buffered records.
+            // Keep the exact reservation through an ambiguous completed
+            // window; a coherent retry claims it before settling/flooring.
             changing.store(false, std::sync::atomic::Ordering::Relaxed);
             reconcile_native_history(&client, &url, "fixture", &p, &tx, "root", running)
                 .await
@@ -3868,6 +3933,9 @@ mod tests {
                 1
             );
         }
+        assert_eq!(observed.iter().filter(|e| matches!(e,
+            ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if turn_id == &a.turn_id && text == "first answer")).count(), 1);
         if buried {
             assert_eq!(observed.iter().filter(|e| matches!(e,
                 ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
