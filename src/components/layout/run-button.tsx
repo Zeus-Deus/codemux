@@ -21,6 +21,7 @@ import {
 import { useActiveWorkspaceProjectRoot } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@/lib/utils";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import {
   detectRunCandidates,
   getProjectScripts,
@@ -267,6 +268,7 @@ function RunCommandForm({
   hasConfigFile,
   onSaved,
 }: RunCommandFormProps) {
+  const remote = isRemoteClient();
   const [candidates, setCandidates] = useState<RunCandidate[]>([]);
   const [draft, setDraft] = useState(currentCommand ?? "");
   const [saving, setSaving] = useState(false);
@@ -285,7 +287,7 @@ function RunCommandForm({
   }, []);
 
   useEffect(() => {
-    if (hasConfigFile) return;
+    if (hasConfigFile || remote) return;
     let cancelled = false;
     detectRunCandidates(projectRoot)
       .then((found) => {
@@ -295,7 +297,7 @@ function RunCommandForm({
     return () => {
       cancelled = true;
     };
-  }, [projectRoot, hasConfigFile]);
+  }, [projectRoot, hasConfigFile, remote]);
 
   // Saving to the DB would be ignored while a config file exists, so point
   // at the file instead of offering choices that would not take effect.
@@ -315,6 +317,15 @@ function RunCommandForm({
             there.
           </>
         )}
+      </p>
+    );
+  }
+
+  // Remote dispatch does not support saving project scripts.
+  if (remote) {
+    return (
+      <p className="px-3 py-2.5 text-body-sm leading-relaxed text-muted-foreground">
+        Configure this project's run command in the desktop app.
       </p>
     );
   }

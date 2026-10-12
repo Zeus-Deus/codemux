@@ -1,5 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -8,6 +8,8 @@ const mockGetWorkspaceConfig = vi.fn();
 const mockRunProjectDevCommand = vi.fn().mockResolvedValue(undefined);
 const mockSetProjectScripts = vi.fn().mockResolvedValue(undefined);
 const mockDetectRunCandidates = vi.fn();
+
+afterEach(() => { delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__; });
 
 vi.mock("@/tauri/commands", () => ({
   getProjectScripts: (...args: unknown[]) => mockGetProjectScripts(...args),
@@ -201,6 +203,28 @@ describe("RunButton", () => {
 // GUI-chrome shape (`variant="split"`, passed only by title-bar.tsx).
 // The legacy default above stays byte-identical for the flag-off PresetBar.
 describe("RunButton — split variant", () => {
+  it("offers desktop configuration instead of unsupported saves on a remote client", async () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    expect(await screen.findByText("Configure this project's run command in the desktop app.")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Run command")).toBeNull();
+    expect(mockDetectRunCandidates).not.toHaveBeenCalled();
+    expect(mockSetProjectScripts).not.toHaveBeenCalled();
+    expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
+  });
+
+  it("runs an already configured command on a remote client", async () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    mockGetProjectScripts.mockResolvedValue({ setup: [], teardown: [], run: "npm run dev" });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Run"));
+    expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
+    expect(mockSetProjectScripts).not.toHaveBeenCalled();
+  });
+
   it('main segment shows "Set Run" and opens the popover with detected commands', async () => {
     renderSplitRunButton();
     await flushPromises();
