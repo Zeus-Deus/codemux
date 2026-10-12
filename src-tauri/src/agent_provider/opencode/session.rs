@@ -2545,6 +2545,350 @@ pub(crate) mod tests {
         assert_eq!(session.current_model.lock().await.as_deref(), Some("p/m"));
     }
 
+    #[derive(Debug)]
+    struct NativeAdmissionRequest {
+        method: String,
+        path: String,
+        body: serde_json::Value,
+    }
+
+    #[derive(Default)]
+    struct NativeAdmissionState {
+        pending: std::collections::HashMap<String, serde_json::Value>,
+        admitted: Vec<String>,
+        cancelled: Vec<String>,
+        wakes: usize,
+        interrupts: usize,
+        waits: usize,
+        active: bool,
+    }
+
+    struct DelayedNativeAdmissionPeer {
+        base_url: String,
+        requests: tokio::sync::mpsc::UnboundedReceiver<NativeAdmissionRequest>,
+        release: tokio::sync::watch::Sender<bool>,
+        state: Arc<Mutex<NativeAdmissionState>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for DelayedNativeAdmissionPeer {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl DelayedNativeAdmissionPeer {
+        /// Pause after preparation, before durable admission. The server task
+        /// remains alive if the HTTP client disconnects, matching native v2's
+        /// uninterruptible admission phase rather than delayed response headers.
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (seen, requests) = tokio::sync::mpsc::unbounded_channel();
+            let (release, released) = tokio::sync::watch::channel(false);
+            let state = Arc::new(Mutex::new(NativeAdmissionState::default()));
+            let server_state = state.clone();
+            let held = Arc::new(AtomicBool::new(false));
+            let server = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = accepted.unwrap();
+                            let seen = seen.clone();
+                            let state = server_state.clone();
+                            let held = held.clone();
+                            let mut released = released.clone();
+                            connections.spawn(async move {
+                                let mut bytes = Vec::new();
+                                let mut chunk = [0_u8; 2048];
+                                let (headers_end, content_length) = loop {
+                                    let read = socket.read(&mut chunk).await.unwrap();
+                                    if read == 0 { return; }
+                                    bytes.extend_from_slice(&chunk[..read]);
+                                    let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else { continue };
+                                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                                    let length = headers.lines().filter_map(|line| line.split_once(':'))
+                                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                        .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
+                                    if bytes.len() >= end + 4 + length { break (end, length); }
+                                };
+                                let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                                let mut first_line = headers.lines().next().unwrap().split_whitespace();
+                                let method = first_line.next().unwrap().to_string();
+                                let path = first_line.next().unwrap().to_string();
+                                let body = if content_length == 0 {
+                                    serde_json::Value::Null
+                                } else {
+                                    serde_json::from_slice(&bytes[headers_end + 4..headers_end + 4 + content_length]).unwrap()
+                                };
+                                let _ = seen.send(NativeAdmissionRequest {
+                                    method: method.clone(), path: path.clone(), body: body.clone(),
+                                });
+                                if method == "POST" && path == "/api/session/s/prompt"
+                                    && !held.swap(true, Ordering::Relaxed)
+                                {
+                                    while !*released.borrow_and_update() {
+                                        if released.changed().await.is_err() { return; }
+                                    }
+                                }
+                                let (status, response) = {
+                                    let mut state = state.lock().await;
+                                    match (method.as_str(), path.as_str()) {
+                                        ("POST", "/api/session/s/prompt") => {
+                                            let id = body["id"].as_str().unwrap_or("msg_server_generated").to_string();
+                                            let existing = state.pending.contains_key(&id);
+                                            let item = state.pending.entry(id.clone()).or_insert_with(|| serde_json::json!({
+                                                "id":id,"sessionID":"s","type":"user",
+                                                "delivery":body["delivery"],"payload":{"text":body["text"]}
+                                            })).clone();
+                                            if !existing {
+                                                state.admitted.push(id);
+                                            }
+                                            if body["resume"] != false {
+                                                state.wakes += 1;
+                                                state.active = true;
+                                            }
+                                            ("200 OK", serde_json::json!({"data":item}).to_string())
+                                        }
+                                        ("POST", "/api/session/s/interrupt?resume=false") => {
+                                            state.interrupts += 1;
+                                            let interrupted = state.active;
+                                            state.active = false;
+                                            ("200 OK", serde_json::json!({"interrupted":interrupted}).to_string())
+                                        }
+                                        ("GET", "/api/session/s/inbox") => (
+                                            "200 OK", serde_json::json!({"data":state.pending.values().collect::<Vec<_>>()} ).to_string()
+                                        ),
+                                        ("POST", "/api/experimental/session/s/wait") => {
+                                            state.waits += 1;
+                                            assert!(!state.active, "wait must follow interrupting native execution");
+                                            ("204 No Content", String::new())
+                                        }
+                                        ("DELETE", target) if target.starts_with("/api/session/s/inbox/") => {
+                                            let id = target.strip_prefix("/api/session/s/inbox/").unwrap();
+                                            // An absent row is a successful no-op, not a
+                                            // cancellation tombstone for future admission.
+                                            if state.pending.remove(id).is_some() {
+                                                state.cancelled.push(id.to_string());
+                                            }
+                                            ("204 No Content", String::new())
+                                        }
+                                        _ => ("404 Not Found", String::new()),
+                                    }
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()
+                                );
+                                let _ = socket.write_all(response.as_bytes()).await;
+                            });
+                        }
+                        _ = connections.join_next(), if !connections.is_empty() => {}
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                requests,
+                release,
+                state,
+                server,
+            }
+        }
+
+        async fn next_request(&mut self, method: &str, path: &str) -> NativeAdmissionRequest {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let request = self.requests.recv().await.unwrap();
+                    if request.method == method && request.path == path {
+                        return request;
+                    }
+                }
+            })
+            .await
+            .expect("native admission peer did not receive the expected request")
+        }
+
+        async fn stop(&mut self) {
+            self.server.abort();
+            let _ = (&mut self.server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_shutdown_waits_for_server_admission_then_cancels_without_waking() {
+        let mut peer = DelayedNativeAdmissionPeer::start().await;
+        let (session, _, mut events) = mock_session_api(
+            peer.base_url.clone(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        let sending = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .enqueue_or_send(delivery_input("held admission"))
+                    .await
+            }
+        });
+        let stage = peer.next_request("POST", "/api/session/s/prompt").await;
+        assert_eq!(stage.body["resume"], false);
+        let input_id = stage.body["id"].as_str().unwrap().to_string();
+        assert!(input_id.starts_with("msg_codemux"));
+        assert!(peer.state.lock().await.pending.is_empty());
+        let closing = tokio::spawn({
+            let session = session.clone();
+            async move { session.shutdown().await }
+        });
+        peer.next_request("POST", "/api/session/s/interrupt?resume=false")
+            .await;
+        assert!(peer.state.lock().await.pending.is_empty());
+        assert!(
+            !closing.is_finished(),
+            "closure cannot precede server admission acknowledgment"
+        );
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                event,
+                ProviderRuntimeEvent::SessionStateChanged {
+                    status: SessionStatus::Closed,
+                    ..
+                }
+            ))
+        );
+        peer.release.send_replace(true);
+        tokio::time::timeout(
+            NATIVE_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            closing,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            sending.await.unwrap(),
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        let state = peer.state.lock().await;
+        assert_eq!(state.admitted, vec![input_id.clone()]);
+        assert_eq!(state.cancelled, vec![input_id]);
+        assert!(state.pending.is_empty());
+        assert_eq!(
+            state.wakes, 0,
+            "late server admission must never schedule native execution"
+        );
+        assert!(!state.active);
+        assert!(state.interrupts > 0);
+        assert!(state.waits > 0);
+        drop(state);
+        let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(matches!(
+            emitted.last(),
+            Some(ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            session
+                .enqueue_or_send(delivery_input("after closure"))
+                .await,
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        assert_eq!(peer.state.lock().await.wakes, 0);
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn native_shutdown_reports_unknown_admission_then_retries_after_owned_cleanup() {
+        let mut peer = DelayedNativeAdmissionPeer::start().await;
+        let (session, _, mut events) = mock_session_api(
+            peer.base_url.clone(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        let sending = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .enqueue_or_send(delivery_input("unknown admission"))
+                    .await
+            }
+        });
+        let stage = peer.next_request("POST", "/api/session/s/prompt").await;
+        assert_eq!(stage.body["resume"], false);
+        let input_id = stage.body["id"].as_str().unwrap().to_string();
+        let started = tokio::time::Instant::now();
+        let closing = tokio::spawn({
+            let session = session.clone();
+            async move { session.shutdown().await }
+        });
+        peer.next_request("POST", "/api/session/s/interrupt?resume=false")
+            .await;
+        let error = tokio::time::timeout(
+            NATIVE_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            closing,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("unknown server admission cannot claim successful closure");
+        assert!(matches!(error, ProviderError::RpcError { .. }));
+        assert!(started.elapsed() >= NATIVE_SHUTDOWN_GRACE);
+        assert!(matches!(
+            sending.await.unwrap(),
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(emitted.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Error { .. },
+                ..
+            }
+        )));
+        assert!(!emitted.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            }
+        )));
+        assert!(peer.state.lock().await.pending.is_empty());
+        peer.release.send_replace(true);
+        peer.next_request("DELETE", &format!("/api/session/s/inbox/{input_id}"))
+            .await;
+        tokio::time::timeout(
+            NATIVE_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            session.shutdown(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state = peer.state.lock().await;
+        assert_eq!(state.admitted, vec![input_id.clone()]);
+        assert_eq!(state.cancelled, vec![input_id]);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.wakes, 0);
+        assert!(!state.active);
+        assert!(state.waits > 0);
+        drop(state);
+        let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(matches!(
+            emitted.last(),
+            Some(ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            })
+        ));
+        peer.stop().await;
+    }
+
     /// Hold the first matching response headers while serving teardown on a
     /// separate connection; this models an unresponsive admission endpoint.
     async fn stalled_first_response(
