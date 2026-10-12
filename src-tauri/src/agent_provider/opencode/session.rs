@@ -137,17 +137,26 @@ impl NativeAdmissionPeer {
     }
 }
 
-async fn await_native_admissions(mut requests: Vec<NativeAdmission>) -> Result<(), String> {
-    for request in &mut requests {
-        loop {
-            if let Some(result) = request.borrow().clone() {
-                result?;
-                break;
+async fn await_native_result(mut request: NativeAdmission) -> Result<(), String> {
+    loop {
+        if let Some(result) = request.borrow().clone() {
+            return result;
+        }
+        request
+            .changed()
+            .await
+            .map_err(|_| "native_admission_owner_lost".to_string())?;
+    }
+}
+
+async fn await_native_admissions(requests: Vec<NativeAdmission>) -> Result<(), String> {
+    for request in requests {
+        if let Err(error) = await_native_result(request).await {
+            // A complete HTTP error response still proves that this handler
+            // finished. Cancel/interrupt/idle must succeed before closing it.
+            if !error.starts_with("native_http_status_") {
+                return Err(error);
             }
-            request
-                .changed()
-                .await
-                .map_err(|_| "native_admission_owner_lost".to_string())?;
         }
     }
     Ok(())
@@ -196,6 +205,7 @@ pub struct OpenCodeSession {
     queue_worker: Mutex<Option<JoinHandle<()>>>,
     native_requests: Mutex<Vec<JoinHandle<()>>>,
     native_admissions: Mutex<Vec<NativeAdmission>>,
+    native_teardown: Mutex<Option<NativeAdmission>>,
     native_inputs: Arc<Mutex<HashSet<String>>>,
     teardown_requested: AtomicBool,
     teardown_complete: AtomicBool,
@@ -503,6 +513,7 @@ impl OpenCodeSession {
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),
+            native_teardown: Mutex::new(None),
             native_inputs: Arc::new(Mutex::new(HashSet::new())),
             teardown_requested: AtomicBool::new(false),
             teardown_complete: AtomicBool::new(false),
@@ -652,7 +663,7 @@ impl OpenCodeSession {
                 thread_id: self.thread_id.clone(),
             });
         }
-        let steered = steer && self.turn_active().await;
+        let steered = steer && self.event_ctx.lock().await.turn_active;
         let checkpoint = input.turn_checkpoint.as_ref().filter(|_| !steered);
         if let Some(checkpoint) = checkpoint {
             checkpoint.prepare().await;
@@ -914,7 +925,15 @@ impl OpenCodeSession {
     /// SSE routing context's `turn_active` flag (armed on send, cleared when
     /// the turn settles). Cheap in-memory check — does not touch the server.
     pub async fn turn_active(&self) -> bool {
-        self.event_ctx.lock().await.turn_active
+        let ctx = self.event_ctx.lock().await;
+        ctx.turn_active
+            || (self.server_handle.api == super::api::OpenCodeApi::V2
+                && self
+                    .router
+                    .lock()
+                    .await
+                    .native
+                    .has_pending_user_admission(&self.provider_session_id.0))
     }
 
     /// Send a user turn. Mints a new Codemux turn id, threads it into
@@ -1156,13 +1175,15 @@ impl OpenCodeSession {
             self.ensure_open()?;
             if native_v2
                 && !steer
-                && (ctx.turn_active
-                    || self
-                        .router
-                        .lock()
-                        .await
+                && (ctx.turn_active || {
+                    let router = self.router.lock().await;
+                    router
                         .native
-                        .awaiting_execution(&self.provider_session_id.0))
+                        .awaiting_execution(&self.provider_session_id.0)
+                        || router
+                            .native
+                            .has_pending_user_admission(&self.provider_session_id.0)
+                })
             {
                 return Ok(None);
             }
@@ -1172,8 +1193,10 @@ impl OpenCodeSession {
             if !steer {
                 ctx.turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
             }
-            ctx.turn_active = true;
-            if native_v2 && endpoint == "prompt" {
+            // Durable staging is not execution ownership. Native delivered
+            // identity, rather than an unrelated Started, claims this User turn.
+            ctx.turn_active = !(native_v2 && endpoint == "prompt" && !steer);
+            if native_v2 && endpoint == "prompt" && !steer {
                 if let Some(id) = body["id"].as_str() {
                     self.router.lock().await.native.remember_user_admission(
                         &self.provider_session_id.0,
@@ -1327,12 +1350,16 @@ impl OpenCodeSession {
     pub(crate) async fn has_unconfirmed_native_admissions(&self) -> bool {
         (self.teardown_requested.load(Ordering::Relaxed)
             && !self.teardown_complete.load(Ordering::Relaxed))
-            || self
-                .native_admissions
-                .lock()
-                .await
-                .iter()
-                .any(|request| !matches!(request.borrow().as_ref(), Some(Ok(()))))
+            || (self.server_handle.api == super::api::OpenCodeApi::V2
+                && *self.closing.borrow()
+                && !self.teardown_complete.load(Ordering::Relaxed))
+            || self.native_admissions.lock().await.iter().any(|request| {
+                match request.borrow().as_ref() {
+                    Some(Ok(())) => false,
+                    Some(Err(error)) if error.starts_with("native_http_status_") => false,
+                    _ => true,
+                }
+            })
     }
 
     pub(crate) async fn handoff_dead_attachment(&self) -> Result<(), ProviderError> {
@@ -1379,14 +1406,23 @@ impl OpenCodeSession {
         // leave at any await, but shutdown still owns the original admission.
         let mut admissions = self.native_admissions.lock().await;
         self.ensure_open()?;
-        admissions.retain(|request| !matches!(request.borrow().as_ref(), Some(Ok(()))));
+        admissions.retain(|request| match request.borrow().as_ref() {
+            Some(Ok(())) => false,
+            Some(Err(error)) if error.starts_with("native_http_status_") => false,
+            _ => true,
+        });
         admissions.push(result.clone());
         let events = self.event_tx.clone();
         let thread_id = self.thread_id.clone();
+        let context = self.event_ctx.clone();
+        let router = self.router.clone();
+        let root_session = self.provider_session_id.0.clone();
+        let expected_turn = turn_id.clone();
+        let steered = body["delivery"] == "steer";
         let dead = self.dead.clone();
         let close = self.closing.clone();
         tokio::spawn(async move {
-            let admission = async {
+            let mut admission: Result<(), String> = async {
                 let path = format!("/api/session/{}/{endpoint}", peer.session);
                 let bytes = NativeAdmissionPeer::acknowledged(
                     peer.request(reqwest::Method::POST, &path).json(&body),
@@ -1418,7 +1454,71 @@ impl OpenCodeSession {
             }
             .await;
             if let Err(message) = &admission {
-                if !*closing.borrow() {
+                if message.starts_with("native_http_status_")
+                    && (endpoint != "compact" || message.starts_with("native_http_status_4"))
+                {
+                    // The handler has acknowledged failure, so it cannot
+                    // admit later. Cancel its exact input before retiring the
+                    // fence; never resubmit this ID after cancellation.
+                    if let Some(id) = input_id {
+                        if let Err(error) = NativeAdmissionPeer::acknowledged(peer.request(
+                            reqwest::Method::DELETE,
+                            &format!(
+                                "/api/session/{}/inbox/{}",
+                                peer.session,
+                                urlencoding::encode(&id)
+                            ),
+                        ))
+                        .await
+                        {
+                            admission = Err(format!(
+                                "native_rejected_input_cleanup_unconfirmed: {error}"
+                            ));
+                        }
+                    }
+                } else if endpoint == "compact" && message.starts_with("native_http_status_") {
+                    admission = Err(format!(
+                        "native_compact_admission_identity_unconfirmed: {message}"
+                    ));
+                }
+            }
+            if let Err(message) = &admission {
+                if message.starts_with("native_http_status_") {
+                    let parked = if let Some(id) = body["id"].as_str() {
+                        router
+                            .lock()
+                            .await
+                            .native
+                            .claim_pending_user_admission(&root_session, id)
+                            .is_some()
+                    } else {
+                        false
+                    };
+                    let mut live = context.lock().await;
+                    if !steered && !*closing.borrow() && !dead.load(Ordering::Relaxed) {
+                        let matching_active = live.turn_active && live.turn_id == expected_turn;
+                        if parked || matching_active {
+                            if matching_active {
+                                live.turn_active = false;
+                            }
+                            let _ = events.send(ProviderRuntimeEvent::TurnCompleted {
+                                thread_id: thread_id.clone(),
+                                turn_id: expected_turn,
+                                status: crate::agent_provider::TurnStatus::Error {
+                                    subtype: "native_command_failed".into(),
+                                    message: message.clone(),
+                                },
+                                usage: None,
+                            });
+                            if !live.turn_active {
+                                let _ = events.send(ProviderRuntimeEvent::SessionStateChanged {
+                                    thread_id,
+                                    status: SessionStatus::Ready,
+                                });
+                            }
+                        }
+                    }
+                } else if !*closing.borrow() {
                     dead.store(true, Ordering::Relaxed);
                     close.send_replace(true);
                     let _ = events.send(ProviderRuntimeEvent::SessionStateChanged {
@@ -1453,16 +1553,18 @@ impl OpenCodeSession {
         .await
         .unwrap_or_else(|_| Err("native_admission_ack_timeout; cleanup remains pending".into()));
         if let Err(message) = response {
-            self.dead.store(true, Ordering::Relaxed);
-            self.closing.send_replace(true);
-            let _ = self
-                .event_tx
-                .send(ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: self.thread_id.clone(),
-                    status: SessionStatus::Error {
-                        message: message.clone(),
-                    },
-                });
+            if !message.starts_with("native_http_status_") {
+                self.dead.store(true, Ordering::Relaxed);
+                self.closing.send_replace(true);
+                let _ = self
+                    .event_tx
+                    .send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: self.thread_id.clone(),
+                        status: SessionStatus::Error {
+                            message: message.clone(),
+                        },
+                    });
+            }
             return Err(ProviderError::RpcError { message });
         }
         Ok(turn_id)
@@ -1744,26 +1846,38 @@ impl OpenCodeSession {
             handle.abort();
         }
         let result = if self.server_handle.api == super::api::OpenCodeApi::V2 {
-            let peer = self.native_peer();
-            // Stop an existing execution immediately, but an idle interrupt is
-            // not evidence that an outstanding admission cannot arrive later.
-            let initial_interrupt =
-                tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, peer.interrupt()).await;
-            match initial_interrupt {
-                Ok(Ok(())) => {
-                    let admissions = self.native_admissions.lock().await.clone();
-                    tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, async {
+            let mut teardown = self.native_teardown.lock().await;
+            let retryable = teardown.as_ref().is_some_and(|request| {
+                matches!(request.borrow().as_ref(), Some(Err(error)) if error.starts_with("native_http_status_"))
+            });
+            if retryable {
+                *teardown = None;
+            }
+            if teardown.is_none() {
+                let peer = self.native_peer();
+                let admissions = self.native_admissions.lock().await.clone();
+                let (done, pending) = tokio::sync::watch::channel(None);
+                *teardown = Some(pending);
+                tokio::spawn(async move {
+                    let cleanup = async {
+                        // An idle interrupt does not fence a late admission.
+                        peer.interrupt().await?;
                         await_native_admissions(admissions).await?;
                         peer.finish().await
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err("native_shutdown_admission_unconfirmed; cleanup remains owned".into())
-                    })
-                }
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err("native_shutdown_interrupt_unconfirmed".into()),
+                    }
+                    .await;
+                    done.send_replace(Some(cleanup));
+                });
             }
+            let pending = teardown.as_ref().unwrap().clone();
+            drop(teardown);
+            // The timeout bounds the caller's wait. It never drops an owned
+            // cancel/interrupt/wait request that could affect a later readoption.
+            tokio::time::timeout(NATIVE_SHUTDOWN_GRACE, await_native_result(pending))
+                .await
+                .unwrap_or_else(|_| {
+                    Err("native_shutdown_admission_unconfirmed; cleanup remains owned".into())
+                })
         } else {
             let requests: Vec<_> = self.native_requests.lock().await.drain(..).collect();
             for request in &requests {
@@ -1798,6 +1912,26 @@ impl OpenCodeSession {
                     status: crate::agent_provider::TurnStatus::Error {
                         subtype: "interrupted".into(),
                         message: "OpenCode attachment closed".into(),
+                    },
+                    usage: None,
+                });
+            }
+        }
+        if self.server_handle.api == super::api::OpenCodeApi::V2 {
+            let mut router = self.router.lock().await;
+            if let Some((input, turn)) = router
+                .native
+                .pending_user_admission(&self.provider_session_id.0)
+            {
+                router
+                    .native
+                    .claim_pending_user_admission(&self.provider_session_id.0, &input);
+                let _ = self.event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: TurnId(turn),
+                    status: crate::agent_provider::TurnStatus::Error {
+                        subtype: "interrupted".into(),
+                        message: "OpenCode attachment closed before input delivery".into(),
                     },
                     usage: None,
                 });
@@ -1851,9 +1985,14 @@ impl Drop for OpenCodeSession {
         {
             let peer = self.native_peer();
             let admissions = self.native_admissions.get_mut().clone();
+            let teardown = self.native_teardown.get_mut().clone();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
-                    if await_native_admissions(admissions).await.is_ok() {
+                    if let Some(teardown) = teardown {
+                        let _ = await_native_result(teardown).await;
+                    } else if peer.interrupt().await.is_ok()
+                        && await_native_admissions(admissions).await.is_ok()
+                    {
                         let _ = peer.finish().await;
                     }
                 });
@@ -2441,6 +2580,7 @@ pub(crate) mod tests {
             queue_worker: Mutex::new(None),
             native_requests: Mutex::new(Vec::new()),
             native_admissions: Mutex::new(Vec::new()),
+            native_teardown: Mutex::new(None),
             native_inputs: Arc::new(Mutex::new(HashSet::new())),
             teardown_requested: AtomicBool::new(false),
             teardown_complete: AtomicBool::new(false),
@@ -2556,7 +2696,7 @@ pub(crate) mod tests {
                 serde_json::json!({"delivery":"queue"}),
             ))
             .with_status(200)
-            .with_body(r#"{"data":{"id":"c","sessionID":"s","type":"compaction"}}"#)
+            .with_body(r#"{"data":{"id":"msg_coalesced","sessionID":"s","type":"compaction"}}"#)
             .create_async()
             .await;
         let command = server
@@ -2590,6 +2730,36 @@ pub(crate) mod tests {
         assert!(session.turn_active().await);
         assert!(!std::iter::from_fn(|| events.try_recv().ok())
             .any(|e| matches!(e, ProviderRuntimeEvent::TurnCompleted { .. })));
+        let _inbox = server
+            .mock("GET", "/api/session/s/inbox")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"msg_coalesced"},{"id":"msg_other_attachment"}]}"#)
+            .create_async()
+            .await;
+        let owned_cancel = server
+            .mock("DELETE", "/api/session/s/inbox/msg_coalesced")
+            .with_status(204)
+            .create_async()
+            .await;
+        let foreign_cancel = server
+            .mock("DELETE", "/api/session/s/inbox/msg_other_attachment")
+            .expect(0)
+            .create_async()
+            .await;
+        let _interrupt = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .expect(2)
+            .create_async()
+            .await;
+        let _wait = server
+            .mock("POST", "/api/experimental/session/s/wait")
+            .with_status(204)
+            .create_async()
+            .await;
+        session.shutdown().await.unwrap();
+        owned_cancel.assert_async().await;
+        foreign_cancel.assert_async().await;
     }
 
     #[tokio::test]
@@ -3269,6 +3439,141 @@ pub(crate) mod tests {
         assert!(emitted.iter().any(|event| matches!(event, ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } if queued_id == &queued)));
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn native_acknowledged_command_failure_allows_retry_and_clean_shutdown() {
+        let mut server = Server::new_async().await;
+        let rejected = server
+            .mock("POST", "/api/session/s/command")
+            .with_status(404)
+            .with_body("command missing")
+            .create_async()
+            .await;
+        let _teardown = native_idle_responses(&mut server, "s").await;
+        let interrupt = server
+            .mock("POST", "/api/session/s/interrupt?resume=false")
+            .with_status(200)
+            .expect(2)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .with_status(200)
+            .with_body("{}")
+            .expect(2)
+            .create_async()
+            .await;
+        let (session, _, mut events) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        let failed_turn = session
+            .send_turn("/missing".into(), vec![], None, None)
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let ProviderRuntimeEvent::TurnCompleted {
+                    turn_id, status, ..
+                } = events.recv().await.unwrap()
+                {
+                    break (turn_id, status);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.0, failed_turn);
+        assert!(matches!(
+            completed.1,
+            crate::agent_provider::TurnStatus::Error { .. }
+        ));
+        assert!(!session.is_dead());
+        assert!(!session.has_unconfirmed_native_admissions().await);
+        let retry = session
+            .send_turn("retry".into(), vec![], None, None)
+            .await
+            .unwrap();
+        assert_ne!(retry, failed_turn);
+        session.shutdown().await.unwrap();
+        rejected.assert_async().await;
+        prompt.assert_async().await;
+        interrupt.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn native_deferred_execution_probe_preserves_queue_until_confirmed_idle() {
+        let mut server = Server::new_async().await;
+        let active = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body(r#"{"data":{"s":{}}}"#)
+            .create_async()
+            .await;
+        let no_prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session_api(
+            server.url(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        session.router.lock().await.native.defer_execution("s", 30);
+        let initial_id = session.event_ctx.lock().await.turn_id.clone();
+        let queue_id = session
+            .enqueue_or_send(delivery_input("after callback"))
+            .await
+            .unwrap()
+            .queued_id
+            .unwrap();
+        assert_eq!(session.event_ctx.lock().await.turn_id, initial_id);
+        assert!(!session.turn_active().await);
+        assert!(session.router.lock().await.native.awaiting_execution("s"));
+        no_prompt.assert_async().await;
+        active.assert_async().await;
+        no_prompt.remove_async().await;
+        active.remove_async().await;
+        let inactive = server
+            .mock("GET", "/api/session/active")
+            .with_status(200)
+            .with_body(r#"{"data":{}}"#)
+            .create_async()
+            .await;
+        let prompt = server
+            .mock("POST", "/api/session/s/prompt")
+            .with_status(200)
+            .with_body("{}")
+            .expect(2)
+            .create_async()
+            .await;
+        session.drain_queue().await;
+        assert!(session.turn_active().await);
+        assert!(!session.router.lock().await.native.awaiting_execution("s"));
+        assert!(session.queued.lock().await.is_empty());
+        let turn = session.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(turn, initial_id);
+        let native_input = session
+            .router
+            .lock()
+            .await
+            .native
+            .user_admission_for("s", &turn.0)
+            .unwrap();
+        assert!(native_input.starts_with("msg_codemux_"));
+        assert!(!queue_id.is_empty());
+        inactive.assert_async().await;
+        prompt.assert_async().await;
+        session.dead.store(true, Ordering::Relaxed);
+        session.handoff_dead_attachment().await.unwrap();
     }
 
     #[tokio::test]
