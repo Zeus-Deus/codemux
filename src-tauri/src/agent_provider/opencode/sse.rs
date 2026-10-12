@@ -980,6 +980,7 @@ async fn reconcile_native_history(
         let mut found_observed_idle = false;
         let mut observed_position = None;
         let mut found_submitted_input = false;
+        let mut submitted_boundary_position = None;
         'history: loop {
             let path = match &cursor {
                 Some(cursor) => format!(
@@ -1008,7 +1009,13 @@ async fn reconcile_native_history(
                         // or even an Idle baselined before delivery was claimed.
                         // Read through its busy period, not merely the latest one.
                         if found_submitted_input {
-                            break 'history;
+                            submitted_boundary_position.get_or_insert(messages.len());
+                            // Known roots still need every missed execution back
+                            // to their observed Idle, even when the submitted User
+                            // belongs to the newer current execution.
+                            if !recover_completed_root || found_observed_idle {
+                                break 'history;
+                            }
                         }
                     } else if !recover_completed_root && boundaries > if running { 0 } else { 1 } {
                         break 'history;
@@ -1032,6 +1039,12 @@ async fn reconcile_native_history(
             if let Some(position) = observed_position {
                 // An undelivered input must not expand ordinary attachment
                 // recovery into older, already-observed history.
+                messages.truncate(position);
+            }
+        } else if found_submitted_input && !found_observed_idle {
+            if let Some(position) = submitted_boundary_position {
+                // If a known anchor disappeared, the exact User still recovers
+                // its own execution without adopting older cold history.
                 messages.truncate(position);
             }
         }
@@ -1066,7 +1079,8 @@ async fn reconcile_native_history(
             .as_ref()
             .map(|(_, turn)| crate::agent_provider::TurnId(turn.clone()))
             .or_else(|| ctx.turn_active.then(|| ctx.turn_id.clone()));
-        let active_input = ctx.turn_active
+        let active_input = ctx
+            .turn_active
             .then(|| router.native.user_admission_for(session, &ctx.turn_id.0))
             .flatten();
         let background = (ctx.turn_active && active_input.is_none()).then(|| ctx.turn_id.clone());
@@ -1291,6 +1305,13 @@ async fn reconcile_native_history(
             event_tx,
         )
         .await?;
+        if newer_boundary > 0 {
+            // The User already has an Idle, but this moving window cannot
+            // settle it safely. Releasing feed readiness would let a newer
+            // callback borrow the still-active User identity. Retry recovery
+            // within the existing budget before consuming that live feed.
+            return Err("native_user_completion_snapshot_unconfirmed".into());
+        }
         return Ok(());
     }
     // A moving checkpoint cannot settle executions. If the known boundary
@@ -3620,7 +3641,7 @@ mod tests {
             router.native.recover_through("root", 10);
         }
         let mut first = Vec::new();
-        if !running {
+        if !running || (moving && buried) {
             first.push(
                 serde_json::json!({"id":"msg_first_done","type":"idle","outcome":"succeeded"}),
             );
@@ -3632,12 +3653,14 @@ mod tests {
             serde_json::json!({"id":"msg_older_done","type":"idle","outcome":"succeeded"}),
         ]);
         let (first_page, older_page) = if buried {
+            let mut callback = Vec::new();
+            if !running {
+                callback.push(serde_json::json!({"id":"msg_callback_done","type":"idle","outcome":"succeeded"}));
+            }
+            callback.push(serde_json::json!({"id":"m_callback_answer","type":"assistant","time":{"completed":4},
+                "content":[{"type":"text","text":"callback answer"}]}));
             (
-                serde_json::json!({"data":[
-                {"id":"msg_callback_done","type":"idle","outcome":"succeeded"},
-                {"id":"m_callback_answer","type":"assistant","time":{"completed":4},
-                    "content":[{"type":"text","text":"callback answer"}]}
-            ],"cursor":{"next":"older"}}),
+                serde_json::json!({"data":callback,"cursor":{"next":"older"}}),
                 Some(serde_json::json!({"data":first})),
             )
         } else {
@@ -3663,9 +3686,53 @@ mod tests {
         };
         let client = reqwest::Client::new();
         let url = server.url();
-        reconcile_native_history(&client, &url, "fixture", &p, &tx, "root", running)
-            .await
-            .unwrap();
+        if moving && buried {
+            let _children = server
+                .mock("GET", "/api/session?parentID=root&limit=200&order=asc")
+                .with_status(200)
+                .with_body(r#"{"data":[]}"#)
+                .create_async()
+                .await;
+            let records = [
+                native_record("connected", "server.connected", serde_json::json!({}), None),
+                native_record("evt_callback_start", "session.execution.started",
+                    serde_json::json!({"sessionID":"root"}), Some(27)),
+                native_record("evt_buffered_callback_text", "session.text.ended",
+                    serde_json::json!({"sessionID":"root","assistantMessageID":"m_buffered_callback",
+                        "ordinal":0,"text":"buffered callback"}), None),
+                native_record("evt_callback_done", "session.execution.succeeded",
+                    serde_json::json!({"sessionID":"root"}), Some(30)),
+            ].concat();
+            let _feed = server
+                .mock("GET", "/test-native-feed")
+                .with_status(200)
+                .with_body(records)
+                .create_async()
+                .await;
+            let response = client
+                .get(format!("{url}/test-native-feed"))
+                .send()
+                .await
+                .unwrap();
+            let mut attempt = 2;
+            consume_stream(response, &p, &tx, &url, "fixture", &mut attempt).await;
+            // The actual connected handshake rejects the whole buffered feed,
+            // retaining its finite retry count and never processing C as A.
+            assert_eq!(attempt, 2);
+            assert!(!*p.ready.borrow());
+        } else {
+            let recovered =
+                reconcile_native_history(&client, &url, "fixture", &p, &tx, "root", running).await;
+            if moving {
+                assert_eq!(
+                    recovered.unwrap_err(),
+                    "native_user_completion_snapshot_unconfirmed"
+                );
+                assert!(!*p.ready.borrow());
+            } else {
+                recovered.unwrap();
+            }
+        }
         assert!(!p
             .router
             .lock()
@@ -3673,6 +3740,18 @@ mod tests {
             .native
             .has_pending_user_admission("root"));
         let mut observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        if moving && buried {
+            assert!(!observed.iter().any(|e| matches!(e,
+                ProviderRuntimeEvent::ItemCompleted { item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                    if text == "buffered callback")));
+            assert!(p
+                .router
+                .lock()
+                .await
+                .native
+                .observed_execution_sequence("root")
+                .is_none());
+        }
         assert_eq!(observed.iter().filter(|e| matches!(e,
             ProviderRuntimeEvent::ItemCompleted { turn_id, item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
                 if turn_id == &a.turn_id && text == "first answer")).count(), 1);
@@ -3702,7 +3781,11 @@ mod tests {
         if running {
             handle_record(
                 &native_record(
-                    "evt_first_done",
+                    if buried {
+                        "evt_callback_done"
+                    } else {
+                        "evt_first_done"
+                    },
                     "session.execution.succeeded",
                     serde_json::json!({"sessionID":"root"}),
                     Some(30),
@@ -3805,6 +3888,7 @@ mod tests {
     #[tokio::test]
     async fn native_recovery_claims_first_pending_user_without_settling_a_moving_snapshot() {
         first_user_recovery(false, false, false, true).await;
+        first_user_recovery(true, true, false, true).await;
     }
 
     #[tokio::test]
