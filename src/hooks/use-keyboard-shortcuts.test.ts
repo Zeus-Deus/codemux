@@ -17,8 +17,15 @@ vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn(), dismiss: vi.fn() },
 }));
 
+vi.mock("@/components/overlays/interface-size-hud", () => ({
+  announceInterfaceSize: vi.fn(),
+}));
+
 import { toast } from "sonner";
 import { dispatch } from "./use-keyboard-shortcuts";
+import { announceInterfaceSize } from "@/components/overlays/interface-size-hud";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { TYPOGRAPHY_RANGES } from "@/lib/typography";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -382,6 +389,22 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       const before = useUIStore.getState().launcherOpenRequest;
       expect(dispatch("openLauncher", FAKE_EVENT)).toBe(true);
       expect(useUIStore.getState().launcherOpenRequest).toBe(before + 1);
+    });
+
+    it("announces an interface-size press even when it is already at the limit", () => {
+      const { max } = TYPOGRAPHY_RANGES.interface;
+      const updateSetting = vi.fn().mockResolvedValue(undefined);
+      const state = useSyncedSettingsStore.getState();
+      useSyncedSettingsStore.setState({
+        settings: { ...state.settings, appearance: { ...state.settings.appearance, interface_font_size: max } },
+        updateSetting,
+      });
+      expect(dispatch("zoomIn", FAKE_EVENT)).toBe(true);
+      expect(updateSetting).not.toHaveBeenCalled();
+      expect(announceInterfaceSize).toHaveBeenLastCalledWith(max, "in", false);
+      expect(dispatch("zoomOut", FAKE_EVENT)).toBe(true);
+      expect(updateSetting).toHaveBeenCalledWith("appearance", "interface_font_size", max - 1);
+      expect(announceInterfaceSize).toHaveBeenLastCalledWith(max - 1, "out", true);
     });
   });
 
