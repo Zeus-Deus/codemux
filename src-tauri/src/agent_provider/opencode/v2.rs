@@ -72,6 +72,12 @@ impl State {
     pub fn recovered_sequence(&self, session: &str) -> Option<u64> {
         self.recovered_sequences.get(session).copied()
     }
+    pub fn observed_execution_sequence(&self, session: &str) -> Option<u64> {
+        self.recovered_sequence(session)
+            .into_iter()
+            .chain(self.terminal_sequences.get(session).map(|(_, seq)| *seq))
+            .max()
+    }
     pub fn completed_idle_sequence(&self, session: &str, idle_id: &str) -> Option<u64> {
         let event_id = idle_id
             .strip_prefix("msg_")

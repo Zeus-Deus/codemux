@@ -836,19 +836,18 @@ async fn reconcile_native(
     let sessions = peer.router.lock().await.watched_sessions();
     for session in sessions {
         let session_running = active["data"].get(&session).is_some();
-        if session != peer.session_id || session_running || peer.event_ctx.lock().await.turn_active
-        {
-            reconcile_native_history(
-                &client,
-                base,
-                password,
-                peer,
-                event_tx,
-                &session,
-                session_running,
-            )
-            .await?;
-        }
+        // A callback may have started and finished entirely while disconnected.
+        // The volatile feed cannot recover it; idle roots need a checkpoint too.
+        reconcile_native_history(
+            &client,
+            base,
+            password,
+            peer,
+            event_tx,
+            &session,
+            session_running,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -867,6 +866,7 @@ async fn reconcile_native_history(
     // at its preceding durable idle boundary. Pagination follows cursor,
     // with no order parameter on cursor pages.
     let encoded = urlencoding::encode(session);
+    let observed_sequence = peer.router.lock().await.native.observed_execution_sequence(session);
     let mut snapshot = None;
     for attempt in 0..3 {
         let previous = peer.router.lock().await.native.recovered_sequence(session);
@@ -932,6 +932,7 @@ async fn reconcile_native_history(
         }
     }
     let (messages, idle_message, running, sequence) = snapshot.unwrap();
+    let mut terminal_claimed = false;
     // Moving/running snapshots must not retire lifecycle records. Completed
     // item tombstones still deduplicate their replay; live terminals settle it.
     if !running && idle_message.is_some() {
@@ -973,10 +974,35 @@ async fn reconcile_native_history(
         } else {
             peer.router.lock().await.native.mark_running(session);
         }
-    } else if session == peer.session_id && !peer.event_ctx.lock().await.turn_active {
-        // The earlier coordinator scan can race settlement. Retire its old
-        // replay boundary above without admitting/completing an idle root.
-        return Ok(());
+    } else if session == peer.session_id {
+        let mut ctx = peer.event_ctx.lock().await;
+        if !ctx.turn_active {
+            let Some(message) = idle_message.as_ref().filter(|_| sequence.is_some()) else {
+                return Ok(());
+            };
+            if !message["id"].as_str().is_some_and(|id| id.starts_with("msg_")) {
+                return Err("missing native idle message identity".into());
+            }
+            let mut router = peer.router.lock().await;
+            let advanced = sequence.zip(observed_sequence)
+                .is_some_and(|(current, observed)| current > observed);
+            let unseen = router.native.recover_terminal(session, message["id"].clone());
+            if !advanced || !unseen {
+                // Initial attachment records its baseline silently. An unchanged
+                // Idle remains retired even if unrelated durable state advances.
+                return Ok(());
+            }
+            admit_native_root(&mut ctx);
+            router.native.mark_running(session);
+            terminal_claimed = true;
+            drop(router);
+            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: ctx.thread_id.clone(),
+                status: crate::agent_provider::SessionStatus::Running {
+                    active_turn: ctx.turn_id.clone(),
+                },
+            });
+        }
     }
     for message in messages
         .into_iter()
@@ -1091,7 +1117,7 @@ async fn reconcile_native_history(
             return Err("missing native idle message identity".into());
         }
         let mut router = peer.router.lock().await;
-        if !router.native.recover_terminal(session, boundary.clone()) {
+        if !terminal_claimed && !router.native.recover_terminal(session, boundary.clone()) {
             return Ok(());
         }
         router.native.mark_running(session);
@@ -1311,6 +1337,84 @@ mod tests {
             );
         }
         mocks
+    }
+
+    async fn mock_completed_root_callback(server: &mut mockito::ServerGuard) -> Vec<mockito::Mock> {
+        let mut mocks = Vec::new();
+        for (path, body) in [
+            ("/api/session/active", serde_json::json!({"data":{}})),
+            ("/api/session?parentID=root&limit=200&order=asc", serde_json::json!({"data":[]})),
+            ("/api/session/root/permission", serde_json::json!({"data":[]})),
+            ("/api/session/root/form", serde_json::json!({"data":[]})),
+            ("/api/session/root/message?limit=200&order=desc", serde_json::json!({"data":[
+                {"id":"msg_callback_done","type":"idle","outcome":"succeeded"},
+                {"id":"callback_message","type":"assistant","time":{"completed":3},
+                    "content":[{"type":"text","text":"background follow-up"}]},
+                {"id":"msg_a_done","type":"idle","outcome":"succeeded"},
+                {"id":"old_message","type":"assistant","time":{"completed":2},
+                    "content":[{"type":"text","text":"old response"}]}
+            ]})),
+        ] {
+            mocks.push(server.mock("GET", path).with_status(200).with_body(body.to_string())
+                .expect_at_least(1).create_async().await);
+        }
+        mocks.extend(mock_watermarks(server, "root", 20).await);
+        mocks
+    }
+
+    #[tokio::test]
+    async fn native_recovery_recovers_root_callback_completed_wholly_during_outage_once() {
+        let mut server = mockito::Server::new_async().await;
+        let mocks = mock_completed_root_callback(&mut server).await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let (tx, mut rx) = broadcast::channel(64);
+        for (id, kind, seq) in [
+            ("evt_a_start", "session.execution.started", 1),
+            ("evt_a_done", "session.execution.succeeded", 10),
+        ] {
+            handle_record(&native_record(id, kind, serde_json::json!({"sessionID":"root"}), Some(seq)), &p, &tx).await;
+        }
+        let original_turn = p.event_ctx.lock().await.turn_id.clone();
+        assert!(!p.event_ctx.lock().await.turn_active);
+        while rx.try_recv().is_ok() {}
+        // Both start and completion happened before resubscribing, so the
+        // volatile feed contributes no callback event to this recovery.
+        reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+        let callback_turn = p.event_ctx.lock().await.turn_id.clone();
+        assert_ne!(callback_turn, original_turn);
+        assert!(!p.event_ctx.lock().await.turn_active);
+        let observed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(observed.iter().filter(|event| matches!(event,
+            ProviderRuntimeEvent::TurnCompleted { turn_id, .. } if turn_id == &callback_turn)).count(), 1);
+        assert_eq!(observed.iter().filter(|event| matches!(event,
+            ProviderRuntimeEvent::ItemCompleted { item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if text == "background follow-up")).count(), 1);
+        assert!(!observed.iter().any(|event| matches!(event,
+            ProviderRuntimeEvent::ItemCompleted { item: crate::agent_provider::CompletedItem::AssistantText { text }, .. }
+                if text == "old response")));
+        reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+        assert_eq!(p.event_ctx.lock().await.turn_id, callback_turn);
+        assert!(rx.try_recv().is_err(), "unchanged idle callback must not replay");
+        for mock in mocks { mock.assert_async().await; }
+    }
+
+    #[tokio::test]
+    async fn native_recovery_initial_idle_attachment_records_baseline_without_replaying_history() {
+        let mut server = mockito::Server::new_async().await;
+        let mocks = mock_completed_root_callback(&mut server).await;
+        let mut p = peer("root");
+        p.api = super::super::api::OpenCodeApi::V2;
+        let (tx, mut rx) = broadcast::channel(64);
+        let original_turn = p.event_ctx.lock().await.turn_id.clone();
+        for _ in 0..2 {
+            reconcile_native(&server.url(), "fixture", &p, &tx).await.unwrap();
+            assert_eq!(p.event_ctx.lock().await.turn_id, original_turn);
+            assert!(!p.event_ctx.lock().await.turn_active);
+            assert!(rx.try_recv().is_err());
+        }
+        assert_eq!(p.router.lock().await.native.observed_execution_sequence("root"), Some(20));
+        for mock in mocks { mock.assert_async().await; }
     }
 
     #[tokio::test]
