@@ -273,4 +273,32 @@ describe("ProviderStatusNotice", () => {
     render(<ProviderStatusNotice provider="claude" />);
     expect(mockProbe).toHaveBeenCalledWith("claude");
   });
+
+  it("keeps the focus retry floor after a failed probe without renewing the report", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      seedReport({
+        provider: "claude", status: "error", installed: true,
+        message: "Claude Code isn't signed in.", version: null, login_command: "claude auth login",
+      });
+      const fetchedAt = Date.now() - 60_000;
+      useProviderHealth.setState((state) => ({ slots: {
+        ...state.slots, claude: { ...state.slots.claude, fetchedAt },
+      } }));
+      mockProbe.mockRejectedValueOnce(new Error("IPC down"));
+      await act(async () => { render(<ProviderStatusNotice provider="claude" />); });
+      expect(mockProbe).toHaveBeenCalledOnce();
+      expect(useProviderHealth.getState().slots.claude.fetchedAt).toBe(fetchedAt);
+      fireEvent(window, new Event("focus"));
+      expect(mockProbe).toHaveBeenCalledOnce();
+      vi.advanceTimersByTime(10_001);
+      fireEvent(window, new Event("focus"));
+      expect(mockProbe).toHaveBeenCalledTimes(2);
+    } finally {
+      cleanup();
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

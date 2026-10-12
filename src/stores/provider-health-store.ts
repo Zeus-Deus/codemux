@@ -54,6 +54,8 @@ export function healthBlocksSend(report: ProviderHealthReport | null): boolean {
 interface ProviderHealthSlot {
   report: ProviderHealthReport | null;
   fetchedAt: number;
+  /** Last settled attempt, including IPC failures, for the focus retry floor. */
+  lastAttemptAt: number;
   /** In-flight probe, for single-flight coalescing. */
   inFlight: Promise<ProviderHealthReport | null> | null;
   /** A forced probe that arrived while `inFlight` was still running and
@@ -99,6 +101,7 @@ export function emptyHealthSlot(): ProviderHealthSlot {
   return {
     report: null,
     fetchedAt: 0,
+    lastAttemptAt: 0,
     inFlight: null,
     queuedForce: null,
     dismissedKey: null,
@@ -173,6 +176,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
                 ...prev,
                 report,
                 fetchedAt: Date.now(),
+                lastAttemptAt: Date.now(),
                 inFlight: null,
                 dismissedKey,
               },
@@ -192,6 +196,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
             ...state.slots,
             [provider]: {
               ...state.slots[provider],
+              lastAttemptAt: Date.now(),
               inFlight: null,
             },
           },
@@ -310,8 +315,8 @@ export function useProviderHealthRecoveryPoll(
       void reprobeUnhealthy(provider);
     }, HEALTH_REPROBE_MS);
     const onFocus = () => {
-      const { fetchedAt } = useProviderHealth.getState().slots[provider];
-      if (Date.now() - fetchedAt < FOCUS_REPROBE_MIN_MS) return;
+      const { fetchedAt, lastAttemptAt } = useProviderHealth.getState().slots[provider];
+      if (Date.now() - Math.max(fetchedAt, lastAttemptAt) < FOCUS_REPROBE_MIN_MS) return;
       void reprobeUnhealthy(provider);
     };
     onFocus();
