@@ -2043,6 +2043,7 @@ mod tests {
                     "child",
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 )
+                .into_bytes()
             })
             .expect(6)
             .create_async()
