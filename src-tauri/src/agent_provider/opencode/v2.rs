@@ -96,6 +96,15 @@ impl State {
                 .is_some_and(|(seq, boundary)| seq <= boundary) {
                 return Ok(vec![]);
             }
+            // A moving snapshot cannot cover content, but an observed durable
+            // terminal still proves older lifecycle records have settled.
+            if matches!(event.kind.as_str(), "session.execution.started"
+                | "session.execution.succeeded" | "session.execution.failed"
+                | "session.execution.interrupted")
+                && event.sequence(session).zip(self.terminal_sequences.get(session))
+                    .is_some_and(|(seq, (_, boundary))| seq <= *boundary) {
+                return Ok(vec![]);
+            }
         }
         // Snapshot identities may recur with a newer partial value. Their
         // per-item state/high-water guards, not event IDs, reconcile them.
@@ -509,6 +518,38 @@ mod tests {
         })).unwrap();
         assert!(decoded.durable.is_none());
         assert!(matches!(State::default().reduce(&decoded).unwrap().as_slice(), [Update::Started]));
+    }
+
+    #[test]
+    fn observed_terminal_fences_old_lifecycle_but_preserves_late_content_and_new_execution() {
+        let durable = |id: &str, kind: &str, data: Value, seq: u64| {
+            let mut event = event(id, kind, data);
+            event.durable = Some(Durable { aggregate_id: "s".into(), seq });
+            event
+        };
+        let lifecycle = |id: &str, kind: &str, seq| durable(id, kind,
+            json!({"sessionID":"s"}), seq);
+        let mut state = State::default();
+        state.mark_running("s");
+        let terminal = lifecycle("evt_a_done", "session.execution.succeeded", 10);
+        assert!(matches!(state.reduce(&terminal).unwrap().as_slice(), [Update::Terminal { .. }]));
+        assert!(state.recovered_sequence("s").is_none());
+        assert!(state.reduce(&lifecycle("evt_a_start", "session.execution.started", 5)).unwrap().is_empty());
+        for i in 0..2100 {
+            state.reduce(&event(&format!("evict_{i}"), "ignored", json!({"sessionID":"s"}))).unwrap();
+        }
+        assert!(!state.seen.contains("evt_a_done"));
+        let late = durable("late_content", "session.text.ended",
+            json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"late"}), 9);
+        assert!(matches!(state.reduce(&late).unwrap().as_slice(), [Update::Content { complete:true, .. }]));
+        assert!(matches!(state.reduce(&lifecycle("evt_b_start", "session.execution.started", 11)).unwrap().as_slice(), [Update::Started]));
+        assert!(state.reduce(&terminal).unwrap().is_empty());
+        assert!(state.reduce(&lifecycle("evt_older_terminal", "session.execution.failed", 7)).unwrap().is_empty());
+        assert_eq!(state.terminal_sequences["s"].1, 10);
+        assert!(state.running.contains("s"));
+        assert!(state.reduce(&lifecycle("evt_old_start_again", "session.execution.started", 8)).unwrap().is_empty());
+        assert!(matches!(state.reduce(&lifecycle("evt_b_done", "session.execution.succeeded", 15)).unwrap().as_slice(), [Update::Terminal { .. }]));
+        assert_eq!(state.terminal_sequences["s"].1, 15);
     }
     #[test]
     fn reconnect_snapshot_appends_only_missing_partial_content_then_accepts_live_deltas() {
