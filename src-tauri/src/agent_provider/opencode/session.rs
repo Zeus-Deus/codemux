@@ -2678,6 +2678,10 @@ pub(crate) mod tests {
         /// remains alive if the HTTP client disconnects, matching native v2's
         /// uninterruptible admission phase rather than delayed response headers.
         async fn start() -> Self {
+            Self::start_for("/api/session/s/prompt").await
+        }
+
+        async fn start_for(held_path: &'static str) -> Self {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -2722,7 +2726,14 @@ pub(crate) mod tests {
                                 let _ = seen.send(NativeAdmissionRequest {
                                     method: method.clone(), path: path.clone(), body: body.clone(),
                                 });
-                                if method == "POST" && path == "/api/session/s/prompt"
+                                // A native command may already be executing while its
+                                // callback response remains outstanding.
+                                if method == "POST" && path == "/api/session/s/command" {
+                                    let mut state = state.lock().await;
+                                    state.wakes += 1;
+                                    state.active = true;
+                                }
+                                if method == "POST" && path == held_path
                                     && !held.swap(true, Ordering::Relaxed)
                                 {
                                     while !*released.borrow_and_update() {
@@ -2754,6 +2765,7 @@ pub(crate) mod tests {
                                             state.active = false;
                                             ("200 OK", serde_json::json!({"interrupted":interrupted}).to_string())
                                         }
+                                        ("POST", "/api/session/s/command") => ("204 No Content", String::new()),
                                         ("GET", "/api/session/s/inbox") => (
                                             "200 OK", serde_json::json!({"data":state.pending.values().collect::<Vec<_>>()} ).to_string()
                                         ),
@@ -2864,10 +2876,11 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap()
         .unwrap();
-        assert!(matches!(
-            sending.await.unwrap(),
-            Err(ProviderError::SessionClosed { .. })
-        ));
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), sending)
+            .await
+            .expect("closure must release the submitting caller")
+            .unwrap();
+        assert!(matches!(sent, Err(ProviderError::SessionClosed { .. })));
         let state = peer.state.lock().await;
         assert_eq!(state.admitted, vec![input_id.clone()]);
         assert_eq!(state.cancelled, vec![input_id]);
@@ -2936,10 +2949,11 @@ pub(crate) mod tests {
         .expect_err("unknown server admission cannot claim successful closure");
         assert!(matches!(error, ProviderError::RpcError { .. }));
         assert!(started.elapsed() >= NATIVE_SHUTDOWN_GRACE);
-        assert!(matches!(
-            sending.await.unwrap(),
-            Err(ProviderError::SessionClosed { .. })
-        ));
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), sending)
+            .await
+            .expect("unknown admission must not hold the submitting caller open")
+            .unwrap();
+        assert!(matches!(sent, Err(ProviderError::SessionClosed { .. })));
         let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         assert!(emitted.iter().any(|event| matches!(
             event,
@@ -2982,6 +2996,82 @@ pub(crate) mod tests {
                 ..
             })
         ));
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn native_command_returns_promptly_but_shutdown_waits_for_its_ack() {
+        let mut peer = DelayedNativeAdmissionPeer::start_for("/api/session/s/command").await;
+        let (session, _, mut events) = mock_session_api(
+            peer.base_url.clone(),
+            "pw".into(),
+            "s",
+            super::super::api::OpenCodeApi::V2,
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.send_turn("/review diff".into(), vec![], None, None),
+        )
+        .await
+        .expect("native command generation must not block the send response")
+        .unwrap();
+        let command = peer.next_request("POST", "/api/session/s/command").await;
+        assert_eq!(command.body["name"], "review");
+        assert_eq!(command.body["text"], "diff");
+        assert_eq!(peer.state.lock().await.wakes, 1);
+        let closing = tokio::spawn({
+            let session = session.clone();
+            async move { session.shutdown().await }
+        });
+        peer.next_request("POST", "/api/session/s/interrupt?resume=false")
+            .await;
+        assert!(
+            !closing.is_finished(),
+            "a held native command ACK still owns teardown work"
+        );
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                event,
+                ProviderRuntimeEvent::SessionStateChanged {
+                    status: SessionStatus::Closed,
+                    ..
+                }
+            ))
+        );
+        peer.release.send_replace(true);
+        tokio::time::timeout(
+            NATIVE_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            closing,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let state = peer.state.lock().await;
+        assert_eq!(
+            state.wakes, 1,
+            "completion of an owned command cannot wake another execution"
+        );
+        assert!(!state.active);
+        assert!(state.interrupts > 0);
+        assert!(state.waits > 0);
+        drop(state);
+        let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(matches!(
+            emitted.last(),
+            Some(ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            session
+                .enqueue_or_send(delivery_input("after command closure"))
+                .await,
+            Err(ProviderError::SessionClosed { .. })
+        ));
+        assert_eq!(peer.state.lock().await.wakes, 1);
         peer.stop().await;
     }
 
