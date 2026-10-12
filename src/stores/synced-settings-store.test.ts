@@ -225,11 +225,17 @@ describe("synced-settings-store", () => {
       },
     );
 
-    it("retains a failure when a full acknowledgement omits its intended value", async () => {
+    it.each(["failed", "saved-locally"] as const)("reports an unpersisted %s intent omitted from a full acknowledgement", async (issue) => {
       const server = { ...DEFAULT_SETTINGS, keyboard: { shortcuts: { "ctrl+s": "save" } } };
       useSyncedSettingsStore.getState().replaceSessionSettings(server);
-      mockUpdateSetting.mockRejectedValueOnce(new Error("Git PATCH failed"));
-      mockUpdateSyncedSettings.mockRejectedValueOnce(new Error("Git PUT failed"));
+      if (issue === "failed") {
+        mockUpdateSetting.mockRejectedValueOnce(new Error("Git PATCH failed"));
+        mockUpdateSyncedSettings.mockRejectedValueOnce(new Error("Git PUT failed"));
+      } else {
+        mockUpdateSetting.mockResolvedValueOnce({
+          settings: { ...server, git: { default_base_branch: "dev" } }, synced: false,
+        });
+      }
       await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
 
       mockUpdateSetting.mockResolvedValueOnce(server);

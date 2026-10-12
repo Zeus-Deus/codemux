@@ -161,7 +161,11 @@ function writeOutcome(
     if (settings && matchesIntent(settings, intent)) {
       if (issue === null) _fieldIntents.delete(field);
       else intent.issue = issue;
-    } else if (issue === "failed" || scope === FULL_WRITE) {
+    } else if (settings && scope === FULL_WRITE) {
+      // A returned full snapshot replaced the cache, so a missing intent
+      // cannot still be described as saved locally.
+      intent.issue = "failed";
+    } else if (issue === "failed") {
       // A failed retry cannot erase an earlier confirmed local save.
       if (intent.issue !== "saved-locally") intent.issue = "failed";
     }
