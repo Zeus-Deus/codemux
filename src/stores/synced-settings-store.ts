@@ -313,16 +313,21 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set, get) =
 
   resetSettings: async () => {
     const token = beginWrite();
-    rememberSnapshot(token, DEFAULT_SETTINGS, true);
-    set({ settings: DEFAULT_SETTINGS, isSyncing: true, syncIssue: syncIssue() });
+    // Keep existing settings and outstanding edits until the reset is saved.
+    // A rejected verified-account reset must remain visible to the caller.
+    set({ isSyncing: true });
     try {
       const result = await resetSyncedSettings();
-      writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set, result.settings);
-      if (isCurrent(token)) set({ settings: settingsWithIntents(result.settings) });
-    } catch {
-      // Keep the optimistic defaults. The backend owns offline persistence and
-      // the next explicit refresh will reconcile them.
-      writeOutcome(token, FULL_WRITE, "failed", set);
+      if (sameSession(token)) {
+        // The persisted reset supersedes earlier edits, while edits made
+        // during the request keep their own intent and acknowledgement.
+        for (const [field, intent] of _fieldIntents) {
+          if (intent.generation <= token.settingsGeneration) _fieldIntents.delete(field);
+        }
+        if (!result.synced) rememberSnapshot(token, result.settings, false);
+        writeOutcome(token, FULL_WRITE, result.synced ? null : "saved-locally", set, result.settings);
+        if (isCurrent(token)) set({ settings: settingsWithIntents(result.settings) });
+      }
     } finally {
       finishWrite(token, set);
     }

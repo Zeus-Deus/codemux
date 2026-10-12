@@ -120,7 +120,8 @@ function DeviceOnlyMark({ id }: { id: string }) {
 
 /** One setting: label and description on the left, its control on the
  *  right. The label names the control for assistive tech, and
- *  `scope="device"` marks a setting that does not sync. */
+ *  `scope="device"` marks a setting that does not sync. Settings search
+ *  highlights the containing `data-settings-row`. */
 export function SettingRow({
   label,
   description,
@@ -128,7 +129,7 @@ export function SettingRow({
   children,
 }: {
   label: string;
-  description?: string;
+  description?: React.ReactNode;
   scope?: "device";
   children: React.ReactNode;
 }) {
@@ -144,6 +145,7 @@ export function SettingRow({
   });
   return (
     <div
+      data-settings-row
       role={control.labelled ? undefined : "group"}
       aria-labelledby={control.labelled ? undefined : labelId}
       aria-describedby={control.labelled ? undefined : describedBy}
@@ -187,7 +189,7 @@ export function SubsectionHeader({
   className?: string;
 }) {
   return (
-    <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
+    <div data-settings-row className={cn("mb-3 flex items-end justify-between gap-4", className)}>
       <div className="min-w-0">
         <Eyebrow>
           {title}

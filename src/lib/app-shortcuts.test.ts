@@ -46,6 +46,15 @@ describe("isAppShortcut", () => {
     expect(isAppShortcut(keyEvent({ key: "F6" }))).toBe(true);
   });
 
+  it("lets a focused terminal keep Ctrl+W for delete-word", () => {
+    updateAppShortcuts({});
+    expect(isAppShortcut(keyEvent({ key: "w", ctrlKey: true }))).toBe(false);
+    // Closing a pane is not a shell key, so it still reaches the app.
+    expect(
+      isAppShortcut(keyEvent({ key: "W", ctrlKey: true, shiftKey: true })),
+    ).toBe(true);
+  });
+
   it("leaves native shortcuts out of the intercept list", () => {
     // The desktop app consumes Ctrl+Alt+R before the page sees it; in a
     // browser client the key is just a key, so a focused terminal keeps it.

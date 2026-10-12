@@ -19,7 +19,7 @@ export function permissionBlockerText(_workspace: WorkspaceSnapshot): string {
   return PERMISSION_BLOCKER_FALLBACK;
 }
 
-interface StatusMark {
+export interface StatusMark {
   status: ActivePaneStatus;
   /** Client-side timestamp of when the workspace entered this status. The
    *  backend does not stamp a status-changed-at, so the sidebar derives

@@ -24,6 +24,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { fallbackModelLabel } from "@/lib/agent-chat/capability-defaults";
 import { cn } from "@/lib/utils";
 import {
   pickerFavoriteKey,
@@ -456,7 +457,7 @@ export function MultiProviderModelPicker({
     if (provider === "hermes" && hermesModelLabel) return hermesModelLabel;
     if (!capsForCurrentProvider && !model) return "Loading…";
     if (resolvedModel) return resolvedModel.label;
-    if (model) return model;
+    if (model) return fallbackModelLabel(model);
     return "Select model";
   }, [capsForCurrentProvider, model, resolvedModel, provider, hermesModelLabel, acpCatalog]);
 

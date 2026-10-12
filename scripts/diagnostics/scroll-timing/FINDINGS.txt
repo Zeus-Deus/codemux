@@ -1,0 +1,146 @@
+Linux wheel scrolling: shipped behavior and future investigation
+2026-10-06
+
+READ THIS FIRST
+The final candidate was accepted in physical testing: ordinary/free-wheel
+scrolling and fast long-chat scrolling are much smoother; the recurrent
+mid-glide timing hiccup is substantially improved. Extremely slow free-wheel
+motion can still feel like tiny forward pulses. This is an acknowledged
+remaining symptom, not a claim of exact Electron parity or a confirmed cause.
+No desktop/NVIDIA/compositor settings were changed. No telemetry ships.
+
+What shipped
+1. Display timing: WebKitGTK otherwise selected a 60Hz timer when DRM vblank
+   waits returned EOPNOTSUPP on this NVIDIA desktop with a 200Hz display.
+   vblank_fallback.rs intercepts only WebKit's narrow blocking relative probe
+   and waits after that error, then paces a timer from the active CRTC mode.
+   Working clocks and unrelated requests pass through. This is not hardware
+   vsync or VRR; it does not fix GPU/compositor scanout. Opt out with
+   CODEMUX_VBLANK_FALLBACK=0. No LD_PRELOAD is required by the application.
+2. Wheel animation: WebKit's repeated native smooth wheel animation made fast
+   wheel input lag. Native wheel smoothing stays off; the Linux app uses
+   velocity-preserving cubic Hermite segments, exact signed destinations and
+   fractional carry. First/ordinary small ticks glide about200ms; larger
+   movement and existing velocity shorten segments. Zero initial velocity
+   avoids the rejected initial push. Keyboard, external scroll owners, native
+   editors/terminals, horizontal owners and reduced motion retain ownership.
+   The former appearance.smooth_scrolling setting and toggle are removed.
+3. Input precision: GTK3's Wayland v5 pointer does not receive v8 value120.
+   The physical G502 trace had2129 fine frames (+/-15, occasional+/-30), but
+   only276 GTK smooth events (+/-1.5 coarse units). The new bridge uses the
+   existing GTK-owned connection and a private v8 pointer, translating
+   value120/120 and suppressing matching timestamped GTK legacy duplicates.
+   Own webview surfaces and explicit wheel sources only; unsupported backends,
+   old compositors, incompatible metadata and multi-seat displays keep GTK.
+   Touchpad sources stay on GTK. CODEMUX_PRECISE_WHEEL=0 opts out.
+4. Packaging: Ubuntu22.04 AppImages bundle Wayland v7 metadata. Private v8
+   descriptions preserve original request/event tables and add axis_value120;
+   GTK's global metadata stays unchanged. Descriptions are retained through
+   queued event cleanup and connection teardown. Modern tables stay native.
+   Nine tests passed with the actual older bundled client, including signed
+   fractional packets decoded by its real wire marshaller.
+5. Pacing: a30ms event-interval cutoff switched between200ms and30ms segments,
+   reproducing periodic stops/surges without the transcript. Fine mouse timing
+   now learns the first interval, then a .75/.25 exponential cadence estimate;
+   requested segment duration is four times that estimate within30..200ms.
+   Existing velocity matching still applies. Fine/coalesced full mouse packets
+   share policy during a gesture. Idle over200ms resets the initial glide.
+   When the precision bridge is available, trackpad/ambiguous fine input retains
+   the prior candidate's30ms filter. Unsupported Linux backends use the accepted
+   baseline app glide; other OS/remote browsers retain native behavior. The classifier
+   uses the actual WebKit mouse/nonmouse delta-to-legacy-tick relationship,
+   including truncation; delta size alone does not identify device source.
+   The transcript rail forwards the original native event's metadata.
+
+Evidence and limits
+- cadence-results.json: deterministic5ms floating-position measurements.
+  Alternating29/31ms worst5ms speed change .705->.051px/ms; mixed fine/full
+  packets2.495->.451. Sustained5ms and sparse80ms trajectories unchanged.
+  Signed travel is exact in all seven scenarios. These are animation metrics,
+  not a measured93% improvement in subjective smoothness or painted pixels.
+- Native production-bridge/frontend probe:64 trusted/cancelable15.5px events,
+  eight deliberately duplicated coarse events suppressed,64 prevented DOM
+  events, final992px equals992px input. Test does not record hardware latency.
+- Source diagnostic:24 synthetic native events; all12 touchpad samples remain
+  unclassified; all10 mouse samples with nonzero legacy ticks are identified.
+  Tiny or ambiguous samples preserve the previous policy.
+- Original timer/glide trials and rendering-ab show long mock transcript frames
+  can still stall: approximately44ms p95/98ms maximum after vs49/107ms before;
+  Electron mock shell10/20.1ms. Do not read this as an installed t3code benchmark.
+- Environment was GTK3.24.52/WebKitGTK2.52.6/Hyprland0.56.2, RTX3090,
+  NVIDIA615.71.09, 200Hz display. Electron41.5.0 comparison was an isolated shell
+  using the same mock content, not the existing t3code process. GLib/Electron
+  input schedules differ; callbacks/DOM offsets are not input-to-photon timings.
+- Release export stress check: release_clock_probe.py compiles the current
+  production clock module with the exact build.rs export flag, opt-level3,
+  thin LTO and symbol stripping. With no direct Rust reference to the hook,
+  readelf finds its defined GLOBAL dynamic symbol; dlsym finds it before loading
+  libdrm and still resolves that executable symbol after libdrm is loaded.
+  See precision-results/release-clock-results.json. This establishes optimized
+  executable export retention/interposition, not a full CodeMux release/AppImage
+  GUI smoke test. Full release fallback logging/callback timing remains a
+  distinct packaging/runtime validation item, especially on other displays.
+- The real dev app's get_precise_wheel_available command returned true. This
+  settled the earlier startup-race concern; the hook waits for native discovery.
+- Physical feedback validated the final candidate. Browser screenshot tooling
+  was blocked by “No pane found”; native mock probes and numeric traces passed.
+
+Experiments that should not be blindly revived
+- A12ms response applied about74% of a tick in16ms and felt too abrupt.
+- Seeded75%-average initial velocity improved onset timing but felt like a push.
+  The final candidate starts at zero velocity.
+- Fixed30ms fine filtering left gaps between sparse events and felt stepped.
+- Fixed200ms fine filtering smoothed sparse input but lagged fast input
+  (699/992px at320ms in one deterministic harness).
+- An EMA initialized from artificial50ms cadence created fast-start catch-up
+  surge. Learning the first actual interval removed that regression.
+- CSS/library/virtualizer trials in rendering-ab did not justify shipping them.
+- scrollTo({behavior:'smooth'}) is not a drop-in wheel replacement: installed
+  WebKit retargets differently and uses distance-dependent duration; slow tiny
+  moves remain short. Verify the exact installed engine, not only upstream main.
+- Pretending a mouse is a touchpad changes WebKit pixel gain (viewport-derived
+  step vs40px/unit), so that is not a valid general source-preserving fix.
+
+Future ultra-slow polish: suggested investigation, NOT implemented
+1. Reproduce tiny pulses on unchanged content away from the chat bottom.
+   Correlate numeric wheel intervals/deltas, animation state, frame gaps,
+   DOM offsets, external offset drift, scroll maxima and numeric row positions.
+   This separates sparse hardware reports, integer setter quantization,
+   main-thread stalls and competing scroll writers; message text is unnecessary.
+2. Integer CSSOM is a plausible limit, not a verified cause of this user's last
+   symptom. Installed WebKit Element.scrollTop and scrollTo use integer
+   coordinates; native coordinated scrolling retains floating-point positions.
+   The passive native probe preserves fractional accumulated distance, but no
+   pixel-level paint test was completed. See native-engine-README.txt and
+   WebKit bug188045 before deciding whether to use a different paint path.
+3. Native interpolation is promising but remains diagnostic. The mock200ms
+   source-preserving native glide showed more moving DOM samples than direct
+   sparse input and similar counts to an Electron mock. It creates additional
+   native/DOM events and does not establish correct ownership, cancellation,
+   nested scrolling, rails, editors or real pixel output. A production route
+   needs a safe DOM-owner lease/handshake and cancellation when keyboard,
+   pointer, layout or another scroll writer takes over; retain signed distance,
+   source, bounds, reduced motion and unsupported-platform fallback.
+4. A fractional visual transform could also be explored, but it must account
+   for fixed/sticky layers, selection, hit testing and virtualized positions.
+   It is an alternative experiment, not proposed production architecture.
+5. If the remaining hitch correlates with chat row/layout events, audit
+   MessageList anchor-size restoration (up to2px), near-bottom pinning (3% of
+   viewport), and LegendList item measurement/absolute style.top updates.
+   size:false prevents some corrections, not all row repositioning. None of
+   those paths is established as the cause of ultra-slow wheel pulses.
+6. Preserve the accepted normal/fast behavior. Require evidence for initial
+   motion, slow gaps, reversals, rapid input lag, exact total travel, native
+   controls, nested ownership and reduced motion before adding longer glides,
+   momentum, per-device sensitivity, new libraries or system configuration.
+
+Where to look
+Production: src-tauri/src/{vblank_fallback,precise_wheel,webview_tuning}.rs,
+src/lib/wheel-scrolling.ts, src/hooks/use-smooth-scrolling.ts,
+src/components/chat/MessageTrail.tsx.
+Tests and reproducible commands: precision-results/cadence-README.txt,
+precision-results/README.txt, wheel-source-README.txt, native_precision_probe.py,
+native_protocol_probe.py, release_clock_probe.py, glide_probe.py, build_native_probe.py.
+Historical hypotheses/sources: research-findings.txt. It describes an earlier
+candidate; the shipped policy and capability confirmation above supersede it.
+Archived attempts: onset-results, precision-results, rendering-ab, glide-results.

@@ -45,6 +45,7 @@ import {
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
+import { isAppShortcut } from "@/lib/app-shortcuts";
 
 interface Props {
   browserId: string;
@@ -179,6 +180,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const lastPointRef = useRef({ x: 0, y: 0 });
   const clickStateRef = useRef<ClickState | null>(null);
   const downButtonsRef = useRef<Set<CdpButton>>(new Set());
+  const appShortcutKeysRef = useRef(new Set<string>());
 
   // Cursor probe state
   const httpBaseRef = useRef<string | null>(null);
@@ -923,6 +925,8 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    const keyId = e.code || e.key.toLowerCase();
+    appShortcutKeysRef.current.delete(keyId);
     // Ctrl+Shift+I toggles element inspector
     if (e.ctrlKey && e.shiftKey && e.key === "I") {
       e.preventDefault();
@@ -930,7 +934,6 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       toggleInspector();
       return;
     }
-    if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
 
     const combo = (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey;
     const key = e.key.toLowerCase();
@@ -950,6 +953,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       e.preventDefault();
       e.stopPropagation();
       runBrowserNav(effectiveSessionId, shortcut).catch(console.error);
+      return;
+    }
+
+    // Browser chrome keeps its own controls, including page reload, ahead
+    // of app bindings such as the guard against reloading the interface.
+    if (isAppShortcut(e.nativeEvent)) {
+      appShortcutKeysRef.current.add(keyId);
       return;
     }
 
@@ -975,7 +985,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   };
 
   const handleKeyUp = (e: React.KeyboardEvent) => {
-    if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
+    // The action may change focus/state and modifiers may be released first.
+    // Match the keydown we yielded rather than rechecking applicability.
+    if (appShortcutKeysRef.current.delete(e.code || e.key.toLowerCase())) return;
     e.preventDefault();
     // handleKeyDown kept these from the page, so the page must not see a
     // release it never got a press for. Ctrl+L without a toolbar (the

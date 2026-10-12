@@ -153,15 +153,16 @@ describe("synced-settings-store", () => {
       expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
     });
 
-    it("does not let an older full write clear a newer failed reset", async () => {
+    it("lets an older full write settle after a rejected reset preserves it", async () => {
       const old = deferred<UserSettings>();
       mockUpdateSyncedSettings.mockReturnValue(old.promise);
       const write = useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
       mockResetSyncedSettings.mockRejectedValue(new Error("reset failed"));
-      await useSyncedSettingsStore.getState().resetSettings();
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toThrow("reset failed");
       old.resolve(DARK_SETTINGS);
       await write;
-      expect(useSyncedSettingsStore.getState().syncIssue).toBe("failed");
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
     });
     it("optimistically updates and syncs", async () => {
       mockUpdateSyncedSettings.mockResolvedValue(DARK_SETTINGS);
@@ -432,6 +433,68 @@ describe("synced-settings-store", () => {
       const state = useSyncedSettingsStore.getState();
       expect(state.settings).toEqual(DEFAULT_SETTINGS);
       expect(state.isSyncing).toBe(false);
+    });
+
+    it("keeps current settings until reset persistence is confirmed", async () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      let resolveReset!: (settings: UserSettings) => void;
+      mockResetSyncedSettings.mockReturnValue(new Promise<UserSettings>((resolve) => {
+        resolveReset = resolve;
+      }));
+      const reset = useSyncedSettingsStore.getState().resetSettings();
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(true);
+
+      resolveReset(DEFAULT_SETTINGS);
+      await reset;
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
+
+    it("rejects a failed backend reset without changing settings", async () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      const error = new Error("Network error");
+      mockResetSyncedSettings.mockRejectedValue(error);
+
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toBe(error);
+      expect(useSyncedSettingsStore.getState().settings).toBe(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
+    });
+
+    it("preserves queued field values and their status after a rejected reset", async () => {
+      const intended = { ...DEFAULT_SETTINGS, git: { default_base_branch: "dev" } };
+      mockUpdateSetting.mockResolvedValueOnce({ settings: intended, synced: false });
+      await useSyncedSettingsStore.getState().updateSetting("git", "default_base_branch", "dev");
+      mockResetSyncedSettings.mockRejectedValueOnce(new Error("reset failed"));
+
+      await expect(useSyncedSettingsStore.getState().resetSettings()).rejects.toThrow("reset failed");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DEFAULT_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().settings.git.default_base_branch).toBe("dev");
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+    });
+
+    it("reports a persisted offline reset until its defaults are confirmed synced", async () => {
+      mockResetSyncedSettings.mockResolvedValueOnce({ settings: DEFAULT_SETTINGS, synced: false });
+      await useSyncedSettingsStore.getState().resetSettings();
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DEFAULT_SETTINGS);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBe("saved-locally");
+      useSyncedSettingsStore.getState().applySettingsFromEvent(DEFAULT_SETTINGS, true);
+      expect(useSyncedSettingsStore.getState().syncIssue).toBeNull();
+    });
+
+    it("does not let a completed reset replace a newer local edit", async () => {
+      let resolveReset!: (settings: UserSettings) => void;
+      mockResetSyncedSettings.mockReturnValue(new Promise<UserSettings>((resolve) => {
+        resolveReset = resolve;
+      }));
+      const reset = useSyncedSettingsStore.getState().resetSettings();
+      mockUpdateSyncedSettings.mockResolvedValue(DARK_SETTINGS);
+      await useSyncedSettingsStore.getState().updateSettings(DARK_SETTINGS);
+
+      resolveReset(DEFAULT_SETTINGS);
+      await reset;
+      expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
+      expect(useSyncedSettingsStore.getState().isSyncing).toBe(false);
     });
   });
 
