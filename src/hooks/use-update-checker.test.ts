@@ -294,6 +294,15 @@ describe("useUpdateChecker → desktop download failures", () => {
     });
     expect(useUpdateStatusStore.getState().errorMessage).toBe("spawn failed");
 
+    // Installed updates still need only a restart after the next poll.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4 * 60 * 60 * 1000);
+    });
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(downloadAndInstall).toHaveBeenCalledTimes(1);
+    expect(useUpdateStatusStore.getState().state).toBe("error");
+    expect(useUpdateStatusStore.getState().errorMessage).toBe("spawn failed");
+
     await act(async () => {
       useUpdateStatusStore.getState().retry!();
     });

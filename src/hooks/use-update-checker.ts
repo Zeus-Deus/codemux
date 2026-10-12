@@ -183,7 +183,11 @@ export function useUpdateChecker(): UpdateCheckerResult {
     // The periodic poll must not knock an in-flight or installed update back
     // to "available" — after "Later" on the ready prompt, restarting is the
     // only step left.
-    if (stateRef.current === "downloading" || stateRef.current === "ready") {
+    if (
+      stateRef.current === "downloading" ||
+      stateRef.current === "ready" ||
+      (stateRef.current === "error" && failedStepRef.current === "restart")
+    ) {
       return;
     }
     try {
