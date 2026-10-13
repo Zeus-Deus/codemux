@@ -26,7 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Loader2, Sparkles, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Sparkles, X } from "lucide-react";
 
 import {
   Select,
@@ -73,6 +73,7 @@ import {
   tzPanelHeader,
   tzRowTitle,
 } from "./review-ui";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Enough to describe any branch a person would open a pull request from;
  *  past this the description would be unreadable anyway. */
@@ -509,7 +510,7 @@ export function CreatePrForm({
               onClick={() => void writeWithAgent()}
             >
               {writing ? (
-                <Loader2 className="size-3 motion-safe:animate-spin" />
+                <Spinner className="size-3" aria-hidden />
               ) : (
                 <Sparkles className="size-3" />
               )}
@@ -626,7 +627,7 @@ export function CreatePrForm({
           disabled={!title.trim() || busy != null || writing}
           onClick={() => void create(true)}
         >
-          {busy === "draft" ? <Loader2 className="size-3 animate-spin" /> : null}
+          {busy === "draft" ? <Spinner className="size-3" aria-hidden /> : null}
           Draft
         </button>
         <button
@@ -637,7 +638,7 @@ export function CreatePrForm({
           disabled={!title.trim() || busy != null || writing}
           onClick={() => void create(false)}
         >
-          {busy === "create" ? <Loader2 className="size-3 animate-spin" /> : null}
+          {busy === "create" ? <Spinner className="size-3" aria-hidden /> : null}
           {busy === "create" ? "Creating" : "Create"}
         </button>
       </div>

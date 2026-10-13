@@ -55,9 +55,62 @@ function makePendingApproval(
   };
 }
 
+/** The `data-state` each Reveal held before it changed while `run` ran. A
+ *  body mounted already open never changes, so it records nothing. */
+function revealStatesBefore(run: () => void): (string | null)[] {
+  const observer = new MutationObserver(() => {});
+  observer.observe(document.body, {
+    subtree: true,
+    attributeFilter: ["data-state"],
+    attributeOldValue: true,
+  });
+  run();
+  const records = observer.takeRecords();
+  observer.disconnect();
+  return records.map((record) => record.oldValue);
+}
+
 describe("ToolCallCard", () => {
   beforeEach(() => {
     vi.mocked(toast.success).mockReset();
+  });
+
+  it("eases the body in only when the user expands it", () => {
+    render(
+      <ToolCallCard
+        item={makeTool({ status: "done", result_content: "total 0" })}
+        approval={null}
+        onDecide={() => {}}
+      />,
+    );
+    const toggle = screen.getByRole("button", { expanded: false });
+    // Reveal commits a freshly opened body collapsed, then flips it open,
+    // so the height eases in instead of landing in one frame.
+    expect(revealStatesBefore(() => fireEvent.click(toggle))).toEqual(["closed"]);
+    const body = document.getElementById(toggle.getAttribute("aria-controls") ?? "");
+    expect(body).toHaveAttribute("data-state", "open");
+    expect(body).toHaveClass("duration-150");
+  });
+
+  it("does not replay the ease on a card that mounts expanded", () => {
+    const states = revealStatesBefore(() =>
+      render(
+        <ToolCallCard
+          item={makeTool({
+            status: "error",
+            result_content: "boom",
+          })}
+          approval={null}
+          onDecide={() => {}}
+        />,
+      ),
+    );
+    // Mounted open: no collapsed frame for the height to ease out of.
+    expect(states).toEqual([]);
+    const toggle = screen.getByRole("button", { expanded: true });
+    expect(
+      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
+    ).toHaveAttribute("data-state", "open");
   });
 
   it("pending_approval state renders the approval controls and input preview", () => {

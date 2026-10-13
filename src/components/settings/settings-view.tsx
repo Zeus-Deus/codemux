@@ -63,6 +63,7 @@ import {
   selectTerminalColorTheme,
   selectDensity,
   selectChatCodeWrap,
+  selectReduceMotion,
   SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
   selectAutoResumeUsageLimit,
@@ -1390,6 +1391,7 @@ export function SettingsView() {
   const density = useSettingsStore(selectDensity);
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
   const chatCodeWrap = useSettingsStore(selectChatCodeWrap);
+  const reduceMotion = useSettingsStore(selectReduceMotion);
   const autoSettleDays = useSettingsStore(
     (s) =>
       (s.settings["sidebar.auto_settle_days"] ??
@@ -1844,6 +1846,19 @@ export function SettingsView() {
                       checked,
                     ).catch(console.error);
                   }}
+                />
+              </SettingRow>
+              <Separator />
+              <SettingRow
+                label="Reduce motion"
+                description="Stop looping and sliding animations, and swap spinners for a slow fade. Always on when your system asks for reduced motion."
+              >
+                <Switch
+                  aria-label="Reduce motion"
+                  checked={reduceMotion}
+                  onCheckedChange={(checked) =>
+                    storeSet("appearance.reduce_motion", checked ? "true" : "false")
+                  }
                 />
               </SettingRow>
             </div>

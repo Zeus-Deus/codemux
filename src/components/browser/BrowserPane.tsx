@@ -7,7 +7,7 @@ import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { Button } from "@/components/ui/button";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
-import { Loader2, Globe, RotateCw, Copy } from "lucide-react";
+import { Globe, RotateCw, Copy } from "lucide-react";
 import type { AgentTarget, ElementInfo } from "./inspector";
 import {
   INSPECTOR_INJECT_SCRIPT,
@@ -45,6 +45,7 @@ import {
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
+import { Spinner } from "@/components/ui/spinner";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 
 interface Props {
@@ -1102,7 +1103,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               </>
             ) : (
               <>
-                <Loader2 className="size-6 motion-safe:animate-spin text-muted-foreground mb-2" />
+                <Spinner className="size-6 text-muted-foreground mb-2" />
                 <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
@@ -1136,7 +1137,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               </>
             ) : (
               <>
-                <Loader2 className="size-3 motion-safe:animate-spin text-muted-foreground" />
+                <Spinner className="size-3 text-muted-foreground" />
                 <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}

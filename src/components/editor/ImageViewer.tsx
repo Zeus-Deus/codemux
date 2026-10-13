@@ -16,6 +16,7 @@ interface Props {
  */
 export function ImageViewer({ filePath }: Props) {
   const [errored, setErrored] = useState(false);
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
   const src = convertFileSrc(filePath);
 
   if (errored) {
@@ -47,10 +48,15 @@ export function ImageViewer({ filePath }: Props) {
 
   return (
     <div className="flex flex-1 min-h-0 items-center justify-center overflow-auto bg-[var(--background)] p-4">
+      {/* Fade in once decoded, like VideoViewer, so a large image never
+          paints in top-down strips. */}
       <img
         src={src}
         alt={filePath}
-        className="max-w-full max-h-full object-contain"
+        className={`max-w-full max-h-full object-contain transition-opacity duration-150 ${
+          loadedSrc === src ? "opacity-100" : "opacity-0"
+        }`}
+        onLoad={() => setLoadedSrc(src)}
         onError={() => setErrored(true)}
       />
     </div>

@@ -6,7 +6,6 @@ import {
   ArrowLeft,
   ArrowRight,
   RotateCw,
-  Loader2,
   Crosshair,
   X,
   Ellipsis,
@@ -35,6 +34,7 @@ import {
 } from "./browser-nav";
 import { PanelHeader } from "@/components/ui/panel-header";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Props {
   browserId: string;
@@ -197,7 +197,7 @@ export function BrowserToolbar({
             onClick={() => runNav("reload")}
           >
             {loading ? (
-              <Loader2 className="size-3 motion-safe:animate-spin" />
+              <Spinner className="size-3" />
             ) : (
               <RotateCw className="size-3" />
             )}

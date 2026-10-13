@@ -1,4 +1,4 @@
-import { Loader2 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 
 import { cn } from "@/lib/utils";
 import {
@@ -92,7 +92,7 @@ export function AgentReadinessRow({
         data-readiness="checking"
         className="flex items-center gap-2 text-body-sm leading-relaxed text-muted-foreground/70"
       >
-        <Loader2 className="size-3 shrink-0 motion-safe:animate-spin" />
+        <Spinner className="size-3" aria-hidden />
         Checking {label} on this machine…
       </div>
     );

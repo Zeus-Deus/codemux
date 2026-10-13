@@ -5,6 +5,7 @@ import {
   DialogTitle,
   DialogDescription,
   DIALOG_CRISP_POSITION,
+  DIALOG_TOP_ANCHORED_MOTION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -52,21 +53,34 @@ export function ContentSearchDialog() {
   // Bumped per query so a slow response can't overwrite a newer one.
   const requestRef = useRef(0);
 
-  // Reset on open
-  useEffect(() => {
+  // The shell keeps this dialog mounted after its first open so Radix can
+  // play the exit animation. Reset on the opening transition during render,
+  // not in an effect, so the previous search never paints for a frame. The
+  // case and regex toggles reset too, as they did when closing unmounted it.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setQuery("");
       setResults([]);
       setError(null);
+      setLoading(false);
+      setCaseSensitive(false);
+      setUseRegex(false);
       setSelectedIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 0);
     }
+  }
+
+  useEffect(() => {
+    if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
   // Debounced search
   useEffect(() => {
     const request = ++requestRef.current;
-    if (!open || !cwd || !query.trim()) {
+    // Closing keeps the last results so the list fades out intact.
+    if (!open) return;
+    if (!cwd || !query.trim()) {
       setResults([]);
       setError(null);
       setLoading(false);
@@ -186,6 +200,7 @@ export function ContentSearchDialog() {
       <DialogContent
         className={cn(
           DIALOG_CRISP_POSITION,
+          DIALOG_TOP_ANCHORED_MOTION,
           "flex max-h-[80vh] flex-col gap-0 overflow-hidden p-0",
         )}
         showCloseButton={false}

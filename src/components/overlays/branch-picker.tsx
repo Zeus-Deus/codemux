@@ -20,11 +20,10 @@ import {
   FolderGit,
   ChevronDown,
   CornerDownRight,
-  Loader2,
-  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BranchDetail, WorktreeInfo } from "@/tauri/types";
+import { Spinner } from "@/components/ui/spinner";
 
 function formatRelativeTime(unixSeconds: number): string {
   const now = Math.floor(Date.now() / 1000);
@@ -279,7 +278,7 @@ export function BranchPicker({
                 className="flex shrink-0 items-center gap-1 px-1.5 text-caption text-muted-foreground"
                 title="Fetching from origin. New remote branches appear when it finishes."
               >
-                <RefreshCw className="size-3 motion-safe:animate-spin" />
+                <Spinner className="size-3" aria-hidden />
                 Syncing
               </span>
             )}
@@ -291,7 +290,7 @@ export function BranchPicker({
           >
             {loading ? (
               <div className="flex items-center justify-center py-8 text-label text-muted-foreground">
-                <Loader2 className="mr-2 size-3.5 animate-spin" />
+                <Spinner className="mr-2 size-3.5" aria-hidden />
                 Loading branches...
               </div>
             ) : (

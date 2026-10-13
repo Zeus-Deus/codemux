@@ -174,6 +174,104 @@ describe("trusted add-on rendering", () => {
     );
     expect(screen.getAllByRole("listitem")[0]).toHaveTextContent("98");
   });
+  it("jumps to the final and first virtual list rows with End and Home", () => {
+    render(
+      <AddonRenderer
+        nodes={[
+          node("list", "cmx-list", {
+            items: Array.from({ length: 500 }, (_, i) => `Path ${i + 1}`),
+          }),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const list = screen.getByRole("list", { name: "Add-on list" });
+    // jsdom has no layout; supply the real list's row and viewport dimensions.
+    Object.defineProperties(list, {
+      scrollHeight: { value: 500 * 36 },
+      clientHeight: { value: 288 },
+    });
+    list.focus();
+
+    expect(fireEvent.keyDown(list, { key: "End" })).toBe(false);
+    const finalRows = screen.getAllByRole("listitem");
+    const finalRow = finalRows[finalRows.length - 1];
+    expect(finalRows.length).toBeLessThanOrEqual(14);
+    expect(finalRow).toHaveAttribute("aria-posinset", "500");
+    expect(finalRow).toHaveTextContent("Path 500");
+    expect(finalRow).toHaveAttribute("aria-setsize", "500");
+    expect(list.scrollTop).toBe(500 * 36 - 288);
+    expect(document.activeElement).toBe(list);
+
+    expect(fireEvent.keyDown(list, { key: "ArrowDown" })).toBe(true);
+    expect(fireEvent.keyDown(list, { key: "a" })).toBe(true);
+    expect(screen.getAllByRole("listitem")).toEqual(finalRows);
+
+    expect(fireEvent.keyDown(list, { key: "Home" })).toBe(false);
+    const firstRows = screen.getAllByRole("listitem");
+    expect(firstRows.length).toBeLessThanOrEqual(14);
+    expect(firstRows[0]).toHaveAttribute("aria-posinset", "1");
+    expect(firstRows[0]).toHaveTextContent("Path 1");
+    expect(list.scrollTop).toBe(0);
+    expect(document.activeElement).toBe(list);
+  });
+  it("keeps the End destination when the browser clamps offsets during a partial layout", () => {
+    render(
+      <AddonRenderer
+        nodes={[
+          node("list", "cmx-list", {
+            items: Array.from({ length: 500 }, (_, i) => `Path ${i + 1}`),
+          }),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const list = screen.getByRole("list", { name: "Add-on list" });
+    const style = document.createElement("style");
+    style.textContent = '[role="listitem"] { height: 36px; }';
+    document.head.append(style);
+    let offset = 0;
+    const initialHeights = new Map([...list.children].map((child) => [
+      child, Number.parseFloat(getComputedStyle(child).height) || 0,
+    ]));
+    let partialLayout = false;
+    // Model a paint where reduced heights apply before increased heights.
+    // Native scroll offsets clamp to that intermediate scroll extent.
+    Object.defineProperties(list, {
+      clientHeight: { value: 286 },
+      scrollHeight: {
+        get: () => [...list.children].reduce((height, child) => {
+          const current = Number.parseFloat(getComputedStyle(child).height) || 0;
+          return height + (partialLayout
+            ? Math.min(current, initialHeights.get(child) ?? current)
+            : current);
+        }, 0),
+      },
+      scrollTop: {
+        get: () => offset,
+        set: (value: number) => {
+          offset = Math.max(0, Math.min(value, list.scrollHeight - list.clientHeight));
+        },
+      },
+    });
+    try {
+      expect(list.scrollHeight).toBe(500 * 36);
+      partialLayout = true;
+      fireEvent.keyDown(list, { key: "End" });
+      list.scrollTop = list.scrollTop;
+      partialLayout = false;
+      fireEvent.scroll(list);
+      expect(list.scrollTop).toBe(500 * 36 - 286);
+      const finalRows = screen.getAllByRole("listitem");
+      expect(finalRows.length).toBeLessThanOrEqual(14);
+      expect(finalRows[finalRows.length - 1]).toHaveAttribute("aria-posinset", "500");
+      expect(finalRows[finalRows.length - 1]).toHaveTextContent("Path 500");
+    } finally {
+      style.remove();
+    }
+  });
   it("exposes complete table dimensions and row positions across a virtual scroll", () => {
     render(
       <AddonRenderer

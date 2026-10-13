@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Check,
-  Loader2,
   Minus,
   Monitor,
   MoreHorizontal,
@@ -62,6 +61,7 @@ import { useHostStatusStore, useHostStatuses } from "@/stores/host-status-store"
 import { useLocalDeviceName } from "@/stores/local-device-store";
 import { useAddDeviceDialogStore } from "@/stores/add-device-dialog-store";
 import { SettingsCard, SubsectionHeader } from "./settings-primitives";
+import { Spinner } from "@/components/ui/spinner";
 
 /**
  * Settings → Devices: this machine, plus every other machine Codemux can run
@@ -282,7 +282,7 @@ export function HostsSection() {
       <SettingsCard className="p-0">
         {!loaded ? (
           <p className="flex items-center gap-2 px-4 py-3 text-body-sm text-muted-foreground">
-            <Loader2 className="size-3.5 animate-spin" aria-hidden />
+            <Spinner className="size-3.5" aria-hidden />
             Loading devices…
           </p>
         ) : hosts.length === 0 ? (
@@ -388,7 +388,7 @@ function DeviceRow({
           <span className="truncate">SSH {host.ssh_target}</span>
           <span aria-hidden>·</span>
           {busy ? (
-            <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+            <Spinner className="size-3 shrink-0" aria-hidden />
           ) : (
             <span
               aria-hidden
@@ -729,7 +729,7 @@ function AddDeviceForm({
 
       <DialogFooter>
         <Button type="submit" disabled={!sshTarget || running}>
-          {running && <Loader2 className="animate-spin" aria-hidden />}
+          {running && <Spinner aria-hidden />}
           {running ? "Connecting…" : failure ? "Retry" : "Connect"}
         </Button>
       </DialogFooter>
@@ -740,7 +740,7 @@ function AddDeviceForm({
 function StepIcon({ state }: { state: StepState }) {
   switch (state) {
     case "running":
-      return <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-hidden />;
+      return <Spinner className="size-3.5 text-muted-foreground" aria-hidden />;
     case "done":
       return <Check className="size-3.5 text-status-open" aria-hidden />;
     case "skipped":

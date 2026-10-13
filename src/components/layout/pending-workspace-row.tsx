@@ -1,4 +1,5 @@
-import { AlertCircle, Loader2, X } from "lucide-react";
+import { AlertCircle, X } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
 import type { PendingWorkspace } from "@/tauri/types";
@@ -21,7 +22,7 @@ export function PendingWorkspaceRow({
   const icon = failed ? (
     <AlertCircle className="size-3.5 shrink-0 text-destructive" />
   ) : (
-    <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+    <Spinner className="size-3.5 shrink-0 text-muted-foreground" />
   );
 
   if (!failed || !pending.draft) {

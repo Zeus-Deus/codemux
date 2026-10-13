@@ -66,7 +66,7 @@ export function HooksManager({ open, onOpenChange, cwd, threadId }: HooksManager
         </DialogHeader>
         <div className="flex items-center gap-3 border-b pb-3">
           <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground" title={catalogue?.cwd ?? cwd ?? "Home"}>{catalogue?.cwd ?? cwd ?? "Home"}</span>
-          <Button size="sm" variant="ghost" disabled={busy} onClick={() => setRevision((value) => value + 1)}><RotateCw className={cn("size-3.5", busy && "animate-spin")} />Refresh</Button>
+          <Button size="sm" variant="ghost" disabled={busy} aria-busy={busy} onClick={() => setRevision((value) => value + 1)}><RotateCw className={cn("size-3.5", busy && "animate-spin")} />Refresh</Button>
         </div>
         {error && <p role="alert" className="break-words text-destructive">{error}</p>}
         {catalogue?.warnings.map((warning, index) => <p key={index} className="break-words text-muted-foreground">{warning}</p>)}

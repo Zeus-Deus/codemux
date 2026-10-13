@@ -1,15 +1,14 @@
 import { HermesPermissionOptions, isHermesPermission, hermesPermissionAllowed } from "./HermesPermissionOptions";
-import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   Check,
   ChevronDown,
   Clock,
-  Loader2,
   X,
-  type LucideIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -622,7 +621,7 @@ function Kbd({ children }: { children: React.ReactNode }) {
 // ---------------------------------------------------------------------------
 
 interface StatusGlyph {
-  Icon: LucideIcon;
+  Icon: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   className: string;
 }
 
@@ -639,9 +638,9 @@ function glyphForState(states: {
 }): StatusGlyph | null {
   if (states.isPendingApproval) return { Icon: Clock, className: "text-status-working" };
   if (states.isResponding)
-    return { Icon: Loader2, className: "animate-spin text-muted-foreground" };
+    return { Icon: Spinner, className: "text-muted-foreground" };
   if (states.isExecuting)
-    return { Icon: Loader2, className: "animate-spin text-accent-ember" };
+    return { Icon: Spinner, className: "text-accent-ember" };
   if (states.isSuccess) return { Icon: Check, className: "text-status-open" };
   if (states.isError) return { Icon: X, className: "text-status-attention" };
   if (states.isDenied) return { Icon: X, className: "text-muted-foreground" };

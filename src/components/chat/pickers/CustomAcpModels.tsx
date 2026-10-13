@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { FlaskConical, LoaderCircle } from "lucide-react";
+import { FlaskConical } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { useCustomAcpThread } from "@/hooks/use-custom-acp-thread";
 import { useCustomAcp } from "@/stores/custom-acp-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -46,7 +47,7 @@ export function CustomAcpModels({ threadId, projectPath, model, onSelect, disabl
     {agent && <button type="button" className="flex items-center justify-end gap-1.5 text-label text-muted-foreground hover:text-foreground disabled:opacity-40" disabled={loading || busy || probing || !agent.enabled} onClick={() => {
       setActionError(null); setProbing(true);
       void (fixed && threadId ? useCustomAcp.getState().refreshThread(threadId) : useCustomAcp.getState().probe(agent.id, projectPath)).catch(e => setActionError(String(e))).finally(() => setProbing(false));
-    }}>{probing ? <LoaderCircle className="size-3 animate-spin" /> : <FlaskConical className="size-3" />}{fixed ? "Refresh session controls" : "Probe saved agent"}</button>}
+    }}>{probing ? <Spinner className="size-3" aria-hidden /> : <FlaskConical className="size-3" />}{fixed ? "Refresh session controls" : "Probe saved agent"}</button>}
     {!fixed && agent && <button type="button" className="rounded-md p-2 text-left font-medium hover:bg-surface-2 disabled:opacity-40" disabled={disabled} aria-pressed={model === null} onClick={() => onSelect(null)}>Use agent default</button>}
     {catalog?.capabilities.models.map(m => <button type="button" key={m.id} className="rounded-md p-2 text-left hover:bg-surface-2 disabled:opacity-40" disabled={disabled} aria-pressed={model === m.id} title={m.description ?? m.id} onClick={() => onSelect(m.id)}><span className="block font-medium">{m.label}</span>{m.description && <span className="block text-label text-muted-foreground">{m.description}</span>}</button>)}
     {catalog?.capabilities.models.length === 0 && <p className="text-label text-muted-foreground">No models advertised. {fixed ? "The session uses the agent default." : "The agent default is available."}</p>}

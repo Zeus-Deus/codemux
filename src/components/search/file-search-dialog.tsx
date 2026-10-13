@@ -5,6 +5,7 @@ import {
   DialogTitle,
   DialogDescription,
   DIALOG_CRISP_POSITION,
+  DIALOG_TOP_ANCHORED_MOTION,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "@/components/ui/eyebrow";
@@ -81,15 +82,27 @@ export function FileSearchDialog() {
   // Bumped per query so a slow response can't overwrite a newer one.
   const requestRef = useRef(0);
 
-  // Reset state when dialog opens, and offer the files the user most likely
-  // wants before they type anything.
+  // The shell keeps this dialog mounted after its first open so Radix can
+  // play the exit animation. Reset on the opening transition during render,
+  // not in an effect, so the previous query never paints for a frame.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) {
+      setQuery("");
+      setResults([]);
+      setLoading(false);
+      setSelectedIndex(0);
+    }
+  }
+
+  useEffect(() => {
+    if (open) setTimeout(() => inputRef.current?.focus(), 0);
+  }, [open]);
+
+  // Offer the files the user most likely wants before they type anything.
   useEffect(() => {
     if (!open) return;
-    setQuery("");
-    setResults([]);
-    setSelectedIndex(0);
-    setTimeout(() => inputRef.current?.focus(), 0);
-
     const opened = openEditorPaths(cwd);
     setSuggestions(opened.map((path) => ({ path, section: "open" })));
     if (!cwd) return;
@@ -116,7 +129,9 @@ export function FileSearchDialog() {
   // Debounced search
   useEffect(() => {
     const request = ++requestRef.current;
-    if (!open || !cwd || !query.trim()) {
+    // Closing keeps the last results so the list fades out intact.
+    if (!open) return;
+    if (!cwd || !query.trim()) {
       setResults([]);
       setLoading(false);
       return;
@@ -207,7 +222,7 @@ export function FileSearchDialog() {
        *  which landed on the search input's top-right corner because the
        *  content here is `p-0` rather than the `p-4` that button assumes. */}
       <DialogContent
-        className={cn(DIALOG_CRISP_POSITION, "gap-0 overflow-hidden p-0")}
+        className={cn(DIALOG_CRISP_POSITION, DIALOG_TOP_ANCHORED_MOTION, "gap-0 overflow-hidden p-0")}
         showCloseButton={false}
         onKeyDown={handleKeyDown}
       >

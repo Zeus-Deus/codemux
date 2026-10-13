@@ -1,5 +1,5 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
-import { Eye, EyeOff, Github, Loader2, Mail } from "lucide-react";
+import { Eye, EyeOff, Github, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { WindowChrome } from "@/components/layout/window-chrome";
@@ -7,6 +7,7 @@ import { BootSplash } from "@/components/layout/boot-splash";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/auth-store";
 import { forgotPassword, resendVerificationEmail } from "@/tauri/commands";
+import { Spinner } from "@/components/ui/spinner";
 import wordmark from "@/assets/codemux-wordmark.svg";
 
 type View = "signin" | "signup" | "forgot-password" | "verify-email";
@@ -86,7 +87,7 @@ export function LoginScreen() {
   if (oauthPending) {
     body = (
       <div className="flex w-full flex-col items-center text-center">
-        <Loader2 className="size-4 text-muted-foreground mb-4 motion-safe:animate-spin" />
+        <Spinner className="size-4 text-muted-foreground mb-4" aria-hidden />
         {/* Only the message is live; the actions below stay out of it. */}
         <div role="status" className="mb-6">
           <h2 className="text-body font-medium text-foreground mb-2">
@@ -170,7 +171,7 @@ export function LoginScreen() {
               disabled={resetLoading}
             >
               {resetLoading && (
-                <Loader2 className="size-4 animate-spin mr-1.5" />
+                <Spinner className="size-4 mr-1.5" aria-hidden />
               )}
               Send reset link
             </Button>
@@ -293,7 +294,7 @@ export function LoginScreen() {
             size="lg"
             disabled={isSigningIn}
           >
-            {isSigningIn && <Loader2 className="size-4 animate-spin mr-1.5" />}
+            {isSigningIn && <Spinner className="size-4 mr-1.5" aria-hidden />}
             {isSignup ? "Create account" : "Sign in"}
           </Button>
         </form>
@@ -435,7 +436,7 @@ function ResendVerification({
         onClick={() => void resend.send()}
       >
         {status === "sending" && (
-          <Loader2 className="size-3.5 motion-safe:animate-spin" />
+          <Spinner className="size-3.5" aria-hidden />
         )}
         {cooldown > 0 ? (
           <span>

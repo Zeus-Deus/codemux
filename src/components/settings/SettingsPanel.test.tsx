@@ -104,6 +104,7 @@ vi.mock("@/stores/settings-store", () => {
     selectDensity: () => "comfortable",
     selectSidebarShowGitStats: () => true,
     selectChatCodeWrap: () => false,
+    selectReduceMotion: () => false,
     selectSidebarAutoSettleDays: () => 3,
     selectOrbMatchActivity: () => true,
     selectAutoResumeUsageLimit: () => true,
@@ -619,6 +620,15 @@ describe("SettingsPanel — Appearance Agents section", () => {
     expect(mockSettingsSet).toHaveBeenCalledWith(
       "agents.orb_match_activity",
       "false",
+    );
+  });
+
+  it("toggling Reduce motion writes appearance.reduce_motion", () => {
+    openAppearance();
+    fireEvent.click(screen.getAllByRole("switch", { name: "Reduce motion" })[0]);
+    expect(mockSettingsSet).toHaveBeenCalledWith(
+      "appearance.reduce_motion",
+      "true",
     );
   });
 
