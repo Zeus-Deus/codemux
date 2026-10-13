@@ -18,6 +18,7 @@ vi.mock("@/hooks/use-terminal-theme-sync", () => ({ useTerminalThemeSync: vi.fn(
 vi.mock("@/hooks/use-terminal-cwd-poll", () => ({ useTerminalCwdPoll: vi.fn() }));
 vi.mock("@/hooks/use-automation-fire-toast", () => ({ useAutomationFireToast: vi.fn() }));
 vi.mock("@/hooks/use-web-notifications", () => ({ useWebNotifications: vi.fn() }));
+vi.mock("@/hooks/use-notification-activate", () => ({ useNotificationActivate: vi.fn() }));
 vi.mock("@/hooks/use-smooth-scrolling", () => ({ useSmoothScrollingInit: vi.fn() }));
 vi.mock("@/hooks/use-renderer-mode", () => ({ useRendererModeInit: vi.fn() }));
 vi.mock("@/hooks/use-ensure-draft-when-empty", () => ({ useEnsureDraftWhenEmpty: vi.fn() }));
